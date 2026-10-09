@@ -132,6 +132,15 @@ impl fmt::Display for Screen {
 /// corrected is not there, so it is refused. Only surrounding quotes and a
 /// sentence's trailing full stop are dropped. Unlike filter text it is not
 /// lowercased, because a command line is case-sensitive.
+///
+/// [`ParamKind::AgentKind`] and [`ParamKind::AgentStatus`] are the agent
+/// dashboard filter's two closed sets (issue #1496): what kind of agent a row
+/// is (an orchestration role, a single agent, or one of the dispatcher,
+/// schedule and schedule: issues modes) and what it is doing (working,
+/// thinking, waiting for input, idle, blocked, error). They are this app's own
+/// vocabulary rather than names it observed, so they resolve against a fixed
+/// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
+/// form's resolves against the agent types the deck knows the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -144,10 +153,12 @@ pub enum ParamKind {
     SpokenPrefix,
     FilterText,
     CommandText,
+    AgentKind,
+    AgentStatus,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 9] = [
+    pub const ALL: [ParamKind; 11] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -157,6 +168,8 @@ impl ParamKind {
         ParamKind::SpokenPrefix,
         ParamKind::FilterText,
         ParamKind::CommandText,
+        ParamKind::AgentKind,
+        ParamKind::AgentStatus,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -170,6 +183,8 @@ impl ParamKind {
             ParamKind::SpokenPrefix => "spoken_prefix",
             ParamKind::FilterText => "filter_text",
             ParamKind::CommandText => "command_text",
+            ParamKind::AgentKind => "agent_kind",
+            ParamKind::AgentStatus => "agent_status",
         }
     }
 
@@ -197,6 +212,9 @@ impl ParamKind {
             // The user's own words, verified against the transcript; nothing
             // observed is involved.
             ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
+            // This app's own closed vocabulary (issue #1496), the same on
+            // every deck: nothing observed is involved.
+            ParamKind::AgentKind | ParamKind::AgentStatus => false,
         }
     }
 }
@@ -526,8 +544,9 @@ pub enum ActionGrounding {
     /// merely occurs in it (PRD #1223, closing audit G1). Drawn from the row's own
     /// words under the same rule as [`ActionGrounding::HeardAs`].
     ///
-    /// **For a row whose action cannot be taken back**, and today that is
-    /// exactly `submit_prompt`. Token presence is evidence that the user
+    /// **First, for a row whose action cannot be taken back** — `submit_prompt`
+    /// was the first; every row using it, and why, is pinned by
+    /// `voice_table_whole_utterance_rows_are_the_deliberate_set`. Token presence is evidence that the user
     /// talked ABOUT a thing, and for most rows that is enough: a wrong
     /// navigation is one more utterance to undo. A prompt submitted to an
     /// agent cannot be recalled once the agent has it, and this row's
@@ -1337,6 +1356,14 @@ mod tests {
             vec![
                 ("open_agent", "openAgent", vec!["deck", "overview"]),
                 ("open_overview", "openOverview", vec!["deck", "overview"]),
+                (
+                    "filter_dashboard",
+                    "filterDashboard",
+                    vec!["deck", "overview"]
+                ),
+                // No screens: clearing the filter shows the whole dashboard
+                // from wherever it is said (issue #1496).
+                ("clear_dashboard_filter", "clearDashboardFilter", vec![]),
                 ("open_deck", "openDeck", vec!["deck", "overview"]),
                 // No screens: callable everywhere. `close` is here because the
                 // voice surface's own overlay can be up on any of the three and
@@ -1356,6 +1383,11 @@ mod tests {
                 ("dictation_on", "startDictation", vec!["agent"]),
                 ("dictation_off", "stopDictation", vec!["agent"]),
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
+                // PRD #1541's typing-mode prompt commands, dispatched only by
+                // the dictation mode's local intercept.
+                ("interrupt_agent", "interruptAgent", vec!["agent"]),
+                ("clear_prompt", "clearAgentPrompt", vec!["agent"]),
+                ("scratch_that", "scratchLastDictation", vec!["agent"]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
                 // The directory browser inside that dialog — `overview`, plus
@@ -1374,6 +1406,12 @@ mod tests {
                 // voice is on (PR #1451 round 3, change 4).
                 ("next_page", "nextPage", vec!["deck", "overview"]),
                 ("previous_page", "previousPage", vec!["deck", "overview"]),
+                // Scrolling the agent dashboard, which no longer pages (issue
+                // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
+                ("scroll_down", "scrollDown", vec!["overview"]),
+                ("scroll_up", "scrollUp", vec!["overview"]),
+                ("scroll_to_top", "scrollToTop", vec!["overview"]),
+                ("scroll_to_bottom", "scrollToBottom", vec!["overview"]),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
@@ -1966,12 +2004,18 @@ mod tests {
         // be taken back, and "discard" is an ordinary word. The dictation
         // mode's pair (PRD #1260) because a switch changes how every later
         // utterance is treated, so it must not ground on words said in passing.
+        // PRD #1541's three prompt commands because their whole-utterance
+        // vocabulary is exactly what the agent screen answers locally outside
+        // typing mode, which is what keeps the model from ever dispatching them.
         assert_eq!(
             whole,
             vec![
                 "dictation_on",
                 "dictation_off",
                 "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
                 "discard_new_agent"
             ]
         );
@@ -2321,7 +2365,15 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(everywhere, vec!["close", "voice_off", "list_commands"]);
+        assert_eq!(
+            everywhere,
+            vec![
+                "clear_dashboard_filter",
+                "close",
+                "voice_off",
+                "list_commands"
+            ]
+        );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -2386,6 +2438,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -2401,6 +2455,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -2410,6 +2466,11 @@ mod tests {
                 "open_new_agent",
                 "next_page",
                 "previous_page",
+                // Scrolling the dashboard (issue #1492): met by no dialog declared.
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2419,14 +2480,63 @@ mod tests {
         assert_eq!(
             callable(Screen::Agent),
             vec![
+                "clear_dashboard_filter",
                 "close",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
                 "dictation_on",
                 "dictation_off",
-                "submit_prompt"
+                "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that"
             ]
+        );
+    }
+
+    /// Scenario: load the shipped dashboard filter rows. Their prompts explain
+    /// filtering a set versus opening one pane, and clearing is available from
+    /// every screen so returning to the whole dashboard is always one step.
+    #[test]
+    fn voice_table_dashboard_filter_rows_describe_the_navigation_split() {
+        let table = super::table();
+        let filter = table
+            .row("filter_dashboard")
+            .expect("missing filter_dashboard voice command");
+        let clear = table
+            .row("clear_dashboard_filter")
+            .expect("missing clear_dashboard_filter voice command");
+        assert_eq!(filter.invoke, "filterDashboard");
+        assert_eq!(clear.invoke, "clearDashboardFilter");
+        for row in [filter, clear] {
+            assert!(
+                row.description.to_lowercase().contains("filter"),
+                "{}: {}",
+                row.id,
+                row.description
+            );
+            assert!(
+                matches!(&row.grounding, ActionGrounding::HeardAs(words) if !words.is_empty()),
+                "{} needs grounded spoken vocabulary",
+                row.id
+            );
+        }
+        for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
+            assert!(
+                clear.callable(screen, None, None),
+                "clear the filter must work on {screen:?}"
+            );
+        }
+        assert!(filter.callable(Screen::Overview, None, None));
+        assert!(
+            filter.description.contains("open_agent"),
+            "explain the distinction from one-agent navigation"
+        );
+        let overview = table.row("open_overview").expect("overview row");
+        assert!(
+            overview.description.contains("clear_dashboard_filter"),
+            "explain which row owns show everything now"
         );
     }
 
@@ -2447,6 +2557,11 @@ mod tests {
                     "dictation on",
                     "start dictation",
                     "keep typing",
+                    "talking on",
+                    "start talking",
+                    "speaking on",
+                    "start speaking",
+                    "dictate on",
                 ],
             ),
             (
@@ -2459,6 +2574,11 @@ mod tests {
                     "dictation off",
                     "stop dictation",
                     "done typing",
+                    "talking off",
+                    "stop talking",
+                    "speaking off",
+                    "stop speaking",
+                    "dictate off",
                 ],
             ),
         ] {
@@ -2852,6 +2972,7 @@ mod tests {
         assert_eq!(
             redirecting,
             vec![
+                ("clear_dashboard_filter", "clear_directory_filter"),
                 ("switch_deck", "choose_deck"),
                 ("open_new_agent", "start_new_agent"),
                 ("start_new_agent", "open_new_agent"),
@@ -3158,12 +3279,17 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "daemon" (or "deck", its name before #1045)
-        // alone — no shared verb — so a steered pick needs the user to have
-        // talked about a daemon (see commands.toml).
+        // Grounded by the word "daemon" (or "deck", its name before #1045,
+        // or "demon", how speech-to-text writes it) alone — no shared verb —
+        // so a steered pick needs the user to have talked about a daemon (see
+        // commands.toml).
         assert_eq!(
             table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec!["daemon".to_string(), "deck".to_string()])
+            ActionGrounding::HeardAs(vec![
+                "daemon".to_string(),
+                "deck".to_string(),
+                "demon".to_string()
+            ])
         );
     }
 
@@ -3219,8 +3345,9 @@ mod tests {
     }
 
     /// PR #1451 round 3, change 4: turning the page of whatever list on screen
-    /// is split into pages while voice is on — the dashboard's agents, the
-    /// Daemons screen's tiles, the New agent dialog's directories and modes.
+    /// is split into pages while voice is on — the Daemons screen's tiles, the
+    /// New agent dialog's directories and modes. On the agent dashboard, which
+    /// scrolls instead (issue #1492), the app scrolls it by a screen.
     /// Pinned by value; neither takes a param or needs a declaration, because
     /// the app answers "nothing here has pages" itself, and neither is
     /// callable over an agent's pane, where nothing pages.
@@ -3256,6 +3383,60 @@ mod tests {
         assert!(
             matches!(&back.grounding, ActionGrounding::HeardAs(heard_as) if heard_as.iter().any(|heard| heard == "back"))
         );
+    }
+
+    /// Issue #1492: scrolling the agent dashboard, which no longer splits into
+    /// pages while voice is on. Pinned by value: no params, `overview` only,
+    /// and callable only while the New agent dialog is closed, since the
+    /// dashboard is what they scroll and the dialog covers it. Each is grounded
+    /// by its direction's word, so "scroll up" never grounds a scroll down.
+    #[test]
+    fn voice_table_scroll_rows_are_pinned_by_value() {
+        let table = super::table();
+        let dialog = VoiceNewAgent { form: None };
+        for (id, invoke, report, word, opposite) in [
+            ("scroll_down", "scrollDown", "Scrolling down.", "down", "up"),
+            ("scroll_up", "scrollUp", "Scrolling up.", "up", "down"),
+            (
+                "scroll_to_top",
+                "scrollToTop",
+                "Scrolled to the top.",
+                "top",
+                "bottom",
+            ),
+            (
+                "scroll_to_bottom",
+                "scrollToBottom",
+                "Scrolled to the bottom.",
+                "bottom",
+                "top",
+            ),
+        ] {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            assert_eq!(
+                row.requires,
+                vec![Requirement::NewAgentDialogClosed],
+                "{id}"
+            );
+            assert!(row.params.is_empty(), "{id}");
+            assert_eq!(row.report, report, "{id}");
+            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
+                panic!("{id} is grounded by `heard_as`");
+            };
+            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert!(!heard_as.iter().any(|heard| heard == opposite), "{id}");
+            assert!(row.callable(Screen::Overview, None, None), "{id}");
+            assert!(
+                !row.callable(Screen::Overview, None, Some(&dialog)),
+                "{id}: under the New agent dialog"
+            );
+            assert!(!row.callable(Screen::Deck, None, None), "{id}");
+            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+        }
     }
 
     #[test]

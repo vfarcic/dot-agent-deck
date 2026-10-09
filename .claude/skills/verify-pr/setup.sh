@@ -6,9 +6,10 @@
 # Usage: setup.sh <pr-number> [--force]
 #        setup.sh <pr-number> --baseline
 #
-# Deliberately a SIBLING of `.claude/skills/dot-ai-worktree-prd/create.sh`
+# Deliberately a SIBLING of `.claude/skills/worktree-prd/create.sh`
 # rather than a caller of it: that script exists to start NEW work, so it
-# derives the branch name from `prds/<n>-*.md` and always branches from `main`.
+# derives the branch name from the PRD (its `prds/<n>-*.md`, else its issue)
+# and always branches from `main`.
 # Reviewing a PR needs the opposite — a branch pinned to the contributor's head
 # commit, fork included. The conventions are kept identical on purpose: same
 # `../<repo>-<suffix>` path scheme, same validate-then-create ordering, same

@@ -56,7 +56,10 @@
 //! - [`trust_deck_hooks_in`] records `[hooks.state."<key>"] { trusted_hash }` in
 //!   `<home>/config.toml` for exactly those keys — `trusted_hash` and nothing
 //!   else, because the sibling `enabled` key is a USER knob and not part of
-//!   trust at all (see [`upsert_trust_record`]).
+//!   trust at all (see [`upsert_trust_record`]). The same write removes the
+//!   deck's OWN records left at positions its hook no longer occupies, under
+//!   three conditions that must all hold (see
+//!   [`sweep_stale_deck_trust_records`], issue #1027).
 //!
 //! The result is strictly narrower than the old bypass and launch-method
 //! agnostic: trust lives in the home (not argv), so `codex`, `devbox run
@@ -80,6 +83,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
 
 /// The fixed command signature that identifies a deck-authored Codex hook. Every
 /// deck hook command is `<binary_path> hook --agent codex`, so a command ending
@@ -223,6 +228,17 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
     command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
 }
 
+/// Whether an install by `binary_path` owns `command` under an event it
+/// INSTALLS: any deck install sharing its basename, live or not
+/// ([`crate::agent_hook_config::is_replaceable_deck_install`]) — one deck
+/// entry per event (PRD #1487). Wider than [`command_is_replaceable`], which
+/// still governs the retired-event sweep: there the deck has nothing to put in
+/// the removed command's place, so a live sibling's rule is left alone.
+fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path))
+}
+
 /// Refresh this install's command hook inside ONE event array **without moving
 /// any rule or handler that is already there**, returning whether it found a
 /// position to claim.
@@ -295,15 +311,14 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 ///   stable across a steady-state install: the hash is a SHA-256 over command +
 ///   `matcher` + `async`, so an unchanged command under preserved siblings
 ///   leaves the deck's own grant valid instead of churning it.
-/// - **A rule emptied by the surplus sweep is kept, not dropped.** Measured on
-///   0.149.0 in both shapes this sweep can leave — `{"hooks": []}` and a bare
-///   `{}` — placed at index 1: the handlers either side reported
+/// - **An interior rule emptied by the surplus sweep is kept, not dropped.**
+///   Measured on 0.149.0 in both shapes this sweep can leave — `{"hooks": []}`
+///   and a bare `{}` — placed at index 1: the handlers either side reported
 ///   `pre_tool_use:0:0` and `pre_tool_use:2:0`, with `warnings` and `errors`
 ///   both empty. So an emptied rule contributes no trust key of its own, draws
 ///   no complaint, and still consumes its `group_idx` — which is exactly what
-///   makes keeping it preserve the indices of everything after it.
-///   Dropping it would re-introduce the defect this function exists to remove,
-///   in exchange for tidiness in a file the deck does not own.
+///   makes keeping it preserve the indices of everything after it. A TRAILING
+///   emptied rule is dropped (PRD #1487): nothing follows it to re-key.
 /// - **The legacy flat rule shape (`{"command": …}`) claims nothing, but is
 ///   still swept.** This adapter's writer emits only the nested shape, so a
 ///   flat deck-owned rule here came from somewhere else, and how Codex indexes
@@ -317,98 +332,16 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 ///   out moves nothing. (It also never ran under Codex, so this is tidying
 ///   rather than a duplicate-fire fix.)
 ///
-/// The signature takes `&mut [Value]` rather than `&mut Vec<Value>` on purpose:
-/// this function may edit a rule but may never add or remove one, and that is
-/// the whole property, so the type says it.
-fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &str) -> bool {
-    let replaceable = |value: &Value| {
-        value
-            .as_str()
-            .is_some_and(|cmd| command_is_replaceable(cmd, binary_path))
-    };
-
-    // Locate the first replaceable command, in `strip_deck_commands`'s walk
-    // order. A flat rule reached before any nested handler abandons the claim.
-    let mut claim = None;
-    'scan: for (rule_idx, rule) in rules.iter().enumerate() {
-        if let Some(handlers) = rule.get("hooks").and_then(Value::as_array) {
-            for (handler_idx, handler) in handlers.iter().enumerate() {
-                if handler.get("command").is_some_and(&replaceable) {
-                    claim = Some((rule_idx, handler_idx));
-                    break 'scan;
-                }
-            }
-        }
-        if rule.get("command").is_some_and(&replaceable) {
-            return false;
-        }
-    }
-    let Some((claimed_rule, claimed_handler)) = claim else {
-        return false;
-    };
-
-    // Drop surplus copies of this install — a second handler for the same
-    // binary, or a dead pin under its basename — but ONLY from the TAIL of a
-    // rule's handler list, because removing one that a surviving handler
-    // follows shifts that handler's `handler_idx`. That is this very defect at
-    // handler granularity, and the first draft of this function had it
-    // (Greptile P1 on PR #1166): a rule holding
-    // `[deck-claimed, deck-surplus, user]` moved the user from `:0:2` to
-    // `:0:1`. Rules before the claim are never visited, since the scan above
-    // stops at the first replaceable command in either shape.
-    for (rule_idx, rule) in rules.iter_mut().enumerate().skip(claimed_rule) {
-        if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
-            while let Some(last_idx) = handlers.len().checked_sub(1) {
-                if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
-                    || !handlers[last_idx].get("command").is_some_and(&replaceable)
-                {
-                    break;
-                }
-                handlers.pop();
-            }
-        }
-        // The legacy flat `command` goes unconditionally: measured on 0.149.0,
-        // a rule carrying no `hooks` array contributes NO listed entry at all —
-        // a `{"type":"command","command":…}` rule placed at index 1 left the
-        // handlers either side reporting `pre_tool_use:0:0` and
-        // `pre_tool_use:2:0` with no warnings — so it holds no trust key of its
-        // own and taking the key out moves nothing. (It also means such a rule
-        // never runs under Codex, so this is tidying, not a duplicate-fire
-        // fix.) The rule OBJECT stays, which is what keeps `group_idx` still.
-        if rule.get("command").is_some_and(&replaceable)
-            && let Some(object) = rule.as_object_mut()
-        {
-            object.remove("command");
-        }
-    }
-
-    // Refresh EVERY replaceable handler still standing, not only the claim.
-    // An interior surplus that the tail rule above could not remove would
-    // otherwise be left carrying a stale command — and if it is a dead pin,
-    // that is an exec failure on every event rather than a harmless duplicate.
-    // Refreshing it costs a second firing of the deck's own hook, which is the
-    // cheaper side of the trade against re-keying a user's grant.
-    for rule in rules.iter_mut().skip(claimed_rule) {
-        let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for handler in handlers.iter_mut() {
-            if !handler.get("command").is_some_and(&replaceable) {
-                continue;
-            }
-            let Some(object) = handler.as_object_mut() else {
-                continue;
-            };
-            object.insert("command".into(), Value::String(command.to_string()));
-            // Only when absent: a handler carrying a deck command but no `type`
-            // is one the deck did not write, and Codex needs the discriminant
-            // to run it. An existing value is the user's and not ours to fix.
-            object
-                .entry("type")
-                .or_insert_with(|| Value::String("command".into()));
-        }
-    }
-    true
+/// **What it claims is any install of the deck, not only this one** (PRD
+/// #1487, [`command_is_deck_install`]): a different still-valid install's
+/// handler is consolidated into the one this install keeps, rather than left
+/// beside it as issue #730 had it. The logic is shared with the Claude and Devin
+/// writers — `agent_hook_config::consolidate_deck_handlers_in_place`.
+fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path: &str) -> bool {
+    crate::agent_hook_config::consolidate_deck_handlers_in_place(rules, command, |cmd| {
+        command_is_deck_install(cmd, binary_path)
+    })
+    .is_some()
 }
 
 /// Merge the deck's command hooks for `command` — the command built for
@@ -427,7 +360,22 @@ fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &
 /// [`refresh_deck_rule_in_place`], which carries the measurement. The one place
 /// an index can still move is the retired-event sweep below, because removing a
 /// rule is what that sweep IS.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+///
+/// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
+/// install is kept rather than replaced (PRD #1487 —
+/// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
+/// no such entry gets the first kept install's command rather than this
+/// binary's. Returns every binary the installed events now name — the first
+/// kept install's first, then any other an event kept for itself — which is
+/// what the trust write has to be about: events that already named different
+/// live installs keep them, and each of those commands needs its own grant
+/// (Qodo 4200693859).
+fn install_impl(
+    root: &mut Value,
+    command: &str,
+    binary_path: &str,
+    mode: InstallMode,
+) -> Vec<String> {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -477,22 +425,49 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
     }
 
-    let entry = json!({
-        "hooks": [ { "type": "command", "command": command } ]
-    });
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            deck_command_executable,
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => CODEX_HOOK_EVENTS.iter().find_map(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
+    let mut named = vec![KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)];
     for &event in CODEX_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
-        // Normalize down to a single rule, but only for THIS binary — plus any
-        // deck pin sharing its basename that the deck would not itself write
-        // (missing, bare or relative, non-executable, or a build-artifact
-        // path), the shape N worktree builds actually take. A deck rule
-        // belonging to a genuinely different, still-valid install is left in
-        // place and the new rule is added ALONGSIDE it (issue #730), which is
-        // what Claude's `install_impl` has always done.
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(arr),
+        };
+        let named_here =
+            KeptDeckEntry::named_binary(kept_here.as_ref().or(keeper.as_ref()), binary_path);
+        if !named.contains(&named_here) {
+            named.push(named_here);
+        }
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
+        let entry = json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        });
+        // Normalize down to ONE deck rule per event (PRD #1487): this
+        // binary's own, plus every other install of the deck sharing its
+        // basename, live or dead — a different still-valid install is
+        // consolidated rather than kept alongside as issue #730 had it, because
+        // a second rule fires every hook twice and is a new untrusted entry
+        // Codex holds every start on.
         //
         // REFRESH IN PLACE FIRST (issue #1034). Codex's trust keys are
         // file-positional, so removing this install's rule and appending a
@@ -512,10 +487,11 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         // nothing to overwrite it with, so it is left as it is rather than
         // papered over with a tombstone rule.
         if !refresh_deck_rule_in_place(arr, command, binary_path) {
-            strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
-            arr.push(entry.clone());
+            strip_deck_commands(arr, |cmd| command_is_deck_install(cmd, binary_path));
+            arr.push(entry);
         }
     }
+    named
 }
 
 /// Reject a structurally-incompatible existing `hooks.json` shape without
@@ -559,10 +535,37 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 /// call errors (never discarded); a structurally-incompatible shape errors
 /// WITHOUT touching the file; unreadable content propagates its error unwritten.
 pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(codex_home)?;
+    install_to_reporting(codex_home, binary_path, InstallMode::Explicit).map(|_| ())
+}
+
+/// The automatic install's seam: [`install_to`] under
+/// [`InstallMode::Automatic`], which keeps another live durable install's entry
+/// rather than replacing it (PRD #1487). Returns whether the file changed and
+/// every binary its entries now name, the first kept install's first.
+pub(crate) fn auto_install_to(
+    codex_home: &Path,
+    binary_path: &str,
+) -> std::io::Result<(bool, Vec<String>)> {
+    install_to_reporting(codex_home, binary_path, InstallMode::Automatic)
+}
+
+/// [`install_to`], reporting whether it changed the definitions and the binary
+/// they name. Equal merged definitions are not written at all (PRD #1487): the
+/// file keeps its bytes, formatting, inode and mtime, so an unchanged install
+/// is invisible to Codex and to anything watching the file.
+fn install_to_reporting(
+    codex_home: &Path,
+    binary_path: &str,
+    mode: InstallMode,
+) -> std::io::Result<(bool, Vec<String>)> {
     let path = codex_home.join("hooks.json");
+    // Before the directory, the backup and the temp file (PRD #1487).
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    std::fs::create_dir_all(codex_home)?;
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across processes too: every wrapper starting a Codex pane runs this.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -570,14 +573,15 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
             Err(parse_err) => {
                 // Preserve the user's bytes (best-effort backup) and refuse to
                 // overwrite — never discard content we couldn't parse. The copy
-                // is published, not `std::fs::write`n: that followed a symlink
-                // planted at this predictable `.bak` name (#731).
+                // is created exclusively, not `std::fs::write`n: that followed a
+                // symlink planted at this predictable `.bak` name (#731), and it
+                // never replaces a `.bak` that is already there (#537).
                 let backup = crate::agent_hook_config::backup_malformed(&path, &bytes);
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "existing hooks.json is not valid JSON ({}): {parse_err}",
-                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
+                        crate::agent_hook_config::preserved_phrase(&backup)
                     ),
                 ));
             }
@@ -597,9 +601,14 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
     // structural, the way S-2 made the trust half structural, instead of held by
     // duplication that a future edit to either site quietly breaks.
     let command = expected_hook_command(binary_path);
-    install_impl(&mut root, &command, binary_path);
+    let before = root.clone();
+    let named = install_impl(&mut root, &command, binary_path, mode);
+    if root == before {
+        return Ok((false, named));
+    }
     let contents = serde_json::to_string_pretty(&root)?;
-    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())?;
+    Ok((true, named))
 }
 
 /// Whether the active `CODEX_HOME`'s `hooks.json` declares any command hook NOT
@@ -693,11 +702,14 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// `auto_install`): a missing home or unwritable dir degrades to the coarse
 /// stdout fallback rather than blocking the spawn.
 ///
-/// Returns the durable binary path the definitions were written for, or `None`
-/// if nothing was written. The caller needs it to build the expected command
-/// [`trust_deck_hooks_in`] compares against (issue #730) — the SAME value, so
-/// install and trust can never be about two different binaries.
-pub fn auto_install() -> Option<String> {
+/// Returns every binary the deck's definitions name afterwards, or `None` if
+/// the install failed. That is this process's durable path unless another live,
+/// durable install's entry was already there — an automatic install keeps that
+/// one rather than replacing it (PRD #1487), and keeps each event's own when
+/// events name different live installs. The caller needs them to build the
+/// expected commands [`trust_deck_hooks_for`] compares against (issue #730) —
+/// the SAME values, so install and trust can never be about different binaries.
+pub fn auto_install() -> Option<Vec<String>> {
     let home = codex_home()?;
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
@@ -710,11 +722,25 @@ pub fn auto_install() -> Option<String> {
             return None;
         }
     };
-    if let Err(e) = install_to(&home, &binary_path) {
-        tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
-        return None;
+    // Automatic: another live durable install's entry is kept, and the trust
+    // write is then about that install's command (PRD #1487).
+    match auto_install_to(&home, &binary_path) {
+        Ok((changed, named)) => {
+            if changed {
+                crate::agent_hook_config::log_auto_install_change(
+                    "codex",
+                    &home.join("hooks.json"),
+                    &named.join(", "),
+                    "codex auto-install",
+                );
+            }
+            Some(named)
+        }
+        Err(e) => {
+            tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
+            None
+        }
     }
-    Some(binary_path)
 }
 
 /// The exact hook command the deck writes for `binary_path` — what
@@ -738,6 +764,7 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
     let path = codex_home.join("hooks.json");
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -747,6 +774,7 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("hooks.json: {e}")))?;
     validate_structure(&root)?;
+    let before = root.clone();
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for value in hooks.values_mut() {
             if let Some(arr) = value.as_array_mut() {
@@ -758,6 +786,11 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
             }
         }
         hooks.retain(|_, value| !value.as_array().is_some_and(|arr| arr.is_empty()));
+    }
+    // Nothing of the deck's was there: leave the user's file untouched rather
+    // than reserializing it (PRD #1487).
+    if root == before {
+        return Ok(());
     }
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
@@ -858,6 +891,25 @@ impl CodexHookEntry {
     }
 }
 
+/// One `hooks/list` reply: the entries Codex enumerated, and how many
+/// `warnings` and `errors` it reported beside them (issue #1027).
+///
+/// Codex answers successfully even when it could not load part of a hooks file
+/// — measured on codex-cli 0.149.0, invalid JSON, a malformed handler or an
+/// unsupported handler type drop entries from `hooks` while the reply still
+/// succeeds — and says so through `warnings`/`errors`. So a listing whose
+/// `diagnostics` is non-zero may be missing positions that really are in the
+/// file, which is exactly what [`trust_deck_hooks_in`]'s stale-record sweep must
+/// not mistake for "that position is gone". The count is all a caller needs;
+/// the messages themselves are Codex's, not ours to interpret.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HooksListing {
+    /// Every hook Codex enumerated, in the order it reported them.
+    pub entries: Vec<CodexHookEntry>,
+    /// How many `warnings` plus `errors` the reply carried, across every group.
+    pub diagnostics: usize,
+}
+
 /// Ask Codex itself for every hook it would load for `cwd` under `home`.
 ///
 /// Mechanism (Codex 0.144.4, verified): `codex app-server` speaks line-delimited
@@ -881,7 +933,7 @@ impl CodexHookEntry {
 /// the wait is bounded by [`HOOKS_LIST_TIMEOUT`], and the child is killed before
 /// returning. EVERY failure — codex absent, non-zero exit, protocol drift, timeout
 /// — is an `Err` so the caller degrades quietly (no spawn is ever blocked).
-pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<Vec<CodexHookEntry>> {
+pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
     let mut child = Command::new("codex")
         .arg("app-server")
         .env("CODEX_HOME", home)
@@ -1029,7 +1081,7 @@ fn read_hooks_list_reply(
     rx: &mpsc::Receiver<String>,
     to_server: &mut dyn io::Write,
     deadline: Instant,
-) -> std::io::Result<Vec<CodexHookEntry>> {
+) -> std::io::Result<HooksListing> {
     let mut skipped = SkippedLog::default();
     let mut declines = 0_usize;
     loop {
@@ -1236,7 +1288,7 @@ fn decline_server_request(value: &Value, to_server: &mut dyn io::Write) -> bool 
 /// flat `result.hooks[]`. An entry missing `key` or `currentHash` is DROPPED
 /// rather than guessed at — a trust record without Codex's own hash is worthless.
 /// A JSON-RPC `error` reply, or a reply with no recognizable hook array, is `Err`.
-fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
+fn parse_hooks_list(response: &Value) -> std::io::Result<HooksListing> {
     if let Some(error) = response.get("error") {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -1255,8 +1307,25 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
     };
     let mut found_array = false;
     let mut entries = Vec::new();
+    let mut diagnostics = 0;
     for group in groups {
+        // Counted per group, BEFORE the group's hooks are looked at, so a group
+        // that carries no `hooks` array still has its warnings counted (Qodo and
+        // Greptile on PR #1519). A field that is present but not an array is
+        // counted as one diagnostic rather than none: it is a shape we do not
+        // understand, and the one consumer of this count only ever uses it to
+        // decline a deletion (issue #1027). For the same reason, a group with
+        // no `hooks` array and every entry dropped below count as one each:
+        // each is something the listing does not report.
+        for field in ["warnings", "errors"] {
+            diagnostics += match group.get(field) {
+                None | Some(Value::Null) => 0,
+                Some(Value::Array(items)) => items.len(),
+                Some(_) => 1,
+            };
+        }
         let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
+            diagnostics += 1;
             continue;
         };
         found_array = true;
@@ -1268,6 +1337,7 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
                     .filter(|s| !s.is_empty())
             };
             let (Some(key), Some(current_hash)) = (string("key"), string("currentHash")) else {
+                diagnostics += 1;
                 continue;
             };
             entries.push(CodexHookEntry {
@@ -1291,7 +1361,10 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
             "codex app-server: hooks/list reply carried no hooks array",
         ));
     }
-    Ok(entries)
+    Ok(HooksListing {
+        entries,
+        diagnostics,
+    })
 }
 
 /// How closely a listed entry's command must match for the entry to count as the
@@ -1391,8 +1464,8 @@ pub fn deck_owned_entries<'a>(
     entries
         .iter()
         .filter(|entry| {
-            let same_file = entry.source_path == ours
-                || (ours_real.is_some() && entry.source_path.canonicalize().ok() == ours_real);
+            let same_file =
+                is_this_homes_hooks_json(&entry.source_path, &ours, ours_real.as_deref());
             // `managed_if_absent` is condition 3's answer when the listing did
             // not carry `isManaged` at all, and it differs BY DIRECTION (issue
             // #730). A grant must assume the entry IS managed — fail closed,
@@ -1424,12 +1497,22 @@ pub fn deck_owned_entries<'a>(
 /// collapsing the two there printed the first cause's sentence on the second
 /// cause's branch — the exact diagnostic dead end
 /// [`warn_if_our_own_entry_was_unrecognisable`] exists to break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustOutcome {
     /// `count` entries were trusted, `count >= 1`. `reports_prompts` says
     /// whether one of them is the deck's `UserPromptSubmit` hook with the user's
     /// toggle not off — see [`Self::reports_prompts`].
-    Trusted { count: usize, reports_prompts: bool },
+    ///
+    /// `turned_off` names, by Codex event (`PreToolUse`, …), every trusted deck
+    /// hook the user has switched off in Codex's `/hooks` list (issue #1027
+    /// item 2). The trust write leaves that toggle alone, so the hook stays off;
+    /// this is what lets `hooks install` say so instead of reporting a count
+    /// that reads as "all working". Empty in the ordinary case.
+    Trusted {
+        count: usize,
+        reports_prompts: bool,
+        turned_off: Vec<String>,
+    },
     /// Nothing in Codex's listing was ELIGIBLE for a trust write — which is
     /// wider than "Codex enumerated no entry of the deck's" and must not be
     /// reported as that (Greptile P2 on PR #1029). Three ways in: the deck's
@@ -1452,9 +1535,9 @@ pub enum TrustOutcome {
 impl TrustOutcome {
     /// How many entries were trusted — zero for both zero causes, so a caller
     /// that only wants the count does not have to match.
-    pub fn trusted(self) -> usize {
+    pub fn trusted(&self) -> usize {
         match self {
-            Self::Trusted { count, .. } => count,
+            Self::Trusted { count, .. } => *count,
             Self::NothingListed | Self::Unrecognised { .. } => 0,
         }
     }
@@ -1468,7 +1551,7 @@ impl TrustOutcome {
     /// `enabled = false` on the prompt hook, so "some deck hook is trusted" is
     /// not "prompts will be reported". `crate::wrap` stamps every event it emits
     /// as unable to report when this is `false`.
-    pub fn reports_prompts(self) -> bool {
+    pub fn reports_prompts(&self) -> bool {
         matches!(
             self,
             Self::Trusted {
@@ -1507,6 +1590,10 @@ impl TrustOutcome {
 /// under [`INSTALL_LOCK`], so a concurrent deck writer can't interleave and the
 /// user's comments/settings survive byte-intact.
 ///
+/// In the same edit it removes the deck's own trust records left at positions
+/// its hook no longer occupies ([`sweep_stale_deck_trust_records`], issue
+/// #1027), and only from a listing Codex reported without warnings or errors.
+///
 /// This REPLACES the old invocation-global `--dangerously-bypass-hook-trust`:
 /// it is launch-method agnostic (trust lives in the home, not argv), never trusts
 /// a hook the deck didn't author, and fails closed (any error ⇒ the hooks stay
@@ -1516,12 +1603,64 @@ pub fn trust_deck_hooks_in(
     cwd: &Path,
     binary_path: &str,
 ) -> std::io::Result<TrustOutcome> {
-    let expected = expected_hook_command(binary_path);
-    let entries = list_hooks_in(home, cwd)?;
-    let eligible = deck_owned_entries(&entries, home, DeckCommandMatch::Exact(&expected));
+    trust_deck_hooks_for(home, cwd, &[binary_path.to_string()])
+}
+
+/// [`trust_deck_hooks_in`] for every binary an automatic install left the
+/// deck's definitions naming ([`auto_install`]): each listed entry is matched
+/// [`DeckCommandMatch::Exact`] against one of their expected commands, so the
+/// grant is exactly as narrow as for one binary — never a signature match, never
+/// a foreign handler — and no event an earlier install kept is left untrusted
+/// because a different event kept a different install (Qodo 4200693859).
+/// `binary_paths` must be non-empty; the first is the one a zero-trust warning
+/// is reported against.
+pub fn trust_deck_hooks_for(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+) -> std::io::Result<TrustOutcome> {
+    let mut expected_commands: Vec<String> = Vec::new();
+    for binary_path in binary_paths {
+        let command = expected_hook_command(binary_path);
+        if !expected_commands.contains(&command) {
+            expected_commands.push(command);
+        }
+    }
+    let Some(expected) = expected_commands.first().cloned() else {
+        return Ok(TrustOutcome::NothingListed);
+    };
+    let listing = list_hooks_in(home, cwd)?;
+    let entries = &listing.entries;
+    let eligible = trust_eligible(entries, home, &expected_commands);
     // Issue #559: taken from the same eligible set the records are, so it can
     // only name an entry this call is about to trust.
     let reports_prompts = eligible.iter().any(|entry| entry.is_enabled_prompt_hook());
+    // Issue #1027 item 2: the user's `/hooks` toggle is respected (the write
+    // below touches `trusted_hash` only), so a deck hook they switched off stays
+    // off. Respected is not the same as invisible: say so, by event, here — this
+    // is the one place every install path (startup, wrapper, CLI) passes — and
+    // hand the names out so the CLI can print them.
+    let mut turned_off: Vec<String> = eligible
+        .iter()
+        .filter(|entry| entry.enabled == Some(false))
+        .filter_map(|entry| entry.event_snake().map(event_display_name))
+        .collect();
+    turned_off.sort();
+    turned_off.dedup();
+    if !turned_off.is_empty() {
+        tracing::warn!(
+            events = turned_off.join(", "),
+            "codex: the deck's own hooks for these events are turned off in Codex's /hooks list; \
+             the deck keeps them trusted but leaves them off, so Codex reports nothing through \
+             them until they are turned back on there"
+        );
+    }
+    // Issue #1027 item 1: the hashes the deck's own CURRENT hook definitions
+    // carry, which is condition (b) of the stale-record sweep below.
+    let deck_hashes: Vec<String> = eligible
+        .iter()
+        .map(|entry| entry.current_hash.clone())
+        .collect();
     let records: Vec<(String, String)> = eligible
         .into_iter()
         .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
@@ -1530,7 +1669,7 @@ pub fn trust_deck_hooks_in(
         // The warn is the diagnosis; its count is what tells the two causes of
         // zero apart, so the caller gets it too rather than having to read a log
         // that may not even have a subscriber (issue #730, auditor S-C).
-        let listed = warn_if_our_own_entry_was_unrecognisable(&entries, home, &expected);
+        let listed = warn_if_our_own_entry_was_unrecognisable(entries, home, &expected);
         return Ok(if listed == 0 {
             TrustOutcome::NothingListed
         } else {
@@ -1538,15 +1677,220 @@ pub fn trust_deck_hooks_in(
         });
     }
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut swept = 0;
     edit_trust_state(home, |state| {
         for (key, hash) in &records {
             upsert_trust_record(state, key, hash);
         }
+        // Only from a listing Codex reported as complete. A warning or an error
+        // means it could not load part of a hooks file and may have dropped
+        // positions that are really there, so their absence proves nothing.
+        // The other half of "the listing is evidence" is already established by
+        // reaching this line at all: `records` is non-empty, so Codex enumerated
+        // at least one of the deck's own hooks out of this home's `hooks.json`
+        // — which an empty listing (`features.hooks = false`, a whole file
+        // dropped as invalid JSON) never does.
+        if listing.diagnostics == 0 {
+            swept = sweep_stale_deck_trust_records(state, entries, &deck_hashes, home);
+        }
     })?;
+    if swept > 0 {
+        tracing::info!(
+            swept,
+            "codex: removed the deck's own trust records left at hook positions that no longer \
+             exist"
+        );
+    } else if listing.diagnostics > 0 {
+        tracing::debug!(
+            diagnostics = listing.diagnostics,
+            "codex: hooks/list reported warnings or errors, so no stale trust record was removed"
+        );
+    }
     Ok(TrustOutcome::Trusted {
         count: records.len(),
         reports_prompts,
+        turned_off,
     })
+}
+
+/// The listed entries a trust write grants: those [`deck_owned_entries`] keeps
+/// under [`DeckCommandMatch::Exact`] for one of `expected_commands`, so a grant
+/// for several installs is the union of single-install grants and nothing wider.
+fn trust_eligible<'a>(
+    entries: &'a [CodexHookEntry],
+    home: &Path,
+    expected_commands: &[String],
+) -> Vec<&'a CodexHookEntry> {
+    expected_commands
+        .iter()
+        .flat_map(|command| deck_owned_entries(entries, home, DeckCommandMatch::Exact(command)))
+        .collect()
+}
+
+/// The name a user sees for a Codex event, from the `<event_snake>` segment of
+/// a trust key: `pre_tool_use` → `PreToolUse`, the spelling `hooks.json` and
+/// Codex's `/hooks` list use. An event the deck does not install (it can still
+/// be named by a key) is converted the same way rather than dropped.
+fn event_display_name(event_snake: &str) -> String {
+    event_snake
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Split a Codex trust key `<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`
+/// into its source path and its `<event_snake>:<group_idx>:<handler_idx>`
+/// position, or `None` for anything not shaped like one.
+///
+/// **Right-anchored**, because a `:` inside the source path is neither rejected
+/// nor escaped by Codex, so the first `:` is not a separator. Both indices must
+/// be decimal integers and the event and path non-empty, so an arbitrary key a
+/// user put in `[hooks.state]` is not mistaken for a Codex position.
+fn split_trust_key(key: &str) -> Option<(&str, &str)> {
+    let mut parts = key.rsplitn(4, ':');
+    let handler = parts.next()?;
+    let group = parts.next()?;
+    let event = parts.next()?;
+    let source = parts.next()?;
+    let is_index = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_index(handler) || !is_index(group) || event.is_empty() || source.is_empty() {
+        return None;
+    }
+    Some((source, &key[source.len() + 1..]))
+}
+
+/// Does `hooks.json` (already parsed) hold anything at `position`
+/// (`<event_snake>:<group_idx>:<handler_idx>`)? Errs toward yes: event names
+/// are compared ignoring case and underscores (`pre_tool_use` ~ `PreToolUse`),
+/// and a rule at `group_idx` that has no `hooks` array counts as occupying
+/// every handler index, since Codex's view of such a rule is not ours to guess.
+fn position_is_in_hooks_json(root: &Value, position: &str) -> bool {
+    let normalize = |name: &str| name.replace('_', "").to_ascii_lowercase();
+    let mut parts = position.splitn(3, ':');
+    let (Some(event), Some(group), Some(handler)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    let (Ok(group), Ok(handler)) = (group.parse::<usize>(), handler.parse::<usize>()) else {
+        return true;
+    };
+    let Some(events) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    events
+        .iter()
+        .filter(|(name, _)| normalize(name) == normalize(event))
+        .filter_map(|(_, rules)| rules.as_array()?.get(group))
+        .any(|rule| match rule.get("hooks").and_then(Value::as_array) {
+            Some(handlers) => handler < handlers.len(),
+            None => true,
+        })
+}
+
+/// Is `path` this home's own `hooks.json` — verbatim, or through a symlinked
+/// spelling of the same real file? Condition 1 of [`deck_owned_entries`] and
+/// condition (c) of [`sweep_stale_deck_trust_records`] ask the same question.
+fn is_this_homes_hooks_json(path: &Path, ours: &Path, ours_real: Option<&Path>) -> bool {
+    path == ours || ours_real.is_some_and(|real| path.canonicalize().ok().as_deref() == Some(real))
+}
+
+/// Remove the deck's own trust records left at hook positions that no longer
+/// exist, returning how many went (issue #1027 item 1).
+///
+/// Codex keys a grant by POSITION (`<sourcePath>:<event>:<group>:<handler>`), so
+/// whenever the deck's hook moves, the record at its old key is left behind, and
+/// nothing removed one except `hooks uninstall`. A record is removed only when
+/// **all three** of these hold, and never on any one of them alone:
+///
+/// - **(a) its position is not in the listing.** Neither its key verbatim nor
+///   its `<event>:<group>:<handler>` under any listed entry from this home's
+///   `hooks.json` — the second spelling so a record written under a symlinked
+///   path to the same file is not mistaken for a vanished position. A position
+///   Codex still lists keeps its record whatever hash it carries: that is the
+///   shape issue #1034 measured, a user's handler moved onto a key still holding
+///   the deck's hash.
+/// - **(b) its `trusted_hash` is the hash of one of the deck's own current hook
+///   definitions** (`deck_hashes`, from the entries this run trusted). Codex's
+///   hash covers the command, matcher and `async`, not the position or the
+///   path, so a user's record — same file, different command — never matches,
+///   and neither does a record left by an older deck build (a different command,
+///   so a different hash). Those older records are left in place on purpose.
+/// - **(c) its source path is this home's own `hooks.json`.** That file is shared
+///   with the user's own hooks, which is why (a) and (b) must hold as well; a
+///   record for any other file is not the deck's to touch.
+///
+/// The caller supplies the remaining preconditions: it runs this only after
+/// Codex listed at least one of the deck's own hooks (so the listing really is
+/// reading this file) and reported no warnings or errors (so an absent position
+/// is absent, not unloadable).
+///
+/// Why an orphan is worth removing although it is inert: an orphan's hash is
+/// the deck's own, so it can only ever authorise the deck's own command — but it
+/// is still an entry in a grant table that grew without bound.
+///
+/// **And the position is not in `hooks.json` as it is NOW** (Greptile on PR
+/// #1519). The listing is taken before the edit, and [`INSTALL_LOCK`]
+/// serialises only this process, so a second deck process could rewrite
+/// `hooks.json` and trust a new position in between; judged by the listing
+/// alone, that fresh record would look stale. It cannot be swept, because of
+/// ordering: that process writes `hooks.json` ([`install_to`]) before it lists
+/// and trusts, its trust record is in the `config.toml` this edit has already
+/// read, and `hooks.json` is read here after that — so its new position is in
+/// the file this sees. A record whose position exists in the file is kept
+/// whatever the listing said, and a `hooks.json` that cannot be read or parsed
+/// keeps every record. What remains is the ordinary lost update any two
+/// concurrent `config.toml` writers have, which this does not add to.
+fn sweep_stale_deck_trust_records(
+    state: &mut toml_edit::Table,
+    listed: &[CodexHookEntry],
+    deck_hashes: &[String],
+    home: &Path,
+) -> usize {
+    use toml_edit::{Item, Value as TomlValue};
+
+    let ours = home.join("hooks.json");
+    let ours_real = ours.canonicalize().ok();
+    let Some(in_file) = std::fs::read(&ours)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return 0;
+    };
+    let listed_positions: Vec<&str> = listed
+        .iter()
+        .filter(|entry| is_this_homes_hooks_json(&entry.source_path, &ours, ours_real.as_deref()))
+        .filter_map(|entry| split_trust_key(&entry.key).map(|(_, position)| position))
+        .collect();
+    let stale: Vec<String> = state
+        .iter()
+        .filter_map(|(key, record)| {
+            let hash = match record {
+                Item::Table(table) => table.get("trusted_hash").and_then(Item::as_str),
+                Item::Value(TomlValue::InlineTable(table)) => {
+                    table.get("trusted_hash").and_then(TomlValue::as_str)
+                }
+                _ => None,
+            }?;
+            let (source, position) = split_trust_key(key)?;
+            let unlisted = !listed.iter().any(|entry| entry.key == key)
+                && !listed_positions.contains(&position);
+            let deck_hash = deck_hashes.iter().any(|deck| deck == hash);
+            let our_file = is_this_homes_hooks_json(Path::new(source), &ours, ours_real.as_deref());
+            let gone_from_file = !position_is_in_hooks_json(&in_file, position);
+            (unlisted && deck_hash && our_file && gone_from_file).then(|| key.to_string())
+        })
+        .collect();
+    for key in &stale {
+        state.remove(key);
+    }
+    stale.len()
 }
 
 /// Say something when a trust write recorded NOTHING even though the listing
@@ -1663,7 +2007,7 @@ fn agreeing_prefix_bytes(a: &str, b: &str) -> usize {
 /// not be managed.
 pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-    let entries = list_hooks_in(home, &cwd)?;
+    let entries = list_hooks_in(home, &cwd)?.entries;
     let keys: Vec<String> = deck_owned_entries(&entries, home, DeckCommandMatch::Signature)
         .into_iter()
         .map(|entry| entry.key.clone())
@@ -1694,8 +2038,14 @@ pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
 fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
     use toml_edit::{DocumentMut, Item, Table};
 
-    std::fs::create_dir_all(home)?;
     let path = home.join(CONFIG_TOML);
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    std::fs::create_dir_all(home)?;
+    // Held across the read, the edit and the publish, against every other
+    // process recording trust here — several Codex panes starting at once each
+    // run this (`codex/trust/008`). The callers' `INSTALL_LOCK` covers threads
+    // of this process only.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
@@ -1743,7 +2093,12 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
 
     edit(state);
 
-    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+    // An edit that changed nothing is not a write (PRD #1487).
+    let updated = doc.to_string();
+    if updated == existing {
+        return Ok(());
+    }
+    crate::agent_hook_config::write_atomic(home, &path, updated.as_bytes())
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { trusted_hash }` record.
@@ -1865,12 +2220,12 @@ pub fn auto_install_and_trust_at_startup() {
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
-    let Some(binary_path) = auto_install() else {
+    let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
         return;
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    match trust_deck_hooks_in(&home, &cwd, &binary_path) {
+    match trust_deck_hooks_for(&home, &cwd, &binary_paths) {
         Ok(outcome) => {
             // The `Unrecognised` case has already warned from inside; this path
             // has no user watching, so the count is all it needs.
@@ -1889,6 +2244,105 @@ pub fn auto_install_and_trust_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// The child half of `codex_trust_008`: when re-executed with these set,
+    /// record `TRUST_RACE_KEYS` trust records into the shared home, each
+    /// through its own `edit_trust_state` call, exactly as a separate deck
+    /// process does when it starts a Codex pane. A no-op otherwise.
+    const TRUST_RACE_HOME: &str = "DAD_TEST_TRUST_RACE_HOME";
+    const TRUST_RACE_WRITER: &str = "DAD_TEST_TRUST_RACE_WRITER";
+    const TRUST_RACE_WRITERS: usize = 8;
+    const TRUST_RACE_KEYS: usize = 20;
+
+    #[test]
+    fn trust_race_child_writer() {
+        let (Ok(home), Ok(writer)) = (
+            std::env::var(TRUST_RACE_HOME),
+            std::env::var(TRUST_RACE_WRITER),
+        ) else {
+            return;
+        };
+        for n in 0..TRUST_RACE_KEYS {
+            let key = format!("{home}/hooks.json:writer{writer}_key{n}:0:0");
+            edit_trust_state(Path::new(&home), |state| {
+                upsert_trust_record(state, &key, "sha256:race")
+            })
+            .expect("record trust");
+        }
+    }
+
+    /// Scenario: Start eight separate processes at once against one fresh Codex
+    /// home, each recording twenty trust records of its own through the deck's
+    /// trust write, as eight Codex panes starting together do. Every one of the
+    /// 160 records must be in `config.toml` afterwards, and no temp file may be
+    /// left beside it.
+    #[spec("codex/trust/008")]
+    #[test]
+    fn codex_trust_008_concurrent_trust_writers_keep_every_record() {
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let children: Vec<_> = (0..TRUST_RACE_WRITERS)
+            .map(|writer| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "codex_hooks_manage::tests::trust_race_child_writer",
+                        "--exact",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(TRUST_RACE_HOME, home.path())
+                    .env(TRUST_RACE_WRITER, writer.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("re-exec this test binary")
+            })
+            .collect();
+        for child in children {
+            let out = child.wait_with_output().expect("wait for a writer");
+            assert!(
+                out.status.success(),
+                "a trust writer failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let config =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        let doc = config
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML");
+        let state = doc["hooks"]["state"]
+            .as_table_like()
+            .expect("hooks.state table");
+        let home_str = home.path().display().to_string();
+        let missing: Vec<String> = (0..TRUST_RACE_WRITERS)
+            .flat_map(|writer| {
+                let home_str = home_str.clone();
+                (0..TRUST_RACE_KEYS)
+                    .map(move |n| format!("{home_str}/hooks.json:writer{writer}_key{n}:0:0"))
+            })
+            .filter(|key| state.get(key).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} trust records were lost to a concurrent writer, e.g. {:?}",
+            missing.len(),
+            TRUST_RACE_WRITERS * TRUST_RACE_KEYS,
+            missing.first()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(home.path())
+            .expect("list the home")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 
     /// Codex's hook commands are quoted for the HOST's shell — the half of #734
     /// that is a real behaviour change, and the half no test on a POSIX box can
@@ -1961,6 +2415,85 @@ mod tests {
             .flat_map(crate::agent_hook_config::rule_commands)
             .map(str::to_string)
             .collect()
+    }
+
+    /// Scenario: two events already name two different live installs (A and
+    /// B) and a third install auto-installs. Each event keeps its own install,
+    /// the install reports both A and B, and the trust grant covers both
+    /// events' exact commands while a foreign handler and a lookalike stay
+    /// ungranted (PRD #1487, Qodo 4200693859).
+    #[cfg(unix)]
+    #[test]
+    fn an_auto_install_keeping_two_live_installs_trusts_both() {
+        let fixture = crate::test_temp::tempdir().expect("codex fixture tempdir");
+        let a = seed_executable(&fixture.path().join("install-a").join("dot-agent-deck"));
+        let b = seed_executable(&fixture.path().join("install-b").join("dot-agent-deck"));
+        let c = seed_executable(&fixture.path().join("install-c").join("dot-agent-deck"));
+        let home = fixture.path().join("codex-home");
+        std::fs::create_dir_all(&home).expect("create codex home");
+        install_to(&home, &a).expect("explicit install from A");
+        // Point one event at B, as a second live install would have left it.
+        let mut root = read_back(&home);
+        root["hooks"]["Stop"][0]["hooks"][0]["command"] = json!(expected_hook_command(&b));
+        std::fs::write(
+            home.join("hooks.json"),
+            serde_json::to_vec_pretty(&root).unwrap(),
+        )
+        .unwrap();
+
+        let (_, named) = auto_install_to(&home, &c).expect("automatic install from C");
+        assert_eq!(named, vec![a.clone(), b.clone()], "A first, then B");
+
+        let root = read_back(&home);
+        let command_of = |event: &str| {
+            root["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} has a deck command"))
+                .to_string()
+        };
+        assert_eq!(
+            command_of("Stop"),
+            expected_hook_command(&b),
+            "Stop keeps B"
+        );
+        assert_eq!(
+            command_of("SessionStart"),
+            expected_hook_command(&a),
+            "SessionStart keeps A"
+        );
+
+        let source = home.join("hooks.json");
+        let entry = |command: String, event: &str| CodexHookEntry {
+            key: format!("{}:{event}:0:0", source.display()),
+            command,
+            source_path: source.clone(),
+            current_hash: format!("sha256:{event}"),
+            trust_status: "untrusted".to_string(),
+            is_managed: Some(false),
+            enabled: None,
+        };
+        let entries = vec![
+            entry(command_of("SessionStart"), "session_start"),
+            entry(command_of("Stop"), "stop"),
+            entry(expected_hook_command(&c), "pre_tool_use"),
+            entry("/usr/local/bin/my-audit.sh".to_string(), "post_tool_use"),
+        ];
+        let granted: Vec<&str> = trust_eligible(
+            &entries,
+            &home,
+            &[
+                expected_hook_command(&named[0]),
+                expected_hook_command(&named[1]),
+            ],
+        )
+        .into_iter()
+        .map(|e| e.key.rsplit(':').nth(2).unwrap())
+        .collect();
+        assert_eq!(
+            granted,
+            vec!["session_start", "stop"],
+            "both kept installs' events are granted; C's lookalike and the foreign hook are not"
+        );
     }
 
     /// The retired-event sweep clears THIS install's leftovers under an event
@@ -2186,6 +2719,110 @@ mod tests {
         );
     }
 
+    /// Issue #1027 item 3, pinned at the DECODER: a listing entry that omits
+    /// `isManaged` must reach `deck_owned_entries` as `None`, not as `false`,
+    /// so a trust write refuses it. `codex_trust_an_absent_is_managed_field_\
+    /// resolves_per_direction` covers the predicate from a hand-built entry;
+    /// this covers the half before it, where the old `.unwrap_or(false)` was.
+    #[test]
+    fn a_listing_without_is_managed_decodes_to_an_entry_no_grant_can_select() {
+        let home = Path::new("/h");
+        let command = "/abs/dot-agent-deck hook --agent codex";
+        let response = json!({
+            "id": 2,
+            "result": {"data": [{
+                "cwd": "/w",
+                "warnings": [],
+                "errors": [],
+                "hooks": [{
+                    "key": "/h/hooks.json:pre_tool_use:0:0",
+                    "command": command,
+                    "sourcePath": "/h/hooks.json",
+                    "currentHash": "sha256:deck",
+                    "trustStatus": "untrusted"
+                }]
+            }]}
+        });
+        let listing = parse_hooks_list(&response).expect("a well-formed reply parses");
+        assert_eq!(
+            listing.entries[0].is_managed, None,
+            "an absent isManaged must stay absent rather than default to unmanaged"
+        );
+        assert!(
+            deck_owned_entries(&listing.entries, home, DeckCommandMatch::Exact(command)).is_empty(),
+            "a grant must not select an entry whose isManaged the listing did not carry"
+        );
+    }
+
+    /// Issue #1027 item 1: the diagnostics count is what stops the stale-record
+    /// sweep trusting a listing Codex said was incomplete, so it must count
+    /// both fields, across groups, and not count an empty array.
+    #[test]
+    fn a_listings_warnings_and_errors_are_counted_across_groups() {
+        let group = |warnings: Value, errors: Value| json!({"cwd": "/w", "hooks": [], "warnings": warnings, "errors": errors});
+        let parse = |groups: Vec<Value>| {
+            parse_hooks_list(&json!({"id": 2, "result": {"data": groups}}))
+                .expect("a well-formed reply parses")
+                .diagnostics
+        };
+        assert_eq!(parse(vec![group(json!([]), json!([]))]), 0);
+        assert_eq!(
+            parse(vec![
+                group(json!(["w1"]), json!([])),
+                group(json!([]), json!([{"message": "e1"}, {"message": "e2"}])),
+            ]),
+            3
+        );
+        assert_eq!(
+            parse(vec![group(json!("not an array"), Value::Null)]),
+            1,
+            "a field of a shape we do not understand counts against the listing"
+        );
+        // A group with no `hooks` array still has its warnings counted, and the
+        // missing array is itself a diagnostic when another group carries one
+        // (Qodo and Greptile on PR #1519): otherwise the listing reads as
+        // complete while a whole group is absent from it.
+        assert_eq!(
+            parse(vec![
+                group(json!([]), json!([])),
+                json!({"cwd": "/w2", "warnings": ["w1"]}),
+            ]),
+            2
+        );
+        // An entry dropped for lacking `key` or `currentHash` is a position the
+        // listing does not report, so it counts too.
+        assert_eq!(
+            parse(vec![json!({
+                "cwd": "/w",
+                "warnings": [],
+                "errors": [],
+                "hooks": [
+                    {"key": "/h/hooks.json:stop:0:0", "currentHash": "sha256:a"},
+                    {"key": "/h/hooks.json:stop:1:0"},
+                    {"currentHash": "sha256:c"}
+                ]
+            })]),
+            2
+        );
+    }
+
+    /// Issue #1027 item 1: a trust key is parsed from the RIGHT, since Codex
+    /// neither rejects nor escapes a `:` in the source path, and anything not
+    /// shaped like `<path>:<event>:<n>:<n>` is not a position at all.
+    #[test]
+    fn a_trust_key_is_split_from_the_right() {
+        assert_eq!(
+            split_trust_key("/home/a:b/.codex/hooks.json:pre_tool_use:2:0"),
+            Some(("/home/a:b/.codex/hooks.json", "pre_tool_use:2:0"))
+        );
+        assert_eq!(split_trust_key("not-a-codex-key"), None);
+        assert_eq!(split_trust_key("/h/hooks.json:stop:x:0"), None);
+        assert_eq!(split_trust_key("/h/hooks.json::0:0"), None);
+        assert_eq!(split_trust_key(":stop:0:0"), None);
+        assert_eq!(event_display_name("pre_tool_use"), "PreToolUse");
+        assert_eq!(event_display_name("stop"), "Stop");
+    }
+
     #[test]
     fn reinstall_is_idempotent_and_preserves_user_hooks() {
         let dir = tempfile::tempdir().expect("codex home tempdir");
@@ -2307,16 +2944,15 @@ mod tests {
             "the backup was written through the planted symlink and overwrote the victim"
         );
         assert!(
-            !std::fs::symlink_metadata(&backup)
+            std::fs::symlink_metadata(&backup)
                 .expect("stat backup")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "something already at the backup name is left as it was (#537)"
         );
-        assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            malformed,
-            "the user's bytes must still be preserved beside the original"
+        assert!(
+            !err.to_string().contains("preserved at"),
+            "the planted link must not be claimed as the backup: {err}"
         );
     }
 
@@ -2453,7 +3089,8 @@ mod tests {
 
         let mut sent = Vec::new();
         let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
-            .expect("the genuine hooks/list reply sits behind the stray request and must be read");
+            .expect("the genuine hooks/list reply sits behind the stray request and must be read")
+            .entries;
         assert_eq!(
             entries.len(),
             1,
@@ -2529,7 +3166,8 @@ mod tests {
 
         let mut sent = Vec::new();
         let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
-            .expect("a plain reply must be read");
+            .expect("a plain reply must be read")
+            .entries;
         assert_eq!(entries.len(), 1);
         assert!(
             sent.is_empty(),

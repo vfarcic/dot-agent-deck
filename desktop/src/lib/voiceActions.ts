@@ -1,5 +1,6 @@
 import type { DeckView } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
+import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -104,6 +105,9 @@ import type { VoiceDeckIdentityDto } from "./bridge";
  */
 export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
 
+/** Issue #1492 — where a spoken scroll moves the agent dashboard: a screen down or up, or to either end. */
+export type DashboardScroll = "down" | "up" | "top" | "bottom";
+
 /** Which agent's pane to open, and which screen it is opened over. */
 export type AgentViewTarget = {
   deckId: string;
@@ -146,6 +150,23 @@ export type VoiceActionContext = {
   toggleEvidence: (open?: boolean) => void;
   /** Make one agent the deck's selected tile. */
   selectAgent: (agentId: string) => void;
+  /**
+   * Issue #1492 — scroll the agent dashboard so one agent's row is on screen,
+   * before its pane opens over it: saying the number of a row scrolled out of
+   * view acts on that row and leaves it in view behind the pane. Served by the
+   * overview; the deck has no rows to reveal.
+   */
+  revealAgent: (deckId: string, agentId: string) => void;
+  /**
+   * Issue #1492 — scroll the agent dashboard by about one screen, or to either
+   * end. Answers `undefined` when it scrolled, or the sentence saying why not
+   * (the whole dashboard is on screen, or it is already at that end).
+   *
+   * **Served by the OVERVIEW**, whose screen it scrolls. "next page" and
+   * "previous page" reach it too while nothing over the dashboard pages (the
+   * shell's `turnPage`), since the dashboard is not split into pages.
+   */
+  scrollDashboard: (move: DashboardScroll) => string | undefined;
   /** Select an agent, show its terminal, and ask that terminal for the caret. */
   focusTerminal: (agentId: string) => void;
   /** Move the deterministic fixture loop one node. Fixture mode only. */
@@ -196,6 +217,17 @@ export type VoiceActionContext = {
   /** Leave the dictation mode. Sends nothing: what was typed stays in the
    * prompt. The voice surface's, for {@link startDictation}'s reason. */
   stopDictation: () => void;
+  /**
+   * PRD #1541 — interrupt the open agent's turn with the deck's own interrupt
+   * key, clear its prompt, or remove the last dictated words. The voice
+   * surface's, because what they need — the words voice typed into the
+   * prompt since it was last sent, whether anything else was typed there, and
+   * when the agent was last interrupted — is state only the surface keeps.
+   * Reached only from typing mode's local intercept.
+   */
+  interruptAgent: (target: VoiceDispatchTarget) => void;
+  clearAgentPrompt: (target: VoiceDispatchTarget) => void;
+  scratchLastDictation: (target: VoiceDispatchTarget) => void;
   /**
    * Close the voice surface's own overlay.
    *
@@ -253,7 +285,8 @@ export type VoiceActionContext = {
   /**
    * PR #1451 round 3, change 4 — turn the page of the list on screen that is
    * split into pages while voice is on: the New agent dialog's while it has
-   * one, else the dashboard's or the Daemons screen's. Answers `undefined`
+   * one, else the Daemons screen's. On the agent dashboard, which scrolls
+   * instead of paging (issue #1492), it scrolls by about a screen. Answers `undefined`
    * when it turned, or the sentence saying why not (nothing pages, or this is
    * the last or the first page).
    *
@@ -434,8 +467,11 @@ export const VOICE_ACTIONS = {
      * and passes no `selectAgent`, which is why the member is optional here and
      * required nowhere else.
      */
-    run: (context: Pick<VoiceActionContext, "navigate"> & Partial<Pick<VoiceActionContext, "selectAgent">>, target: AgentViewTarget) => {
+    run: (context: Pick<VoiceActionContext, "navigate"> & Partial<Pick<VoiceActionContext, "selectAgent" | "revealAgent">>, target: AgentViewTarget) => {
       context.selectAgent?.(target.agentId);
+      /* The dashboard's row, scrolled on screen (issue #1492); optional for
+         `selectAgent`'s reason — only the overview has rows to reveal. */
+      context.revealAgent?.(target.deckId, target.agentId);
       /* The three view members named rather than spread. `VoiceDispatchTarget`
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
@@ -486,6 +522,29 @@ export const VOICE_ACTIONS = {
     voice: true,
     needs: ["stopDictation"],
     run: (context: Pick<VoiceActionContext, "stopDictation">) => context.stopDictation(),
+  },
+
+  interruptAgent: {
+    label: "Interrupt the open agent's turn",
+    voice: true,
+    needs: ["interruptAgent"],
+    /** Presses the deck's interrupt key for the agent — never `Ctrl+C` — and
+        only while the agent is working. */
+    run: (context: Pick<VoiceActionContext, "interruptAgent">, target: VoiceDispatchTarget) => context.interruptAgent(target),
+  },
+
+  clearAgentPrompt: {
+    label: "Clear the open agent's prompt",
+    voice: true,
+    needs: ["clearAgentPrompt"],
+    run: (context: Pick<VoiceActionContext, "clearAgentPrompt">, target: VoiceDispatchTarget) => context.clearAgentPrompt(target),
+  },
+
+  scratchLastDictation: {
+    label: "Remove the words last typed by voice from the open agent's prompt",
+    voice: true,
+    needs: ["scratchLastDictation"],
+    run: (context: Pick<VoiceActionContext, "scratchLastDictation">, target: VoiceDispatchTarget) => context.scratchLastDictation(target),
   },
 
   closeTopmost: {
@@ -546,6 +605,33 @@ export const VOICE_ACTIONS = {
     voice: true,
     needs: ["navigate"],
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "overview" }),
+  },
+
+  /* Issue #1496 — the agent dashboard's filter. Both write the window
+     session's filter, which the dashboard reads, and open the dashboard, so
+     what was asked for is what is on screen wherever it was said. A filter
+     replaces the one before it. */
+  filterDashboard: {
+    label: "Filter the agent dashboard",
+    voice: true,
+    needs: ["navigate"],
+    run: (context: Pick<VoiceActionContext, "navigate">, target?: Pick<VoiceDispatchTarget, "dashboardFilter">) => {
+      setDashboardFilter(target?.dashboardFilter ?? clearDashboardFilter());
+      context.navigate({ kind: "overview" });
+    },
+  },
+
+  /* "show everything" means the unfiltered dashboard wherever it is said:
+     with no filter set this is exactly `openOverview`. The dashboard's Show
+     all button is this entry too. */
+  clearDashboardFilter: {
+    label: "Show the whole agent dashboard, unfiltered",
+    voice: true,
+    needs: ["navigate"],
+    run: (context: Pick<VoiceActionContext, "navigate">) => {
+      setDashboardFilter(clearDashboardFilter());
+      context.navigate({ kind: "overview" });
+    },
   },
 
   /**
@@ -633,6 +719,49 @@ export const VOICE_ACTIONS = {
     needs: ["turnPage", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "turnPage" | "reportRefused">) => {
       const refused = context.turnPage(-1);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* Issue #1492 — scrolling the agent dashboard, which shows everything
+     whether voice is on or off rather than a page at a time. A scroll changes
+     which part of the dashboard is showing and nothing else. */
+  scrollDown: {
+    label: "Scroll the agent dashboard down by about a screen",
+    voice: true,
+    needs: ["scrollDashboard", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
+      const refused = context.scrollDashboard("down");
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  scrollUp: {
+    label: "Scroll the agent dashboard up by about a screen",
+    voice: true,
+    needs: ["scrollDashboard", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
+      const refused = context.scrollDashboard("up");
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  scrollToTop: {
+    label: "Scroll the agent dashboard to its top",
+    voice: true,
+    needs: ["scrollDashboard", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
+      const refused = context.scrollDashboard("top");
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  scrollToBottom: {
+    label: "Scroll the agent dashboard to its bottom",
+    voice: true,
+    needs: ["scrollDashboard", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
+      const refused = context.scrollDashboard("bottom");
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
@@ -1045,6 +1174,11 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   /** The agent entry an `agent_type_ref` resolved to — its registry id. */
   agentTypeId?: string;
   /**
+   * The dashboard filter a `filter_dashboard` dispatch asks for, built from
+   * its resolved facets (issue #1496).
+   */
+  dashboardFilter?: DashboardFilter;
+  /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
    * directory as declared — or absent when no live form was declared. The
    * form members refuse when the live form differs, for
@@ -1139,7 +1273,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -1182,7 +1316,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

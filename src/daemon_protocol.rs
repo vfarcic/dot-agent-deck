@@ -466,6 +466,33 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the capability is the desktop, which bounds its preparation call against a
 /// deck naming it and keeps waiting an older one out.
 ///
+/// **Issue #1445 contributes no bump for
+/// [`AttachRequest::RecordOrchestratorContext`]**, for the reason `focus-gained`
+/// needed none: its one sender,
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`], withholds
+/// it unless [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is advertised, and the residual
+/// pairing — a cached capability set that outlived a daemon replaced by an older
+/// build — fails closed: that daemon refuses the unknown variant and records
+/// nothing, which is exactly the pre-#1445 behaviour. No existing field changed
+/// meaning: [`crate::agent_pty::AgentRecord::orchestrator_context_path`] still
+/// names the coordinator's own context file, now the newest one rather than the
+/// first, and its one reader, the TUI, already takes it as "this tab's own
+/// file". So no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
+///
+/// **PRD #1487 contributes no bump for [`AttachRequest::RestartDaemon`].** It
+/// is the second rung of the graded path (`CLAUDE.md` rule 18): a new variant
+/// whose one sender, [`crate::daemon_client::DaemonClient::restart_daemon`],
+/// withholds it unless the `Hello` reply of that same call names
+/// [`CAP_RESTART_DAEMON`] — so an older daemon is never sent it, and an older
+/// client never sends it. The reply's [`AttachResponse::restart`] is additive
+/// and optional. No existing field or verb changed meaning, so no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual is the usual
+/// one — a raw sender that skips the check gets an older daemon's
+/// `malformed request` refusal and nothing is stopped — and it fails closed.
+/// Its [`AttachResponse::instance_id`] on the live `Hello` reply is the first
+/// rung, an additive optional field, so it contributes no bump either.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -660,6 +687,37 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
+/// #1445).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`] holds the
+/// check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated, and the two reads it makes go through
+/// the same bounded context-file read the TUI's re-arm uses on every platform.
+pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
+
+/// Capability string for [`AttachRequest::SubscribeEventsWithSnapshot`] (issue
+/// #1555).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`] holds
+/// the check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated.
+pub const CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT: &str = "subscribe-events-with-snapshot";
+
+/// Capability string for [`AttachRequest::RestartDaemon`] (PRD #1487).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`.
+/// Its one sender, [`crate::daemon_client::DaemonClient::restart_daemon`],
+/// withholds the frame unless the `Hello` reply of THAT call names this
+/// string — never a cached set, because the whole point of the verb is that the
+/// daemon behind the endpoint gets replaced.
+///
+/// Advertised on every platform: the handler arm is not `#[cfg]`-gated, and
+/// the successor spawn it hands off to exists on both detach backends.
+pub const CAP_RESTART_DAEMON: &str = "restart-daemon";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -750,6 +808,24 @@ pub const CAP_AUTHORING_KIND: &str = "authoring-kind";
 /// platforms is not one it can honour there.
 pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 
+/// Capability string for the deck's shared last command (issue #1540): the
+/// [`crate::new_agent_options::NewAgentOptions::last_command`] answer field,
+/// [`AttachRequest::StartAgent`]'s `remember_command` marker, and the
+/// [`AttachRequest::SeedLastCommand`] verb — one feature, so one string.
+///
+/// Names a FEATURE rather than a single verb's `op`, because two of its three
+/// parts are fields: an older daemon drops `remember_command` silently and
+/// omits `last_command`, so neither can be detected from the reply, and a
+/// client that wants to know whether this deck keeps the last command — and so
+/// whether to keep its own copy — has only this to ask. Held by
+/// [`crate::daemon_client::DaemonClient::start_form_agent`],
+/// [`crate::daemon_client::DaemonClient::start_form_authoring_agent`] and
+/// [`crate::daemon_client::DaemonClient::seed_last_command`], so no call site
+/// checks it itself. Advertised on every platform: none of the three arms is
+/// `#[cfg]`-gated, and the store is an owner-only file under the state
+/// directory on every platform this builds for.
+pub const CAP_LAST_COMMAND: &str = "last-command";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -819,11 +895,17 @@ fn invalid_client_id_message() -> String {
 /// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
 /// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
 /// same reason: none of their dispatch arms is `#[cfg]`-gated — and so is issue
-/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first.
+/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first, and issue
+/// #1540's [`CAP_LAST_COMMAND`].
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
 /// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb — and so is
 /// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
-/// [`CAP_PREPARE_ORCHESTRATION`].
+/// [`CAP_PREPARE_ORCHESTRATION`]. Issue #1445's
+/// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
+/// not `#[cfg]`-gated, and neither is issue #1555's
+/// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`].
+/// PRD #1487's [`CAP_RESTART_DAEMON`] is on both lists: its dispatch arm is
+/// not `#[cfg]`-gated either.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -839,6 +921,10 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
+    CAP_LAST_COMMAND,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_RESTART_DAEMON,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -850,6 +936,10 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_LAST_COMMAND,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_RESTART_DAEMON,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1120,43 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // orchestrator instruction or script matching the old words stops matching.
     // It takes effect when the daemon starts on the new build.
     "505-unsolicited-work-done-label-reworded",
+    // Issue #1396, at 10 without moving it -- the #555 shape. A `StartAgent`
+    // whose `cwd` is not a directory used to start the agent in `$HOME`
+    // (portable-pty's silent fallback) while recording the requested path; a
+    // newer daemon refuses it with `START_ERR_CWD_NOT_A_DIRECTORY` before the PTY
+    // opens. Every other spawn path shares the refusal, so a respawn or
+    // `pane restart` into a deleted directory is refused too, and a pane a
+    // prepared start created is respawned only into the directory object that
+    // start verified. The request and the refusal channel are unchanged on the
+    // wire. What changed is which starts are refused.
+    "1396-start-refuses-non-directory-cwd",
+    // Issue #1396, at 10 without moving it -- the #580 shape, on the hook
+    // socket. `dispatch --orchestration <name>` (and a schedule's
+    // `shape = "orchestration:<name>"`) naming an orchestration the repo declares
+    // more than once, with roles each time, used to start the FIRST declaration;
+    // a newer daemon refuses it with `PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`, as
+    // `PrepareOrchestration` has since #1233. The `DispatchSignal` and its reply
+    // are unchanged on the wire. What changed is which dispatches are refused.
+    "1396-dispatch-refuses-ambiguous-orchestration",
+    // Issue #318, at 10 without moving it -- #1077's shape, extended from the
+    // `DaemonMessage` verbs to raw hook events. A status event naming a pane the
+    // daemon issued a hook capability token for must now present that token;
+    // a newer daemon refuses one that arrives without it, or with a token
+    // issued for another pane or agent, before it reaches any card or any
+    // attached client. `token` is an optional key an older daemon ignores, and
+    // the hook socket is not what PROTOCOL_VERSION versions. What changed is
+    // which events a NEWER daemon refuses, which a version number cannot
+    // express.
+    "318-hook-event-capability-token",
+    // Issue #463, at 10 without moving it -- the #555 shape. An orchestration
+    // `StartAgent` (or `StartPreparedAgent`) whose membership carries no per-tab
+    // `orchestration_id` used to be served, its pane routed on the legacy
+    // `(name, orchestration_cwd)` identity; a newer daemon refuses it with
+    // `START_ERR_ORCHESTRATION_ID_REQUIRED` before anything spawns. Only a client
+    // older than v0.35.0 sends that shape, and those are no longer supported.
+    // `orchestration_id` stays optional on the wire. What changed is which
+    // starts are refused, which a version number cannot express.
+    "463-orchestration-start-requires-instance-token",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1281,6 +1408,22 @@ pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 /// put the new-pane form back with its collision warning rather than reporting
 /// a generic pane-spawn failure; any other client just shows the sentence.
 pub const START_ERR_ORCHESTRATION_TITLE_IN_USE: &str = "orchestration-title-in-use";
+
+/// Issue #463: the stable prefix of the [`AttachRequest::StartAgent`] (and
+/// [`AttachRequest::StartPreparedAgent`]) refusal a start earns when it carries
+/// a [`TabMembership::Orchestration`] with no `orchestration_id`. Only a client
+/// predating v0.35.0 (PRD #140) sends that shape; such clients are no longer
+/// supported, and a daemon before #463 routed the pane on the legacy
+/// `(name, cwd)` tuple instead of refusing it.
+pub const START_ERR_ORCHESTRATION_ID_REQUIRED: &str = "orchestration-id-required";
+
+/// Issue #1396 item 2: the stable prefix of the [`AttachRequest::StartAgent`]
+/// refusal a start earns when its `cwd` is not a directory — it does not exist,
+/// or names a file. A daemon before #1396 started such an agent in `$HOME`
+/// instead (portable-pty's fallback) while recording the requested path, which
+/// is why this is declared as a contract break (`1396-start-refuses-non-directory-cwd`
+/// in [`CONTRACT_BREAKS`]): a request an older daemon served is now refused.
+pub const START_ERR_CWD_NOT_A_DIRECTORY: &str = "cwd-not-a-directory";
 
 /// PRD #819 audit fix: [`AttachRequest::PrepareOrchestration`] (in either
 /// spelling) is refused on this platform because the publish cannot deliver the owner-only guarantee it
@@ -1551,6 +1694,46 @@ pub enum AttachRequest {
         /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        /// Issue #1496: this start is an AUTHORING agent whose seed the CLIENT
+        /// delivers itself — the TUI's `schedule` / `schedule: issues` /
+        /// `dispatcher` options, which type their own seed once the agent is
+        /// ready. The daemon composes and delivers nothing for it; it only
+        /// records the kind once it has accepted the start, as it does for
+        /// `authoring_kind`, so [`crate::agent_pty::AgentRecord::authoring_kind`]
+        /// answers for an authoring agent whichever client started it. Refused,
+        /// with nothing started, when it is combined with `authoring_kind`.
+        ///
+        /// Not gated on a capability: an older daemon drops the key and starts
+        /// the agent unchanged, which records no kind — what every daemon did
+        /// before this field. No `PROTOCOL_VERSION` bump: an additive optional
+        /// field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seeded_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        /// Issue #1540: this start was submitted from a **New agent form** (the
+        /// TUI's `Ctrl+n`, the desktop's New agent dialog), plain or authoring,
+        /// so once the daemon has ACCEPTED it — the spawn succeeded — `command`
+        /// becomes the deck's last command
+        /// ([`crate::last_command::LastCommandStore::remember`]). A start that is
+        /// refused records nothing, and so does one with no `command` (the
+        /// default shell) or a command [`crate::last_command::is_recordable`]
+        /// rejects.
+        ///
+        /// **Ignored, not refused, on an orchestration role start** — one
+        /// presenting a preparation token (`start-prepared-agent`) or carrying a
+        /// [`TabMembership::Orchestration`] — so a role start can never
+        /// overwrite the value whatever a client sends. Scheduled runs and
+        /// `dispatch` do not come through this verb with it set: neither is a
+        /// form, and the one production sender of `true` is
+        /// [`crate::daemon_client::DaemonClient`]'s form-start methods.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`].** An
+        /// older daemon drops the key and starts the agent unchanged, so sending
+        /// it would be harmless; it is gated anyway so the capability is the one
+        /// thing a client reads to know whether this deck keeps the value. No
+        /// `PROTOCOL_VERSION` bump: an additive optional field, omitted when
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remember_command: bool,
     },
     StopAgent {
         id: String,
@@ -1679,6 +1862,33 @@ pub enum AttachRequest {
     /// `AppState` mirrors the daemon's view of live agent activity (agent
     /// type, tool counts, prompts, last-activity timestamps).
     SubscribeEvents,
+    /// Issue #1555: [`Self::SubscribeEvents`], answered with the daemon's agents
+    /// as of the instant the subscription opened — the OK `RESP` carries the
+    /// same [`AttachResponse::agent_records`] a [`Self::ListAgents`] reply does,
+    /// and the `KIND_EVENT` frames that follow it are the broadcasts made after
+    /// that instant.
+    ///
+    /// What a resubscribing client needs, and what `SubscribeEvents` followed by
+    /// `ListAgents` cannot give it: between those two requests the daemon keeps
+    /// broadcasting, so an event sent in that window is queued on the new
+    /// subscription AND already reflected in the listing, and the client
+    /// replays it over the snapshot (a conversation that rolled over comes back
+    /// for a moment and its closure is counted twice). Here the daemon opens the
+    /// subscription and builds the listing under one read of its `AppState`
+    /// lock, and the hook-event ingest path broadcasts and applies each event
+    /// under that lock's write guard, so such an event is on exactly one side:
+    /// in the listing and not on the stream, or the other way round. That
+    /// holds for a broadcast made under the same guard as the state change it
+    /// reports, which is how every hook event the daemon receives, a
+    /// conversation's start and end included, reaches both; see
+    /// `handle_subscribe_events_with_snapshot`.
+    ///
+    /// **Withheld unless the daemon advertises
+    /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`]**, by
+    /// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`],
+    /// which a client falls back from to `SubscribeEvents` plus `ListAgents`.
+    /// An older daemon refuses the unknown variant and opens nothing.
+    SubscribeEventsWithSnapshot,
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
@@ -1992,6 +2202,50 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
+    /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
+    /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
+    /// per-publish context file for that coordinator
+    /// (`orchestrator_context::reassert_orchestrator_prompt`).
+    ///
+    /// The daemon records the context file each orchestration's coordinator
+    /// was started with and hands it to every TUI that later hydrates the tab
+    /// (`AgentRecord::orchestrator_context_path`), and deletes it when the
+    /// orchestration ends. A re-arm writes a new file the daemon would
+    /// otherwise never hear of, so a reattached tab was handed the startup file
+    /// — gone once the retention sweep reached it, after which the next re-arm
+    /// carried no task — and the re-arm files outlived the orchestration. This
+    /// moves the record to the reported file and keeps the one it replaces for
+    /// deletion at the end.
+    ///
+    /// **The daemon follows only a report it can check**, and otherwise leaves
+    /// the record as it was — answering `ok: true` for a report older than the
+    /// recorded file (it lost a race with a later one, so the record is already
+    /// where it should be; the file is still deleted when the orchestration
+    /// ends) and `ok: false` for every other refusal: `pane_id` must be the
+    /// registered orchestrator seat of an orchestration the daemon records a
+    /// file for; `context_path` must be `orchestrator-context-<32 hex>.md`
+    /// directly in that recorded file's own `.dot-agent-deck`, recorded by no
+    /// other orchestration; and it must carry the recorded file's brief — the
+    /// same `## Your task` section and attendance — and not be older than it
+    /// (`orchestrator_context::compare_rearmed_context`). So a report can never
+    /// point an orchestration at another one's brief, nor move its record back
+    /// to an older file when reports arrive out of order. A
+    /// refusal is not an error the TUI acts on: its own tab keeps the file it
+    /// published either way.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RECORD_ORCHESTRATOR_CONTEXT`]**,
+    /// by [`crate::daemon_client::DaemonClient::record_orchestrator_context`].
+    /// An older daemon has no such variant and would answer `malformed
+    /// request: …`, changing nothing.
+    ///
+    /// Its own short-lived connection: one request, one response, close.
+    RecordOrchestratorContext {
+        /// The coordinator's pane, as the daemon knows it
+        /// ([`crate::agent_pty::AgentRecord::pane_id_env`]).
+        pane_id: String,
+        /// The absolute path of the context file the re-arm published.
+        context_path: String,
+    },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
     /// Ctrl+C dialog reaches the deck via the header-only [`KIND_SHUTDOWN`]
@@ -2106,6 +2360,182 @@ pub enum AttachRequest {
     /// **Withheld unless the daemon advertises [`CAP_NEW_AGENT_OPTIONS`]**, on
     /// the same no-bump basis as [`Self::ListDirectories`].
     NewAgentOptions {},
+    /// Issue #1540: offer `command` as the deck's last command **only if the
+    /// daemon has none yet** ([`crate::last_command::LastCommandStore::remember_if_empty`]) —
+    /// how a client hands over a value it kept before the daemon owned one
+    /// (the TUI's `session.toml`) without overwriting a newer command another
+    /// client already recorded. Answers `ok` whether or not the value was
+    /// taken; a blank or over-long `command` is simply not taken.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`]**, on the
+    /// same no-bump basis as [`Self::FocusGained`]: an older daemon has no such
+    /// variant and refuses it with the generic `malformed request: …`, changing
+    /// nothing.
+    SeedLastCommand {
+        command: String,
+    },
+    /// PRD #1487: restart this daemon — onto the build now installed at its own
+    /// path ([`RestartSuccessor::Installed`]), or for a client that starts its
+    /// own build afterwards ([`RestartSuccessor::ClientSpawns`]). The reply
+    /// rides back on [`AttachResponse::restart`].
+    ///
+    /// The daemon applies one policy whoever asks: when nothing is live it
+    /// restarts straight away; when agents or orchestration roles are live it
+    /// answers [`RestartDaemonReply::NeedsConfirmation`] naming every one of
+    /// them, and restarts only when a later request carries that same set in
+    /// `confirm`. Before any of that, in `Installed` mode, it verifies the
+    /// installed binary answers `--version` — so nobody is asked to confirm a
+    /// restart that cannot happen, and a failed check leaves the old daemon
+    /// running untouched. See `crate::daemon_restart` for the pieces and
+    /// `docs/develop/daemon-teardown-paths.md` for where this sits among the
+    /// other teardown paths.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTART_DAEMON`]**, by its
+    /// one sender, so it contributes no [`PROTOCOL_VERSION`] bump.
+    ///
+    /// It adds **no authority** to this wire, for the reason
+    /// [`Self::StopDaemon`] gives: a peer that can send it can already stop the
+    /// deck with `KIND_SHUTDOWN`. No binary path crosses the wire — the daemon
+    /// resolves its successor from what it recorded at startup.
+    RestartDaemon {
+        /// The set the user confirmed with "Restart now". `None` on the first
+        /// ask. Compared order-insensitively — see
+        /// [`RestartStopSet::same_targets`].
+        #[serde(default)]
+        confirm: Option<RestartStopSet>,
+        /// The version the client just installed (what landed — for Homebrew
+        /// that may differ from the client's own). In `Installed` mode the
+        /// daemon refuses with [`RestartRefusalReason::VersionMismatch`] if the
+        /// binary it resolves reports something else.
+        #[serde(default)]
+        expected_version: Option<String>,
+        /// Who starts the successor. Defaults to [`RestartSuccessor::Installed`].
+        #[serde(default)]
+        successor: RestartSuccessor,
+    },
+}
+
+/// PRD #1487: who starts the daemon that replaces one answering
+/// [`AttachRequest::RestartDaemon`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartSuccessor {
+    /// The daemon restarts onto the binary now installed at its own path,
+    /// verified first. How the successor starts is the daemon's own policy: an
+    /// unsupervised daemon spawns it once it has released its sockets; one a
+    /// service manager supervises spawns nothing and exits for the manager to
+    /// start the installed build (`SuccessorPlan::LeaveToSupervisor`).
+    #[default]
+    Installed,
+    /// The local Replace: the daemon applies the same policy, drains and exits,
+    /// and the CLIENT spawns its own build. No binary path crosses the wire.
+    ClientSpawns,
+}
+
+/// PRD #1487: what a restart would stop — the agents the daemon manages and the
+/// orchestration roles registered against live panes.
+///
+/// Compared order-insensitively by [`Self::same_targets`]: agent ids as a set,
+/// roles as a set of `(pane_id, role, orchestration)`. `label`, `cwd`,
+/// `pane_id` on an agent and `is_orchestrator` on a role are display only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartStopSet {
+    #[serde(default)]
+    pub agents: Vec<RestartAgent>,
+    #[serde(default)]
+    pub roles: Vec<crate::state::OrchestrationRoleRecord>,
+}
+
+/// One agent in a [`RestartStopSet`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartAgent {
+    /// The daemon's registry id — the compared identity.
+    pub id: String,
+    /// `display_name`, else the id, as [`RunningAgentsSummary::from_records`]
+    /// labels it.
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl RestartStopSet {
+    /// Nothing would be stopped — the restart needs no confirmation.
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty() && self.roles.is_empty()
+    }
+
+    /// Whether `other` names exactly the same agents and roles, in any order.
+    pub fn same_targets(&self, other: &Self) -> bool {
+        use std::collections::BTreeSet;
+        let agents = |s: &Self| {
+            s.agents
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let roles = |s: &Self| {
+            s.roles
+                .iter()
+                .map(|r| (r.pane_id.clone(), r.role.clone(), r.orchestration.clone()))
+                .collect::<BTreeSet<_>>()
+        };
+        agents(self) == agents(other) && roles(self) == roles(other)
+    }
+}
+
+/// PRD #1487: the answer to [`AttachRequest::RestartDaemon`], carried on
+/// [`AttachResponse::restart`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum RestartDaemonReply {
+    /// `ok = true`. Written BEFORE any teardown; a failed write aborts the
+    /// restart. `to_version` is what the verified installed binary reported
+    /// (`Installed`), or the client's `expected_version` (`ClientSpawns`).
+    Accepted {
+        from_version: String,
+        to_version: Option<String>,
+        successor: RestartSuccessor,
+        stopping: RestartStopSet,
+    },
+    /// `ok = false`. Something is live and `confirm` was absent
+    /// (`stale = false`) or no longer matches (`stale = true`). Nothing was
+    /// stopped; `at_stake` is the full current set.
+    NeedsConfirmation {
+        at_stake: RestartStopSet,
+        stale: bool,
+    },
+    /// `ok = false`. Nothing was stopped; the old daemon keeps running.
+    Refused {
+        reason: RestartRefusalReason,
+        message: String,
+    },
+}
+
+/// Why the daemon refused an [`AttachRequest::RestartDaemon`].
+///
+/// `#[serde(other)]` on [`Self::Unknown`] keeps a newer daemon's next reason
+/// from failing an older client's whole-response decode, as
+/// [`StopRefusalReason::Unknown`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartRefusalReason {
+    /// Another restart holds the lock, one was already accepted, or the daemon
+    /// is already shutting down.
+    InProgress,
+    /// The installed binary could not be worked out from what the daemon
+    /// recorded at startup.
+    TargetUnresolvable,
+    /// The resolved path is absent, or not a regular executable file.
+    TargetMissing,
+    /// `<target> --version` failed, timed out, or printed no parsable version.
+    TargetDidNotAnswer,
+    /// The target answered with a version other than `expected_version`.
+    VersionMismatch,
+    /// A reason this build does not know, reported by a newer daemon.
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_rows() -> u16 {
@@ -2410,6 +2840,29 @@ pub struct AttachResponse {
     /// `None` on every non-`WriteAndSubmit` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_result: Option<crate::event::SendResult>,
+    /// Issue #621: on a `stale` refusal of a paned `write-and-submit` that named
+    /// NO session, the hook-session generation the pane carried when the guard
+    /// refused it — the conversation the caller would have to name for the
+    /// write to be accepted. Read by the guard itself, under the target writer
+    /// and the same `AppState` guard as the refusal, so it is the value the
+    /// refusal was decided on rather than a later re-read.
+    ///
+    /// Why it exists: before it, a refused caller's ONLY route to the
+    /// generation was its own event stream, and the TUI's subscriber does not
+    /// replay what it missed across a reconnect. A `SessionStart` dropped there
+    /// left every retry unnamed and every one refused, until the prompt was
+    /// abandoned at `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`.
+    ///
+    /// `None` on every other response — including a `stale` refusal of a
+    /// request that DID name a session, which is a lost target and not an
+    /// invitation to rebind (a delivery bound to one conversation must never be
+    /// redirected into its successor). Advisory, not an authorization: the
+    /// retry that names it is re-validated by the same guard. Additive +
+    /// optional (`#[serde(default, skip_serializing_if)]`): an older daemon
+    /// omits it, an older client ignores it, and the request/response shape is
+    /// otherwise unchanged, so it needs no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<String>,
     /// PRD #20 R20-003/004/006 (finding #6): guarded-send capability advertised
     /// on the `Hello` reply. `Some(true)` means this daemon enforces the
     /// identity/idempotency guards on `write-and-submit` (exact agent + session
@@ -2574,6 +3027,43 @@ pub struct AttachResponse {
     /// [`Self::directories`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_agent_options: Option<crate::new_agent_options::NewAgentOptions>,
+    /// PRD #1487: the answer to [`AttachRequest::RestartDaemon`]. `None` on
+    /// every other response. Set on refusals too, beside `ok = false` and a
+    /// one-line `error`, so a client that knows nothing of this field still
+    /// shows something true. Additive + optional, and the request it answers is
+    /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartDaemonReply>,
+    /// PRD #1487: a random identity minted once per daemon process
+    /// ([`daemon_instance_id`]), on the live daemon's `Hello` reply only — the
+    /// static `daemon hello` probe and the plain [`Self::hello`] constructor
+    /// leave it `None`, because they are not a running daemon.
+    ///
+    /// An upgrade records it before asking the daemon to restart and accepts a
+    /// successor only when the identity has changed, so the old daemon still
+    /// answering with the same build is never mistaken for its replacement.
+    /// Equal identities mean the same process; it carries no other meaning and
+    /// is not an authenticator. `None` is a daemon that predates the field (or
+    /// could not read OS randomness), and the upgrade then falls back to its
+    /// older rule. Additive and optional, so no [`PROTOCOL_VERSION`] bump: an
+    /// older client ignores the key and an older daemon omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+/// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
+/// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
+/// the life of the process (an `exec` into a successor mints a new one).
+/// `None` when OS randomness is unavailable, which a client reads as a daemon
+/// that does not say.
+pub fn daemon_instance_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).ok()?;
+        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    })
+    .as_deref()
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -2731,6 +3221,15 @@ impl AttachResponse {
             ..Default::default()
         }
     }
+    /// Issue #621: [`Self::with_send_result`] for a guarded send's full outcome,
+    /// carrying the generation a `stale` refusal was decided on — see
+    /// [`Self::current_session_id`].
+    fn with_write_and_submit_outcome(outcome: WriteAndSubmitOutcome) -> Self {
+        Self {
+            current_session_id: outcome.current_session_id,
+            ..Self::with_send_result(outcome.result)
+        }
+    }
     /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
     /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
     ///
@@ -2790,6 +3289,14 @@ impl AttachResponse {
     /// `None`, which a client reads as "withhold" — see [`Self::capabilities`].
     pub fn with_capabilities(mut self) -> Self {
         self.capabilities = Some(DAEMON_CAPABILITIES.iter().map(|c| c.to_string()).collect());
+        self
+    }
+
+    /// PRD #1487: name this daemon process on a handshake reply
+    /// ([`Self::instance_id`]). Only the live daemon's `Hello` handler calls
+    /// it.
+    pub fn with_instance_id(mut self) -> Self {
+        self.instance_id = daemon_instance_id().map(str::to_string);
         self
     }
 }
@@ -2884,6 +3391,43 @@ pub async fn serve_attach_with_counter(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
+    // PRD #1487: a server started this way records no install, so a
+    // `restart-daemon` it is sent can drain (`ClientSpawns`) but never resolves
+    // a successor to spawn (`Installed` is refused as `target-unresolvable`).
+    // `run_daemon_with` passes the daemon's own control through
+    // [`serve_attach_with_restart`].
+    serve_attach_with_restart(
+        listener,
+        registry,
+        event_tx,
+        client_count,
+        state,
+        shutdown,
+        scheduler,
+        reuse_registry,
+        worktree_registry,
+        Arc::new(crate::daemon_restart::RestartControl::default()),
+    )
+    .await
+}
+
+/// [`serve_attach_with_counter`] plus the daemon's PRD #1487
+/// [`crate::daemon_restart::RestartControl`], shared by every connection so
+/// restart requests serialise across clients and the accepted successor reaches
+/// `run_daemon_with`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_attach_with_restart(
+    listener: IpcListener,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+    state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    restart: Arc<crate::daemon_restart::RestartControl>,
+) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
     // Issue #454: this is one of the two seams that first hold BOTH the
@@ -2924,6 +3468,7 @@ pub async fn serve_attach_with_counter(
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
+                let restart = restart.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -2962,6 +3507,7 @@ pub async fn serve_attach_with_counter(
                         scheduler,
                         reuse_registry,
                         worktree_registry,
+                        restart,
                     )
                     .await
                     {
@@ -3063,6 +3609,7 @@ pub async fn run_attach_server_with_counter(
 /// deliberate carve-out that CANNOT distinguish such an agent from a
 /// conversation that has just ended, which is a known hole spelled out at the
 /// arm that implements it.
+#[cfg(test)]
 async fn compute_write_and_submit_outcome(
     registry: &AgentPtyRegistry,
     state: &SharedState,
@@ -3070,6 +3617,41 @@ async fn compute_write_and_submit_outcome(
     text: &str,
     extras: &WriteAndSubmitExtras,
 ) -> Result<crate::event::SendResult, String> {
+    compute_write_and_submit_reply(registry, state, pane_id, text, extras)
+        .await
+        .map(|outcome| outcome.result)
+}
+
+/// Issue #621: what a `write-and-submit` decided — the honest
+/// [`crate::event::SendResult`], plus, on a `stale` refusal of a paned request
+/// that named no session, the generation the guard refused it against. See
+/// [`AttachResponse::current_session_id`] for why the second half exists and
+/// what it does not license.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteAndSubmitOutcome {
+    result: crate::event::SendResult,
+    current_session_id: Option<String>,
+}
+
+impl From<crate::event::SendResult> for WriteAndSubmitOutcome {
+    fn from(result: crate::event::SendResult) -> Self {
+        Self {
+            result,
+            current_session_id: None,
+        }
+    }
+}
+
+/// [`compute_write_and_submit_outcome`] with the refused generation kept — what
+/// the attach handler answers from. The decision is identical; issue #621 only
+/// stops discarding the one value the refusal was made on.
+async fn compute_write_and_submit_reply(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    pane_id: &str,
+    text: &str,
+    extras: &WriteAndSubmitExtras,
+) -> Result<WriteAndSubmitOutcome, String> {
     use crate::agent_pty::GuardedSend;
     use crate::event::{SendResult, Writable};
     // PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
@@ -3107,8 +3689,8 @@ async fn compute_write_and_submit_outcome(
         }
     };
     match writable {
-        Writable::HistoryOnly => Ok(SendResult::HistoryOnly),
-        Writable::None => Ok(SendResult::NoLiveTarget),
+        Writable::HistoryOnly => Ok(SendResult::HistoryOnly.into()),
+        Writable::None => Ok(SendResult::NoLiveTarget.into()),
         Writable::Live => {
             // The re-validation closure runs UNDER the held target writer (inside
             // `write_and_submit_guarded`), immediately before the write, against
@@ -3137,8 +3719,15 @@ async fn compute_write_and_submit_outcome(
             // nothing and answers with the same `SendResult::NoLiveTarget` the
             // resolution block above already gives an identity-less request.
             let Some(agent_id) = extras.expected_agent_id.clone() else {
-                return Ok(SendResult::NoLiveTarget);
+                return Ok(SendResult::NoLiveTarget.into());
             };
+            // Issue #621: the generation the unnamed-request arm below refuses
+            // against, written by the closure under the writer and read back
+            // only if the send comes back `Stale`. Set by that arm alone, so
+            // every other cause of a `Stale` — the agent exiting, the pane
+            // changing hands, a named generation that no longer matches —
+            // leaves it `None`.
+            let refused_generation = Arc::new(std::sync::Mutex::new(None::<String>));
             let guarded = if is_paneless {
                 // A paneless target is re-validated by agent identity (mirroring
                 // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
@@ -3157,6 +3746,7 @@ async fn compute_write_and_submit_outcome(
                 // Issue #915 (finding 4): the ended-generation witness is keyed by
                 // AGENT, so the closure needs the identity it is already bound to.
                 let agent_for_check = agent_id.clone();
+                let refused_generation = Arc::clone(&refused_generation);
                 registry
                     .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
@@ -3275,23 +3865,37 @@ async fn compute_write_and_submit_outcome(
                         // Binding once rather than every frame is also what keeps
                         // this from looping.
                         //
-                        // It is NOT a general guarantee. `Stale` does not carry
-                        // the daemon's current generation, so a refused caller's
-                        // ONLY route to it is its own event stream — and
-                        // `spawn_event_subscriber` (`main.rs`) resubscribes after
-                        // a lagged or errored stream WITHOUT replaying what it
-                        // missed. A `SessionStart` dropped in that window is
-                        // never applied to the client `AppState`, so its
-                        // `pane_hook_session_id` for the pane stays `None`
-                        // indefinitely: every retry goes out unnamed, every one
-                        // is refused here, and at
+                        // Issue #621: and it now recovers when the caller's event
+                        // stream DROPPED the generation too. The TUI's event
+                        // subscriber resubscribed after a lagged or errored
+                        // stream WITHOUT replaying what it missed, so a
+                        // `SessionStart` dropped in that window was never applied
+                        // to the client `AppState`: every retry went out unnamed,
+                        // every one was refused here, and at
                         // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
-                        // (60 s) the delivery is ABANDONED with the prompt never
-                        // delivered. Bounded and logged rather than silent or
-                        // mis-delivered — but lost. Closing it means
-                        // resynchronizing state after a reconnect, or returning
-                        // the daemon's current generation on `Stale`; both are
-                        // design changes outside this branch.
+                        // (60 s) the prompt was abandoned undelivered. This arm
+                        // therefore records the generation it refuses against,
+                        // and the reply carries it
+                        // (`AttachResponse::current_session_id`), so the caller
+                        // can name it without waiting on an event it will never
+                        // receive. The TUI adopts it only for a delivery that has
+                        // written nothing yet — the same precondition as the
+                        // snapshot bind — so it names the conversation the bytes
+                        // are about to enter and claims nothing retroactively.
+                        // A delivery that already wrote into a pane with no
+                        // generation and then missed the start still cannot
+                        // bind from a refusal: from a point-in-time answer it
+                        // cannot tell the conversation it wrote into from a
+                        // successor whose predecessor ended unseen. Since issue
+                        // #1520 the TUI's subscriber (`crate::event_subscriber`)
+                        // records the gap that dropped the start and
+                        // resynchronizes its state when it reconnects, and such a
+                        // delivery stops when its next retry falls due after the
+                        // gap (`crate::ui`'s `delivery_outlived_event_gap`) rather
+                        // than being retried until the deadline; a retry that
+                        // falls due while the stream is still down waits, bounded
+                        // by that deadline. Stopping writes nothing more, so
+                        // nothing here needs to change for it.
                         //
                         // Issue #608 audit, finding 5(b): this arm refuses on the
                         // SESSION evidence alone, with no `has_live_attach`
@@ -3304,8 +3908,8 @@ async fn compute_write_and_submit_outcome(
                         // more — and `Stale` is retryable, so an unattached
                         // caller whose snapshot HAS the generation names it on
                         // the next attempt (one whose snapshot never observes it
-                        // retries unnamed until the deadline — see finding 6
-                        // above). Measured before adopting: across the whole
+                        // can name the generation this refusal reports, issue
+                        // #621 — see finding 6 above). Measured before adopting: across the whole
                         // fast tier the ONLY paned send that reaches this arm
                         // against a current generation is an ATTACHED one, which
                         // both rules refuse identically.
@@ -3384,7 +3988,14 @@ async fn compute_write_and_submit_outcome(
                                 None => return false,
                             },
                             None => {
-                                if guard.pane_hook_session_id(&pane_for_check).is_some() {
+                                // Issue #621: refused, and the refusal now says
+                                // which conversation it was refused against —
+                                // see `AttachResponse::current_session_id`.
+                                if let Some(current) = guard.pane_hook_session_id(&pane_for_check) {
+                                    *refused_generation
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        Some(current);
                                     return false;
                                 }
                                 if guard.agent_generation_ended(&agent_for_check) {
@@ -3397,11 +4008,17 @@ async fn compute_write_and_submit_outcome(
                     .await
             };
             match guarded {
-                Ok(GuardedSend::Applied) => Ok(SendResult::Applied),
-                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession),
-                Ok(GuardedSend::Stale) => Ok(SendResult::Stale),
-                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget),
-                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous),
+                Ok(GuardedSend::Applied) => Ok(SendResult::Applied.into()),
+                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession.into()),
+                Ok(GuardedSend::Stale) => Ok(WriteAndSubmitOutcome {
+                    result: SendResult::Stale,
+                    current_session_id: refused_generation
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take(),
+                }),
+                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget.into()),
+                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous.into()),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -3420,59 +4037,455 @@ struct OrchestrationSpawnMeta {
     role_name: String,
     /// Whether this pane is the orchestrator (start) role.
     is_start_role: bool,
-    /// Round-11 auditor #C: the tab-wide cwd, the `NameCwd` disambiguator.
+    /// Round-11 auditor #C: the tab-wide cwd. No longer part of the routing
+    /// identity (issue #463), but still the directory the run-title check
+    /// scopes by.
     orchestration_cwd: Option<String>,
-    /// PRD #140: the per-tab instance token, when the client stamped one.
-    orchestration_id: Option<String>,
+    /// PRD #140: the per-tab instance token. Required since issue #463 — the
+    /// handler refuses a membership without one before this is built.
+    orchestration_id: String,
     /// Issue #555: the run title the client stamped, if any — what the
     /// daemon's uniqueness check resolves and records.
     display_title: Option<String>,
 }
 
 impl OrchestrationSpawnMeta {
-    /// The routing identity this pane registers under.
+    /// The routing identity this pane registers under: the per-tab instance
+    /// token (PRD #140 M2.0) plus the config name.
     ///
-    /// Round-11 auditor #C: scope the orchestration identity by
-    /// `(name, orchestration_cwd)` so two unnamed orchestrations in different
-    /// cwds (`~/a/foo` and `~/b/foo`, both resolving `name` to "foo") don't
-    /// collide. The `orchestration_cwd` is shared across every role pane in one
-    /// orchestration tab (round-9 #2: per-pane cwd may diverge, but the
-    /// orchestration's identity does not). Older clients that don't carry the
-    /// field fall back to `StartAgent.cwd` — preserves backwards compat at the
-    /// cost of re-opening the collision; `Some` vs `None` is detectable so this
-    /// is documented behavior, not a silent misroute.
+    /// Issue #463: a client predating the token used to fall back to the
+    /// round-11 `(name, orchestration_cwd)` tuple, which cannot tell two tabs
+    /// of one orchestration in one directory apart. Such a client is no longer
+    /// supported and its start is refused with
+    /// [`START_ERR_ORCHESTRATION_ID_REQUIRED`], so the token is always there.
     ///
-    /// PRD #140 M2.0: prefer the per-tab instance token when the client stamped
-    /// one. Two tabs of the same orchestration in the same directory produce
-    /// identical `(name, cwd)` pairs, so the tuple alone cannot tell their panes
-    /// apart and delegate / work-done cross-deliver between them (issue #140). A
-    /// client predating the token falls back to the round-11 tuple — same
-    /// routing behaviour as before, so old and new clients coexist on one daemon.
-    ///
-    /// Issue #555: computed BEFORE the spawn now (it used to be built after it),
+    /// Issue #555: computed BEFORE the spawn (it used to be built after it),
     /// because the run-title check that scopes by it has to run before the
     /// registry insert.
-    fn identity(&self, cwd: Option<&str>) -> crate::state::OrchestrationIdentity {
-        match &self.orchestration_id {
-            Some(id) => crate::state::OrchestrationIdentity::Instance {
-                id: id.clone(),
-                name: self.name.clone(),
-            },
-            None => crate::state::OrchestrationIdentity::NameCwd {
-                name: self.name.clone(),
-                cwd: self.orchestration_cwd(cwd),
-            },
+    fn identity(&self) -> crate::state::OrchestrationIdentity {
+        crate::state::OrchestrationIdentity {
+            id: self.orchestration_id.clone(),
+            name: self.name.clone(),
         }
     }
 
     /// The tab-wide orchestration cwd, falling back to `StartAgent.cwd` for a
-    /// client that sends none (see [`Self::identity`]).
+    /// client that sends none. The run-title check's directory.
     fn orchestration_cwd(&self, cwd: Option<&str>) -> String {
         self.orchestration_cwd
             .clone()
             .or_else(|| cwd.map(str::to_string))
             .unwrap_or_default()
     }
+}
+
+/// Issue #463 test seam: whether this daemon serves an orchestration start with
+/// no `orchestration_id` the way a daemon before #463 did, instead of refusing
+/// it. The only way an L2 test can put such a record in front of a real TUI —
+/// the state a current TUI meets when it reattaches to an older daemon still
+/// running an old client's orchestration — is a daemon that accepted the start.
+///
+/// `false` in every build without the `e2e` feature, whatever the environment
+/// says: `cfg!` folds the read away there, so no release binary can be told to
+/// serve the retired shape. Under `e2e` it is opt-in per process with
+/// `DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION=1`. A start it lets
+/// through registers no role (`OrchestrationSpawnMeta` needs the token), which
+/// is what such a pane looks like to the routing maps of a current daemon.
+fn serves_tokenless_orchestration_for_test() -> bool {
+    cfg!(feature = "e2e")
+        && std::env::var_os("DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION")
+            .is_some_and(|v| v == "1")
+}
+
+/// Issue #1445: [`AttachRequest::RecordOrchestratorContext`]'s handling — check
+/// the report and, if it holds, move the orchestration's recorded context file
+/// to the one the re-arm published.
+///
+/// Three steps, so no file is read under the state lock: the lexical checks
+/// and the recorded file come from a read lock
+/// ([`crate::state::AppState::rearmed_context_target`]); the two files are
+/// compared on a blocking thread — same brief, and the report not older than
+/// the recorded file ([`crate::orchestrator_context::compare_rearmed_context`]);
+/// and the write lock re-runs the lexical checks and records only if the
+/// recorded file is still the one compared against
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]),
+/// otherwise the three steps run again against the new file. A report older
+/// than the recorded file answers `ok`: it lost a race with a later one, and
+/// the record already names the newer file. Its file is kept for deletion at
+/// the end under the same write-lock checks
+/// ([`crate::state::AppState::keep_older_rearmed_orchestration_context`]),
+/// without moving the record. The refusal never echoes the path:
+/// it is the client's value, and it failed a check.
+async fn record_rearmed_context(
+    state: &SharedState,
+    pane_id: &str,
+    context_path: &str,
+) -> Result<(), String> {
+    use crate::orchestrator_context::RearmComparison;
+    use crate::state::RearmedContextRefusal;
+    if !crate::agent_pty::is_valid_pane_id_env(pane_id)
+        || !crate::agent_pty::is_valid_orchestration_cwd(context_path)
+    {
+        return Err("record-orchestrator-context: invalid pane id or context path".into());
+    }
+    let reported = std::path::PathBuf::from(context_path);
+    // An orchestration the daemon holds no file for — every one a TUI opened
+    // with `Ctrl+n` — is the routine refusal, so it is not worth a warning.
+    let refused = |reason: &dyn std::fmt::Display, routine: bool| {
+        if routine {
+            tracing::debug!(pane_id, reason = %reason, "not following a re-arm publication");
+        } else {
+            tracing::warn!(pane_id, reason = %reason, "not following a re-arm publication");
+        }
+        format!("record-orchestrator-context: {reason}")
+    };
+    // Each pass compares against the file recorded when it started; a record
+    // that moves during the comparison sends it round again, against the new
+    // file. Bounded, since every move is a report or a start that won.
+    for _ in 0..REARM_RECORD_ATTEMPTS {
+        let current = state
+            .read()
+            .await
+            .rearmed_context_target(pane_id, &reported)
+            .map_err(|r| refused(&r, r == RearmedContextRefusal::NoRecordedContext))?;
+        let mut older = false;
+        if current != reported {
+            let (compared, candidate) = (current.clone(), reported.clone());
+            let comparison = tokio::task::spawn_blocking(move || {
+                crate::orchestrator_context::compare_rearmed_context(&compared, &candidate)
+            })
+            .await;
+            match comparison {
+                Ok(Ok(RearmComparison::Follows)) => {}
+                Ok(Ok(RearmComparison::DifferentBrief)) => {
+                    return Err(refused(&"the file carries a different brief", false));
+                }
+                // A report that lost a race with a later one: the record
+                // already names a newer file, which is the outcome wanted, but
+                // this file is still the orchestration's own and goes with it
+                // at the end (Qodo on PR #1554).
+                Ok(Ok(RearmComparison::Older)) => older = true,
+                Ok(Err(e)) => {
+                    return Err(refused(&format!("could not compare the files: {e}"), false));
+                }
+                Err(e) => {
+                    return Err(refused(
+                        &format!("the comparison did not finish: {e}"),
+                        false,
+                    ));
+                }
+            }
+        }
+        if older {
+            match state
+                .write()
+                .await
+                .keep_older_rearmed_orchestration_context(pane_id, &reported, &current)
+            {
+                Ok(_) => {
+                    refused(&"a newer file is already recorded", true);
+                    return Ok(());
+                }
+                Err(RearmedContextRefusal::RecordMoved) => continue,
+                Err(r) => return Err(refused(&r, false)),
+            }
+        }
+        match state
+            .write()
+            .await
+            .record_rearmed_orchestration_context(pane_id, &reported, &current)
+        {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!(
+                        pane_id,
+                        "the orchestrator's recorded context followed a re-arm"
+                    );
+                }
+                return Ok(());
+            }
+            Err(RearmedContextRefusal::RecordMoved) => continue,
+            Err(r) => return Err(refused(&r, false)),
+        }
+    }
+    Err(refused(&RearmedContextRefusal::RecordMoved, false))
+}
+
+/// Issue #1445: how many times [`record_rearmed_context`] compares again after
+/// the record moved under it before giving up on the report.
+const REARM_RECORD_ATTEMPTS: usize = 4;
+
+/// One refusal to an [`AttachRequest::RestartDaemon`]: `ok = false`, the
+/// message in `error` for a client that knows nothing of the field, and the
+/// structured reply beside it.
+fn restart_refusal(reason: RestartRefusalReason, message: String) -> AttachResponse {
+    let mut resp = AttachResponse::err(format!("restart-daemon refused: {message}"));
+    resp.restart = Some(RestartDaemonReply::Refused { reason, message });
+    resp
+}
+
+/// PRD #1487: the [`AttachRequest::RestartDaemon`] arm. Steps, in order:
+///
+/// 1. Take the restart lock; a held lock, an accepted restart, or a daemon
+///    already shutting down is `InProgress`. Held until step 6.
+/// 2. `Installed` mode: resolve and verify the target. A failure is `Refused`
+///    and nothing has been touched — before the live-set check, so nobody is
+///    asked to confirm a restart that cannot happen.
+/// 3. Reserve, then snapshot what is at stake from the same sources
+///    `StopDaemon` reads (audit A2). The reservation is the registry's
+///    [admission freeze](AgentPtyRegistry::freeze_admission), which refuses
+///    every new agent — a spawn still forking included — refuses a respawn
+///    before it touches the pane it would replace, and waits for respawns
+///    already refilling a pane, so nothing can join what the snapshot names
+///    (re-check R2). A respawn stuck past the freeze's wait is `InProgress`.
+///    The snapshot is one read of the role maps beside the registry; the
+///    `AppState` guard is released straight after it, never held across a
+///    network write (re-check, reviewer R1). A role registered later can only
+///    name an agent the snapshot already names, because registration follows
+///    the agent's publication and no agent publishes past the freeze.
+/// 4. Apply [`crate::daemon_restart::restart_decision`]; ask if it says so.
+///    Asking releases the reservation first: what changes while the user
+///    decides makes their confirmation stale, and they are asked again.
+/// 5. Write `Accepted` — a failed write aborts the restart (`?`), and the
+///    reservation is released with nothing stopped.
+/// 6. Latch acceptance and record the successor; keep the admission freeze
+///    (the drain follows), release the lock.
+/// 7. Disclose (#1109): the teardown inventory, then one line naming the target.
+/// 8. Drain, then signal shutdown. `run_daemon_with` spawns the successor once
+///    the sockets are released.
+#[allow(clippy::too_many_arguments)]
+async fn handle_restart_daemon(
+    stream: &mut IpcStream,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    shutdown: Option<&Arc<tokio::sync::Notify>>,
+    restart: &Arc<crate::daemon_restart::RestartControl>,
+    confirm: Option<RestartStopSet>,
+    expected_version: Option<String>,
+    mode: RestartSuccessor,
+) -> io::Result<()> {
+    use crate::daemon_restart::{
+        RESTART_VERIFY_TIMEOUT, resolve_restart_target, restart_decision, stop_set,
+        verify_restart_target_pinned,
+    };
+
+    // 1.
+    let guard = match restart.try_begin() {
+        Some(guard) if !stop_under_way(registry, restart) => guard,
+        _ => {
+            warn!("RestartDaemon refused: another restart or shutdown is already under way");
+            let resp = restart_refusal(
+                RestartRefusalReason::InProgress,
+                "another restart or shutdown of this daemon is already under way".into(),
+            );
+            return write_resp(stream, &resp).await;
+        }
+    };
+
+    // 2.
+    let (target, to_version) = match mode {
+        RestartSuccessor::Installed => {
+            let target = match resolve_restart_target(&restart.install().startup_exe) {
+                Ok(target) => target,
+                Err(reason) => {
+                    let message = format!(
+                        "could not work out the installed build from the path this daemon \
+                         started from ({})",
+                        restart.install().startup_exe.display()
+                    );
+                    warn!(?reason, "RestartDaemon refused: {message}");
+                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                }
+            };
+            let check_target = target.clone();
+            let check_expected = expected_version.clone();
+            let verified = tokio::task::spawn_blocking(move || {
+                verify_restart_target_pinned(
+                    &check_target,
+                    check_expected.as_deref(),
+                    RESTART_VERIFY_TIMEOUT,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err((
+                    RestartRefusalReason::TargetDidNotAnswer,
+                    format!("checking the installed build failed ({e})"),
+                ))
+            });
+            match verified {
+                Ok(verified) => {
+                    let version = verified.version.clone();
+                    (Some(verified), Some(version))
+                }
+                Err((reason, message)) => {
+                    warn!(?reason, target = %target.display(), "RestartDaemon refused: {message}");
+                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                }
+            }
+        }
+        RestartSuccessor::ClientSpawns => (None, expected_version.clone()),
+    };
+
+    // 3. The freeze first: it waits for respawns already refilling a pane
+    // (re-check R2), and nothing may be read before they have. Then one
+    // consistent read of the role maps and the registry, released at once —
+    // the snapshot is a value from here on, and no role-map change after it
+    // can put a role on an agent outside it (re-check, reviewer R1): every
+    // role registration follows its agent's publication, and none can publish
+    // past the freeze.
+    let admission = match registry.freeze_admission().await {
+        Ok(admission) => admission,
+        Err(crate::agent_pty::RespawnsInFlight) => {
+            let message = "an agent of this daemon is being restarted and did not finish in time; \
+                           try again once it is back"
+                .to_string();
+            warn!("RestartDaemon refused: {message}");
+            return write_resp(
+                stream,
+                &restart_refusal(RestartRefusalReason::InProgress, message),
+            )
+            .await;
+        }
+    };
+    // A stop that arrived during the verification or the freeze wins: refuse,
+    // having stopped nothing (Qodo 4201244680).
+    if stop_under_way(registry, restart) {
+        return refuse_restart_for_stop(stream).await;
+    }
+    let at_stake = {
+        let role_maps = state.read().await;
+        let roles = role_maps.live_orchestration_roles(registry);
+        stop_set(&roles, &registry.agent_records())
+    };
+
+    // 4.
+    if let Some(reply) = restart_decision(&at_stake, confirm.as_ref()) {
+        drop(admission);
+        let stale = matches!(
+            reply,
+            RestartDaemonReply::NeedsConfirmation { stale: true, .. }
+        );
+        warn!(
+            agent_count = at_stake.agents.len(),
+            role_count = at_stake.roles.len(),
+            stale,
+            "RestartDaemon needs confirmation; daemon stays up"
+        );
+        let summary = format!(
+            "restart-daemon needs confirmation: it would stop {} agent(s) and {} orchestration \
+             role(s){}",
+            at_stake.agents.len(),
+            at_stake.roles.len(),
+            if stale {
+                "; what is at stake changed since it was confirmed"
+            } else {
+                ""
+            }
+        );
+        let mut resp = AttachResponse::err(summary);
+        resp.restart = Some(reply);
+        return write_resp(stream, &resp).await;
+    }
+
+    #[cfg(test)]
+    restart
+        .checkpoint(crate::daemon_restart::RestartPause::BeforeAccepting)
+        .await;
+
+    // The last moment a stop can still be answered as a refusal.
+    if stop_under_way(registry, restart) {
+        return refuse_restart_for_stop(stream).await;
+    }
+
+    // 5. A failed write returns here, dropping the reservation: nothing was
+    // stopped, and agents may start again.
+    let mut resp = AttachResponse::ok();
+    resp.restart = Some(RestartDaemonReply::Accepted {
+        from_version: env!("DAD_VERSION").to_string(),
+        to_version: to_version.clone(),
+        successor: mode,
+        stopping: at_stake,
+    });
+    write_resp(stream, &resp).await?;
+
+    #[cfg(test)]
+    restart
+        .checkpoint(crate::daemon_restart::RestartPause::AfterAccepting)
+        .await;
+
+    // 6. The latch and the stop flag share one lock, so a stop that arrived
+    // after the check above leaves nothing latched and the daemon just stops:
+    // the stop path tears it down and discloses what it stops. The agents this
+    // reply named were confirmed by the client, so stopping them is no surprise.
+    let shown_target = target
+        .as_ref()
+        .map(|t| t.path.display().to_string())
+        .unwrap_or_default();
+    let latched = match target {
+        Some(verified) => restart.mark_accepted_verified(verified),
+        None => restart.mark_accepted(None),
+    };
+    admission.keep();
+    drop(guard);
+    if !latched {
+        warn!(
+            "RestartDaemon accepted, but the daemon began stopping before the successor was \
+             recorded; it stops without starting a successor, and the stop path discloses what \
+             it stops"
+        );
+        return Ok(());
+    }
+
+    // 7.
+    crate::daemon_stop::log_teardown_inventory(state, registry, "restart-daemon").await;
+    match mode {
+        RestartSuccessor::Installed => warn!(
+            target = %shown_target,
+            to_version = to_version.as_deref().unwrap_or(""),
+            successor = ?mode,
+            "RestartDaemon accepted — restarting onto the installed build; every agent and \
+             orchestration role named above was confirmed by the client"
+        ),
+        RestartSuccessor::ClientSpawns => warn!(
+            to_version = to_version.as_deref().unwrap_or(""),
+            successor = ?mode,
+            "RestartDaemon accepted — stopping so the client can start its own build; every \
+             agent and orchestration role named above was confirmed by the client"
+        ),
+    }
+
+    // 8.
+    let registry_for_shutdown = registry.clone();
+    tokio::task::spawn_blocking(move || {
+        registry_for_shutdown.shutdown_all_graceful(Duration::from_secs(3));
+    })
+    .await
+    .ok();
+    if let Some(s) = shutdown {
+        s.notify_one();
+    } else {
+        warn!("RestartDaemon handled but no daemon-shutdown notify wired (likely a test harness)");
+    }
+    Ok(())
+}
+
+/// Whether a stop of this daemon (`StopDaemon`, `KIND_SHUTDOWN` or a signal)
+/// has begun, so a restart must not be accepted.
+fn stop_under_way(
+    registry: &AgentPtyRegistry,
+    restart: &crate::daemon_restart::RestartControl,
+) -> bool {
+    registry.is_shutting_down() || restart.is_stop_requested()
+}
+
+async fn refuse_restart_for_stop(stream: &mut IpcStream) -> io::Result<()> {
+    warn!("RestartDaemon refused: the daemon is stopping");
+    let resp = restart_refusal(
+        RestartRefusalReason::InProgress,
+        "this daemon is stopping; nothing was restarted".into(),
+    );
+    write_resp(stream, &resp).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3485,6 +4498,7 @@ async fn handle_connection(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    restart: Arc<crate::daemon_restart::RestartControl>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -3511,6 +4525,22 @@ async fn handle_connection(
                 payload_len = frame.1.len(),
                 "KIND_SHUTDOWN rejected — frame is contractually header-only"
             );
+            return Ok(());
+        }
+        // PRD #1487: a stop wins over a restart under way or already accepted.
+        // Once the daemon has committed to a restart it cannot stop instead, so
+        // the frame is refused rather than acknowledged (audit A1): the reply
+        // is a `KIND_RESP` error, which `DaemonClient::send_shutdown` reports
+        // as a failed Stop with this message — and which a client predating
+        // the refusal also treats as a failure, since it accepts nothing but
+        // `KIND_SHUTDOWN_ACK`. Nothing is drained: the restart already did.
+        if !restart.stop_wins("shutdown-frame") {
+            let resp = AttachResponse::err(
+                crate::daemon_restart::STOP_REFUSED_RESTART_COMMITTED.to_string(),
+            );
+            if let Err(e) = write_resp(&mut stream, &resp).await {
+                warn!(error = %e, "failed to write the KIND_SHUTDOWN refusal");
+            }
             return Ok(());
         }
         info!("KIND_SHUTDOWN received — sending ack and beginning graceful daemon shutdown");
@@ -3655,6 +4685,10 @@ async fn handle_connection(
                     // PRD #1223 M7: an orchestration role is not an authoring
                     // agent, and `start-prepared-agent` has no such field.
                     authoring_kind: None,
+                    client_seeded_kind: None,
+                    // Issue #1540: a role start is not a form start, so it
+                    // never records the deck's last command.
+                    remember_command: false,
                 },
                 Some(prep_token),
                 use_configured_command,
@@ -3712,6 +4746,10 @@ async fn handle_connection(
             // resolve from the registry's spawn-time type while the record
             // travels with the live one beside it.
             crate::agent_pty::attach_cli_names(&mut records);
+            // PRD #1541: the keys that interrupt and edit each agent's prompt,
+            // from the same registry and the same reported identity, after the
+            // live join for the same reason.
+            crate::agent_pty::attach_prompt_keys(&mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -3772,7 +4810,29 @@ async fn handle_connection(
             // routine and has causes that have nothing to do with intent — so
             // proceeding would let a flaky network stop somebody's deck and tell
             // no one why. Not stopping costs a retry; stopping costs the run.
+            //
+            // PRD #1487: a stop wins over a restart under way or already
+            // accepted, so it is claimed before the ack — never acknowledged
+            // once the daemon has committed to a restart, when it is refused
+            // instead — and confirmed only once the ack is written; a failed
+            // ack withdraws this claim alone (Qodo 4201540983, 4201633116).
+            let Some(claim) = restart.claim_stop() else {
+                warn!("StopDaemon refused: the daemon already committed to a restart");
+                let resp = AttachResponse::err(
+                    crate::daemon_restart::STOP_REFUSED_RESTART_COMMITTED.to_string(),
+                );
+                write_resp(&mut stream, &resp).await?;
+                return Ok(());
+            };
+            // A failed write returns here and drops `claim`, withdrawing it.
             write_resp(&mut stream, &AttachResponse::ok()).await?;
+            claim.confirm("stop-daemon");
+            // Issue #1109's disclosure, which this path lacked (PRD #1487
+            // audit D1): `--force` stops live agents and roles, and the
+            // acceptance log above carries only their counts. After the ack —
+            // the client is waiting on it — and before the drain, which
+            // empties what this reads.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "stop-daemon").await;
             // The same graceful drain, with the same grace, as the
             // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
             // one. Idempotent via the registry's `shutting_down` latch.
@@ -3795,6 +4855,27 @@ async fn handle_connection(
             }
             return Ok(());
         }
+        // PRD #1487: restart onto the installed build (or for a client that
+        // spawns its own), under the D6 policy. Step order is load-bearing and
+        // documented in `docs/develop/daemon-teardown-paths.md`.
+        AttachRequest::RestartDaemon {
+            confirm,
+            expected_version,
+            successor,
+        } => {
+            handle_restart_daemon(
+                &mut stream,
+                &registry,
+                &state,
+                shutdown.as_ref(),
+                &restart,
+                confirm,
+                expected_version,
+                successor,
+            )
+            .await?;
+            return Ok(());
+        }
         AttachRequest::StartAgent {
             command,
             cwd,
@@ -3806,6 +4887,8 @@ async fn handle_connection(
             agent_type,
             seed,
             authoring_kind,
+            client_seeded_kind,
+            remember_command,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -3818,6 +4901,20 @@ async fn handle_connection(
                 write_resp(
                     &mut stream,
                     &AttachResponse::err("start-agent: daemon is shutting down"),
+                )
+                .await?;
+                return Ok(());
+            }
+            // PRD #1487 audit A2: a restart is deciding, or draining, and its
+            // reservation refuses new agents. The spawn path checks the same
+            // flag under its publishing lock; this answers early and plainly.
+            if registry.is_admission_frozen() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "start-agent: {}",
+                        crate::agent_pty::ADMISSION_FROZEN_REASON
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -3836,6 +4933,40 @@ async fn handle_connection(
                 write_resp(
                     &mut stream,
                     &AttachResponse::err("start-agent: command is empty or whitespace-only"),
+                )
+                .await?;
+                return Ok(());
+            }
+            // Issue #463: an orchestration membership must carry the per-tab
+            // `orchestration_id`. Every client since v0.35.0 (PRD #140) stamps
+            // one; a pane without it used to be routed on the `(name, cwd)`
+            // tuple, which cannot keep two tabs of one orchestration in one
+            // directory apart. Clients that old are no longer supported
+            // (`docs/develop/versioning.md`), and the daemon ignores
+            // `client_version`, so it is this refusal — not a client-side check
+            // — that stops an older TUI from registering a pane under an
+            // identity it shares with a sibling tab. Refused before anything
+            // spawns, so nothing is started.
+            if let Some(TabMembership::Orchestration {
+                name,
+                orchestration_id: None,
+                ..
+            }) = tab_membership.as_ref()
+                && !serves_tokenless_orchestration_for_test()
+            {
+                info!(
+                    orchestration = %crate::config_validation::escape_id_for_log(name),
+                    "start-agent refused: the orchestration membership carries no \
+                     orchestration_id (a client predating v0.35.0)"
+                );
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "{START_ERR_ORCHESTRATION_ID_REQUIRED}: the orchestration membership \
+                         carries no orchestration_id. This daemon no longer accepts \
+                         orchestration panes from clients older than v0.35.0; upgrade the \
+                         client to this daemon's version. Nothing was started."
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -4040,22 +5171,23 @@ async fn handle_connection(
                 .map(|(_, v)| v.clone())
                 .filter(|v| is_valid_pane_id_env(v));
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
-            // the membership so the daemon can use it (not StartAgent.cwd)
-            // as the disambiguator in `pane_orchestration_map`. This keeps
-            // round-9 #2's "workers can have different per-pane cwds"
-            // contract intact — pane_cwd_map gets StartAgent.cwd
-            // per-pane, but pane_orchestration_map keys on the shared
-            // orchestration cwd from the TabMembership.
-            // PRD #140 M2.0: also pull the per-tab `orchestration_id` so the
-            // identity can key on it when present (see below).
+            // the membership — the shared orchestration cwd, not
+            // StartAgent.cwd, which may diverge per pane (round-9 #2). Since
+            // issue #463 it no longer keys `pane_orchestration_map`; the
+            // run-title check below scopes by it.
+            // PRD #140 M2.0: also pull the per-tab `orchestration_id`, which
+            // the identity keys on (see below).
             let orchestration_meta: Option<OrchestrationSpawnMeta> =
                 tab_membership.as_ref().and_then(|tm| match tm {
+                    // Issue #463: a token-less membership was refused above
+                    // (outside `serves_tokenless_orchestration_for_test`), and
+                    // one let through registers no role, as below.
                     TabMembership::Orchestration {
                         name,
                         role_name,
                         is_start_role,
                         orchestration_cwd,
-                        orchestration_id,
+                        orchestration_id: Some(orchestration_id),
                         display_title,
                         ..
                     } if !role_name.is_empty() => Some(OrchestrationSpawnMeta {
@@ -4075,7 +5207,29 @@ async fn handle_connection(
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
+            // Issue #1540: whether an accepted start becomes the deck's last
+            // command. Decided here, from the request as it stands, because
+            // `tab_membership` moves into the spawn. A role start — a prepared
+            // one, or one carrying an orchestration membership — never records,
+            // whatever the marker says (see `StartAgent::remember_command`).
+            let last_command_to_record: Option<String> = (remember_command
+                && prepared_token.is_none()
+                && !matches!(tab_membership, Some(TabMembership::Orchestration { .. })))
+            .then(|| command.clone())
+            .flatten();
 
+            // Issue #1496: one start names one kind, whoever delivers its seed.
+            if authoring_kind.is_some() && client_seeded_kind.is_some() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(
+                        "start-agent: authoring_kind and client_seeded_kind are mutually \
+                         exclusive; nothing was started",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             // PRD #1223 M7: an authoring start's seed is composed — and its
             // preconditions checked — before anything spawns, so a refusal
             // starts nothing. See `AttachRequest::StartAgent::authoring_kind`.
@@ -4140,7 +5294,7 @@ async fn handle_connection(
             let title_claim: Option<crate::state::OrchestrationIdentity> =
                 match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
                     (Some(_), Some(meta)) if membership_is_kept => {
-                        let identity = meta.identity(cwd_for_state.as_deref());
+                        let identity = meta.identity();
                         let orch_cwd = crate::state::orchestration_title_cwd_key(
                             &meta.orchestration_cwd(cwd_for_state.as_deref()),
                         )
@@ -4200,6 +5354,12 @@ async fn handle_connection(
             drop(prepared_dir);
             match spawned {
                 Ok(id) => {
+                    // Issue #1496: the start is accepted, so the record says
+                    // what kind of authoring agent it is — before the seed
+                    // delivery below, which can wait on the agent's readiness.
+                    if let Some(kind) = authoring_kind.or(client_seeded_kind) {
+                        let _ = registry.set_authoring_kind(&id, kind);
+                    }
                     // PRD #1223 M7: deliver the authoring seed through the path
                     // this agent already has, never a new one (#528). A Pi pane
                     // takes PRD #201's native seed — the branch just below, which
@@ -4305,21 +5465,21 @@ async fn handle_connection(
                     //   Unchanged by round 2 and stated because it is the
                     //   residual;
                     // * the pane was explicitly registered by this process (an
-                    //   orchestration role below, or the auto-registration in
-                    //   the next line). Registration is pane-scoped by design —
-                    //   the registrant is asserting the pane, not a generation.
+                    //   orchestration role below). Registration is pane-scoped
+                    //   by design — the registrant is asserting the pane, not a
+                    //   generation.
                     //
                     // A `SessionStart` is weaker on purpose — `apply_event`
-                    // auto-registers a pane id it names, unless the id is the
-                    // synthetic `__dead-slot__-…` shape or the registry already
-                    // holds a generation for that pane — to cover the TUI
-                    // startup race where the hook beats `register_pane`. So a
-                    // same-uid process CAN mint a card for a pane NOBODY
-                    // spawned by forging one. That is pre-existing, it is not a
-                    // cross-user escalation (both sockets are owner-only and
-                    // an attach peer can already write to agents directly),
-                    // and closing it is tracked separately; it is stated here
-                    // rather than papered over.
+                    // admits one naming a pane id the registry holds no
+                    // generation for, unless the id is the synthetic
+                    // `__dead-slot__-…` shape, so an outside agent still gets a
+                    // card. So a same-uid process CAN mint a card for a pane
+                    // NOBODY spawned by forging one. Since issue #601 that card
+                    // is recorded as UNPROVEN, never in `managed_pane_ids`, so
+                    // it confers no ownership of the pane, and since #697 such
+                    // cards are bounded (`MAX_UNPROVEN_SESSIONS`). A pane this
+                    // daemon DID spawn cannot be named that way at all: the hook
+                    // gate refuses a token-less event for it (#318).
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -4336,7 +5496,7 @@ async fn handle_connection(
                         // for why this must not be inlined again. The identity
                         // is the one the title check above scoped by
                         // (`OrchestrationSpawnMeta::identity`).
-                        let identity = meta.identity(cwd_for_state.as_deref());
+                        let identity = meta.identity();
                         let mut state = state.write().await;
                         state.register_orchestration_role(
                             pane_id,
@@ -4345,6 +5505,9 @@ async fn handle_connection(
                             identity.clone(),
                             cwd_for_state.as_deref(),
                         );
+                        // Issue #697: outside cards the registration dropped
+                        // leave every attached client's view too.
+                        state.announce_unproven_evictions(&event_tx);
                         // Issue #555: the registered pane holds the title from
                         // here on, so this start's in-flight claim ends — under
                         // the same guard, so there is no instant in which
@@ -4381,6 +5544,15 @@ async fn handle_connection(
                             command.as_deref(),
                         );
                     }
+                    // Issue #1540: the start is accepted, so a form start's
+                    // command becomes the deck's last command — in memory
+                    // before the reply, so a form that reopens on the reply
+                    // already sees it, and on disk after, on a detached task,
+                    // so the reply never waits for the state directory. A
+                    // failed write is logged and does not fail the start.
+                    if let Some(command) = last_command_to_record {
+                        record_last_command(&state, &command).await;
+                    }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
                 Err(e) => {
@@ -4403,6 +5575,11 @@ async fn handle_connection(
                                  changed before the spawn"
                             );
                             crate::project_resolve::stale_preparation_refusal()
+                        }
+                        // Issue #1396 item 2: a plain start whose cwd is not a
+                        // directory, refused before the PTY was opened.
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(_) => {
+                            format!("{START_ERR_CWD_NOT_A_DIRECTORY}: {e}. Nothing was started.")
                         }
                         _ => e.to_string(),
                     };
@@ -4785,6 +5962,16 @@ async fn handle_connection(
                 .await?
             }
         }
+        AttachRequest::RecordOrchestratorContext {
+            pane_id,
+            context_path,
+        } => {
+            let resp = match record_rearmed_context(&state, &pane_id, &context_path).await {
+                Ok(()) => AttachResponse::ok(),
+                Err(refusal) => AttachResponse::err(refusal),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::WriteAndSubmit { pane_id, text } => {
             // PRD #20 M3: deliver input honestly. A dashboard-visible session is
             // not necessarily a live, writable target (a wrapped Codex session
@@ -4851,13 +6038,17 @@ async fn handle_connection(
             match extras.delivery_id.as_deref() {
                 // No idempotency key (legacy / non-guarded caller): compute once,
                 // no dedup ledger involvement.
-                None => match compute_write_and_submit_outcome(
+                None => match compute_write_and_submit_reply(
                     &registry, &state, &pane_id, &text, &extras,
                 )
                 .await
                 {
                     Ok(outcome) => {
-                        write_resp(&mut stream, &AttachResponse::with_send_result(outcome)).await?
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::with_write_and_submit_outcome(outcome),
+                        )
+                        .await?
                     }
                     Err(e) => write_resp(&mut stream, &AttachResponse::err(e)).await?,
                 },
@@ -4902,7 +6093,7 @@ async fn handle_connection(
                             .await?
                         }
                         crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
-                            match compute_write_and_submit_outcome(
+                            match compute_write_and_submit_reply(
                                 &registry, &state, &pane_id, &text, &extras,
                             )
                             .await
@@ -4911,10 +6102,13 @@ async fn handle_connection(
                                     // Cache a DELIVERED (`applied`/`queued`) or
                                     // AMBIGUOUS outcome; a non-delivery stays
                                     // retryable (see `record_delivery_outcome`).
-                                    registry.record_delivery_outcome(&permit, outcome);
+                                    // A `stale` is never cached, so the
+                                    // generation it carries (issue #621) is
+                                    // never replayed stale either.
+                                    registry.record_delivery_outcome(&permit, outcome.result);
                                     write_resp(
                                         &mut stream,
-                                        &AttachResponse::with_send_result(outcome),
+                                        &AttachResponse::with_write_and_submit_outcome(outcome),
                                     )
                                     .await?
                                 }
@@ -4933,6 +6127,9 @@ async fn handle_connection(
         }
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
+        }
+        AttachRequest::SubscribeEventsWithSnapshot => {
+            handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
         }
         AttachRequest::Hello {
             client_version: _,
@@ -4995,9 +6192,12 @@ async fn handle_connection(
             // client asks a stable question ("do you know this op?") instead
             // of string-matching serde's `unknown variant` message. Absence
             // means withhold — see `AttachResponse::capabilities`.
+            // PRD #1487: and name this process, so an upgrade can tell its
+            // successor from it.
             let mut resp = AttachResponse::hello(advertised_protocol_version())
                 .with_guarded_send()
-                .with_capabilities();
+                .with_capabilities()
+                .with_instance_id();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -5331,7 +6531,14 @@ async fn handle_connection(
             )
             .await
             {
-                Ok(options) => {
+                Ok(mut options) => {
+                    // Issue #1540: the deck's last command, from the daemon's
+                    // in-memory snapshot — `get` takes no lock a writer holds
+                    // across disk I/O, so it is read here rather than inside
+                    // the blocking query. The store is bound first so the
+                    // `AppState` guard is released before it is read.
+                    let store = state.read().await.last_command_store();
+                    options.last_command = store.and_then(|store| store.get());
                     let mut resp = AttachResponse::ok();
                     resp.new_agent_options = Some(options);
                     resp
@@ -5348,8 +6555,53 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        // Issue #1540: set the deck's last command only if it has none. `ok`
+        // whether or not it was taken — the caller has nothing to do either way.
+        AttachRequest::SeedLastCommand { command } => {
+            // Bound in its own statement so the `AppState` read guard is
+            // dropped before the store is used. The value is taken in memory
+            // and written on a detached task, so the answer never waits for
+            // the disk — the same shape as a form start's record.
+            let store = state.read().await.last_command_store();
+            if let Some(store) = store
+                && store.remember_if_empty(&command) == crate::last_command::StoreOutcome::Set
+            {
+                persist_last_command(store, "seed-last-command");
+            }
+            write_resp(&mut stream, &AttachResponse::ok()).await?
+        }
     }
     Ok(())
+}
+
+/// Issue #1540: make `command` the deck's last command in memory — no I/O, so
+/// the caller may reply straight after — and write it to disk on a detached
+/// blocking task ([`persist_last_command`]). A daemon with no store installed —
+/// a test harness — records nothing. Never fails the caller: the start it
+/// follows has already been accepted.
+async fn record_last_command(state: &SharedState, command: &str) {
+    // `let … else` drops the `AppState` read guard at the end of this
+    // statement.
+    let Some(store) = state.read().await.last_command_store() else {
+        return;
+    };
+    if store.remember(command) == crate::last_command::StoreOutcome::Set {
+        persist_last_command(store, "start-agent");
+    }
+}
+
+/// Issue #1540: write the store's current value to disk on a detached blocking
+/// task, so no reply waits for the state directory. The store writes whatever
+/// value is newest when the task runs and skips one already on disk, so tasks
+/// finishing out of order cannot leave an older command on disk. A failure is
+/// logged under `verb` with the store's error, which names a path and never the
+/// command.
+fn persist_last_command(store: Arc<crate::last_command::LastCommandStore>, verb: &'static str) {
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(error) = store.persist() {
+            warn!(verb, %error, "could not persist the last command");
+        }
+    }));
 }
 
 /// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
@@ -5602,7 +6854,9 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// so a wedged client can't pin this task forever. A lagged receiver
 /// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
-/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// TUI's reconnect path resynchronizes from a snapshot of the daemon's agents
+/// to recover — [`AttachRequest::SubscribeEventsWithSnapshot`] where the daemon
+/// offers it (issue #1555), `ListAgents` otherwise.
 /// Client disconnect is detected by racing a one-byte read against
 /// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
 /// the client goes away between messages — otherwise the
@@ -5621,9 +6875,60 @@ async fn handle_subscribe_events(
     stream: IpcStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
-    let mut rx = event_tx.subscribe();
+    let rx = event_tx.subscribe();
+    forward_event_stream(stream, rx, &AttachResponse::ok()).await
+}
+
+/// Issue #1555: [`AttachRequest::SubscribeEventsWithSnapshot`]. The receiver is
+/// opened and the listing's live state is read under ONE read guard of the
+/// daemon's `AppState`, so no broadcast made under that state's write guard can
+/// fall between them. `crate::daemon::ingest_event` broadcasts and applies every
+/// hook event under its write guard, and the daemon's delivery notices are
+/// broadcast and applied under one too, so each such event is either already in
+/// the listing (sent before the receiver existed, so not on this stream) or on
+/// this stream (sent after the listing was read, so not in it) — never both.
+///
+/// The registry's records are read under the same guard, AFTER the receiver is
+/// open (Greptile and Qodo on #1577). A spawn registers its agent before it
+/// broadcasts the agent's card, and a stop removes the agent before it
+/// broadcasts the pane's end, so an agent whose broadcast came before the
+/// receiver is already in, or already gone from, the records, and one whose
+/// broadcast came after it is on the stream. Reading the records first left a
+/// window in which an agent registered between the two reads was in neither.
+/// Taking the registry's lock inside the `AppState` guard is the nesting
+/// `AppState::apply_event`'s ownership check already takes under the write
+/// guard on every event, so it adds no new lock order.
+///
+/// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
+/// built by the same calls.
+async fn handle_subscribe_events_with_snapshot(
+    stream: IpcStream,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+) -> io::Result<()> {
+    let (rx, mut records) = {
+        let guard = state.read().await;
+        let rx = event_tx.subscribe();
+        let mut records = registry.agent_records();
+        guard.attach_live_sessions(&mut records);
+        guard.attach_orchestrator_context_paths(&mut records);
+        (rx, records)
+    };
+    crate::agent_pty::attach_cli_names(&mut records);
+    forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
+}
+
+/// The forwarding loop both subscribe handlers share: confirm with `resp`, then
+/// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
+/// ends. See [`handle_subscribe_events`].
+async fn forward_event_stream(
+    stream: IpcStream,
+    mut rx: broadcast::Receiver<BroadcastMsg>,
+    resp: &AttachResponse,
+) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
-    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    write_resp(&mut wr, resp).await?;
 
     loop {
         tokio::select! {
@@ -5930,7 +7235,6 @@ async fn handle_attach_stream(
     loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
-                use std::io::Write;
                 // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
                 // just in the UI. If the focused session became non-live (a
                 // wrapped Codex pane that declared `history-only`, or a
@@ -5985,7 +7289,7 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
-                let mut w = writer.lock().await;
+                let w = writer.lock().await;
                 // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
                 // immediately before writing. A close/respawn (registry removal),
                 // a liveness transition, or a rebind can land WHILE this frame
@@ -6056,10 +7360,12 @@ async fn handle_attach_stream(
                     payload = %escape_bytes_for_log(&bytes),
                     "STREAM_IN forwarded to PTY writer"
                 );
-                if w.write_all(&bytes).is_err() {
+                // Issue #525: awaited, not written inline — the PTY is written
+                // by the pane writer's own thread, so a pane whose agent has
+                // stopped reading holds this task, never a runtime worker.
+                if w.write_user(&bytes).await.is_err() {
                     break;
                 }
-                let _ = w.flush();
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
                 // stamp the pane's deliver-on-idle debounce clock so a
                 // concurrent scheduled reuse fire queues its prompt instead of
@@ -6067,7 +7373,7 @@ async fn handle_attach_stream(
                 // key the reuse path delivers to).
                 //
                 // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
-                // released, and the `write_all` above stamps it too (the pane
+                // released, and the `write_user` above stamps it too (the pane
                 // writer observes every non-daemon byte — see
                 // `crate::agent_pty::PaneWriter`). This used to drop the writer
                 // first and stamp afterwards, and a guarded automatic sender
@@ -6114,6 +7420,97 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
+    /// daemon in reverse publication order leave the record on the newer file,
+    /// and the older one is still deleted when the orchestration ends rather
+    /// than waiting for the retention sweep.
+    #[tokio::test]
+    async fn an_out_of_order_rearm_report_is_still_removed_when_the_orchestration_ends() {
+        use crate::orchestrator_context::{
+            Attendance, prepare_orchestrator_prompt, reassert_orchestrator_prompt,
+        };
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::state::{AppState, OrchestrationIdentity};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let config = OrchestrationConfig {
+            default: false,
+            name: "loop".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let startup =
+            prepare_orchestrator_prompt(&config, &cwd, Some("TASK-ALPHA"), Attendance::Unattended)
+                .expect("published")
+                .context_path;
+        let rearm = |known: &std::path::Path| {
+            reassert_orchestrator_prompt(&config, &cwd, Some(known))
+                .expect("re-armed")
+                .context_path
+        };
+        let first = rearm(&startup);
+        let second = rearm(&first);
+        // Three publishes in one test can share a timestamp tick; date the
+        // earlier two back so their publication order is unambiguous.
+        for (path, age) in [(&startup, 120), (&first, 60)] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| {
+                    f.set_modified(
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(age),
+                    )
+                })
+                .expect("date the file back");
+        }
+
+        let identity = OrchestrationIdentity {
+            id: "a".to_string(),
+            name: "loop".to_string(),
+        };
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().await;
+            s.orchestrator_pane_ids.insert("a0".to_string());
+            s.pane_orchestration_map
+                .insert("a0".to_string(), identity.clone());
+            s.record_orchestration_context(&identity, startup.clone());
+        }
+
+        // The second re-arm's report wins the race; the first arrives after it.
+        record_rearmed_context(&state, "a0", second.to_str().unwrap())
+            .await
+            .expect("the newer report is followed");
+        record_rearmed_context(&state, "a0", first.to_str().unwrap())
+            .await
+            .expect("an older report is answered ok");
+
+        let mut s = state.write().await;
+        assert_eq!(
+            s.orchestration_context_paths.get(&identity),
+            Some(&second),
+            "an older report must not move the record back"
+        );
+        s.pane_orchestration_map.remove("a0");
+        let mut ended = s.take_ended_orchestration_context(&identity);
+        ended.sort();
+        let mut expected = vec![startup, first, second];
+        expected.sort();
+        assert_eq!(
+            ended, expected,
+            "ending the orchestration must remove every file its re-arms published, \
+             including one whose report arrived out of order"
+        );
+    }
 
     /// PRD #819 audit fix: `PrepareOrchestration` is available exactly where the
     /// publish can deliver its owner-only guarantee, and the capability list
@@ -6503,6 +7900,190 @@ mod tests {
             assert_eq!(session.agent_id.as_deref(), Some(agent_id.as_str()));
             assert_eq!(session.status, crate::state::SessionStatus::Thinking);
         }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Issue #1555: a `SubscribeEventsWithSnapshot` reply never carries an event
+    /// on its stream that its snapshot already includes, even when the
+    /// conversation rolls over while the request is in flight.
+    ///
+    /// The test sends the request itself, raw, while holding the daemon's
+    /// `AppState` write guard, and under that guard broadcasts and applies a
+    /// rollover — `gen-a` ends and `gen-b` starts — exactly as
+    /// `crate::daemon::ingest_event` does. Whichever side of the guard the
+    /// handler lands on, the rollover must be in the snapshot or on the stream,
+    /// not both. Here it lands after (the guard is held until the rollover is
+    /// done), so the snapshot must name `gen-b` and the stream's first event
+    /// must be the next one ingested. A handler that opened its receiver before
+    /// taking the guard would get the rollover on the stream as well, which is
+    /// the replay the TUI cannot tell apart.
+    ///
+    /// Greptile on #1577: such a handler must have opened its receiver before
+    /// the rollover is sent, or this would pass it. So the request goes out raw,
+    /// with no `Hello` round trip in front of it, and the rollover waits until a
+    /// new receiver appears or a second passes. A correct handler never opens one
+    /// while the guard is held, so for it the wait is the whole second; a wrong
+    /// one is a single buffered frame away from opening it.
+    ///
+    /// The same window carries an agent started while the request is in flight,
+    /// whose announcement is broadcast before the receiver opens: it must be in
+    /// the snapshot, since the stream cannot carry it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordered_subscription_never_carries_an_event_its_snapshot_includes() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+        use crate::event::EventType;
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "ordered-pane-1555";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a pane through the attach socket");
+        let event = |session: &str, event_type: EventType| crate::event::AgentEvent {
+            session_id: session.to_string(),
+            event_type,
+            agent_type: crate::event::AgentType::ClaudeCode,
+            ..thinking_event_454(pane_id, &agent_id)
+        };
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-a", EventType::SessionStart),
+        )
+        .await;
+
+        let (mut rd, mut wr) = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect for the ordered subscription")
+            .into_split();
+        let mut guard = state.write().await;
+        let receivers = event_tx.receiver_count();
+        let request = serde_json::to_vec(&AttachRequest::SubscribeEventsWithSnapshot).unwrap();
+        write_frame(&mut wr, KIND_REQ, &request)
+            .await
+            .expect("send the request");
+        let opened_by = tokio::time::Instant::now() + Duration::from_secs(1);
+        while event_tx.receiver_count() == receivers && tokio::time::Instant::now() < opened_by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for ev in [
+            event("gen-a", EventType::SessionEnd),
+            event("gen-b", EventType::SessionStart),
+        ] {
+            let _ = event_tx.send(BroadcastMsg::Event(ev.clone()));
+            guard.apply_event(ev);
+        }
+        // Greptile and Qodo on #1577: an agent started while the request is in
+        // flight, registered and then announced the way a spawn does it. Its
+        // announcement goes out before the receiver exists, so the snapshot
+        // must carry it; a handler that read the registry before taking the
+        // guard would have it in neither.
+        let late_pane = "ordered-pane-1555-late";
+        let late_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(dir.path().to_str().expect("a UTF-8 tempdir")),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), late_pane.to_string())],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the late pane");
+        let _ = event_tx.send(BroadcastMsg::Event(thinking_event_454(
+            late_pane,
+            &late_agent,
+        )));
+        drop(guard);
+
+        async fn read(rd: &mut tokio::net::unix::OwnedReadHalf) -> (u8, Vec<u8>) {
+            tokio::time::timeout(Duration::from_secs(5), read_frame(rd))
+                .await
+                .expect("the daemon answers within 5 s")
+                .expect("the frame reads")
+                .expect("the stream is open")
+        }
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).expect("a response");
+        assert!(resp.ok, "the ordered subscription opens: {:?}", resp.error);
+        let records = resp.agent_records.expect("the reply carries the snapshot");
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == late_agent && r.pane_id_env.as_deref() == Some(late_pane)),
+            "an agent announced before the receiver opened must be in the snapshot, or the \
+             client learns of it nowhere"
+        );
+        let generation = records
+            .iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|r| r.live.as_ref())
+            .and_then(|live| live.hook_generation.as_ref())
+            .map(|generation| generation.session_id.clone());
+        assert_eq!(
+            generation.as_deref(),
+            Some("gen-b"),
+            "the snapshot was read after the rollover, so it must name gen-b"
+        );
+
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-b", EventType::Thinking),
+        )
+        .await;
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_EVENT);
+        let first: BroadcastMsg = serde_json::from_slice(&payload).expect("a broadcast");
+        let BroadcastMsg::Event(first) = first else {
+            panic!("expected an event, got {first:?}");
+        };
+        assert_eq!(
+            (first.session_id.as_str(), first.event_type),
+            ("gen-b", EventType::Thinking),
+            "the stream must start after the snapshot: the rollover it includes must not \
+             follow it"
+        );
 
         registry.shutdown_all();
         server.abort();
@@ -7496,9 +9077,11 @@ mod tests {
     /// FORGES for a pane it invented cannot witness against a victim agent that
     /// sits on a different pane.
     ///
-    /// The chain this closes, and every step of it is reachable over the
-    /// unauthenticated hook socket: a `SessionStart` for an invented pane id no
-    /// registry claims auto-registers that pane into `managed_pane_ids`
+    /// The chain this closes, as it stood before issue #601 (a daemon now
+    /// records an invented pane as an outside agent's, never in
+    /// `managed_pane_ids`, but the registry check pinned here is what holds in
+    /// every process, so it stays): a `SessionStart` for an invented pane id no
+    /// registry claims auto-registered that pane into `managed_pane_ids`
     /// (`AppState::apply_event`'s startup-race escape hatch); `managed_pane_ids`
     /// is permanent, so the NEXT event for that pane is admitted by the
     /// pane-scoped ground without the generation check looking at who sent it;
@@ -7572,8 +9155,9 @@ mod tests {
             .expect("spawn the victim agent");
 
         // Step 1: the forger establishes a pane nothing owns. This is admitted
-        // (the startup-race hatch) and is the pre-existing shape the fix does
-        // not try to close.
+        // as an outside agent's card (issue #601: recorded as unproven, never
+        // in `managed_pane_ids`) and is the shape the fix does not try to
+        // close.
         state.write().await.apply_event(frame(
             invented_pane,
             "forged-generation",
@@ -7610,11 +9194,14 @@ mod tests {
                  pane's generation — this test is about what it may WITNESS, not about \
                  admission"
             );
+            // Issue #697: the invented pane is an outside agent's, and its
+            // per-pane state is forgotten once its last card is gone — so the
+            // pane-local counter no longer even keeps the forger's own count.
             assert_eq!(
                 guard.pane_generation_closures(invented_pane),
-                1,
-                "precondition: the pane-keyed counter still counts it, on the forger's own \
-                 invented pane, which is where a pane-local poison stays"
+                0,
+                "an outside pane left with no card keeps no per-pane state, so a pane-local \
+                 poison does not stay on it either"
             );
             assert!(
                 !guard.agent_generation_ended(&victim),
@@ -7735,6 +9322,8 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -7771,6 +9360,8 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -7812,6 +9403,8 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -7848,11 +9441,13 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -7873,7 +9468,7 @@ mod tests {
                         is_start_role: false,
                         orchestration_cwd: None,
                         display_title: None,
-                        orchestration_id: None,
+                        orchestration_id: Some("orch-test-0".to_string()),
                     })
                 );
             }
@@ -7898,7 +9493,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             rows: 0,
@@ -7906,8 +9501,10 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -7928,8 +9525,10 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -8045,6 +9644,7 @@ mod tests {
             SessionStatus::Error,
         ] {
             let snap = SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: status.clone(),
                 agent_type: Some(AgentType::ClaudeCode),
@@ -8058,6 +9658,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -8085,6 +9686,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: Some(SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::ClaudeCode),
@@ -8095,11 +9697,14 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -8172,6 +9777,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -8458,8 +10065,10 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: Some("claude".into()),
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
@@ -8490,6 +10099,41 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.cli_name.as_deref(), Some("claude-next"));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-6"));
+    }
+
+    /// PRD #1541: `AgentRecord.prompt_keys` is additive and optional in both
+    /// directions — the basis of the no-`PROTOCOL_VERSION`-bump decision, proven
+    /// the way `cli_name` above is. Absent means NO KEY on the wire, and an
+    /// older peer's record without it decodes to `None`, which a client reads as
+    /// "this deck sent no keys" and refuses on.
+    #[test]
+    fn prompt_keys_are_additive_and_optional_in_both_directions() {
+        let keys = crate::agent_registry::spec(&AgentType::OpenCode)
+            .prompt_keys
+            .clone()
+            .expect("OpenCode carries prompt keys");
+        let mut rec: AgentRecord =
+            serde_json::from_str(r#"{"id": "3", "pane_id_env": "pane-3"}"#).expect("decodes");
+        rec.prompt_keys = Some(keys.clone());
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.prompt_keys, Some(keys));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert_eq!(value["prompt_keys"]["interrupt"][0]["pause_after_ms"], 300);
+
+        rec.prompt_keys = None;
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("prompt_keys").is_none(),
+            "no keys must mean no key at all; got {json}"
+        );
+
+        let legacy = r#"{"id": "5", "pane_id_env": "pane-5", "cli_name": "claude"}"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(old.prompt_keys.is_none());
+        assert_eq!(old.cli_name.as_deref(), Some("claude"));
     }
 
     /// Issue #887: `AttachResponse.schedule_revision` is additive and optional
@@ -9112,6 +10756,34 @@ mod tests {
         assert_eq!(back.build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
     }
 
+    /// PRD #1487: `instance_id` is an additive optional field — the plain
+    /// `hello()` (what the static `daemon hello` probe prints) leaves it off
+    /// the wire, a reply from a daemon predating it decodes as `None`, and the
+    /// live handler's `with_instance_id` sets this process's identity.
+    #[test]
+    fn instance_id_is_additive_and_names_this_process() {
+        let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
+        assert!(
+            !plain.as_object().unwrap().contains_key("instance_id"),
+            "{plain}"
+        );
+        let legacy: AttachResponse =
+            serde_json::from_str(r#"{"ok":true,"server_version":10}"#).unwrap();
+        assert!(legacy.instance_id.is_none());
+
+        let live = AttachResponse::hello(PROTOCOL_VERSION).with_instance_id();
+        let id = live
+            .instance_id
+            .clone()
+            .expect("this process has an identity");
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        assert_eq!(daemon_instance_id(), Some(id.as_str()));
+        let back: AttachResponse =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(back.instance_id, Some(id));
+    }
+
     #[test]
     fn response_omits_build_version_when_none() {
         // PRD #103 M1.1: forward compat. An unrelated response (e.g.
@@ -9167,6 +10839,17 @@ mod tests {
         assert!(resp.server_version.is_none());
     }
 
+    /// Issue #1555 — the ordered subscription is advertised on every platform,
+    /// under its variant's `op`, per PRD #819's convention.
+    #[test]
+    fn the_ordered_subscription_is_advertised_under_its_op_name() {
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT));
+        assert_eq!(
+            serde_json::to_value(AttachRequest::SubscribeEventsWithSnapshot).unwrap()["op"],
+            CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT
+        );
+    }
+
     /// PRD #1223 — both new-agent queries are advertised on every platform, and
     /// each capability string is its variant's `op`, per PRD #819's convention:
     /// two spellings could drift, and a client would then withhold a verb the
@@ -9216,6 +10899,8 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind,
+            client_seeded_kind: None,
+            remember_command: false,
         };
         let plain = serde_json::to_value(start(None)).unwrap();
         assert!(
@@ -9606,5 +11291,856 @@ mod tests {
         );
         let neither: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(neither.into_prepared_orchestration(), None);
+    }
+
+    /// Issue #1540: the daemon records the deck's last command from a New
+    /// agent form start once it has accepted it, answers it on the options
+    /// query, and records nothing for any other start — a plain (non-form)
+    /// start, a form-marked orchestration role start, or a refused form start.
+    /// A seed only fills an empty store.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_accepted_form_start_records_the_last_command() {
+        use crate::daemon_client::{
+            DaemonClient, GatedQuery, LastCommandKeeper, StartAgentOptions,
+        };
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        // The options query reads through the shared new-agent pool; see the
+        // guard's doc for why tests that use it serialise.
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join("state").join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock.clone());
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let last_command = || async {
+            match client.new_agent_options().await.expect("options query") {
+                GatedQuery::Answered(options) => options.last_command,
+                GatedQuery::Unsupported => panic!("this build advertises the options query"),
+            }
+        };
+        let start = |command: &str, pane: &str| StartAgentOptions {
+            command: Some(command.to_string()),
+            cwd: Some(cwd.clone()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..StartAgentOptions::default()
+        };
+
+        assert_eq!(last_command().await, None, "a fresh deck has none");
+        assert_eq!(
+            client.last_command_keeper().await.unwrap(),
+            LastCommandKeeper::Daemon
+        );
+
+        // A non-form start — what `dispatch` and the CLI send — records nothing.
+        client
+            .start_agent(start("cat", "plain-1540"))
+            .await
+            .expect("plain start");
+        assert_eq!(last_command().await, None, "a non-form start never records");
+
+        // A form start records once accepted, and the next options query has it.
+        let form = client
+            .start_form_agent(start("cat -u", "form-1540"))
+            .await
+            .expect("form start");
+        assert_eq!(form.last_command, LastCommandKeeper::Daemon);
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+        // The disk write runs after the reply, on a detached task, so wait for
+        // it — bounded, since it is a small local file.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("cat -u") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recorded command never reached disk, so it would not survive a \
+                 daemon restart"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A form-marked ORCHESTRATION role start is ignored, whatever the marker.
+        let role = StartAgentOptions {
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-1540".into(),
+                role_index: 0,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: Some(cwd.clone()),
+                display_title: None,
+                orchestration_id: Some("orch-test-0".to_string()),
+            }),
+            ..start("cat -v", "role-1540")
+        };
+        client
+            .start_form_agent(role)
+            .await
+            .expect("role start is accepted");
+        assert_eq!(
+            last_command().await.as_deref(),
+            Some("cat -u"),
+            "an orchestration role start never overwrites the last command"
+        );
+
+        // A REFUSED form start (an authoring start naming no directory) records
+        // nothing.
+        let refused = client
+            .start_form_authoring_agent(
+                StartAgentOptions {
+                    cwd: None,
+                    ..start("cat -e", "refused-1540")
+                },
+                crate::authoring_seeds::AuthoringKind::Schedule,
+            )
+            .await;
+        assert!(refused.is_err(), "precondition: the start is refused");
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        // A seed does not overwrite a recorded value.
+        assert_eq!(
+            client.seed_last_command("from-session-toml").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        server.abort();
+        for record in registry.agent_records() {
+            let _ = registry.close_agent(&record.id);
+        }
+    }
+
+    /// Issue #1540: a seed fills an empty store, through the real dispatch.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_fills_an_empty_deck_through_the_dispatch() {
+        use crate::daemon_client::{DaemonClient, GatedQuery};
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+        let server = {
+            let sock = sock.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock);
+        assert_eq!(
+            client.seed_last_command("   ").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(
+            LastCommandStore::load(store_path.clone()).get(),
+            None,
+            "blank is not taken"
+        );
+        client.seed_last_command("claude").await.unwrap();
+        let GatedQuery::Answered(options) = client.new_agent_options().await.unwrap() else {
+            panic!("this build advertises the options query");
+        };
+        assert_eq!(options.last_command.as_deref(), Some("claude"));
+        // Persisted after the answer, on a detached task: wait for it, bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("claude") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seeded command never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+    }
+
+    /// PRD #1487 audit A2: a daemon serving the attach socket with a
+    /// `RestartControl` the test holds, so it can arm the handler's pause.
+    #[cfg(unix)]
+    struct RestartFixture {
+        _dir: tempfile::TempDir,
+        cwd: String,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        restart: Arc<crate::daemon_restart::RestartControl>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl RestartFixture {
+        async fn start() -> Self {
+            Self::start_with(crate::daemon_restart::InstallRecord::unresolved()).await
+        }
+
+        async fn start_with(install: crate::daemon_restart::InstallRecord) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+            let sock = dir.path().join("attach.sock");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (event_tx, _rx) = broadcast::channel(16);
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let restart = Arc::new(crate::daemon_restart::RestartControl::new(install));
+            let listener = bind_attach_listener(&sock).expect("bind the attach socket");
+            let server = {
+                let registry = registry.clone();
+                let restart = restart.clone();
+                tokio::spawn(async move {
+                    let _ = serve_attach_with_restart(
+                        listener,
+                        registry,
+                        event_tx,
+                        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        state,
+                        None,
+                        Arc::new(crate::scheduler::Scheduler::with_stderr_notifier()),
+                        crate::spawn::new_reuse_registry(),
+                        crate::issue_dispatch_run::new_worktree_registry(),
+                        restart,
+                    )
+                    .await;
+                })
+            };
+            Self {
+                cwd: dir.path().to_string_lossy().into_owned(),
+                _dir: dir,
+                sock,
+                registry,
+                restart,
+                server,
+            }
+        }
+
+        fn client(&self) -> crate::daemon_client::DaemonClient {
+            crate::daemon_client::DaemonClient::new(self.sock.clone())
+        }
+
+        /// Start a long-lived agent over the wire, as a client would.
+        async fn start_agent(&self) -> Result<String, crate::daemon_client::ClientError> {
+            self.client()
+                .start_agent(crate::daemon_client::StartAgentOptions {
+                    command: Some("cat".to_string()),
+                    cwd: Some(self.cwd.clone()),
+                    ..crate::daemon_client::StartAgentOptions::default()
+                })
+                .await
+        }
+
+        fn request(confirm: Option<RestartStopSet>) -> crate::daemon_client::RestartDaemonRequest {
+            crate::daemon_client::RestartDaemonRequest {
+                confirm,
+                expected_version: None,
+                successor: RestartSuccessor::ClientSpawns,
+            }
+        }
+
+        async fn restart(&self, confirm: Option<RestartStopSet>) -> RestartDaemonReply {
+            match self.client().restart_daemon(Self::request(confirm)).await {
+                Ok(crate::daemon_client::GatedQuery::Answered(reply)) => reply,
+                other => panic!("no restart answer: {other:?}"),
+            }
+        }
+
+        fn agent_ids(&self) -> std::collections::BTreeSet<String> {
+            self.registry
+                .agent_records()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestartFixture {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+            self.server.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    fn stop_set_ids(set: &RestartStopSet) -> std::collections::BTreeSet<String> {
+        set.agents.iter().map(|a| a.id.clone()).collect()
+    }
+
+    /// Scenario: a client confirms restarting a daemon running one agent.
+    /// Held at a barrier between the handler's check and its acceptance, a
+    /// second client tries to start an agent: it is refused with "the daemon
+    /// is restarting", so the drain stops exactly the confirmed agent and
+    /// nothing unnamed (PRD #1487 audit A2, D6).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_racing_an_accepted_restart_is_refused_not_stopped_unnamed() {
+        let fx = RestartFixture::start().await;
+        let confirmed_agent = fx.start_agent().await.expect("the confirmed agent starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let checkpoint = fx.restart.pause_before_accepting();
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm.clone()));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the handler reached its acceptance barrier");
+
+        // Between validation and acceptance: the reservation refuses the start.
+        let raced = tokio::time::timeout(Duration::from_secs(30), fx.start_agent())
+            .await
+            .expect("a refused start answers promptly");
+        let err = raced.expect_err("a start during the reservation must be refused");
+        assert!(
+            err.to_string().contains("the daemon is restarting"),
+            "the refusal says why: {err}"
+        );
+        assert_eq!(
+            fx.agent_ids(),
+            std::collections::BTreeSet::from([confirmed_agent.clone()]),
+            "nothing joined the registry behind the confirmed snapshot"
+        );
+
+        checkpoint.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Accepted {
+                stopping,
+                ..
+            })) => assert_eq!(
+                stop_set_ids(&stopping),
+                std::collections::BTreeSet::from([confirmed_agent])
+            ),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        // The handler records the acceptance just after writing it, so the
+        // reply can arrive first; wait for the record rather than race it.
+        wait_until("the handler records the acceptance", || {
+            fx.restart.is_accepted()
+        })
+        .await;
+        assert!(
+            fx.registry.is_admission_frozen(),
+            "an accepted restart keeps refusing starts until the daemon exits"
+        );
+    }
+
+    /// Scenario: a `clear = true` delegate is respawning a worker — its old
+    /// record already lifted out, the replacement not yet published — when a
+    /// client confirms a restart naming the old worker. The restart waits for
+    /// the respawn instead of snapshotting an empty pane, sees the replacement,
+    /// and asks again naming it; confirming that set is accepted with the
+    /// pane's new worker in the named set, so nothing it stops is unnamed and
+    /// no replacement is stranded (PRD #1487 re-check R2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_respawn_mid_window_is_named_by_the_restart_or_it_asks_again() {
+        let fx = RestartFixture::start().await;
+        let old = fx
+            .registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "respawning-pane".to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("the worker starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let (reached, release) = fx.registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = fx.registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .respawn_agent_for_pane("respawning-pane", "cat")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("the respawn reached its window")
+            .unwrap();
+
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !restarting.is_finished(),
+            "the restart must not answer while a pane is between workers"
+        );
+        release.send(()).unwrap();
+        let new = tokio::time::timeout(Duration::from_secs(30), respawn)
+            .await
+            .expect("the respawn finishes")
+            .unwrap()
+            .expect("the admitted respawn publishes its replacement");
+        assert_ne!(new, old);
+
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        let at_stake = match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                RestartDaemonReply::NeedsConfirmation {
+                    at_stake,
+                    stale: true,
+                },
+            )) => at_stake,
+            other => panic!("expected a fresh confirmation naming the replacement, got {other:?}"),
+        };
+        assert_eq!(
+            stop_set_ids(&at_stake),
+            std::collections::BTreeSet::from([new.clone()]),
+            "the question names the pane's replacement"
+        );
+        assert!(
+            !fx.registry.is_admission_frozen(),
+            "asking released the reservation"
+        );
+
+        match fx.restart(Some(at_stake)).await {
+            RestartDaemonReply::Accepted { stopping, .. } => {
+                assert_eq!(
+                    stop_set_ids(&stopping),
+                    std::collections::BTreeSet::from([new])
+                );
+                assert!(
+                    stopping
+                        .agents
+                        .iter()
+                        .any(|a| a.pane_id.as_deref() == Some("respawning-pane")),
+                    "the respawned pane is in the named set"
+                );
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    /// Scenario: one restart is held at its acceptance barrier — the handler
+    /// lock taken, the `Accepted` write not yet done — and a second client asks
+    /// for a restart. It is refused `InProgress` at once, without waiting for
+    /// the first request's write: the lock is only ever tried, never awaited
+    /// (PRD #1487, Qodo 4200693855).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_restart_is_refused_at_once_while_the_first_holds_the_lock() {
+        let fx = RestartFixture::start().await;
+        let checkpoint = fx.restart.pause_before_accepting();
+        let first = {
+            let client = fx.client();
+            let request = RestartFixture::request(None);
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the first handler reached its acceptance barrier");
+
+        // The first handler holds the lock and has not written its answer.
+        let second = tokio::time::timeout(Duration::from_secs(5), fx.restart(None))
+            .await
+            .expect("the second request is answered while the first still holds the lock");
+        match second {
+            RestartDaemonReply::Refused { reason, .. } => {
+                assert_eq!(reason, RestartRefusalReason::InProgress)
+            }
+            other => panic!("expected Refused(InProgress), got {other:?}"),
+        }
+        assert!(!fx.restart.is_accepted(), "the first is still unanswered");
+
+        checkpoint.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .expect("the first restart answered")
+            .unwrap();
+        assert!(
+            matches!(
+                reply,
+                Ok(crate::daemon_client::GatedQuery::Answered(
+                    RestartDaemonReply::Accepted { .. }
+                ))
+            ),
+            "the first request is accepted: {reply:?}"
+        );
+    }
+
+    /// Scenario: the client that asked for the restart goes away while the
+    /// handler is at its acceptance barrier, so the acceptance cannot be
+    /// delivered. Nothing is stopped, no restart is latched, and agents can
+    /// start again — the reservation is released (PRD #1487 audit A2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_undeliverable_acceptance_releases_the_reservation_and_stops_nothing() {
+        let fx = RestartFixture::start().await;
+        let survivor = fx.start_agent().await.expect("an agent starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let checkpoint = fx.restart.pause_before_accepting();
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the handler reached its acceptance barrier");
+        assert!(fx.registry.is_admission_frozen());
+        // The client hangs up: its end of the connection closes.
+        restarting.abort();
+        let _ = restarting.await;
+        checkpoint.resume.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while fx.registry.is_admission_frozen() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reservation was never released after a failed acceptance"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!fx.restart.is_accepted(), "no restart was latched");
+        assert!(!fx.registry.is_shutting_down(), "nothing was drained");
+        assert!(fx.agent_ids().contains(&survivor), "the agent survived");
+        let later = fx.start_agent().await.expect("agents start again");
+        assert_eq!(fx.agent_ids().len(), 2, "{later}");
+    }
+
+    /// An "installed build" for an `Installed` restart: a script answering
+    /// `--version` as a release would, after `prelude` runs.
+    #[cfg(unix)]
+    fn installed_build(dir: &std::path::Path, prelude: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("dot-agent-deck");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh\n{prelude}\necho 'dot-agent-deck 9.9.9'").unwrap();
+            f.sync_all().unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn installed_request() -> crate::daemon_client::RestartDaemonRequest {
+        crate::daemon_client::RestartDaemonRequest {
+            confirm: None,
+            expected_version: None,
+            successor: RestartSuccessor::Installed,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Scenario: a client asks an idle daemon to restart onto its installed
+    /// build, and while the daemon is still checking that build a stop
+    /// arrives over the wire. The stop goes ahead, the restart is refused as
+    /// "the daemon is stopping", and no successor is left to start after the
+    /// daemon exits (PRD #1487, Qodo 4201244680).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_during_verification_wins_over_the_restart() {
+        let bin = tempfile::tempdir().unwrap();
+        let started = bin.path().join("started");
+        let go = bin.path().join("go");
+        let prelude = format!(
+            "touch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done",
+            started.display(),
+            go.display()
+        );
+        let target = installed_build(bin.path(), &prelude);
+        let fx = RestartFixture::start_with(crate::daemon_restart::InstallRecord {
+            startup_exe: target,
+            supervisor: crate::daemon_restart::Supervisor::None,
+        })
+        .await;
+
+        let restarting = {
+            let client = fx.client();
+            tokio::spawn(async move { client.restart_daemon(installed_request()).await })
+        };
+        wait_until("the installed build is being checked", || started.exists()).await;
+
+        // A short confirmation budget: this fixture's server outlives the stop.
+        let stop = crate::daemon_stop::run_daemon_stop_over_wire_with(
+            &fx.sock,
+            false,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(30), stop)
+            .await
+            .expect("the stop answers")
+            .expect("an idle daemon accepts the stop");
+        wait_until("the stop drains the daemon", || {
+            fx.registry.is_shutting_down()
+        })
+        .await;
+        std::fs::write(&go, b"").unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Refused {
+                reason,
+                message,
+            })) => {
+                assert_eq!(reason, RestartRefusalReason::InProgress);
+                assert!(message.contains("stopping"), "{message}");
+            }
+            other => panic!("expected Refused(InProgress), got {other:?}"),
+        }
+        assert!(!fx.restart.is_accepted());
+        assert_eq!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing,
+            "no successor starts after a stop"
+        );
+    }
+
+    /// Scenario: a client's restart onto the installed build is accepted —
+    /// the reply is already on its way — and a `Stop` from the TUI arrives
+    /// before the daemon records the build to start next. The daemon just
+    /// stops: nothing is recorded, so no successor starts after it exits
+    /// (PRD #1487, Qodo 4201244680).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_after_acceptance_starts_no_successor() {
+        let bin = tempfile::tempdir().unwrap();
+        let target = installed_build(bin.path(), "");
+        let fx = RestartFixture::start_with(crate::daemon_restart::InstallRecord {
+            startup_exe: target,
+            supervisor: crate::daemon_restart::Supervisor::None,
+        })
+        .await;
+
+        let checkpoint = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAccepting);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(30),
+            fx.client().restart_daemon(installed_request()),
+        )
+        .await
+        .expect("the acceptance is written before the pause");
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Accepted {
+                successor,
+                ..
+            })) => assert_eq!(successor, RestartSuccessor::Installed),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the handler paused after accepting");
+
+        tokio::time::timeout(Duration::from_secs(30), fx.client().send_shutdown())
+            .await
+            .expect("the shutdown frame is acknowledged")
+            .expect("the shutdown frame is acknowledged");
+        wait_until("the stop drains the daemon", || {
+            fx.registry.is_shutting_down()
+        })
+        .await;
+        checkpoint.resume.notify_one();
+        wait_until("the restart handler finishes", || {
+            !fx.restart.handler_busy()
+        })
+        .await;
+
+        assert!(fx.restart.is_stop_requested());
+        assert!(!fx.restart.is_accepted(), "nothing was latched");
+        assert_eq!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing,
+            "no successor starts after a stop"
+        );
+    }
+
+    /// Scenario: the daemon has committed to a restart onto its installed
+    /// build — its successor plan is taken — when a stop arrives over the
+    /// wire. The stop is refused, saying the daemon is already restarting,
+    /// rather than acknowledged as a stop that cannot happen; nothing is
+    /// drained by it (PRD #1487, Qodo 4201540983).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_after_the_restart_is_committed_is_refused_not_acknowledged() {
+        let fx = RestartFixture::start().await;
+        assert!(
+            fx.restart
+                .mark_accepted(Some(std::path::PathBuf::from("/x/dot-agent-deck")))
+        );
+        assert_ne!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing
+        );
+
+        let stop = crate::daemon_stop::run_daemon_stop_over_wire_with(
+            &fx.sock,
+            false,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(30), stop)
+            .await
+            .expect("the stop answers")
+            .expect_err("a stop after the commit is refused");
+        assert!(
+            err.to_string().contains("already restarting"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            !fx.registry.is_shutting_down(),
+            "the refused stop drained nothing"
+        );
+        assert!(!fx.restart.is_stop_requested());
+    }
+
+    /// Scenario: the daemon has committed to a restart onto its installed
+    /// build — its successor plan is taken — when the TUI's `Stop` frame
+    /// arrives on a connection still being served. The frame is refused with
+    /// an error saying the daemon is already restarting, which the client
+    /// reports as a failed Stop, rather than acknowledged as a stop that
+    /// cannot happen; nothing is drained by it (PRD #1487 audit A1).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shutdown_frame_after_the_restart_is_committed_is_refused_not_acknowledged() {
+        let fx = RestartFixture::start().await;
+        assert!(
+            fx.restart
+                .mark_accepted(Some(std::path::PathBuf::from("/x/dot-agent-deck")))
+        );
+        assert_ne!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing
+        );
+
+        let err = tokio::time::timeout(Duration::from_secs(30), fx.client().send_shutdown())
+            .await
+            .expect("the frame is answered")
+            .expect_err("a stop after the commit is refused");
+        assert!(
+            err.to_string().contains("already restarting"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            !fx.registry.is_shutting_down(),
+            "the refused stop drained nothing"
+        );
+        assert!(!fx.restart.is_stop_requested());
+    }
+
+    /// Scenario: the daemon asks for confirmation; while the user decides, a
+    /// new agent starts — the question released the reservation, so the start
+    /// succeeds. The confirmation that arrives names only the old agent, so the
+    /// daemon asks again, naming both, and stops nothing (PRD #1487 audit A2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_started_while_the_user_decides_forces_a_fresh_confirmation() {
+        let fx = RestartFixture::start().await;
+        let first = fx.start_agent().await.expect("an agent starts");
+        let asked = match fx.restart(None).await {
+            RestartDaemonReply::NeedsConfirmation { at_stake, stale } => {
+                assert!(!stale);
+                at_stake
+            }
+            other => panic!("expected NeedsConfirmation, got {other:?}"),
+        };
+        assert!(
+            !fx.registry.is_admission_frozen(),
+            "asking releases the reservation"
+        );
+        let second = fx
+            .start_agent()
+            .await
+            .expect("a start while the user decides");
+
+        match fx.restart(Some(asked)).await {
+            RestartDaemonReply::NeedsConfirmation { at_stake, stale } => {
+                assert!(stale, "the confirmed set is stale");
+                assert_eq!(
+                    stop_set_ids(&at_stake),
+                    std::collections::BTreeSet::from([first.clone(), second.clone()])
+                );
+            }
+            other => panic!("expected a fresh confirmation, got {other:?}"),
+        }
+        assert!(!fx.restart.is_accepted());
+        assert_eq!(
+            fx.agent_ids(),
+            std::collections::BTreeSet::from([first, second]),
+            "both agents survived"
+        );
     }
 }

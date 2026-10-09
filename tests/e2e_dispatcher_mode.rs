@@ -162,30 +162,6 @@ fn path_with_binary_dir() -> String {
     )
 }
 
-/// Give the fixture repo an initial commit.
-///
-/// The harness `git init`s the copied fixture but never commits, leaving an
-/// unborn HEAD — and `git worktree add` cannot create a worktree from that. A
-/// dispatch in such a repo fails on worktree creation, so without this the
-/// dispatch path is unreachable no matter what the agent does.
-fn commit_fixture_repo(dir: &Path) {
-    // Through `common::fixture_git`, which clears the ambient git LOCATION
-    // variables — a bare `git commit` with only `.current_dir` commits into
-    // whatever an ambient `GIT_DIR` names (issue #834) — and supplies the
-    // identity by environment. `dir` is both the fixture repo and its own
-    // sandbox root: it is the harness tempdir, and nothing above it is this
-    // test's. The two `git config` writes this used to make are gone with it.
-    let run = |args: &[&str]| {
-        let out = common::fixture_git(dir, dir)
-            .args(args)
-            .output()
-            .expect("git available");
-        assert!(out.status.success(), "git {args:?} failed: {out:?}");
-    };
-    run(&["add", "-A"]);
-    run(&["commit", "-qm", "fixture baseline"]);
-}
-
 /// The sibling worktree a dispatch of `unit` must create — `../<repo>-dispatch-<unit>`.
 fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
     deck.workdir()
@@ -215,6 +191,14 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 /// Backspaces on an already-empty field are harmless, so this is unconditional
 /// rather than a flag the caller has to get right.
 fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+    open_caller_pane(deck, b"cat")
+}
+
+/// [`open_cat_caller_pane`] with the caller's Command chosen by the test. An
+/// empty `command` starts the caller with no command at all (the user's shell),
+/// which is the dispatcher a `--single` unit does NOT copy its command from
+/// (issue #1602): such a unit starts the deck's `default_command` instead.
+fn open_caller_pane(deck: &TuiDeck, command: &[u8]) -> String {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("┌ New Agent");
@@ -222,7 +206,7 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 96]); // clear whatever the config seeded
-    deck.send_keys(b"cat");
+    deck.send_keys(command);
     let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
@@ -568,13 +552,21 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // re-enter the launcher (itself named `claude`). Both agents this test brings
     // up run on it: the dispatcher, and the unit it dispatches, which inherits the
     // same `default_command`.
+    //
+    // `--allowedTools Bash` (issue #1520's lane-2 run): without it the agent's
+    // `dot-agent-deck dispatch …` call stops on Claude Code's "This command
+    // requires approval" dialog, which nothing in an unattended run answers, so
+    // all three nudges time out on a pane that has already received its seed.
+    // Measured failing 3 of 4 runs on the PR #1553 branch; both failures whose
+    // grid was captured ended on that dialog. CLAUDE.md rule 4 asks for exactly
+    // this flag.
     let real_claude = real_claude_path();
     let launcher = common::write_late_announcing_real_agent(
         staging.path(),
         LAUNCHER_LOG,
         LAUNCHER_DELAY_SECS,
         &format!(
-            "'{}' --model {HAIKU_MODEL}",
+            "'{}' --model {HAIKU_MODEL} --allowedTools Bash",
             real_claude.to_string_lossy().replace('\'', r"'\''")
         ),
     );
@@ -598,7 +590,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a real commit to branch from.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // Trust the fixture working directory so the daemon-spawned interactive
     // claude clears its first-run onboarding + per-folder trust gates without a
@@ -840,7 +832,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a commit to branch from.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // One ordinary pane, so the daemon has a registered pane (with a cwd) to
     // resolve the dispatch's caller from.
@@ -1253,7 +1245,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // `git worktree add` needs a commit to branch from — and the worktree is a
     // HEAD checkout, so this is also what puts `.dot-agent-deck.toml` (and its
     // three roles) inside the dispatched worktree at all.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // Trust BOTH the fixture dir and the dispatched WORKTREE for the interactive
     // `claude` panes, so no first-run onboarding / per-folder trust dialog can
@@ -1608,7 +1600,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         "This fixture proves the dispatched unit inspected its checkout.\n",
     )
     .expect("write the uniquely named fixture sentinel");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
@@ -1890,7 +1882,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     // Trust the dispatched WORKTREE (where the agent runs) so claude's first-run
@@ -1901,7 +1893,11 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     )
     .expect("seed Claude onboarding and project trust");
 
-    let caller_pane = open_cat_caller_pane(&deck);
+    // Issue #1602: a `--single` unit runs its dispatcher's own command, so a
+    // `cat` caller would get a `cat` unit. A caller started with NO command (a
+    // shell) is the one whose units fall back to `default_command` — the
+    // wrapper above — which is the real agent this test needs to close.
+    let caller_pane = open_caller_pane(&deck, b"");
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -2052,7 +2048,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let caller_pane = open_cat_caller_pane(&deck);
@@ -2208,7 +2204,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let caller_pane = open_cat_caller_pane(&deck);
@@ -2321,7 +2317,7 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orch-multi");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
     // The READ-ONLY half: what a dispatcher agent is shown before it chooses.

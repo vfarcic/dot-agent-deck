@@ -30,6 +30,66 @@ action = "switch_deck"
 outcome = "dispatch"
 resolved_deck = "deck-local"
 
+# Issue #1491: the selector's All daemons entry, by the phrasings users say.
+# `open_overview` changes no selection, so none of these may route there.
+[[fixtures]]
+name = "switch-deck-select-all-daemons"
+utterance = "select all daemons"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-switch-to-all-daemons"
+utterance = "switch to all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-show-all-daemons"
+utterance = "show all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-daemon-to-all"
+utterance = "switch daemon to all"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+# A one-word daemon name as speech-to-text writes it: split, with a comma, and
+# "daemon" heard as "demon" — measured from a real transcript.
+[[fixtures]]
+name = "switch-deck-mini-pc-demon"
+utterance = "Select mini PC, Demon."
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-minipc"
+
+# Issue #1491: speech-to-text glued "deck" onto the name — measured from a
+# real transcript. The model answers with the listed daemon it meant.
+[[fixtures]]
+name = "switch-deck-in-motion-deck-glued"
+utterance = "Switch to InMotionDeck"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-inmotion"
+
+# Two daemons hold "box". The instructions ask the model to answer a tie with
+# the user's words, which the app asks about; since issue #1491 its pick is not
+# held against the transcript, and the shipping model settles this tie itself,
+# on the connected box, in every run measured (7 of 7, 2026-10-03). A switch
+# stops nothing and the next one undoes it, so either answer passes — only a
+# deck outside the tie fails.
 [[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"
@@ -37,6 +97,7 @@ screen = "overview"
 action = "switch_deck"
 outcome = "param_ambiguous"
 candidates = ["deck-build-box", "deck-stale-box"]
+tie_may_be_settled = true
 
 [[fixtures]]
 name = "switch-deck-unknown"
@@ -78,6 +139,112 @@ action = "open_agent"
 outcome = "param_ambiguous"
 candidates = ["agent-atlas-one", "agent-atlas-two"]
 
+# Issue #1495 — agents named the way the user thinks about them, against the
+# `facets` fleet (`test_support::facets_fleet`): labels that say nothing about
+# what each agent is doing, so only its mode, type, directory, orchestration,
+# last prompt or start time can tell it apart. The first is the reported
+# sentence, word for word: a dispatcher whose own name is "Mercury".
+[[fixtures]]
+name = "open-agent-select-dispatcher"
+utterance = "Select Dispatcher agent."
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-go-to-dispatcher"
+utterance = "go to the dispatcher"
+screen = "deck"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-switch-to-codex"
+utterance = "switch to the Codex agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-by-directory"
+utterance = "open the agent in dot agent deck"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-by-orchestration"
+utterance = "show the reviewer in the PRD 1487 orchestration"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-review-1487"
+
+[[fixtures]]
+name = "open-agent-by-daemon"
+utterance = "open the Codex agent on the local deck"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-by-last-prompt"
+utterance = "show me the one fixing the scroll"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-newest"
+utterance = "open the newest agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-vega"
+
+# Two Claude Code agents: a tie, offered as the numbered choice.
+[[fixtures]]
+name = "open-agent-ambiguous-claude"
+utterance = "open the Claude agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "param_ambiguous"
+candidates = ["agent-mercury", "agent-vega"]
+
+# The controls: "select" with a daemon still switches the daemon, and a name
+# the screen shows still opens that agent by its label.
+[[fixtures]]
+name = "switch-deck-select-build-box-daemon"
+utterance = "select build box daemon"
+screen = "overview"
+fleet = "facets"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "open-agent-tester-by-label"
+utterance = "open tester"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
 [[fixtures]]
 name = "open-agent-unavailable"
 utterance = "zoom the tester"
@@ -86,10 +253,27 @@ action = "open_agent"
 outcome = "unavailable"
 
 [[fixtures]]
-name = "open-overview-everything"
-utterance = "show me everything"
+name = "open-overview-the-agent-dashboard"
+utterance = "show me the agent dashboard"
 screen = "deck"
 action = "open_overview"
+outcome = "dispatch"
+
+# Issue #1496 — "everything" means the WHOLE dashboard, unfiltered, which is
+# `clear_dashboard_filter`; with no filter set it opens the dashboard exactly
+# as `open_overview` did, from any screen.
+[[fixtures]]
+name = "clear-dashboard-filter-show-me-everything"
+utterance = "show me everything"
+screen = "deck"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "clear-dashboard-filter-over-an-agent-pane"
+utterance = "show me everything"
+screen = "agent"
+action = "clear_dashboard_filter"
 outcome = "dispatch"
 
 [[fixtures]]
@@ -108,7 +292,7 @@ outcome = "dispatch"
 
 [[fixtures]]
 name = "open-overview-unavailable"
-utterance = "show me everything"
+utterance = "show me the dashboard"
 # The agent screen: the one rail offers Overview on the deck and the overview
 # alike (#1197), and it is inert only behind an agent's modal pane.
 screen = "agent"
@@ -296,6 +480,16 @@ resolved_deck = "deck-local"
 [[fixtures]]
 name = "choose-deck-by-its-label"
 utterance = "deck build box"
+screen = "overview"
+dialog = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+# Issue #1491: "deck" glued onto the daemon's name, in the dialog's field.
+[[fixtures]]
+name = "choose-deck-glued-name"
+utterance = "Daemon BuildBoxDeck."
 screen = "overview"
 dialog = true
 action = "choose_deck"
@@ -601,7 +795,81 @@ screen = "deck"
 action = "dictation_off"
 outcome = "unavailable"
 
-# A switch phrase said INSIDE a sentence is not a switch. The first two go
+# Issue #1544 — the talking, speaking and dictate phrasings, one fixture each,
+# so every phrasing the mode answers has its whole-pipeline answer pinned.
+# "dictate on" / "dictate off" open with the `dictate` opener and would type
+# the word "on" / "off" if the switches were not answered ahead of it.
+[[fixtures]]
+name = "dictation-on-talking-on"
+utterance = "talking on"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-talking"
+utterance = "Start talking."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-speaking-on"
+utterance = "Speaking on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-speaking"
+utterance = "start speaking"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-dictate-on"
+utterance = "Dictate on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-talking-off"
+utterance = "Talking off."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-talking"
+utterance = "stop talking"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-speaking-off"
+utterance = "speaking off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-speaking"
+utterance = "Stop speaking, please."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-dictate-off"
+utterance = "dictate off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+# A switch phrase said INSIDE a sentence is not a switch. The first three go
 # through the local `type` opener; the last three reach the model, through an
 # opener no list holds, with a reserved phrase in the middle of what is to be
 # typed — the case where another row stealing it would be a silent wrong
@@ -617,6 +885,14 @@ dictate_prefix = "type"
 [[fixtures]]
 name = "dictate-the-word-on"
 utterance = "type the word on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-talking-on-in-passing"
+utterance = "type I was talking on the phone"
 screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"
@@ -693,6 +969,406 @@ screen = "agent"
 action = "voice_off"
 outcome = "dispatch"
 
+# PRD #1541 — the typing-mode prompt commands: interrupt the open agent's
+# turn, clear its prompt, scratch the last thing voice typed.
+#
+# **With typing mode ON (`typing_mode = true`) every phrase dispatches its
+# row**, the bare "stop" forms interrupting — decided by
+# `outcome::dictation_intercept` with no model call, so these fixtures are
+# deterministic. A sentence that merely contains one of the words, or a phrase
+# after a dictation opener, is typed whole.
+
+[[fixtures]]
+name = "typing-interrupt"
+utterance = "interrupt"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-interrupt-it"
+utterance = "interrupt it"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-interrupt-that"
+utterance = "interrupt that"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-stop"
+utterance = "stop"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-stop-it"
+utterance = "stop it"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-stop-that"
+utterance = "stop that"
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-clear-the-prompt"
+utterance = "clear the prompt"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-clear-prompt"
+utterance = "clear prompt"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-clear-it"
+utterance = "clear it"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-clear-all"
+utterance = "clear all"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-clear-everything"
+utterance = "clear everything"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-delete-everything"
+utterance = "delete everything"
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-that"
+utterance = "scratch that"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-it"
+utterance = "scratch it"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-the-last-part"
+utterance = "scratch the last part"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-the-last-sentence"
+utterance = "scratch the last sentence"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-the-last-prompt"
+utterance = "scratch the last prompt"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-delete-that"
+utterance = "delete that"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-undo-that"
+utterance = "undo that"
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-polite-interrupt"
+utterance = "Okay, interrupt it please."
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-polite-stop"
+utterance = "Stop, please."
+screen = "agent"
+typing_mode = true
+action = "interrupt_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-polite-clear"
+utterance = "Okay, clear the prompt."
+screen = "agent"
+typing_mode = true
+action = "clear_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-polite-scratch"
+utterance = "Scratch that, thanks."
+screen = "agent"
+typing_mode = true
+action = "scratch_that"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "typing-scratch-in-a-sentence"
+utterance = "we should work on the scratch feature"
+screen = "agent"
+typing_mode = true
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = ""
+
+[[fixtures]]
+name = "typing-stop-in-a-sentence"
+utterance = "stop the build when tests fail"
+screen = "agent"
+typing_mode = true
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = ""
+
+[[fixtures]]
+name = "typing-clear-in-a-sentence"
+utterance = "clear the cache please and then run it"
+screen = "agent"
+typing_mode = true
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = ""
+
+[[fixtures]]
+name = "typing-opener-scratch-that"
+utterance = "type scratch that"
+screen = "agent"
+typing_mode = true
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = ""
+
+[[fixtures]]
+name = "typing-opener-stop"
+utterance = "say stop"
+screen = "agent"
+typing_mode = true
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = ""
+
+# **With typing mode OFF, in the agent's pane**, the interrupt-only, clear and
+# scratch phrases run nothing: `outcome::local_intercept` answers them with
+# "say typing on first" (an `unavailable` outcome naming the row) before any
+# model call — also deterministic.
+
+[[fixtures]]
+name = "idle-interrupt"
+utterance = "interrupt"
+screen = "agent"
+action = "interrupt_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-interrupt-it"
+utterance = "interrupt it"
+screen = "agent"
+action = "interrupt_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-interrupt-that"
+utterance = "interrupt that"
+screen = "agent"
+action = "interrupt_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-clear-the-prompt"
+utterance = "clear the prompt"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-clear-prompt"
+utterance = "clear prompt"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-clear-it"
+utterance = "clear it"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-clear-all"
+utterance = "clear all"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-clear-everything"
+utterance = "clear everything"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-delete-everything"
+utterance = "delete everything"
+screen = "agent"
+action = "clear_prompt"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-scratch-that"
+utterance = "scratch that"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-scratch-it"
+utterance = "scratch it"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-scratch-the-last-part"
+utterance = "scratch the last part"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-scratch-the-last-sentence"
+utterance = "scratch the last sentence"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-scratch-the-last-prompt"
+utterance = "scratch the last prompt"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-delete-that"
+utterance = "delete that"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-undo-that"
+utterance = "undo that"
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-polite-scratch"
+utterance = "Okay, scratch that please."
+screen = "agent"
+action = "scratch_that"
+outcome = "unavailable"
+
+# **A bare "stop" outside typing mode is NOT intercepted** and keeps today's
+# answer: the model's `stop_agent`, which is not callable on the agent screen
+# (issue #1402 owns what it should become). NOT measured when added — no
+# `OPENAI_API_KEY` on the box that wrote them — and pinned on `stop_agent`'s
+# own `heard_as` "stop" and the `stop-the-agent` precedent; a run that finds
+# the model answering otherwise should re-pin them, as long as the answer is
+# not `interrupt_agent`.
+
+[[fixtures]]
+name = "idle-bare-stop"
+utterance = "stop"
+screen = "agent"
+action = "stop_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-bare-stop-it"
+utterance = "stop it"
+screen = "agent"
+action = "stop_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "idle-bare-stop-that"
+utterance = "stop that"
+screen = "agent"
+action = "stop_agent"
+outcome = "unavailable"
+
+# On another screen the prompt commands are the model's to answer, and the row
+# is not callable there. Model-facing, like the dictation `unavailable` pair.
+[[fixtures]]
+name = "clear-prompt-unavailable"
+utterance = "clear the prompt"
+screen = "overview"
+action = "clear_prompt"
+outcome = "unavailable"
+
 # PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
 # optional param. The bare phrase must open the dialog; a named deck must
 # resolve against the planted fleet; and the deck screen must say where the
@@ -749,9 +1425,10 @@ outcome = "dispatch"
 resolved_deck = "deck-local"
 
 # PRD #1223 — a deck that cannot take a new agent (`ci@stale-box`, not
-# connected), which the New agent dialog does not list (PR #1451 round 3). It is
-# never offered to the model, so it cannot be preselected — the harness checks
-# that on every fixture — and when the user names it the report must say in one
+# connected), which the New agent dialog does not list (PR #1451 round 3). The
+# model sees it only among `decks_without_new_agent` (issue #1491), and it is
+# never preselected — the harness checks that on every fixture — and when the
+# user names it the report must say in one
 # line that it can't take a new agent, with its short reason, rather than claim
 # a preselection the dialog will not make.
 [[fixtures]]
@@ -777,6 +1454,16 @@ outcome = "unavailable"
 [[fixtures]]
 name = "open-dir-by-name"
 utterance = "open dir billing service"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/billing-service"
+
+# Issue #1491: a listed name as speech-to-text can write it, run together.
+[[fixtures]]
+name = "open-dir-glued-name"
+utterance = "open dir BillingService"
 screen = "overview"
 listing = true
 action = "open_dir"
@@ -949,6 +1636,10 @@ name = "filter-directories-clear"
 utterance = "clear filter"
 screen = "overview"
 listing = true
+# The dialog declared too, as the app always does while its listing shows
+# (`NewAgentDialog`'s `newAgent` slot): issue #1496's `clear_dashboard_filter`
+# is withheld there, and a pick of it is redirected to this row.
+dialog = true
 action = "clear_directory_filter"
 outcome = "dispatch"
 
@@ -1510,3 +2201,216 @@ utterance = "next page"
 screen = "agent"
 action = "next_page"
 outcome = "unavailable"
+
+# Issue #1492 — scrolling the agent dashboard, which no longer splits into
+# pages while voice is on. The four rows are `overview`-only and need the New
+# agent dialog closed. "go back to the top" is a scroll, not leaving the screen.
+# "page down" / "page up" are the page rows' words, which scroll the dashboard.
+[[fixtures]]
+name = "scroll-down"
+utterance = "scroll down"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-a-bit"
+utterance = "scroll down a bit"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-go-down"
+utterance = "go down"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-down-on-the-dashboard"
+utterance = "page down"
+screen = "overview"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up"
+utterance = "scroll up"
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-go-up"
+utterance = "go up"
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-a-bit"
+utterance = "Scroll up a bit."
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-up-on-the-dashboard"
+utterance = "page up"
+screen = "overview"
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top"
+utterance = "scroll to the top"
+screen = "overview"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-go-back-to-the-top"
+utterance = "go back to the top"
+screen = "overview"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom"
+utterance = "scroll to the bottom"
+screen = "overview"
+action = "scroll_to_bottom"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-the-end"
+utterance = "scroll to the end"
+screen = "overview"
+action = "scroll_to_bottom"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-negative-over-an-agent-pane"
+utterance = "scroll down"
+screen = "agent"
+action = "scroll_down"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "scroll-negative-under-the-new-agent-dialog"
+utterance = "scroll down"
+screen = "overview"
+dialog = true
+action = "scroll_down"
+outcome = "unavailable"
+
+# Issue #1496 — the agent dashboard's filter. Each phrase from the issue
+# narrows the dashboard to a SET of agents with the facet it names, and the
+# clear phrases show the whole dashboard from any screen. The controls: one
+# agent named alone still opens its pane, and "show the dashboard" still opens
+# the dashboard without touching the filter.
+[[fixtures]]
+name = "dashboard-filter-orchestration-agents"
+utterance = "show me all orchestration agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_kind = "orchestration"
+
+[[fixtures]]
+name = "dashboard-filter-only-the-dispatchers"
+utterance = "show only the dispatchers"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_kind = "dispatcher"
+
+[[fixtures]]
+name = "dashboard-filter-working-agents"
+utterance = "show me all working agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "working"
+
+[[fixtures]]
+name = "dashboard-filter-codex-agents"
+utterance = "show Codex agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_agent_type = "codex"
+
+[[fixtures]]
+name = "dashboard-filter-agents-on-build-box"
+utterance = "show the agents on build box"
+screen = "deck"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "dashboard-filter-waiting-for-input"
+utterance = "show only agents waiting for input"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting_for_input"
+
+[[fixtures]]
+name = "dashboard-clear-show-everything"
+utterance = "show everything"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-show-everything-from-the-daemons-screen"
+utterance = "show everything"
+screen = "deck"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-show-all-agents"
+utterance = "show all agents"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-the-filter"
+utterance = "clear the filter"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-remove-the-filter"
+utterance = "remove the filter"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-reset"
+utterance = "reset"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-filter-control-see-only-the-tester"
+utterance = "see only the tester"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "dashboard-filter-control-show-the-dashboard"
+utterance = "show the dashboard"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"

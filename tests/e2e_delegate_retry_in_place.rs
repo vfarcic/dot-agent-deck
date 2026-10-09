@@ -20,6 +20,7 @@ const WORKER: &str = r#"import os
 import select
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
@@ -27,7 +28,8 @@ with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 deadline = time.monotonic() + 3.5
 while time.monotonic() < deadline:
     readable, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
@@ -185,6 +187,185 @@ fn delegate_042_retries_lost_pointer_in_the_same_worker_process() {
     assert!(common::process_running(delivered_pid as i32));
 }
 
+/// Issue #1381's worker: an OpenCode stand-in whose boot outlasts the
+/// production no-signal hold. It is deaf for at least `argv[2]` seconds from
+/// its own launch — the ~12 s a loaded box needs where the hold ships 8 s
+/// (`NO_SIGNAL_READINESS_BUFFER`'s own doc comment) — and, so that a slow
+/// runner cannot hand it the first pointer after it is already listening, until
+/// 4 s after its first input arrives. What arrives meanwhile is consumed without
+/// being acted on, as a TUI's terminal-mode switch does. It
+/// then echoes typed bytes like OpenCode's composer, and on a submitted pointer
+/// sends what a real OpenCode sends once a prompt creates its session:
+/// `session.created` then `session.prompt`, through the real hook CLI.
+const LOADED_BOOT_WORKER: &str = r#"import json
+import os
+import select
+import subprocess
+import sys
+import time
+import tty
+
+pid = os.getpid()
+started = time.monotonic()
+with open('worker-launches.log', 'a', encoding='ascii') as log:
+    log.write(f'{pid}\n')
+
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+deadline = started + float(sys.argv[2])
+first_input = None
+while first_input is None or time.monotonic() < deadline:
+    readable, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
+    if readable:
+        discarded = os.read(fd, 4096)
+        if discarded:
+            if first_input is None:
+                first_input = time.monotonic()
+                deadline = max(deadline, first_input + 4)
+            # The wall-clock time first, so a reader that sees the bytes always
+            # finds when they arrived.
+            with open('worker-discarded-at.log', 'a', encoding='ascii') as log:
+                log.write(f'{time.time():.3f}\n')
+            with open('worker-discarded.log', 'ab') as log:
+                log.write(discarded)
+
+os.write(sys.stdout.fileno(), b'Ask anything\r\n')
+line = bytearray()
+accepted = 0
+while True:
+    chunk = os.read(fd, 4096)
+    for byte in chunk:
+        if accepted:
+            with open('worker-after-accept.log', 'ab') as log:
+                log.write(bytes([byte]))
+            continue
+        if byte not in (10, 13):
+            line.append(byte)
+            os.write(sys.stdout.fileno(), bytes([byte]))
+            continue
+        if b'worker-task-coder.md' in line:
+            accepted += 1
+            with open('worker-accepted-pid.log', 'a', encoding='ascii') as log:
+                log.write(f'{pid}\n')
+            for event in ({'event': 'session.created'},
+                          {'event': 'session.prompt', 'prompt': line.decode('utf-8', 'replace')}):
+                event['session_id'] = f'loaded-boot-{pid}'
+                hook = subprocess.run([sys.argv[1], 'hook', '--agent', 'opencode'],
+                    input=json.dumps(event), text=True, capture_output=True, timeout=5)
+                if hook.returncode:
+                    raise SystemExit(hook.stderr)
+            os.write(sys.stdout.fileno(), b'\r\nDELEGATE_RETRY_LOADED_BOOT_1381\r\n')
+        line.clear()
+"#;
+
+/// Scenario: Delegate at the production timings — the 8 s no-signal hold, the
+/// default retry schedule and silence window — to an OpenCode stand-in whose
+/// boot takes 12 s and swallows the pointer typed during it (issue #1381). The
+/// same process must later accept the task exactly once and show it in its
+/// attached pane, and the orchestrator must not be told the worker went quiet.
+#[spec("orchestration/delegate/042")]
+#[test]
+fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot() {
+    let schedule = dot_agent_deck::delegate_retry::DEFAULT_RETRY_SCHEDULE_MS
+        .map(|ms| ms.to_string())
+        .join(",");
+    let command = format!(
+        "python3 -u worker.py {} 12",
+        env!("CARGO_BIN_EXE_dot-agent-deck")
+    );
+    // The harness pins all three to off; an empty buffer and silence window
+    // are not a number, so the daemon falls back to its production defaults
+    // for both. An empty schedule means "disabled", so the default is spelled
+    // out from the shipped constant; that an unset variable resolves to it is
+    // pinned at L1 by `retry_schedule_unset_is_the_default`.
+    let (deck, work, delivered_pid) = launch_retry_fixture_with_timings(
+        LOADED_BOOT_WORKER,
+        &command,
+        "opencode",
+        &[
+            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", ""),
+            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", &schedule),
+            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", ""),
+            // The hold's own debug line names the interval it resolved.
+            ("RUST_LOG", "dot_agent_deck::state=debug"),
+        ],
+    );
+
+    let discarded = work.join("worker-discarded.log");
+    assert!(
+        common::wait_until(Duration::from_secs(20), || std::fs::read(&discarded)
+            .is_ok_and(|bytes| pointer_count(&bytes) >= 1)),
+        "precondition: the first pointer never landed inside the 12 s boot; discarded={:?}; grid:\n{}",
+        String::from_utf8_lossy(&std::fs::read(&discarded).unwrap_or_default()).into_owned(),
+        deck.snapshot_grid()
+    );
+    // The production hold was in force, by the daemon's own account: the
+    // declared-no-signal path logs the interval it resolved before it waits.
+    let daemon_log = std::fs::read_to_string(work.join("retry-loop.log")).unwrap_or_default();
+    assert!(
+        daemon_log.lines().any(|line| line
+            .contains("holding the task prompt for the no-signal readiness buffer")
+            && line.contains("buffer_ms=8000")),
+        "precondition: the daemon did not hold the pointer for the shipped 8000 ms no-signal buffer; daemon log:\n{daemon_log}"
+    );
+    // And the bytes really arrived that late. The baseline is taken just
+    // before the delegate CLI starts, so this is a sanity bound, not a
+    // measurement of the hold: 7.5 s leaves room for clock granularity.
+    let delegated_at: f64 = std::fs::read_to_string(work.join("delegate-sent-at.log"))
+        .expect("fixture logged when it sent the delegate")
+        .trim()
+        .parse()
+        .expect("numeric delegate time");
+    let lost_at: f64 = std::fs::read_to_string(work.join("worker-discarded-at.log"))
+        .expect("worker logged when it discarded input")
+        .lines()
+        .next()
+        .and_then(|line| line.parse().ok())
+        .expect("numeric discard time");
+    let held = lost_at - delegated_at;
+    assert!(
+        held >= 7.5,
+        "precondition: the pointer arrived {held:.3}s after the delegate was sent, so the 8 s no-signal hold was not in force"
+    );
+
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.send_bytes(b"2");
+    let proof_visible = deck
+        .wait_for_grid_string_within("DELEGATE_RETRY_LOADED_BOOT_1381", Duration::from_secs(75));
+    assert!(
+        proof_visible,
+        "the worker lost the pointer typed during its boot and it never reached the booted worker; discarded={:?}; accepted={:?}; grid:\n{}",
+        String::from_utf8_lossy(&std::fs::read(&discarded).unwrap_or_default()).into_owned(),
+        std::fs::read_to_string(work.join("worker-accepted-pid.log")).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+    // The turn it reported stops the retry; nothing may reach it after that.
+    wait_for_retry_loop_end(&work);
+    assert_eq!(
+        std::fs::read_to_string(work.join("worker-accepted-pid.log"))
+            .expect("accepted PID log")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![delivered_pid.to_string()],
+        "the booted worker must accept the task exactly once, in the process that lost the first pointer"
+    );
+    let after_accept = std::fs::read(work.join("worker-after-accept.log")).unwrap_or_default();
+    assert!(
+        after_accept.is_empty(),
+        "input reached the worker after it accepted the task: {:?}",
+        String::from_utf8_lossy(&after_accept)
+    );
+    assert!(
+        !orchestrator_text(&deck)
+            .contains(&common::squeeze_wrapped_text("delegated worker went quiet")),
+        "a recovered delegation was reported to the orchestrator as silent; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert_eq!(launch_pids(&work.join("worker-launches.log")).len(), 2);
+    assert!(common::process_running(delivered_pid as i32));
+}
+
 const NEVER_READS_WORKER: &str = r#"import os
 import time
 
@@ -197,13 +378,15 @@ while True:
 const COMPOSER_WORKER: &str = r#"import os
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 first_submit = None
 while True:
@@ -274,14 +457,17 @@ while True:
                         log.write(f'{(timestamp - accepted_at) / 1_000_000:.3f} {received_byte:02x}\n')
                     log.write('ACCEPT 0\n')
                 before_accept.clear()
-                if sys.argv[2] == 'claude':
-                    turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
-                        input=json.dumps({'hook_event_name': 'UserPromptSubmit',
-                            'session_id': f'ready-composer-{pid}',
-                            'prompt': line.decode('utf-8', 'replace')}),
-                        text=True, capture_output=True, timeout=5)
-                    if turn.returncode:
-                        raise SystemExit(turn.stderr)
+                # Both agents report the submitted turn through their native
+                # prompt hook. The wrapper's reading of a Codex pane's output is
+                # not evidence of a turn (issue #1493), so the line printed below
+                # cannot stand in for it.
+                turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
+                    input=json.dumps({'hook_event_name': 'UserPromptSubmit',
+                        'session_id': f'ready-composer-{pid}',
+                        'prompt': line.decode('utf-8', 'replace')}),
+                    text=True, capture_output=True, timeout=5)
+                if turn.returncode:
+                    raise SystemExit(turn.stderr)
                 with open('worker-accepted-pid.log', 'w', encoding='ascii') as log:
                     log.write(str(pid))
                 os.write(sys.stdout.fileno(), b'\r\nREADY_COMPOSER_SUBMITTED_1383\r\n')
@@ -296,13 +482,19 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW, not setraw's default TCSAFLUSH: this worker announces no readiness,
+# so on a slow start the pointer can arrive before this line runs, and a flush
+# would throw it away while its echo stays on screen. That is not the scenario
+# under test (delegate_042's worker models a swallowed pointer on purpose), and
+# it failed this test on a starved machine with only the Enter probes received.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 while True:
     chunk = os.read(fd, 4096)
@@ -347,13 +539,33 @@ fn launch_retry_fixture_for_agent(
     schedule: &str,
     silence_window: &str,
 ) -> (TuiDeck, PathBuf, u32) {
-    let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .with_pty_size(120, 40)
-        .with_env("DOT_AGENT_DECK_LOG", "retry-loop.log")
-        .with_env("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "200")
-        .with_env("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", schedule)
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", silence_window)
+    launch_retry_fixture_with_timings(
+        worker,
+        worker_command,
+        agent,
+        &[
+            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "200"),
+            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", schedule),
+            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", silence_window),
+        ],
+    )
+}
+
+fn launch_retry_fixture_with_timings(
+    worker: &str,
+    worker_command: &str,
+    agent: &str,
+    timings: &[(&str, &str)],
+) -> (TuiDeck, PathBuf, u32) {
+    let deck = timings
+        .iter()
+        .fold(
+            TuiDeck::builder()
+                .impersonating_pane_signals()
+                .with_pty_size(120, 40)
+                .with_env("DOT_AGENT_DECK_LOG", "retry-loop.log"),
+            |builder, (key, value)| builder.with_env(*key, *value),
+        )
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let work = deck.workdir().to_path_buf();
@@ -404,6 +616,12 @@ fn launch_retry_fixture_for_agent(
         })
         .expect("orchestrator role has a daemon record");
     let orchestrator_pane = orchestrator.pane_id_env.expect("orchestrator pane id");
+    let sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64();
+    std::fs::write(work.join("delegate-sent-at.log"), format!("{sent_at:.3}"))
+        .expect("record when the delegate was sent");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["delegate", "--to", "coder", "--task", "check the pointer"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())

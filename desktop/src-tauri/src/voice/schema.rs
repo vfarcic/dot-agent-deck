@@ -115,28 +115,43 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     `agents_on_screen` carries each agent's LIVE state as the daemon holds it: \
     `status` is the daemon's own word for what it is doing (`working`, `thinking`, \
     `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
-    `tool` is what it is running right now. A user refers to an agent by state as \
-    readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
-    resolve such a reference against those fields and answer with that agent's \
-    `label`. For a reference the user made by name, answer with the words the user \
-    used and let the app resolve them. `decks` lists every daemon a new agent \
-    can be started on, named the way the screen names it; a `deck_ref` param is a \
-    reference to one of those daemons — \"local\" means this machine's, and a user \
-    may still call a daemon a deck — and is \
-    answered with the words the user used for it, never with an agent. \
-    `switch_deck`'s `deck_ref` is the one exception to \"one of those daemons\": it may \
-    name any daemon the user has configured, listed there or not, and is answered with \
-    the user's words all the same. A param marked \
+    `tool` is what it is running right now. It also carries what the deck knows \
+    about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
+    working directory's name), `orchestration` (its run's title) and `newest_rank` \
+    (1 is the agent that started last); `agents_daemon` is the daemon they are all \
+    on. A user refers to an agent by state as readily as by name — \"the one that \
+    is stuck\" — so resolve such a reference against those fields and answer with \
+    that agent's `label`. For an agent the user named by mode, agent type, \
+    directory, orchestration, daemon, start order or what it was asked to do — \
+    \"the dispatcher\", \"the Codex agent\", \"the one in billing\", \"the newest \
+    agent\", \"the one fixing the scroll\" — answer with the words the user used \
+    and let the app resolve them; the app matches a task against each agent's \
+    last prompt itself. \
+    A param that names an entry of a list below — a daemon, a \
+    directory, a Mode chip, an agent type or an orchestration — is answered, \
+    when the user named the entry, with its name exactly as listed, even when \
+    the transcript spells it differently: split or run together (\"mini PC\" for \
+    `minipc`, \"InMotionDeck\" for `inmotion`), with punctuation, or misheard \
+    (\"demon\" for daemon). When their words fit more than one entry, or none, \
+    or the list is not shown, answer that param with the words the user used \
+    for it, and the app asks which or says so. Every other param follows its \
+    own description. \
+    `decks` lists every daemon the Daemon selector shows, named the way the \
+    screen names it, and `decks_without_new_agent` the ones among them a new \
+    agent cannot be started on; a `deck_ref` param is a reference to one of \
+    those daemons — \"local\" means this machine's, and a user may still call a \
+    daemon a deck — never to an agent. When the user names a daemon in \
+    `decks_without_new_agent` for a new agent, still answer with it: the app \
+    tells them why a new agent cannot start there. A param marked \
     `optional` is left out when the user named nothing for it. `directories`, \
     when present, is the New agent dialog's directory browser: `entries` are the \
-    directories on screen, and a `dir_ref` param names one of THOSE, answered with \
-    the words the user used for it. `new_agent_form`, when present, is the New \
+    directories on screen, and a `dir_ref` param names one of THOSE. \
+    `new_agent_form`, when present, is the New \
     agent dialog's form: `modes` are the Mode chips it offers and `agent_types` \
     the agents whose default command it can put in Command, and a `mode_ref` or `agent_type_ref` param \
-    names one of THOSE, answered with the words the user used for it. \
+    names one of THOSE. \
     `orchestrations` lists the orchestrations among those agents by `title`, with \
-    their roles; an `orchestration_ref` param names one of them, answered with the \
-    words the user used for it. When the user refers to a daemon, a directory or an \
+    their roles; an `orchestration_ref` param names one of them. When the user refers to a daemon, a directory or an \
     orchestration by its position or by what kind of thing it is rather than by a \
     word of its name — \"the first one\", \"the remote daemon\", \"the other run\" — \
     answer with that entry's name exactly as listed. When the user's words could mean closing a VIEW \
@@ -144,7 +159,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     action that stops nothing, and pick a stop only for words that can only mean \
     stopping. An action that stops something only ASKS: the app shows a \
     confirmation and the user confirms by hand, so pick it whenever the user \
-    asked to stop, however urgently. Write no prose; the app writes what the \
+    asked to stop, however urgently. Words that start something — launch, start, \
+    create, run — never ask to stop, however urgently they are said. Write no prose; the app writes what the \
     user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -344,6 +360,8 @@ mod tests {
             vec![
                 "open_agent".to_string(),
                 "open_overview".to_string(),
+                "filter_dashboard".to_string(),
+                "clear_dashboard_filter".to_string(),
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
@@ -354,6 +372,9 @@ mod tests {
                 "dictation_on".to_string(),
                 "dictation_off".to_string(),
                 "submit_prompt".to_string(),
+                "interrupt_agent".to_string(),
+                "clear_prompt".to_string(),
+                "scratch_that".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
@@ -362,6 +383,10 @@ mod tests {
                 "clear_directory_filter".to_string(),
                 "next_page".to_string(),
                 "previous_page".to_string(),
+                "scroll_down".to_string(),
+                "scroll_up".to_string(),
+                "scroll_to_top".to_string(),
+                "scroll_to_bottom".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -422,6 +447,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -432,6 +459,9 @@ mod tests {
                 "dictation_on",
                 "dictation_off",
                 "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
@@ -440,6 +470,10 @@ mod tests {
                 "clear_directory_filter",
                 "next_page",
                 "previous_page",
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -610,6 +644,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
@@ -622,6 +658,9 @@ mod tests {
                 ("dictation_on".to_string(), false),
                 ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("interrupt_agent".to_string(), false),
+                ("clear_prompt".to_string(), false),
+                ("scratch_that".to_string(), false),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -632,6 +671,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), true),
                 ("previous_page".to_string(), true),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), false),
+                ("scroll_up".to_string(), false),
+                ("scroll_to_top".to_string(), false),
+                ("scroll_to_bottom".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -650,6 +694,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 // The shared rail offers Settings from the overview too.
@@ -663,6 +709,9 @@ mod tests {
                 ("dictation_on".to_string(), false),
                 ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("interrupt_agent".to_string(), false),
+                ("clear_prompt".to_string(), false),
+                ("scratch_that".to_string(), false),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -673,6 +722,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), true),
                 ("previous_page".to_string(), true),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), true),
+                ("scroll_up".to_string(), true),
+                ("scroll_to_top".to_string(), true),
+                ("scroll_to_bottom".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -693,6 +747,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), false),
                 ("open_overview".to_string(), false),
+                ("filter_dashboard".to_string(), false),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), false),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), false),
@@ -703,6 +759,9 @@ mod tests {
                 ("dictation_on".to_string(), true),
                 ("dictation_off".to_string(), true),
                 ("submit_prompt".to_string(), true),
+                ("interrupt_agent".to_string(), true),
+                ("clear_prompt".to_string(), true),
+                ("scratch_that".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -713,6 +772,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), false),
                 ("previous_page".to_string(), false),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), false),
+                ("scroll_up".to_string(), false),
+                ("scroll_to_top".to_string(), false),
+                ("scroll_to_bottom".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

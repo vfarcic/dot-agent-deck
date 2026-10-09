@@ -51,7 +51,7 @@ A daemon the deck starts in the background also writes its standard output and e
 
 The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64); there is no Windows build.
 
-The app connects to a daemon you started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so start that daemon with logging on:
+Start the daemon yourself with logging on, rather than with the app's **Start daemon** (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)):
 
 1. If a daemon is already running, stop it with `dot-agent-deck daemon stop`. It refuses while agents are running, so finish or close them first; see [Recycling the daemon](#recycling-the-daemon).
 2. Start a daemon with the variable set, in a terminal:
@@ -121,7 +121,7 @@ Hooks are how an agent tells the deck what it is doing: prompts, tool use, waiti
 | Devin | `devin` is on the `PATH` | a `"hooks"` object in `$XDG_CONFIG_HOME/devin/config.json` (when `XDG_CONFIG_HOME` is an absolute path), else `~/.config/devin/config.json` |
 | Pi | `pi` is on the `PATH` | no hooks; the daemon writes the deck's Pi extension to `$PI_CODING_AGENT_DIR/extensions/dot-agent-deck` (default `~/.pi/agent/extensions/dot-agent-deck`) when it starts. `dot-agent-deck orchestrator setup` does the same on demand |
 
-Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
+Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. For Claude Code, an install also removes the deck's entries from hook types it no longer installs, such as `StopFailure` after Claude Code is downgraded below 2.1.78. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
 
 On Windows, `$HOME` is usually unset, so Codex hooks are installed only when `CODEX_HOME` is set.
 
@@ -181,7 +181,7 @@ A hook command whose binary still **exists** is left alone, even when it names a
 
 `dot-agent-deck hooks install` or `hooks uninstall` fails with one of:
 
-- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. Fix the syntax and run the install again. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
+- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. If a `<name>.bak` already exists, for example a copy you made before editing, the deck leaves it alone and the message says `original not copied: <path>.bak already exists and was left as it was` instead. Fix the syntax and run the install again; the command exits with a non-zero status until it succeeds. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
 - `<path> is a symlink (left unchanged): …` — the config is a symbolic link, as in a dotfiles setup. The deck neither replaces the link nor writes through it. Point it at a regular file, or add the deck's hooks to the linked file yourself.
 
 At startup the same problems are logged instead of printed, and the hooks are not installed.
@@ -190,14 +190,25 @@ At startup the same problems are logged instead of printed, and the hooks are no
 
 Codex only runs hooks it trusts. The deck records trust for its own hook entries, and only those, in the Codex home's `config.toml`, at startup and whenever it starts a Codex pane. This does not depend on how you launch Codex, so a launcher (`devbox run codex-big`, a script, an alias) needs nothing added.
 
-If a Codex card shows only coarse status with no tool or prompt detail, check in this order:
+If a Codex card never shows a tool, a prompt or **Needs Input**, its hooks are not running. You see one of two things. Usually the card shows **Thinking** while Codex's screen is changing and **Idle** once it has been still for a few seconds (in the desktop app, **running** and then **waiting**; [Which agents report which status](session-management.md#which-agents-report-which-status)). If instead it stays **Idle** (**waiting** in the desktop app) even while Codex works, start with step 2. Check in this order:
 
 1. **Is `codex` on the daemon's `PATH`?** The install is skipped when it is not. `$SHELL -ilc 'command -v codex'` should print a path; if you installed Codex after the daemon started, restart the daemon ([Recycling the daemon](#recycling-the-daemon)).
-2. **Does your launcher change `CODEX_HOME`?** The deck sets `CODEX_HOME` on the Codex process it starts, to the home it installed into. A script that re-exports `CODEX_HOME` before running `codex` points Codex at a home without the deck's hooks. Remove the re-export, or make it the same home (`$CODEX_HOME`, else `~/.codex`).
+2. **Does your launcher change `CODEX_HOME`?** The deck sets `CODEX_HOME` on the Codex process it starts, to the home it installed into. A script that re-exports `CODEX_HOME` before running `codex` points Codex at a home without the deck's hooks. The deck cannot tell that this happened, so the card stays **Idle** in the TUI (**waiting** in the desktop app) even while Codex works. Remove the re-export, or make it the same home (`$CODEX_HOME`, else `~/.codex`).
 3. **Run the install by hand** to see errors the startup install only logs: `dot-agent-deck hooks install --agent codex`. Then check with [the Codex listing command](#checking-that-hooks-are-installed).
 4. **Approve the hooks in Codex** as a fallback: run Codex once and approve the deck's hooks in its `/hooks` review. Codex remembers that trust.
 
 Trust is tied to each hook's exact content. If a hook definition changes after trust was recorded, Codex refuses to run it and the card falls back to coarse status; running the install again records trust for the new content.
+
+Codex keeps those trust records under `[hooks.state]` in its `config.toml`, one per hook position in `hooks.json`. When the deck's hook moves to a different position, the deck removes the record it left at the old one the next time it records trust. It never removes a record for one of your own hooks, for another Codex home's hooks, or for a position Codex still lists, and it removes nothing while Codex reports a warning or an error about your hook files.
+
+**If you turn off one of the deck's hooks** in Codex's `/hooks` list, the deck leaves it off: it keeps recording trust for it, but Codex reports nothing through it, so the agent's card (TUI) or row (desktop) is missing that hook's detail. This is the same in the TUI and the desktop app. `dot-agent-deck hooks install --agent codex` names every deck hook that is turned off, for example:
+
+```text
+Trusted hooks: 10
+Note: the deck's Codex hook for PreToolUse is turned off in Codex's /hooks list, so Codex reports nothing through it. The deck leaves it off; turn it back on in Codex's /hooks list to restore that detail.
+```
+
+The deck's log also records a warning naming those hooks each time the deck records trust. To get the detail back, turn the hook on again in Codex's `/hooks` list.
 
 While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, Codex cannot confirm to the deck that it received an automatic prompt (the first prompt of a dispatcher or a schedule-authoring agent, an orchestration role's first task, a dispatched unit's task). The deck then types such a prompt once and does not retype it, so the prompt can go missing. Fixing trust fixes that as well.
 
@@ -289,7 +300,21 @@ To move to the new version, let the daemon restart: finish or stop your agents a
 
 *Applies to the TUI.*
 
-When the upgrade changed the attach protocol, the new TUI cannot attach to the older daemon at all. The mismatch prompt says `This binary cannot attach to it`, and its second option becomes `exit, leaving the daemon running`; declining (or running without a terminal) prints `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. Either attach with the build that started that daemon to keep the agents, or stop it (`dot-agent-deck daemon stop`, which stops the agents too) and relaunch. See [Installation](installation.md) for upgrading. The same prompt appears on `dot-agent-deck connect <remote>` after `remote upgrade` changed the protocol: press `S` to restart the remote's daemon (which stops its agents), or return to the version those agents run with `dot-agent-deck remote upgrade <remote> --version <old version>`.
+When the upgrade changed the attach protocol, the new TUI cannot attach to the older daemon at all. The mismatch prompt says `This binary cannot attach to it`, and its second option becomes `exit, leaving the daemon running`; declining (or running without a terminal) prints `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. Either attach with the build that started that daemon to keep the agents, or stop it (`dot-agent-deck daemon stop`, which stops the agents too) and relaunch. See [Installation](installation.md) for upgrading. The same prompt appears on `dot-agent-deck connect <remote>` when an upgrade that changed the protocol installed the new release but kept the remote's daemon running: press `S` to restart the remote's daemon (which stops its agents), or return to the version those agents run with `dot-agent-deck remote upgrade <remote> --version <old version>`.
+
+### An upgrade installed the new release but the daemon still runs the old one
+
+*Applies to the TUI, the CLI and the desktop app.*
+
+`dot-agent-deck remote upgrade <remote>`, `connect`'s upgrade offer and the desktop app's **Upgrade** install the new release and then restart the remote's daemon onto it. When the result says the new release is installed but the daemon keeps running, the reason is in the same message:
+
+- **You kept it, or nobody could answer.** Agents or orchestration roles were running, and you chose **Keep current daemon**, or the command ran without a terminal. Upgrade again when they have finished, and choose **Restart now** if you are ready to stop them.
+- **`… is too old to restart itself`.** The daemon was started by a release that cannot be asked to restart. Run `dot-agent-deck connect <remote>`: the TUI on the host restarts the older daemon, asking first when agents are running.
+- **`… did not answer within 20s`.** The old daemon stopped and the new one did not come up in time. Run `dot-agent-deck connect <remote>`, which starts one. If a systemd user service runs the daemon on the host, systemd normally starts the new one itself; check that the unit keeps `Restart=on-failure` and run `systemctl --user restart dot-agent-deck.service` there. When the message adds `it is still the daemon that was asked to restart`, the old daemon agreed to restart but never stopped: run the upgrade again, or run `dot-agent-deck daemon restart` on the host.
+- **`… was replaced, but the new binary did not pass its version check`.** The upgrade failed while installing, after the new binary was already in place, so the host no longer has the old one; the message names what it has now, a version or `an unverified build`. The daemon keeps running. Run the upgrade again, and if the check keeps failing, run the binary the message names with `--version` on the host to see what it reports.
+- **`… is too old to restart it from here`.** You installed an older release with `--version`, one from before the deck could restart a daemon during an upgrade. The daemon keeps running. Run `dot-agent-deck connect <remote>`: the TUI on the host restarts the daemon onto the older release, asking first when agents are running.
+
+[Remote Environments → When the upgrade cannot restart the daemon](remote-environments.md#when-the-upgrade-cannot-restart-the-daemon) lists every result with its fix, and [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon) shows how the desktop app words them.
 
 ## Orchestration and delegation
 
@@ -328,6 +353,20 @@ DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck
 ```
 
 An accepted `work-done` or `dispatch` means the daemon admitted the message, not that the work behind it succeeded.
+
+### An agent's card stops updating, and the daemon log says `refused a status event`
+
+An agent the deck started keeps working in its pane, but its card stays on an old status, and the daemon's log ([Enabling Debug Logs](#enabling-debug-logs) says how to turn it on) has a line like:
+
+```text
+hook socket: refused a status event whose hook capability token does not attest the pane it names … reason="missing_token"
+```
+
+The status updates that drive a card carry the same token as the commands in the entry above, and the daemon refuses an update that names a pane it started without that pane's token. The reasons and fixes are the ones in that table: `missing_token` almost always means the `dot-agent-deck` on the pane's `PATH` is older than the daemon, so [recycle the daemon](#recycling-the-daemon) from the binary on your `PATH`, or start the daemon with `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` to accept the updates with a warning. `token_names_another_agent` means the update carried this pane's token but named a different agent than the one the deck started there; run the agent with the environment the deck gave it. `token_generation_replaced` means the update named no agent and carried the token of an agent the deck has since replaced in that pane, usually a leftover process of the previous agent that is still running; the card keeps following the current agent, and stopping the leftover process ends the log lines.
+
+If an agent was restarted in its pane and its card keeps showing the previous agent, with no such line in the log, the new agent's updates are not saying which agent sent them: make sure `DOT_AGENT_DECK_AGENT_ID` is still set in the agent's environment (a wrapper script that resets the environment drops it), or detach and reattach the deck (in the desktop app, reconnect to the daemon) to refresh its cards.
+
+Agents you start yourself, outside the deck, need no token: their updates are accepted and, in the TUI, they get a card of their own. The desktop app lists only the agents the deck started, so such an agent has no card there (see [Agents the deck did not start](session-management.md#agents-the-deck-did-not-start)).
 
 ### An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
 
@@ -437,6 +476,16 @@ If a pane stays smaller than its box with no other client open, check for a `dot
 
 When an agent's size changes, the daemon discards the output history it keeps for clients that attach later, because that output was drawn for the old size and would replay garbled. Only a client that attaches or re-attaches after the change is affected: it gets the correct live screen with no history behind it. A client that was already attached keeps its own scrollback. In practice you see this when you open an agent's pane in the desktop app after the agent was resized, or when a pane reconnects. Switching between two clients whose panes differ in size resizes the agent, so each switch discards the history again (switches within about a quarter of a second count as one). The history fills back in as the agent keeps working.
 
+### Card borders or right edges look misaligned in the TUI
+
+If card and pane borders are broken or shifted, a card's bottom-right corner is painted over, or text in card titles runs into the border, check whether your terminal is set to draw "ambiguous-width" characters two columns wide. The lines the deck draws borders with, and the `·`, `…` and `—` it uses in card titles and messages, are such characters, and the TUI expects them to be one column wide. That setting is not supported, so turn it off:
+
+- **iTerm2:** Settings → Profiles → Text, clear **Ambiguous characters are double-width**.
+- **GNOME Terminal:** Preferences → your profile → Compatibility, set **Ambiguous-width characters** to **Narrow**.
+- **Other terminals:** look for a setting with "ambiguous" or "East Asian width" in its name.
+
+The borders should line up again. If they are still off, quit the TUI, choosing **Detach** so your agents keep running, and start it again. The desktop app is not affected by this setting.
+
 ## Configuration and schedules
 
 ### A setting or environment variable has no effect
@@ -503,7 +552,7 @@ It tells apart two causes whose ssh error messages are identical: `AllowTcpForwa
 
 *Applies to the desktop app.*
 
-- **Daemon disconnected** (`No daemon is listening on the configured socket.`): no daemon answered. Start one as described in [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon), then press **Reconnect**. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
-- **Incompatible daemon** (for example `This daemon is older than this app, and the two cannot work together.`): the daemon and the app are different versions, usually after upgrading one of the two, and the message says which one is older. Update that one so both run the same version (for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary) and press **Reconnect**. When the message says the app has not connected because it could misread what the daemon reports, the app also offers **Connect anyway**, which uses the daemon as it is until you quit the app. **Technical details** under the message shows the exact versions. If it still cannot connect, for example because the daemon stopped answering in the meantime, the daemon's card says why and what to do next.
+- **Daemon disconnected**: the app is not connected to that daemon, and the sentence under the title says why. When it says no daemon is running there, press **Start daemon**; otherwise press **Reconnect**. [Daemons → Start a daemon from the app](desktop/daemons.md#start-a-daemon-from-the-app) lists what a failed start says and what to do. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
+- **Incompatible daemon** (for example `This daemon is older than this app, and the two cannot work together.`): the daemon and the app are different versions, usually after upgrading one of the two, and the message says which one is older. Update that one so both run the same version and press **Reconnect**: for a remote daemon older than the app, press **Upgrade** in the message, which installs the app's version there and restarts the daemon, asking before it stops any running agent ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)); for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary. When the message says the app has not connected because it could misread what the daemon reports, the app also offers **Connect anyway**, which uses the daemon as it is until you quit the app. **Technical details** under the message shows the exact versions. If it still cannot connect, for example because the daemon stopped answering in the meantime, the daemon's card says why and what to do next.
 
 See [Daemons](desktop/daemons.md) for adding and testing daemons in the app.

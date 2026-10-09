@@ -235,13 +235,16 @@ mod tests {
             live,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
     fn snapshot(status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status,
             agent_type: None,
@@ -252,6 +255,7 @@ mod tests {
             live_target: None,
             last_activity_ms: None,
             blocked: None,
+            hook_generation: None,
         }
     }
 

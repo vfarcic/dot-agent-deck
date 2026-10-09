@@ -34,6 +34,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |
 | `agent-pane` | desktop | Agent pane over the Dashboard, showing a fixed implementation transcript. |
 | `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
+| `daemon-upgrade` | desktop | The Upgrade dialog on the `upgrade` fixture's `dev@build-box` deck, an older remote release with agents running, stopped at the restart question listing them (PRD #1487). The fixture bridge walks the stages; nothing is installed. |
 | `settings-voice` | desktop | Voice settings. |
 | `voice-typing-mode` | desktop | Agent pane with voice typing mode on, entered through the fixture's scripted microphone (`?voice=type%20on`). |
 | `voice-choice` | desktop | Dashboard with the numbered voice choice dialog open over two agents, centred above the screen with its countdown, and the voice row below saying what was heard; entered through the fixture's scripted microphone (`?voice=open%20the%20agent`). |

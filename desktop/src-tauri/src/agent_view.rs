@@ -437,8 +437,10 @@ mod tests {
             live: None,
             spawned_at_ms: Some(1_700_000_000_000),
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -640,6 +642,7 @@ mod tests {
         let mut paneless = record("3", "unused");
         paneless.pane_id_env = None;
         paneless.live = Some(dot_agent_deck::state::SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status: SessionStatus::Working,
             agent_type: Some(AgentType::ClaudeCode),
@@ -650,6 +653,7 @@ mod tests {
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
+            hook_generation: None,
         });
 
         let mut view = AgentView::default();
@@ -681,6 +685,7 @@ mod tests {
         let now = Instant::now();
         let mut seeded = record("7", "pane-7");
         seeded.live = Some(dot_agent_deck::state::SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status: SessionStatus::Idle,
             agent_type: Some(AgentType::ClaudeCode),
@@ -691,6 +696,7 @@ mod tests {
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
+            hook_generation: None,
         });
 
         let mut view = AgentView::default();
@@ -719,6 +725,7 @@ mod tests {
         let now = Instant::now();
         let mut quiet = record("7", "pane-7");
         quiet.live = Some(dot_agent_deck::state::SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status: SessionStatus::Idle,
             agent_type: Some(AgentType::ClaudeCode),
@@ -729,6 +736,7 @@ mod tests {
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
+            hook_generation: None,
         });
 
         let mut view = AgentView::default();

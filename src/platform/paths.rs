@@ -234,24 +234,62 @@ fn is_pipe_name_token(token: &str) -> bool {
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> std::io::Result<String> {
     static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    match SID.get_or_init(|| current_user_sid_string().map_err(|err| err.to_string())) {
+    match SID.get_or_init(|| token_sid_string(TokenSid::User).map_err(|err| err.to_string())) {
         Ok(sid) => Ok(sid.clone()),
         Err(message) => Err(std::io::Error::other(message.clone())),
     }
 }
 
-/// Read the calling process's user SID and return it in the canonical string
-/// form (`S-<revision>-<authority>-<sub-authority>…`).
+/// The SID the process token assigns as the owner of objects it creates without
+/// an explicit owner (its `TokenOwner`), in canonical string form, cached.
+///
+/// For an ordinary token this is the user's own SID. Under an elevated
+/// administrator token it is normally `BUILTIN\Administrators` (`S-1-5-32-544`),
+/// so a file the process creates with a default security descriptor is owned by
+/// that group rather than by [`current_user_sid`] — which is why a check on such
+/// a file has to accept this SID too. A token's default owner is fixed for the
+/// life of the process for our purposes (nothing here calls
+/// `SetTokenInformation`), so it is resolved once, like the user SID.
+#[cfg(windows)]
+pub(crate) fn token_default_owner_sid() -> std::io::Result<String> {
+    static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    match SID
+        .get_or_init(|| token_sid_string(TokenSid::DefaultOwner).map_err(|err| err.to_string()))
+    {
+        Ok(sid) => Ok(sid.clone()),
+        Err(message) => Err(std::io::Error::other(message.clone())),
+    }
+}
+
+/// Which SID [`token_sid_string`] reads from the process token.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum TokenSid {
+    /// `TokenUser`: the user the process runs as.
+    User,
+    /// `TokenOwner`: the owner given to objects created without one.
+    DefaultOwner,
+}
+
+/// Read one SID from the calling process's token and return it in the
+/// canonical string form (`S-<revision>-<authority>-<sub-authority>…`).
 ///
 /// Uses the token rather than any env var so the value is identical in the
 /// daemon and in every client, however their environments were scrubbed (see
 /// [`endpoint_user_suffix`]).
 #[cfg(windows)]
-fn current_user_sid_string() -> std::io::Result<String> {
+fn token_sid_string(which: TokenSid) -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let class = match which {
+        TokenSid::User => TokenUser,
+        TokenSid::DefaultOwner => TokenOwner,
+    };
 
     /// Closes the opened process token on every exit path below.
     struct TokenHandle(HANDLE);
@@ -276,33 +314,30 @@ fn current_user_sid_string() -> std::io::Result<String> {
     let mut needed: u32 = 0;
     // SAFETY: null buffer + zero length is the probe form; `needed` is a valid
     // out-pointer.
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    // `TOKEN_USER` leads with a pointer, so the buffer must be pointer-aligned;
-    // a `Vec<u8>` is only byte-aligned. `Vec<u64>` is (over-)aligned for every
-    // Windows target we build.
+    // `TOKEN_USER` and `TOKEN_OWNER` both lead with a pointer, so the buffer
+    // must be pointer-aligned; a `Vec<u8>` is only byte-aligned. `Vec<u64>` is
+    // (over-)aligned for every Windows target we build.
     let mut buf = vec![0u64; needed.div_ceil(8) as usize];
     // SAFETY: `buf` owns at least `needed` bytes of writable, 8-byte-aligned
     // storage, and `needed` is passed as its true length.
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
+    if unsafe { GetTokenInformation(token.0, class, buf.as_mut_ptr().cast(), needed, &mut needed) }
+        == 0
     {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SAFETY: on success the buffer holds a `TOKEN_USER` followed by the
-    // variable-length SID it points into; both stay valid as long as `buf`.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: on success the buffer holds the structure `class` names (a
+    // `TOKEN_USER` or a `TOKEN_OWNER`) followed by the variable-length SID it
+    // points into; both stay valid as long as `buf`.
+    let sid = match which {
+        TokenSid::User => unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+        TokenSid::DefaultOwner => unsafe { (*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner },
+    };
 
     let mut wide: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sid` is the token's SID and `wide` a valid out-pointer; on
@@ -719,9 +754,9 @@ fn durable_path_string(path: &Path) -> Option<String> {
     path.to_str().map(str::to_string)
 }
 
-/// Whether `path` runs through a cargo build-output directory: a path
-/// **component** `debug` or `release` whose immediate parent component is
-/// `target`.
+/// Whether `path` is cargo build output: it runs through a path **component**
+/// `debug` or `release` whose immediate parent component is `target`, or it
+/// sits directly in a cargo profile directory of any name (below).
 ///
 /// Component-wise, not a substring search, and that is load-bearing rather
 /// than fastidious. `path.contains("target/debug")` would also catch a user
@@ -730,13 +765,41 @@ fn durable_path_string(path: &Path) -> Option<String> {
 /// the separator is `\`. Matching components makes the test mean what it says
 /// on both platforms.
 ///
-/// Known and accepted limitation: it recognises the **default** layout only. A
-/// `CARGO_TARGET_DIR=/tmp/build` puts artifacts at `/tmp/build/debug/…`, whose
-/// `debug` has no `target` parent, so such a build is treated as durable. PRD
-/// #381 defines the check as `target/debug` / `target/release`, which is the
-/// layout every path in the field report had; widening it to "any `debug` or
-/// `release` component" would reject legitimate install prefixes.
+/// **A custom target directory is recognised by what cargo puts beside the
+/// binary, not by its name** (PRD #1487). `CARGO_TARGET_DIR` puts artifacts at
+/// `<dir>/debug/…`, whose `debug` has no `target` parent, and the component
+/// test alone treated such a build as durable — on a `$PATH` entry it even
+/// outranked a real install, and its path went into the operator's real Codex
+/// hooks. Every cargo profile directory, whatever the target dir is called and
+/// whatever the profile or `--target` triple, holds cargo's own `.fingerprint/`
+/// and `deps/` directories beside the binaries ([`is_cargo_output_dir`]); an
+/// install directory (`~/.local/bin`, `/usr/local/bin`, a Homebrew keg,
+/// `~/.cargo/bin`, which `cargo install` copies into) holds neither. A
+/// compile-time provenance stamp was the alternative and cannot answer this:
+/// every deck binary is cargo output, and the question is whether this copy is
+/// still sitting in the build tree, which only its location can say.
+///
+/// Widening the name test instead — "any `debug` or `release` component" —
+/// would reject legitimate install prefixes, and still miss a renamed profile.
 pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
+    is_default_target_layout(path) || path.parent().is_some_and(is_cargo_output_dir)
+}
+
+/// Whether `dir` is a cargo profile output directory (`<target-dir>/<profile>`
+/// or its `deps/`, where test binaries live): it, or for `deps/` its parent,
+/// holds both cargo's `.fingerprint/` and `deps/` directories. A filesystem
+/// probe, so a directory that does not exist is not one.
+pub(crate) fn is_cargo_output_dir(dir: &Path) -> bool {
+    let holds_cargo_layout =
+        |profile: &Path| profile.join(".fingerprint").is_dir() && profile.join("deps").is_dir();
+    holds_cargo_layout(dir)
+        || (dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+            && dir.parent().is_some_and(holds_cargo_layout))
+}
+
+/// The component half of [`is_build_artifact_path`]: `target/debug` or
+/// `target/release` anywhere in `path`.
+fn is_default_target_layout(path: &Path) -> bool {
     use std::ffi::OsStr;
     use std::path::Component;
 
@@ -793,7 +856,11 @@ fn is_installed_location(exe: &Path, home: &Path, path_value: Option<&std::ffi::
     path_value.is_some_and(|value| {
         std::env::split_paths(value)
             .filter(|dir| !is_untrustworthy_path_entry(dir))
-            .any(|dir| !is_build_artifact_path(&dir) && lexical_absolute(&dir) == parent)
+            .any(|dir| {
+                !is_build_artifact_path(&dir)
+                    && !is_cargo_output_dir(&dir)
+                    && lexical_absolute(&dir) == parent
+            })
     })
 }
 
@@ -1208,6 +1275,35 @@ pub(crate) fn pin_is_repairable(pin: &str) -> bool {
         Err(_) => false,
         Ok(true) => !is_executable_file(path) || is_build_artifact_path(path),
     }
+}
+
+/// Whether `path` is positively a live, durable deck install: absolute, reported
+/// to exist, an executable file, and not cargo build output — neither as
+/// spelled nor once its symlinks are resolved. Every term must be established —
+/// a path whose existence cannot be read is not one, and nor is one whose
+/// target cannot be resolved. The automatic hook install keeps another
+/// install's entry only on this (`agent_hook_config::auto_install_keeps`).
+///
+/// The resolved check is what stops a symlink outside any build tree that
+/// points into one (`/usr/local/bin/dot-agent-deck -> …/target/debug/…`, or into
+/// a custom cargo target dir) from being kept: the binary behind it is rebuilt
+/// or deleted by `cargo`, whatever the link is called. This is deliberately the
+/// opposite of [`durable_binary_path`]'s step 2a, which writes such a
+/// `~/.local/bin` link without canonicalizing: that is the installing binary
+/// naming itself, while this decides whether to defer to ANOTHER install, and
+/// there the fail-safe direction is to replace.
+pub(crate) fn is_live_durable_install(path: &Path) -> bool {
+    path.is_absolute()
+        && matches!(path.try_exists(), Ok(true))
+        && is_executable_file(path)
+        && !is_build_artifact_path(path)
+        && resolved_install_is_not_build_output(std::fs::canonicalize(path))
+}
+
+/// The resolved half of [`is_live_durable_install`]: `canonical` is the pin's
+/// canonicalized target, and a target that could not be resolved is not kept.
+fn resolved_install_is_not_build_output(canonical: std::io::Result<PathBuf>) -> bool {
+    canonical.is_ok_and(|target| !is_build_artifact_path(&target))
 }
 
 /// Single-quote `path` for a POSIX shell only when it contains a character
@@ -3859,6 +3955,44 @@ mod tests {
         }
     }
 
+    /// Scenario: Resolve a running binary built into a custom cargo target directory, both on and off PATH. Prefer the installed binary, and refuse the artifact when no install is available.
+    #[test]
+    fn durable_binary_path_custom_cargo_target_never_becomes_an_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        let name = durable_binary_file_name();
+        // Component-wise: the resolver builds its candidate with the host's
+        // separator, and this is compared to it as a string.
+        let installed = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&installed);
+        let build = fixture
+            .path()
+            .join("dot-agent-deck-p1487-docs-target")
+            .join("debug");
+        let artifact = build.join(&name);
+        write_stub_executable(&artifact);
+        // Real cargo output has these directories even with a custom target name.
+        std::fs::create_dir_all(build.join(".fingerprint")).unwrap();
+        std::fs::create_dir_all(build.join("deps")).unwrap();
+        let path = std::env::join_paths([&build]).unwrap();
+        for path_value in [None, Some(path.as_os_str())] {
+            let result = durable_binary_path_with(Ok(artifact.clone()), &home, path_value);
+            assert_eq!(
+                assert_durable(&result),
+                installed.to_str().unwrap(),
+                "custom cargo output must never beat the installed binary (PATH={path_value:?})"
+            );
+        }
+        std::fs::remove_file(&installed).unwrap();
+        for path_value in [None, Some(path.as_os_str())] {
+            let result = durable_binary_path_with(Ok(artifact.clone()), &home, path_value);
+            assert!(
+                result.is_err(),
+                "custom cargo output must be refused without an install: {result:?}"
+            );
+        }
+    }
+
     /// Step 2b: no `~/.local/bin` candidate, but the name is on `$PATH` — its
     /// absolute path is used. An untrustworthy (relative) entry earlier on the
     /// same `$PATH` is skipped, and so is one pointing into a cargo target
@@ -4049,6 +4183,82 @@ mod tests {
                  misclassify it"
             );
         }
+    }
+
+    /// Scenario: a pin outside every build tree that is a symlink is kept only
+    /// when what it resolves to is a real install. A link to a regular install
+    /// is kept; a link into `target/debug` and a link into a custom cargo
+    /// target dir (`.fingerprint/` beside `deps/`) are not, though neither
+    /// link's own spelling names a build tree (PRD #1487 review, Qodo
+    /// 4208317449).
+    #[cfg(unix)]
+    #[test]
+    fn is_live_durable_install_resolves_symlinks_before_the_build_output_check() {
+        let dir = crate::test_temp::tempdir().expect("tempdir");
+        let root = dir.path();
+        let links = root.join("usr-local-bin");
+        std::fs::create_dir_all(&links).expect("create link dir");
+        let link_to = |name: &str, target: &Path| {
+            let link = links.join(name);
+            std::os::unix::fs::symlink(target, &link).expect("symlink");
+            assert!(
+                !is_build_artifact_path(&link),
+                "the link's own spelling must not already read as build output"
+            );
+            link
+        };
+
+        let install = root.join("opt/deck/bin/dot-agent-deck");
+        write_stub_executable(&install);
+        assert!(is_live_durable_install(&install));
+        let to_install = link_to("to-install", &install);
+        assert!(
+            is_live_durable_install(&to_install),
+            "a symlink to a real install stays kept"
+        );
+
+        let debug = root.join("code/deck/target/debug/dot-agent-deck");
+        write_stub_executable(&debug);
+        let to_debug = link_to("to-debug", &debug);
+        assert!(
+            !is_live_durable_install(&to_debug),
+            "a symlink into target/debug is cargo build output once resolved"
+        );
+
+        let profile = root.join("custom-target/dev-profile");
+        std::fs::create_dir_all(profile.join(".fingerprint")).expect("create .fingerprint");
+        std::fs::create_dir_all(profile.join("deps")).expect("create deps");
+        let custom = profile.join("dot-agent-deck");
+        write_stub_executable(&custom);
+        let to_custom = link_to("to-custom", &custom);
+        assert!(
+            !is_live_durable_install(&to_custom),
+            "a symlink into a custom cargo target dir is cargo build output once resolved"
+        );
+        let test_binary = profile.join("deps").join("dot_agent_deck-0123abcd");
+        write_stub_executable(&test_binary);
+        let to_deps = link_to("to-deps", &test_binary);
+        assert!(
+            !is_live_durable_install(&to_deps),
+            "a symlink into a cargo deps/ dir is cargo build output once resolved"
+        );
+    }
+
+    /// Scenario: when a pin's target cannot be resolved, the resolved half of
+    /// the keep check refuses it, so the automatic install replaces the entry
+    /// rather than deferring to something it could not inspect.
+    #[test]
+    fn is_live_durable_install_does_not_keep_a_pin_whose_target_cannot_be_resolved() {
+        assert!(!resolved_install_is_not_build_output(Err(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
+        let durable = std::env::temp_dir()
+            .join("no-such-install-dir")
+            .join("dot-agent-deck");
+        assert!(resolved_install_is_not_build_output(Ok(durable)));
+        assert!(!resolved_install_is_not_build_output(Ok(PathBuf::from(
+            "/home/u/code/deck/target/release/dot-agent-deck"
+        ))));
     }
 
     /// A near-miss end to end: a deck genuinely installed under a directory

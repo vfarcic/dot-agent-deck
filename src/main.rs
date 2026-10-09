@@ -211,14 +211,32 @@ enum Commands {
         /// The delivery id from the task file, e.g. `d-7f3a9c21`.
         delivery_id: String,
     },
-    /// Report an agent lifecycle state so the pane's card status updates
-    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
-    /// extension) to drive status with NO hook installed: it rides the
-    /// existing raw-`AgentEvent` socket path.
+    /// Report an agent lifecycle state, a submitted prompt or a tool call so
+    /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
+    /// extension (e.g. the bundled Pi extension) to drive its card with NO
+    /// hook installed: it rides the existing raw-`AgentEvent` socket path.
     AgentEvent {
-        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        /// One of `running`, `waiting`, `finished` (lifecycle), `prompt`,
+        /// `tool-start`, `tool-end` (card detail).
         #[arg(long = "type")]
         r#type: String,
+        /// The agent's working directory, shown as the card's `Dir:`.
+        #[arg(long, allow_hyphen_values = true)]
+        cwd: Option<String>,
+        /// The prompt being submitted (with `--type prompt`).
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// The tool starting or finishing (with `--type tool-start|tool-end`).
+        #[arg(long = "tool-name", allow_hyphen_values = true)]
+        tool_name: Option<String>,
+        /// A short description of the tool call, e.g. its command or path.
+        #[arg(long = "tool-detail", allow_hyphen_values = true)]
+        tool_detail: Option<String>,
+        /// Declare that the reporter reports every prompt the agent submits,
+        /// so the deck may re-submit a delivered prompt it never reported
+        /// (issue #1567). Sent by the bundled Pi extension on every report.
+        #[arg(long = "reports-prompts")]
+        reports_prompts: bool,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
     /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
@@ -505,6 +523,32 @@ enum DaemonCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Plumbing (PRD #1487): report whether a daemon is running at this host's
+    /// endpoint, and its `Hello` reply when one is. Never lazy-spawns. Run over
+    /// ssh by the laptop's `remote upgrade`, because `daemon hello` prints this
+    /// binary's own static hello rather than the running daemon's.
+    #[command(hide = true)]
+    Probe {
+        /// Print one JSON line (`{running, hello}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plumbing (PRD #1487): ask the running daemon at this host's endpoint to
+    /// restart onto the build installed at its own path. Run over ssh by the
+    /// laptop's `remote upgrade`, through the freshly installed binary.
+    #[command(hide = true)]
+    RestartInstalled {
+        /// Print one JSON line (`{running, reply, unsupported}`).
+        #[arg(long)]
+        json: bool,
+        /// The version the caller just installed; the daemon refuses if the
+        /// installed build reports anything else.
+        #[arg(long)]
+        expect_version: Option<String>,
+        /// The confirmed stop set, as hex-encoded JSON.
+        #[arg(long)]
+        confirm_hex: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -560,9 +604,12 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to diagnose.
         name: String,
     },
-    /// Re-run the binary install flow against an existing entry, then bump
-    /// the registry's version field. On a host whose deck Homebrew installed,
-    /// runs `brew upgrade dot-agent-deck` there instead of downloading a copy.
+    /// Install a new build on a remote and restart its daemon onto it. On a
+    /// host whose deck Homebrew installed, runs `brew upgrade dot-agent-deck`
+    /// there instead of downloading a copy. An idle daemon restarts without a
+    /// question; when agents or orchestration roles would stop, it asks first
+    /// on a terminal and, with no terminal to ask on, installs and keeps the
+    /// running daemon. Exits non-zero only when a stage fails.
     Upgrade {
         /// Friendly name of the registry entry to upgrade.
         name: String,
@@ -574,6 +621,10 @@ enum RemoteCmd {
         /// updated.
         #[arg(long = "no-install")]
         no_install: bool,
+        /// Print the outcome as one JSON object on stdout (progress goes to
+        /// stderr).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -949,15 +1000,19 @@ fn delegate_verdict(
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The four causes, stated as the four causes rather than as the one that
+    // The five causes, stated as the five causes rather than as the one that
     // happens to be most common. Issue #554 added the fourth: the daemon routes
     // by the role name a pane was started with, so a role renamed in the toml
     // after the orchestration started is present in the file and still reaches
     // nobody — the first cause alone sent the user to a file that looked right.
+    // Issue #524 added the fifth: a worker that exited on its own is still in
+    // the role maps, and only a `clear = true` role is respawned by a delegate.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
                   itself — an orchestrator cannot delegate to itself — when \
-                  its worker pane has been closed, or when the role was renamed \
+                  its worker pane has been closed, when its worker has exited \
+                  and the role is not `clear = true` — `dot-agent-deck pane \
+                  restart <role>` starts it again — or when the role was renamed \
                   or added in .dot-agent-deck.toml after this orchestration \
                   started — running panes keep the role names they were started \
                   with until the orchestration is restarted.)";
@@ -1458,7 +1513,14 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::AgentEvent { r#type }) => {
+        Some(Commands::AgentEvent {
+            r#type,
+            cwd,
+            prompt,
+            tool_name,
+            tool_detail,
+            reports_prompts,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -1475,8 +1537,9 @@ fn main() -> ExitCode {
                 Some(et) => et,
                 None => {
                     eprintln!(
-                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
-                        r#type
+                        "Error: unknown agent-event --type {:?}. Expected one of: {}.",
+                        r#type,
+                        dot_agent_deck::event::AGENT_EVENT_TYPES.join(", ")
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1485,29 +1548,22 @@ fn main() -> ExitCode {
             // a bare AgentEvent with no `message_type` envelope, keyed on a
             // stable session id derived from the pane so repeated events update
             // the same card. The daemon's `run_hook_loop` falls back to
-            // `AgentEvent` and `apply_event` drives the status.
-            let event = dot_agent_deck::event::AgentEvent {
-                session_id: format!("{pane_id}-session"),
-                // TODO(companion PRD): derive agent type from the pane instead
-                // of hard-coding Pi. Safe today because the daemon's
-                // `apply_event` only UPGRADES `None` → a concrete type (never
-                // downgrades), so a hard-coded `Pi` from the `agent-event`
-                // subcommand can't clobber an already-known type.
-                agent_type: dot_agent_deck::event::AgentType::Pi,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id),
+            // `AgentEvent` and `apply_event` drives the card.
+            let event = dot_agent_deck::hook::build_agent_event_cli(
+                pane_id,
                 agent_id,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            };
-            let json = match serde_json::to_string(&event) {
+                event_type,
+                dot_agent_deck::hook::AgentEventDetail {
+                    cwd,
+                    prompt,
+                    tool_name,
+                    tool_detail,
+                    reports_prompts,
+                },
+            );
+            // Issue #318: present this pane's hook capability token.
+            let token = dot_agent_deck::hook_provenance::token_from_env();
+            let json = match dot_agent_deck::event::agent_event_line(&event, token.as_deref()) {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!("Failed to serialize agent-event: {e}");
@@ -1883,6 +1939,12 @@ fn main() -> ExitCode {
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
             DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
+            DaemonCmd::Probe { json } => run_daemon_probe_cli(json),
+            DaemonCmd::RestartInstalled {
+                json,
+                expect_version,
+                confirm_hex,
+            } => run_daemon_restart_installed_cli(json, expect_version, confirm_hex),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -1957,23 +2019,8 @@ fn main() -> ExitCode {
                 name,
                 version,
                 no_install,
-            } => {
-                let opts = dot_agent_deck::remote::UpgradeOptions {
-                    name,
-                    version,
-                    no_install,
-                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
-                };
-                let path = dot_agent_deck::remote::default_remotes_path();
-                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
-                match dot_agent_deck::remote::upgrade(&opts, &executor, &path) {
-                    Ok(_) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
+                json,
+            } => run_remote_upgrade(&name, version, no_install, json),
         },
         Some(Commands::Worktree { cmd }) => match cmd {
             WorktreeCmd::List { json } => run_worktree_list_cli(json),
@@ -2445,99 +2492,70 @@ async fn run_tui_session() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
-/// long-lived `SubscribeEvents` connection against the daemon and
-/// route each [`BroadcastMsg::Event`] into the TUI's `AppState` via
-/// `apply_event`.
-///
-/// PRD #93 round-5: the delegate / work-done variants used to ride this
-/// channel too — the daemon couldn't dispatch them locally and the TUI
-/// re-ran the role-validation guards. The daemon now owns dispatch end
-/// to end (writes the prompt directly into the target pane's PTY), so
-/// only hook events flow through here.
-///
-/// Reconnects with a small backoff on transport errors so a daemon
-/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
-/// automatically.
+/// PRD #76 M2.17: spawn the TUI's event subscriber — see
+/// [`dot_agent_deck::event_subscriber`].
 fn spawn_event_subscriber(
     attach_path: std::path::PathBuf,
     state: dot_agent_deck::state::SharedState,
 ) {
-    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
 
-    tokio::spawn(async move {
-        // Backoff parameters tuned for "daemon briefly unavailable" rather
-        // than long outages: a fresh-daemon ready window is sub-second, so
-        // a 500ms initial delay catches most transient cases, and we cap
-        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
-        let mut delay = std::time::Duration::from_millis(500);
-        let max_delay = std::time::Duration::from_secs(5);
-        let client = DaemonClient::new(attach_path);
-        loop {
-            match client.subscribe_events().await {
-                Ok(mut sub) => {
-                    // Reset backoff on a successful subscribe.
-                    delay = std::time::Duration::from_millis(500);
-                    loop {
-                        match sub.next_event().await {
-                            Ok(Some(BroadcastMsg::Event(event))) => {
-                                state.write().await.apply_event(event);
-                            }
-                            // PRD #120: a daemon-spawned orchestration (issue
-                            // dispatch). Queue it for the render loop, which owns
-                            // the TabManager + pane controller and builds the
-                            // live tab. The subscriber task can't touch those.
-                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
-                                state.write().await.queue_orchestration_surface(surface);
-                            }
-                            // Issue #717: a close left a dispatched worktree on
-                            // disk. Queue it for the render loop for the same
-                            // reason as the surface above — the status line is
-                            // `UiState`, which this task cannot touch.
-                            Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
-                                state.write().await.queue_worktree_kept(kept);
-                            }
-                            // PRD #741 M8 (issue #801 item 3): a `kind` tag this
-                            // build does not know, from a newer daemon. Ignored
-                            // rather than escalated — there is no payload to act
-                            // on, and the TUI's own state is rebuilt from
-                            // `list_agents` at hydration and reconciled by the
-                            // ordinary event flow, so a message it cannot read
-                            // costs it nothing it can name.
-                            //
-                            // What the variant buys is the line above this one:
-                            // before it, such a frame failed its whole decode
-                            // and arrived at the `Err` arm below, which breaks
-                            // the loop and reconnects. A daemon pushing the new
-                            // variant regularly therefore took the TUI's event
-                            // stream down every time it did.
-                            Ok(Some(BroadcastMsg::Unknown)) => {
-                                tracing::debug!(
-                                    "subscribe_events: ignoring a broadcast kind this build does                                      not know"
-                                );
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "subscribe_events: stream error, reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "subscribe_events: subscribe failed, retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, max_delay);
-        }
-    });
+    let config = SubscriberConfig {
+        #[cfg(feature = "e2e")]
+        drop_event: Some(e2e_subscriber_drops),
+        #[cfg(feature = "e2e")]
+        break_on_event: Some(e2e_subscriber_breaks),
+        ..SubscriberConfig::default()
+    };
+    tokio::spawn(run(DaemonClient::new(attach_path), state, config));
+}
+
+/// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
+/// way it did when they arrived while it was reconnecting — it resubscribed
+/// without replaying what it missed, so the daemon knew the conversation and
+/// the TUI never learned it. (Since issue #1520 a reconnect re-reads the
+/// daemon's state, so this seam now models a gap the subscriber does not see,
+/// which the daemon's `stale` refusal still covers.) A reconnect cannot be timed against an agent's boot
+/// from a PTY test, so the test names a session-id prefix in
+/// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
+/// asserts the prompt is still delivered.
+///
+/// EVERY event of that conversation is dropped, not only its `SessionStart`:
+/// any later frame carrying the session id — the daemon's own `ShellIdle` for a
+/// pane that went quiet, measured arriving right behind the start — would
+/// establish the generation in the TUI's view on its own, so a gap that misses
+/// the start alone recovers by itself. The failure needs the gap to cover the
+/// boot, and this models exactly that.
+///
+/// Compiled only into the `e2e` build, like `effective_current_exe`'s seam in
+/// `platform/paths.rs`, so a shipped binary has no switch that discards events.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
+        .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
+}
+
+/// Issue #1520 e2e seam: tear this subscriber's stream down ONCE, losing the
+/// event that triggered it, the way a `KIND_STREAM_END "lagged"` loses whatever
+/// the daemon never forwarded — so a PTY test can make the deck reconnect at a
+/// moment it chooses, which neither a real lag (1024 unread broadcasts) nor a
+/// daemon restart (which takes the agents with it) gives it.
+/// `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` names `<pane id>/<EventType>`, the
+/// event type spelled as its `Debug` name (`Thinking`); `session/live/019`
+/// uses it. Compiled only into the `e2e` build, like the seam above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let Ok(target) = std::env::var("DOT_AGENT_DECK_E2E_BREAK_STREAM_ON") else {
+        return false;
+    };
+    let Some((pane, kind)) = target.split_once('/') else {
+        return false;
+    };
+    event.pane_id.as_deref() == Some(pane)
+        && format!("{:?}", event.event_type) == kind
+        && !FIRED.swap(true, Ordering::SeqCst)
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
@@ -2879,6 +2897,273 @@ async fn run_daemon_endpoint_cli() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `dot-agent-deck remote upgrade <name> [--version V] [--no-install] [--json]`
+/// (PRD #1487): install and restart through
+/// [`dot_agent_deck::daemon_upgrade::upgrade_daemon`], the function every
+/// client shares. The restart question is asked only when stdin and stdout are
+/// both terminals; otherwise no one can answer, and live work keeps the
+/// running daemon. With `--json`, stdout carries only the outcome. Exits
+/// non-zero only for a failed stage.
+fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_upgrade::{
+        NoDecider, RestartDecider, SshInstaller, TtyDecider, UpgradePlan, upgrade_daemon,
+        upgrade_ssh_executor,
+    };
+    use dot_agent_deck::remote::{RemoteUpgradeError, RemotesFile};
+    use std::io::{IsTerminal, Write};
+
+    let path = dot_agent_deck::remote::default_remotes_path();
+    // Unknown names and an unreadable registry fail before any ssh, as before.
+    let entry = match RemotesFile::load(&path) {
+        Ok(file) => file.remotes.into_iter().find(|r| r.name == name),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(entry) = entry else {
+        eprintln!(
+            "{}",
+            RemoteUpgradeError::UnknownName {
+                name: name.to_string()
+            }
+        );
+        return ExitCode::FAILURE;
+    };
+
+    // What is said along the way goes to stdout, or to stderr under `--json`
+    // so stdout holds the outcome alone.
+    let report: fn() -> Box<dyn Write> = if json {
+        || Box::new(std::io::stderr())
+    } else {
+        || Box::new(std::io::stdout())
+    };
+    // The row read above, for the install as for the port, so both reach
+    // the same machine even if the row changes meanwhile.
+    let mut installer = SshInstaller::for_entry(&entry, path.clone(), report());
+    installer.no_install = no_install;
+    let port =
+        dot_agent_deck::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let tty;
+    let decider: &dyn RestartDecider = if interactive {
+        tty = TtyDecider::new(std::io::stdin().lock(), report());
+        &tty
+    } else {
+        &NoDecider
+    };
+    let plan = UpgradePlan {
+        version,
+        successor: dot_agent_deck::daemon_protocol::RestartSuccessor::Installed,
+    };
+    let mut progress_out = report();
+    let outcome = upgrade_daemon(name, &plan, &installer, &port, decider, &mut |p| {
+        dot_agent_deck::connect::print_upgrade_progress(name, &p, &mut *progress_out)
+    });
+
+    if json {
+        match serde_json::to_string(&outcome) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("remote upgrade: could not encode the outcome: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if outcome.is_failure() {
+        eprintln!("{}", outcome.summary(name));
+    } else {
+        println!("{}", outcome.summary(name));
+    }
+    if outcome.is_failure() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck daemon probe [--json]` (PRD #1487, hidden plumbing). One
+/// bounded `Hello` against the running daemon at this host's endpoint, through
+/// [`DaemonClient::probe_running`], which never lazy-spawns. "Nothing running"
+/// is an answer (exit 0, `running: false`); a probe that learned nothing — a
+/// transport error or no reply within [`ENDPOINT_RESOLVE_TIMEOUT`] — is a
+/// failure on stderr. Puts nothing new on the wire.
+#[tokio::main]
+async fn run_daemon_probe_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_restart::DaemonProbe;
+    let client = DaemonClient::new(client_attach_socket_path());
+    let hello = match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(e)) => {
+            eprintln!("daemon probe: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon probe: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let probe = DaemonProbe {
+        running: hello.is_some(),
+        hello,
+    };
+    if json {
+        match serde_json::to_string(&probe) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("daemon probe: could not encode the result: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match probe
+            .hello
+            .as_ref()
+            .and_then(|h| h.daemon_version.as_deref())
+        {
+            Some(v) => println!("running: {v}"),
+            None if probe.running => println!("running"),
+            None => println!("not running"),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon restart-installed [--json] [--expect-version V]
+/// [--confirm-hex H]` (PRD #1487, hidden plumbing). Asks the running daemon at
+/// this host's endpoint to restart onto the build installed at its own path,
+/// through [`DaemonClient::restart_daemon`] — the verb's only sender, which
+/// withholds it from a daemon that does not advertise it. Prints one
+/// [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
+/// the daemon too old for the verb, or the daemon's reply (accepted, needs
+/// confirmation, refused) — all exit 0, because each is an answer. A failure
+/// is on stderr, and its exit code says whether the request had been sent:
+/// [`dot_agent_deck::daemon_restart::RESTART_NOT_SENT_EXIT`] before it,
+/// [`dot_agent_deck::daemon_restart::RESTART_UNANSWERED_EXIT`] after it.
+#[tokio::main]
+async fn run_daemon_restart_installed_cli(
+    json: bool,
+    expect_version: Option<String>,
+    confirm_hex: Option<String>,
+) -> ExitCode {
+    use dot_agent_deck::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
+    use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
+    use dot_agent_deck::daemon_restart::{
+        RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport, decode_stop_set_hex,
+    };
+
+    let confirm = match confirm_hex.as_deref().map(decode_stop_set_hex).transpose() {
+        Ok(confirm) => confirm,
+        Err(e) => {
+            eprintln!("daemon restart-installed: --confirm-hex: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return print_restart_report(
+                json,
+                &RemoteRestartReport {
+                    running: false,
+                    reply: None,
+                    unsupported: false,
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon restart-installed: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    }
+    let request = RestartDaemonRequest {
+        confirm,
+        expected_version: expect_version,
+        successor: RestartSuccessor::Installed,
+    };
+    let report = match client.restart_daemon(request).await {
+        Ok(GatedQuery::Answered(reply)) => RemoteRestartReport {
+            running: true,
+            reply: Some(reply),
+            unsupported: false,
+        },
+        Ok(GatedQuery::Unsupported) => RemoteRestartReport {
+            running: true,
+            reply: None,
+            unsupported: true,
+        },
+        // Sent, then no answer: the daemon may be restarting, which the
+        // caller has to be able to tell from a request that never went out.
+        Err(e @ ClientError::Unanswered(_)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_UNANSWERED_EXIT);
+        }
+        Err(e) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    };
+    if !json {
+        // A short human line; the JSON form is what callers parse.
+        let line = match &report.reply {
+            Some(RestartDaemonReply::Accepted { to_version, .. }) => format!(
+                "restart accepted{}",
+                to_version
+                    .as_deref()
+                    .map(|v| format!(" (onto {v})"))
+                    .unwrap_or_default()
+            ),
+            Some(RestartDaemonReply::NeedsConfirmation { at_stake, .. }) => format!(
+                "needs confirmation: {} agent(s), {} orchestration role(s) would be stopped",
+                at_stake.agents.len(),
+                at_stake.roles.len()
+            ),
+            Some(RestartDaemonReply::Refused { message, .. }) => format!("refused: {message}"),
+            None => "the running daemon is too old to restart this way".to_string(),
+        };
+        println!("{line}");
+        return ExitCode::SUCCESS;
+    }
+    // The daemon has answered: a report that cannot be printed is a lost
+    // reply, not a request that was never sent.
+    match print_restart_report(json, &report) {
+        code if code == ExitCode::SUCCESS => code,
+        _ => ExitCode::from(RESTART_UNANSWERED_EXIT),
+    }
+}
+
+/// Print a [`dot_agent_deck::daemon_restart::RemoteRestartReport`] as one JSON
+/// line (or a short human line without `--json`).
+fn print_restart_report(
+    json: bool,
+    report: &dot_agent_deck::daemon_restart::RemoteRestartReport,
+) -> ExitCode {
+    if !json {
+        println!("no daemon running");
+        return ExitCode::SUCCESS;
+    }
+    match serde_json::to_string(report) {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("daemon restart-installed: could not encode the result: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// [`run_daemon_endpoint_cli`]: something is at the endpoint path and it failed
 /// a trust check, so the caller must **not** keep looking and must not forward
 /// it. Distinct from clap's `2` so an older build is never mistaken for one.
@@ -3113,13 +3398,28 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // fallback arm, so a client from before #1121 still finds this daemon and
     // gets the mismatch prompt instead of silently spawning a second one. A
     // failure to bind it is a warning, never a failure to start.
-    let daemon = Daemon::with_attach(state, attach_path.clone()).with_legacy_aliases(
-        dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
-        dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
-    );
+    //
+    // PRD #1487: record this daemon's own binary now, at startup, so a later
+    // `restart-daemon` resolves "the build installed at my own path" from where
+    // it started rather than from whatever `current_exe()` reports after an
+    // upgrade replaced the file.
+    let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
+        dot_agent_deck::daemon_restart::InstallRecord::capture(),
+    ));
+    let daemon = Daemon::with_attach(state, attach_path.clone())
+        .with_legacy_aliases(
+            dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
+            dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
+        )
+        .with_restart_control(restart_control.clone());
     if let Err(e) = run_daemon_with(&path, daemon).await {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
+    }
+    // PRD #1487: a supervised daemon that accepted a restart started no
+    // successor; this status is what makes its service manager start one.
+    if restart_control.handed_to_supervisor() {
+        return ExitCode::from(dot_agent_deck::daemon_restart::SUPERVISED_RESTART_EXIT);
     }
     ExitCode::SUCCESS
 }
@@ -3975,21 +4275,23 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The four causes, not the one that happens to be most common: the
+        // The five causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
         // orchestrator itself, or had had its worker pane closed — or, issue
         // #554, had been renamed in the toml after the orchestration started,
         // which leaves the file looking right while the daemon still routes by
-        // the old name.
+        // the old name — or, issue #524, had a worker that exited on its own.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
                 && msg.contains("worker pane has been closed")
+                && msg.contains("worker has exited")
+                && msg.contains("pane restart <role>")
                 && msg.contains(
                     "renamed or added in .dot-agent-deck.toml after this orchestration started"
                 ),
-            "the message must state all four causes, not assert one: {msg}"
+            "the message must state all five causes, not assert one: {msg}"
         );
     }
 

@@ -47,6 +47,7 @@ pub mod dictation;
 mod filter;
 pub mod hold;
 pub mod http;
+pub mod human_voice;
 pub mod numbers;
 pub mod openai;
 pub mod outcome;
@@ -109,10 +110,18 @@ pub struct VoiceDeck {
     /// preselect from the webview's fleet (`preselectedDeck` in
     /// `desktop/src/lib/newAgent.ts`), and a report that is to agree with the
     /// dialog has to be judged against the same list the dialog judges. A deck
-    /// with a reason is never shown to the model, so it cannot be picked, and
-    /// one resolved anyway from the user's own words is reported as unable to
-    /// take the agent rather than as preselected.
+    /// with a reason is shown to the model only among the decks a new agent
+    /// cannot start on (`decks_without_new_agent`, issue #1491), and one
+    /// resolved anyway for the New agent dialog is reported as unable to take
+    /// the agent rather than as preselected.
     pub unavailable: Option<String>,
+    /// Whether the agents a spoken `agent_ref` resolves against are this
+    /// deck's (issue #1495) — the deck `get_snapshot` read them from, which is
+    /// the selected deck, and this machine's under All daemons. It is what lets
+    /// "the agent on build box" name the daemon an agent is on, and what refuses
+    /// it when the agents voice can reach are on another one. At most one deck
+    /// carries it; none does when that deck is not in the observed fleet.
+    pub holds_agents: bool,
 }
 
 impl VoiceDeck {
@@ -167,6 +176,25 @@ pub const DECK_NOT_CONNECTED: &str = "the app is not connected to it; switch to 
 /// The short reason class for a deck the Deck selector lists with no address
 /// yet — `DECK_SHORT_REASON.unconfigured` in `desktop/src/lib/newAgent.ts`.
 pub const DECK_NO_ADDRESS: &str = "it has no address yet";
+
+/// Issue #1491 — the key voice gives the Deck selector's **All daemons**
+/// entry among its decks. Never a fleet key: those are `deck-<16 hex>` or
+/// `unconfigured-<row id>`, so it cannot collide with a deck the app observes.
+/// A switch to it is addressed to the selector's `all` token
+/// (`crate::settings::ALL_SELECTION_TOKEN`) like any other switch.
+pub const ALL_DECKS_ID: &str = "all-daemons";
+
+/// What the Deck selector calls that entry (`deckChoices` in
+/// `desktop/src/lib/endpoints.ts`), so a report names it the way the screen
+/// does: "Showing All daemons."
+pub const ALL_DECKS_LABEL: &str = "All daemons";
+
+/// Why All daemons cannot take a new agent: it is a selection rather than one
+/// deck. It keeps it out of what the New agent dialog preselects — a deck
+/// with a reason is listed to the model as one a new agent cannot start on,
+/// and is never preselected — while `switch_deck`, which ignores the reason,
+/// switches to it.
+pub const DECK_IS_EVERY_DAEMON: &str = "it is every daemon at once; name one daemon";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken
@@ -339,10 +367,11 @@ pub use capture::{
 pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
-    VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
-    handle_utterance_with, handle_utterance_with_dictation, refuse_switch_beyond_selector,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam, SWITCH_DECK_ROW,
+    VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch,
+    handle_utterance, handle_utterance_with, handle_utterance_with_dictation,
+    refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref,
+    resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -593,6 +622,7 @@ pub mod test_support {
             cols: 80,
             agent_type: agent_type.to_string(),
             cli_name: None,
+            prompt_keys: None,
             status: "running".to_string(),
             active_tool: None,
             tool_count: 0,
@@ -601,6 +631,7 @@ pub mod test_support {
             last_activity_ms: None,
             spawned_at_ms: None,
             blocked: None,
+            authoring_kind: None,
             tab: DesktopTab::Dashboard,
         }
     }
@@ -679,6 +710,96 @@ pub mod test_support {
             detail: detail.map(str::to_string),
         });
         agent
+    }
+
+    /// Issue #1495 — agents whose labels say nothing about what they are
+    /// doing, the way a dispatcher's own name does not say "dispatcher". Each
+    /// is told apart only by a fact the deck holds beside the label: its mode,
+    /// its agent type, its directory, its orchestration, its last prompt (read
+    /// on this machine) or
+    /// when it started.
+    ///
+    /// - **Mercury** runs in the `dispatcher` mode, in `dot-agent-deck`, and
+    ///   started first.
+    /// - **Juno** is the one Codex agent, in `billing`, and was last asked to
+    ///   fix the scroll.
+    /// - **Vega** is a second Claude Code agent beside Mercury, in
+    ///   `docs-site`, and started last — the newest.
+    /// - two OpenCode **reviewers**, one in the `prd-1487` run and one in the
+    ///   `docs-1502` run, so "the reviewer" alone is a tie and the run's name
+    ///   breaks it.
+    pub fn facets_fleet() -> Vec<DesktopAgent> {
+        const STARTED: i64 = 1_790_000_000_000;
+        let named = |id: &str, name: &str, agent_type: &str, cli: &str, cwd: &str| {
+            let mut agent = agent(id, Some(name), agent_type);
+            agent.cli_name = Some(cli.to_string());
+            agent.cwd = Some(cwd.to_string());
+            agent.status = "working".to_string();
+            agent
+        };
+        let mut mercury = named(
+            "agent-mercury",
+            "Mercury",
+            "claude_code",
+            "claude",
+            "/home/dev/code/dot-agent-deck",
+        );
+        mercury.tab = DesktopTab::Mode {
+            name: "dispatcher".to_string(),
+        };
+        mercury.status = "idle".to_string();
+        mercury.spawned_at_ms = Some(STARTED);
+        let mut juno = named(
+            "agent-juno",
+            "Juno",
+            "codex",
+            "codex",
+            "/home/dev/code/billing",
+        );
+        juno.last_user_prompt =
+            Some("Fix the scroll jump when the terminal pane resizes".to_string());
+        juno.spawned_at_ms = Some(STARTED + 60_000);
+        let mut vega = named(
+            "agent-vega",
+            "Vega",
+            "claude_code",
+            "claude",
+            "/home/dev/code/docs-site",
+        );
+        vega.last_user_prompt = Some("Rewrite the install guide for Windows".to_string());
+        vega.spawned_at_ms = Some(STARTED + 600_000);
+        let reviewer = |id: &str, run: &str, config: &str, title: &str, cwd: &str, at: i64| {
+            let mut agent = in_titled_orchestration(role_agent(id, "reviewer"), run, config, title);
+            agent.agent_type = "open_code".to_string();
+            agent.cli_name = Some("opencode".to_string());
+            agent.cwd = Some(cwd.to_string());
+            agent.spawned_at_ms = Some(at);
+            if let DesktopTab::Orchestration { cwd: run_cwd, .. } = &mut agent.tab {
+                *run_cwd = Some(cwd.to_string());
+            }
+            agent
+        };
+        vec![
+            mercury,
+            juno,
+            vega,
+            reviewer(
+                "agent-review-1487",
+                "orch-1487",
+                "prd-review",
+                "prd-1487",
+                "/home/dev/code/dot-agent-deck-prd-1487",
+                STARTED + 120_000,
+            ),
+            reviewer(
+                "agent-review-docs",
+                "orch-docs",
+                "docs-review",
+                "docs-1502",
+                "/home/dev/code/handbook",
+                STARTED + 180_000,
+            ),
+        ]
     }
 }
 

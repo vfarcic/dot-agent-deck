@@ -2,6 +2,84 @@ import { expect, test, type Page } from "@playwright/test";
 
 import type { FixtureScenario } from "./support/overview";
 
+test.describe("start a daemon with experimental off (issue #1490)", () => {
+  for (const deckKind of ["local", "remote"] as const) {
+    /// Scenario: A local or remote disconnected deck offers Start daemon on the default dashboard.
+    /// Confirming names its host and the mocked Tauri start emits a connected snapshot for that deck.
+    test(`starts the ${deckKind} dashboard deck and shows it connected`, async ({ page }) => {
+      const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+      const deckId = deckKind === "local" ? "deck-0000000000001490" : "deck-0000000000001491";
+      const reason = { kind: "not-running", action: "start-daemon", message: `No daemon is running on ${host}.`, host };
+      const initial = {
+        connection: {
+          status: "disconnected" as "connected" | "disconnected", deckKind, deckId,
+          socketPath: deckKind === "local" ? "/tmp/start-daemon-browser.sock" : host,
+          clientProtocolVersion: 10, clientBuildVersion: "0.45.0",
+          disconnectedReason: reason as typeof reason | undefined,
+        },
+        agents: [], protocolVersion: 10, source: "daemon", fleet: [deckId],
+      };
+      // Same IPC callback/event contract as @tauri-apps/api/mocks.mockIPC;
+      // install it before the bundle loads so the real live bridge is driven.
+      await page.addInitScript(({ initial, host }) => {
+        const callbacks = new Map<number, (event: unknown) => void>();
+        const listeners = new Map<string, number[]>();
+        const starts: unknown[] = [];
+        let next = 0;
+        let current = initial;
+        Object.defineProperty(window, "__dadStartCalls", { value: starts });
+        Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
+          transformCallback: (callback: (event: unknown) => void) => { const id = ++next; callbacks.set(id, callback); return id; },
+          unregisterCallback: (id: number) => callbacks.delete(id),
+          invoke: async (command: string, args: Record<string, unknown> = {}) => {
+            if (command === "plugin:event|listen") {
+              const event = String(args.event);
+              listeners.set(event, [...(listeners.get(event) ?? []), Number(args.handler)]);
+              return args.handler;
+            }
+            if (command === "plugin:event|unlisten") {
+              const event = String(args.event);
+              listeners.set(event, (listeners.get(event) ?? []).filter((id) => id !== args.eventId));
+              return;
+            }
+            if (command === "desktop_bootstrap") return current;
+            if (command === "desktop_features") return {};
+            if (command === "desktop_get_settings") return { settings: { version: 1, appearance: { mode: "system" }, zoom: { level: 1 } } };
+            if (command === "desktop_set_zoom") return args.level;
+            if (command === "desktop_start_daemon") {
+              starts.push(args.deckId);
+              if (args.deckId !== initial.connection.deckId) throw new Error("Start must name the deck from the dashboard card.");
+              current = { ...initial, connection: { ...initial.connection, status: "connected", disconnectedReason: undefined } };
+              for (const id of listeners.get("desktop://snapshot") ?? []) callbacks.get(id)?.({ event: "desktop://snapshot", id, payload: current });
+              return { outcome: "started", host, snapshot: current };
+            }
+            return { ok: true };
+          },
+        } });
+        Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", { value: { unregisterListener: (_event: string, id: number) => callbacks.delete(id) } });
+      }, { initial, host });
+      await page.goto("/?live=1");
+      await expect(page.getByTestId("open-deck")).toHaveCount(0);
+      const card = page.getByTestId("daemon-group");
+      await expect(card).toHaveCount(1);
+      await expect(card.getByTestId("overview-disconnected")).toBeVisible();
+      await expect(card).toHaveAttribute("data-deck-connected", "no");
+      await expect(card.getByTestId("start-daemon")).toBeVisible();
+      await expect(card.getByRole("button", { name: "Reconnect", exact: true })).toHaveCount(0);
+      await card.getByTestId("start-daemon").click();
+      const dialog = page.getByRole("alertdialog");
+      await expect(dialog).toContainText(host);
+      await expect(dialog).not.toContainText("local daemon");
+      await dialog.getByRole("button", { name: "Start daemon", exact: true }).click();
+      await expect(card).toHaveAttribute("data-deck-connected", "yes");
+      await expect(card.getByTestId("overview-disconnected")).toHaveCount(0);
+      await expect(card.getByTestId("overview-first-run")).toBeVisible();
+      await expect(dialog).toHaveCount(0);
+      expect(await page.evaluate(() => (window as Window & { __dadStartCalls?: unknown[] }).__dadStartCalls)).toEqual([deckId]);
+    });
+  }
+});
+
 /**
  * Each connection state puts its own screen in front of the reader — issue
  * #836's third item.

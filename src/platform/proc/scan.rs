@@ -26,7 +26,26 @@
 //! has no controlling terminal either — every descendant matches and the pane
 //! pins at `Working` forever. [`ProcessInfo::has_controlling_tty`] is therefore
 //! recorded as corroborating evidence only; [`descendant_shell_activity`]
-//! compares session ids against **the agent's own** and never reads that field.
+//! compares session ids against **the agent's own** and never reads that field
+//! to call a process busy.
+//!
+//! ## A nested terminal is not a detached command (issue #1493)
+//!
+//! The one place that field IS read points the other way: it can only make a
+//! process count for LESS. `dot-agent-deck wrap` — how the deck launches Codex —
+//! starts its child on a pseudo-terminal of its own, so that child leads a
+//! session of its own *and* has a controlling terminal. To the plain session
+//! test that child is a detached descendant from the moment it starts, so every
+//! wrapped pane read busy for its whole life and its card sat at `Working` with
+//! no prompt sent (and went back to `Working` after every finished turn, because
+//! the monitor re-asserts a busy pane whose card reads `Idle`). A session leader
+//! that owns a terminal is a terminal session nested inside the pane — the same
+//! shape as `tmux`, `script` or `ssh -t` — not a command the agent sent off the
+//! pane's terminal, so its subtree is compared against ITS session instead
+//! ([`walk_with_reference_session`]). The measured shell-tool shape is
+//! unaffected: Claude Code's `setsid`-detached Bash-tool child has no
+//! controlling terminal (`tests/shell_activity.rs`), and in the container shape
+//! nothing has one, so nothing is re-rooted there either.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -324,20 +343,69 @@ pub fn descendant_shell_activity(
 /// [`descendant_shell_activity`]'s cross-check call — sharing that function is
 /// what keeps those two sets identical rather than merely intended to be.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
-    let root = table.iter().find(|row| row.pid == root_pid)?;
-    if root.session_id <= 0 {
-        return None;
-    }
     Some(
-        descendants(table, root_pid)
+        walk_with_reference_session(table, root_pid)?
             .into_iter()
             // A row whose session id could not be read is unclassifiable, not
             // "different" — counting it as different would turn an exit racing
             // the sample into a false `Working`.
-            .filter(|row| row.session_id > 0 && row.session_id != root.session_id)
-            .map(|row| row.pid)
+            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+            .map(|(row, _)| row.pid)
             .collect(),
     )
+}
+
+/// Is `row` a terminal session nested inside the pane — a session leader with a
+/// controlling terminal of its own, which is what `dot-agent-deck wrap` makes of
+/// the agent it hosts? See this module's docs (issue #1493).
+fn is_nested_terminal_session(row: &ProcessInfo) -> bool {
+    row.session_leader && row.has_controlling_tty && row.session_id > 0
+}
+
+/// [`descendants`] of `root_pid`, each paired with the session id it must be
+/// compared against: `root_pid`'s own, except below a nested terminal session
+/// ([`is_nested_terminal_session`]), whose subtree is compared against that
+/// session. A nested terminal session itself is reported with its own session as
+/// its reference, so it is never detached from itself. `None` has
+/// [`detached_descendants`]'s meaning.
+///
+/// Same visited-set walk as [`descendants`], for the same reason: it must
+/// terminate on a cycle.
+fn walk_with_reference_session(
+    table: &[ProcessInfo],
+    root_pid: i32,
+) -> Option<Vec<(&ProcessInfo, i32)>> {
+    let root = table.iter().find(|row| row.pid == root_pid)?;
+    if root.session_id <= 0 {
+        return None;
+    }
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+    let mut visited: HashSet<i32> = HashSet::new();
+    visited.insert(root_pid);
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id));
+    let mut out = Vec::new();
+    while let Some((pid, reference)) = queue.pop_front() {
+        let Some(kids) = children.get(&pid) else {
+            continue;
+        };
+        for kid in kids {
+            if !visited.insert(kid.pid) {
+                continue;
+            }
+            let reference = if is_nested_terminal_session(kid) {
+                kid.session_id
+            } else {
+                reference
+            };
+            out.push((*kid, reference));
+            queue.push_back((kid.pid, reference));
+        }
+    }
+    Some(out)
 }
 
 /// The detached descendants of `root_pid` that the argv cross-check can actually
@@ -381,15 +449,12 @@ pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<
 /// boundary set alongside a non-empty detached set would read idle, exactly as a
 /// cross-check that matches nothing does.
 pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
-    let root = table.iter().find(|row| row.pid == root_pid)?;
-    if root.session_id <= 0 {
-        return None;
-    }
     let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     Some(
-        descendants(table, root_pid)
+        walk_with_reference_session(table, root_pid)?
             .into_iter()
-            .filter(|row| row.session_id > 0 && row.session_id != root.session_id)
+            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+            .map(|(row, _)| row)
             .filter(|row| {
                 session_of
                     .get(&row.ppid)
@@ -576,6 +641,53 @@ mod tests {
             Some(false),
             "a supplied shape the descendant does not carry must veto the structural match"
         );
+    }
+
+    /// Issue #1493: `dot-agent-deck wrap` runs the agent it hosts on a
+    /// pseudo-terminal of its own, so the wrapped agent leads a session and owns
+    /// a terminal. That nested terminal must not read as a detached command —
+    /// it did, and pinned every wrapped Codex card at `Working` — while a
+    /// command the wrapped agent detaches off ITS terminal still reads busy, and
+    /// so does a detached command beside the wrapper (the control).
+    #[test]
+    fn a_nested_terminal_session_is_not_busy_but_what_it_detaches_is() {
+        let no_tty = |row: ProcessInfo| ProcessInfo {
+            has_controlling_tty: false,
+            ..row
+        };
+        // The pane's child is the wrapper; its child is the wrapped agent, in a
+        // session of its own on the wrapper's inner pty; the agent's helpers
+        // share the agent's session.
+        let wrapped = vec![
+            row(100, 1, 100, "dot-agent-deck wrap --agent codex -- codex"),
+            row(200, 100, 200, "codex"),
+            row(201, 200, 200, "codex mcp-helper"),
+        ];
+        assert_eq!(detached_descendants(&wrapped, 100), Some(vec![]));
+        assert_eq!(descendant_shell_activity(&wrapped, 100, &[]), Some(false));
+        assert_eq!(shell_tool_candidates(&wrapped, 100), Some(vec![]));
+
+        // The wrapped agent detaches a tool command off its terminal: busy.
+        let mut tool_running = wrapped.clone();
+        tool_running.push(no_tty(row(300, 200, 300, "/bin/bash -lc ls")));
+        tool_running.push(no_tty(row(301, 300, 300, "ls")));
+        assert_eq!(
+            detached_descendants(&tool_running, 100),
+            Some(vec![300, 301])
+        );
+        assert_eq!(
+            descendant_shell_activity(&tool_running, 100, &[]),
+            Some(true)
+        );
+        assert_eq!(shell_tool_candidates(&tool_running, 100), Some(vec![300]));
+
+        // Control: the same session leader WITHOUT a terminal is exactly the
+        // measured detached shell-tool shape, and stays busy.
+        let detached = vec![
+            row(100, 1, 100, "claude"),
+            no_tty(row(200, 100, 200, "/bin/zsh -c eval ls")),
+        ];
+        assert_eq!(descendant_shell_activity(&detached, 100, &[]), Some(true));
     }
 
     /// The two measured Claude Bash-tool variants: the usual one carrying the

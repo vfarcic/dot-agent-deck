@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
@@ -44,7 +45,18 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
+
+/**
+ * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
+ * older one their remote daemons run. Live mode reads both from the crate
+ * (`daemon_upgrade::upgrade_offer`); the fixture only has to be consistent.
+ */
+export const FIXTURE_APP_VERSION = "0.45.0";
+export const FIXTURE_DAEMON_VERSION = "0.44.0";
+/** How long each fixture upgrade stage lasts — long enough to see, short enough for a browser test. */
+export const FIXTURE_UPGRADE_STEP_MS = 250;
+const FIXTURE_OLDER: { kind: "offered"; from: string; to: string } = { kind: "offered", from: FIXTURE_DAEMON_VERSION, to: FIXTURE_APP_VERSION };
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -193,7 +205,42 @@ const evidence: EvidenceItem[] = [
   },
 ];
 
-const agents: AgentSession[] = [
+/**
+ * PRD #1541 — the agent identity a deck reports beside the binary: its type,
+ * whether it is mid-turn, and its prompt keys.
+ *
+ * The keys come from `prompt-keys.json`, which the desktop crate's
+ * `the_browser_fixture_prompt_keys_match_the_registry` pins to what a deck
+ * built from this tree serves, so the preview presses the real keys. Devin
+ * and an unrecognised binary get no keys, as from a real deck.
+ */
+export const FIXTURE_PROMPT_KEYS = PROMPT_KEYS_JSON as Partial<Record<AgentTypeId, PromptKeys>>;
+
+const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
+  claude: "claude_code",
+  opencode: "open_code",
+  codex: "codex",
+  pi: "pi",
+  devin: "devin",
+};
+
+export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
+  const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
+  const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
+  // What `agentTurn` makes of the daemon status each fixture status stands for.
+  const turn = status === "running" ? "working" : status === "waiting" ? "idle" : undefined;
+  return {
+    agentType,
+    ...(turn ? { turn } : {}),
+    ...(promptKeys ? { promptKeys } : {}),
+  };
+}
+
+function withAgentIdentity(agent: AgentSession): AgentSession {
+  return { ...agent, ...fixtureAgentIdentity(agent.cli, agent.status) };
+}
+
+const agents: AgentSession[] = ([
   {
     id: "planner",
     daemonId: FIXTURE_DAEMON_ID,
@@ -312,7 +359,7 @@ const agents: AgentSession[] = [
     handoffIds: [],
     artifacts: [],
   },
-];
+] satisfies AgentSession[]).map(withAgentIdentity);
 
 /** One agent in the crowded scenario, described only by what a daemon reports. */
 interface CrowdedSeed {
@@ -374,6 +421,7 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     role: seed.role,
     displayName: seed.displayName,
     cli: seed.cli,
+    ...fixtureAgentIdentity(seed.cli, seed.status),
     model: "Unavailable",
     status: seed.status,
     task: seed.lastUserPrompt
@@ -423,6 +471,8 @@ export interface FixtureStartedAgent {
   cwd?: string;
   rows?: number;
   cols?: number;
+  /** Issue #1496: recorded on the agent, as the live daemon records it. */
+  authoringKind?: AuthoringKind;
 }
 
 /**
@@ -456,6 +506,7 @@ export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSe
     worktree: "Unavailable",
     writeLease: "unknown",
     spawnedAtMs: Date.now(),
+    ...(started.authoringKind ? { authoringKind: started.authoringKind } : {}),
     rows: started.rows ?? 24,
     cols: started.cols ?? 80,
     toolCount: 0,
@@ -886,6 +937,8 @@ function fleetDeck(
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
   if (state === "docs-fleet") return docsFleet();
   if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
+  if (state === "upgrade") return upgradeFleet();
+  if (state === "upgrade-error") return [upgradeIncompatibleDeck()];
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -946,11 +999,64 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   ];
 }
 
+/**
+ * PRD #1487 M5 — a remote deck whose daemon is older than this app AND across
+ * a compatibility break, so it is refused: the version-mismatch banner, with
+ * Upgrade beside Connect anyway. Nothing runs on it, so its upgrade restarts
+ * without asking.
+ */
+function upgradeIncompatibleDeck(): DeckSnapshot {
+  return fleetDeck(
+    FIXTURE_UNREACHABLE_DAEMON_ID,
+    {
+      status: "error",
+      deckId: FIXTURE_UNREACHABLE_DAEMON_ID,
+      socketPath: FIXTURE_UNREACHABLE_DAEMON_ID,
+      daemonDetected: true,
+      buildStampMismatchOnly: true,
+      runningAgentCount: 0,
+      message: "This daemon is older than this app, and a change between the two versions means it may be read wrongly.",
+      deckKind: "remote",
+      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      upgradeOffer: FIXTURE_OLDER,
+    },
+    [],
+    "/home/ci/code/dot-agent-deck",
+  );
+}
+
+/**
+ * PRD #1487 M5 — the Upgrade scenario: this machine's deck at the app's own
+ * version (nothing to offer), a connected remote deck on an older version with
+ * agents running (Upgrade asks before stopping them), and the refused remote
+ * deck above.
+ */
+function upgradeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local", upgradeOffer: { kind: "current" } },
+      // The docs agents, not the shared `connected` ones: the `daemon-upgrade`
+      // docs screenshot shows this deck behind its dialog, and the shared
+      // agents carry demo-run paths.
+      docsAgents,
+      DOCS_CWD,
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+    upgradeIncompatibleDeck(),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
@@ -1059,6 +1165,14 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    */
   readonly params?: readonly VoiceResolvedParamDto[];
   /**
+   * PRD #1541 — a typing-mode prompt command: dispatched only while typing
+   * mode is on, and never by the generic phrase match below. Outside the mode
+   * on the agent screen its phrases (less {@link FIXTURE_TYPING_STOP_PHRASES})
+   * are answered with {@link FIXTURE_TYPING_MODE_FIRST}, as `local_intercept`
+   * answers them.
+   */
+  readonly typingOnly?: true;
+  /**
    * Words this row is matched by as a PREFIX rather than by equality, with
    * everything after them becoming the row's `spoken_prefix` param.
    *
@@ -1074,7 +1188,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    * New agent dialog's live form, and otherwise refused with the row's own
    * hint — the same `Not here — <hint>.` Rust renders.
    */
-  readonly requires?: "directory_listing" | "new_agent_form";
+  readonly requires?: "directory_listing" | "new_agent_form" | "new_agent_dialog_closed";
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -1173,7 +1287,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
     // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
     // the opener row, as `local_intercept` checks them.
-    phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
+    phrases: [
+      "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
+      "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+    ],
     action: "dictation_on",
     invoke: "startDictation",
     screens: ["agent"],
@@ -1181,7 +1298,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typing to the agent.",
   },
   {
-    phrases: ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"],
+    phrases: [
+      "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
+      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+    ],
     action: "dictation_off",
     invoke: "stopDictation",
     screens: ["agent"],
@@ -1206,6 +1326,38 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     screens: ["agent"],
     unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
+  },
+  {
+    // PRD #1541 — the typing-mode prompt commands. The phrases are
+    // `voice::dictation::INTERRUPT_PHRASES` followed by `TYPING_STOP_PHRASES`
+    // (interrupt's bare "stop" forms, live only in typing mode),
+    // `CLEAR_PROMPT_PHRASES` and `SCRATCH_PHRASES`; `fixture.test.ts` compares
+    // each row with Rust's lists.
+    phrases: ["interrupt", "interrupt it", "interrupt that", "stop", "stop it", "stop that"],
+    action: "interrupt_agent",
+    invoke: "interruptAgent",
+    screens: ["agent"],
+    unavailableHint: "interrupting an agent works in its pane, in typing mode",
+    report: "Interrupted the agent.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["clear the prompt", "clear prompt", "clear it", "clear all", "clear everything", "delete everything"],
+    action: "clear_prompt",
+    invoke: "clearAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "clearing a prompt works in an agent's pane, in typing mode",
+    report: "Cleared the prompt.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["scratch that", "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that"],
+    action: "scratch_that",
+    invoke: "scratchLastDictation",
+    screens: ["agent"],
+    unavailableHint: "scratching dictated words works in an agent's pane, in typing mode",
+    report: "Scratched the last dictation.",
+    typingOnly: true,
   },
   {
     // PR #1451 round 3, change 5 — the New agent browser's Filter box.
@@ -1252,7 +1404,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   {
     // PR #1451 round 3, change 4 — turning the page of a list voice shows a
     // page at a time. The app refuses a turn with nothing to turn to itself.
-    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more", "page down"],
     action: "next_page",
     invoke: "nextPage",
     screens: ["deck", "overview"],
@@ -1260,12 +1412,50 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Next page.",
   },
   {
-    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back"],
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back", "page up"],
     action: "previous_page",
     invoke: "previousPage",
     screens: ["deck", "overview"],
     unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
     report: "Previous page.",
+  },
+  {
+    // Issue #1492 — scrolling the agent dashboard, which no longer pages. Like
+    // the live rows, only while the New agent dialog is closed.
+    phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
+    action: "scroll_down",
+    invoke: "scrollDown",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling down.",
+  },
+  {
+    phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
+    action: "scroll_up",
+    invoke: "scrollUp",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling up.",
+  },
+  {
+    phrases: ["scroll to the top", "go to the top", "back to the top"],
+    action: "scroll_to_top",
+    invoke: "scrollToTop",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the top.",
+  },
+  {
+    phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
+    action: "scroll_to_bottom",
+    invoke: "scrollToBottom",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the bottom.",
   },
 ];
 
@@ -1282,11 +1472,11 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
  * honest about what this stand-in is — a matcher over a fixed list — and is
  * what a preview reader most needs to know.
  */
-export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false): VoiceCommandDto[] {
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceCommandDto[] {
   return FIXTURE_VOICE_COMMANDS.map((command) => ({
     id: command.action,
     description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
-    callable: fixtureCallable(command, screen, directoryListing, newAgentForm),
+    callable: fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog),
     unavailable_hint: command.unavailableHint,
     params: [],
   }));
@@ -1337,7 +1527,7 @@ const FIXTURE_VOICE_TIE = {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
@@ -1345,7 +1535,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      whole. The same rule here, over this module's own rows, in
      `dictation_intercept`'s order: the biggest stop first. */
   if (dictating) {
-    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt", "interrupt_agent", "clear_prompt", "scratch_that"]);
     /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
        what precedes it and asks the panel to send after it. */
     const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
@@ -1369,6 +1559,19 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      the same whole-utterance rule, ahead of the `type` opener — "type on"
      opens with `type` and would otherwise type the word "on". */
   const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  /* PRD #1541 — a typing-mode prompt command said with the mode OFF: on the
+     agent screen it runs nothing and says to say "typing on" first. On the
+     other screens Rust's model answers it, which the preview stands in for
+     with the row's own hint. A bare "stop" is neither: Rust hands it to the
+     model, and here it falls through like any other phrase. */
+  const typingOnly = reserved || fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES)
+    ? undefined
+    : FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.typingOnly && fixtureSaidWhole(utterance, candidate.phrases));
+  if (typingOnly) {
+    const hint = screen === "agent" ? FIXTURE_TYPING_MODE_FIRST : typingOnly.unavailableHint;
+    const sentence = screen === "agent" ? `${hint[0].toUpperCase()}${hint.slice(1)}.` : `Not here — ${hint}.`;
+    return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: typingOnly.action, hint, sentence } };
+  }
   if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
     const hint = "opening an agent works from the Daemons screen or the agent dashboard";
     if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
@@ -1394,12 +1597,12 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
     };
   }
   const command = reserved
-    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => !candidate.typingOnly && candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
-  if (!fixtureCallable(command, screen, directoryListing, newAgentForm)) {
+  if (!fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog)) {
     return {
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
@@ -1467,8 +1670,9 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
 }
 
 /** Whether `command` can run on `screen`, given whether a directory listing and a live New agent form are declared. */
-function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean): boolean {
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean, newAgentDialog = false): boolean {
   if (!command.screens.includes(screen)) return false;
+  if (command.requires === "new_agent_dialog_closed") return !newAgentDialog;
   if (command.requires === "directory_listing") return directoryListing;
   if (command.requires === "new_agent_form") return newAgentForm;
   return true;
@@ -1600,6 +1804,15 @@ function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolea
  * the whole utterance.
  */
 const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::dictation::TYPING_STOP_PHRASES` — interrupt's bare "stop" forms,
+ * which interrupt only in typing mode and are not answered locally outside it.
+ */
+const FIXTURE_TYPING_STOP_PHRASES: readonly string[] = ["stop", "stop it", "stop that"];
+
+/** `voice::outcome::TYPING_MODE_FIRST_HINT`, which `fixture.test.ts` compares. */
+const FIXTURE_TYPING_MODE_FIRST = "say “typing on” first — interrupting, clearing and scratching work in typing mode";
 
 /**
  * `voice::outcome::trailing_send`: the words before a separate final sentence

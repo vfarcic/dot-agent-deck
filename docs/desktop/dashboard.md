@@ -8,11 +8,11 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. Remote daemons are added in [Settings → Daemons](daemons.md).
 2. Read the counters at the top. **AGENTS**, **RUNNING**, **WAITING**, **FAILED** and **GROUPS** count the agents on the daemons that answered. **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When a shown daemon has not answered, **DAEMONS** turns red and the other counters describe only the daemons that did. When no daemon answered, the other counters read `—`.
-3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again.
+3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
 
-Each daemon being shown gets its own section, headed with its name (**Local daemon** for this machine, the ssh user and host for a remote one) and its own **New agent** button, which creates the agent on that daemon. Inside a section, agents are grouped:
+Each daemon being shown gets its own section, headed with its name (**Local daemon** for this machine, the ssh user and host for a remote one) and its own **New agent** button, which creates the agent on that daemon. A remote daemon that runs an older release than the app also gets an **Upgrade** button there ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)). Inside a section, agents are grouped:
 
 - **Standalone agents** (kicker **NO TAB**): agents that belong to no orchestration and no workspace mode.
 - One group per orchestration (kicker **ORCHESTRATION**), named after the run. Its rows are numbered in role order, and the start role, the one you message, carries an **ORCHESTRATOR** badge.
@@ -40,6 +40,25 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 
 **Restore defaults** in the Columns menu goes back to the four default columns. The choice is remembered by the app on this computer, in the app's own storage, not in the [settings file](settings.md#the-settings-file). The TUI has no column choice: its cards pick their density from the terminal's size.
 
+## Filter the dashboard
+
+To show only the agents you care about right now, use the filter at the top of the Dashboard:
+
+1. Type into **Filter agents** to show only agents whose name, orchestration role, orchestration, working directory or last prompt contains what you typed. Case does not matter.
+2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, dispatchers, schedule agents or schedule: issues agents), **Status** (Working, Thinking, Waiting for input, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
+
+Dispatchers, schedule agents and schedule: issues agents are the agents started with the **dispatcher**, **schedule** and **schedule: issues** modes of [New agent](new-agent.md), in the desktop app or the TUI. An agent started that way by an earlier release of the deck is listed under single agents.
+
+An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
+
+While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **WAITING**, **FAILED**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
+
+A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
+
+The filter stays while you move between screens and lasts until you clear it or quit the app; the next time the app starts, the Dashboard shows every agent. You can also set and clear it [by voice](voice.md#filtering-the-dashboard). The TUI's dashboard has no filter.
+
+![The Dashboard filtered to working agents: two daemons filtered to working agents: the line under the header reads Showing 3 of 6 agents · Working, with a remove control beside Working and a Show all button, while the counters above still count all six agents](/img/dashboard-filter-desktop.png)
+
 ## Statuses
 
 The desktop app shows four statuses. Each covers one or more of the words the TUI shows on its cards:
@@ -59,8 +78,9 @@ To watch or talk to one agent:
 
 1. Click its row, or its open control (`Open <name> agent`). Its live terminal opens in a full-window pane over the Dashboard.
 2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
-3. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS). Plain `Ctrl+C` still goes to the agent as an interrupt, even while text is selected.
-4. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
+3. When the agent's output is longer than the terminal, a scrollbar stays on the terminal's right edge, so you can see that there is more above and how far back you are. Scroll up to read earlier output.
+4. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS). Plain `Ctrl+C` still goes to the agent as an interrupt, even while text is selected.
+5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
 The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal.
 
@@ -91,11 +111,11 @@ A daemon section shows one of these instead of its agents:
 
 | Title | What it means | What to do |
 | --- | --- | --- |
-| **Daemon disconnected** | Nothing is answering at that daemon's address. | Start a daemon (see [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon)), then press **Reconnect**. For a remote daemon, see [Daemons → What a remote daemon must already have](daemons.md#what-a-remote-daemon-must-already-have). |
+| **Daemon disconnected** | The app is not connected to that daemon, and the sentence under the title says why: no daemon is running there, a daemon is running but the app is not connected to it, or the app cannot tell, for example because the host cannot be reached. | Press the one button the section offers: **Start daemon** when no daemon is running, which asks first and names the machine it starts on, or **Reconnect** otherwise. See [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app), which also lists what a failed start says. |
 | **Waiting for this daemon** | The app is still connecting to it. | Nothing: its agents appear when it answers. If it never does, press **Test connection** for it in [Settings → Daemons](daemons.md#test-connection). |
 | **Establishing control channel** | The app is reading the daemon's agent list. | Nothing. |
 | **Daemon not configured** | A remote daemon has no socket path yet. | Open [Settings → Daemons](daemons.md), choose it and press **Test connection**, which finds the path. |
-| **Incompatible daemon** | A daemon answered, but it and the app are different versions, so the app will not use it. The message says which of the two is older, and either that the app has not connected because it could misread what the daemon reports, or that the two cannot work together at all. | Update the older of the two (see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)). The note says what each of its buttons does: **Open daemons** goes to the Daemons screen, where a daemon on this machine with no running agents can be replaced; **Connect anyway**, offered only when the message says the app could misread the daemon (never when the two cannot work together), uses the daemon as it is until you quit the app, though some of what it shows may be wrong; **Reconnect** tries again. **Technical details** under the message shows the exact versions, for a bug report. |
+| **Incompatible daemon** | A daemon answered, but it and the app are different versions, so the app will not use it. The message says which of the two is older, and either that the app has not connected because it could misread what the daemon reports, or that the two cannot work together at all. | Update the older of the two (see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)). The note says what each of its buttons does: **Upgrade**, offered when a remote daemon is older than the app, installs the app's version there and restarts the daemon, asking before it stops any running agent ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)); **Open daemons** goes to the Daemons screen, where the daemon on this machine can be replaced, asking before it stops any running agent; **Connect anyway**, offered only when the message says the app could misread the daemon (never when the two cannot work together), uses the daemon as it is until you quit the app, though some of what it shows may be wrong; **Reconnect** tries again. **Technical details** under the message shows the exact versions, for a bug report. |
 | **Desktop bridge error** | The app could not read the daemon's agents, and no daemon answered for it to judge. This is a problem on the app's side, not a version difference. | Press **Reconnect**. If it keeps happening, restart the app. |
 | **No agents are running yet** | The daemon is healthy and runs no agents. This is what a fresh install looks like. | Press **New agent**. |
 

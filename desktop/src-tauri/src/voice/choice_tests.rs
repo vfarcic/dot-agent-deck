@@ -18,6 +18,9 @@ fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
             ParamKind::SpokenPrefix => panic!("a spoken prefix cannot be an offered choice"),
             ParamKind::FilterText => panic!("filter text cannot be an offered choice"),
             ParamKind::CommandText => panic!("a command cannot be an offered choice"),
+            ParamKind::AgentKind | ParamKind::AgentStatus => {
+                panic!("a dashboard filter facet is optional, so it is never offered")
+            }
         }
         .to_string(),
         kind,
@@ -285,6 +288,7 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
         address: None,
         local: false,
         unavailable: None,
+        holds_agents: false,
     }];
     let live = ChoiceLive {
         agents: &agents,

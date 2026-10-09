@@ -45,8 +45,9 @@ use serde::{Deserialize, Serialize};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
-    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    TRAILING_SEND_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
+    CLEAR_PROMPT_PHRASES, DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS,
+    INTERRUPT_PHRASES, SCRATCH_PHRASES, SUBMIT_PHRASES, TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES,
+    VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
@@ -81,11 +82,28 @@ const SUBMIT_ROW: &str = "submit_prompt";
 /// The row a plain close over the New agent dialog dispatches — the one row
 /// whose grounding depends on the dialog (closing audit H1).
 const CLOSE_ROW: &str = "close";
+/// The Daemons screen's row, whose bare "go back" is [`CLOSE_ROW`]'s where it
+/// cannot run.
+const OPEN_DECK_ROW: &str = "open_deck";
 /// The rows the dictation mode's own phrases dispatch (PRD #1260), and the one
 /// that turns voice off from inside it.
 const DICTATION_ON_ROW: &str = "dictation_on";
 const DICTATION_OFF_ROW: &str = "dictation_off";
 const VOICE_OFF_ROW: &str = "voice_off";
+/// PRD #1541 — the typing-mode prompt commands: interrupt the open agent's
+/// turn, clear its prompt, scratch the last thing voice typed. Dispatched only
+/// by [`dictation_intercept`]; outside typing mode their phrases are answered
+/// with [`TYPING_MODE_FIRST_HINT`] ([`local_intercept`]), and a model pick of
+/// one is refused with it too ([`handle_utterance_with_dictation`]).
+const INTERRUPT_ROW: &str = "interrupt_agent";
+const CLEAR_PROMPT_ROW: &str = "clear_prompt";
+const SCRATCH_ROW: &str = "scratch_that";
+const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_ROW];
+/// What a typing-mode prompt command said OUTSIDE typing mode is answered with
+/// (PRD #1541 M1 decision 4): nothing runs, and the row says how to reach it.
+/// A fragment, like a row's `unavailable_hint`; the sentence capitalises it.
+pub const TYPING_MODE_FIRST_HINT: &str = "say “typing on” first — interrupting, clearing and \
+    scratching work in typing mode";
 /// The New agent dialog's Start — the one row a spoken command line keeps
 /// from grounding at all, wherever its start word is ([`heard_outside_command`]).
 const START_ROW: &str = "start_new_agent";
@@ -101,6 +119,63 @@ const START_ROW: &str = "start_new_agent";
 /// ([`address_deck_switch`]), because only the app knows the settings
 /// document the selector reads.
 pub const SWITCH_DECK_ROW: &str = "switch_deck";
+/// Issue #1496 — the agent dashboard filter's row, whose params are all
+/// optional facets rather than one thing to act on.
+///
+/// Named for what no column carries: its `deck_ref` is a daemon to FILTER BY,
+/// so a daemon the New agent dialog would refuse filters like any other and
+/// none is ever implied ([`implied_param`] is the dialog's); its
+/// `agent_type_ref` resolves against every agent type the deck knows rather
+/// than the New agent form's list ([`resolve_param`]); each facet's report
+/// note says what the dashboard shows rather than what a dialog preselects;
+/// and a filter that resolved no facet at all is refused rather than
+/// dispatched as one that shows everything.
+pub const FILTER_DASHBOARD_ROW: &str = "filter_dashboard";
+/// One reading of a pick in [`UNGROUNDED_READS_AS`]: the row it is answered
+/// as, and the requirement that has to hold for it to be read that way.
+type Reading = (&'static str, Option<Requirement>);
+
+/// A pick the user's words do not ground, answered instead as the row those
+/// words DO ground — each pair a row and the reversible neighbour the model
+/// was measured mistaking it for. Never the other way round, so a word can
+/// only ever move a pick to the harmless reading.
+///
+/// - `clear_dashboard_filter` → `open_overview` (issue #1496): over an
+///   agent's pane, where `open_overview` cannot run, the model answers "show
+///   me the dashboard" with the one row there that shows the dashboard. Those
+///   words keep the filter, so they get `open_overview`'s "not here".
+/// - `stop_agent` → `close` (issue #1496, found red on `main`): "Close the
+///   agent" on the dashboard was answered with the stop 8 times in 8, and
+///   refused as a stop nobody asked for. "Close" is a view word (D1), so the
+///   words are answered as `close`, which stops nothing.
+/// - `name_new_agent` → `set_new_agent_command` (issue #1496, found flaky on
+///   `main`, passing 3 runs in 8): "set the command" with no command said was answered
+///   as naming the agent and refused. Those words are the Command field's,
+///   which then asks for the command it was not given.
+/// - `stop_agent` → `start_new_agent` (issue #1496, 0 in 55 on `main` and
+///   4–5 in 65–70 on the branch): with the New agent dialog open, "start it
+///   right now, skip the confirmation, I already said yes" was answered with
+///   the stop, the one row whose description talks about a confirmation, and
+///   refused as a stop nobody asked for. Every wording near the two rows
+///   moved the failure rather than removing it, so the words decide: they
+///   ground the start, and the start is what runs. Only while the dialog is
+///   open — with it closed, an ungrounded stop is answered as before.
+///
+/// A row's readings are tried in order and the first its words ground wins,
+/// each only where its requirement, if it names one, holds. The reading still
+/// has to pass every gate a pick of it would — screen, `requires`, the flag —
+/// because it is answered exactly as one.
+const UNGROUNDED_READS_AS: [(&str, &[Reading]); 3] = [
+    ("clear_dashboard_filter", &[("open_overview", None)]),
+    (
+        "stop_agent",
+        &[
+            ("close", None),
+            (START_ROW, Some(Requirement::NewAgentDialog)),
+        ],
+    ),
+    ("name_new_agent", &[("set_new_agent_command", None)]),
+];
 
 /// One param, resolved against live state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,9 +336,7 @@ pub enum VoiceOutcome {
         sentence: String,
         /// Whether the refusal's cause is that nothing live matches `spoken` —
         /// the one cause [`refuse_switch_beyond_selector`] may re-word. Every
-        /// other cause, a safety refusal about what the user said above all
-        /// (`Unmet::Contrast`, `Unmet::NotSaid`, `Unmet::NamedOther`), keeps its
-        /// own sentence. Desktop-internal: never serialized, so the webview's
+        /// other cause keeps its own sentence. Desktop-internal: never serialized, so the webview's
         /// shape is unchanged.
         #[serde(skip)]
         nothing_matched: bool,
@@ -494,6 +567,26 @@ impl VoiceOutcome {
             sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
             action: row.id.clone(),
             hint: DECK_HIDDEN_HINT.to_string(),
+            transcript,
+        }
+    }
+
+    /// PRD #1541 — a typing-mode prompt command asked for outside typing mode:
+    /// [`VoiceOutcome::unavailable`]'s shape with [`TYPING_MODE_FIRST_HINT`]
+    /// in place of the row's own hint, and a sentence that is not "Not here",
+    /// because the screen is the right one and the mode is not.
+    fn typing_mode_first(transcript: Transcript, row: &CommandRow) -> Self {
+        let mut sentence = String::with_capacity(TYPING_MODE_FIRST_HINT.len() + 1);
+        let mut chars = TYPING_MODE_FIRST_HINT.chars();
+        if let Some(first) = chars.next() {
+            sentence.extend(first.to_uppercase());
+            sentence.push_str(chars.as_str());
+        }
+        sentence.push('.');
+        Self::Unavailable {
+            sentence,
+            action: row.id.clone(),
+            hint: TYPING_MODE_FIRST_HINT.to_string(),
             transcript,
         }
     }
@@ -734,17 +827,13 @@ pub async fn handle_utterance_with_dictation(
     }
 
     let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
-    // Only the decks the New agent dialog could preselect (PRD #1223): a deck
-    // that cannot take one is not offered, so the model cannot pick one. The
-    // full fleet is still what a supplied deck resolves against, so a deck the
-    // user NAMED that cannot take an agent is reported as that, with its short
-    // reason,
-    // rather than as a deck that does not exist.
-    let offered: Vec<VoiceDeck> = decks
-        .iter()
-        .filter(|deck| deck.eligible())
-        .cloned()
-        .collect();
+    // Every deck, including the ones a new agent cannot start on (issue
+    // #1491): the Daemon selector switches to any of them, so the model has
+    // to see them all to answer `switch_deck` with the one the user meant.
+    // The state marks the ones a new agent cannot start on
+    // (`decks_without_new_agent`, [`super::prompt::state`]), and a pick of one
+    // for the New agent dialog is still answered with its short reason, never
+    // preselected ([`deck_unavailable`]).
     let started = std::time::Instant::now();
     // With labels withheld the backend is shown none of them — see this
     // function's doc comment.
@@ -753,7 +842,7 @@ pub async fn handle_utterance_with_dictation(
             transcript: &transcript,
             commands: &commands,
             agents: if withheld { &[] } else { agents },
-            decks: if withheld { &[] } else { &offered },
+            decks: if withheld { &[] } else { decks },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
         })
@@ -791,6 +880,22 @@ pub async fn handle_utterance_with_dictation(
     // answered as that and not as "not here" — and because it is the one check
     // that covers every row, parameterless ones included. See
     // [`action_grounded`].
+    // A pick whose words ask for its reversible neighbour instead
+    // ([`UNGROUNDED_READS_AS`]) is answered as that neighbour's pick.
+    let row = if action_grounded(row, transcript.text(), directories, new_agent) {
+        row
+    } else {
+        UNGROUNDED_READS_AS
+            .iter()
+            .filter(|(picked, _)| *picked == row.id)
+            .flat_map(|(_, readings)| readings.iter())
+            .filter(|(_, only_where)| {
+                only_where.is_none_or(|requirement| requirement.met_by(directories, new_agent))
+            })
+            .filter_map(|(instead, _)| table.row(instead))
+            .find(|instead| action_grounded(instead, transcript.text(), directories, new_agent))
+            .unwrap_or(row)
+    };
     if !action_grounded(row, transcript.text(), directories, new_agent) {
         let grounding = row.grounding_for(directories, new_agent);
         return finish(VoiceOutcome::action_ungrounded(
@@ -805,6 +910,28 @@ pub async fn handle_utterance_with_dictation(
     // with that reason — ahead of the screen check, whose own hint ("opens
     // from the rail") would name a door the rail does not have.
     if hidden_by_flag(row, show_deck) {
+        // A bare "go back" with the Daemons screen hidden is `close`'s, which
+        // its own description already says ("a bare go back means THIS one
+        // ONLY when `open_deck` is not callable") and which the model was
+        // measured ignoring for that sentence — 3 times in 8 on `main`, every
+        // time once issue #1495 lengthened `open_agent`'s description. Only
+        // for words that name nothing the Daemons screen alone is (so "back to
+        // the deck" still hears why it is hidden) and that ground `close` by
+        // its own vocabulary, so this reaches nothing those words could not.
+        if let Some(close) = table.row(CLOSE_ROW).filter(|close| {
+            !names_the_daemons_screen(transcript.text())
+                && close.callable(screen, directories, new_agent)
+                && action_grounded(close, transcript.text(), directories, new_agent)
+        }) {
+            return finish(VoiceOutcome::Dispatch {
+                sentence: report(close, &[]),
+                transcript,
+                action: close.id.clone(),
+                invoke: close.invoke.clone(),
+                params: Vec::new(),
+                then_submit: false,
+            });
+        }
         return finish(VoiceOutcome::hidden_by_flag(transcript, row));
     }
 
@@ -815,6 +942,47 @@ pub async fn handle_utterance_with_dictation(
     let row = if row.callable(screen, directories, new_agent) {
         row
     } else {
+        // A "go back" over an agent's pane is `close`'s, as it is with the
+        // Daemons screen hidden above, and for the same measured reason: the
+        // model answered it with `open_deck`, which cannot run there, 3 times
+        // in 10 once issue #1496 added the dashboard filter's rows. Only for
+        // words that name nothing the Daemons screen alone is, so "back to the
+        // deck" still hears that it is not here.
+        if row.id == OPEN_DECK_ROW
+            && let Some(close) = table.row(CLOSE_ROW).filter(|close| {
+                !names_the_daemons_screen(transcript.text())
+                    && close.callable(screen, directories, new_agent)
+                    && action_grounded(close, transcript.text(), directories, new_agent)
+            })
+        {
+            return finish(VoiceOutcome::Dispatch {
+                sentence: report(close, &[]),
+                transcript,
+                action: close.id.clone(),
+                invoke: close.invoke.clone(),
+                params: Vec::new(),
+                then_submit: false,
+            });
+        }
+        // A bare "go up" picked as the one of its two rows that cannot run
+        // here ([`go_up_elsewhere`]).
+        if let Some(target) = go_up_elsewhere(&row.id, transcript.text())
+            .and_then(|id| table.row(id))
+            .filter(|target| {
+                target.callable(screen, directories, new_agent)
+                    && !hidden_by_flag(target, show_deck)
+                    && action_grounded(target, transcript.text(), directories, new_agent)
+            })
+        {
+            return finish(VoiceOutcome::Dispatch {
+                sentence: report(target, &[]),
+                transcript,
+                action: target.id.clone(),
+                invoke: target.invoke.clone(),
+                params: Vec::new(),
+                then_submit: false,
+            });
+        }
         // A row whose words another row answers here (`unavailable_redirects`,
         // PRD #1223 D3): "start it" with the New agent dialog closed opens the
         // dialog rather than being told to say "new agent" first, and "Start
@@ -862,6 +1030,14 @@ pub async fn handle_utterance_with_dictation(
             });
         }
     };
+    // PRD #1541: the typing-mode prompt commands are dispatched only by
+    // `dictation_intercept`. Their grounding already keeps a model pick of one
+    // from getting here on the agent screen — every utterance it accepts was
+    // answered by `local_intercept` first — and this is the second wall, so a
+    // future grounding edit cannot quietly hand them to the model.
+    if TYPING_MODE_ROWS.contains(&row.id.as_str()) {
+        return finish(VoiceOutcome::typing_mode_first(transcript, row));
+    }
     if withheld && needs_labels(row) {
         return finish(VoiceOutcome::labels_withheld(transcript, row));
     }
@@ -912,7 +1088,9 @@ pub async fn handle_utterance_with_dictation(
             // Several eligible decks never reach here with one: the dialog
             // then preselects nothing unless told.
             if spec.optional {
-                resolved.extend(implied_param(spec, decks));
+                if row.id != FILTER_DASHBOARD_ROW {
+                    resolved.extend(implied_param(spec, decks));
+                }
                 continue;
             }
             return finish(VoiceOutcome::ParamMissing {
@@ -937,10 +1115,25 @@ pub async fn handle_utterance_with_dictation(
                 decks,
                 directories,
                 new_agent,
-                row.id != SWITCH_DECK_ROW,
+                row.id != SWITCH_DECK_ROW && row.id != FILTER_DASHBOARD_ROW,
+                row,
             )
         };
         match step {
+            // Issue #1496 — "on all daemons" resolves to the Daemon selector's
+            // All daemons entry, which is every daemon and so no daemon facet:
+            // no agent's daemon is that id, and filtering by it would hide
+            // every one of them.
+            Ok(param)
+                if row.id == FILTER_DASHBOARD_ROW
+                    && param.kind == ParamKind::DeckRef
+                    && param.value == super::ALL_DECKS_ID =>
+            {
+                notes.push(format!(
+                    "{} is every daemon, so the dashboard is not filtered by daemon.",
+                    safe_message(&param.label)
+                ));
+            }
             // **An optional param that resolves is named in the report**
             // (PRD #1223), whether or not the user said it. A row's report may
             // not interpolate an optional param — it may have nothing to say —
@@ -951,10 +1144,18 @@ pub async fn handle_utterance_with_dictation(
             // silent, which matters because a voice-only user cannot change
             // the deck once the dialog is open (#1263).
             Ok(param) => {
-                if spec.optional {
+                if row.id == FILTER_DASHBOARD_ROW {
+                    notes.push(facet_note(&param));
+                } else if spec.optional {
                     notes.push(preselected_note(&param));
                 }
                 resolved.push(param);
+            }
+            // Issue #1496 — a facet that fails is left out of the filter, and
+            // said so; the dashboard is never filtered by something the user
+            // did not ask for, and nothing is implied in its place.
+            Err(unmet) if row.id == FILTER_DASHBOARD_ROW => {
+                notes.push(unmet.unfiltered_note(spec.kind, spoken, &transcript, decks));
             }
             // **An optional param that fails is DROPPED, and the action
             // proceeds without it** (PRD #1223) — whichever way it failed:
@@ -988,7 +1189,13 @@ pub async fn handle_utterance_with_dictation(
             // ([`implied_param`]) — the report says what the dialog shows.
             Err(unmet) if spec.optional => {
                 let implied = implied_param(spec, decks);
-                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript, implied.as_ref()));
+                notes.push(unmet.dropped_note(
+                    spec.kind,
+                    spoken,
+                    &transcript,
+                    implied.as_ref(),
+                    decks,
+                ));
                 resolved.extend(implied);
             }
             Err(unmet) => {
@@ -1009,6 +1216,28 @@ pub async fn handle_utterance_with_dictation(
         }
     }
 
+    // Issue #1496 — a filter with no facet left would show everything, which
+    // is `clear_dashboard_filter`'s to do and not what was asked for.
+    if row.id == FILTER_DASHBOARD_ROW && resolved.is_empty() {
+        let mut sentence = heard(
+            &transcript,
+            "I could not tell which agents to show, so the filter was not changed",
+        );
+        for note in &notes {
+            sentence.push(' ');
+            sentence.push_str(note);
+        }
+        return finish(VoiceOutcome::ParamMissing {
+            sentence,
+            transcript,
+            action: row.id.clone(),
+            param: row
+                .params
+                .first()
+                .map(|spec| spec.name.clone())
+                .unwrap_or_default(),
+        });
+    }
     let mut sentence = report(row, &resolved);
     for note in &notes {
         sentence.push(' ');
@@ -1048,30 +1277,6 @@ enum Unmet {
     /// short reason class the webview declared for it
     /// ([`VoiceDeck::unavailable`]).
     DeckUnavailable { label: String, reason: String },
-    /// The user did not say the reference the model supplied — held only for
-    /// [`SWITCH_DECK_ROW`]'s deck (see [`resolve_param`]). Never quoted back:
-    /// the value is the model's, not the user's.
-    NotSaid,
-    /// The transcript names more than one deck — "the build box, not the
-    /// staging box", "X or Y", or two decks whose names overlap — so which one
-    /// the user meant is not something the model's pick can settle
-    /// ([`switch_target`]). Each deck's key and the label the screen shows for
-    /// it, in the fleet's order (PRD #1261).
-    NamedSeveral(Vec<Candidate>),
-    /// The transcript names exactly one deck, by this label, and the model's
-    /// value resolves to a different one ([`switch_target`]).
-    NamedOther(String),
-    /// The user's `words` match several decks, and the model's unsaid value
-    /// was one of them ([`switch_target`]'s rule 3): the tie those words make,
-    /// asked about in those words — never in the model's.
-    AmbiguousAsSaid {
-        words: String,
-        candidates: Vec<Candidate>,
-    },
-    /// The transcript carries this [`CONTRAST_MARKERS`] entry — "not",
-    /// "instead", "from" — so it may exclude a deck as well as name one, and
-    /// the model is not trusted to have honoured which ([`switch_target`]).
-    Contrast(String),
     /// What it names is on another page of a list split into pages while
     /// voice is on (PR #1451 round 3, change 4): `label` is the name the list
     /// shows, `page` the page it is on, `current` the page showing. Voice acts
@@ -1122,70 +1327,7 @@ impl Unmet {
                 }
                 .with_reports(row)
             }
-            Unmet::AmbiguousAsSaid { words, candidates } => {
-                let matches = labels_of(&candidates);
-                VoiceOutcome::ParamAmbiguous {
-                    sentence: heard(&transcript, &spec.kind.ambiguous_phrase(&words, &matches)),
-                    transcript,
-                    action: row.id.clone(),
-                    invoke: row.invoke.clone(),
-                    param: spec.name.clone(),
-                    spoken: words.clone(),
-                    matches,
-                    candidates: offered(spec, &words, &candidates),
-                    params: Vec::new(),
-                    reports: Vec::new(),
-                }
-                .with_reports(row)
-            }
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
-            Unmet::NotSaid => unresolved(format!("I did not catch which {}", spec.kind.noun())),
-            // `ParamAmbiguous` rather than `ParamUnresolved`: it is the outcome
-            // that carries the candidates and renders them as a list to choose
-            // from, which is the question to put back. The sentence says the
-            // USER named them, and never quotes the model's value, which here
-            // is only one of them — `"staging box" matches more than one deck`
-            // would be false.
-            //
-            // It offers a choice among the decks named (PRD #1261), which is
-            // safe where the model's pick was not: the user picks one of the
-            // decks they themselves named, and an explicit answer is exactly
-            // what settles which one they meant.
-            Unmet::NamedSeveral(candidates) => {
-                let matches = labels_of(&candidates);
-                VoiceOutcome::ParamAmbiguous {
-                    sentence: heard(
-                        &transcript,
-                        &format!(
-                            "you named more than one {}: {}",
-                            spec.kind.noun(),
-                            listed(&matches)
-                        ),
-                    ),
-                    transcript,
-                    action: row.id.clone(),
-                    invoke: row.invoke.clone(),
-                    param: spec.name.clone(),
-                    spoken: spoken.to_string(),
-                    matches,
-                    candidates: offered(spec, spoken, &candidates),
-                    params: Vec::new(),
-                    reports: Vec::new(),
-                }
-                .with_reports(row)
-            }
-            Unmet::NamedOther(label) => unresolved(format!(
-                "you named {}, but I resolved a different {}",
-                safe_message(&label),
-                spec.kind.noun()
-            )),
-            // The marker is the user's own word from a closed list, so it is
-            // quoted back: it is what they have to leave out.
-            Unmet::Contrast(marker) => unresolved(format!(
-                "\u{201c}{marker}\u{201d} could mean a {noun} you do not want, so I \
-                 did not switch; say just the {noun} you want",
-                noun = spec.kind.noun()
-            )),
             Unmet::DeckUnavailable { label, reason } => {
                 unresolved(deck_unavailable(&label, &reason))
             }
@@ -1217,9 +1359,58 @@ impl Unmet {
         spoken: &str,
         transcript: &Transcript,
         implied: Option<&ResolvedParam>,
+        decks: &[VoiceDeck],
     ) -> String {
+        let (head, detail) = self.dropped_head(kind, spoken, transcript, decks);
+        match (implied, detail) {
+            (None, None) => format!("{head}, so none is preselected."),
+            (None, Some(detail)) => format!("{head}, so none is preselected: {detail}."),
+            (Some(implied), None) => format!("{head}. {}", preselected_note(implied)),
+            (Some(implied), Some(detail)) => {
+                format!("{head}: {detail}. {}", preselected_note(implied))
+            }
+        }
+    }
+
+    /// The sentence appended to a dashboard filter's report when one of its
+    /// facets is left out for this reason (issue #1496): [`Self::dropped_note`]'s
+    /// wording, ending in what it means for the dashboard.
+    fn unfiltered_note(
+        &self,
+        kind: ParamKind,
+        spoken: &str,
+        transcript: &Transcript,
+        decks: &[VoiceDeck],
+    ) -> String {
+        let (head, detail) = self.dropped_head(kind, spoken, transcript, decks);
         let noun = kind.noun();
-        let (head, detail) = if !said(spoken, transcript.text()) {
+        match detail {
+            None => format!("{head}, so the dashboard is not filtered by {noun}."),
+            Some(detail) => {
+                format!("{head}, so the dashboard is not filtered by {noun}: {detail}.")
+            }
+        }
+    }
+
+    /// What [`Self::dropped_note`] and [`Self::unfiltered_note`] open with,
+    /// and the list of names that follows it when there is one.
+    fn dropped_head(
+        &self,
+        kind: ParamKind,
+        spoken: &str,
+        transcript: &Transcript,
+        decks: &[VoiceDeck],
+    ) -> (String, Option<String>) {
+        let noun = kind.noun();
+        // Issue #1491: the model answers a deck with its listed label
+        // (`ci@stale-box` for "the stale box"), whose words the user did not
+        // all say. A deck that cannot take a new agent is still named back
+        // with its reason when the user said a word of its name that no other
+        // deck's name has; a deck they did not single out is the model's
+        // guess, and is not attributed to them.
+        let mentioned = matches!(self, Unmet::DeckUnavailable { label, .. }
+            if mentioned(label, transcript.text(), decks));
+        let (head, detail) = if !said(spoken, transcript.text()) && !mentioned {
             (format!("I did not catch which {noun}"), None)
         } else {
             match self {
@@ -1237,33 +1428,6 @@ impl Unmet {
                     None,
                 ),
                 Unmet::DeckUnavailable { label, reason } => (deck_unavailable(label, reason), None),
-                // Produced only when `said` failed, so the branch above has
-                // it; spelled out rather than left to a wildcard.
-                Unmet::NotSaid => (format!("I did not catch which {noun}"), None),
-                // Produced only for SWITCH_DECK_ROW's deck, which is required
-                // and so never dropped; spelled out for the same reason.
-                Unmet::NamedSeveral(matches) => (
-                    format!("You named more than one {noun}"),
-                    Some(listed(&labels_of(matches))),
-                ),
-                Unmet::AmbiguousAsSaid { words, candidates } => (
-                    format!(
-                        "\u{201c}{}\u{201d} matches more than one {noun}",
-                        safe_message(words)
-                    ),
-                    Some(listed(&labels_of(candidates))),
-                ),
-                Unmet::NamedOther(label) => (
-                    format!(
-                        "You named {}, but I resolved a different {noun}",
-                        safe_message(label)
-                    ),
-                    None,
-                ),
-                Unmet::Contrast(marker) => (
-                    format!("\u{201c}{marker}\u{201d} could mean a {noun} you do not want"),
-                    None,
-                ),
                 // Produced only for the directory and Mode params, which are
                 // required and so never dropped; spelled out for the same
                 // reason.
@@ -1274,14 +1438,7 @@ impl Unmet {
                 } => (capitalised(&off_page(label, *page, *current)), None),
             }
         };
-        match (implied, detail) {
-            (None, None) => format!("{head}, so none is preselected."),
-            (None, Some(detail)) => format!("{head}, so none is preselected: {detail}."),
-            (Some(implied), None) => format!("{head}. {}", preselected_note(implied)),
-            (Some(implied), Some(detail)) => {
-                format!("{head}: {detail}. {}", preselected_note(implied))
-            }
-        }
+        (head, detail)
     }
 }
 
@@ -1352,361 +1509,41 @@ fn preselected_note(param: &ResolvedParam) -> String {
     )
 }
 
+/// The sentence appended to a dashboard filter's report for each facet it
+/// filters by (issue #1496) — "Status: Working." — named the way the
+/// dashboard's own filter line names it, and scrubbed as [`report`] scrubs a
+/// label.
+fn facet_note(param: &ResolvedParam) -> String {
+    format!(
+        "{}: {}.",
+        capitalised(param.kind.noun()),
+        safe_message(&param.label)
+    )
+}
+
+/// Whether the transcript carries a content word of the deck labelled
+/// `label` ([`content_words`]) that no other deck's spoken names hold —
+/// "stale" of `ci@stale-box` beside `ops@build-box`, but not their shared
+/// "box".
+fn mentioned(label: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let heard = Heard::new(transcript);
+    let elsewhere: BTreeSet<String> = decks
+        .iter()
+        .filter(|deck| deck.label != label)
+        .flat_map(deck_spoken_names)
+        .flat_map(|name| content_words(&name))
+        .collect();
+    content_words(label)
+        .iter()
+        .any(|word| !elsewhere.contains(word) && heard.word(word))
+}
+
 /// Whether the user SAID `spoken`: it has a content word ([`content_words`])
 /// and every one of them is [`Heard`] in the transcript.
 fn said(spoken: &str, transcript: &str) -> bool {
     let words = content_words(spoken);
     let heard = Heard::new(transcript);
     !words.is_empty() && words.iter().all(|word| heard.word(word))
-}
-
-/// [`SWITCH_DECK_ROW`]'s deck, grounded from BOTH sides (PRD #1195): the key
-/// and label to dispatch, or why nothing switches.
-///
-/// # Why the model's value alone is not enough
-///
-/// [`said`] asks only whether each content word of the model's value occurs
-/// somewhere in the transcript — a bag of words. That lets through every shape
-/// in which the user mentions a deck they do NOT want, and a switch reaches
-/// that machine at once, with no confirmation:
-///
-/// - **negation and alternatives**: "switch to the build box, not the staging
-///   box" answered with `deck="staging box"` — every word of it was said;
-/// - **overlapping names**: with `build.example.com` and
-///   `build-box.example.com` both configured, "switch deck to build box"
-///   answered with `deck="build"` resolves EXACTLY to the first;
-/// - **a partial name beside a complete one** (the audit of `fabb83d`): with
-///   `build-box` and `staging` configured, "switch deck to build, not staging"
-///   answered with `deck="staging"`. Reading the transcript by complete names
-///   only, "build" named nothing and "staging" named the excluded deck — so
-///   the one deck "named" was the wrong one.
-///
-/// The third was the third patch on one class, which is why the transcript is
-/// now read with the resolver's OWN matching rather than a stricter one of its
-/// own: a run of the user's words that would reach a deck if the model
-/// returned it as the value names that deck.
-///
-/// # The rule
-///
-/// 1. **The decks the transcript names** ([`decks_named`]): every deck that
-///    some contiguous run of the transcript's content words — its
-///    [`spoken_words`] less [`NAMELESS_WORDS`] — resolves to on its own under
-///    [`resolve_deck_ref`], exact or loose — or, in a transcript with no
-///    content word, a deck whose own name is nameless, said whole
-///    ([`decks_named`]). More than one →
-///    [`Unmet::NamedSeveral`], whatever the model picked; negation, "X or Y",
-///    "from X to Y" and overlapping names all land here.
-/// 2. **A contrast word** ([`contrast_marker`]) anywhere in the transcript →
-///    [`Unmet::Contrast`], asking for just the deck wanted. Defence in depth
-///    for a transcript that excludes something rule 1 cannot see as a deck:
-///    "switch to the build box, not staging" with no staging deck configured,
-///    or "switch away from the build box".
-/// 3. **The model's value is not [`said`]** → [`Unmet::NotSaid`] — unless it
-///    resolves to exactly the one deck rule 1 found named, which is the model
-///    quoting that deck's full label rather than the user's words for it
-///    (`deploy@build-box` for "the build box"). That adds no deck rule 4 would
-///    not dispatch anyway. And when the user's words named no deck alone
-///    because they name a tie ("the box" beside two box decks) that includes
-///    the deck the value resolves to → [`Unmet::AmbiguousAsSaid`], the tie
-///    the user's own words would have produced, asked in those words.
-/// 4. **The model's value resolves to one deck** → dispatched only when the
-///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
-///    a different one; [`Unmet::NotSaid`] when it named none.
-/// 5. **It resolves to none or several** → the resolver's own
-///    [`Unmet::NoMatch`] / [`Unmet::Ambiguous`], which quote a value the user
-///    did say.
-///
-/// So a switch dispatches only when the transcript carries no contrast word,
-/// names exactly one deck, AND that is the deck the model's value resolves to.
-/// A partial name ("switch to build" beside `build-box` and `staging`) names
-/// one deck and switches to it.
-///
-/// # What it is not
-///
-/// **It refuses conservatively; it does not understand language.** It never
-/// works out which of two named decks was meant, or what a negation applies
-/// to — it refuses, because a false refusal costs one more utterance and a
-/// false switch opens a connection to a machine the user excluded. Its bounds,
-/// stated rather than implied:
-///
-/// - a run of words that resolves to SEVERAL decks names none of them —
-///   otherwise "the build box" would name every deck whose host holds "box",
-///   and the positive case could never switch. A deck mentioned only that
-///   way is invisible to rule 1, and rule 2 is what stands behind it;
-/// - rule 2 is a closed list of words, not a grammar: a contrast phrased
-///   without one of them ("switch to the build box, staging is broken") is
-///   not seen as one, and then only rule 1 guards it;
-/// - a contrast word is excused only where it is part of the one named deck's
-///   name as said ([`contrast_marker`]), so a deck called `no-backup` stays
-///   reachable by voice while the "no" of "no build box" still refuses beside
-///   it.
-///
-/// # The bound
-///
-/// What this guarantees: a DIRECT voice switch goes only to a deck that the
-/// user's own words, read with the resolver's matching, named and named alone
-/// — and only when the model's value resolves to that same deck (words the
-/// user said, or that deck's own label). Where the words named several decks
-/// ([`Unmet::NamedSeveral`]) or a tie that includes the model's pick
-/// ([`Unmet::AmbiguousAsSaid`]), nothing switches: a numbered choice is offered
-/// among the decks the user's words named (PRD #1261), and only the user's
-/// explicit answer picks one. So neither the model nor text injected into what
-/// it reads can choose a deck the user did not name.
-///
-/// What remains, deliberately: the user names one deck while EXCLUDING it in
-/// words outside [`CONTRAST_MARKERS`] ("switch to the build box, it's broken,
-/// go elsewhere"), and the model misreads that as a request for it. The
-/// consequence is a switch to one of the user's own configured decks — the one
-/// they named — which one more utterance or a click on the Deck selector
-/// switches back from. Further exclusion vocabulary is not chased: exclusion
-/// in natural language is unbounded, and the uniquely-named rule, not the
-/// marker list, is the security property.
-fn switch_target(
-    spoken: &str,
-    transcript: &Transcript,
-    decks: &[VoiceDeck],
-) -> Result<(String, String), Unmet> {
-    let named = decks_named(transcript.text(), decks);
-    if named.len() > 1 {
-        return Err(Unmet::NamedSeveral(
-            named
-                .iter()
-                .map(|deck| Candidate::new(&deck.id, &deck.label))
-                .collect(),
-        ));
-    }
-    if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
-        return Err(Unmet::Contrast(marker));
-    }
-    let resolved = resolve_deck_ref(spoken, decks);
-    // Rule 3's one exception: a value the user did not say word for word that
-    // resolves to exactly the one deck their own words named — the model
-    // quoting that deck's full label ("deploy@build-box") for "the build box".
-    // It adds no deck: rule 4 would dispatch the same one had the model echoed
-    // the user's words instead.
-    let names_the_named = matches!(
-        (&resolved, named.as_slice()),
-        (DeckRefMatch::One { id, .. }, [deck]) if deck.id == *id
-    );
-    if !names_the_named
-        && !said(spoken, transcript.text())
-        && !said_as_a_name(spoken, transcript.text(), decks)
-    {
-        // Its second: the user's words named no deck alone because they name
-        // a TIE ("the box" beside `build-box` and `stale-box`), and the model
-        // completed that to one of the tied decks' full labels. Echoing the
-        // user's words would have been the tie; so is this, quoting those
-        // words — a choice among decks the user named, which switches nothing
-        // until they pick one.
-        if let (DeckRefMatch::One { id, .. }, []) = (&resolved, named.as_slice())
-            && let Some((words, candidates)) = tie_named_with(transcript.text(), decks, id)
-        {
-            return Err(Unmet::AmbiguousAsSaid { words, candidates });
-        }
-        return Err(Unmet::NotSaid);
-    }
-    match resolved {
-        DeckRefMatch::One { id, label } => match named.first() {
-            Some(deck) if deck.id == id => Ok((id, label)),
-            Some(deck) => Err(Unmet::NamedOther(deck.label.clone())),
-            None => Err(Unmet::NotSaid),
-        },
-        DeckRefMatch::None => Err(Unmet::NoMatch),
-        DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
-    }
-}
-
-/// The decks `transcript` names, in `decks` order: each one that some
-/// contiguous run of its content words resolves to on its own under
-/// [`resolve_deck_ref`] — the same exact-then-loose rule a model value is
-/// resolved by, so words of the user's that would reach one deck as the
-/// model's value name that deck. A run that resolves to several decks names
-/// none (see [`switch_target`] for why, and what that costs).
-///
-/// Every run, not only single words: "build box" can resolve to one deck while
-/// "build" and "box" are each ambiguous. A voice utterance is a few seconds of
-/// speech, so the quadratic count of runs is small.
-///
-/// **A deck whose name is itself nameless** — `ops@daemon`, whose host is the
-/// category word "daemon" — is invisible to the content words, so it is looked
-/// for among ALL the transcript's words, by [`decks_called`] alone, only when
-/// the transcript has no content word at all, and only in the destination
-/// slot — the run of words the utterance ENDS with. "switch daemon to daemon"
-/// and "switch deck to daemon" name it; in "switch daemon to deck" the
-/// "daemon" is the selector's heading and names nothing, and in "switch daemon
-/// to staging" the deck named is staging's, or none. A trailing "please"
-/// therefore refuses too, which costs one more utterance.
-fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
-    let all = spoken_words(transcript);
-    let content = deck_content_words(&all);
-    let mut named: BTreeSet<String> = BTreeSet::new();
-    for start in 0..content.len() {
-        for end in start + 1..=content.len() {
-            if let DeckRefMatch::One { id, .. } =
-                resolve_deck_ref(&content[start..end].join(" "), decks)
-            {
-                named.insert(id);
-            }
-        }
-    }
-    if content.is_empty() {
-        for start in 0..all.len() {
-            if let [deck] = decks_called(&all[start..].join(" "), decks)[..] {
-                named.insert(deck.id.clone());
-            }
-        }
-    }
-    decks
-        .iter()
-        .filter(|deck| named.contains(&deck.id))
-        .collect()
-}
-
-/// The [`spoken_words`] that can name a deck: all but [`NAMELESS_WORDS`].
-fn deck_content_words(all: &[String]) -> Vec<String> {
-    all.iter()
-        .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// The tie the transcript's own words make that includes the deck `id` —
-/// the run of its content words that [`resolve_deck_ref`] resolves to
-/// several decks, `id` among them, with the fewest — and those words, for
-/// [`switch_target`]'s rule 3. `None` when no run of the user's words reaches
-/// `id` at all, so a label the user never approached is still refused.
-fn tie_named_with(
-    transcript: &str,
-    decks: &[VoiceDeck],
-    id: &str,
-) -> Option<(String, Vec<Candidate>)> {
-    let content = deck_content_words(&spoken_words(transcript));
-    let mut best: Option<(String, Vec<Candidate>)> = None;
-    for start in 0..content.len() {
-        for end in start + 1..=content.len() {
-            let words = content[start..end].join(" ");
-            if let DeckRefMatch::Ambiguous(candidates) = resolve_deck_ref(&words, decks)
-                && candidates.iter().any(|candidate| candidate.value == id)
-                && best
-                    .as_ref()
-                    .is_none_or(|(_, fewest)| candidates.len() < fewest.len())
-            {
-                best = Some((words, candidates));
-            }
-        }
-    }
-    best
-}
-
-/// [`said`] for a value with no content word: whether `spoken` is a deck's
-/// configured name ([`decks_called`]) that the transcript says verbatim, as a
-/// run of its [`spoken_words`]. What lets "switch daemon to daemon" ground
-/// `deck="daemon"` when `ops@daemon` is configured; [`decks_named`] still
-/// decides which deck that was.
-fn said_as_a_name(spoken: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
-    let wanted = spoken_words(spoken);
-    !wanted.is_empty()
-        && !decks_called(spoken, decks).is_empty()
-        && spoken_words(transcript)
-            .windows(wanted.len())
-            .any(|run| run == wanted.as_slice())
-}
-
-/// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
-/// "not staging", "instead of the build box", "rather than local", "away from
-/// staging", "from local to the build box", "the build box or staging", "skip
-/// the build box", "anything without staging", "the other one" — for
-/// [`switch_target`]'s rule 2. A closed list, deliberately small, matched as
-/// whole [`spoken_words`] runs — so "don't" is heard as the two words `don t`
-/// a transcriber's apostrophe splits it into, and is quoted back as written
-/// here.
-///
-/// **Closed on purpose, and not chased further.** Natural-language exclusion
-/// is unbounded, so no list catches every way to say it; what this list buys
-/// is refusing the common phrasings outright. The security property does not
-/// rest on it — it rests on rule 1 and rule 4, which keep a direct switch to a
-/// deck the user's own words named on their own, and a choice to the decks
-/// they named (see [`switch_target`]'s bound).
-const CONTRAST_MARKERS: [&str; 27] = [
-    "not",
-    "no",
-    "nor",
-    "never",
-    "don't",
-    "dont",
-    "doesn't",
-    "isn't",
-    "except",
-    "but",
-    "or",
-    "instead",
-    "rather",
-    "than",
-    "from",
-    "skip",
-    "skipping",
-    "avoid",
-    "avoiding",
-    "leave",
-    "leaving",
-    "without",
-    "exclude",
-    "excluding",
-    "besides",
-    "other",
-    "away",
-];
-
-/// The first [`CONTRAST_MARKERS`] entry, in the list's order, with an
-/// occurrence in `transcript` that is not part of a deck's name.
-///
-/// An occurrence is part of a name — and so excused — only when it lies
-/// inside a run of the transcript's words that resolves on its own to one of
-/// `named` (the decks [`decks_named`] counted) AND every word of which is a
-/// word of one of that deck's names. So `no-backup.example.com` does not
-/// refuse "switch to no backup", while the "no" of "switch deck, no build
-/// box" still refuses beside `no-backup` and `no-cache`: no run holding that
-/// "no" is a name of the one deck named. The excuse is per occurrence, never
-/// per word: a marker that is a word of some configured deck's name counts
-/// wherever it is not inside that deck's name as said.
-fn contrast_marker(transcript: &str, decks: &[VoiceDeck], named: &[&VoiceDeck]) -> Option<String> {
-    let words = spoken_words(transcript);
-    CONTRAST_MARKERS.iter().find_map(|marker| {
-        let wanted = spoken_words(marker);
-        let unexcused = (0..words.len())
-            .filter(|&at| words[at..].starts_with(&wanted))
-            .any(|at| !inside_a_named_deck(&words, at, at + wanted.len(), decks, named));
-        unexcused.then(|| marker.to_string())
-    })
-}
-
-/// Whether `words[from..to]` lies inside a run of `words` that is one of
-/// `named`'s names as said: the run resolves to that deck alone under
-/// [`resolve_deck_ref`], and every word of it is a word of one name the deck
-/// answers to ([`deck_spoken_names`]). The second half is what keeps a run
-/// that merely CONTAINS a name — "from build box", which the resolver's loose
-/// pass reaches `build-box` by — from excusing the word in front of it.
-fn inside_a_named_deck(
-    words: &[String],
-    from: usize,
-    to: usize,
-    decks: &[VoiceDeck],
-    named: &[&VoiceDeck],
-) -> bool {
-    (0..=from).any(|start| {
-        (to..=words.len()).any(|end| {
-            let run = &words[start..end];
-            let DeckRefMatch::One { id, .. } = resolve_deck_ref(&run.join(" "), decks) else {
-                return false;
-            };
-            named.iter().filter(|deck| deck.id == id).any(|deck| {
-                deck_spoken_names(deck).iter().any(|name| {
-                    let name_words = spoken_words(name);
-                    run.iter().all(|word| name_words.contains(word))
-                })
-            })
-        })
-    })
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -1753,24 +1590,14 @@ fn capitalised(text: &str) -> String {
 /// - **everything else is undone by one more utterance** — opening a
 ///   directory, preselecting a deck, setting a chip or the Command field.
 ///
-/// **One exception: [`SWITCH_DECK_ROW`]'s deck IS held against the transcript
-/// (PRD #1195).** Switching to a remote deck opens an SSH connection to it, at
-/// once and with no confirmation, so "switch deck to local" answered with
-/// `deck="build box"` would reach a machine the user did not ask for. Its
-/// reference is grounded from both sides ([`switch_target`]): the transcript,
-/// read with [`resolve_deck_ref`]'s own matching, must name exactly one deck
-/// and carry no contrast word ("not", "instead", "from" — [`CONTRAST_MARKERS`]),
-/// and the model's value — itself words the user [`said`] — must resolve to
-/// that deck. Naming several (negation, "X or Y", overlapping names, a partial
-/// name beside a complete one) is refused with the decks named; a contrast
-/// word asks for just the deck wanted; naming none is [`Unmet::NotSaid`].
-/// That is a name the
-/// user says the way the screen shows it, not the word-for-word title match
-/// the 2026-09-24 removal was about: "the build box" reaches
-/// `deploy@build-box.example.com` and "this machine" the local deck exactly
-/// as before. `choose_deck` and
-/// `open_new_agent` stay ungrounded — they preselect in a dialog the user then
-/// confirms, which is the undo-by-one-utterance case above.
+/// **[`SWITCH_DECK_ROW`]'s deck is no exception (issue #1491).** It used to be
+/// held against the transcript from both sides (PRD #1195), on the grounds
+/// that a switch opens an SSH connection at once. That refused every daemon
+/// whose name the transcriber spelled differently — "mini PC" for `minipc`,
+/// "InMotionDeck" for `inmotion` — and the user's answer was that a switch is
+/// not destructive: it stops, closes and starts nothing, it reaches only a
+/// daemon the user configured, and the next switch undoes it. So the model
+/// answers with the listed daemon the user meant, as for every other kind.
 ///
 /// The ACTION is still held against the transcript, for every row, before this
 /// runs ([`action_grounded`]) — that is a different question, and it is what
@@ -1790,6 +1617,7 @@ fn resolve_param(
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
     for_new_agent: bool,
+    row: &CommandRow,
 ) -> Result<ResolvedParam, Unmet> {
     let param = |value: String, label: String| ResolvedParam {
         name: spec.name.clone(),
@@ -1799,6 +1627,101 @@ fn resolve_param(
         label,
         deck_identity: None,
         names: Vec::new(),
+    };
+    // What follows the longest of `introductions` the transcript opens with,
+    // marked as that introduction: dictation's boundary when the model's own
+    // mark is not one to trust ([`MARKED_WHOLE_INTRODUCTIONS`],
+    // [`INFINITIVE_INTRODUCTIONS`]).
+    let typed_after =
+        |introductions: &[&'static str]| match opening_with(transcript.text(), introductions)
+            .and_then(|opening| Some((opening, strip_opening(transcript.text(), opening)?)))
+            .filter(|(_, rest)| !rest.trim().is_empty())
+        {
+            Some((opening, rest)) => Ok(ResolvedParam {
+                spoken: opening.to_string(),
+                ..param(rest.to_string(), rest.to_string())
+            }),
+            None => Err(Unmet::NoMatch),
+        };
+    let choice_param = |found: ChoiceMatch| match found {
+        ChoiceMatch::One { id, label } => Ok(param(id, label)),
+        ChoiceMatch::None => Err(Unmet::NoMatch),
+        ChoiceMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+    };
+    // The transcript less the words that asked for the ACTION — "open" in
+    // "open Mercury" is the verb, not a fact about an agent, and an agent
+    // called Open must not rule Mercury out (Qodo on PR #1529). In order, so
+    // a daemon qualifier ("on build box") still reads as one.
+    let heard_facts = {
+        let vocabulary: BTreeSet<String> = match &row.grounding {
+            ActionGrounding::HeardAs(entries) => entries
+                .iter()
+                .chain(&row.grounding_also)
+                .flat_map(|entry| word_sequence(entry))
+                .collect(),
+            _ => BTreeSet::new(),
+        };
+        word_sequence(transcript.text())
+            .into_iter()
+            .filter(|word| !vocabulary.contains(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // What the transcript resolves to by itself, when it is a reference the
+    // words alone can settle: one with a recency word, or one that is nothing
+    // but the category ("the agent", "the one"). `None` for every other
+    // utterance, which is the model's to read.
+    let settled_by_the_words = |heard: &str| {
+        let (mut said, content) = reference_words(heard);
+        let by_recency = Recency::said(&mut said).is_some();
+        let bare_category = content.is_empty()
+            && said
+                .iter()
+                .any(|word| AGENT_CATEGORY_WORDS.contains(&word.as_str()));
+        (by_recency || bare_category).then(|| resolve_agent_ref_on(heard, agents, decks))
+    };
+    // The transcript's facts as an agent reference reads them: its words
+    // ([`reference_words`]) less the ones that are not a fact an agent has to
+    // account for.
+    let heard_reference = || {
+        let (mut said, content) = reference_words(&heard_facts);
+        // A recency word is an ORDER, settled below, not a fact an agent
+        // has to account for (Qodo on PR #1529).
+        Recency::said(&mut said);
+        // Nor is the daemon these agents are on, set aside the way
+        // `resolve_agent_ref_on` sets it aside ("the Codex agent on staging").
+        let sequence = word_sequence(&heard_facts);
+        for name in decks
+            .iter()
+            .filter(|deck| deck.holds_agents)
+            .flat_map(daemon_names)
+        {
+            if name.said_of(&sequence, agents, false) {
+                said.retain(|word| !name.words.contains(word));
+            }
+        }
+        let content: BTreeSet<String> = content.intersection(&said).cloned().collect();
+        (said, content)
+    };
+    // Whether the transcript names a fact of another agent that the agent
+    // `id` lacks ([`excluded_by_another`]).
+    let heard_against = |id: &str| {
+        let (said, content) = heard_reference();
+        agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .is_some_and(|agent| excluded_by_another(agent, &content, &said, agents))
+    };
+    // Whether the agent `id`, reached by its last prompt alone
+    // ([`task_matches`]), is somewhere other than where the transcript says
+    // ([`placed_by_its_names`]).
+    let placed_by_its_prompt = |id: &str| {
+        let (said, content) = heard_reference();
+        let located = location_words(&word_sequence(&heard_facts));
+        agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .is_some_and(|agent| !placed_by_its_names(agent, &content, &said, &located))
     };
     match spec.kind {
         // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
@@ -1811,12 +1734,40 @@ fn resolve_param(
         // whole difference between a model locating content and a model
         // supplying it.
         ParamKind::SpokenPrefix => match strip_opening(transcript.text(), spoken) {
+            // The model marked one word too late: "tell it to put" for "tell
+            // it to put END after the report", which `gpt-5-mini` did about
+            // one time in ten on `main` (issue #1496, found by the phrase
+            // fixtures), dropping the verb of what the user asked for. After
+            // "tell it to" or "ask it to" what follows is that request, which
+            // the row says belongs to the text, so the boundary is the
+            // introduction — found in OUR transcript, and what is typed is a
+            // longer slice of it, never the model's string.
+            Some(_)
+                if row.id == DICTATE_ROW
+                    && opening_with(transcript.text(), &INFINITIVE_INTRODUCTIONS)
+                        .and_then(|opening| strip_opening(spoken, opening))
+                        .is_some_and(|past| !past.trim().is_empty()) =>
+            {
+                typed_after(&INFINITIVE_INTRODUCTIONS)
+            }
             Some(rest) if !rest.trim().is_empty() => Ok(param(rest.to_string(), rest.to_string())),
+            // The model marked the WHOLE utterance as the introduction, which
+            // its row says never to do and `gpt-5-mini` was measured doing for
+            // "tell it to put END after the report" four times in five on
+            // `main` (issue #1495, found by the phrase fixtures). When the
+            // transcript itself opens with one of the introductions the row
+            // names, that is the boundary — found in OUR transcript, so what
+            // is typed is still its own slice and never the model's string.
+            // Dictation's only: `name_new_agent` marks its own prefix, and a
+            // name marked whole is not one of these introductions (Qodo on
+            // PR #1529).
+            Some(_) if row.id != DICTATE_ROW => Err(Unmet::NoMatch),
+            Some(_) => typed_after(&MARKED_WHOLE_INTRODUCTIONS),
             // Two situations, one refusal, because the user's position is
             // the same in both: nothing was typed. Either the marked words
             // are not how the utterance started, or they are the whole of
             // it and there is nothing left to type.
-            _ => Err(Unmet::NoMatch),
+            None => Err(Unmet::NoMatch),
         },
         // PR #1451 round 3, change 5 — the directory Filter box. The model
         // extracted the value ("letter D" is `d`), so it is held to the user's
@@ -1834,10 +1785,106 @@ fn resolve_param(
             Some(text) => Ok(param(text.clone(), text)),
             None => Err(Unmet::NoMatch),
         },
-        ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
-            AgentRefMatch::One { id, label } => Ok(param(id, label)),
-            AgentRefMatch::None => Err(Unmet::NoMatch),
-            AgentRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+        // Issue #1495 (Greptile on PR #1529): the model may drop the daemon
+        // the user named — "Codex" for "open the Codex agent on build box" —
+        // so the transcript is held to the same rule as the reference: naming
+        // a daemon these agents are not on reaches none of them.
+        ParamKind::AgentRef
+            if names_another_daemon(&word_sequence(transcript.text()), agents, decks, true) =>
+        {
+            Err(Unmet::NoMatch)
+        }
+        ParamKind::AgentRef => match resolve_agent_ref_reading(spoken, agents, decks) {
+            // The model may also drop a FACT the user named — "Codex" for
+            // "open the Codex agent in docs-site" — so the agent its answer
+            // reached is held to the transcript's facts too (Qodo on PR
+            // #1529): a word of it that another agent's names account for,
+            // and this one's do not, rules this one out.
+            (AgentRefMatch::One { id, .. }, _) if heard_against(&id) => Err(Unmet::NoMatch),
+            // An answer no name or fact matched is read as a task, and the
+            // agent its last prompt reached is held to where the user said it
+            // is: "open the agent in the billing project" answered as
+            // "billing" does not reach an agent in docs-site last asked to
+            // "Fix billing" (issue #1496).
+            (AgentRefMatch::One { id, .. }, true) if placed_by_its_prompt(&id) => {
+                Err(Unmet::NoMatch)
+            }
+            // Where the user's own words settle the reference without the
+            // model — "the newest agent", or a bare "the agent" with several
+            // here — they decide, whatever label the model answered with
+            // (Qodo on PR #1529): recency is the agent that started last or
+            // first, and a bare category is the numbered choice.
+            (AgentRefMatch::One { id, label }, _) => match settled_by_the_words(&heard_facts) {
+                Some(AgentRefMatch::One { id, label }) => Ok(param(id, label)),
+                Some(AgentRefMatch::Ambiguous(candidates)) => Err(Unmet::Ambiguous(candidates)),
+                _ => Ok(param(id, label)),
+            },
+            // The model answered a reference by state with the user's words
+            // rather than the label its instructions ask for ("the one that's
+            // stuck"); the words are read against each agent's status here
+            // ([`agents_in_state`]) before the reference is refused. Only a
+            // state the user said counts, and the agents in it are held to the
+            // transcript exactly as the model's own pick is above: a fact the
+            // model dropped — "the stuck Codex agent" answered as "the one
+            // that's stuck" — rules out the agents that lack it, and a recency
+            // word picks among the agents in that state.
+            //
+            // And held to it on its own as well, whatever other agents there
+            // are: the state is the model's reading of the user's words rather
+            // than a name, so every other word the user said has to be one of
+            // the agent's own names ([`accounts_for_the_rest`]). With a single
+            // stuck Claude Code agent, "stop the stuck Codex agent" answered
+            // as "the one that's stuck" reaches nobody — no other agent is
+            // there to account for "Codex", and that is not a reason to stop
+            // the one that is not Codex.
+            (AgentRefMatch::None, _) => {
+                let (said, content) = heard_reference();
+                let located = location_words(&word_sequence(&heard_facts));
+                let in_state: Vec<&DesktopAgent> =
+                    agents_in_state(spoken, transcript.text(), agents)
+                        .into_iter()
+                        .filter(|agent| !heard_against(&agent.id))
+                        .filter(|agent| accounts_for_the_rest(agent, &content, &said, &located))
+                        .collect();
+                let (mut said, _) = reference_words(&heard_facts);
+                let in_state = match Recency::said(&mut said) {
+                    Some(recency) => recency.pick(in_state),
+                    None => in_state,
+                };
+                match agent_ref_match(&in_state, agents) {
+                    AgentRefMatch::One { id, label } => Ok(param(id, label)),
+                    AgentRefMatch::Ambiguous(candidates) => Err(Unmet::Ambiguous(candidates)),
+                    AgentRefMatch::None => Err(Unmet::NoMatch),
+                }
+            }
+            // Issue #1495 — the model's words tie, and the USER's may not: for
+            // "show the reviewer in the PRD 1487 orchestration" the model was
+            // measured answering just "reviewer". The tie is re-read against
+            // the transcript among the tied agents ONLY, so this can pick one
+            // of the agents the model's words already reached and nothing
+            // else; anything short of one agent keeps the tie, and the choice.
+            (AgentRefMatch::Ambiguous(candidates), _) => {
+                let tied: Vec<DesktopAgent> = agents
+                    .iter()
+                    .filter(|agent| candidates.iter().any(|tied| tied.value == agent.id))
+                    .cloned()
+                    .collect();
+                match resolve_agent_ref_reading(&heard_facts, &tied, decks) {
+                    (AgentRefMatch::One { id, .. }, _) if heard_against(&id) => Err(Unmet::NoMatch),
+                    (AgentRefMatch::One { id, .. }, true) if placed_by_its_prompt(&id) => {
+                        Err(Unmet::NoMatch)
+                    }
+                    (AgentRefMatch::One { id, .. }, _) => {
+                        let label = agents
+                            .iter()
+                            .find(|agent| agent.id == id)
+                            .map(|agent| display_label(agent, agents))
+                            .unwrap_or_default();
+                        Ok(param(id, label))
+                    }
+                    _ => Err(Unmet::Ambiguous(candidates)),
+                }
+            }
         },
         // PRD #1223 — the same three answers as an agent reference, against
         // the observed fleet, and the same two refusals: no new outcome
@@ -1849,11 +1896,17 @@ fn resolve_param(
         // ([`VoiceDeck::unavailable`], [`deck_unavailable`]). Only for the dialog: the
         // Deck selector switches to a disabled deck as readily as to any other
         // (PRD #1195, [`SWITCH_DECK_ROW`]).
-        // Checked before resolving, so a deck the model invented is never
-        // quoted back as "no deck matches …" either.
-        ParamKind::DeckRef if !for_new_agent => {
-            switch_target(spoken, transcript, decks).map(|(id, label)| param(id, label))
-        }
+        //
+        // Issue #1496 — the dashboard filter's daemon is a facet, held to the
+        // transcript like the filter's other facets below ([`heard_facet`]).
+        ParamKind::DeckRef if !for_new_agent => match resolve_deck_ref(spoken, decks) {
+            DeckRefMatch::One { id, label } if row.id == FILTER_DASHBOARD_ROW => {
+                heard_facet(param(id, label), spec.kind, transcript, decks)
+            }
+            DeckRefMatch::One { id, label } => Ok(param(id, label)),
+            DeckRefMatch::None => Err(Unmet::NoMatch),
+            DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+        },
         ParamKind::DeckRef => match resolve_new_agent_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
                 // Reached only for the New agent dialog: the guard above
@@ -1926,6 +1979,23 @@ fn resolve_param(
         // carries a form whenever a row requiring one got past `callable`;
         // the resolver answers no match without one rather than trusting
         // that, for the `dir_ref` arm's reason.
+        // Issue #1496 — the dashboard filter's own closed sets, and an agent
+        // type to filter by, which is any type the deck knows rather than
+        // what the New agent form offers.
+        //
+        // A facet the vocabulary knows still has to be one the USER asked
+        // for: the model may add a status to "show Codex agents", and the
+        // dashboard is never filtered by something nobody said. So the value
+        // is held to the transcript by its own names ([`facet_heard`]), and
+        // one the user did not say is dropped with the facet's note.
+        ParamKind::AgentKind => choice_param(resolve_dashboard_kind(spoken))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        ParamKind::AgentStatus => choice_param(resolve_dashboard_status(spoken))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        ParamKind::AgentTypeRef if row.id == FILTER_DASHBOARD_ROW => {
+            choice_param(resolve_known_agent_type(spoken))
+                .and_then(|found| heard_facet(found, spec.kind, transcript, decks))
+        }
         ParamKind::ModeRef | ParamKind::AgentTypeRef => {
             let form = new_agent.and_then(|dialog| dialog.form.as_ref());
             let choices = match (spec.kind, form) {
@@ -2065,6 +2135,17 @@ fn local_intercept(
         }
     }
 
+    // PRD #1541: the typing-mode prompt commands, said with typing mode OFF on
+    // the agent screen, run nothing and say how to reach them. Only there —
+    // on another screen these words are the model's to answer, which renders
+    // the row's own hint — and never for a bare "stop" (`TYPING_STOP_PHRASES`
+    // is not consulted here), which keeps today's model answer (issue #1402).
+    if screen == Screen::Agent
+        && let Some(row) = typing_mode_row(table, transcript.text(), false)
+    {
+        return Some(VoiceOutcome::typing_mode_first(transcript.clone(), row));
+    }
+
     // Less an edge politeness word, as `heard_as_whole` grounding and the
     // dictation mode compare: "okay, send it please" is the same request as
     // "send it", and answering it here decides it without a model on every
@@ -2132,6 +2213,38 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
             .any(|phrase| spoken_words(phrase) == said)
 }
 
+/// The typing-mode prompt command (PRD #1541) whose phrase list the whole
+/// utterance is, less an edge politeness word — or `None`. `in_typing_mode`
+/// adds the bare "stop" forms ([`TYPING_STOP_PHRASES`]) to interrupt's list,
+/// which they belong to only while the mode is on. `None` too for a table
+/// without the row, which then falls through as it did before the rows existed.
+fn typing_mode_row<'t>(
+    table: &'t CommandTable,
+    text: &str,
+    in_typing_mode: bool,
+) -> Option<&'t CommandRow> {
+    let stops: &[&str] = if in_typing_mode {
+        &TYPING_STOP_PHRASES
+    } else {
+        &[]
+    };
+    [
+        (
+            INTERRUPT_ROW,
+            INTERRUPT_PHRASES
+                .iter()
+                .chain(stops)
+                .copied()
+                .collect::<Vec<_>>(),
+        ),
+        (CLEAR_PROMPT_ROW, CLEAR_PROMPT_PHRASES.to_vec()),
+        (SCRATCH_ROW, SCRATCH_PHRASES.to_vec()),
+    ]
+    .into_iter()
+    .find(|(_, phrases)| said_whole(text, phrases.iter().copied()))
+    .and_then(|(row_id, _)| table.row(row_id))
+}
+
 /// One utterance while the dictation mode is on (PRD #1260), decided with no
 /// backend call at all.
 ///
@@ -2141,12 +2254,16 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
 /// 2. [`DICTATION_OFF_PHRASES`] — end the mode;
 /// 3. a submit — [`SUBMIT_PHRASES`] or one of `submit_prompt`'s own
 ///    `heard_as_whole` entries ("go ahead");
-/// 4. a trailing send — the utterance ends with a separate sentence that is
+/// 4. a prompt command (PRD #1541) — [`INTERRUPT_PHRASES`] or
+///    [`TYPING_STOP_PHRASES`] interrupt the agent's turn,
+///    [`CLEAR_PROMPT_PHRASES`] clear its prompt, [`SCRATCH_PHRASES`] remove
+///    the last thing voice typed ([`typing_mode_row`]);
+/// 5. a trailing send — the utterance ends with a separate sentence that is
 ///    one of [`TRAILING_SEND_PHRASES`] ([`trailing_send`]): what precedes it
 ///    is typed and the dispatch asks for a send after it (`then_submit`);
-/// 5. anything else is typed, whole.
+/// 6. anything else is typed, whole.
 ///
-/// Each of the first three is a whole-utterance comparison, and the fourth a
+/// Each of the first four is a whole-utterance comparison, and the fifth a
 /// whole-SENTENCE one, so a phrase said inside a longer sentence is typed. The lists are disjoint (linkage-check
 /// rule 14), so the order decides nothing; it is #802's decided one — the
 /// bigger stop first — so a future overlap cannot leave a live microphone
@@ -2197,6 +2314,11 @@ fn dictation_intercept(
         if submits {
             return Some(dispatch(row, Vec::new()));
         }
+    }
+    // PRD #1541: interrupt, clear, scratch — with the bare "stop" forms
+    // interrupting here, and only here.
+    if let Some(row) = typing_mode_row(table, text, true) {
+        return Some(dispatch(row, Vec::new()));
     }
 
     let row = table.row(DICTATE_ROW)?;
@@ -2282,13 +2404,10 @@ fn millis(elapsed: std::time::Duration) -> u32 {
 /// dispatcher mode") and the verbs a command is made of ("open", "use") — and
 /// so are no evidence, on their own, that the user SAID a particular value.
 ///
-/// Read in two places: [`said`] (through [`content_words`]), which decides
-/// whether a dropped optional value is quoted back or reported as not caught,
-/// and — with [`decks_named`] — grounds [`SWITCH_DECK_ROW`]'s deck, the one
-/// reference still held against the transcript ([`switch_target`]). It used
+/// Read by [`said`] (through [`content_words`]), which decides whether a
+/// dropped optional value is quoted back or reported as not caught. It used
 /// to be the filler list of reference grounding for every row, removed on
-/// 2026-09-24 (see [`resolve_param`]); `switch_deck` is the only dispatch it
-/// gates now.
+/// 2026-09-24 (see [`resolve_param`]), and for `switch_deck` until issue #1491.
 const NAMELESS_WORDS: [&str; 53] = [
     "a",
     "an",
@@ -2692,6 +2811,8 @@ impl ParamKind {
             ParamKind::CommandText => {
                 "I could not tell what command you said, so the command was not changed"
             }
+            ParamKind::AgentKind => "I could not tell which kind of agent you meant",
+            ParamKind::AgentStatus => "I could not tell which status you meant",
         }
     }
 
@@ -2749,6 +2870,12 @@ impl ParamKind {
             ParamKind::CommandText => {
                 format!("you did not say \u{201c}{spoken}\u{201d}, so the command was not changed")
             }
+            ParamKind::AgentKind => {
+                format!("no kind of agent matches \u{201c}{spoken}\u{201d}")
+            }
+            ParamKind::AgentStatus => {
+                format!("no agent status matches \u{201c}{spoken}\u{201d}")
+            }
         }
     }
 
@@ -2800,6 +2927,12 @@ impl ParamKind {
             ParamKind::CommandText => {
                 format!("\u{201c}{spoken}\u{201d} could be more than one command: {listed}")
             }
+            ParamKind::AgentKind => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one kind of agent: {listed}")
+            }
+            ParamKind::AgentStatus => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one status: {listed}")
+            }
         }
     }
 
@@ -2816,6 +2949,8 @@ impl ParamKind {
             ParamKind::SpokenPrefix => "words",
             ParamKind::FilterText => "filter",
             ParamKind::CommandText => "command",
+            ParamKind::AgentKind => "kind",
+            ParamKind::AgentStatus => "status",
         }
     }
 }
@@ -2891,6 +3026,62 @@ fn offered(
         .collect()
 }
 
+/// The introductions `dictate_to_agent`'s description names besides the
+/// openers the fast path answers itself ([`DICTATION_OPENERS`]), read off the
+/// transcript only when the model marked the whole utterance as one
+/// ([`resolve_param`]'s `spoken_prefix` arm). Not a vocabulary: every other
+/// introduction still works the way it always has, through the model's mark.
+const MARKED_WHOLE_INTRODUCTIONS: [&str; 4] = ["tell it to", "ask it to", "tell it", "ask it"];
+
+/// The introductions among [`MARKED_WHOLE_INTRODUCTIONS`] that end in "to":
+/// what follows one is the request itself, so a mark that runs past one took
+/// words the user wanted typed. "tell it" and "ask it" are not here, because
+/// what follows them may still be introduction ("tell it that …").
+const INFINITIVE_INTRODUCTIONS: [&str; 2] = ["tell it to", "ask it to"];
+
+/// The other row a bare "go up" means, when the model picked `row` and `row`
+/// cannot run here: the New agent dialog's `go_to_parent` and the dashboard's
+/// `scroll_up` both claim "go up", and need exact complements (a parent
+/// directory on screen; the dialog closed), so a bare "go up" is whichever can
+/// run — the model picked `go_to_parent` on the dashboard every time
+/// (`scroll-up-go-up`, red on `main` after #1509). Only BARE: the whole
+/// utterance is "go up", "move up" or "up", a politeness word aside. Anything
+/// more ("go up a directory", "scroll up a bit", "go up to the top") asks for
+/// something the model's pick or another row answers, and keeps that pick's
+/// refusal (Qodo on PR #1529, where a two-way `unavailable_redirects`
+/// grounded on "up" alone crossed them).
+fn go_up_elsewhere(row: &str, text: &str) -> Option<&'static str> {
+    const BARE: [&str; 3] = ["go up", "move up", "up"];
+    let said = whole_utterance(text).join(" ");
+    if !BARE.contains(&said.as_str()) {
+        return None;
+    }
+    match row {
+        "go_to_parent" => Some("scroll_up"),
+        "scroll_up" => Some("go_to_parent"),
+        _ => None,
+    }
+}
+
+/// Whether `text` names the Daemons screen itself rather than only asking to
+/// go back — a word `open_deck` answers to that a bare "go back" does not
+/// carry.
+fn names_the_daemons_screen(text: &str) -> bool {
+    const NOUNS: [&str; 8] = [
+        "daemon",
+        "daemons",
+        "deck",
+        "decks",
+        "terminal",
+        "terminals",
+        "pane",
+        "panes",
+    ];
+    words(&normalize(&spoken_text(text)))
+        .iter()
+        .any(|word| NOUNS.contains(&word.as_str()))
+}
+
 /// What a spoken agent reference resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRefMatch {
@@ -2899,53 +3090,818 @@ pub enum AgentRefMatch {
     Ambiguous(Vec<Candidate>),
 }
 
+/// Resolve a spoken reference against the live agent snapshot, with no deck
+/// to name the daemon those agents are on — [`resolve_agent_ref_on`] with none.
+/// The numbered choice's answer uses it: an answer there is held to the names
+/// of the entries on offer, and a daemon names every one of them.
+pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch {
+    resolve_agent_ref_on(spoken, agents, &[])
+}
+
 /// Resolve a spoken reference against the live agent snapshot.
 ///
-/// Two passes, exact before loose, because an exact hit has to win: with agents
-/// named "tester" and "tester two", a loose-only match on "tester" would call
-/// an unambiguous request ambiguous.
+/// The names an agent answers to come in two tiers, and the first always wins:
 ///
-/// 1. **Exact** — the normalised reference equals one of the agent's names.
-/// 2. **Word subset** — every word of one is present in the other, so "the
-///    tester" reaches `tester` and "tester" reaches `Tester agent`. Word sets
-///    rather than substrings: under a substring rule a one-letter reference
-///    matches every name containing that letter.
+/// - **the names the deck SHOWS** for it ([`spoken_names`]) — its display name,
+///   its orchestration role or agent type, its CLI and its id, because ids
+///   appear on screen too. Derived the way `desktop/src/lib/bridge.ts` derives
+///   them for display, so a user can say what they can see;
+/// - **what the deck knows about it** ([`agent_facets`], issue #1495) — its
+///   mode, its agent type, its directory and its orchestration's name — which
+///   is how people think of an agent whose own name says none of it: a
+///   dispatcher called "Mercury" is "the dispatcher".
 ///
-/// The names an agent answers to are the ones the deck SHOWS for it — its
-/// display name, its orchestration role, its agent type and its CLI — plus its
-/// id, because ids appear on screen too. Derived here the way
-/// `desktop/src/lib/bridge.ts` derives them for display, so a user can say what
-/// they can see.
-pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch {
+/// Passes, each returning when it finds anything:
+///
+/// 1. **Exact on a shown name** — the normalised reference equals one. So
+///    "open tester" reaches the agent labelled tester even when another runs in
+///    a mode called tester.
+/// 2. **Exact on a facet** — "dispatcher", "dot-agent-deck" — or the start of
+///    a value the model was shown cut short with an ellipsis.
+/// 3. **Words.** The reference's words, less filler ("the", "one", "agent", …),
+///    are matched against both tiers at once, and the agents that account for
+///    the MOST of them win: "the reviewer in the PRD 1487 run" is the reviewer
+///    whose run is `prd-1487`, not every reviewer. A name counts when all of
+///    its words were said; a name that merely contains every word said
+///    ("billing" in `billing-service`) counts below that. Ties go to the agent
+///    matched by shown names, then stay a tie and become the numbered choice.
+///    Word sets rather than substrings: under a substring rule a one-letter
+///    reference matches every name containing that letter.
+///
+/// Around pass 3, two kinds of words are read for what they say about the
+/// agents rather than matched as names:
+///
+/// - **a daemon** (`decks`, the one that [`VoiceDeck::holds_agents`]): naming
+///   the daemon the agents are on narrows nothing, since every agent here is
+///   on it, and naming ANOTHER daemon finds nothing — those agents are not the
+///   ones voice can reach, and resolving "the Codex agent on build box" to a
+///   Codex agent elsewhere would act on one the user excluded;
+/// - **recency** ("newest", "latest", "most recent", "oldest"): the agent that
+///   started last, or first, among the ones the rest of the reference names —
+///   by the daemon's spawn time, and only when every one of them reports one.
+///
+/// A reference that is nothing but filler, a daemon or recency — "the agent",
+/// "the newest one" — names every agent here, so one agent is that agent and
+/// several are a choice, as a category reference to an orchestration already
+/// is ([`resolve_orchestration_ref`]).
+pub fn resolve_agent_ref_on(
+    spoken: &str,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+) -> AgentRefMatch {
+    resolve_agent_ref_reading(spoken, agents, decks).0
+}
+
+/// [`resolve_agent_ref_on`], and whether its answer came from the task pass
+/// alone ([`task_matches`]) — no name or fact of the agents matched, so what
+/// reached them was their last prompt (issue #1496).
+fn resolve_agent_ref_reading(
+    spoken: &str,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+) -> (AgentRefMatch, bool) {
     let reference = normalize(spoken);
     if reference.is_empty() {
-        return AgentRefMatch::None;
+        return (AgentRefMatch::None, false);
     }
-    let reference_words = words(&reference);
-
-    let mut exact: Vec<&DesktopAgent> = Vec::new();
-    let mut loose: Vec<&DesktopAgent> = Vec::new();
-    for agent in agents {
-        let names = spoken_names(agent);
-        if names.iter().any(|name| normalize(name) == reference) {
-            exact.push(agent);
-        } else if names.iter().any(|name| word_subset(&reference_words, name)) {
-            loose.push(agent);
+    let named_exactly = |names: Vec<String>| names.iter().any(|name| normalize(name) == reference);
+    let shown: Vec<&DesktopAgent> = agents
+        .iter()
+        .filter(|agent| named_exactly(spoken_names(agent)))
+        .collect();
+    if !shown.is_empty() {
+        return (agent_ref_match(&shown, agents), false);
+    }
+    // Facets are spelled by [`spoken_text`], so the reference is too: the
+    // model answers `work/api` the way it was shown it.
+    let spelled = normalize(&spoken_text(spoken));
+    // A value the model was shown cut short, ending in an ellipsis — a long
+    // directory name (`prompt::directory_labels`) — is matched as the start of
+    // a facet, as long as enough of it is left to mean something (Qodo on PR
+    // #1529).
+    let cut = spoken.trim_end().ends_with('\u{2026}') && spelled.chars().count() >= CUT_FACET_CHARS;
+    let known: Vec<&DesktopAgent> = agents
+        .iter()
+        .filter(|agent| {
+            agent_facets(agent).iter().any(|name| {
+                let name = normalize(name);
+                name == reference || name == spelled || (cut && name.starts_with(&spelled))
+            })
+        })
+        .collect();
+    if !known.is_empty() {
+        return (agent_ref_match(&known, agents), false);
+    }
+    // Spelled the way every name below is, so punctuation splits a reference
+    // exactly where it splits a name ("deploy@build-box", "schedule: issues").
+    let mut said = words(&normalize(&spoken_text(spoken)));
+    let sequence = word_sequence(spoken);
+    if names_another_daemon(&sequence, agents, decks, false) {
+        return (AgentRefMatch::None, false);
+    }
+    let mut daemon_named = false;
+    for name in decks
+        .iter()
+        .filter(|deck| deck.holds_agents)
+        .flat_map(daemon_names)
+    {
+        if name.said_of(&sequence, agents, false) {
+            said.retain(|word| !name.words.contains(word));
+            daemon_named = true;
         }
     }
+    let recency = Recency::said(&mut said);
+    let content: BTreeSet<String> = said
+        .iter()
+        .filter(|word| !AGENT_FILLER_WORDS.contains(&word.as_str()))
+        .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    let mut by_task = false;
+    let pool: Vec<&DesktopAgent> = if content.is_empty() {
+        let category = said
+            .iter()
+            .any(|word| AGENT_CATEGORY_WORDS.contains(&word.as_str()));
+        if daemon_named || recency.is_some() || category {
+            agents.iter().collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        let named = best_covered(&content, &said, agents);
+        if named.is_empty() {
+            by_task = true;
+            task_matches(&content, agents)
+        } else {
+            named
+        }
+    };
+    let found = match recency {
+        Some(recency) => agent_ref_match(&recency.pick(pool), agents),
+        None => agent_ref_match(&pool, agents),
+    };
+    (found, by_task)
+}
 
-    let hits = if exact.is_empty() { loose } else { exact };
-    match hits.len() {
-        0 => AgentRefMatch::None,
-        1 => AgentRefMatch::One {
-            id: hits[0].id.clone(),
-            label: display_label(hits[0], agents),
+/// The fewest characters of a facet, quoted back cut short, that still name
+/// one ([`resolve_agent_ref_on`]).
+const CUT_FACET_CHARS: usize = 16;
+
+/// Words a reference to an agent by its TASK carries that are not the task:
+/// "the one I asked to fix the scroll", "the agent working on the login".
+const TASK_FILLER_WORDS: [&str; 22] = [
+    "i", "me", "my", "we", "us", "you", "it", "to", "asked", "ask", "told", "tell", "working",
+    "work", "doing", "do", "about", "was", "were", "last", "prompt", "task",
+];
+
+/// The agents whose last prompt best matches a reference by task — "the one
+/// fixing the scroll" (issue #1495) — read on THIS machine: the prompt never
+/// reaches the Commands endpoint (Qodo on PR #1529), so the model answers a
+/// reference by task with the user's own words and this is where they meet
+/// the prompt.
+///
+/// A word counts when the prompt has it, or a word with the same stem
+/// ("fixing" and "Fix", "resizing" and "resizes", [`same_stem`]). MORE than
+/// half of the reference's task words have to count, so a shared verb alone
+/// ("fixing" in "the one fixing the printer") reaches nobody; the agents counting the
+/// most win, exact words breaking a tie, and a tie that is left is the
+/// numbered choice. Only run when no name or fact matched: a task is the last
+/// thing a reference is read as.
+fn task_matches<'a>(
+    content: &BTreeSet<String>,
+    agents: &'a [DesktopAgent],
+) -> Vec<&'a DesktopAgent> {
+    let wanted: Vec<&String> = content
+        .iter()
+        .filter(|word| !TASK_FILLER_WORDS.contains(&word.as_str()))
+        .collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut best = (0, 0);
+    let mut hits: Vec<&DesktopAgent> = Vec::new();
+    for agent in agents {
+        let Some(prompt) = agent.last_user_prompt.as_deref() else {
+            continue;
+        };
+        let prompt = words(&normalize(&spoken_text(prompt)));
+        let exact = wanted.iter().filter(|word| prompt.contains(**word)).count();
+        let stemmed = wanted
+            .iter()
+            .filter(|word| prompt.iter().any(|said| same_stem(word, said)))
+            .count();
+        if stemmed * 2 <= wanted.len() {
+            continue;
+        }
+        let score = (stemmed, exact);
+        match score.cmp(&best) {
+            std::cmp::Ordering::Greater => {
+                best = score;
+                hits = vec![agent];
+            }
+            std::cmp::Ordering::Equal => hits.push(agent),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    hits
+}
+
+/// Whether two words share a stem, as a task is said and as it was typed:
+/// equal once a common ending ("ing", "ed", "es", "s") is off, or one the
+/// start of the other with three letters or more ("fix" and "fixing").
+fn same_stem(one: &str, other: &str) -> bool {
+    let stem = |word: &str| -> String {
+        for ending in ["ing", "ed", "es", "s"] {
+            if let Some(stem) = word.strip_suffix(ending)
+                && stem.chars().count() >= 3
+            {
+                return stem.to_string();
+            }
+        }
+        word.to_string()
+    };
+    let (one, other) = (stem(one), stem(other));
+    let (short, long) = if one.len() <= other.len() {
+        (&one, &other)
+    } else {
+        (&other, &one)
+    };
+    one == other || (short.chars().count() >= 3 && long.starts_with(short.as_str()))
+}
+
+/// `text` as the ordered words [`spoken_text`] and [`normalize`] make of it.
+fn word_sequence(text: &str) -> Vec<String> {
+    normalize(&spoken_text(text))
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The daemon status words a reference BY STATE names, by the words a user
+/// says for each: "stuck" is any agent waiting on someone — for input, on a
+/// refusing provider, or after an error.
+const STATE_WORDS: [(&str, &[&str]); 8] = [
+    ("stuck", &["waiting_for_input", "blocked", "error"]),
+    ("waiting", &["waiting_for_input"]),
+    ("working", &["working"]),
+    ("busy", &["working", "thinking", "compacting"]),
+    ("thinking", &["thinking"]),
+    ("idle", &["idle"]),
+    ("blocked", &["blocked"]),
+    ("failed", &["error"]),
+];
+
+/// The words around a state that say nothing more about the agent.
+const STATE_FILLER: [&str; 14] = [
+    "the",
+    "one",
+    "that",
+    "s",
+    "is",
+    "which",
+    "who",
+    "agent",
+    "a",
+    "an",
+    "it",
+    "for",
+    "input",
+    "currently",
+];
+
+/// An agent named only by what it is doing now — "the one that's stuck",
+/// "the idle agent" — read against each agent's status (issue #1496).
+///
+/// The model is asked to answer such a reference with the agent's label
+/// ([`super::schema::TOOL_INSTRUCTIONS`]); this is the recovery for an answer
+/// that kept the user's words instead, measured on `open-agent-by-state` once
+/// the dashboard filter's row put status words in the table. Only a reference
+/// made of nothing but [`STATE_WORDS`] and [`STATE_FILLER`] is read this way,
+/// so a name or any other fact in it leaves the refusal standing.
+///
+/// Every state in it has to be one the user said, in some word for it — the
+/// model's answer is not the user's words, and a state it supplies for "kill
+/// it" reaches nobody. The model may say it in another of the words, though:
+/// "stop the busy agent" answered as "the working agent" names the working
+/// agents, because "busy" covers working. A state word the model said counts
+/// only for the statuses the user's own state words cover, so its word never
+/// widens what the user said — "busy" for "working" reaches no thinking agent.
+/// What it returns is every agent in those states; the caller holds them to
+/// the rest of the transcript ([`resolve_param`]).
+fn agents_in_state<'a>(
+    spoken: &str,
+    transcript: &str,
+    agents: &'a [DesktopAgent],
+) -> Vec<&'a DesktopAgent> {
+    let heard: BTreeSet<String> = word_sequence(transcript).into_iter().collect();
+    let said: BTreeSet<&str> = STATE_WORDS
+        .iter()
+        .filter(|(state, _)| heard.contains(*state))
+        .flat_map(|(_, named)| named.iter().copied())
+        .collect();
+    let mut statuses: BTreeSet<&str> = BTreeSet::new();
+    for word in &word_sequence(spoken) {
+        if let Some((_, named)) = STATE_WORDS.iter().find(|(state, _)| state == word) {
+            let grounded: Vec<&str> = named
+                .iter()
+                .copied()
+                .filter(|status| said.contains(status))
+                .collect();
+            if grounded.is_empty() {
+                return Vec::new();
+            }
+            statuses.extend(grounded);
+        } else if !STATE_FILLER.contains(&word.as_str()) {
+            return Vec::new();
+        }
+    }
+    agents
+        .iter()
+        .filter(|agent| statuses.contains(agent.status.as_str()))
+        .collect()
+}
+
+/// One spoken name of a daemon, as a reference to an agent reads it.
+struct DaemonName {
+    /// Its words, in order — "local daemon", or "daemon" for a host called
+    /// that.
+    ordered: Vec<String>,
+    /// Its words less the category words ("local" for "Local daemon"),
+    /// which is what an unqualified mention has to say. Empty for a name made
+    /// only of them, which then counts only as a qualifier.
+    words: BTreeSet<String>,
+}
+
+impl DaemonName {
+    /// Whether `said` puts this daemon in the reference.
+    ///
+    /// **A qualifier always does** — the name right after "on" or "from",
+    /// optionally with "the": "the Codex agent on build box". It says where
+    /// the agent is, whatever else the words could mean, so an agent whose
+    /// own name is "build box" does not cancel it, and a host called
+    /// `daemon` is still a daemon there (Qodo on PR #1529).
+    ///
+    /// **An unqualified mention does only when no agent's names explain it**:
+    /// "the agent in billing" next to a daemon also called `billing` is about
+    /// the directory, and "the staging reviewer" next to a daemon called
+    /// `staging` keeps the word that tells the staging run apart.
+    ///
+    /// `qualified_only` keeps just the first rule, for a whole TRANSCRIPT:
+    /// there a daemon's name said bare is as likely a command's own word — a
+    /// host called `open` would otherwise refuse "open Mercury" (Qodo on PR
+    /// #1529).
+    fn said_of(&self, said: &[String], agents: &[DesktopAgent], qualified_only: bool) -> bool {
+        const LEADS: [&[&str]; 4] = [&["on"], &["from"], &["on", "the"], &["from", "the"]];
+        let qualified = |lead: &[&str]| {
+            said.windows(lead.len() + self.ordered.len()).any(|window| {
+                window.iter().zip(lead).all(|(said, lead)| said == lead)
+                    && window[lead.len()..] == self.ordered[..]
+            })
+        };
+        if !self.ordered.is_empty() && LEADS.iter().any(|lead| qualified(lead)) {
+            return true;
+        }
+        if qualified_only {
+            return false;
+        }
+        let said: BTreeSet<String> = said.iter().cloned().collect();
+        !self.words.is_empty()
+            && self.words.is_subset(&said)
+            && !agents.iter().any(|agent| {
+                let mut all = BTreeSet::new();
+                for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
+                    all.extend(words(&normalize(&spoken_text(name))));
+                }
+                self.words.is_subset(&all)
+            })
+    }
+}
+
+/// Every spoken name of `deck` ([`deck_spoken_names`]) as a [`DaemonName`].
+fn daemon_names(deck: &VoiceDeck) -> Vec<DaemonName> {
+    deck_spoken_names(deck)
+        .iter()
+        .map(|name| {
+            let ordered = word_sequence(name);
+            let words = ordered
+                .iter()
+                .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
+                .cloned()
+                .collect();
+            DaemonName { ordered, words }
+        })
+        .collect()
+}
+
+/// Whether `said` (ordered words) names a daemon the agents here are NOT on
+/// ([`DaemonName::said_of`]). The agents voice reaches are one daemon's
+/// ([`VoiceDeck::holds_agents`]), so an agent reference naming another daemon
+/// names none of them: "the Codex agent on build box" is not this machine's
+/// Codex agent.
+fn names_another_daemon(
+    said: &[String],
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    qualified_only: bool,
+) -> bool {
+    decks
+        .iter()
+        // All daemons is the Daemon selector's selection, not a daemon an
+        // agent can be on (#1491): "all" in "stop all the testers" is not
+        // another daemon.
+        .filter(|deck| !deck.holds_agents && deck.id != super::ALL_DECKS_ID)
+        .flat_map(daemon_names)
+        .any(|name| name.said_of(said, agents, qualified_only))
+}
+
+/// [`resolve_agent_ref_on`]'s answer for the agents a pass found.
+fn agent_ref_match(hits: &[&DesktopAgent], agents: &[DesktopAgent]) -> AgentRefMatch {
+    match hits {
+        [] => AgentRefMatch::None,
+        [one] => AgentRefMatch::One {
+            id: one.id.clone(),
+            label: display_label(one, agents),
         },
-        _ => AgentRefMatch::Ambiguous(
-            hits.iter()
+        several => AgentRefMatch::Ambiguous(
+            several
+                .iter()
                 .map(|agent| Candidate::new(&agent.id, display_label(agent, agents)))
                 .collect(),
         ),
+    }
+}
+
+/// Words a reference to an agent carries that name none of them: "the one in
+/// billing", "the agent that is fixing it".
+const AGENT_FILLER_WORDS: [&str; 22] = [
+    "the", "a", "an", "one", "ones", "agent", "agents", "that", "this", "which", "who", "is", "in",
+    "on", "at", "of", "for", "from", "with", "its", "running", "started",
+];
+
+/// The filler that, said alone, still means "an agent" — "the agent", "the
+/// one" — and so names every agent rather than none.
+const AGENT_CATEGORY_WORDS: [&str; 4] = ["agent", "agents", "one", "ones"];
+
+/// The agents that account for the most of `content`, the reference's words
+/// less filler — pass 3 of [`resolve_agent_ref_on`].
+///
+/// An agent's score is, in order of weight: how many of those words are
+/// covered by its names (shown and known) whose words were ALL said; how many
+/// by its shown names alone, so a tie goes to the name on screen; and whether
+/// any one name contains every word said, which is the old loose match and
+/// still reaches `billing-service` from "billing". An agent scoring nothing is
+/// not a match.
+fn best_covered<'a>(
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    agents: &'a [DesktopAgent],
+) -> Vec<&'a DesktopAgent> {
+    let covered = |names: &[String]| {
+        let mut covered = BTreeSet::new();
+        for name in names {
+            let name_words = words(&normalize(&spoken_text(name)));
+            if !name_words.is_empty() && name_words.is_subset(said) {
+                covered.extend(name_words.intersection(content).cloned());
+            }
+        }
+        covered
+    };
+    let mut best = (0, 0, false);
+    let mut hits: Vec<&DesktopAgent> = Vec::new();
+    for agent in agents {
+        let shown = spoken_names(agent);
+        let mut every = shown.clone();
+        every.extend(agent_facets(agent));
+        let contains_all = every
+            .iter()
+            .any(|name| content.is_subset(&words(&normalize(&spoken_text(name)))));
+        let score = (covered(&every).len(), covered(&shown).len(), contains_all);
+        if score == (0, 0, false) {
+            continue;
+        }
+        match score.cmp(&best) {
+            std::cmp::Ordering::Greater => {
+                best = score;
+                hits = vec![agent];
+            }
+            std::cmp::Ordering::Equal => hits.push(agent),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    hits.retain(|hit| !excluded_by_another(hit, content, said, agents));
+    hits
+}
+
+/// Whether `agent` leaves out a word of `content` that ANOTHER agent's names
+/// account for — a name of it, shown or known, whose every word is in `said`.
+///
+/// That is a conflict, not a match: "the Codex agent in docs-site" names the
+/// Codex agent and the agent in docs-site, and when those are two agents,
+/// opening either one acts on something the user excluded. So a reference
+/// like that finds nothing ([`best_covered`]), and an agent the model's own
+/// answer reached is held to the transcript the same way ([`resolve_param`]),
+/// since the model may drop the fact that rules it out.
+fn excluded_by_another(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    agents: &[DesktopAgent],
+) -> bool {
+    let left_out: BTreeSet<String> = content
+        .difference(&covered_by(agent, content, said))
+        .cloned()
+        .collect();
+    !left_out.is_empty()
+        && agents.iter().any(|other| {
+            other.id != agent.id && !covered_by(other, content, said).is_disjoint(&left_out)
+        })
+}
+
+/// The words of `content` that `agent`'s names, shown or known, account for —
+/// a name counting when its every word is in `said`.
+fn covered_by(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut covered = BTreeSet::new();
+    for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
+        let name_words = words(&normalize(&spoken_text(name)));
+        if !name_words.is_empty() && name_words.is_subset(said) {
+            covered.extend(name_words.intersection(content).cloned());
+        }
+    }
+    covered
+}
+
+/// Words a reference by STATE carries that name no agent, beyond
+/// [`STATE_WORDS`] and [`STATE_FILLER`]: the courtesy around it, the nouns a
+/// directory, a run or a daemon is introduced with ("in the prd-1487 run",
+/// "in the docs-site project"), whose own names are what [`covered_by`]
+/// reads, and the words that point rather than name ("the stuck one over
+/// there", "the stuck pane").
+///
+/// Each is generic: it says where a name is, or what kind of thing an agent
+/// is shown as, and never which agent — so dropping it lets no identifying
+/// word through, and the name it introduces is still held to the agent
+/// ("the stuck agent in the billing project" reaches nothing in `docs-site`).
+const STATE_REFERENCE_CARRIERS: [&str; 28] = [
+    "me",
+    "please",
+    "now",
+    "just",
+    "can",
+    "could",
+    "would",
+    "you",
+    "go",
+    "right",
+    "dir",
+    "directory",
+    "folder",
+    "project",
+    "repo",
+    "repository",
+    "workspace",
+    "codebase",
+    "orchestration",
+    "run",
+    "mode",
+    "type",
+    "there",
+    "here",
+    "over",
+    "pane",
+    "card",
+    "session",
+];
+
+/// Whether `agent`, found by state ([`agents_in_state`]), accounts for every
+/// other fact the transcript states — `content` and `said` as
+/// [`excluded_by_another`] takes them — by its own names and its own task
+/// (issue #1496).
+///
+/// [`excluded_by_another`] is comparative: it rules an agent out for a word
+/// ANOTHER agent's names account for, so with no such agent a dropped
+/// "Codex", directory or run rules nobody out. A state is the model's reading
+/// of the user's words, not a name, so the agents it finds are held to the
+/// rest of what the user said absolutely: a word that is not a state, filler
+/// or [`STATE_REFERENCE_CARRIERS`] has to be one of this agent's own names,
+/// or a word of its last prompt as [`task_matches`] reads one — the same
+/// word or the same stem, [`TASK_FILLER_WORDS`] aside — or the recovery does
+/// not reach it. Every such word, not the majority [`task_matches`] asks for:
+/// there a task is the whole reference, while here a word the task does not
+/// account for may be the one that names a different agent ("the stuck Codex
+/// one fixing the scroll"). And never a word of an agent type's name, which
+/// says what the agent IS whatever its prompt mentions: "Codex" shares a
+/// stem with "code" in "review the code", and is still not this Claude Code
+/// agent. Nor a word that says where the agent is or which run it is in
+/// (`located`, [`location_words`]): "the stuck agent in the billing project"
+/// names a directory, and an agent in `docs-site` last asked to "Fix
+/// billing" is not in it, so only the agent's own names account for such a
+/// word. (A word another agent's names account for has already ruled this
+/// one out, [`excluded_by_another`].)
+///
+/// So a task phrase whose word is also an agent type's name is refused even
+/// when the prompt matches — "the stuck one reviewing the code" does not
+/// reach a stuck Claude Code agent last asked to "Review the code" — which is
+/// the deliberate safe-side trade, not a defect.
+fn accounts_for_the_rest(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    located: &BTreeSet<String>,
+) -> bool {
+    let facts: BTreeSet<String> = content
+        .iter()
+        .filter(|word| !STATE_WORDS.iter().any(|(state, _)| state == word))
+        .filter(|word| !STATE_FILLER.contains(&word.as_str()))
+        .filter(|word| !STATE_REFERENCE_CARRIERS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    let named = covered_by(agent, &facts, said);
+    let task: BTreeSet<String> = agent
+        .last_user_prompt
+        .as_deref()
+        .map(|prompt| words(&normalize(&spoken_text(prompt))))
+        .unwrap_or_default();
+    let a_type: BTreeSet<String> = DASHBOARD_AGENT_TYPES
+        .iter()
+        .flat_map(|agent_type| agent_type_spoken(agent_type))
+        .flat_map(|name| words(&normalize(&spoken_text(name))))
+        .collect();
+    facts.difference(&named).all(|word| {
+        TASK_FILLER_WORDS.contains(&word.as_str())
+            || (!a_type.contains(word)
+                && !located.contains(word)
+                && task.iter().any(|typed| same_stem(word, typed)))
+    })
+}
+
+/// Whether `agent`'s own names account for every word the transcript says
+/// WHERE it is or which run it is in (`located`, [`location_words`]) —
+/// `content` and `said` as [`excluded_by_another`] takes them (issue #1496).
+///
+/// Asked of an agent its last prompt alone reached ([`task_matches`]): a
+/// place is never a task, so an agent in `docs-site` last asked to "Fix
+/// billing" is not "the agent in the billing project", whatever the model
+/// answered. The location nouns themselves ("project", "run") and filler are
+/// not places; every other located word is, and refusing it is the safe side
+/// ([`location_words`] over-reads on purpose).
+fn placed_by_its_names(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    located: &BTreeSet<String>,
+) -> bool {
+    let place: BTreeSet<String> = content
+        .intersection(located)
+        .filter(|word| !STATE_REFERENCE_CARRIERS.contains(&word.as_str()))
+        .filter(|word| !LOCATION_ARTICLES.contains(&word.as_str()))
+        .filter(|word| !TASK_FILLER_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    place.is_subset(&covered_by(agent, &place, said))
+}
+
+/// The nouns that introduce where an agent is, or the run it belongs to —
+/// "in the billing project", "from the prd-1487 run" — and the prepositions
+/// such a phrase opens with (issue #1496).
+const LOCATION_NOUNS: [&str; 11] = [
+    "dir",
+    "directory",
+    "folder",
+    "project",
+    "repo",
+    "repository",
+    "workspace",
+    "codebase",
+    "orchestration",
+    "run",
+    "mode",
+];
+const LOCATION_PREPOSITIONS: [&str; 6] = ["in", "inside", "within", "from", "under", "at"];
+const LOCATION_ARTICLES: [&str; 7] = ["the", "a", "an", "this", "that", "my", "our"];
+
+/// The words of `sequence` (the transcript's words, in order) that say WHERE
+/// an agent is or which run it is in, rather than what it was asked to do —
+/// so [`accounts_for_the_rest`] holds them to the agent's names and never to
+/// its last prompt (issue #1496).
+///
+/// A word counts when it is:
+/// - between a location preposition ("in", "inside", "within", "from",
+///   "under", "at") and a [`LOCATION_NOUNS`] noun at most four words later —
+///   "billing" in "in the billing project";
+/// - right before such a noun with no preposition — "the billing repo agent";
+/// - right after such a noun that only a preposition or an article precedes —
+///   "billing" in "in project billing" or "in the repo billing";
+/// - the first word after a location preposition, articles skipped — "billing"
+///   in "in billing" — since that is a place too.
+///
+/// Over-reading costs a refusal (a task reference that happens to say "in
+/// the parser", or "looking at the billing bug", is read as a place, and its
+/// prompt no longer accounts for it), never the wrong agent, which is the
+/// side to err on.
+fn location_words(sequence: &[String]) -> BTreeSet<String> {
+    let is =
+        |list: &[&str], at: usize| sequence.get(at).is_some_and(|w| list.contains(&w.as_str()));
+    let mut located = BTreeSet::new();
+    for (at, word) in sequence.iter().enumerate() {
+        if LOCATION_PREPOSITIONS.contains(&word.as_str())
+            && let Some(first) = sequence[at + 1..]
+                .iter()
+                .find(|next| !LOCATION_ARTICLES.contains(&next.as_str()))
+        {
+            located.insert(first.clone());
+        }
+        if !LOCATION_NOUNS.contains(&word.as_str()) {
+            continue;
+        }
+        match (at.saturating_sub(4)..at)
+            .rev()
+            .find(|&from| is(&LOCATION_PREPOSITIONS, from))
+        {
+            Some(from) => located.extend(sequence[from + 1..at].iter().cloned()),
+            None => located.extend(at.checked_sub(1).map(|before| sequence[before].clone())),
+        }
+        if at == 0 || is(&LOCATION_PREPOSITIONS, at - 1) || is(&LOCATION_ARTICLES, at - 1) {
+            located.extend(sequence.get(at + 1).cloned());
+        }
+    }
+    located
+}
+
+/// `text`'s words as an agent reference reads them, and the ones of those
+/// that could name something — less [`AGENT_FILLER_WORDS`] and the category
+/// words.
+fn reference_words(text: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let said = words(&normalize(&spoken_text(text)));
+    let content = said
+        .iter()
+        .filter(|word| !AGENT_FILLER_WORDS.contains(&word.as_str()))
+        .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    (said, content)
+}
+
+/// "The newest agent", "the oldest one" — a reference by when an agent
+/// started (issue #1495).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recency {
+    Newest,
+    Oldest,
+}
+
+impl Recency {
+    /// Not "recent" or "recently" alone: "the one I recently asked to fix
+    /// the scroll" is a task, not an order (Qodo on PR #1529). "Most recent"
+    /// is read below.
+    const NEWEST: [&'static str; 4] = ["newest", "latest", "youngest", "newer"];
+    const OLDEST: [&'static str; 3] = ["oldest", "earliest", "older"];
+
+    /// The recency `said` asks for, with its words taken out of it ("most"
+    /// too, from "most recent"). `None` when it asks for none, or for both.
+    fn said(said: &mut BTreeSet<String>) -> Option<Self> {
+        let newest = Self::NEWEST.iter().any(|word| said.contains(*word))
+            || (said.contains("most") && said.contains("recent"));
+        let oldest = Self::OLDEST.iter().any(|word| said.contains(*word));
+        let recency = match (newest, oldest) {
+            (true, false) => Self::Newest,
+            (false, true) => Self::Oldest,
+            _ => return None,
+        };
+        let most_recent = said.contains("most") && said.contains("recent");
+        said.retain(|word| {
+            !Self::NEWEST.contains(&word.as_str())
+                && !Self::OLDEST.contains(&word.as_str())
+                && !(most_recent && (word == "most" || word == "recent"))
+        });
+        Some(recency)
+    }
+
+    /// The agents in `pool` that started last (or first). Every one of them
+    /// has to report when it started: one that does not could be the newest,
+    /// so then the whole pool is returned and stays a choice.
+    fn pick(self, pool: Vec<&DesktopAgent>) -> Vec<&DesktopAgent> {
+        let Some(times) = pool
+            .iter()
+            .map(|agent| agent.spawned_at_ms)
+            .collect::<Option<Vec<i64>>>()
+        else {
+            return pool;
+        };
+        let extreme = match self {
+            Self::Newest => times.iter().max(),
+            Self::Oldest => times.iter().min(),
+        };
+        let Some(extreme) = extreme.copied() else {
+            return pool;
+        };
+        pool.into_iter()
+            .filter(|agent| agent.spawned_at_ms == Some(extreme))
+            .collect()
     }
 }
 
@@ -3024,7 +3980,40 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
             })
             .collect();
     }
+    if hits.is_empty() {
+        hits = glued_deck_names(&reference, decks);
+    }
     deck_ref_match(&hits)
+}
+
+/// The decks a reference names with its words run together — "BuildBoxDeck"
+/// for `build-box`, "InMotionDeck" for `inmotion` — which is how
+/// speech-to-text writes a name said quickly, and how the model was measured
+/// passing it on verbatim (issue #1496, `choose-deck-glued-name`: 7 times in
+/// 180 once `use_this_directory`'s description gained three words, against 0
+/// in 120 without them). The last thing [`resolve_deck_ref`] tries, and
+/// decided here rather than by more wording, which is what moved it.
+///
+/// A name matches when it has the reference's letters with no spaces at all,
+/// with a [`DECK_CATEGORY_WORDS`] word glued to either end of it set aside, so
+/// it reaches only a deck one of whose names it spells out in full.
+fn glued_deck_names<'a>(reference: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
+    let glued: String = reference.split_whitespace().collect();
+    let mut readings = vec![glued.clone()];
+    for category in ["deck", "daemon", "demon"] {
+        for reading in [glued.strip_suffix(category), glued.strip_prefix(category)] {
+            readings.extend(reading.filter(|rest| !rest.is_empty()).map(str::to_string));
+        }
+    }
+    decks
+        .iter()
+        .filter(|deck| {
+            deck_spoken_names(deck).iter().any(|name| {
+                let name: String = normalize(name).split_whitespace().collect();
+                readings.contains(&name)
+            })
+        })
+        .collect()
 }
 
 /// "the remote daemon" — a deck referred to by what KIND it is rather than by
@@ -3032,15 +4021,16 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
 /// remote deck a new agent can start on (#1260).
 ///
 /// The instructions tell the model to answer such a reference with the listed
-/// name, and the list it is shown is exactly the eligible decks; after #1045
+/// name, and the list it is shown marks the decks a new agent cannot start
+/// on (`decks_without_new_agent`); after #1045
 /// the default model answered "new agent on the remote deck" with the user's
 /// own words in every measured run instead, which named no deck. This is that
 /// same rule decided here, over the same list: consulted only once
 /// [`resolve_deck_ref`] has found nothing — so a host that really is called
 /// `remote` still wins — and only for a reference that is "remote" and
 /// category words. Several eligible remote decks are asked about; none is no
-/// match. Not used for [`SWITCH_DECK_ROW`], whose reference must name its deck
-/// ([`switch_target`]).
+/// match. Not used for [`SWITCH_DECK_ROW`], where "the remote daemon" would
+/// switch to one of several the user did not name.
 fn resolve_new_agent_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     let matched = resolve_deck_ref(spoken, decks);
     if matched != DeckRefMatch::None || deck_reference(spoken) != "remote" {
@@ -3497,6 +4487,155 @@ pub(super) fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
     names
 }
 
+/// The agent dashboard filter's kinds (issue #1496): the id the frontend's
+/// `DashboardFilter.kinds` holds, the label its filter line shows, and the
+/// names a user calls each by. A mode is its mode tab's name, so
+/// `schedule-issues` is the `schedule: issues` tab and `schedule` is not it.
+const DASHBOARD_KINDS: [(&str, &str, &[&str]); 5] = [
+    (
+        "orchestration",
+        "Orchestration roles",
+        &[
+            "orchestration",
+            "orchestrations",
+            "orchestration roles",
+            "roles",
+        ],
+    ),
+    (
+        "single",
+        "Single agents",
+        &["single", "single agents", "standalone", "standalone agents"],
+    ),
+    ("dispatcher", "Dispatchers", &["dispatcher", "dispatchers"]),
+    (
+        "schedule",
+        "Schedule",
+        &["schedule", "schedules", "scheduled"],
+    ),
+    (
+        "schedule-issues",
+        "Schedule: issues",
+        &["schedule: issues", "schedule issues", "issues"],
+    ),
+];
+
+/// The agent dashboard filter's statuses (issue #1496), the same three
+/// columns as [`DASHBOARD_KINDS`]. Each is one of the daemon's own status
+/// words, which the dashboard keeps apart: Working is not Thinking, and Idle
+/// is not Waiting for input.
+const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 6] = [
+    ("working", "Working", &["working", "busy"]),
+    ("thinking", "Thinking", &["thinking"]),
+    (
+        "waiting_for_input",
+        "Waiting for input",
+        &["waiting for input", "waiting", "needs input", "need input"],
+    ),
+    ("idle", "Idle", &["idle"]),
+    ("blocked", "Blocked", &["blocked"]),
+    (
+        "error",
+        "Error",
+        &["error", "errors", "errored", "failed", "failing"],
+    ),
+];
+
+/// The agent types the dashboard filter offers, by the wire id the agents
+/// report ([`agent_type_spoken`] says how each is called).
+const DASHBOARD_AGENT_TYPES: [&str; 5] = ["claude_code", "codex", "open_code", "pi", "devin"];
+
+/// Resolve one of a fixed vocabulary, by [`resolve_choice`]'s rule, where each
+/// name may also be followed by "agents" ("dispatcher agents").
+fn resolve_fixed(spoken: &str, set: &[(&str, &str, &[&str])]) -> ChoiceMatch {
+    let choices: Vec<VoiceChoice> = set
+        .iter()
+        .map(|(id, label, _)| VoiceChoice {
+            id: (*id).to_string(),
+            label: (*label).to_string(),
+        })
+        .collect();
+    resolve_choice(spoken, &choices, |choice| {
+        set.iter()
+            .filter(|(id, _, _)| *id == choice.id)
+            .flat_map(|(_, label, names)| std::iter::once(*label).chain(names.iter().copied()))
+            .flat_map(|name| [name.to_string(), format!("{name} agents")])
+            .collect()
+    })
+}
+
+/// `found`, a dashboard facet resolved from the model's answer, when the user
+/// said it — or [`Unmet::NoMatch`] when they did not (issue #1496).
+fn heard_facet(
+    found: ResolvedParam,
+    kind: ParamKind,
+    transcript: &Transcript,
+    decks: &[VoiceDeck],
+) -> Result<ResolvedParam, Unmet> {
+    if facet_heard(kind, &found.value, transcript.text(), decks) {
+        Ok(found)
+    } else {
+        Err(Unmet::NoMatch)
+    }
+}
+
+/// Whether `transcript` says the dashboard facet `value` of `kind` by one of
+/// its names: a kind, status or agent type by any name its vocabulary gives
+/// it, and a daemon by one of its spoken names or a word of its name no other
+/// daemon has ([`mentioned`]). Any other kind is not a facet, and passes.
+fn facet_heard(kind: ParamKind, value: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let of_set = |set: &[(&str, &str, &[&str])]| -> Vec<String> {
+        set.iter()
+            .filter(|(id, _, _)| *id == value)
+            .flat_map(|(_, label, names)| std::iter::once(*label).chain(names.iter().copied()))
+            .map(str::to_string)
+            .collect()
+    };
+    let names: Vec<String> = match kind {
+        ParamKind::AgentKind => of_set(&DASHBOARD_KINDS),
+        ParamKind::AgentStatus => of_set(&DASHBOARD_STATUSES),
+        ParamKind::AgentTypeRef => agent_type_spoken(value)
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        ParamKind::DeckRef => {
+            let Some(deck) = decks.iter().find(|deck| deck.id == value) else {
+                return false;
+            };
+            if mentioned(&deck.label, transcript, decks) {
+                return true;
+            }
+            deck_spoken_names(deck)
+        }
+        _ => return true,
+    };
+    let heard = Heard::new(transcript);
+    names.iter().any(|name| heard.phrase(name))
+}
+
+/// A spoken kind of agent, for the dashboard filter (issue #1496).
+pub fn resolve_dashboard_kind(spoken: &str) -> ChoiceMatch {
+    resolve_fixed(spoken, &DASHBOARD_KINDS)
+}
+
+/// A spoken agent status, for the dashboard filter (issue #1496).
+pub fn resolve_dashboard_status(spoken: &str) -> ChoiceMatch {
+    resolve_fixed(spoken, &DASHBOARD_STATUSES)
+}
+
+/// A spoken agent type, for the dashboard filter (issue #1496): any type the
+/// deck knows, by the names [`agent_type_spoken`] gives it.
+pub fn resolve_known_agent_type(spoken: &str) -> ChoiceMatch {
+    let set: Vec<(&str, &str, &[&str])> = DASHBOARD_AGENT_TYPES
+        .iter()
+        .map(|id| {
+            let names = agent_type_spoken(id);
+            (*id, names.first().copied().unwrap_or(id), names)
+        })
+        .collect();
+    resolve_fixed(spoken, &set)
+}
+
 /// The words a user puts AROUND a chip's name without meaning anything else by
 /// them — "the dispatcher mode", "an opencode agent".
 const CHOICE_FILLER: [&str; 10] = [
@@ -3724,8 +4863,13 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 }
 
 /// The words that say a reference IS to a deck without saying which one: the
-/// field's name, before and since issue #1045, and the articles around it.
-const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+/// field's name, before and since issue #1045, the articles around it, and
+/// "demon", how speech-to-text writes "daemon" (issue #1491), for a model that
+/// echoes the user's words — with Names withheld, or when nothing it was
+/// shown fits.
+const DECK_CATEGORY_WORDS: [&str; 9] = [
+    "daemon", "daemons", "deck", "decks", "demon", "demons", "the", "a", "an",
+];
 
 /// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
 /// that names no deck.
@@ -3809,6 +4953,137 @@ pub(super) fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
     }
     names.push(agent.id.clone());
     names
+}
+
+/// What the deck knows about an agent besides the names it shows for it
+/// (issue #1495): its **mode** (`dispatcher`, `schedule: issues`), its **agent
+/// type** as people say it ("Claude Code", "Codex"), the name of its working
+/// **directory**, and for an orchestration role the orchestration's config
+/// **name**, its run **title** and the run's own directory's name. Each is a
+/// name in the sense [`resolve_agent_ref_on`] matches, below [`spoken_names`]:
+/// it reaches an agent, but never takes a reference away from one the deck
+/// shows by that name.
+///
+/// Never the whole path — a directory is called by its name — and never the
+/// last prompt, which is prose rather than a name: a reference by task is
+/// read against it last, on this machine ([`task_matches`]).
+pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
+    let mut facets: Vec<String> = Vec::new();
+    let mut add = |value: &str| {
+        let value = spoken_text(value);
+        if !value.is_empty() && !facets.iter().any(|known| same_spoken_name(known, &value)) {
+            facets.push(value);
+        }
+    };
+    match &agent.tab {
+        DesktopTab::Mode { name } => add(name),
+        DesktopTab::Orchestration {
+            name,
+            display_title,
+            cwd,
+            ..
+        } => {
+            add(name);
+            if let Some(title) = display_title {
+                add(title);
+            }
+            if let Some(directory) = cwd.as_deref().and_then(directory_name) {
+                add(directory);
+            }
+        }
+        DesktopTab::Dashboard => {}
+    }
+    for name in agent_type_spoken(&agent.agent_type) {
+        add(name);
+    }
+    if let Some(directory) = agent.cwd.as_deref().and_then(directory_name) {
+        add(directory);
+    }
+    // The directory with the one above it — `work/api` — which is how the
+    // model is shown two agents whose directories share a name
+    // (`prompt::state`), and so how it may answer. A whole name, so it counts
+    // only when both words were said: the parent alone names nothing.
+    //
+    // And with only the parent's LAST words, down to one — every such form,
+    // because a long parent is shown cut from its start by CHARACTERS
+    // (`prompt::directory_labels`), so the words left can be any number of
+    // them, and the model may answer with the words it was shown. A cap on
+    // the count here once left a shown word unregistered (the agent reviewer
+    // and Qodo on PR #1529).
+    if let Some(path) = agent.cwd.as_deref()
+        && let Some(name) = directory_name(path)
+    {
+        let parent = path.trim().trim_end_matches(['/', '\\']);
+        if let Some(parent) = directory_name(&parent[..parent.len() - name.len()]) {
+            add(&format!("{parent}/{name}"));
+            // Only as many as a label can show: `prompt::directory_labels`
+            // never shows more than `FACT_CHARS`, so a longer form is never
+            // what the model answers with, and a path of any length costs a
+            // bounded number of names (Qodo on PR #1529).
+            let parent_words = word_sequence(parent);
+            for kept in 1..parent_words.len() {
+                let tail = parent_words[parent_words.len() - kept..].join(" ");
+                if tail.chars().count() + name.chars().count() + 1 > super::prompt::FACT_CHARS {
+                    break;
+                }
+                add(&format!("{tail}/{name}"));
+            }
+        }
+    }
+    facets
+}
+
+/// An agent type the way people say it, first the way the registry labels it
+/// — `claude_code` is "Claude Code", or just "Claude". Empty for a type with no
+/// agent behind it (`none`) and for one this build does not know, which a
+/// newer daemon can report.
+pub(super) fn agent_type_spoken(agent_type: &str) -> &'static [&'static str] {
+    match agent_type {
+        "claude_code" => &["Claude Code", "Claude"],
+        "open_code" => &["OpenCode", "open code"],
+        "codex" => &["Codex"],
+        "pi" => &["Pi"],
+        "devin" => &["Devin"],
+        _ => &[],
+    }
+}
+
+/// The last component of a path, as a directory is called out loud. Either
+/// separator, since a remote daemon's paths are its own platform's; `None`
+/// for a path that is all separators.
+pub(super) fn directory_name(path: &str) -> Option<&str> {
+    path.trim()
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// `value` with every character that is not a letter, a digit, a space, `-`
+/// or `_` spelled as a space — so `schedule: issues` is two words, and
+/// `deploy@build-box` three, the way they are said.
+fn spoken_text(value: &str) -> String {
+    // A control or bidi character is DROPPED, as the model is shown it
+    // (`prompt::shown`), not read as a word break — "qa\u{202e}runner" is shown
+    // as `qarunner` and must be named that way (Qodo on PR #1529). Whitespace
+    // is a break first, so a newline still separates two words.
+    let spaced: String = value
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    dot_agent_deck::untrusted_text::strip_control_and_bidi(&spaced, false)
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The role, as `bridge.ts`'s `roleFromAgent` derives it: the orchestration
@@ -3937,7 +5212,9 @@ mod tests {
     use crate::voice::resolver::{IntentAnswer, StubResolver};
     use crate::voice::table::table;
 
-    use crate::voice::fixtures::{agent, role_agent};
+    use crate::voice::fixtures::{
+        agent, facets_fleet, in_titled_orchestration, role_agent, role_agent_in_state,
+    };
 
     /// A row's first whole-utterance phrase over the New agent dialog, when it
     /// has a grounding that depends on it.
@@ -3953,6 +5230,930 @@ mod tests {
         vec![role_agent("1", "tester"), role_agent("2", "orchestrator")]
     }
 
+    /// Scenario: ask to show orchestration agents or only dispatchers on the
+    /// dashboard. Each category selects a dashboard kind facet, rather than
+    /// opening one agent with that kind.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_kind_phrases() {
+        for (said, spoken, value) in [
+            (
+                "show me all orchestration agents",
+                "orchestration",
+                "orchestration",
+            ),
+            ("show only the dispatchers", "dispatchers", "dispatcher"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param("kind", spoken),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                    if action == "filter_dashboard" && invoke == "filterDashboard"
+                    && params.iter().any(|param| param.name == "kind" && param.value == value)),
+                "{said:?} must select kind {value:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: ask for working agents or agents waiting for input. The
+    /// existing voice pipeline grounds the words and returns the right status
+    /// facet for the dashboard without opening an individual pane.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_status_phrases() {
+        for (said, spoken, value) in [
+            ("show me all working agents", "working", "working"),
+            (
+                "show only agents waiting for input",
+                "waiting for input",
+                "waiting_for_input",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param("status", spoken),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                    if action == "filter_dashboard" && invoke == "filterDashboard"
+                    && params.iter().any(|param| param.name == "status" && param.value == value)),
+                "{said:?} must select status {value:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: ask for Codex agents or agents on build box. The type and
+    /// daemon words resolve using existing facts into dashboard facets, leaving
+    /// daemon selection and agent-pane navigation untouched.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_type_and_daemon_phrases() {
+        for (said, name, spoken, value) in [
+            ("show Codex agents", "agent_type", "Codex", "codex"),
+            (
+                "show the agents on build box",
+                "daemon",
+                "build box",
+                "deck-build",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param(name, spoken),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                    if action == "filter_dashboard" && invoke == "filterDashboard"
+                    && params.iter().any(|param| param.name == name && param.value == value)),
+                "{said:?} must select {name} {value:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: ask for agents "on all daemons", which the model answers with
+    /// the Daemon selector's All daemons entry. That is every daemon, so it is
+    /// no daemon facet: beside another facet only that one filters, and alone
+    /// the filter is refused rather than collapsing every daemon.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_all_daemons_is_no_daemon_facet() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        });
+        let filter = |said: &'static str, answer: IntentAnswer| {
+            let decks = decks.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, answer);
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let outcome = filter(
+            "show the working agents on all daemons",
+            IntentAnswer::new("filter_dashboard")
+                .with_param("status", "working")
+                .with_param("daemon", "all daemons"),
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0].name, "status");
+        assert!(sentence.contains("not filtered by daemon"), "{sentence}");
+        let outcome = filter(
+            "show the agents on all daemons",
+            IntentAnswer::new("filter_dashboard").with_param("daemon", "all daemons"),
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, .. } if action == "filter_dashboard"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: say any clear phrase from the dashboard, deck or agent pane.
+    /// Each dispatches a complete filter reset and opens the dashboard in one
+    /// step, including when it was said over a different screen.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_clear_phrases() {
+        for said in [
+            "show everything",
+            "show all agents",
+            "clear the filter",
+            "remove the filter",
+            "reset",
+        ] {
+            for screen in [Screen::Overview, Screen::Deck, Screen::Agent] {
+                let resolver = StubResolver::new()
+                    .answering(said, IntentAnswer::new("clear_dashboard_filter"));
+                let outcome = run(&resolver, screen, &fleet(), said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                        if action == "clear_dashboard_filter" && invoke == "clearDashboardFilter" && params.is_empty()),
+                    "{said:?} on {screen:?} must clear every facet, got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: opening tester or seeing only tester still opens that one
+    /// pane, and asking to show the dashboard still opens the overview. The
+    /// plural filter capability does not claim these existing navigation forms.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_navigation_controls() {
+        for said in ["open tester", "see only the tester"] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "tester"),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "open_agent" && invoke == "openAgent" && params[0].value == "1"),
+                "{said:?}: {outcome:?}"
+            );
+        }
+        let resolver =
+            StubResolver::new().answering("show the dashboard", IntentAnswer::new("open_overview"));
+        let outcome = run(&resolver, Screen::Deck, &fleet(), "show the dashboard").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, .. }
+            if action == "open_overview" && invoke == "openOverview"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: over an agent's pane, the model answers "show me the
+    /// dashboard" with the clear-the-filter row, the one there that shows the
+    /// dashboard. Those words ask for the dashboard, not for clearing the
+    /// filter, so the app answers as for the dashboard row — not here — and
+    /// clears nothing; "show everything" there still clears and opens it.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_kept_by_show_the_dashboard_over_a_pane() {
+        let said = "show me the dashboard";
+        let resolver =
+            StubResolver::new().answering(said, IntentAnswer::new("clear_dashboard_filter"));
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == "open_overview"),
+            "{outcome:?}"
+        );
+        let said = "show everything";
+        let resolver =
+            StubResolver::new().answering(said, IntentAnswer::new("clear_dashboard_filter"));
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "clear_dashboard_filter"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: on the dashboard the model answers "Close the agent" with the
+    /// stop, whose words it does not say. "Close" is a view word, so the app
+    /// answers it as closing what is on top and stops nothing; "stop the
+    /// tester" is still the stop.
+    #[tokio::test]
+    async fn voice_outcome_close_the_agent_picked_as_a_stop_is_a_close() {
+        let said = "Close the agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "close" && params.is_empty()),
+            "{outcome:?}"
+        );
+        let said = "stop the tester";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "stop_agent"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: over an agent's pane the model answers "go back" with the
+    /// Daemons screen, which cannot open there. A bare "go back" closes the
+    /// pane instead; "go back to the deck" still hears that it is not here.
+    #[tokio::test]
+    async fn voice_outcome_go_back_over_a_pane_picked_as_the_daemons_screen_closes_it() {
+        let said = "go back";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("open_deck"));
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "close"),
+            "{outcome:?}"
+        );
+        let said = "go back to the deck";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("open_deck"));
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == "open_deck"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the model answers "show me the one that's stuck" with the
+    /// user's words instead of the stuck agent's label. The only agent waiting
+    /// for input is opened; with two stuck agents the app asks which, and a
+    /// reference naming anything besides a state is still refused.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_in_the_users_words_resolves() {
+        let said = "show me the one that's stuck";
+        let fleet = vec![
+            role_agent_in_state("1", "tester", "waiting_for_input"),
+            role_agent_in_state("2", "coder", "working"),
+        ];
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &fleet, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "1"),
+            "{outcome:?}"
+        );
+        let two_stuck = vec![
+            role_agent_in_state("1", "tester", "waiting_for_input"),
+            role_agent_in_state("2", "coder", "error"),
+        ];
+        let outcome = run(&resolver, Screen::Deck, &two_stuck, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamAmbiguous { .. }),
+            "{outcome:?}"
+        );
+        let said = "show me the stuck reviewer";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "the stuck reviewer"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &fleet, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the user says "stop the busy agent" and the model answers
+    /// with a different word for the same state, "the working agent". "Busy"
+    /// covers working, so the working agent is the one to stop. A state the
+    /// user did not say in any form is refused: "idle" for "busy", "busy" for
+    /// "working" reaching a thinking agent, or any state for "stop the agent".
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_grounded_on_the_status_the_user_said() {
+        let fleet = vec![
+            role_agent_in_state("1", "tester", "working"),
+            role_agent_in_state("2", "coder", "idle"),
+        ];
+        let stop = |said: &'static str, answered: &'static str, fleet: Vec<DesktopAgent>| async move {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("stop_agent").with_param("agent", answered),
+            );
+            run(&resolver, Screen::Overview, &fleet, said).await
+        };
+        let outcome = stop("stop the busy agent", "the working agent", fleet.clone()).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. } if action == "stop_agent" && params[0].value == "1"),
+            "{outcome:?}"
+        );
+        for (said, answered, fleet) in [
+            // The model invents a state the user never said in any alias.
+            ("stop the agent", "the idle agent", fleet.clone()),
+            ("stop the agent", "the working agent", fleet.clone()),
+            // A state word the user said, but for another status.
+            ("stop the busy agent", "the idle agent", fleet.clone()),
+            // "Busy" is wider than "working": the model's word may not widen
+            // what the user said to the thinking agent.
+            (
+                "stop the working agent",
+                "the busy agent",
+                vec![
+                    role_agent_in_state("1", "tester", "thinking"),
+                    role_agent_in_state("2", "coder", "idle"),
+                ],
+            ),
+        ] {
+            let outcome = stop(said, answered, fleet).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                "{said:?} answered {answered:?} must reach nobody: {outcome:?}"
+            );
+        }
+    }
+
+    /// A working Codex agent in `billing` and a blocked Claude Code agent in
+    /// `docs-site`: "stuck" names only the second, and every other fact the
+    /// user might say names only the first.
+    fn stuck_fleet() -> Vec<DesktopAgent> {
+        let named = |id: &str, name: &str, agent_type: &str, cwd: &str, status: &str| {
+            let mut agent = agent(id, Some(name), agent_type);
+            agent.cwd = Some(cwd.to_string());
+            agent.status = status.to_string();
+            agent
+        };
+        vec![
+            named(
+                "agent-juno",
+                "Juno",
+                "codex",
+                "/home/dev/code/billing",
+                "working",
+            ),
+            named(
+                "agent-vega",
+                "Vega",
+                "claude_code",
+                "/home/dev/code/docs-site",
+                "blocked",
+            ),
+        ]
+    }
+
+    /// Scenario: the user asks for the stuck agent with a type or a directory
+    /// the stuck one does not have, and the model answers only "the one that's
+    /// stuck". The words the model dropped rule the stuck Claude Code agent
+    /// out, so nothing is opened — and nothing is offered for stopping.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_held_to_the_facts_the_user_said() {
+        for (said, row, screen) in [
+            ("open the stuck Codex agent", "open_agent", Screen::Deck),
+            (
+                "open the stuck agent in billing",
+                "open_agent",
+                Screen::Deck,
+            ),
+            ("stop the stuck Codex agent", "stop_agent", Screen::Overview),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, screen, &stuck_fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                "{said:?} must not reach the stuck Claude Code agent: {outcome:?}"
+            );
+        }
+        // The positive control: the same answer, with nothing else said.
+        let said = "open the stuck agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &stuck_fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the only agent is the blocked Claude Code agent in
+    /// `docs-site`, and the user asks for a stuck agent with a type, a
+    /// directory or a run it does not have; the model answers only "the one
+    /// that's stuck". No other agent accounts for the dropped words, and they
+    /// still rule the stuck one out, so nothing is opened or offered for
+    /// stopping — while its own type and directory, said, still reach it.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_alone_is_held_to_the_facts_the_user_said() {
+        let alone = || vec![stuck_fleet().remove(1)];
+        for (said, row, screen) in [
+            ("open the stuck Codex agent", "open_agent", Screen::Deck),
+            ("stop the stuck Codex agent", "stop_agent", Screen::Overview),
+            (
+                "open the stuck agent in billing",
+                "open_agent",
+                Screen::Deck,
+            ),
+            (
+                "stop the stuck agent in billing",
+                "stop_agent",
+                Screen::Overview,
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, screen, &alone(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                "{said:?} must not reach the only stuck agent: {outcome:?}"
+            );
+        }
+        for said in [
+            "open the stuck agent",
+            "open the stuck Claude Code agent",
+            "open the stuck agent in docs-site",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, Screen::Deck, &alone(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+                "{said:?}: {outcome:?}"
+            );
+        }
+        // A run: the only stuck reviewer is in docs-1502, so naming prd-1487
+        // reaches nobody, and naming its own run reaches it.
+        let only = vec![in_titled_orchestration(
+            role_agent_in_state("review-docs", "reviewer", "error"),
+            "orch-docs-1502",
+            "review",
+            "docs-1502",
+        )];
+        for (said, reached) in [
+            ("open the stuck reviewer in the prd-1487 run", false),
+            ("open the stuck reviewer in the docs-1502 run", true),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, Screen::Deck, &only, said).await;
+            if reached {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "review-docs"),
+                    "{said:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only stuck agent is the Claude Code agent in
+    /// `docs-site`, and the user points at it with everyday words — "over
+    /// there", "in the docs-site project", "in the docs-site repo" — while the
+    /// model answers only "the one that's stuck". Those words name no agent,
+    /// so the stuck one is opened; a type or a directory it does not have,
+    /// said with the same words, still reaches nobody.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_reached_through_everyday_words() {
+        let alone = || vec![stuck_fleet().remove(1)];
+        for (said, reached) in [
+            ("open the stuck agent over there", true),
+            ("open the stuck one over here please", true),
+            ("open the stuck agent in the docs-site project", true),
+            ("open the stuck agent in the docs-site repo", true),
+            ("open the stuck agent in this workspace", true),
+            ("open the stuck pane", true),
+            ("open the stuck agent in the billing project", false),
+            ("open the stuck agent in the billing repository", false),
+            ("open the stuck Codex agent over there", false),
+            ("open the stuck Codex agent in the docs-site repo", false),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, Screen::Deck, &alone(), said).await;
+            if reached {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+                    "{said:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the only stuck agent: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only stuck agent was last asked to fix the scroll, and
+    /// the user asks for "the stuck one fixing the scroll" while the model
+    /// answers only "the one that's stuck". Its task accounts for the words,
+    /// so it is opened. When the scroll is ANOTHER agent's task, or the user
+    /// also names a type the stuck one is not, nothing is opened.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_held_to_its_task_too() {
+        let open = |said: &'static str, fleet: Vec<DesktopAgent>| async move {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            run(&resolver, Screen::Deck, &fleet, said).await
+        };
+        let mut fixing = stuck_fleet().remove(1);
+        fixing.last_user_prompt = Some("Fix the scroll in the install guide".to_string());
+        for said in [
+            "open the stuck one fixing the scroll",
+            "open the stuck agent I asked to fix the scroll",
+        ] {
+            let outcome = open(said, vec![fixing.clone()]).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+                "{said:?}: {outcome:?}"
+            );
+        }
+        // The scroll is the working Codex agent's task; the stuck one was
+        // asked for something else.
+        let mut fleet = stuck_fleet();
+        fleet[0].last_user_prompt = Some("Fix the scroll".to_string());
+        fleet[1].last_user_prompt = Some("Rewrite the install guide".to_string());
+        let outcome = open("open the stuck one fixing the scroll", fleet).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // Half the task is not the task: "printer" is in nobody's prompt.
+        let outcome = open(
+            "open the stuck one fixing the printer",
+            vec![fixing.clone()],
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // A type is what the agent IS: "Codex" is not this Claude Code agent,
+        // whatever its prompt says about code.
+        let mut reviewing = stuck_fleet().remove(1);
+        reviewing.last_user_prompt = Some("Review the code".to_string());
+        let outcome = open(
+            "open the stuck Codex one reviewing the code",
+            vec![reviewing],
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the only stuck agent is the Claude Code agent in
+    /// `docs-site`, last asked to "Fix the billing issue". The user opens or
+    /// stops "the stuck agent in the billing project" (or repo, folder, run,
+    /// orchestration…) and the model answers only "the one that's stuck".
+    /// Billing is where the user said the agent is, and this one is in
+    /// docs-site, so nothing is opened or offered for stopping: a prompt that
+    /// mentions billing does not put the agent there. Asked for as "the stuck
+    /// agent fixing the billing issue", the same agent is reached by its task,
+    /// and so it is when the user also says the place it really is in.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for place in [
+                "in the billing project",
+                "in the billing repo",
+                "in the billing repository",
+                "in the billing folder",
+                "in the billing directory",
+                "in the billing workspace",
+                "in the billing codebase",
+                "in the billing orchestration",
+                "in the billing run",
+                "from the billing folder",
+                "in project billing",
+                "in billing",
+            ] {
+                let said = format!("{verb} the stuck agent {place}");
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
+                );
+            }
+            for task in [
+                "fixing the billing issue",
+                "in the docs-site project fixing the billing issue",
+            ] {
+                let said = format!("{verb} the stuck agent {task}");
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                        if action == row && params[0].value == "agent-vega"),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only agent is the Claude Code agent in `docs-site`, last
+    /// asked to "Fix the billing issue". The user opens or stops "the agent in
+    /// the billing project" and the model answers just "billing", which names
+    /// no agent and so is read as a task. Billing is where the user said the
+    /// agent is, and a prompt that mentions billing does not put this one
+    /// there, so nothing is opened or offered for stopping. Asked for as "the
+    /// one fixing the billing issue" — or with the place it really is in — the
+    /// same agent is still reached by its task.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_found_by_its_task_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for place in [
+                "in the billing project",
+                "in the billing repo",
+                "from the billing folder",
+                "in project billing",
+                "in billing",
+            ] {
+                let said = format!("{verb} the agent {place}");
+                let resolver = StubResolver::new()
+                    .answering(&said, IntentAnswer::new(row).with_param("agent", "billing"));
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
+                );
+            }
+            for said in [
+                format!("{verb} the one fixing the billing issue"),
+                format!("{verb} the agent in the docs-site project fixing the billing issue"),
+            ] {
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one fixing the billing issue"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                        if action == row && params[0].value == "agent-vega"),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only agent is the Claude Code agent in `docs-site`, last
+    /// asked to "Fix the billing issue". The user opens or stops "the agent
+    /// at billing" (or "at the billing project") and the model answers just
+    /// "billing". "At" says where the agent is as "in" does, and this one is
+    /// in docs-site, so nothing is opened or offered for stopping. The same
+    /// holds when the model answers "the one that's stuck" for "the stuck
+    /// agent at billing".
+    #[tokio::test]
+    async fn voice_outcome_an_agent_said_to_be_at_a_place_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for (said, spoken) in [
+                (format!("{verb} the agent at billing"), "billing"),
+                (
+                    format!("{verb} the agent at the billing project"),
+                    "billing",
+                ),
+                (
+                    format!("{verb} the stuck agent at billing"),
+                    "the one that's stuck",
+                ),
+            ] {
+                let resolver = StubResolver::new()
+                    .answering(&said, IntentAnswer::new(row).with_param("agent", spoken));
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: two reviewers are stuck, one in the prd-1487 run and one in
+    /// the docs-1502 run; the user names the run and the model answers only
+    /// "the one that's stuck". The run the user said narrows the two to its
+    /// reviewer, and with only the docs reviewer stuck nothing is opened.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_narrowed_by_the_run_the_user_said() {
+        let reviewer = |id: &str, run: &str, status: &str| {
+            in_titled_orchestration(
+                role_agent_in_state(id, "reviewer", status),
+                &format!("orch-{run}"),
+                "review",
+                run,
+            )
+        };
+        let said = "open the stuck reviewer in the prd-1487 run";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+        );
+        let both_stuck = vec![
+            reviewer("review-1487", "prd-1487", "blocked"),
+            reviewer("review-docs", "docs-1502", "error"),
+        ];
+        let outcome = run(&resolver, Screen::Deck, &both_stuck, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "review-1487"),
+            "{outcome:?}"
+        );
+        let docs_stuck = vec![
+            reviewer("review-1487", "prd-1487", "working"),
+            reviewer("review-docs", "docs-1502", "error"),
+        ];
+        let outcome = run(&resolver, Screen::Deck, &docs_stuck, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the user says "stop it" or "open that one" and the model
+    /// answers with a state the user never said. The state is not read, so no
+    /// agent is picked by it; a recency word the user does say picks among the
+    /// agents in the state they named.
+    #[tokio::test]
+    async fn voice_outcome_a_state_only_the_model_said_is_not_read() {
+        for (said, row, screen, spoken) in [
+            (
+                "stop it",
+                "stop_agent",
+                Screen::Overview,
+                "the one that's stuck",
+            ),
+            ("open that one", "open_agent", Screen::Deck, "the idle one"),
+        ] {
+            let mut fleet = stuck_fleet();
+            fleet[0].status = "idle".to_string();
+            let resolver = StubResolver::new()
+                .answering(said, IntentAnswer::new(row).with_param("agent", spoken));
+            let outcome = run(&resolver, screen, &fleet, said).await;
+            assert!(
+                !matches!(&outcome, VoiceOutcome::Dispatch { .. }),
+                "{said:?} answered {spoken:?} must not pick by state: {outcome:?}"
+            );
+        }
+        let mut fleet = vec![
+            role_agent_in_state("1", "tester", "blocked"),
+            role_agent_in_state("2", "coder", "error"),
+        ];
+        fleet[0].spawned_at_ms = Some(1_000);
+        fleet[1].spawned_at_ms = Some(2_000);
+        let said = "open the newest stuck agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "the stuck one"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &fleet, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "2"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the user asks for Codex agents and the model also supplies a
+    /// status, a kind and a daemon nobody said. Only the agent type filters
+    /// the dashboard, and the report says each of the others was left out.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_drops_facets_the_user_did_not_say() {
+        let said = "show Codex agents";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("filter_dashboard")
+                .with_param("agent_type", "codex")
+                .with_param("status", "blocked")
+                .with_param("kind", "dispatchers")
+                .with_param("daemon", "build box"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0].name, "agent_type");
+        assert_eq!(params[0].value, "codex");
+        for noun in ["status", "kind", "daemon"] {
+            assert!(
+                sentence.contains(&format!("not filtered by {noun}")),
+                "{noun}: {sentence}"
+            );
+        }
+        // Every facet invented: nothing is left, so the filter is refused.
+        let said = "show only the agents";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("filter_dashboard")
+                .with_param("status", "working")
+                .with_param("agent_type", "codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, .. } if action == "filter_dashboard"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: filter the dashboard by a status the model names in words
+    /// the app does not know, beside one it does. The known facet filters and
+    /// the report says the other was left out; with no facet left at all the
+    /// filter is refused rather than dispatched as showing everything.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_drops_an_unknown_facet_and_refuses_none() {
+        let said = "show only the sleepy codex agents";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("filter_dashboard")
+                .with_param("status", "sleepy")
+                .with_param("agent_type", "codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0].value, "codex");
+        assert!(sentence.contains("Agent type: Codex."), "{sentence}");
+        assert!(sentence.contains("not filtered by status"), "{sentence}");
+        let said = "show only the sleepy agents";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("filter_dashboard").with_param("status", "sleepy"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, .. } if action == "filter_dashboard"),
+            "{outcome:?}"
+        );
+    }
+
     fn deck(id: &str, label: &str, local: bool) -> VoiceDeck {
         VoiceDeck {
             id: id.to_string(),
@@ -3960,6 +6161,7 @@ mod tests {
             address: None,
             local,
             unavailable: None,
+            holds_agents: local,
         }
     }
 
@@ -3984,9 +6186,9 @@ mod tests {
     // -- deck_ref (PRD #1223) ---------------------------------------------
 
     /// Scenario: switch to the named remote deck, the local deck called
-    /// "local" or "this machine", an ambiguous name, or a missing deck.
-    /// A model-supplied remote name that the transcript did not say is refused
-    /// as an unresolved required deck reference, even when that deck exists.
+    /// "local" or "this machine", an ambiguous name, or a missing deck. The
+    /// model's value is resolved as given, like every other reference
+    /// (issue #1491).
     #[tokio::test]
     async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
         let cases = [
@@ -3996,7 +6198,6 @@ mod tests {
             ("switch daemon to the build box", "build box"),
             ("switch deck to local", "local"),
             ("switch deck to this machine", "this machine"),
-            ("switch deck to local", "build box"),
             ("switch deck to build", "build"),
             ("switch deck to the ghost box", "ghost box"),
         ];
@@ -4034,11 +6235,6 @@ mod tests {
                         if params[0].value == "deck-local"),
                     "{outcome:?}"
                 ),
-                ("switch deck to local", "build box") => assert!(
-                    matches!(&outcome, VoiceOutcome::ParamUnresolved { action, param, .. }
-                        if action == "switch_deck" && param == "deck"),
-                    "a deck absent from the transcript must be refused: {outcome:?}"
-                ),
                 (_, "build") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
                         if action == "switch_deck" && sentence.contains("matches more than one daemon")),
@@ -4052,6 +6248,32 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Scenario (issue #1491): speech-to-text writes "daemon" as "demon". A
+    /// model that echoes the user's words — with Names withheld, or when
+    /// nothing it was shown fits — hands over "all demons" or a bare "demon",
+    /// and each resolves exactly as "all daemons" and "daemon" do.
+    #[test]
+    fn voice_outcome_deck_ref_reads_demon_as_daemon() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        });
+        assert!(matches!(
+            resolve_deck_ref("all demons", &decks),
+            DeckRefMatch::One { id, .. } if id == crate::voice::ALL_DECKS_ID
+        ));
+        assert_eq!(
+            resolve_deck_ref("demon", &decks),
+            resolve_deck_ref("daemon", &decks)
+        );
+        assert_eq!(resolve_deck_ref("demon", &decks), DeckRefMatch::None);
     }
 
     #[test]
@@ -4097,6 +6319,32 @@ mod tests {
         );
         assert_eq!(resolve_deck_ref("local", &[]), DeckRefMatch::None);
         assert_eq!(resolve_deck_ref("   ", &decks()), DeckRefMatch::None);
+    }
+
+    /// Glued words reach a deck only when they spell one of its names in
+    /// full: "BuildBoxDeck" is the build box, while "BuildDeck" — a part of
+    /// two names — and "GhostBoxDeck" reach none.
+    #[test]
+    fn voice_outcome_deck_ref_reads_glued_words_only_as_a_whole_name() {
+        let build_box = DeckRefMatch::One {
+            id: "deck-build".to_string(),
+            label: "deploy@build-box.example.com:2222".to_string(),
+        };
+        for said in [
+            "BuildBoxDeck",
+            "buildbox",
+            "DaemonBuildBox",
+            "the BuildBoxDeck",
+        ] {
+            assert_eq!(resolve_deck_ref(said, &decks()), build_box, "{said}");
+        }
+        for said in ["BuildDeck", "GhostBoxDeck", "BoxDeck", "Deck"] {
+            assert_eq!(
+                resolve_deck_ref(said, &decks()),
+                DeckRefMatch::None,
+                "{said}"
+            );
+        }
     }
 
     #[test]
@@ -4383,6 +6631,79 @@ mod tests {
             entries: names.iter().map(|name| entry(name)).collect(),
             paging: None,
         }
+    }
+
+    /// Scenario: "go up" is said on the dashboard and the model answers
+    /// `go_to_parent`, the New agent dialog's directory row, which cannot run
+    /// there; the dashboard scrolls up instead (`scroll-up-go-up`, red on
+    /// `main`). Said over the dialog showing a parent directory and answered
+    /// as `scroll_up`, it goes up a directory. "Go back" on the dashboard
+    /// carries no word of `scroll_up`'s and is not turned into a scroll.
+    #[tokio::test]
+    async fn voice_outcome_go_up_is_the_row_that_can_run_here() {
+        let on_the_dashboard = |said: &'static str, row: &'static str| async move {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(row));
+            run(&resolver, Screen::Overview, &fleet(), said).await
+        };
+        assert!(matches!(
+            &on_the_dashboard("go up", "go_to_parent").await,
+            VoiceOutcome::Dispatch { action, .. } if action == "scroll_up"
+        ));
+        assert!(matches!(
+            &on_the_dashboard("go back", "go_to_parent").await,
+            VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
+        ));
+        // Only a bare "go up" crosses: words naming a folder, or the top,
+        // keep the folder row's refusal.
+        for said in ["go up a directory", "go up to the top"] {
+            assert!(
+                matches!(&on_the_dashboard(said, "go_to_parent").await,
+                    VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"),
+                "{said:?}"
+            );
+        }
+        assert!(matches!(
+            &on_the_dashboard("Okay, go up please.", "go_to_parent").await,
+            VoiceOutcome::Dispatch { action, .. } if action == "scroll_up"
+        ));
+        let dialog = VoiceNewAgent { form: None };
+        let browsing = listing(&["billing"], true);
+        let resolver = StubResolver::new().answering("go up", IntentAnswer::new("scroll_up"));
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&browsing),
+            Some(&dialog),
+            Transcript::new("go up"),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "go_to_parent"),
+            "{outcome:?}"
+        );
+        // Words naming a scroll keep the scroll's refusal over the dialog.
+        let resolver =
+            StubResolver::new().answering("scroll up a bit", IntentAnswer::new("scroll_up"));
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&browsing),
+            Some(&dialog),
+            Transcript::new("scroll up a bit"),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == "scroll_up"),
+            "{outcome:?}"
+        );
     }
 
     fn code_dir() -> VoiceDirectories {
@@ -4940,6 +7261,84 @@ mod tests {
                 "{said} over a pane"
             );
         }
+    }
+
+    /// Scenario: "scroll down", "scroll up", "scroll to the top" and "scroll
+    /// to the bottom" on the agent dashboard dispatch the dashboard's scroll
+    /// (issue #1492). They are not available on the Daemons screen, over an
+    /// agent's pane, or while the New agent dialog covers the dashboard.
+    #[tokio::test]
+    async fn voice_outcome_scrolls_dispatch_on_the_dashboard_only() {
+        let dialog = VoiceNewAgent { form: None };
+        for (said, id, invoke, sentence) in [
+            (
+                "scroll down",
+                "scroll_down",
+                "scrollDown",
+                "Scrolling down.",
+            ),
+            ("scroll up a bit", "scroll_up", "scrollUp", "Scrolling up."),
+            (
+                "scroll to the top",
+                "scroll_to_top",
+                "scrollToTop",
+                "Scrolled to the top.",
+            ),
+            (
+                "go to the bottom",
+                "scroll_to_bottom",
+                "scrollToBottom",
+                "Scrolled to the bottom.",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(id));
+            assert_eq!(
+                run_with(&resolver, Screen::Overview, None, said).await,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new(said),
+                    action: id.to_string(),
+                    invoke: invoke.to_string(),
+                    params: Vec::new(),
+                    sentence: sentence.to_string(),
+                    then_submit: false,
+                },
+                "{said}"
+            );
+            for screen in [Screen::Deck, Screen::Agent] {
+                assert!(
+                    matches!(
+                        run_with(&resolver, screen, None, said).await,
+                        VoiceOutcome::Unavailable { .. }
+                    ),
+                    "{said} on {screen:?}"
+                );
+            }
+            let under_dialog = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                Some(&dialog),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(under_dialog, VoiceOutcome::Unavailable { .. }),
+                "{said} under the New agent dialog: {under_dialog:?}"
+            );
+        }
+        // A pick of the opposite direction is refused, not run the wrong way.
+        let resolver = StubResolver::new().answering("scroll up", IntentAnswer::new("scroll_down"));
+        assert!(
+            !matches!(
+                run_with(&resolver, Screen::Overview, None, "scroll up").await,
+                VoiceOutcome::Dispatch { .. }
+            ),
+            "scroll up must not ground a scroll down"
+        );
     }
 
     /// Scenario: an ambiguous required directory offers dispatchable paths in
@@ -5535,8 +7934,10 @@ mod tests {
 
     /// Scenario: the New agent dialog does not list a deck — here the build
     /// box, which is not connected — and the user says "new agent on the build
-    /// box". The model was never shown that deck, and when its answer names it
-    /// anyway the report says in one line that it can't take a new agent, with
+    /// box". The model is shown that deck among every daemon, marked as one a
+    /// new agent cannot start on (it is still one the Daemon selector switches
+    /// to, issue #1491), and when its answer names it the report says in one
+    /// line that it can't take a new agent, with
     /// the short reason class the webview declared for it (PR #1451 round 3,
     /// change 6), instead of "Preselected daemon:" for a deck the dialog will
     /// not preselect. A deck the user did not name
@@ -5561,12 +7962,14 @@ mod tests {
         )
         .await;
         assert!(
-            data.contains("Local deck") && data.contains("ci@build-farm"),
-            "the decks that can take an agent are offered: {data}"
+            data.contains(
+                r#""decks":["Local deck","deploy@build-box.example.com:2222","ci@build-farm"]"#
+            ),
+            "every daemon is shown, so a switch can name any of them: {data}"
         );
         assert!(
-            !data.contains("build-box"),
-            "a deck the dialog disables is not offered at all: {data}"
+            data.contains(r#""decks_without_new_agent":["deploy@build-box.example.com:2222"]"#),
+            "a deck the dialog disables is marked as one: {data}"
         );
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
@@ -5576,6 +7979,42 @@ mod tests {
             outcome.sentence(),
             "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
              can't take a new agent: it is not connected, so none is preselected."
+        );
+
+        // Answered with its full label, which the user did not say word for
+        // word (issue #1491), it is still named back with its reason: the
+        // user said words of its name.
+        let (outcome, _) = open_new_agent_over(
+            &fleet,
+            IntentAnswer::new("open_new_agent")
+                .with_param("deck", "deploy@build-box.example.com:2222"),
+            "new agent on the build box",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
+             can't take a new agent: it is not connected, so none is preselected."
+        );
+
+        // Qodo on PR #1504: beside another deck that cannot take one and shares
+        // "box", the user's "build box" does not single out the stale box the
+        // model guessed, so that deck is not named back as if they had.
+        let two_boxes = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck("deck-build", "ops@build-box", false, NOT_CONNECTED),
+            unavailable_deck("deck-stale", "ci@stale-box", false, NOT_CONNECTED),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &two_boxes,
+            IntentAnswer::new("open_new_agent").with_param("deck", "ci@stale-box"),
+            "new agent on the build box",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. I did not catch which daemon. \
+             Preselected daemon: Local deck."
         );
 
         // The model's own invention of it is not caught, like any invented deck.
@@ -5939,9 +8378,24 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_go_to_parent_is_unavailable_at_a_root() {
+        // A listing is the New agent dialog's, so the dialog is declared open
+        // with it, as the webview declares them; under the dialog the
+        // dashboard's `scroll_up` cannot run either, so nothing redirects.
         let root = listing(&["home", "srv"], false);
+        let dialog = VoiceNewAgent { form: None };
         let resolver = StubResolver::new().answering("go up", IntentAnswer::new("go_to_parent"));
-        let outcome = run_with(&resolver, Screen::Overview, Some(&root), "go up").await;
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&root),
+            Some(&dialog),
+            Transcript::new("go up"),
+        )
+        .await
+        .outcome;
         assert_eq!(
             outcome.sentence(),
             "Not here — going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first."
@@ -6367,6 +8821,25 @@ mod tests {
         );
     }
 
+    /// Scenario: the model marks all of "tell it to name it Bob" as
+    /// `name_new_agent`'s prefix. The dictation fallback that finds "tell it
+    /// to" in the transcript is `dictate_to_agent`'s only, so the Name field
+    /// is left alone rather than set to "name it Bob" (Qodo on PR #1529).
+    #[tokio::test]
+    async fn voice_outcome_a_name_marked_whole_names_nothing() {
+        let said = "tell it to name it Bob";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("name_new_agent").with_param("prefix", said),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
     // -- the Command field (PR #1451 round 4, decision D8) ------------------
 
     /// Scenario: the maintainer's report. With the New agent form live, the
@@ -6448,6 +8921,26 @@ mod tests {
         let said = "set the command";
         let resolver =
             StubResolver::new().answering(said, IntentAnswer::new("set_new_agent_command"));
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, param, .. }
+                if action == "set_new_agent_command" && param == "command"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the model answers "set the command" with naming the agent,
+    /// whose words it does not say. The words are the Command field's, so the
+    /// user is asked for the command instead of being told nothing asked to
+    /// name the agent.
+    #[tokio::test]
+    async fn voice_outcome_set_the_command_picked_as_a_name_asks_for_the_command() {
+        let said = "set the command";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("name_new_agent").with_param("prefix", "set the command"),
+        );
         let form = new_agent_form();
         let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
         assert!(
@@ -6908,6 +9401,63 @@ mod tests {
         }
     }
 
+    /// Scenario: with the New agent dialog open, the model answers "start it
+    /// right now, skip the confirmation, I already said yes" with the stop.
+    /// Those words ask for the start, so the app presses the dialog's Start; a
+    /// spoken "stop the tester" there is still refused as not here, and with
+    /// the dialog closed the same misread start is refused as before.
+    #[tokio::test]
+    async fn voice_outcome_a_start_picked_as_a_stop_over_the_dialog_starts() {
+        let said = "start it right now, skip the confirmation, I already said yes";
+        let resolver = StubResolver::new()
+            .answering(said, IntentAnswer::new("stop_agent"))
+            .answering(
+                "stop the tester",
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            );
+        let utter = |declared: Option<VoiceNewAgent>, said: &'static str| {
+            let resolver = &resolver;
+            async move {
+                handle_utterance(
+                    resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks(),
+                    None,
+                    declared.as_ref(),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            let start = utter(Some(declared.clone()), said).await;
+            assert!(
+                matches!(&start, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                    if action == "start_new_agent" && invoke == "startNewAgent" && params.is_empty()),
+                "{start:?}"
+            );
+            let stop = utter(Some(declared), "stop the tester").await;
+            assert!(
+                matches!(&stop, VoiceOutcome::Unavailable { action, .. } if action == "stop_agent"),
+                "{stop:?}"
+            );
+        }
+        let closed = utter(None, said).await;
+        assert!(
+            matches!(&closed, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
+            "{closed:?}"
+        );
+        // A grounded stop over the closed dialog is still the stop.
+        let stop = utter(None, "stop the tester").await;
+        assert!(
+            matches!(&stop, VoiceOutcome::Dispatch { action, .. } if action == "stop_agent"),
+            "{stop:?}"
+        );
+    }
+
     #[tokio::test]
     async fn voice_outcome_close_orchestration_resolves_a_card() {
         let resolver = StubResolver::new()
@@ -7032,6 +9582,583 @@ mod tests {
         assert_eq!(params[0].label, "tester");
         assert_eq!(sentence, "Opening tester.");
         assert!(outcome.is_dispatch());
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_select_dispatcher_agent_opens_the_dispatcher() {
+        // Issue #1495, as reported: "Select Dispatcher agent." was answered
+        // "no matching action" with a dispatcher-mode agent running. Its label
+        // is its own name, Mercury, so the word "dispatcher" is only its MODE,
+        // and "select" was a verb of `switch_deck` alone. The stub answers the
+        // way a model shown the mode would; the real model's answer is pinned
+        // by the `open-agent-select-dispatcher` phrase fixture.
+        let said = "Select Dispatcher agent.";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "dispatcher"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &facets_fleet(), said).await;
+        let VoiceOutcome::Dispatch {
+            action,
+            params,
+            sentence,
+            ..
+        } = &outcome
+        else {
+            panic!("expected the dispatcher's pane to open, got {outcome:?}");
+        };
+        assert_eq!(action, "open_agent");
+        assert_eq!(params[0].value, "agent-mercury");
+        assert_eq!(sentence, "Opening Mercury.");
+    }
+
+    /// Scenario: against agents whose labels say nothing about what they are
+    /// doing (issue #1495), a spoken reference reaches the one agent named by
+    /// its mode, its agent type, its directory, its orchestration, the daemon
+    /// it is on, or when it started — and a reference naming another daemon
+    /// reaches none.
+    #[test]
+    fn voice_outcome_an_agent_is_named_by_what_the_deck_knows_about_it() {
+        let agents = facets_fleet();
+        let decks = decks();
+        let one = |spoken: &str| match resolve_agent_ref_on(spoken, &agents, &decks) {
+            AgentRefMatch::One { id, .. } => id,
+            other => panic!("{spoken:?} should name one agent, got {other:?}"),
+        };
+        // Mode.
+        assert_eq!(one("dispatcher"), "agent-mercury");
+        assert_eq!(one("the dispatcher agent"), "agent-mercury");
+        // Agent type: Juno is the one Codex agent.
+        assert_eq!(one("the Codex agent"), "agent-juno");
+        // Directory, said whole, in words, and as part of a longer reference.
+        assert_eq!(one("dot-agent-deck"), "agent-mercury");
+        assert_eq!(one("the one in dot agent deck"), "agent-mercury");
+        assert_eq!(one("the agent in billing"), "agent-juno");
+        // Orchestration: two reviewers, told apart by their run.
+        assert_eq!(
+            one("the reviewer in the PRD 1487 orchestration"),
+            "agent-review-1487"
+        );
+        assert_eq!(one("the docs 1502 reviewer"), "agent-review-docs");
+        // Daemon: the one the agents are on narrows nothing and blocks nothing.
+        assert_eq!(one("the Codex agent on the local deck"), "agent-juno");
+        // Recency, alone and narrowed by another fact.
+        assert_eq!(one("the newest agent"), "agent-vega");
+        assert_eq!(one("the most recent one"), "agent-vega");
+        assert_eq!(one("the oldest agent"), "agent-mercury");
+        assert_eq!(one("the newest reviewer"), "agent-review-docs");
+
+        // A daemon the agents are NOT on: nothing here, rather than the Codex
+        // agent this machine happens to have.
+        assert_eq!(
+            resolve_agent_ref_on("the Codex agent on build box", &agents, &decks),
+            AgentRefMatch::None
+        );
+        // Without the decks, no daemon is known, so none is read.
+        assert_eq!(
+            resolve_agent_ref("the Codex agent", &agents),
+            AgentRefMatch::One {
+                id: "agent-juno".to_string(),
+                label: "Juno".to_string()
+            }
+        );
+    }
+
+    /// Scenario: review findings on PR #1529. Two agents in directories that
+    /// share a name are told apart the way the model is shown them
+    /// (`work/api`); a reference whose facts belong to two different agents —
+    /// "the Codex agent in docs-site" — reaches neither; and a daemon the user
+    /// named that the model left out of its answer still refuses.
+    #[tokio::test]
+    async fn voice_outcome_a_reference_is_held_to_every_fact_it_names() {
+        let mut work = agent("1", Some("Atlas"), "codex");
+        work.cwd = Some("/home/dev/work/api".to_string());
+        let mut oss = agent("2", Some("Boreas"), "codex");
+        oss.cwd = Some("/home/dev/oss/api/".to_string());
+        let twins = vec![work, oss];
+        for (said, id) in [("work/api", "1"), ("the one in oss api", "2")] {
+            assert!(
+                matches!(resolve_agent_ref_on(said, &twins, &decks()),
+                    AgentRefMatch::One { id: found, .. } if found == id),
+                "{said:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_agent_ref_on("the one in api", &twins, &decks()),
+            AgentRefMatch::Ambiguous(_)
+        ));
+
+        let agents = facets_fleet();
+        for conflicting in [
+            "the Codex agent in docs-site",
+            "reviewer in billing PRD 1487",
+        ] {
+            assert_eq!(
+                resolve_agent_ref_on(conflicting, &agents, &decks()),
+                AgentRefMatch::None,
+                "{conflicting:?}"
+            );
+        }
+        // The same facts on ONE agent still reach it.
+        assert!(matches!(
+            resolve_agent_ref_on("the Codex agent in billing", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-juno"
+        ));
+
+        let said = "open the Codex agent on build box";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // A qualifier ("on build box") constrains even when an agent here is
+        // itself called "build box", and a host literally called `daemon` is
+        // still a daemon there; said without "on", a name the deck shows wins.
+        let mut named_like_a_daemon = agent("9", Some("build box"), "codex");
+        named_like_a_daemon.cli_name = Some("codex".to_string());
+        let colliding = vec![named_like_a_daemon];
+        assert_eq!(
+            resolve_agent_ref_on("the Codex agent on build box", &colliding, &decks()),
+            AgentRefMatch::None
+        );
+        assert!(matches!(
+            resolve_agent_ref_on("build box", &colliding, &decks()),
+            AgentRefMatch::One { id, .. } if id == "9"
+        ));
+        let mut with_a_daemon_host = decks();
+        with_a_daemon_host.push(deck("deck-daemon", "ops@daemon", false));
+        assert_eq!(
+            resolve_agent_ref_on("the Codex agent on daemon", &agents, &with_a_daemon_host),
+            AgentRefMatch::None
+        );
+        // The daemon the agents ARE on keeps a word that is also a run's name
+        // unless it is said as the qualifier.
+        let staging = [VoiceDeck {
+            holds_agents: true,
+            ..deck("deck-staging", "ops@staging", false)
+        }];
+        let runs = vec![
+            in_titled_orchestration(role_agent("10", "reviewer"), "o1", "staging", "staging"),
+            in_titled_orchestration(role_agent("11", "reviewer"), "o2", "prod", "prod"),
+        ];
+        assert!(matches!(
+            resolve_agent_ref_on("the staging reviewer", &runs, &staging),
+            AgentRefMatch::One { id, .. } if id == "10"
+        ));
+        assert!(matches!(
+            resolve_agent_ref_on("the reviewer on staging", &runs, &staging),
+            AgentRefMatch::Ambiguous(_)
+        ));
+
+        // A fact the model dropped is held to the transcript too: "Codex" for
+        // "open the Codex agent in docs-site" opens nothing, since Vega is the
+        // agent in docs-site and Juno is not.
+        let said = "open the Codex agent in docs-site";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // A daemon's name said bare in the TRANSCRIPT is not a daemon there —
+        // it may be the command's own verb: a host called `open` does not stop
+        // "open Mercury".
+        let mut with_an_open_host = decks();
+        with_an_open_host.push(deck("deck-open", "ops@open", false));
+        let said = "open Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &agents,
+            &with_an_open_host,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{outcome:?}"
+        );
+
+        // The words that asked for the ACTION are not facts about an agent:
+        // beside an agent called Open, "open Mercury" still opens Mercury.
+        let mut with_open = agents.clone();
+        with_open.push(agent("12", Some("Open"), "pi"));
+        let said = "open Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &with_open, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{outcome:?}"
+        );
+
+        // Where the user's words settle it alone, they decide over the
+        // model's label: the newest agent is Vega whatever the model named,
+        // and a bare "open the agent" with several here is the choice.
+        let said = "open the newest agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+            "{outcome:?}"
+        );
+        let said = "open the agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Juno"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamAmbiguous { candidates, .. } if candidates.len() == agents.len()),
+            "{outcome:?}"
+        );
+        // A reference the words alone do not settle is still the model's:
+        // "show me the one fixing the scroll" answered as Juno opens Juno.
+        let said = "show me the one fixing the scroll";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Juno"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
+            "{outcome:?}"
+        );
+
+        // A task is read against the last prompt on this machine, by stem:
+        // "resizing" meets "resizes" in a prompt the model never saw.
+        let mut long_task = agent("22", Some("Sigma"), "codex");
+        long_task.last_user_prompt = Some(
+            "Fix the scroll jump when the terminal pane resizes and keep the cursor where it was before"
+                .to_string(),
+        );
+        let with_task = vec![long_task, agent("23", Some("Upsilon"), "pi")];
+        assert!(matches!(
+            resolve_agent_ref_on("the one fixing the pane resizing", &with_task, &decks()),
+            AgentRefMatch::One { id, .. } if id == "22"
+        ));
+        // A long directory name the model was shown cut with an ellipsis
+        // still resolves.
+        let mut long_named = agent("13", Some("Hydra"), "codex");
+        long_named.cwd = Some(format!("/srv/{}", "x".repeat(120)));
+        let with_long = vec![long_named, agent("14", Some("Lyra"), "codex")];
+        assert!(matches!(
+            resolve_agent_ref_on(&format!("{}\u{2026}", "x".repeat(79)), &with_long, &decks()),
+            AgentRefMatch::One { id, .. } if id == "13"
+        ));
+        // An exact word outranks a shared stem: "the one fixing the cat"
+        // reaches the cat, not the catalogue too.
+        let mut cat = agent("16", Some("Cat"), "codex");
+        cat.last_user_prompt = Some("Fix the cat".to_string());
+        let mut catalogue = agent("17", Some("Catalogue"), "codex");
+        catalogue.last_user_prompt = Some("Fix the catalogue".to_string());
+        let pets = vec![cat, catalogue];
+        assert!(matches!(
+            resolve_agent_ref_on("the one fixing the cat", &pets, &decks()),
+            AgentRefMatch::One { id, .. } if id == "16"
+        ));
+        // A control or bidi character is dropped as the model is shown it,
+        // not read as a word break.
+        let mut runner = agent("18", Some("Rho"), "codex");
+        runner.tab = DesktopTab::Mode {
+            name: "qa\u{202e}runner".to_string(),
+        };
+        assert!(matches!(
+            resolve_agent_ref_on("the qarunner agent", &[runner, agent("19", Some("Tau"), "pi")], &decks()),
+            AgentRefMatch::One { id, .. } if id == "18"
+        ));
+        // "recently" describes a task, not an order; "most recent" is one.
+        let mut heard: BTreeSet<String> = ["i", "recently", "asked"].map(str::to_string).into();
+        assert_eq!(Recency::said(&mut heard), None);
+        let mut heard: BTreeSet<String> =
+            ["the", "most", "recent", "one"].map(str::to_string).into();
+        assert_eq!(Recency::said(&mut heard), Some(Recency::Newest));
+        // The daemon these agents are on is not a fact either, even when a
+        // run here shares its name: "open the Codex agent on staging".
+        let staging_here = [VoiceDeck {
+            holds_agents: true,
+            ..deck("deck-staging", "ops@staging", false)
+        }];
+        let mut coder = agent("20", Some("Kappa"), "codex");
+        coder.cli_name = Some("codex".to_string());
+        let on_staging = vec![
+            coder,
+            in_titled_orchestration(role_agent("21", "reviewer"), "o3", "staging", "staging"),
+        ];
+        let said = "open the Codex agent on staging";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &on_staging,
+            &staging_here,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "20"),
+            "{outcome:?}"
+        );
+        // A recency word is an order, not a fact: beside an agent called
+        // "newest", "open the newest agent in billing" still opens Juno.
+        let mut with_newest = agents.clone();
+        with_newest.push(agent("15", Some("newest"), "pi"));
+        let said = "open the newest agent in billing";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "agent in billing"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &with_newest, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
+            "{outcome:?}"
+        );
+
+        // The daemon the agents ARE on is no obstacle.
+        let said = "open the Codex agent on the local deck";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: an orchestration role whose daemon reported no CLI is still
+    /// "the Codex agent" by its agent type, which the deck does not show for a
+    /// role (issue #1495).
+    #[test]
+    fn voice_outcome_a_role_is_named_by_its_agent_type() {
+        let mut coder = role_agent("7", "coder");
+        coder.agent_type = "codex".to_string();
+        let agents = vec![coder, role_agent("8", "planner")];
+        assert!(matches!(
+            resolve_agent_ref_on("the codex agent", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "7"
+        ));
+        // Claude Code is said either way.
+        assert!(matches!(
+            resolve_agent_ref_on("the claude code agent", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "8"
+        ));
+    }
+
+    /// Scenario: a reference by start time needs every candidate's start time
+    /// — an agent whose daemon reported none could be the newest, so it stays
+    /// a choice rather than a guess.
+    #[test]
+    fn voice_outcome_newest_is_a_choice_when_a_start_time_is_missing() {
+        let mut agents = facets_fleet();
+        agents[1].spawned_at_ms = None;
+        assert_eq!(
+            resolve_agent_ref_on("the newest agent", &agents, &decks()).ambiguous_labels(),
+            Some(
+                ["Mercury", "Juno", "Vega", "reviewer", "reviewer"]
+                    .map(str::to_string)
+                    .to_vec()
+            )
+        );
+    }
+
+    /// Scenario: a name the deck shows wins over the same word as a fact —
+    /// "open tester" opens the agent labelled tester even beside one started
+    /// in a mode called tester — and a bare "the agent" names every agent, so
+    /// several are a choice and one is that agent.
+    #[test]
+    fn voice_outcome_a_shown_name_outranks_a_fact_and_the_agent_is_a_category() {
+        let mut moded = agent("2", Some("Orion"), "claude_code");
+        moded.tab = DesktopTab::Mode {
+            name: "tester".to_string(),
+        };
+        let agents = vec![role_agent("1", "tester"), moded];
+        for said in ["tester", "the tester"] {
+            assert!(
+                matches!(
+                    resolve_agent_ref_on(said, &agents, &decks()),
+                    AgentRefMatch::One { id, .. } if id == "1"
+                ),
+                "{said:?}"
+            );
+        }
+        assert_eq!(
+            resolve_agent_ref_on("the agent", &agents, &decks()).ambiguous_labels(),
+            Some(vec!["tester".to_string(), "Orion".to_string()])
+        );
+        assert!(matches!(
+            resolve_agent_ref_on("the agent", &agents[..1], &decks()),
+            AgentRefMatch::One { id, .. } if id == "1"
+        ));
+        // Filler alone names nothing.
+        assert_eq!(
+            resolve_agent_ref_on("the", &agents, &decks()),
+            AgentRefMatch::None
+        );
+    }
+
+    /// Scenario: the model answers "reviewer" for "show the reviewer in the
+    /// PRD 1487 orchestration", which ties two reviewers; the user's own words
+    /// pick the one in that run (issue #1495). Words that name neither keep
+    /// the tie.
+    #[tokio::test]
+    async fn voice_outcome_the_user_s_words_break_a_tie_the_model_s_made() {
+        let agents = facets_fleet();
+        let said = "show the reviewer in the PRD 1487 orchestration";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "reviewer"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params[0].value == "agent-review-1487" && sentence == "Opening reviewer."),
+            "{outcome:?}"
+        );
+        let said = "show the reviewer";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "reviewer"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamAmbiguous { candidates, .. } if candidates.len() == 2),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: "the one fixing the scroll" names Juno, whose last prompt
+    /// was "Fix the scroll jump when the terminal pane resizes" — matched on
+    /// this machine, since the prompt is never sent to the Commands endpoint.
+    /// A task word nobody's prompt has names nobody, and a task is read only
+    /// when no name or fact matched.
+    #[test]
+    fn voice_outcome_a_task_is_matched_on_this_machine() {
+        let agents = facets_fleet();
+        for said in [
+            "the one fixing the scroll",
+            "the agent I asked to fix the scroll jump",
+            "the one working on the terminal pane resizing",
+        ] {
+            assert!(
+                matches!(resolve_agent_ref_on(said, &agents, &decks()),
+                    AgentRefMatch::One { id, .. } if id == "agent-juno"),
+                "{said:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_agent_ref_on("the one rewriting the install guide", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-vega"
+        ));
+        assert_eq!(
+            resolve_agent_ref_on("the one fixing the printer", &agents, &decks()),
+            AgentRefMatch::None
+        );
+        // A fact still outranks a task: "dispatcher" is Mercury's mode even
+        // if another agent was asked about a dispatcher.
+        let mut asked = agents.clone();
+        asked[1].last_user_prompt = Some("Review the dispatcher".to_string());
+        assert!(matches!(
+            resolve_agent_ref_on("the dispatcher", &asked, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-mercury"
+        ));
+    }
+
+    /// Scenario: "open the Claude agent" with two Claude Code agents running
+    /// (issue #1495) offers both as the numbered choice instead of refusing or
+    /// guessing.
+    #[tokio::test]
+    async fn voice_outcome_two_claude_agents_are_a_numbered_choice() {
+        let said = "open the Claude agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Claude"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &facets_fleet(), said).await;
+        let VoiceOutcome::ParamAmbiguous { candidates, .. } = &outcome else {
+            panic!("expected the numbered choice, got {outcome:?}");
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.value.as_str(), candidate.label.as_str()))
+                .collect::<Vec<_>>(),
+            [("agent-mercury", "Mercury"), ("agent-vega", "Vega")]
+        );
+    }
+
+    /// Scenario: "select", "go to" and "switch to" open an agent named by its
+    /// facts (issue #1495), and the noun decides: "select build box daemon"
+    /// still switches the daemon, and a model that sent it to `open_agent`
+    /// anyway opens nothing, since no agent is the build box.
+    #[tokio::test]
+    async fn voice_outcome_select_opens_an_agent_and_a_daemon_still_switches() {
+        let agents = facets_fleet();
+        for (said, agent, id) in [
+            ("go to the dispatcher", "dispatcher", "agent-mercury"),
+            ("switch to the Codex agent", "Codex agent", "agent-juno"),
+            ("select the newest agent", "newest agent", "agent-vega"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", agent),
+            );
+            let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                    if action == "open_agent" && params[0].value == id),
+                "{said:?}: {outcome:?}"
+            );
+        }
+
+        let said = "select build box daemon";
+        let switched = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        );
+        let outcome = run(&switched, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
+        let misrouted = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "build box"),
+        );
+        let outcome = run(&misrouted, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -8030,7 +11157,9 @@ mod tests {
     }
 
     /// Scenario: the two spoken mode switches are answered locally before the
-    /// one-shot `type` opener can turn their last word into prompt text.
+    /// one-shot `type` opener can turn their last word into prompt text, for
+    /// every phrasing of either switch (#1544 added talking, speaking and
+    /// dictate). A sentence that merely contains one reaches the model instead.
     #[tokio::test]
     async fn voice_outcome_type_on_and_off_switch_mode_without_typing_or_resolving() {
         for (said, action) in [
@@ -8038,6 +11167,16 @@ mod tests {
             ("okay, type on please", "dictation_on"),
             ("type off", "dictation_off"),
             ("please type off now", "dictation_off"),
+            ("talking on", "dictation_on"),
+            ("Start talking.", "dictation_on"),
+            ("speaking on", "dictation_on"),
+            ("start speaking", "dictation_on"),
+            ("dictate on", "dictation_on"),
+            ("talking off", "dictation_off"),
+            ("stop talking", "dictation_off"),
+            ("speaking off", "dictation_off"),
+            ("Stop speaking.", "dictation_off"),
+            ("dictate off", "dictation_off"),
         ] {
             let resolver = NoCommandsResolver;
             let answer = handle_utterance(
@@ -8059,6 +11198,32 @@ mod tests {
             );
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
         }
+        // The control: a switch phrase said in passing is not a switch, in
+        // either direction. It is the model's to answer like any sentence.
+        for said in [
+            "I was talking on the phone",
+            "we should stop talking about the release",
+        ] {
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                !matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. }
+                if action == "dictation_on" || action == "dictation_off"),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(resolver.calls(), 1, "{said} was answered locally");
+        }
     }
 
     /// Scenario: a declared dictation target keeps every utterance local to
@@ -8074,6 +11239,21 @@ mod tests {
         for (said, action, text) in [
             ("voice off", "voice_off", None),
             ("type off", "dictation_off", None),
+            ("talking off", "dictation_off", None),
+            ("Stop talking.", "dictation_off", None),
+            ("speaking off", "dictation_off", None),
+            ("stop speaking", "dictation_off", None),
+            ("dictate off", "dictation_off", None),
+            (
+                "I was talking on the phone",
+                "dictate_to_agent",
+                Some("I was talking on the phone"),
+            ),
+            (
+                "we should stop talking about the release",
+                "dictate_to_agent",
+                Some("we should stop talking about the release"),
+            ),
             ("send it", "submit_prompt", None),
             ("go ahead", "submit_prompt", None),
             ("finished", "submit_prompt", None),
@@ -8143,6 +11323,276 @@ mod tests {
                 assert_eq!(typed(&answer.outcome), text, "{said}");
             }
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    // -- PRD #1541: the typing-mode prompt commands --------------------------
+
+    /// Every phrase of each prompt-command list and the row it dispatches in
+    /// typing mode — the bare "stop" forms included, interrupting.
+    fn prompt_command_phrases() -> Vec<(&'static str, &'static str)> {
+        INTERRUPT_PHRASES
+            .iter()
+            .chain(TYPING_STOP_PHRASES.iter())
+            .map(|phrase| (*phrase, INTERRUPT_ROW))
+            .chain(
+                CLEAR_PROMPT_PHRASES
+                    .iter()
+                    .map(|phrase| (*phrase, CLEAR_PROMPT_ROW)),
+            )
+            .chain(SCRATCH_PHRASES.iter().map(|phrase| (*phrase, SCRATCH_ROW)))
+            .collect()
+    }
+
+    fn typing_target() -> VoiceDictationTarget {
+        VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        }
+    }
+
+    async fn in_typing_mode(said: &str) -> VoiceResult {
+        handle_utterance_with_dictation(
+            &NoCommandsResolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Some(&typing_target()),
+            Transcript::new(said),
+            LabelSharing::Shared,
+            true,
+        )
+        .await
+    }
+
+    /// Scenario: with typing mode on in an agent's pane, the user says each
+    /// interrupt, clear and scratch phrase alone — bare, with transcription
+    /// punctuation, and wrapped in an edge politeness word. Each dispatches its
+    /// own row with no params and nothing is typed or sent to the model.
+    #[tokio::test]
+    async fn voice_outcome_dictating_prompt_commands_dispatch_their_rows_without_resolving() {
+        for (phrase, row_id) in prompt_command_phrases() {
+            let capitalised = format!("{}{}.", phrase[..1].to_uppercase(), &phrase[1..]);
+            for said in [
+                phrase.to_string(),
+                capitalised,
+                format!("okay, {phrase}"),
+                format!("{phrase} please"),
+                format!("Okay, {phrase} now."),
+            ] {
+                let answer = in_typing_mode(&said).await;
+                let row = table().row(row_id).expect("a shipped row");
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, then_submit, .. }
+                        if action == row_id && *invoke == row.invoke && params.is_empty() && !then_submit),
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode on, a sentence that merely contains an
+    /// interrupt, clear or scratch word, or a phrase introduced by a dictation
+    /// opener ("type scratch that", "say stop"), is typed into the prompt whole
+    /// rather than run as a command.
+    #[tokio::test]
+    async fn voice_outcome_dictating_a_prompt_word_in_a_sentence_or_after_an_opener_is_typed() {
+        let mut typed_whole: Vec<String> = [
+            "we should work on the scratch feature",
+            "stop the build when tests fail",
+            "clear the cache please and then run it",
+            "interrupt the build if a test fails",
+            "delete that file and undo that change",
+            "please stop it from logging so much",
+            "scratch that idea and start over",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for (phrase, _) in prompt_command_phrases() {
+            for opener in DICTATION_OPENERS {
+                typed_whole.push(format!("{opener} {phrase}"));
+            }
+        }
+        for said in typed_whole {
+            let answer = in_typing_mode(&said).await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. } if action == DICTATE_ROW),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(typed(&answer.outcome), said, "{said}");
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, the user says an
+    /// interrupt, clear or scratch phrase (politely or not). Nothing runs, no
+    /// model is asked, and the row tells them to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_outside_typing_mode_say_typing_on_first() {
+        let outside: Vec<(&str, &str)> = prompt_command_phrases()
+            .into_iter()
+            .filter(|(phrase, _)| !TYPING_STOP_PHRASES.contains(phrase))
+            .collect();
+        assert_eq!(outside.len(), 16, "every phrase but the bare stops");
+        for (phrase, row_id) in outside {
+            for said in [phrase.to_string(), format!("okay, {phrase} please")] {
+                let answer = handle_utterance(
+                    &NoCommandsResolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(&said),
+                )
+                .await;
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::Unavailable {
+                        transcript: Transcript::new(&said),
+                        action: row_id.to_string(),
+                        hint: TYPING_MODE_FIRST_HINT.to_string(),
+                        sentence: "Say “typing on” first — interrupting, clearing and scratching \
+                                   work in typing mode."
+                            .to_string(),
+                    },
+                    "{said}"
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, a bare "stop",
+    /// "stop it" or "stop that" is not intercepted: it reaches the model as it
+    /// did before, whose `stop_agent` answer is refused as not available here.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_stop_outside_typing_mode_keeps_the_model_answer() {
+        for said in TYPING_STOP_PHRASES {
+            let resolver = CountingResolver::answering(IntentAnswer::new("stop_agent"));
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert_eq!(resolver.calls(), 1, "{said} was not asked of the model");
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                    if action == "stop_agent" && hint != TYPING_MODE_FIRST_HINT),
+                "{said}: {:?}",
+                answer.outcome
+            );
+        }
+    }
+
+    /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
+    /// or scratch phrase is not intercepted locally; it goes to the model,
+    /// and a pick of the row is refused with the row's own hint.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_on_other_screens_are_the_model_s_to_answer() {
+        for screen in [Screen::Deck, Screen::Overview] {
+            for (said, row_id) in [
+                ("interrupt", INTERRUPT_ROW),
+                ("clear the prompt", CLEAR_PROMPT_ROW),
+                ("scratch that", SCRATCH_ROW),
+            ] {
+                let resolver = CountingResolver::answering(IntentAnswer::new(row_id));
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await;
+                assert_eq!(resolver.calls(), 1, "{said} on {screen:?}");
+                let row = table().row(row_id).expect("a shipped row");
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::unavailable(Transcript::new(said), row),
+                    "{said} on {screen:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a table whose interrupt row grounds on a word the local list
+    /// does not hold, so the model can pick it in an agent's pane. The pick is
+    /// still not dispatched: the user is told to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_a_model_pick_of_a_typing_mode_row_is_never_dispatched() {
+        let source = "[[commands]]\n\
+                      id = \"interrupt_agent\"\n\
+                      invoke = \"interruptAgent\"\n\
+                      description = \"Interrupt or halt the open agent\"\n\
+                      screens = [\"agent\"]\n\
+                      unavailable_hint = \"open a pane first\"\n\
+                      report = \"Interrupted.\"\n\
+                      asks_to = \"interrupt the agent\"\n\
+                      try_saying = \"halt\"\n\
+                      heard_as = [\"halt\"]\n";
+        let parsed = CommandTable::parse(source).expect("a valid table");
+        let resolver = StubResolver::new().answering("halt", IntentAnswer::new(INTERRUPT_ROW));
+        let answer = handle_utterance(
+            &resolver,
+            &parsed,
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Transcript::new("halt"),
+        )
+        .await;
+        assert!(
+            matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                if action == INTERRUPT_ROW && hint == TYPING_MODE_FIRST_HINT),
+            "{:?}",
+            answer.outcome
+        );
+    }
+
+    /// The local paths answer exactly the rows' whole-utterance vocabularies
+    /// outside typing mode, so every utterance that could ground a model pick
+    /// of a prompt command on the agent screen is answered before the model.
+    #[test]
+    fn voice_outcome_prompt_command_grounding_is_the_local_list() {
+        for (row_id, phrases) in [
+            (INTERRUPT_ROW, &INTERRUPT_PHRASES[..]),
+            (CLEAR_PROMPT_ROW, &CLEAR_PROMPT_PHRASES[..]),
+            (SCRATCH_ROW, &SCRATCH_PHRASES[..]),
+        ] {
+            let row = table().row(row_id).expect("a shipped row");
+            assert_eq!(
+                row.grounding,
+                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
+                "{row_id}"
+            );
+            assert_eq!(row.screens, vec![Screen::Agent], "{row_id}");
+            assert!(row.params.is_empty(), "{row_id}");
+        }
+        // The bare stops ground nothing: a model pick of `interrupt_agent` for
+        // "stop" outside typing mode is refused rather than dispatched.
+        let interrupt = table().row(INTERRUPT_ROW).expect("a shipped row");
+        for said in TYPING_STOP_PHRASES {
+            assert!(!action_grounded(interrupt, said, None, None), "{said}");
         }
     }
 
@@ -8539,6 +11989,82 @@ mod tests {
         );
     }
 
+    /// Scenario: "tell it to put END after the report" is answered with the
+    /// whole sentence marked as the introduction (measured from `gpt-5-mini`);
+    /// the app finds "tell it to" in the transcript itself and types the rest.
+    /// An introduction outside that short list still types nothing when it is
+    /// marked whole.
+    #[tokio::test]
+    async fn voice_outcome_dictation_marked_whole_falls_back_to_the_introduction_said() {
+        let said = "tell it to put END after the report";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", said),
+        );
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+            panic!("expected the words typed, got {outcome:?}");
+        };
+        assert_eq!(params[0].spoken, "tell it to");
+        assert_eq!(params[0].value, "put END after the report");
+
+        let said = "I want it to put END after the report";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", said),
+        );
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_dictation_marked_past_tell_it_to_types_the_request_whole() {
+        // Measured on `gpt-5-mini` (issue #1496): "tell it to put" for this
+        // utterance, which typed "END after the report" without its verb.
+        for (said, marked, introduction, typed) in [
+            (
+                "tell it to put END after the report",
+                "tell it to put",
+                "tell it to",
+                "put END after the report",
+            ),
+            (
+                "Ask it to summarise what it just did",
+                "ask it to summarise",
+                "ask it to",
+                "summarise what it just did",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("dictate_to_agent").with_param("prefix", marked),
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+                panic!("expected the words typed, got {outcome:?}");
+            };
+            assert_eq!(params[0].spoken, introduction);
+            assert_eq!(params[0].value, typed);
+        }
+
+        // Only past an introduction ending in "to": after "tell it" the
+        // model's mark may still be introduction, and stands as marked.
+        let said = "tell it that the build is green";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "tell it that"),
+        );
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+            panic!("expected the words typed, got {outcome:?}");
+        };
+        assert_eq!(params[0].spoken, "tell it that");
+        assert_eq!(params[0].value, "the build is green");
+    }
+
     #[tokio::test]
     async fn voice_outcome_dictation_with_no_boundary_marked_types_nothing() {
         let resolver = CountingResolver::answering(IntentAnswer::new("dictate_to_agent"));
@@ -8775,6 +12301,10 @@ mod tests {
             ("submit_prompt", Screen::Agent, "go ahead"),
             ("go_to_parent", Screen::Overview, "go up one level"),
             ("go_to_parent", Screen::Overview, "cd dot dot"),
+            // Said to the New agent dialog's browser and refused as "nothing
+            // in that asks to go up a directory" while "back" was not one of
+            // the row's words.
+            ("go_to_parent", Screen::Overview, "Go back one directory."),
             (
                 "use_this_directory",
                 Screen::Overview,
@@ -9252,7 +12782,8 @@ mod tests {
     /// says "take me back to the deck" and the model answers `open_deck`
     /// anyway. It is refused as unavailable, naming the flag, rather than
     /// dispatched — and a pick the user did not ask for is still refused as
-    /// that first.
+    /// that first. A bare "go back" picked the same way closes what is on top
+    /// instead, since it names nothing the hidden screen alone is.
     #[tokio::test]
     async fn voice_outcome_refuses_the_deck_while_it_is_hidden() {
         let ask = |said: &'static str| async move {
@@ -9285,6 +12816,19 @@ mod tests {
         assert!(
             matches!(ask("open docs").await, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_deck")
         );
+        // A bare "go back" names nothing the Daemons screen alone is, and with
+        // that screen hidden it is `close`'s — which `close`'s description
+        // already says and the model was measured ignoring (issue #1495).
+        for said in ["go back", "take me back"] {
+            assert!(
+                matches!(&ask(said).await, VoiceOutcome::Dispatch { action, .. } if action == "close"),
+                "{said:?}"
+            );
+        }
+        assert!(matches!(
+            ask("back to the terminals").await,
+            VoiceOutcome::Unavailable { action, .. } if action == "open_deck"
+        ));
     }
 
     #[test]
@@ -9454,8 +12998,8 @@ mod tests {
     /// Scenario: a `switch_deck` dispatch leaves the pipeline carrying the
     /// fleet key it resolved; the app swaps in the Deck selector's token, and
     /// a key with no token becomes empty rather than passing through. The row's
-    /// Scenario: "switch to build or staging" names two decks and is offered
-    /// as a choice. Each candidate is addressed with the Deck selector's token
+    /// Scenario: "switch to the box" is answered with "box", which matches two
+    /// decks, and is offered as a choice. Each candidate is addressed with the Deck selector's token
     /// and its row's address, like a dispatch; a tie holding a deck the
     /// selector has no token for offers no choice at all, and keeps its
     /// sentence.
@@ -9484,7 +13028,7 @@ mod tests {
             }),
             _ => None,
         };
-        let mut named = switched_over(&pair, "switch to build or staging", "build").await;
+        let mut named = switched_over(&pair, "switch to the box", "box").await;
         address_deck_switch(&mut named, token);
         let VoiceOutcome::ParamAmbiguous {
             candidates,
@@ -9505,7 +13049,7 @@ mod tests {
         );
         assert_eq!(reports.len(), 2);
 
-        let mut unknown = switched_over(&pair, "switch to build or staging", "build").await;
+        let mut unknown = switched_over(&pair, "switch to the box", "box").await;
         address_deck_switch(&mut unknown, |key| {
             (key == "deck-build").then(|| VoiceDeckSelection {
                 token: "row-build".to_string(),
@@ -9671,15 +13215,15 @@ mod tests {
         .outcome
     }
 
-    /// Scenario: naming two decks for a required switch offers exactly those
-    /// deck values. Safety refusals are not ties and never carry candidates.
+    /// Scenario: a required switch whose value matches two decks offers
+    /// exactly those deck values. Safety refusals are not ties and never carry candidates.
     #[tokio::test]
     async fn voice_outcome_only_a_required_genuine_tie_offers_a_choice() {
         let pair = [
             deck("deck-build", "ops@build-box", false),
             deck("deck-staging", "ops@staging-box", false),
         ];
-        let named = switched_over(&pair, "switch to build or staging", "build").await;
+        let named = switched_over(&pair, "switch to the box", "box").await;
         let VoiceOutcome::ParamAmbiguous {
             candidates,
             matches,
@@ -9705,9 +13249,6 @@ mod tests {
             .expect("required deck param");
         assert!(!spec.optional);
         for unmet in [
-            Unmet::Contrast("not".to_string()),
-            Unmet::NotSaid,
-            Unmet::NamedOther("ops@build-box".to_string()),
             Unmet::WithheldChoice("hidden".to_string()),
             Unmet::DeckUnavailable {
                 label: "ops@build-box".to_string(),
@@ -9741,239 +13282,6 @@ mod tests {
                 .get("candidates")
                 .is_none()
         );
-    }
-
-    /// Scenario: the switch target is grounded from the transcript's side too
-    /// (PRD #1195, audit of `d57cf7d`). "Switch to the build box, not the
-    /// staging box" answered with the staging box, "the build box or the
-    /// staging box", and — with both `build` and `build-box` configured —
-    /// "switch deck to build box" answered with `build` all name more than one
-    /// deck, so each is refused with the decks named and nothing switches.
-    /// Naming exactly one deck while the model picked another is refused too.
-    /// The positive controls — the build box, "local", "this machine" — still
-    /// switch.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_dispatches_only_the_one_deck_the_transcript_names() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build", "deploy@build-box.example.com:2222", false),
-            deck("deck-staging", "deploy@staging-box.example.com", false),
-        ];
-        let overlapping = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-bare", "ops@build.example.com", false),
-            deck("deck-box", "ops@build-box.example.com", false),
-        ];
-        // Two hosts whose first components hold the same words in the other
-        // order: the model's words are all in the transcript, in the wrong
-        // order, and resolve exactly to the deck the user did NOT name.
-        let reordered = [
-            deck("deck-staging-box", "ops@staging-box.example.com", false),
-            deck("deck-box-staging", "ops@box-staging.example.com", false),
-        ];
-
-        let refused_as_several = |outcome: &VoiceOutcome, labels: &[&str]| {
-            let VoiceOutcome::ParamAmbiguous {
-                action,
-                param,
-                matches,
-                sentence,
-                ..
-            } = outcome
-            else {
-                panic!("expected a refusal naming the decks, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert_eq!(param, "deck");
-            assert_eq!(matches, &labels.to_vec(), "{sentence}");
-            assert!(
-                sentence.contains("you named more than one daemon"),
-                "{sentence}"
-            );
-        };
-
-        let negated = switched_over(
-            &staged,
-            "switch to the build box, not the staging box",
-            "staging box",
-        )
-        .await;
-        refused_as_several(
-            &negated,
-            &[
-                "deploy@build-box.example.com:2222",
-                "deploy@staging-box.example.com",
-            ],
-        );
-
-        let either = switched_over(
-            &staged,
-            "switch deck to the build box or the staging box",
-            "build box",
-        )
-        .await;
-        refused_as_several(
-            &either,
-            &[
-                "deploy@build-box.example.com:2222",
-                "deploy@staging-box.example.com",
-            ],
-        );
-
-        for spoken in ["build", "build box"] {
-            let overlap = switched_over(&overlapping, "switch deck to build box", spoken).await;
-            refused_as_several(
-                &overlap,
-                &["ops@build.example.com", "ops@build-box.example.com"],
-            );
-        }
-
-        let other =
-            switched_over(&reordered, "switch deck to the staging box", "box staging").await;
-        let VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &other
-        else {
-            panic!("the model's pick is not the deck the user named: {other:?}");
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("you named ops@staging-box.example.com"),
-            "{sentence}"
-        );
-        assert!(!sentence.contains("box staging"), "{sentence}");
-
-        for (decks, said, spoken, expected) in [
-            (
-                &staged[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build",
-            ),
-            (&staged[..], "switch deck to local", "local", "deck-local"),
-            (
-                &staged[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-            (
-                &overlapping[..],
-                "switch deck to local",
-                "local",
-                "deck-local",
-            ),
-            (
-                &reordered[..],
-                "switch deck to the staging box",
-                "staging box",
-                "deck-staging-box",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
-    /// Scenario: "switch deck to the build box" answered with the deck's full
-    /// label, `deploy@build-box.example.com:2222`, rather than the words said —
-    /// what the shipping model returns about half the time (the
-    /// `switch-deck-build-box` phrase fixture, 2026-09-29). The user's own
-    /// words named exactly that deck, so it switches. A full label for a deck
-    /// the transcript did NOT name is still refused, whether the transcript
-    /// named another deck or none.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_accepts_the_full_label_of_the_one_deck_named() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build", "deploy@build-box.example.com:2222", false),
-            deck("deck-staging", "deploy@staging-box.example.com", false),
-        ];
-        let labelled = switched_over(
-            &staged,
-            "switch deck to the build box",
-            "deploy@build-box.example.com:2222",
-        )
-        .await;
-        assert!(
-            matches!(&labelled, VoiceOutcome::Dispatch { params, .. }
-                if params[0].value == "deck-build"),
-            "{labelled:?}"
-        );
-
-        for (said, spoken) in [
-            (
-                "switch deck to the build box",
-                "deploy@staging-box.example.com",
-            ),
-            ("switch deck", "deploy@build-box.example.com:2222"),
-        ] {
-            let refused = switched_over(&staged, said, spoken).await;
-            assert!(
-                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
-                "{said} / {spoken}: {refused:?}"
-            );
-        }
-    }
-
-    /// Scenario: "switch deck to the box" with two box decks configured,
-    /// answered with one of them's full label, `deploy@build-box` — what the
-    /// shipping model returned in 12 of 20 runs of the
-    /// `switch-deck-ambiguous-box` phrase fixture (2026-09-30), which was then
-    /// refused as "I did not catch which daemon". The user's words name both
-    /// box decks, so the app asks which of the two — quoting "box", never the
-    /// model's label — exactly as it does when the model echoes "the box".
-    /// A label outside that tie, or one for a transcript that names no deck
-    /// at all, is still refused.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_asks_the_users_tie_for_a_completed_label() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box", false),
-            deck("deck-stale-box", "ci@stale-box", false),
-        ];
-        let echoed = switched_over(&staged, "switch deck to the box", "the box").await;
-        let completed = switched_over(&staged, "switch deck to the box", "deploy@build-box").await;
-        for outcome in [&echoed, &completed] {
-            let VoiceOutcome::ParamAmbiguous {
-                candidates,
-                sentence,
-                ..
-            } = outcome
-            else {
-                panic!("a tie: {outcome:?}");
-            };
-            let mut values: Vec<&str> = candidates
-                .iter()
-                .map(|candidate| candidate.value.as_str())
-                .collect();
-            values.sort_unstable();
-            assert_eq!(values, ["deck-build-box", "deck-stale-box"]);
-            assert!(!sentence.contains("deploy@build-box\u{201d}"), "{sentence}");
-        }
-        let VoiceOutcome::ParamAmbiguous {
-            sentence, spoken, ..
-        } = &completed
-        else {
-            unreachable!()
-        };
-        assert_eq!(spoken, "box");
-        assert!(sentence.contains("\u{201c}box\u{201d}"), "{sentence}");
-
-        for (said, spoken) in [
-            ("switch deck to the box", "Local deck"),
-            ("switch deck", "deploy@build-box"),
-        ] {
-            let refused = switched_over(&staged, said, spoken).await;
-            assert!(
-                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
-                "{said} / {spoken}: {refused:?}"
-            );
-        }
     }
 
     /// A remote deck called by its name in the shared deck list (issue #1426),
@@ -10072,245 +13380,6 @@ mod tests {
         }
     }
 
-    /// Scenario: the audit of `fabb83d` — with `build-box` and `staging`
-    /// configured, "switch deck to build, not staging" answered with
-    /// `staging`. "build" is only part of the build box's names, so a
-    /// complete-phrase reading of the transcript saw one deck named, the
-    /// excluded one, and switched to it. Read with the resolver's own loose
-    /// matching the transcript names both, and every contrast-shaped request
-    /// is refused; one naming a single deck beside a contrast word ("not",
-    /// "rather than", "away from") is refused too, asking for just the deck.
-    /// A partial name with no contrast ("switch to build") still switches,
-    /// as do the plain controls and a deck whose own name holds "no".
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_refuses_a_contrast_or_a_loosely_named_second_deck() {
-        let pair = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box.example.com", false),
-            deck("deck-staging", "deploy@staging.example.com", false),
-        ];
-        let single = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box.example.com", false),
-        ];
-        // A contrast word inside a configured deck's own name is that name.
-        let named_no = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-no-backup", "ops@no-backup.example.com", false),
-        ];
-        let both = [
-            "deploy@build-box.example.com".to_string(),
-            "deploy@staging.example.com".to_string(),
-        ];
-
-        for (said, spoken) in [
-            ("switch deck to build, not staging", "staging"),
-            ("switch to build not staging", "build"),
-            ("switch to staging instead of build", "staging"),
-            ("switch to staging instead of build", "build"),
-        ] {
-            let outcome = switched_over(&pair, said, spoken).await;
-            let VoiceOutcome::ParamAmbiguous {
-                action,
-                matches,
-                sentence,
-                ..
-            } = &outcome
-            else {
-                panic!("{said} / {spoken}: expected the decks named, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert_eq!(matches, &both.to_vec(), "{said}: {sentence}");
-            assert!(
-                sentence.contains("you named more than one daemon"),
-                "{sentence}"
-            );
-        }
-
-        for (said, spoken, marker) in [
-            ("switch to build, not staging", "build", "not"),
-            (
-                "switch deck to the build box rather than this one",
-                "build box",
-                "rather",
-            ),
-            ("switch away from the build box", "build box", "from"),
-            ("don't switch to the build box", "build box", "don't"),
-        ] {
-            let outcome = switched_over(&single, said, spoken).await;
-            let VoiceOutcome::ParamUnresolved {
-                action, sentence, ..
-            } = &outcome
-            else {
-                panic!("{said}: a contrast must refuse, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert!(
-                sentence.contains("say just the daemon you want"),
-                "{said}: {sentence}"
-            );
-            assert!(
-                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
-                "{said}: {sentence}"
-            );
-        }
-
-        for (decks, said, spoken, expected) in [
-            (&pair[..], "switch to build", "build", "deck-build-box"),
-            (
-                &pair[..],
-                "switch deck to staging",
-                "staging",
-                "deck-staging",
-            ),
-            (
-                &pair[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build-box",
-            ),
-            (&pair[..], "switch deck to local", "local", "deck-local"),
-            (
-                &named_no[..],
-                "switch deck to no backup",
-                "no backup",
-                "deck-no-backup",
-            ),
-            (
-                &single[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
-    /// Scenario: the audit of `a465eac` — a contrast word used to be excused
-    /// everywhere once ANY configured deck's name held it. With `no-backup`
-    /// and `no-cache` configured, "switch deck, no build box" answered with
-    /// `build box` switched to the excluded deck, and with `from-prod`
-    /// configured "switch from the build box" switched to the deck being
-    /// left. Each is refused now, as are the exclusion verbs the closed list
-    /// gained ("skip", "avoid", "leave", "without"). A contrast word inside
-    /// the one deck the user named — "no backup", "from prod" — is that
-    /// deck's name and still switches, as do the plain controls.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_excuses_a_contrast_word_only_inside_the_deck_named() {
-        let local = deck("deck-local", "Local deck", true);
-        let build = deck("deck-build-box", "deploy@build-box.example.com", false);
-        let no_backups = [
-            local.clone(),
-            build.clone(),
-            deck("deck-no-backup", "ops@no-backup.example.com", false),
-            deck("deck-no-cache", "ops@no-cache.example.com", false),
-        ];
-        let from_prod = [
-            local.clone(),
-            build.clone(),
-            deck("deck-from-prod", "ops@from-prod.example.com", false),
-        ];
-        let single = [local.clone(), build.clone()];
-
-        for (decks, said, spoken, marker) in [
-            (
-                &no_backups[..],
-                "switch deck, no build box",
-                "build box",
-                "no",
-            ),
-            (
-                &from_prod[..],
-                "switch from the build box",
-                "build box",
-                "from",
-            ),
-            (
-                &single[..],
-                "switch decks, skip the build box",
-                "build box",
-                "skip",
-            ),
-            (
-                &single[..],
-                "switch deck, avoid the build box",
-                "build box",
-                "avoid",
-            ),
-            (
-                &single[..],
-                "switch decks and leave the build box",
-                "build box",
-                "leave",
-            ),
-            (
-                &single[..],
-                "switch to anything without the build box",
-                "build box",
-                "without",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            let VoiceOutcome::ParamUnresolved {
-                action, sentence, ..
-            } = &outcome
-            else {
-                panic!("{said}: a contrast must refuse, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert!(
-                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
-                "{said}: {sentence}"
-            );
-        }
-
-        for (decks, said, spoken, expected) in [
-            (
-                &no_backups[..],
-                "switch to no backup",
-                "no backup",
-                "deck-no-backup",
-            ),
-            (
-                &from_prod[..],
-                "switch to from prod",
-                "from prod",
-                "deck-from-prod",
-            ),
-            (
-                &no_backups[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build-box",
-            ),
-            (
-                &from_prod[..],
-                "switch deck to local",
-                "local",
-                "deck-local",
-            ),
-            (
-                &single[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
     // -- the deck field and Discard (#1263, #1247) ---------------------------
 
     /// Scenario: the New agent dialog is open — with no directory chosen yet,
@@ -10346,6 +13415,87 @@ mod tests {
             matches!(&closed, VoiceOutcome::Unavailable { action, .. } if action == "choose_deck"),
             "{closed:?}"
         );
+    }
+
+    /// Scenario: the New agent dialog is open on a fleet with remote daemons
+    /// named `minipc` and `inmotion`, and the transcriber writes the user's
+    /// words the way speech-to-text does: "Daemon mini PC." (the one-word name
+    /// split in two), "Select mini PC, Demon." (a comma, and "daemon" heard as
+    /// its homophone), which the model answers with the app's selector row,
+    /// and "Daemon InMotionDeck." (the word "deck" glued onto the name). The
+    /// model answers with the listed daemon the user meant, and each chooses
+    /// it in the dialog's Daemon field.
+    #[tokio::test]
+    async fn voice_outcome_the_dialog_chooses_a_daemon_however_the_transcript_spells_its_name() {
+        let mut decks = decks();
+        for (id, label, address) in [
+            ("deck-minipc", "minipc", "ops@10.0.0.7"),
+            ("deck-inmotion", "inmotion", "ops@10.0.0.8"),
+        ] {
+            decks.push(VoiceDeck {
+                id: id.to_string(),
+                label: label.to_string(),
+                address: Some(address.to_string()),
+                local: false,
+                unavailable: None,
+                holds_agents: false,
+            });
+        }
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            for (said, answer, id) in [
+                (
+                    "Daemon mini PC.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "minipc"),
+                    "deck-minipc",
+                ),
+                (
+                    "Select mini PC, Demon.",
+                    IntentAnswer::new("switch_deck").with_param("deck", "minipc"),
+                    "deck-minipc",
+                ),
+                (
+                    "Daemon InMotionDeck.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "inmotion"),
+                    "deck-inmotion",
+                ),
+                // The model passing the glued words on as they were written
+                // (issue #1496).
+                (
+                    "Daemon InMotionDeck.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "InMotionDeck"),
+                    "deck-inmotion",
+                ),
+                (
+                    "Daemon BuildBoxDeck.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "BuildBoxDeck"),
+                    "deck-build",
+                ),
+                (
+                    "Daemon DeckMiniPC.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "DeckMiniPC"),
+                    "deck-minipc",
+                ),
+            ] {
+                let resolver = StubResolver::new().answering(said, answer);
+                let outcome = handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    Some(&declared),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { invoke, params, .. }
+                        if invoke == "chooseNewAgentDeck" && params[0].value == id),
+                    "{said}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: the New agent dialog is open and the user says "use the build
@@ -10960,33 +14110,6 @@ mod tests {
             matches!(&destination, VoiceOutcome::Dispatch { invoke, params, .. }
                 if invoke == "switchDeck" && params[0].value == "deck-daemon"),
             "{destination:?}"
-        );
-        // Control: said as the selector's heading, before a destination that
-        // names no daemon, it is not the destination — a model reading it as
-        // the deck is refused.
-        let heading = ask(
-            "switch daemon to deck",
-            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
-            Screen::Deck,
-            false,
-        )
-        .await;
-        assert!(
-            !matches!(&heading, VoiceOutcome::Dispatch { .. }),
-            "{heading:?}"
-        );
-        // Control: beside another word that could be a name, "daemon" is the
-        // selector's heading, so a model reading it as the deck is refused.
-        let other = ask(
-            "switch daemon to the ghost box",
-            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
-            Screen::Deck,
-            false,
-        )
-        .await;
-        assert!(
-            !matches!(&other, VoiceOutcome::Dispatch { .. }),
-            "{other:?}"
         );
         // Control: the category phrase is not the host's name said whole.
         let vague = ask(

@@ -191,6 +191,8 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -214,6 +216,8 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             agent_type: Some(AgentType::Codex),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -237,6 +241,8 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -439,6 +445,8 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -498,11 +506,13 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -537,7 +547,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         },
     )
     .await;
@@ -556,7 +566,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         })
     );
     server.registry.shutdown_all();
@@ -590,6 +600,8 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -702,6 +714,8 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -732,6 +746,8 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -763,8 +779,10 @@ fn agent_record_round_trips_explicit_agent_type() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -788,8 +806,10 @@ fn agent_record_omits_agent_type_when_none() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -912,8 +932,10 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -927,8 +949,10 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);
@@ -1011,6 +1035,8 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 authoring_kind: None,
+                client_seeded_kind: None,
+                remember_command: false,
             },
         )
         .await;
@@ -1644,7 +1670,7 @@ fn prepared_start_payload(
                 is_start_role,
                 orchestration_cwd: cwd.map(str::to_string),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }
         }),
         agent_type: None,
@@ -2296,7 +2322,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
                     is_start_role: true,
                     orchestration_cwd: Some(prepared.path.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
                 ..StartAgentOptions::default()
             },
@@ -2652,6 +2678,38 @@ async fn hello_advertises_the_project_capabilities() {
     );
 }
 
+/// PRD #1487: the live `Hello` reply names the daemon process, the same on
+/// every connection to it — an upgrade tells the old daemon from its
+/// successor by it.
+#[tokio::test]
+async fn hello_names_the_daemon_process() {
+    let server = start_server().await;
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::Hello {
+                client_version: PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(resp.ok);
+        seen.push(
+            resp.instance_id
+                .expect("Hello must name the daemon process"),
+        );
+    }
+    assert_eq!(seen[0], seen[1], "one process, one identity");
+    assert_eq!(seen[0].len(), 32, "{:?}", seen[0]);
+    assert_eq!(
+        Some(seen[0].as_str()),
+        dot_agent_deck::daemon_protocol::daemon_instance_id()
+    );
+}
+
 #[tokio::test]
 async fn wrong_first_frame_kind_returns_err() {
     let server = start_server().await;
@@ -2695,7 +2753,9 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
 
 /// Scenario: Queue prompts for paned agents, then omit or replace their agent or
 /// logical-session identity before delivery. The daemon must fail closed without
-/// writing, while exact identities and genuinely sessionless agents still deliver.
+/// writing — naming the current conversation when the request named none — while
+/// exact identities, a retry naming that conversation, and genuinely sessionless
+/// agents still deliver.
 #[spec("prompt/pane-input/009")]
 #[test]
 fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
@@ -2797,6 +2857,9 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             Some(SendResult::WrongSession | SendResult::Stale)
         ) && !old_prompt_reached_new_session;
         let same_agent_result = response.send_result;
+        // Issue #621: a `stale` for a request that NAMED a session is a lost
+        // target, so it names no generation to rebind to.
+        let same_agent_offered = response.current_session_id;
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
@@ -2896,18 +2959,22 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             Duration::from_millis(750),
         )
         .await;
-        let matching_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "current-required-session",
-                "delivery_id": "matching-identity-009"
-            }),
-        )
-        .await;
+        // Issue #621: the refusal names the generation it was refused against,
+        // and the retry names exactly that — the round trip a caller whose
+        // event stream dropped the `SessionStart` depends on, since it has no
+        // other source for the value.
+        let refused_against = unnamed_response.current_session_id.clone();
+        let mut matching_request = serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
+            "expected_agent_id": agent_id,
+            "delivery_id": "matching-identity-009"
+        });
+        if let Some(generation) = &refused_against {
+            matching_request["expected_session_id"] = serde_json::json!(generation);
+        }
+        let matching_response = issue_json_request(&server, matching_request).await;
         let matching_identity_reached = stream_contains_within(
             &mut attached,
             b"MATCHING-IDENTITY-DELIVERED",
@@ -2919,6 +2986,10 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             unnamed_session_leaked,
             matching_response.send_result,
             matching_identity_reached,
+        );
+        let offered_generations = (
+            refused_against,
+            matching_response.current_session_id.clone(),
         );
         server.registry.close_agent(&agent_id).unwrap();
 
@@ -2973,6 +3044,7 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                 .windows(unattached_marker.len())
                 .any(|window| window == unattached_marker),
         );
+        let unattached_offered = unattached_response.current_session_id.clone();
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
@@ -3016,6 +3088,19 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,
             missing_session_result
+        );
+        // Issue #621: an unnamed request refused `stale` is told the generation
+        // it was refused against, attached or not; a delivered request and a
+        // named-but-lost one are told nothing.
+        assert_eq!(
+            (offered_generations, unattached_offered, same_agent_offered),
+            (
+                (Some("current-required-session".to_string()), None),
+                Some("unattached-current-session".to_string()),
+                None,
+            ),
+            "a `stale` refusal of an unnamed request must name the pane's current generation, \
+             and nothing else may carry one"
         );
     });
 }
@@ -3405,6 +3490,175 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 && end_observation.0 == Some(SendResult::Applied)
                 && end_observation.1,
             "late prior-generation events must not restore or clear the current guarded-send generation; activity={activity_observation:?}, end={end_observation:?}"
+        );
+    });
+}
+
+/// Scenario: A wrapped Codex pane carries two producers under one agent id — the `dot-agent-deck wrap` host reporting under `<pane>-session` and Codex's native hooks under their own session. After Codex announces its conversation, the wrapper keeps reporting ordinary frames; a guarded prompt naming Codex's conversation must still be delivered. Only a genuine new `SessionStart` (a `/clear`) moves the pane, after which the old conversation's prompt is refused with no bytes and the new one's is delivered.
+#[spec("prompt/pane-input/043")]
+#[test]
+fn pane_input_043_second_producer_ordinary_frames_do_not_move_generation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wrapped-pane generation runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-wrapped-codex";
+        // What `dot-agent-deck wrap` names its own events on a managed pane
+        // (`wrap::session_id_for`).
+        let wrapper_session = format!("{pane_id}-session");
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let now = chrono::Utc::now();
+        let at = |secs: i64| now + chrono::Duration::seconds(secs);
+        let event = |session_id: &str, event_type, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            // The wrapper's fork-time start, then its stdout classifier reporting
+            // the child as busy, both under the wrapper's own session id.
+            let mut fork = event(&wrapper_session, EventType::SessionStart, at(0));
+            fork.metadata.insert(
+                dot_agent_deck::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                dot_agent_deck::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+            state.apply_event(fork);
+            state.apply_event(event(&wrapper_session, EventType::Thinking, at(1)));
+            // Codex's native hooks announce the conversation.
+            state.apply_event(event("codex-native", EventType::SessionStart, at(2)));
+            state.apply_event(event("codex-native", EventType::ToolStart, at(3)));
+            // The wrapper keeps reporting what it sees on stdout. These frames
+            // are NEWER than anything Codex has sent and name a different
+            // session, but they announce nothing.
+            state.apply_event(event(&wrapper_session, EventType::Thinking, at(4)));
+            state.apply_event(event(&wrapper_session, EventType::Idle, at(5)));
+        }
+        let generation_after_wrapper_frames = server
+            .state
+            .read()
+            .await
+            .pane_hook_session_id(pane_id);
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let to_conversation = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'WRAPPED-PANE-PROMPT-DELIVERED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native",
+                "delivery_id": "wrapped-pane-current"
+            }),
+        )
+        .await;
+        let (delivered, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"WRAPPED-PANE-PROMPT-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+
+        // Control: a GENUINE new conversation (a `/clear`) still moves the pane,
+        // so the guard keeps refusing the conversation that is over.
+        server.state.write().await.apply_event(event(
+            "codex-native-cleared",
+            EventType::SessionStart,
+            at(6),
+        ));
+        server.state.write().await.apply_event(event(
+            &wrapper_session,
+            EventType::Thinking,
+            at(7),
+        ));
+        let generation_after_clear = server
+            .state
+            .read()
+            .await
+            .pane_hook_session_id(pane_id);
+        let stale = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'CLEARED-CONVERSATION-PROMPT-LEAKED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native",
+                "delivery_id": "wrapped-pane-stale"
+            }),
+        )
+        .await;
+        let (stale_leaked, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"CLEARED-CONVERSATION-PROMPT-LEAKED",
+            Duration::from_millis(500),
+        )
+        .await;
+        let to_successor = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'SUCCESSOR-PROMPT-DELIVERED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native-cleared",
+                "delivery_id": "wrapped-pane-successor"
+            }),
+        )
+        .await;
+        let (successor_delivered, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"SUCCESSOR-PROMPT-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert_eq!(
+            (
+                generation_after_wrapper_frames.as_deref(),
+                to_conversation.send_result,
+                delivered,
+            ),
+            (Some("codex-native"), Some(SendResult::Applied), true),
+            "the wrapper's ordinary frames must not take the pane off the conversation Codex announced, \
+             so a prompt naming that conversation is delivered (issue #532)"
+        );
+        assert_eq!(
+            generation_after_clear.as_deref(),
+            Some("codex-native-cleared"),
+            "the control: a genuine SessionStart still moves the pane, and the wrapper frame after it \
+             does not move it back"
+        );
+        assert!(
+            !matches!(
+                stale.send_result,
+                Some(SendResult::Applied | SendResult::Queued)
+            ) && !stale_leaked
+                && to_successor.send_result == Some(SendResult::Applied)
+                && successor_delivered,
+            "after a genuine new conversation the old one's prompt is refused with no bytes and the \
+             new one's is delivered; stale={:?} leaked={stale_leaked}, successor={:?} delivered={successor_delivered}",
+            stale.send_result,
+            to_successor.send_result
         );
     });
 }
@@ -4292,6 +4546,8 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -4958,4 +5214,139 @@ async fn registry_resize_clamps_oversized_cols() {
 #[tokio::test]
 async fn registry_resize_clamps_both() {
     assert_resize_clamps(u16::MAX, u16::MAX, 4096, 4096).await;
+}
+
+/// Issue #1396 item 2: a plain `start-agent` whose `cwd` is not a directory —
+/// a regular file, or a path that does not exist — is refused, and nothing is
+/// spawned. portable-pty's `as_command` replaces such a cwd with `$HOME`
+/// without a word, so before this the agent was started in the home directory
+/// and the deck recorded the path the caller asked for. `HOME` is pinned to a
+/// sandbox directory through the request's own env, which is the value that
+/// fallback reads, so a regression shows up as a marker there instead of in
+/// the developer's real home.
+#[tokio::test]
+async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
+    let server = start_server().await;
+    let sandbox = test_temp::tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    let file = sandbox.path().join("a-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let missing = sandbox.path().join("missing");
+
+    let start = |cwd: &Path| AttachRequest::StartAgent {
+        command: Some("echo x > marker".into()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("SHELL".into(), "/bin/sh".into()),
+        ],
+        tab_membership: None,
+        agent_type: None,
+        seed: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
+    };
+
+    for (what, cwd) in [("a regular file", &file), ("a missing path", &missing)] {
+        let spawned_before = server.registry.agent_records().len();
+        let mut stream = UnixStream::connect(&server.path).await.unwrap();
+        write_request(&mut stream, &start(cwd)).await;
+        let resp = read_response(&mut stream).await;
+        // A served start runs its command asynchronously; give `echo` the time
+        // it needs before looking for where it ran.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !home.join("marker").exists(),
+            "{what}: the agent was started in $HOME instead of being refused; response = {resp:?}"
+        );
+        assert!(
+            !resp.ok && resp.id.is_none(),
+            "{what}: a start-agent whose cwd is not a directory must be refused; response = {resp:?}"
+        );
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.contains("not a directory"),
+            "{what}: the refusal must say why: {error:?}"
+        );
+        assert_eq!(
+            server.registry.agent_records().len(),
+            spawned_before,
+            "{what}: a refused start-agent must not have spawned a pane"
+        );
+    }
+
+    // Control: the same request with a real directory is served, and runs there.
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &start(&project)).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        resp.ok,
+        "control: a directory cwd must be served: {:?}",
+        resp.error
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !project.join("marker").exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        project.join("marker").exists(),
+        "control: the agent must have run in the requested directory"
+    );
+    assert!(!home.join("marker").exists());
+
+    // A pane a prepared start created, re-created by a plain `start-agent`
+    // after its project directory was deleted (agent review, PR #1557): the same
+    // not-a-directory refusal, not the stale-preparation one. "Prepare again" is
+    // the remedy for a directory that was REPLACED; for one that is gone it
+    // would only send the user round the loop.
+    const PANE: &str = "prepared-deleted-1396";
+    let prepared = sandbox.path().join("prepared");
+    std::fs::create_dir(&prepared).unwrap();
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&prepared).unwrap();
+    let prepared_id = server
+        .registry
+        .spawn_agent_in(
+            dot_agent_deck::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(prepared.to_str().unwrap()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+                ..Default::default()
+            },
+            &verified,
+        )
+        .unwrap();
+    drop(verified);
+    server.registry.close_agent(&prepared_id).unwrap();
+    std::fs::remove_dir(&prepared).unwrap();
+
+    let mut request = start(&prepared);
+    if let AttachRequest::StartAgent { env, .. } = &mut request {
+        env.push(("DOT_AGENT_DECK_PANE_ID".into(), PANE.into()));
+    }
+    let spawned_before = server.registry.agent_records().len();
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &request).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        !resp.ok && resp.id.is_none(),
+        "a prepared pane whose directory was deleted must be refused; response = {resp:?}"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(&format!(
+            "{}:",
+            dot_agent_deck::daemon_protocol::START_ERR_CWD_NOT_A_DIRECTORY
+        )),
+        "a deleted prepared directory gets the not-a-directory refusal, not a stale-preparation \
+         one: {error:?}"
+    );
+    assert_eq!(server.registry.agent_records().len(), spawned_before);
+    server.registry.shutdown_all();
 }

@@ -174,6 +174,82 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
   });
 });
 
+/// Scenario: in a shell agent's pane, with another window in front of the app,
+/// press on a printed line in the terminal — the press that brings the window
+/// to the front — and drag across the line, and find exactly that line
+/// selected. First with the deck alone, where coming to the front changes
+/// nothing; then with a stand-in TUI on the same agent that the person used
+/// last, so coming to the front resizes the agent to the window's own pane
+/// while the button is still down, and the drag must keep its selection anyway.
+test("terminal_003 a drag that starts with the press focusing the window keeps its selection", async () => {
+  const command = "bash --noprofile --norc";
+  await withDeck("terminal_003", { daemonFirst: true, defaultCommand: command }, async (deck) => {
+    await deck.element(connected, "the deck group to report connected");
+    const input = await openShellPane(deck);
+    await deck.traceTerminals();
+    const [agent] = await deck.daemonAgents();
+    // The grid the pane fits, once the daemon has applied it: off the agent's
+    // spawn size, 80x24, which every pane in this window is larger than, and
+    // then still. The settle alone is not enough. The pane's own size has
+    // reached the daemon 1.9-2.0s after the attach, measured on a runner and
+    // locally, so a settle can finish at the spawn size and the control below
+    // would then see that late resize rather than none (PR #1505's first three
+    // CI runs).
+    await waitFor("the daemon to apply the pane's own size", async () => {
+      const [grid] = await deck.grids();
+      return grid !== undefined && !(grid[0] === 80 && grid[1] === 24);
+    });
+    await deck.gridSettled();
+    const [own] = await deck.grids();
+
+    // The control: the same gesture when coming to the front resizes nothing,
+    // because the window is the only client and already the one sized for.
+    await deck.session.type(input, `echo dad-alone-$((6*7))-ok${ENTER}`);
+    await deck.setWindowFocus(false);
+    await dragFocusingTheWindow(deck, "dad-alone-42-ok");
+    assert.deepEqual((await deck.grids())[0], own, "coming to the front resized the grid with no other client");
+
+    // A TUI the person used last, smaller than the pane, so it sizes the agent.
+    await deck.setWindowFocus(false);
+    const tui = await deck.standInClient(agent.agent_id, 12, 70);
+    try {
+      await waitFor("the grid to take the stand-in TUI's size", async () => {
+        const [cols, rows] = (await deck.grids())[0];
+        return cols === 70 && rows === 12;
+      });
+      await deck.session.type(input, `echo dad-front-$((6*7))-ok${ENTER}`);
+      await dragFocusingTheWindow(deck, "dad-front-42-ok", own);
+    } finally {
+      tui.close();
+    }
+  });
+});
+
+/**
+ * Issue #1457 — press on the row whose text is exactly `text`, bring the window
+ * to the front while the button is held, finish the drag across that row and
+ * wait for xterm to hold it as the selection. With `resizedTo`, the focus-in
+ * must resize the grid to that `[cols, rows]` before the drag finishes, and the
+ * drag ends on the row where it now is, which is where a person's pointer
+ * would follow it.
+ */
+async function dragFocusingTheWindow(deck: Deck, text: string, resizedTo?: [number, number]): Promise<void> {
+  const start = await waitFor(`${text} on its own row`, () => deck.rowSpan(text));
+  await deck.session.pressAt(start.from);
+  await deck.setWindowFocus(true);
+  if (resizedTo) {
+    await waitFor(`the window's focus claim to resize the grid to ${resizedTo.join("x")}`, async () => {
+      const [cols, rows] = (await deck.grids())[0];
+      return cols === resizedTo[0] && rows === resizedTo[1];
+    });
+  }
+  const end = await waitFor(`${text} on its own row after the focus-in`, () => deck.rowSpan(text));
+  await deck.session.releaseAt(end.to);
+  await waitFor(`the drag to select ${text}`, () => deck.hasSelection(text), 15_000).catch(async (error: Error) => {
+    throw new Error(`${error.message}; xterm holds ${JSON.stringify(await deck.selections())}`);
+  });
+}
+
 /** Start `default_command` from New agent and return its pane's enabled xterm input, at the shell's first prompt. */
 async function openShellPane(deck: Deck): Promise<Element> {
   await deck.session.click(await deck.element('[data-testid="overview-new-agent"]'));

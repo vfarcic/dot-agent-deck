@@ -713,10 +713,10 @@ fn run_signal_case(
     );
 
     // The wrapper is our own child, so detect its exit by reaping it through the
-    // owned handle rather than probing by pid: common::process_running() cannot see
-    // a zombie on non-Linux (its kill(pid, 0) fallback treats an exited-but-unreaped
-    // pid as alive), so on macOS an exited-but-unreaped wrapper looks like it never
-    // exited. try_wait() reaps the wrapper and reports its exit portably.
+    // owned handle rather than probing by pid: try_wait() reaps the wrapper and
+    // reports its exit portably. Until issue #1565, common::process_running()
+    // could not see a zombie on macOS (its kill(pid, 0) fallback treated an
+    // exited-but-unreaped pid as alive), which is what this once misread.
     let wrapper_exited = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -789,9 +789,9 @@ fn codex_wrap_004_termination_signals_reap_children_on_every_path() {
 fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     let fixture = common::harness_tempdir().expect("create lifetime backstop fixture");
     let pid_path = fixture.path().join("child.pid");
-    // Held for the whole test: the wrapper's descriptors must stay valid while it
-    // runs, and (see the KNOWN PLATFORM GAP note below) releasing it early made no
-    // difference to the macOS behaviour anyway.
+    // Held for the whole test, as a live terminal would be: the wrapper must exit
+    // on its own once the backstop has taken its child down, not because its
+    // outer terminal went away.
     let (_master, slave) = open_pty();
     let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args([
@@ -834,64 +834,73 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     let child_pid = read_child_pid().expect("child pid recorded");
 
     // Two SEPARATE properties, waited on child-first so a failure says which one
-    // broke. The first draft used one 15 s budget and waited on the wrapper
-    // first; when that tripped on a macOS runner the message accused the backstop
-    // of never firing, while the child had in fact already been killed — the
-    // backstop HAD worked and only the wrapper's own teardown was still
-    // finishing. That is precisely the "one message for two unrelated causes"
-    // trap this branch fixes in `auto-reattach`; do not reintroduce it here.
+    // broke — one message for two unrelated causes is the trap #396 fixed in
+    // `auto-reattach`; do not reintroduce it here.
     //
     // 1. The child is dead — the backstop's actual contract: the watchdog fired,
     //    the reap loop forwarded SIGTERM and, since this child traps TERM,
     //    escalated to SIGKILL. Bounded by the 1 s cap + up to ~1 s of watchdog
     //    poll + the reap loop's 50 ms tick + WRAP_TERMINATE_GRACE (1.5 s).
-    // 2. KNOWN PLATFORM GAP — deliberately observed, not asserted. On macOS the
-    //    wrapper PROCESS does not exit after its child dies here: three CI runs
-    //    held on past 60 s with the child already reaped, both while this test
-    //    kept the outer PTY master open and after it was dropped between the two
-    //    waits. On Linux it exits in well under a second.
-    //
-    //    Not asserted because (a) no test asserted wrapper exit on ANY platform
-    //    before this one, so declining to gate on it removes no existing
-    //    coverage, and (b) the arithmetic teardown path is bounded — the stdin
-    //    pump is spawned detached and never joined, and the redirected-output
-    //    tees are `None` when all three descriptors are a tty — so the real cause
-    //    is something only reproducible on macOS, which no amount of adjusting
-    //    this test will establish.
-    //
-    //    Consequence to be honest about: on macOS the backstop removes the
-    //    expensive half of the leak (the child, which is what burned CPU in the
-    //    incident) but may leave the wrapper process itself behind. On Linux both
-    //    go. Worth a follow-up issue against the wrap teardown, NOT worth
-    //    blocking a Linux-verified leak fix.
     let child_gone = common::wait_until(Duration::from_secs(30), || {
         !common::process_running(child_pid)
     });
 
-    let wrapper_pid = wrapper.id() as libc::pid_t;
-
-    // Never leak this test's own probes, whatever the outcome above.
-    for pid in [child_pid, wrapper_pid] {
-        if common::process_running(pid) {
-            // SAFETY: best-effort cleanup of pids this test created. A
-            // `process_running` check followed by a signal is check-then-act:
-            // between the two the pid could in principle be reaped and reissued,
-            // so this is a bounded same-UID residual rather than a guarantee it
-            // only ever reaches its own probes. Unix permission checks rule out
-            // touching another user; closing the window entirely would need an
-            // OS-owned container (a cgroup), not a revalidated number.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
+    // 2. The wrapper then exits, so nothing is left at PID 1. Its teardown adds
+    //    the bounded post-exit drain (a 300 ms settle, then up to
+    //    AGENT_TERMINATE_GRACE, then a 500 ms final wait), so the arithmetic
+    //    worst case is a few seconds; the budget sits far above that because the
+    //    failure worth catching is "never exits".
+    //
+    //    Detected by reaping through the owned `Child` (issue #397). The wrapper
+    //    is this test's own child, so once it exits it stays a zombie until
+    //    reaped, and until issue #1565 `common::process_running(wrapper_pid)`
+    //    fell back off Linux to a `kill(pid, 0)` probe that reports a zombie as
+    //    alive. #396 asserted it that way, read the result on macOS as "the
+    //    wrapper never exits", and dropped the assertion; it was the same misread
+    //    `codex_wrap_004` had already been fixed for. Measured on a macOS runner
+    //    for #397: the wrapper had already exited by the time its child was seen
+    //    gone, while that probe still read it as running 15 s later.
+    let wrapper_exited = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match wrapper.try_wait() {
+                Ok(Some(_)) => break true,
+                Err(_) => break false,
+                Ok(None) if Instant::now() >= deadline => break false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
+    };
+
+    // Never leak this test's own probes, whatever the outcome above.
+    if common::process_running(child_pid) {
+        // SAFETY: best-effort cleanup of the pid this test's wrapper recorded. A
+        // `process_running` check followed by a signal is check-then-act:
+        // between the two the pid could in principle be reaped and reissued,
+        // so this is a bounded same-UID residual rather than a guarantee it
+        // only ever reaches its own probe. Unix permission checks rule out
+        // touching another user; closing the window entirely would need an
+        // OS-owned container (a cgroup), not a revalidated number.
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+        }
     }
-    let _ = wrapper.wait();
+    // The wrapper is ended through its owned handle, which cannot reach a reissued
+    // pid: until `wait` reaps it, the number stays ours.
+    if !wrapper_exited {
+        terminate(&mut wrapper);
+    }
 
     assert!(
         child_gone,
         "the backstop never took the child down — either the watchdog did not \
          fire, or the reap loop never escalated past the SIGTERM this child \
          ignores. This is the three-day leak the backstop exists to prevent."
+    );
+    assert!(
+        wrapper_exited,
+        "the backstop killed the child but the WRAPPER never exited, so it would \
+         still be left behind at PID 1."
     );
 }
 

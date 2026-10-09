@@ -87,6 +87,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "dashboard-filter",
+        description: "The desktop Dashboard across two daemons, filtered to working agents, with the filter line and Show all.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "new-agent",
         description: "The New Agent form with a project directory selected.",
         clients: &[Client::Tui, Client::Desktop],
@@ -104,6 +109,11 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "settings-daemons",
         description: "Desktop Daemons settings with one remote configured.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "daemon-upgrade",
+        description: "The desktop Upgrade dialog for a remote daemon on an older release, stopped at the restart question that names the agents a restart would stop, with Keep current daemon and Restart now.",
         clients: &[Client::Desktop],
     },
     Scenario {

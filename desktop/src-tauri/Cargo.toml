@@ -48,9 +48,12 @@ toml_edit = { version = "0.25", features = ["serde"] }
 # is now empty, so the feature goes with it rather than sitting here as a
 # capability nothing uses.
 #
-# `rt` is `spawn_blocking`. Three callers, none of them voice: the two endpoint
-# probes in `endpoint_test.rs` and the tunnel open in `endpoint_tunnels.rs`,
-# all of which are blocking by nature and must not run on a runtime thread.
+# `rt` is `spawn_blocking`. Four callers of `tokio::task::spawn_blocking`: the
+# two endpoint probes in `endpoint_test.rs` and the tunnel open in
+# `endpoint_tunnels.rs`, all of which are blocking by nature and must not run
+# on a runtime thread; and, since issue #1450, the voice check in
+# `voice/transcribe.rs`'s `handle_audio`, which is CPU work over a whole
+# utterance rather than blocking I/O, for the same reason.
 #
 # It adds no dependency and no line of new code to the workspace build: the
 # root package already declares `tokio` with `full`, so this was reachable here
@@ -210,6 +213,20 @@ getrandom = "0.4"
 # version actually built, and Renovate moves it within that range once a
 # release has cleared the four days `renovate.json` holds a Tauri crate.
 tauri-plugin-clipboard-manager = "2.3.3"
+# Issue #1450: whether a finished voice segment holds a human voice at all,
+# asked before any Speech backend is called (`voice/human_voice.rs`). A
+# breath, a cough, a knock or a beep clears the level-and-density audio gate,
+# and a Whisper-family model answers it with a training artefact that typing
+# mode then types into an agent's prompt.
+#
+# A trained voice-activity model, and the one that fits this file's rule for
+# what a dependency here may cost (the `cpal` entry above): pure Rust, no
+# dependency of its own, no build script, no C/C++ toolchain and no inference
+# runtime — the network is 40 KiB of weights compiled into the binary.
+# MIT OR Apache-2.0. One lockfile entry. Optimised in debug builds by the
+# workspace's `[profile.dev.package.earshot]`, or every dev-build utterance
+# and every test that scores one pays seconds for it.
+earshot = "1.2.2"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket

@@ -27,19 +27,69 @@ pub struct PendingSubmit {
     state: PendingSubmitState,
 }
 
+/// Issue #621: a finished write-and-submit — its outcome, and on a `stale`
+/// refusal of a request that named no session, the hook-session generation the
+/// daemon refused it against
+/// ([`crate::daemon_client::GuardedSendReply::current_session_id`]). A
+/// controller that does not talk to a daemon never has one.
+#[derive(Debug)]
+pub struct SubmitReply {
+    pub result: Result<crate::event::SendResult, PaneError>,
+    pub current_session_id: Option<String>,
+    /// For a failed submit, whether it could nonetheless have written — see
+    /// [`crate::daemon_client::GuardedSendFailure`]. A controller that cannot
+    /// tell says so by leaving it `true` for every error, which is what the
+    /// `From` conversion does; it is never consulted for an `Ok`.
+    pub may_have_written: bool,
+}
+
+impl From<Result<crate::event::SendResult, PaneError>> for SubmitReply {
+    fn from(result: Result<crate::event::SendResult, PaneError>) -> Self {
+        Self {
+            may_have_written: result.is_err(),
+            result,
+            current_session_id: None,
+        }
+    }
+}
+
 /// The sending half of [`PendingSubmit::channel`].
-pub type PendingSubmitSender = std::sync::mpsc::Sender<Result<crate::event::SendResult, PaneError>>;
+#[derive(Clone)]
+pub struct PendingSubmitSender(std::sync::mpsc::Sender<SubmitReply>);
+
+impl PendingSubmitSender {
+    /// Finish the submit with `outcome` and no refused generation.
+    pub fn send(
+        &self,
+        outcome: Result<crate::event::SendResult, PaneError>,
+    ) -> Result<(), std::sync::mpsc::SendError<SubmitReply>> {
+        self.send_reply(outcome.into())
+    }
+
+    /// Finish the submit with its whole reply (issue #621).
+    pub fn send_reply(
+        &self,
+        reply: SubmitReply,
+    ) -> Result<(), std::sync::mpsc::SendError<SubmitReply>> {
+        self.0.send(reply)
+    }
+}
 
 enum PendingSubmitState {
-    Ready(Option<Result<crate::event::SendResult, PaneError>>),
-    Waiting(std::sync::mpsc::Receiver<Result<crate::event::SendResult, PaneError>>),
+    Ready(Option<SubmitReply>),
+    Waiting(std::sync::mpsc::Receiver<SubmitReply>),
 }
 
 impl PendingSubmit {
     /// A submit that has already finished.
     pub fn ready(result: Result<crate::event::SendResult, PaneError>) -> Self {
+        Self::ready_reply(result.into())
+    }
+
+    /// A submit that has already finished, with its whole reply (issue #621).
+    pub fn ready_reply(reply: SubmitReply) -> Self {
         Self {
-            state: PendingSubmitState::Ready(Some(result)),
+            state: PendingSubmitState::Ready(Some(reply)),
         }
     }
 
@@ -47,7 +97,7 @@ impl PendingSubmit {
     pub fn channel() -> (PendingSubmitSender, Self) {
         let (tx, rx) = std::sync::mpsc::channel();
         (
-            tx,
+            PendingSubmitSender(tx),
             Self {
                 state: PendingSubmitState::Waiting(rx),
             },
@@ -59,18 +109,24 @@ impl PendingSubmit {
     /// task running the submit ended early) reads as a failed submit, so a
     /// caller never waits on one forever.
     pub fn poll(&mut self) -> Option<Result<crate::event::SendResult, PaneError>> {
-        let outcome = match &mut self.state {
-            PendingSubmitState::Ready(outcome) => return outcome.take(),
+        self.poll_reply().map(|reply| reply.result)
+    }
+
+    /// [`Self::poll`], keeping the whole reply (issue #621).
+    pub fn poll_reply(&mut self) -> Option<SubmitReply> {
+        let reply = match &mut self.state {
+            PendingSubmitState::Ready(reply) => return reply.take(),
             PendingSubmitState::Waiting(rx) => match rx.try_recv() {
-                Ok(outcome) => outcome,
+                Ok(reply) => reply,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(PaneError::CommandFailed(
                     "write_and_submit: the submit ended without an outcome".to_string(),
-                )),
+                ))
+                .into(),
             },
         };
         self.state = PendingSubmitState::Ready(None);
-        Some(outcome)
+        Some(reply)
     }
 }
 
@@ -318,6 +374,17 @@ pub struct AgentSpawnOptions<'a> {
     /// into the PTY. Set only for a Pi start-role (orchestrator) pane; `None`
     /// for every other pane, which keeps the unchanged PTY-injection path.
     pub seed: Option<String>,
+    /// Issue #1540: this start was submitted from the New agent form, so the
+    /// deck may remember its command as the form's next pre-fill. `false` for
+    /// every other start — orchestration roles, restores and anything else —
+    /// so none of them ever becomes the deck's last command.
+    pub remember_command: bool,
+    /// Issue #1496: the authoring kind of a New agent form start whose seed
+    /// the TUI delivers itself (a `schedule`, `schedule: issues` or
+    /// `dispatcher` card), so the daemon records it on the agent. Read only
+    /// with `remember_command`, the form start it belongs to; `None` for every
+    /// other start.
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -332,6 +399,8 @@ impl Default for AgentSpawnOptions<'_> {
             cols: 80,
             agent_type: None,
             seed: None,
+            remember_command: false,
+            authoring_kind: None,
         }
     }
 }
@@ -581,6 +650,17 @@ pub trait PaneController: Send + Sync {
             delivery_id,
         ))
     }
+    /// Issue #1445: tell the daemon that the orchestrator in `pane_id` has just
+    /// been re-armed from `context_path`, so the context file it records for
+    /// that orchestration — the one a TUI attaching later is handed, and the
+    /// ones it deletes when the orchestration ends — follows the re-arm.
+    ///
+    /// Fire-and-forget, for a caller on the TUI's render thread: nothing the
+    /// tab holds depends on the answer, since the tab already points at the
+    /// file it published. The default does nothing — correct for controllers
+    /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
+    /// overrides it to send the report on its runtime.
+    fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

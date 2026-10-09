@@ -13,13 +13,116 @@ use crate::event::{
     RestartRoleSignal, SpawnRoleSignal, WorkDoneSignal, Writable,
 };
 use crate::project_config::{
-    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, ProjectConfig,
+    load_project_config,
 };
 /// Issue #714: the quota-block reason types live in [`crate::quota_block`], and
 /// are re-exported here beside the [`SessionStatus::Blocked`] they explain.
 pub use crate::quota_block::{BlockedKind, BlockedReason};
 
 const MAX_RECENT_EVENTS: usize = 50;
+
+/// Issues #697 / #601: the most UNPROVEN sessions one [`AppState`] keeps — the
+/// cards of outside agents, admitted on a pane (or as a paneless agent) this
+/// deck never spawned. Counted per session rather than per pane, because one
+/// outside pane can carry any number of sessions.
+///
+/// Admitting one more at the cap evicts the least recently active unproven
+/// session (by the order events were applied, never by a producer timestamp),
+/// so an outside agent that keeps reporting outranks a one-shot flood entry and
+/// the set heals itself after a flood. Cards of agents the deck spawned are
+/// never counted and never evicted. The daemon, an attached TUI and the desktop
+/// apply the same bound; the daemon also announces each eviction
+/// ([`crate::event::UNPROVEN_EVICTED_METADATA_KEY`]) for a client that attached
+/// later and holds a different set.
+pub const MAX_UNPROVEN_SESSIONS: usize = 256;
+
+/// Issue #697: an unproven session's event journal — the
+/// [`MAX_RECENT_EVENTS`] counterpart. Smaller because a card that reports often
+/// should not crowd the others out of [`MAX_UNPROVEN_JOURNAL_BYTES`]. A count
+/// alone does not bound the memory: a retained event is the whole event, and a
+/// hook line may be up to [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] (8 MiB),
+/// so a full set of [`MAX_UNPROVEN_SESSIONS`] journals at this size could
+/// otherwise hold 16 GiB. The byte budget is what bounds them.
+const MAX_UNPROVEN_RECENT_EVENTS: usize = 8;
+
+/// Qodo, PR #1559: the most bytes the journals of every unproven session
+/// together retain, as [`retained_event_bytes`] counts them. Past it, the
+/// journals of the least recently active outside cards give up their oldest
+/// events, down to each card's newest, and then the payload of that newest
+/// event ([`strip_event_payload`]), until the total fits. Neither touches a
+/// card's status, pane, agent or key, which live on the card rather than in
+/// its journal, nor its live target, which every journal event carries forward.
+/// Large enough to hold one event from the longest hook line whole, so the card
+/// of the event being applied keeps it unless every other journal is already
+/// down to a stripped event.
+const MAX_UNPROVEN_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes one event retained in a journal holds, approximately: its own
+/// size, its strings, and each metadata entry with a fixed allowance for the
+/// entry's slot and allocations. An estimate, but one that grows with every
+/// byte a producer controls, which is what [`MAX_UNPROVEN_JOURNAL_BYTES`] needs.
+fn retained_event_bytes(event: &AgentEvent) -> usize {
+    const METADATA_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<String>() + 16;
+    let strings: usize = [
+        Some(&event.session_id),
+        event.tool_name.as_ref(),
+        event.tool_detail.as_ref(),
+        event.cwd.as_ref(),
+        event.user_prompt.as_ref(),
+        event.pane_id.as_ref(),
+        event.agent_id.as_ref(),
+        event.agent_version.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum();
+    let metadata: usize = event
+        .metadata
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + METADATA_ENTRY_OVERHEAD)
+        .sum();
+    std::mem::size_of::<AgentEvent>() + strings + metadata
+}
+
+/// Drop what a retained event reports beyond its identity — see
+/// [`MAX_UNPROVEN_JOURNAL_BYTES`]. Keeps the key, pane, agent, type, kind,
+/// timestamp and live target.
+fn strip_event_payload(event: &mut AgentEvent) {
+    event.tool_name = None;
+    event.tool_detail = None;
+    event.cwd = None;
+    event.user_prompt = None;
+    event.agent_version = None;
+    event.metadata = HashMap::new();
+}
+
+/// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id —
+/// the whole bound on what a wait tracks, at a few kilobytes per session for
+/// ordinary ids. Up to this many subagents a wait is exact: a re-ask from an
+/// id it holds is the same subagent, and a stop from an id it does not hold
+/// is one that never asked. Subagents that join past this many are counted in
+/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an
+/// id forgotten while its prompt is still open would let the card leave the
+/// wait with that prompt pending.
+const MAX_SUBAGENT_IDS: usize = 128;
+
+/// Issue #697: one session [`AppState`] holds as UNPROVEN — see
+/// [`MAX_UNPROVEN_SESSIONS`].
+#[derive(Debug, Clone)]
+struct UnprovenSession {
+    /// Position in [`AppState::unproven_seq`]'s order of the last event
+    /// applied to this session. The eviction order.
+    seq: u64,
+    /// The pane the session sits on, so evicting it can clear what this state
+    /// keeps per pane once nothing is left there.
+    pane_id: Option<String>,
+    /// What the card's journal retains, by [`retained_event_bytes`], kept up
+    /// to date as the journal changes. `None` until first counted: a card can
+    /// reach this accounting with a journal already on it.
+    journal_bytes: Option<usize>,
+}
 /// The session key a pane's PLACEHOLDER card is filed under — the one
 /// [`AppState::insert_placeholder_session`] mints.
 ///
@@ -645,7 +748,9 @@ pub(crate) fn no_signal_readiness_buffer() -> std::time::Duration {
 /// is a setting, and it means zero (the e2e harness and the toggle test's control
 /// arm both rely on that).
 fn explicit_delegate_readiness_buffer() -> Option<std::time::Duration> {
-    let raw = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS).ok()?;
+    // Issue #1516: through `env_override`, so a test can change the buffer
+    // between two delegates without writing the environment under live workers.
+    let raw = crate::env_override::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS)?;
     parse_bounded_ms_override(
         DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS,
         &raw,
@@ -810,6 +915,44 @@ pub struct SessionSnapshot {
     /// so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_wait: Option<SubagentWait>,
+    /// Issue #1493 (Qodo on PR #1523): the status is a Thinking the wrapper
+    /// read off a Codex pane's output — [`SessionState::output_set_status`] —
+    /// so a TUI that attaches while it stands can still end it on the
+    /// wrapper's quiet-output Idle, while a hook's Thinking stays protected.
+    /// Additive optional, the `blocked` precedent: an older reader ignores the
+    /// key, a newer one reads its absence as `false` (the hook-owned answer),
+    /// so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_set_status: bool,
+    /// Issue #532: the PANE's hook generation as the daemon holds it
+    /// ([`AppState::pane_hook_session_id`]), so a reconnecting TUI starts from
+    /// the daemon's answer instead of from whichever frame happens to reach it
+    /// first. Since #532 an ordinary frame cannot move an established
+    /// generation, so a TUI whose first frame after reconnecting came from a
+    /// wrapped agent's wrapper would otherwise hold the wrapper's id until the
+    /// agent's next `SessionStart`, and its guarded sends would be refused
+    /// against the daemon's. Adopted by [`AppState::seed_hydrated_session`].
+    ///
+    /// A property of the pane rather than of this session, carried here because
+    /// this is the per-pane record a reconnect already reads; filled by
+    /// [`AppState::live_session_for`], never by [`SessionState::live_snapshot`].
+    /// Additive optional, the `blocked` precedent: an older daemon omits it and
+    /// the TUI builds the generation from events as before, and an older TUI
+    /// ignores the key, so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_generation: Option<HookGeneration>,
+}
+
+/// Issue #532: a pane's hook generation on the wire — see
+/// [`SessionSnapshot::hook_generation`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookGeneration {
+    /// The hook session id the daemon's send guard compares a guarded write's
+    /// `expected_session_id` against.
+    pub session_id: String,
+    /// When the generation's newest frame was stamped, in milliseconds since
+    /// the Unix epoch (the `last_activity_ms` unit).
+    pub established_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -890,6 +1033,33 @@ pub struct SessionState {
     /// read it belong to the TUI that spawned the pane, not to one that
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
+    /// Issue #1567: this session's producer DECLARED that it reports every
+    /// prompt it submits — an ATTESTED event arrived carrying
+    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`], which the bundled
+    /// Pi extension sends on every report from #1567 on
+    /// ([`crate::event::AgentEvent::declares_prompt_reports`]), and the session
+    /// is not an outside agent's unproven card. For a Pi session this
+    /// is what makes the pane one that confirms its own prompts; an extension
+    /// from an older deck never sends it, so its pane keeps being one that
+    /// cannot.
+    ///
+    /// Per SESSION and STICKY once set, for the reasons
+    /// [`Self::prompt_reports_unavailable`] is: the answer has to outlive the
+    /// frame that carried it, and a producer that declared it does not stop
+    /// being that producer because one later frame — the extension's bare
+    /// lifecycle retry after a failed report — went out without it. It cannot
+    /// outrank [`Self::prompt_reports_unavailable`]; see
+    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`]. Not carried
+    /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
+    /// TUI learns it again from the producer's next event.
+    pub prompt_reports_declared: bool,
+    /// Issue #1493: the current status is a Thinking that `dot-agent-deck wrap`
+    /// read off a Codex pane's output (the mode where its prompt hook is not
+    /// running), not one a hook reported. Only such a Thinking may be ended by
+    /// the wrapper's quiet-output Idle: a prompt hook that does run after all
+    /// (trust left by an earlier install) still outranks output. Process-local,
+    /// like [`Self::prompt_reports_unavailable`].
+    pub output_set_status: bool,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -909,6 +1079,25 @@ pub struct SessionState {
 pub struct SubagentWait {
     pub subagent_ids: Vec<String>,
     pub resume_idle: bool,
+    /// Issue #697: how many asks arrived from ids not in
+    /// [`Self::subagent_ids`] after [`MAX_SUBAGENT_IDS`] ids were already
+    /// recorded. Their ids are not kept, so a `SubagentStop` naming an id not
+    /// in [`Self::subagent_ids`] counts one off while this is non-zero, and the
+    /// wait ends only once both are empty. Without the ids the count cannot
+    /// tell a re-ask from a new subagent, or a waiting subagent's stop from one
+    /// that never asked, so once a wait holds more than [`MAX_SUBAGENT_IDS`]
+    /// subagents it is approximate in both directions: an untracked subagent
+    /// that asks twice is counted twice and can hold the card on Needs Input
+    /// after it stops (until the main thread moves), and a stop from an
+    /// untracked subagent that never asked counts off one that did. Below that
+    /// it stays zero. Additive optional on the wire, the `blocked` precedent:
+    /// an older reader ignores it and a newer one reads its absence as zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub overflow: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SessionState {
@@ -941,17 +1130,26 @@ impl SessionState {
             // always knows when it last saw this one do something. Absence on
             // the wire means there was no live session to snapshot at all.
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
+            output_set_status: self.output_set_status,
             blocked: self.blocked.clone(),
             subagent_wait: self.subagent_wait.clone(),
+            // A pane property: `AppState::live_session_for` fills it.
+            hook_generation: None,
         }
     }
 
     /// Issue #559: this session as a candidate confirmation producer — its
-    /// declared agent type, and whether the session's producer declared it
-    /// cannot report a submitted prompt ([`Self::prompt_reports_unavailable`]).
-    /// The input [`crate::prompt_delivery::pane_confirmation_capability`] takes.
-    pub fn confirmation_producer(&self) -> (&AgentType, bool) {
-        (&self.agent_type, self.prompt_reports_unavailable)
+    /// declared agent type, and what the session's producer declared about its
+    /// prompt reports: that it cannot report a submitted prompt
+    /// ([`Self::prompt_reports_unavailable`]), or (issue #1567) that it reports
+    /// every one ([`Self::prompt_reports_declared`]). The input
+    /// [`crate::prompt_delivery::pane_confirmation_capability`] takes.
+    pub fn confirmation_producer(&self) -> crate::prompt_delivery::ConfirmationProducer<'_> {
+        crate::prompt_delivery::ConfirmationProducer {
+            agent_type: &self.agent_type,
+            prompt_reports_declared: self.prompt_reports_declared,
+            prompt_reports_unavailable: self.prompt_reports_unavailable,
+        }
     }
 
     /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
@@ -990,47 +1188,40 @@ impl SessionState {
 /// from one can reach the other's orchestrator) **iff** their identities are
 /// equal. Nothing else about the value is interpreted.
 ///
-/// Two variants, one per generation of client:
+/// Equality is the per-tab
+/// [`crate::agent_pty::TabMembership::Orchestration::orchestration_id`] token
+/// every role pane of a tab is stamped with, so two tabs of the SAME
+/// orchestration in the SAME directory are two distinct routing groups — what
+/// closes issue #140's cross-delivery.
 ///
-/// - [`Self::Instance`] — the client stamped a per-tab
-///   [`crate::agent_pty::TabMembership::Orchestration::orchestration_id`] on
-///   every role pane of the tab. Equality is the token, so two tabs of the
-///   SAME orchestration in the SAME directory are two distinct routing groups.
-///   This is what closes issue #140's cross-delivery.
-/// - [`Self::NameCwd`] — the pane came from a client predating #140 (no
-///   token). Falls back to the round-11 `(name, orchestration_cwd)` tuple,
-///   byte-equivalent to the pre-#140 behaviour: correct across directories and
-///   across differently-named orchestrations, ambiguous only for the
-///   same-name-same-directory case that has always been ambiguous.
+/// Issue #463: this used to be an enum with a second, `NameCwd { name, cwd }`
+/// variant, the round-11 `(name, orchestration_cwd)` tuple a client predating
+/// #140 (v0.35.0) was routed on because it stamped no token. Clients that old
+/// are no longer supported (`docs/develop/versioning.md`), and the daemon now
+/// refuses an orchestration membership without a token
+/// ([`crate::daemon_protocol::START_ERR_ORCHESTRATION_ID_REQUIRED`]) rather
+/// than registering it under an identity it cannot keep apart from a sibling
+/// tab's — so every identity has a token, and the fallback went.
 ///
-/// Mixed-variant comparison is never equal (derived `PartialEq`), which is the
-/// right answer: a tokened pane and a token-less pane were produced by
-/// different clients and we have no evidence they share a tab.
-///
-/// Both variants carry `name` because the delegate dispatch also needs the
+/// `name` rides along because the delegate dispatch also needs the
 /// orchestration's CONFIG name — [`lookup_orchestration_role`] resolves the
-/// target role's `prompt_template` / `clear` flag from it. Including it in
-/// `Instance` costs nothing for equality: every role pane of one tab is
-/// stamped with the same `name` at the construct site, so the token alone
-/// already decides the group.
+/// target role's `prompt_template` / `clear` flag from it. It costs nothing for
+/// equality: every role pane of one tab is stamped with the same `name` at the
+/// construct site, so the token alone already decides the group.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum OrchestrationIdentity {
-    /// Per-tab instance token (PRD #140) plus the orchestration's config name.
-    Instance { id: String, name: String },
-    /// Legacy `(name, orchestration_cwd)` identity for clients that carry no
-    /// instance token.
-    NameCwd { name: String, cwd: String },
+pub struct OrchestrationIdentity {
+    /// The per-tab instance token (PRD #140).
+    pub id: String,
+    /// The orchestration's CONFIG name (`OrchestrationConfig.name`, or the
+    /// cwd-basename fallback the construct sites resolve), used for role-config
+    /// lookup and never on its own for routing.
+    pub name: String,
 }
 
 impl OrchestrationIdentity {
-    /// The orchestration's CONFIG name (`OrchestrationConfig.name`, or the
-    /// cwd-basename fallback the construct sites resolve). Present in both
-    /// variants; used for role-config lookup, never on its own for routing.
+    /// The orchestration's CONFIG name, the `name` field.
     pub fn name(&self) -> &str {
-        match self {
-            OrchestrationIdentity::Instance { name, .. } => name,
-            OrchestrationIdentity::NameCwd { name, .. } => name,
-        }
+        &self.name
     }
 }
 
@@ -1089,34 +1280,69 @@ pub struct OrchestrationTitleInUse {
 
 /// Issue #555: the routing identity a registry record's own membership names —
 /// the same derivation the `StartAgent` handler registers the pane under
-/// (`OrchestrationSpawnMeta::identity`): the per-tab token when the client
-/// stamped one, else `(name, orchestration_cwd)` falling back to the pane's own
-/// cwd. `None` for a pane that is not an orchestration role.
+/// (`OrchestrationSpawnMeta::identity`). `None` for a pane that is not an
+/// orchestration role, and (issue #463) for one whose membership carries no
+/// per-tab token: the daemon refuses to start such a pane, so it names no
+/// routing group.
 pub fn orchestration_identity_of_record(
     record: &crate::agent_pty::AgentRecord,
 ) -> Option<OrchestrationIdentity> {
     let crate::agent_pty::TabMembership::Orchestration {
         name,
-        orchestration_cwd,
-        orchestration_id,
+        orchestration_id: Some(id),
         ..
     } = record.tab_membership.as_ref()?
     else {
         return None;
     };
-    Some(match orchestration_id {
-        Some(id) => OrchestrationIdentity::Instance {
-            id: id.clone(),
-            name: name.clone(),
-        },
-        None => OrchestrationIdentity::NameCwd {
-            name: name.clone(),
-            cwd: orchestration_cwd
-                .clone()
-                .or_else(|| record.cwd.clone())
-                .unwrap_or_default(),
-        },
+    Some(OrchestrationIdentity {
+        id: id.clone(),
+        name: name.clone(),
     })
+}
+
+/// Issue #1445: how many replaced context files
+/// [`AppState::orchestration_superseded_contexts`] keeps per orchestration.
+///
+/// A re-arm follows a compaction or a `/clear`, so a long run reaches a few
+/// dozen at most; the bound only keeps a client that reports in a loop from
+/// growing daemon memory without limit. A file pushed out of it is not deleted
+/// at the end and is left to the retention sweep, as every re-arm file was
+/// before issue #1445.
+pub const MAX_SUPERSEDED_CONTEXTS: usize = 256;
+
+/// Issue #1445: why [`AppState::record_rearmed_orchestration_context`] did not
+/// follow a reported re-arm publication. Each refusal leaves the record as it
+/// was, so the orchestration keeps the file it already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearmedContextRefusal {
+    /// The pane is not a registered orchestrator seat of a live orchestration.
+    NotACoordinator,
+    /// The daemon records no context file for that orchestration — it was
+    /// started by a client that published its own context, or by an older
+    /// path — so there is nothing to follow.
+    NoRecordedContext,
+    /// The path is not `orchestrator-context-<32 hex>.md` directly in the
+    /// recorded file's own `.dot-agent-deck`.
+    NotBesideTheRecordedContext,
+    /// Another orchestration records that file.
+    AnotherOrchestrationsContext,
+    /// The recorded file changed after the caller compared against it.
+    RecordMoved,
+}
+
+impl std::fmt::Display for RearmedContextRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotACoordinator => "the pane is not a live orchestration's coordinator",
+            Self::NoRecordedContext => "no context file is recorded for that orchestration",
+            Self::NotBesideTheRecordedContext => {
+                "the path is not a per-publish context file beside the recorded one"
+            }
+            Self::AnotherOrchestrationsContext => "another orchestration records that file",
+            Self::RecordMoved => "the recorded file changed while the report was being checked",
+        })
+    }
 }
 
 /// Issue #1395 item 2: delete an ended orchestration's context file off the
@@ -1145,6 +1371,22 @@ fn spawn_context_removal(path: std::path::PathBuf) {
                 .spawn(remove);
         }
     }
+}
+
+/// Issue #1339: `<base> · <n>`, the label a daemon-spawned run takes when its
+/// own title is already held. The base is shortened at a character boundary
+/// when the whole would pass [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`], since
+/// `validate_tab_membership` drops an over-long title and the tab would then
+/// fall back to the canonical name — the very label the suffix was added to
+/// tell apart. The suffix is never the part cut.
+fn suffixed_run_title(base: &str, n: usize) -> String {
+    let suffix = format!(" · {n}");
+    let room = crate::agent_pty::DISPLAY_NAME_MAX_LEN.saturating_sub(suffix.len());
+    let mut end = base.len().min(room);
+    while !base.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &base[..end])
 }
 
 /// Issue #555: the directory half of an orchestration title's uniqueness key,
@@ -1244,7 +1486,7 @@ pub struct OrchestrationRoleRecord {
 /// | event `(pane_id, agent_id)` | admitted when |
 /// |---|---|
 /// | `(Some(P), Some(A))` | generation `A` claims pane `P`, **and** `A` is live, or `A` is retired and no other generation claims `P` |
-/// | `(Some(P), None)` | some generation claims `P` — the producer named none, so the pane is all there is to go on |
+/// | `(Some(P), None)` | some generation that the first row would admit for `P` claims it — the producer named none, so the pane is all there is to go on, but a retired generation's grace ends here exactly where it ends in the first row (issue #698) |
 /// | `(None, Some(A))` | `A` is a genuinely pane-less generation (live or retired) |
 /// | `(None, None)` | never — [`AppState`] falls back to its historical rule |
 ///
@@ -1376,15 +1618,69 @@ pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
+    /// Issue #1507: per pane, the daemon registry id its card-surfacing
+    /// `SessionStart` named ([`crate::event::SURFACED_AGENT_ID_METADATA_KEY`]),
+    /// as a number. Read by the dashboard's creation-order sort for a card
+    /// that has no `agent_id` of its own yet — a live-surfaced card before its
+    /// agent's first real hook, or a pane that never sends one. Order only:
+    /// nothing here is identity, and dropped with the pane.
+    pane_surfaced_agent_seq: HashMap<String, u64>,
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
-    /// Pane IDs created by our app — events from unknown panes are rejected.
+    /// Pane ids this process holds as its OWN: panes it registered itself
+    /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
+    /// daemon's orchestration role panes), plus, in a process with no
+    /// ownership oracle, a pane whose first event is an unmarked `SessionStart`
+    /// arriving before its `register_pane` (the TUI's startup race).
+    ///
+    /// Issue #601: an outside agent's pane is NEVER recorded here. Before, any
+    /// `SessionStart` for an unknown pane auto-registered it, so one forged
+    /// start made the pane "ours" for the rest of the process's life. A pane
+    /// whose admission rests only on its sender's own word sits in the unproven
+    /// set instead ([`Self::unproven_sessions`]), which is bounded and confers
+    /// no ownership. Even an entry here is subordinate to a registry claim
+    /// ([`Self::registration_admits`]); in the daemon, the ownership proof is
+    /// the registry ([`AgentOwnership`]), not this set.
     pub managed_pane_ids: HashSet<String>,
+    /// Issues #601 / #697: the sessions this state holds as UNPROVEN — cards
+    /// admitted on nothing but their sender's own word, for a pane (or a
+    /// paneless agent) this deck never spawned. A pane counts as an outside
+    /// agent's for exactly as long as at least one of these sits on it
+    /// ([`Self::foreign_admits`]), so evicting or ending its last session also
+    /// withdraws the pane's admission. Bounded by [`MAX_UNPROVEN_SESSIONS`].
+    ///
+    /// Keyed by card id. An entry whose card is gone is dropped at the end of
+    /// the event that removed it ([`Self::settle_unproven`]).
+    unproven_sessions: HashMap<String, UnprovenSession>,
+    /// Issue #697: the clock [`UnprovenSession::seq`] is read from — one tick
+    /// per event applied to an unproven session.
+    unproven_seq: u64,
+    /// Issue #697: the daemon's evictions, as the `SessionEnd` announcements an
+    /// attached client applies, waiting for `crate::daemon::ingest_event` to
+    /// broadcast them after the event that caused them — or, for the outside
+    /// cards a registration removed ([`Self::register_pane`]), for the spawn
+    /// path that registered the pane ([`Self::announce_unproven_evictions`]). Filled only when an
+    /// ownership oracle is installed (the daemon), so a TUI or the desktop fold
+    /// never accumulates it; bounded by [`MAX_UNPROVEN_SESSIONS`] regardless.
+    pending_unproven_evictions: Vec<AgentEvent>,
+    /// Qodo, PR #1559: a test's override of [`MAX_UNPROVEN_JOURNAL_BYTES`], so
+    /// a regression can exercise the budget without allocating it. `None`
+    /// everywhere outside tests.
+    unproven_journal_budget: Option<usize>,
+    /// Whether the event [`Self::apply_event_unsettled`] last admitted was
+    /// admitted as UNPROVEN — read by the daemon's waiting-for-input watch,
+    /// which keeps history only for the deck's own agents (audit finding 4).
+    applied_unproven: bool,
     /// Issue #454: the daemon's registry-backed answer to "do I own this
     /// agent?", installed once at daemon start. `None` in the TUI and in unit
     /// tests, where [`Self::managed_pane_ids`] alone decides. See
     /// [`AgentOwnership`] and [`Self::apply_event`].
     agent_ownership: Option<AgentOwnershipOracle>,
+    /// Issue #1540: the deck's last New-agent-form command, installed once at
+    /// daemon start ([`Self::set_last_command_store`]). `None` in the TUI and in
+    /// unit tests that do not install one, where the daemon dispatch records
+    /// nothing and answers no `last_command`.
+    last_command_store: Option<Arc<crate::last_command::LastCommandStore>>,
     /// Panes whose CURRENT [`SessionState::status`] was last written by an
     /// event carrying no `agent_id` — i.e. by a producer that named no
     /// generation (issue #398, Greptile PR #443 finding #2).
@@ -1449,10 +1745,9 @@ pub struct AppState {
     /// PRD #140 M2.0: that tuple is still ambiguous when the SAME
     /// orchestration is opened twice from the SAME directory — the two tabs
     /// produce byte-identical identities and delegate/work-done cross-deliver
-    /// between them. The value is now an [`OrchestrationIdentity`] whose
-    /// `Instance` variant keys on a per-tab token, with the `(name, cwd)`
-    /// tuple preserved as the `NameCwd` fallback for clients that predate
-    /// the token.
+    /// between them. The value is now an [`OrchestrationIdentity`] keyed on
+    /// a per-tab token. The `(name, cwd)` tuple survived as a fallback for
+    /// clients that predate the token until issue #463 retired it.
     ///
     /// Issue #462: daemon-only in practice. The five TUI-side sites in
     /// `src/ui.rs` that register the other three maps deliberately leave this
@@ -1474,17 +1769,30 @@ pub struct AppState {
     pub orchestration_titles: HashMap<OrchestrationIdentity, OrchestrationTitle>,
     /// Issue #1395: the per-publish orchestrator context file each
     /// orchestration's coordinator was started with, keyed by the same
-    /// identity as [`Self::orchestration_titles`]. Written only by the daemon's
+    /// identity as [`Self::orchestration_titles`]. Created only by the daemon's
     /// own start paths from what THEY published or bound
-    /// ([`Self::record_orchestration_context`]) — never from a client-supplied
-    /// value — and read twice: the `ListAgents` reply stamps it onto the start
-    /// role's record ([`Self::attach_orchestrator_context_paths`]) so a
-    /// hydrated tab re-arms from its own file, and [`Self::unregister_pane`]
-    /// deletes the file once the orchestration's last pane closes
+    /// ([`Self::record_orchestration_context`]). Issue #1445: then moved to
+    /// each file a TUI reports re-arming the coordinator from, once the daemon
+    /// has checked the report ([`Self::record_rearmed_orchestration_context`]),
+    /// so the entry names the newest file. Read twice: the `ListAgents` reply
+    /// stamps it onto the start role's record
+    /// ([`Self::attach_orchestrator_context_paths`]) so a hydrated tab re-arms
+    /// from its own file, and [`Self::unregister_pane`] deletes the file once
+    /// the orchestration's last pane closes
     /// ([`Self::take_ended_orchestration_context`]).
     ///
     /// Daemon-only, like the routing map beside it.
     pub orchestration_context_paths: HashMap<OrchestrationIdentity, std::path::PathBuf>,
+    /// Issue #1445: the files [`Self::orchestration_context_paths`] has moved
+    /// on from for each orchestration — and re-arm files whose report arrived
+    /// after a newer one's, which it never moved to — in the order the daemon
+    /// learnt of them, kept only so that
+    /// [`Self::take_ended_orchestration_context`] deletes them along with the
+    /// newest one. At most [`MAX_SUPERSEDED_CONTEXTS`] per orchestration; one
+    /// pushed out of that bound is left to the retention sweep.
+    ///
+    /// Daemon-only, like the map it belongs to.
+    pub orchestration_superseded_contexts: HashMap<OrchestrationIdentity, Vec<std::path::PathBuf>>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -1526,12 +1834,42 @@ pub struct AppState {
     /// generation is refused with no bytes. Cleared on `SessionEnd`.
     ///
     /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
-    /// `(session_id, established_at)` pair, NOT just the id. The generation only
-    /// advances on a genuinely newer session (an incoming id different from the
-    /// current one whose event timestamp is `>=` the established one); an
-    /// out-of-order / older-generation event is IGNORED so a delayed prior-event
-    /// can neither restore a stale id nor clear a newer one, and a delayed
+    /// `(session_id, established_at)` pair, NOT just the id. A frame naming the
+    /// current generation only refreshes its timestamp, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
+    ///
+    /// Issue #532: once a pane HAS a generation, only a genuine `SessionStart`
+    /// naming a different session moves it (issue #424 D2: whatever its
+    /// timestamp). An ordinary frame naming another session — a delayed
+    /// straggler, or a second producer on the same pane such as the
+    /// `dot-agent-deck wrap` host beside a wrapped agent's native hooks —
+    /// changes nothing. That is the rule [`latch_generation`] applies, so the
+    /// daemon's send guard and its own delivery latch agree on what the pane's
+    /// conversation is.
+    ///
+    /// **Rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
+    /// `CONTRACT_BREAKS` entry.** The wire is unchanged and each side computes
+    /// this value from the same event stream; what moved is when an ordinary
+    /// frame may move it, and every old/new pairing is today's behaviour or
+    /// fails closed. A newer TUI against an older daemon is refused exactly as
+    /// intermittently as today. An older TUI against a newer daemon can bind
+    /// the wrapper's id after the agent announced its own conversation, and
+    /// that send is now always refused rather than sometimes accepted; once it
+    /// has written, that TUI's own target check already abandoned such a
+    /// delivery at the next alternation. The desktop binds the session a
+    /// genuine `SessionStart` named, which a newer daemon now honours instead
+    /// of refusing intermittently. A newer daemon accepts a write the older one
+    /// refused only when an ordinary frame under another session id arrived
+    /// with no `SessionStart` for it — a second producer, or a producer that
+    /// rolls its session id without announcing the new one. Claude Code, Codex,
+    /// Devin and OpenCode each map a native session-start hook to
+    /// `SessionStart`, and Pi reports under one pane-derived id for its whole
+    /// life. The reconnect half, [`SessionSnapshot::hook_generation`], is an
+    /// additive optional: an older TUI ignores it, and a newer TUI against an
+    /// older daemon builds the generation from events, where a wrapper frame
+    /// that arrives first holds the pane until the agent's next `SessionStart`
+    /// and that daemon refuses the TUI's sends whenever the agent spoke last —
+    /// intermittent refusal, as today, never a write into another conversation.
     ///
     /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
     /// conversation, or because an ordinary frame carrying a pane id arrived. A
@@ -1569,6 +1907,18 @@ pub struct AppState {
     /// Monotonic per pane, `u64`, in memory only; it grows by one per real
     /// conversation rollover, which no daemon lifetime can exhaust.
     pane_generation_closures: HashMap<String, u64>,
+    /// Issue #532 (Qodo on #1515): the panes whose CURRENT
+    /// [`Self::pane_hook_session`] entry was set by a genuine `SessionStart`
+    /// this state applied itself, as opposed to one an ordinary frame
+    /// established or [`Self::adopt_hydrated_generation`] seeded.
+    ///
+    /// Read only by that seeding. A reconnecting TUI subscribes to events before
+    /// it hydrates, so an announcement can reach it after the daemon built its
+    /// `ListAgents` snapshot, and must then not be overwritten by it. See
+    /// [`Self::adopt_hydrated_generation`] for the opposite ordering and why
+    /// keeping the local announcement still converges. Kept in step with the
+    /// map at each site that writes it.
+    pane_generation_announced: HashSet<String>,
     /// Issue #915 (finding 4): how many of each AGENT's own hook generations
     /// have ended, keyed by the registry agent id the `SessionEnd` carried.
     ///
@@ -1640,6 +1990,36 @@ pub struct AppState {
     /// caller-steerable; the count is bounded by the conversations ended by
     /// agents this daemon spawned.
     agent_generation_closures: HashMap<String, u64>,
+    /// Issue #1520: how many times this state's event stream has broken — the
+    /// TUI's subscriber lost its `SubscribeEvents` connection (a `KIND_STREAM_END
+    /// "lagged"`, a daemon restart, a transport error) and so missed whatever the
+    /// daemon broadcast until it resubscribed. Bumped by
+    /// [`Self::note_event_stream_gap`] when the stream ends and again by
+    /// [`Self::resync_after_event_gap`] once it is back.
+    ///
+    /// Every TUI-side delivery check that reads this state's history rests on
+    /// that history being in order and complete: [`Self::pane_generation_closures`]
+    /// ("how many conversations ended since we wrote"), the announced-generation
+    /// witness, and the per-pane event journal that confirms a submission. A
+    /// snapshot re-read after the reconnect repairs what the pane's state IS, but
+    /// cannot say what happened while nobody was listening — whether a
+    /// conversation the delivery wrote into ended, or whether the agent already
+    /// reported submitting it. So a delivery that may have written before a gap
+    /// stops rather than retrying or confirming against a history with a hole in
+    /// it (`ui::delivery_outlived_event_gap`). That is the same terminal outcome a
+    /// counted closure already produces, and it never writes again.
+    ///
+    /// Global rather than per pane because a gap is: it drops every pane's events
+    /// at once, including a pane this state had not yet heard from — the
+    /// no-generation launcher pane at the centre of #621, which has no entry in
+    /// any per-pane map to bump. Only the TUI's subscriber bumps it; the daemon's
+    /// own state consumes its events in-process and stays at 0. In memory only.
+    event_stream_gaps: u64,
+    /// Issue #1520: whether the event stream is down right now — set by
+    /// [`Self::note_event_stream_gap`] and cleared by a successful
+    /// [`Self::resync_after_event_gap`]. A delivery's retry waits while it is
+    /// set, because no confirmation can reach this state until it clears.
+    event_stream_down: bool,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -1976,6 +2356,10 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 /// the file per delegation (as `lookup_orchestration_role` already does) means
 /// an edited timeout takes effect on the next delegate without a respawn.
 ///
+/// Reads the file on the calling thread. A request handler resolves the same
+/// value through [`worker_response_timeout_in`], from configs read with no state
+/// guard held (issue #1387).
+///
 /// PRD #126 M1 audit (finding 4) — bounds, for BOTH sources:
 ///
 /// * **`0` means "detector disabled"**, explicitly and for either source. The
@@ -1993,8 +2377,19 @@ pub fn worker_response_timeout(
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
-    if let Some(ms) = std::env::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
-        .ok()
+    let configs = ProjectConfigs::load_blocking(orchestration_cwd.into_iter().chain(worker_cwd));
+    worker_response_timeout_in(&configs, orchestration_cwd, worker_cwd)
+}
+
+/// [`worker_response_timeout`], resolved from configs the caller already read.
+fn worker_response_timeout_in(
+    configs: &ProjectConfigs,
+    orchestration_cwd: Option<&str>,
+    worker_cwd: Option<&str>,
+) -> Option<std::time::Duration> {
+    // Issue #1516: through `env_override`, for the same reason as
+    // `explicit_delegate_readiness_buffer`.
+    if let Some(ms) = crate::env_override::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         if ms == 0 {
@@ -2018,9 +2413,8 @@ pub fn worker_response_timeout(
         .into_iter()
         .chain(worker_cwd)
         .find_map(|cwd| {
-            load_project_config(std::path::Path::new(cwd))
-                .ok()
-                .flatten()
+            configs
+                .get(cwd)
                 .map(|cfg| cfg.worker_response_timeout_minutes)
         })
         .unwrap_or(DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES);
@@ -3091,14 +3485,12 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// * **Both sides carry PRD #140's per-tab token → compare the tokens.** This is
 ///   the only comparison that distinguishes two tabs of the SAME orchestration
 ///   opened from the SAME directory, which #140 made two distinct routing groups.
-/// * **Otherwise → compare the orchestration name**, the pre-#140 check, which is
-///   all a token-less (older-client) pane can be compared on.
+/// * **The live membership carries no token → compare the orchestration
+///   name**, the pre-#140 check. The daemon no longer starts a token-less
+///   orchestration pane (issue #463), so this arm is defence in depth for a
+///   membership that reached the registry some other way, and it must not
+///   refuse on absence for the reason the first rule gives.
 ///
-/// Deliberately not comparing `NameCwd`'s cwd: the daemon folds
-/// `orchestration_cwd.or(StartAgent.cwd)` into the identity at `StartAgent` time
-/// and the registry membership holds only the un-defaulted field, so the two
-/// sources can disagree about the cwd for a perfectly healthy pane — a
-/// comparison that would refuse a legitimate nudge.
 /// PR #1398 finding #18: the write-time re-check every deck notice about a
 /// worker makes, in its `revalidate` closure: refuse the notice when one of the
 /// worker's delegations has been resolved — a `work-done`, a supersede, a
@@ -3132,9 +3524,9 @@ pub(crate) fn orchestration_still_matches(
     let (Some(expected), Some(live)) = (expected, live) else {
         return true;
     };
-    match (expected, live.instance_id.as_deref()) {
-        (OrchestrationIdentity::Instance { id, .. }, Some(live_id)) => id == live_id,
-        _ => expected.name() == live.name,
+    match live.instance_id.as_deref() {
+        Some(live_id) => expected.id == live_id,
+        None => expected.name() == live.name,
     }
 }
 
@@ -3346,7 +3738,7 @@ fn release_reserved_silence_watch(
     }
 }
 
-/// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
+/// PRD #126: take the resolved timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
 /// three ways it legitimately does nothing stay legible:
@@ -3361,10 +3753,11 @@ fn release_reserved_silence_watch(
 /// * **the pane is mid-close** — [`AgentPtyRegistry::arm_outstanding_delegation`]
 ///   refuses, closing the arm-after-cancel race.
 ///
-/// PRD #140 integration: `orchestration` is the daemon's routing identity, whose
-/// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
-/// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
-/// than read back out of the identity.
+/// `timeout` is [`worker_response_timeout`]'s answer for this delegate, `None`
+/// for a disabled detector. The caller resolves it from project configs it read
+/// with no state guard held (issue #1387), and from the orchestration's cwd,
+/// which PRD #140's routing identity does not carry (see
+/// [`AppState::orchestration_cwd_of`]).
 ///
 /// Returns the armed record's generation (`Some(seq)`) when a
 /// watch was armed, `None` on any of the three no-op paths above. The caller
@@ -3377,10 +3770,9 @@ fn arm_idle_worker_watch_for_delegation(
     role: &str,
     orchestrator_pane_id: &str,
     orchestration: Option<&OrchestrationIdentity>,
-    orchestration_cwd: Option<&str>,
-    worker_cwd: Option<&str>,
+    timeout: Option<std::time::Duration>,
 ) -> Option<u64> {
-    let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
+    let Some(timeout) = timeout else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -3976,17 +4368,42 @@ impl AppState {
         event: AgentEvent,
         registry: &Arc<AgentPtyRegistry>,
     ) {
+        self.apply_hook_event_watching_waiting(event, registry, None);
+    }
+
+    /// Issue #318: [`Self::apply_event_watching_waiting`] for a raw hook event
+    /// the provenance gate ATTESTED, with `attested_agent` the agent its token
+    /// was minted for (audit finding 2). An event that names no agent is
+    /// admitted only if that generation still speaks for the pane, asked here
+    /// under the state lock — the gate asked too, but a successor can claim the
+    /// pane in between, and the pane alone would then credit the report to the
+    /// successor. The event's own absent `agent_id` is left as it is, so the
+    /// untagged-status rules downstream are unchanged.
+    ///
+    /// The attested agent travels as an argument rather than as state on
+    /// `self`, so nothing outlives the call — not even an unwind out of it.
+    pub fn apply_hook_event_watching_waiting(
+        &mut self,
+        event: AgentEvent,
+        registry: &Arc<AgentPtyRegistry>,
+        attested_agent: Option<&str>,
+    ) {
         let pane_id = event.pane_id.clone();
         let event_agent_id = event.agent_id.clone();
         let generation_before = pane_id
             .as_deref()
             .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
         let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
-        let applied = self.apply_event_reporting(event);
+        let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
             return;
         };
-        if applied == AppliedEvent::Rejected {
+        // Audit finding 4: an outside agent's report keeps no waiting-watch
+        // history. The watch serves the deck's own generations — an episode
+        // needs the pane's live registry agent and a commission made to it —
+        // and history kept per outside pane would be a map any sender could
+        // grow one invented pane id at a time, outliving the bounded card.
+        if applied == AppliedEvent::Rejected || self.applied_unproven {
             return;
         }
         // A report from a hook session the pane has already moved past — the
@@ -4479,10 +4896,13 @@ pub const DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS: &str =
 /// the derived default — off. That is deliberate: the two questions are
 /// independently switchable in both directions.
 fn delegate_no_event_window(
+    configs: &ProjectConfigs,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
-    if let Ok(raw) = std::env::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS)
+    // Issue #1516: through `env_override`, for the same reason as
+    // `explicit_delegate_readiness_buffer`.
+    if let Some(raw) = crate::env_override::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS)
         && let Some(window) = parse_bounded_ms_override(
             DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS,
             &raw,
@@ -4498,7 +4918,7 @@ fn delegate_no_event_window(
         }
         return Some(window);
     }
-    worker_response_timeout(orchestration_cwd, worker_cwd)
+    worker_response_timeout_in(configs, orchestration_cwd, worker_cwd)
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
 
@@ -4889,7 +5309,17 @@ pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
 /// agent-specific evidence (a `Stop`-derived `Idle` from Claude *does* imply a
 /// turn; OpenCode's identically-typed startup `session.idle` does not) without
 /// another signature change.
+///
+/// Issue #1493: except a Codex pane's wrapper-classified frames. Codex's own
+/// hooks report its turns; what the wrapper reads off its output is drawing,
+/// and once the deck could not get those hooks trusted the wrapper reports
+/// drawing that RESUMES — which includes the echo of the very pointer being
+/// typed into the composer, submitted or not. Counting it would stop a submit
+/// recovery for a pointer still sitting unsubmitted.
 pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
+    if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() {
+        return false;
+    }
     match event.event_type {
         // Lifecycle: emitted by a booting or dying agent that never saw the prompt.
         EventType::SessionStart | EventType::SessionEnd => false,
@@ -5203,6 +5633,11 @@ fn arm_delegate_silence_watch(
         // ran and the cancellation had not been observed yet — suppress.
         // PR #1398 finding #18: captured before the take — see the idle watch.
         let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
+        // Qodo, PR #1502: and the pane's pointer deliveries, also before the
+        // take — a watch displaced by a newer delegate whose pointer is still
+        // being written can fire and take its own record, and that pointer
+        // landing while this report waits answers the question it asks.
+        let delivery = registry.pointer_delivery_epoch(&worker_pane_id);
         if !registry.cancel_silence_watch_if(&worker_pane_id, seq) {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -5303,6 +5738,14 @@ fn arm_delegate_silence_watch(
                         resolution,
                         "silent-worker watch",
                     ) {
+                        return false;
+                    }
+                    if revalidate_registry.pointer_delivery_epoch(&revalidate_worker) != delivery {
+                        tracing::info!(
+                            worker_pane_id = %revalidate_worker,
+                            "a newer task pointer reached the worker while the silent-worker \
+                             report waited to be written; not sent"
+                        );
                         return false;
                     }
                     orchestration_still_matches(
@@ -5968,17 +6411,144 @@ pub fn compose_worker_task_file(
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
+/// Issue #1387: the `.dot-agent-deck.toml` of each directory a request resolves
+/// role config from, as one request read them.
+///
+/// Every daemon verb that resolves a role — `delegate`, `restart-role`,
+/// `spawn-role` — used to read the file synchronously while holding the
+/// [`AppState`] read guard. A read that hung (a network mount, a FIFO at the
+/// config path) then parked a runtime thread and, behind that guard, every
+/// writer: hook ingestion stopped until the read returned. The verbs now read
+/// through [`read_guard_with_project_configs`], which reads on the blocking pool
+/// with no guard held, and resolve from this.
+///
+/// Read once per request and never kept past it: an edit to the file takes
+/// effect on the next delegate (#704/#705).
+#[derive(Debug, Default)]
+pub(crate) struct ProjectConfigs {
+    /// `None` for a directory with no config or one that does not parse — both
+    /// resolve as "no role config", as they always have.
+    by_dir: HashMap<String, Option<ProjectConfig>>,
+}
+
+impl ProjectConfigs {
+    /// Read `dirs` on the calling thread. Only for a caller that is not on a
+    /// request path: tests, and [`worker_response_timeout`].
+    pub(crate) fn load_blocking<S: Into<String>>(dirs: impl IntoIterator<Item = S>) -> Self {
+        let by_dir = dirs
+            .into_iter()
+            .map(Into::into)
+            .map(|dir| {
+                let config = load_project_config(std::path::Path::new(&dir))
+                    .ok()
+                    .flatten();
+                (dir, config)
+            })
+            .collect();
+        Self { by_dir }
+    }
+
+    /// Read `dirs` on the blocking pool. This frees the runtime thread, not a
+    /// state guard the caller holds — a request handler reads through
+    /// [`read_guard_with_project_configs`], which holds none.
+    pub(crate) async fn load(dirs: Vec<String>) -> Self {
+        let mut configs = Self::default();
+        configs.read_more(dirs).await;
+        configs
+    }
+
+    /// Read whichever of `dirs` this set has not read yet, on the blocking pool.
+    async fn read_more(&mut self, dirs: Vec<String>) {
+        let unread = self.unread(dirs);
+        if unread.is_empty() {
+            return;
+        }
+        match tokio::task::spawn_blocking(move || Self::load_blocking(unread)).await {
+            Ok(read) => self.by_dir.extend(read.by_dir),
+            Err(e) => warn!(
+                error = %e,
+                "reading the project config failed; the directories it named resolve as \
+                 having none for this request"
+            ),
+        }
+    }
+
+    /// Which of `dirs` this set has not read, each named once.
+    fn unread(&self, dirs: Vec<String>) -> Vec<String> {
+        let mut unread: Vec<String> = dirs
+            .into_iter()
+            .filter(|dir| !self.by_dir.contains_key(dir))
+            .collect();
+        unread.sort();
+        unread.dedup();
+        unread
+    }
+
+    /// The config `dir` holds, or `None` when it holds none. A directory this
+    /// set never read answers `None` too, and says so in the log — see
+    /// [`read_guard_with_project_configs`] for the one way that can happen.
+    pub(crate) fn get(&self, dir: &str) -> Option<&ProjectConfig> {
+        match self.by_dir.get(dir) {
+            Some(config) => config.as_ref(),
+            None => {
+                warn!(
+                    dir = %escape_id_for_log(dir),
+                    "the project config of this directory was not read for this request; \
+                     resolving it as having none"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// How many times [`read_guard_with_project_configs`] drops its guard to read a
+/// directory the state names. One round is the ordinary case; a further one is
+/// needed only when the state changed while the first was reading.
+const PROJECT_CONFIG_READ_ROUNDS: usize = 3;
+
+/// Issue #1387: a read guard on `state`, with the project config of every
+/// directory `dirs_of` names under that same guard — read while no guard was
+/// held.
+///
+/// `dirs_of` runs under a short guard, which is dropped while those files are
+/// read on the blocking pool; then the guard is taken again and `dirs_of` asked
+/// once more, because the state may have moved in between (a pane registered
+/// with another cwd). A directory it names that was not read is read the same
+/// way, with the guard dropped again. After [`PROJECT_CONFIG_READ_ROUNDS`] such
+/// rounds the guard is returned anyway, and a directory still unread resolves
+/// as having no config ([`ProjectConfigs::get`] logs it) — the state would have
+/// had to change during every round.
+async fn read_guard_with_project_configs<'a>(
+    state: &'a SharedState,
+    dirs_of: impl Fn(&AppState) -> Vec<String>,
+) -> (tokio::sync::RwLockReadGuard<'a, AppState>, ProjectConfigs) {
+    let mut configs = ProjectConfigs::default();
+    let mut rounds = 0;
+    loop {
+        let guard = state.read().await;
+        let unread = configs.unread(dirs_of(&guard));
+        if unread.is_empty() || rounds == PROJECT_CONFIG_READ_ROUNDS {
+            return (guard, configs);
+        }
+        drop(guard);
+        rounds += 1;
+        configs.read_more(unread).await;
+    }
+}
+
 /// Issue #447: whether a delegate to `role` will replace the worker's agent
 /// (`clear = true`) — the same decision `dispatch_one_owned` makes, from the
 /// same inputs. `false` when the role config cannot be resolved, as there.
 fn delegate_respawns_worker(
+    configs: &ProjectConfigs,
     cwd: Option<&str>,
     orchestration: Option<&OrchestrationIdentity>,
     role: &str,
 ) -> bool {
     match (cwd, orchestration) {
         (Some(cwd), Some(identity)) => {
-            lookup_orchestration_role_indexed(cwd, identity.name(), role)
+            lookup_orchestration_role_indexed(configs, cwd, identity.name(), role)
                 .is_some_and(|(_, role_config)| role_config.clear)
         }
         _ => false,
@@ -5986,8 +6556,8 @@ fn delegate_respawns_worker(
 }
 
 /// Look up the role config for `role_name` inside the orchestration
-/// named `orchestration_name`, by parsing the project config file at
-/// `cwd`, together with the role's INDEX within that orchestration.
+/// named `orchestration_name`, in the project config of `cwd` as `configs`
+/// read it, together with the role's INDEX within that orchestration.
 /// Returns `None` when any layer is missing (no project config,
 /// no matching orchestration, no matching role) — the caller treats
 /// "no config" as "no template, no clear" and falls through to the
@@ -5999,11 +6569,12 @@ fn delegate_respawns_worker(
 /// re-create a worker pane from nothing — the card would otherwise land outside
 /// the orchestration's tab, or in the wrong column of it.
 fn lookup_orchestration_role_indexed(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig)> {
-    lookup_orchestration_role_seated(cwd, orchestration_name, role_name)
+    lookup_orchestration_role_seated(configs, cwd, orchestration_name, role_name)
         .map(|(index, role, _)| (index, role))
 }
 
@@ -6014,13 +6585,12 @@ fn lookup_orchestration_role_indexed(
 /// read of the file, so the role and its seat cannot come from two versions of
 /// it.
 fn lookup_orchestration_role_seated(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig, bool)> {
-    let cfg = load_project_config(std::path::Path::new(cwd))
-        .ok()
-        .flatten()?;
+    let cfg = configs.get(cwd)?;
     let Some(orch) = cfg
         .orchestrations
         .iter()
@@ -6890,9 +7460,11 @@ pub(crate) enum PromptWatch {
     /// the only proof that a re-submission could ever be confirmed.
     ///
     /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
-    /// the agent's id. Pi emits exactly such events and hardcodes
-    /// `user_prompt: None`, so a Pi pane armed a retry loop that could never
-    /// terminate on success and retyped the prompt until the deadline.
+    /// the agent's id. A Pi extension from before issue #622 emits exactly such
+    /// events and never a prompt, so a Pi pane armed a retry loop that could
+    /// never terminate on success and retyped the prompt until the deadline.
+    /// Issue #1567: a Pi frame counts only when its extension declares that it
+    /// reports every prompt.
     ///
     /// Issue #666: `agent_start` carries the FIRST `SessionStart` seen in this
     /// window that satisfies the rearm's facts G ∧ I ∧ W — genuine (not
@@ -7871,9 +8443,13 @@ async fn dispatch_one_owned(
     // Issue #606: the role's INDEX comes back too, so that a `clear = true`
     // respawn which has to re-create the pane from nothing can rebuild the
     // pane's `TabMembership` and keep the card on its orchestration's tab.
+    //
+    // Issue #1387: read on the blocking pool, so a config whose read hangs parks
+    // this dispatch (it holds no state guard) and not a runtime thread.
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
-            lookup_orchestration_role_indexed(c, identity.name(), &target_role)
+            let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
+            lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
     };
@@ -8033,10 +8609,7 @@ async fn dispatch_one_owned(
                     is_start_role: false,
                     orchestration_cwd: cwd.clone(),
                     display_title: recreated_display_title.clone(),
-                    orchestration_id: match orchestration.as_ref() {
-                        Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
-                        _ => None,
-                    },
+                    orchestration_id: orchestration.as_ref().map(|o| o.id.clone()),
                 }
             }),
             // Issue #308: the role's RESOLVED type — declaration first, command
@@ -8152,6 +8725,7 @@ async fn dispatch_one_owned(
                             identity,
                             cwd.as_deref(),
                         );
+                        state.announce_unproven_evictions(&event_tx);
                     }
                 }
                 // Issue #962: the replacement holds the title from here on (a
@@ -9793,12 +10367,57 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
     }
 }
 
+/// The kept-card half of [`AppState::seed_hydrated_session`]: a card that
+/// already exists takes the daemon's snapshot only when the snapshot is the
+/// fresher evidence, plus the live-target tie exception. See
+/// `seed_hydrated_session`'s doc comment for both rules.
+fn overlay_snapshot_onto_kept_card(
+    session: &mut SessionState,
+    snap: &SessionSnapshot,
+    observed: Option<DateTime<Utc>>,
+) {
+    if let Some(observed) = observed
+        && observed > session.last_activity
+        && observed <= Utc::now()
+    {
+        // PRD #1223 with issue #804: a card the upsert kept takes the
+        // snapshot only when the snapshot is the fresher evidence, by the
+        // same clock bar as the minted branch: strictly newer than what the
+        // card holds, and no later than now. See the doc comment.
+        if let Some(agent_type) = snap.agent_type.clone() {
+            session.agent_type = agent_type;
+        }
+        // The stamp moves BEFORE the carrier is built, so the carrier sits
+        // at the snapshot's instant: the newest evidence the card now
+        // holds, and still no later than now.
+        session.last_activity = observed;
+        overlay_snapshot_fields(session, snap);
+    } else if let Some(observed) = observed
+        && observed == session.last_activity
+        && session.live_target().is_none()
+        && let Some(live_target) = snap.live_target
+    {
+        // PRD #1223: the tie exception in the doc comment. Only the
+        // live-target carrier moves, because a missing one lets a card
+        // that should refuse input accept it; the display fields stay,
+        // since an equal stamp gives no reason to prefer the snapshot's.
+        // The carrier is stamped at the card's `last_activity`, which is
+        // the snapshot's instant too, so it moves no watermark.
+        push_live_target_carrier(session, live_target);
+    }
+}
+
 /// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
 /// status, tool fields, prompt context and the live-target carrier. Everything
 /// but `agent_type` and `last_activity`, which the two callers decide
 /// differently (see that function's doc comment).
 fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     session.status = snap.status.clone();
+    // Issue #1493 (Qodo on PR #1523): the overlaid status keeps the daemon's
+    // answer about who set it — output, which the wrapper's quiet Idle may end,
+    // or anything else, which it may not. An older daemon sends nothing, which
+    // reads as the protected answer.
+    session.output_set_status = snap.output_set_status && snap.status == SessionStatus::Thinking;
     // Issue #714: the reason travels with the status it explains, and only with
     // it. The detail is agent-derived text arriving over the wire, so it gets the
     // same scrub `apply_event` gives it rather than trusting the daemon's, and
@@ -9923,6 +10542,9 @@ impl AppState {
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
+        let announced_before = pane_id
+            .as_ref()
+            .is_some_and(|pane| self.pane_generation_announced.contains(pane));
         // Issue #424 H4: the closure COUNT is the same fact seen over time, so it
         // is restored for the same reason the entry is. A report that bumped it
         // would read to an in-flight TUI delivery as "a conversation ended while
@@ -9939,6 +10561,11 @@ impl AppState {
                 None => {
                     self.pane_hook_session.remove(&pane);
                 }
+            }
+            if announced_before {
+                self.pane_generation_announced.insert(pane.clone());
+            } else {
+                self.pane_generation_announced.remove(&pane);
             }
             match closures_before {
                 Some(count) => {
@@ -10189,7 +10816,19 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| s.live_snapshot())
+            .map(|s| {
+                let mut snapshot = s.live_snapshot();
+                // Issue #532: the pane's generation, so a reconnecting TUI
+                // adopts the daemon's answer. See
+                // [`SessionSnapshot::hook_generation`].
+                snapshot.hook_generation = pane_id
+                    .and_then(|pane| self.pane_hook_session.get(pane))
+                    .map(|(session_id, established_at)| HookGeneration {
+                        session_id: session_id.clone(),
+                        established_ms: established_at.timestamp_millis(),
+                    });
+                snapshot
+            })
     }
 
     /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
@@ -10208,8 +10847,454 @@ impl AppState {
     }
 
     /// Register a pane ID as managed by our app.
+    ///
+    /// Issue #601: registering a pane is the process asserting that the pane
+    /// is its own, so any card on it that this state held as an outside
+    /// agent's stops counting as unproven.
+    ///
+    /// The outside cards themselves go too (reviewer S2): a card left behind
+    /// would be counted nowhere, so it could never be evicted, and would show
+    /// as a second, stale card beside the pane's real one. What this state
+    /// kept per pane for them is cleared with them when nothing else is left on
+    /// the pane, so the deck's agent starts on a clean pane.
+    ///
+    /// On the daemon each card removed this way is announced like an eviction
+    /// (Qodo, PR #1559): an attached client that does not register the pane
+    /// itself would otherwise keep showing it. The caller broadcasts the queue
+    /// ([`Self::announce_unproven_evictions`]); one that does not leaves it for
+    /// the next ingested event to drain.
     pub fn register_pane(&mut self, pane_id: String) {
+        let outside: Vec<String> = self
+            .unproven_sessions
+            .iter()
+            .filter(|(_, entry)| entry.pane_id.as_deref() == Some(pane_id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &outside {
+            self.unproven_sessions.remove(id);
+            if let Some(session) = self.sessions.remove(id) {
+                let pane = session.pane_id.clone();
+                self.queue_unproven_eviction(id, session, pane);
+            }
+        }
+        if !outside.is_empty()
+            && !self.managed_pane_ids.contains(&pane_id)
+            && !self
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(pane_id.as_str()))
+        {
+            self.clear_pane_maps(&pane_id);
+        }
         self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// Whether `session_id` names a card this state holds as PROVEN — one
+    /// that is not an outside agent's (audit finding 1).
+    fn is_proven_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id) && !self.unproven_sessions.contains_key(session_id)
+    }
+
+    /// Issue #601: is `pane_id` currently admitted as an OUTSIDE agent's pane —
+    /// does at least one unproven session sit on it? Subordinate to a registry
+    /// claim, like [`Self::registration_admits`]: a pane the registry claims is
+    /// generation-checked whatever this state recorded about it earlier.
+    fn foreign_admits(&self, pane_id: &str) -> bool {
+        !self.managed_pane_ids.contains(pane_id)
+            && self.unproven_sessions.iter().any(|(id, entry)| {
+                entry.pane_id.as_deref() == Some(pane_id) && self.sessions.contains_key(id)
+            })
+            && !matches!(
+                self.oracle_ownership(Some(pane_id), None),
+                Some(Ownership::Owned)
+            )
+    }
+
+    /// Issue #697: how many unproven sessions this state holds. See
+    /// [`MAX_UNPROVEN_SESSIONS`].
+    pub fn unproven_session_count(&self) -> usize {
+        self.unproven_sessions
+            .keys()
+            .filter(|id| self.sessions.contains_key(*id))
+            .count()
+    }
+
+    /// Issue #697 (audit): the sizes of every per-pane and per-agent map an
+    /// UNPROVEN event can reach, by name, so a flood test can assert what this
+    /// state retains rather than only the cards it shows.
+    #[cfg(test)]
+    pub(crate) fn retained_map_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("sessions", self.sessions.len()),
+            ("unproven_sessions", self.unproven_sessions.len()),
+            (
+                "pending_unproven_evictions",
+                self.pending_unproven_evictions.len(),
+            ),
+            ("managed_pane_ids", self.managed_pane_ids.len()),
+            ("pane_started_at", self.pane_started_at.len()),
+            ("pane_hook_session", self.pane_hook_session.len()),
+            (
+                "pane_generation_closures",
+                self.pane_generation_closures.len(),
+            ),
+            (
+                "pane_generation_announced",
+                self.pane_generation_announced.len(),
+            ),
+            ("untagged_status_panes", self.untagged_status_panes.len()),
+            (
+                "waiting_superseded_sessions",
+                self.waiting_superseded_sessions.len(),
+            ),
+            (
+                "agent_generation_closures",
+                self.agent_generation_closures.len(),
+            ),
+        ]
+    }
+
+    /// Qodo, PR #1559: lower [`MAX_UNPROVEN_JOURNAL_BYTES`] for this state.
+    #[cfg(test)]
+    pub(crate) fn set_unproven_journal_budget(&mut self, bytes: usize) {
+        self.unproven_journal_budget = Some(bytes);
+    }
+
+    /// Issue #697: take the daemon's queued eviction announcements, oldest
+    /// first. See [`Self::pending_unproven_evictions`].
+    pub fn take_unproven_evictions(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.pending_unproven_evictions)
+    }
+
+    /// Issue #697: broadcast the daemon's queued eviction announcements to
+    /// attached clients, oldest first. For a daemon path that removes outside
+    /// cards outside an ingested event — a spawn registering its pane
+    /// ([`Self::register_pane`]) — so a client that does not register that pane
+    /// itself still drops the card. A no-op outside the daemon, whose queue
+    /// stays empty.
+    pub(crate) fn announce_unproven_evictions(
+        &mut self,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+    ) {
+        for eviction in self.take_unproven_evictions() {
+            let _ = event_tx.send(BroadcastMsg::Event(eviction));
+        }
+    }
+
+    /// Issue #697: queue the announcement that the outside card `id`, whose
+    /// session was `session` on `pane`, is gone — on the daemon only (an
+    /// ownership oracle is installed), where an attached client holding the
+    /// same card applies it ([`Self::apply_unproven_eviction`]).
+    fn queue_unproven_eviction(&mut self, id: &str, session: SessionState, pane: Option<String>) {
+        if self.agent_ownership.is_none() {
+            return;
+        }
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        if self.pending_unproven_evictions.len() >= MAX_UNPROVEN_SESSIONS {
+            self.pending_unproven_evictions.remove(0);
+        }
+        self.pending_unproven_evictions.push(AgentEvent {
+            session_id: id.to_string(),
+            agent_type: session.agent_type,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: pane,
+            agent_id: session.agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    /// Issue #697: record activity on the unproven session `session_id`, about
+    /// to be created or updated by an event on `pane_id`. A new session at the
+    /// cap first evicts the least recently active unproven session.
+    fn note_unproven_activity(&mut self, session_id: &str, pane_id: Option<&str>) {
+        self.unproven_seq = self.unproven_seq.wrapping_add(1);
+        let seq = self.unproven_seq;
+        if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
+            entry.seq = seq;
+            // Qodo, PR #1559: a key whose card is gone — superseded by a new
+            // generation, closed with its pane, re-keyed — is about to get a
+            // fresh card with an empty journal, so the count of the old one
+            // must not carry over to it.
+            if !self.sessions.contains_key(session_id) {
+                entry.journal_bytes = None;
+            }
+            return;
+        }
+        self.settle_unproven(pane_id);
+        while self.unproven_sessions.len() >= MAX_UNPROVEN_SESSIONS {
+            if !self.evict_least_recent_unproven(pane_id) {
+                break;
+            }
+        }
+        self.unproven_sessions.insert(
+            session_id.to_string(),
+            UnprovenSession {
+                seq,
+                pane_id: pane_id.map(str::to_string),
+                journal_bytes: None,
+            },
+        );
+    }
+
+    /// Issue #697: evict the least recently active unproven session. Returns
+    /// `false` when there is none. `keep_pane` is the pane of the event being
+    /// applied, whose per-pane state that event has already written and must
+    /// keep.
+    fn evict_least_recent_unproven(&mut self, keep_pane: Option<&str>) -> bool {
+        let Some(id) = self
+            .unproven_sessions
+            .iter()
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(id, _)| id.clone())
+        else {
+            return false;
+        };
+        let entry = self
+            .unproven_sessions
+            .remove(&id)
+            .expect("the key was just read");
+        let removed = self.sessions.remove(&id);
+        // Audit finding 5: the card's own pane is the eviction's target — the
+        // card may have learnt a pane after it was first recorded, and a
+        // client applying the announcement matches on the card's pane.
+        let card_pane = removed
+            .as_ref()
+            .map_or(entry.pane_id.clone(), |session| session.pane_id.clone());
+        if let Some(session) = removed {
+            self.queue_unproven_eviction(&id, session, card_pane.clone());
+        }
+        tracing::debug!(
+            session_id = %crate::config_validation::escape_id_for_log(&id),
+            cap = MAX_UNPROVEN_SESSIONS,
+            "unproven sessions at cap; evicted the least recently active"
+        );
+        for pane in [entry.pane_id.as_deref(), card_pane.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if keep_pane != Some(pane) {
+                self.forget_unbacked_pane(pane);
+            }
+        }
+        true
+    }
+
+    /// Issue #697: drop the unproven entries whose card is gone, and clear
+    /// what this state keeps per pane for an outside pane that no longer has
+    /// any card. `keep_pane` as for [`Self::evict_least_recent_unproven`].
+    ///
+    /// Also keeps each entry's pane in step with its card's (audit finding 5):
+    /// a card admitted without a pane can learn one later, and an entry still
+    /// naming the old pane would clear the wrong pane's maps when the card goes
+    /// and announce its eviction under a pane no client's card carries. A pane
+    /// the card has left is cleared like one whose card is gone.
+    fn settle_unproven(&mut self, keep_pane: Option<&str>) {
+        // Reviewer S5: managed-only traffic does no per-event work here.
+        if self.unproven_sessions.is_empty() {
+            return;
+        }
+        let sessions = &self.sessions;
+        let mut gone_panes = Vec::new();
+        self.unproven_sessions.retain(|id, entry| {
+            let Some(session) = sessions.get(id) else {
+                if let Some(pane) = entry.pane_id.clone() {
+                    gone_panes.push(pane);
+                }
+                return false;
+            };
+            if session.pane_id != entry.pane_id {
+                if let Some(pane) = entry.pane_id.take() {
+                    gone_panes.push(pane);
+                }
+                entry.pane_id.clone_from(&session.pane_id);
+            }
+            true
+        });
+        for pane in gone_panes {
+            if keep_pane != Some(pane.as_str()) {
+                self.forget_unbacked_pane(&pane);
+            }
+        }
+    }
+
+    /// Qodo, PR #1559: drop the cached journal size of the unproven session
+    /// `session_id`, so the next budget pass recounts what its card retains.
+    /// Owed wherever a card's journal is replaced or appended to outside
+    /// `apply_event`'s own accounted push: a cached count that outlives its
+    /// journal makes the budget strip cards for bytes nobody holds.
+    fn forget_unproven_journal_count(&mut self, session_id: &str) {
+        if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
+            entry.journal_bytes = None;
+        }
+    }
+
+    /// Qodo, PR #1559: bring the unproven journals within
+    /// [`MAX_UNPROVEN_JOURNAL_BYTES`], least recently active card first. See
+    /// the constant for what goes and what every card keeps.
+    fn enforce_unproven_journal_budget(&mut self) {
+        let budget = self
+            .unproven_journal_budget
+            .unwrap_or(MAX_UNPROVEN_JOURNAL_BYTES);
+        let mut total = 0usize;
+        let mut order = Vec::with_capacity(self.unproven_sessions.len());
+        for (id, entry) in &mut self.unproven_sessions {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let bytes = *entry.journal_bytes.get_or_insert_with(|| {
+                session.recent_events.iter().map(retained_event_bytes).sum()
+            });
+            total += bytes;
+            order.push((entry.seq, id.clone()));
+        }
+        if total <= budget {
+            return;
+        }
+        order.sort_unstable();
+        // First the older events, down to each card's newest; then the payload
+        // of that newest event.
+        for strip in [false, true] {
+            for (_, id) in &order {
+                if total <= budget {
+                    return;
+                }
+                let (Some(session), Some(entry)) = (
+                    self.sessions.get_mut(id),
+                    self.unproven_sessions.get_mut(id),
+                ) else {
+                    continue;
+                };
+                let before = entry.journal_bytes.unwrap_or_default();
+                let mut freed = 0;
+                if strip {
+                    if let Some(event) = session.recent_events.back_mut() {
+                        let full = retained_event_bytes(event);
+                        strip_event_payload(event);
+                        freed = full.saturating_sub(retained_event_bytes(event));
+                    }
+                } else {
+                    while total.saturating_sub(freed) > budget && session.recent_events.len() > 1 {
+                        if let Some(old) = session.recent_events.pop_front() {
+                            freed += retained_event_bytes(&old);
+                        }
+                    }
+                }
+                entry.journal_bytes = Some(before.saturating_sub(freed));
+                total = total.saturating_sub(freed);
+            }
+        }
+    }
+
+    /// Issue #697: clear the per-pane maps this state keeps for `pane_id`, if
+    /// the pane now has no card at all and is neither this process's own nor
+    /// claimed by the registry. Those maps are otherwise only cleared when a
+    /// managed pane closes, so without this every outside pane id ever seen
+    /// would leave entries behind.
+    fn forget_unbacked_pane(&mut self, pane_id: &str) {
+        if self.managed_pane_ids.contains(pane_id)
+            || self
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(pane_id))
+            || matches!(
+                self.oracle_ownership(Some(pane_id), None),
+                Some(Ownership::Owned)
+            )
+        {
+            return;
+        }
+        self.clear_pane_maps(pane_id);
+    }
+
+    /// The per-pane maps an event can write for a pane, cleared together. See
+    /// [`Self::forget_unbacked_pane`] and [`Self::register_pane`].
+    fn clear_pane_maps(&mut self, pane_id: &str) {
+        self.pane_started_at.remove(pane_id);
+        self.pane_hook_session.remove(pane_id);
+        self.pane_generation_closures.remove(pane_id);
+        self.pane_generation_announced.remove(pane_id);
+        self.untagged_status_panes.remove(pane_id);
+        self.waiting_superseded_sessions.remove(pane_id);
+    }
+
+    /// Issue #697: apply the daemon's announcement that it evicted the unproven
+    /// session `event` names ([`crate::event::UNPROVEN_EVICTED_METADATA_KEY`]).
+    /// Idempotent: a client that already evicted the same session, or never
+    /// held it, has nothing to remove.
+    ///
+    /// A card leaves the outside-card accounting if and only if it leaves
+    /// [`Self::sessions`] (round-3 audit B1). Dropping only the accounting
+    /// would leave a card counted nowhere: outside the budget, read as one of
+    /// this process's own, and refusing its own sender's reports.
+    fn apply_unproven_eviction(&mut self, event: &AgentEvent) {
+        let Some(card) = self.unproven_eviction_target(event) else {
+            return;
+        };
+        self.sessions.remove(&card);
+        self.unproven_sessions.remove(&card);
+        if let Some(pane) = event.pane_id.as_deref() {
+            self.forget_unbacked_pane(pane);
+        }
+    }
+
+    /// The card a daemon eviction announcement names on this process, if any.
+    ///
+    /// Only a card THIS process holds as an outside agent's (round-2 audit):
+    /// the daemon files a daemon-restart survivor's reports as an outside
+    /// agent's, so it can evict a card under the key and pane of a survivor's
+    /// card a client still holds as its own — and an outside sender can choose
+    /// both. And only one on the announced pane: the same key on another pane
+    /// is a different card.
+    ///
+    /// The daemon and a client can file one outside card under different keys
+    /// (round-3 audit B1): the cross-pane re-key ([`Self::apply_event_unsettled`])
+    /// depends on the cards each side already holds, and a client that attached
+    /// late holds fewer. So a card on the announced pane whose key is the
+    /// announced one with that pane's qualification added or removed, any
+    /// number of times, may be the same card. Any other divergence — an
+    /// adoption that landed differently, say — matches nothing here; the
+    /// client's card then stays counted against its own budget and goes when
+    /// that budget evicts it.
+    ///
+    /// Spelling alone does not identify the card (round-4 audit B1): a
+    /// producer's literal key can equal another session's qualified one, so a
+    /// client can hold two such cards on one pane. The candidate must also name
+    /// the evicted card's agent — `None` included — and must be the only one
+    /// that does. When more than one remains this declines and removes nothing
+    /// rather than guess: a wrong guess loses a live card and its journal,
+    /// while declining only leaves a card for the client's own budget to retire.
+    fn unproven_eviction_target(&self, event: &AgentEvent) -> Option<String> {
+        let pane = event.pane_id.as_deref();
+        let prefix = pane.map(|pane| format!("{pane}::"));
+        fn unqualified<'a>(mut key: &'a str, prefix: Option<&str>) -> &'a str {
+            if let Some(prefix) = prefix {
+                while let Some(rest) = key.strip_prefix(prefix) {
+                    key = rest;
+                }
+            }
+            key
+        }
+        let announced = unqualified(&event.session_id, prefix.as_deref());
+        let mut candidates = self.unproven_sessions.keys().filter(|id| {
+            unqualified(id, prefix.as_deref()) == announced
+                && self.sessions.get(id.as_str()).is_some_and(|session| {
+                    session.pane_id.as_deref() == pane && session.agent_id == event.agent_id
+                })
+        });
+        let target = candidates.next()?;
+        candidates.next().is_none().then(|| target.clone())
     }
 
     /// Issue #454: install the daemon's registry-backed ownership oracle.
@@ -10228,16 +11313,30 @@ impl AppState {
         self.agent_ownership = Some(AgentOwnershipOracle(ownership));
     }
 
+    /// Issue #1540: install the daemon's last-command store. Called once, by
+    /// [`crate::daemon::run_daemon_with`] after loading it from the daemon's
+    /// state directory; a test installs one over a temp directory.
+    pub fn set_last_command_store(&mut self, store: Arc<crate::last_command::LastCommandStore>) {
+        self.last_command_store = Some(store);
+    }
+
+    /// Issue #1540: the daemon's last-command store, if one is installed.
+    pub fn last_command_store(&self) -> Option<Arc<crate::last_command::LastCommandStore>> {
+        self.last_command_store.clone()
+    }
+
     /// Issue #454: may an event naming `(pane_id, agent_id)` drive this state?
     ///
     /// Two independent grounds, because two different kinds of process ask:
     ///
     /// * **explicitly registered** — [`Self::register_pane`], i.e. the TUI's own
-    ///   panes, the daemon's orchestration role panes, and the
-    ///   `SessionStart` auto-registration below. This is the historical rule and
-    ///   is unchanged, and it is deliberately still PANE-scoped: a process that
-    ///   registers a pane by hand is asserting the pane is its own, and has no
-    ///   generation to name;
+    ///   panes, the daemon's orchestration role panes, and, in a process with no
+    ///   oracle, the TUI's startup-race auto-registration in
+    ///   [`Self::apply_event`]. It is deliberately still PANE-scoped: a process
+    ///   that registers a pane by hand is asserting the pane is its own, and has
+    ///   no generation to name. An outside agent's pane is never registered
+    ///   (issue #601); it is admitted by [`Self::foreign_admits`] instead, and
+    ///   only to its own unproven cards;
     /// * **owned by the registry** — the daemon's answer, which IS
     ///   generation-scoped. See [`AgentOwnership`] for the exact rule; the short
     ///   version is that a tagged event has to come from the generation that
@@ -10289,7 +11388,9 @@ impl AppState {
     ///
     /// Otherwise the historical rule stands: a process that manages no panes at
     /// all is watching EXTERNAL agents and takes their pane-less events; one
-    /// that manages panes is not, and rejects them.
+    /// that manages panes is not, and rejects them. Since issue #601 an outside
+    /// agent's card no longer puts its pane into [`Self::managed_pane_ids`], so
+    /// one outside `SessionStart` no longer flips a process out of that mode.
     fn admits_paneless_event(&self, agent_id: Option<&str>) -> bool {
         matches!(
             self.oracle_ownership(None, agent_id),
@@ -10425,6 +11526,9 @@ impl AppState {
         // comparing against it, enough to get the successor's card deleted by
         // the render-thread half. A pane id reused after a close is a new pane.
         self.pane_started_at.remove(pane_id);
+        // Issue #1507: likewise its surfaced creation order — a successor on a
+        // reused pane id surfaces with its own.
+        self.pane_surfaced_agent_seq.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -10518,6 +11622,7 @@ impl AppState {
         }
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+        self.forget_unproven_journal_count(&session_id);
         self.sessions.insert(
             session_id.clone(),
             SessionState {
@@ -10540,6 +11645,8 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
         session_id
@@ -10698,6 +11805,10 @@ impl AppState {
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         let Some(snap) = live else { return };
+        // The overlay below can push a live-target carrier onto the card's
+        // journal outside the accounted path; recount it at the next pass.
+        self.forget_unproven_journal_count(&session_id);
+        self.adopt_hydrated_generation(&pane_id, snap.hook_generation.as_ref());
         let observed = snap
             .last_activity_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis);
@@ -10718,34 +11829,8 @@ impl AppState {
             {
                 session.last_activity = observed;
             }
-        } else if let Some(observed) = observed
-            && observed > session.last_activity
-            && observed <= Utc::now()
-        {
-            // PRD #1223 with issue #804: a card the upsert kept takes the
-            // snapshot only when the snapshot is the fresher evidence, by the
-            // same clock bar as the minted branch: strictly newer than what the
-            // card holds, and no later than now. See the doc comment.
-            if let Some(agent_type) = snap.agent_type.clone() {
-                session.agent_type = agent_type;
-            }
-            // The stamp moves BEFORE the carrier is built, so the carrier sits
-            // at the snapshot's instant: the newest evidence the card now
-            // holds, and still no later than now.
-            session.last_activity = observed;
-            overlay_snapshot_fields(session, snap);
-        } else if let Some(observed) = observed
-            && observed == session.last_activity
-            && session.live_target().is_none()
-            && let Some(live_target) = snap.live_target
-        {
-            // PRD #1223: the tie exception in the doc comment. Only the
-            // live-target carrier moves, because a missing one lets a card
-            // that should refuse input accept it; the display fields stay,
-            // since an equal stamp gives no reason to prefer the snapshot's.
-            // The carrier is stamped at the card's `last_activity`, which is
-            // the snapshot's instant too, so it moves no watermark.
-            push_live_target_carrier(session, live_target);
+        } else {
+            overlay_snapshot_onto_kept_card(session, snap, observed);
         }
     }
 
@@ -10754,6 +11839,243 @@ impl AppState {
     /// those on the same pane, and those from the same agent. `None` when this
     /// state holds no such session. [`Self::seed_hydrated_session`] is the only
     /// caller.
+    /// Issue #532: take the daemon's hook generation for `pane_id` on a
+    /// reconnect — see [`SessionSnapshot::hook_generation`].
+    ///
+    /// The daemon's answer REPLACES a generation this state built from ordinary
+    /// frames that reached it before hydration ran (the event subscriber starts
+    /// first), because the daemon saw the whole history and this state saw only
+    /// its tail. It does NOT replace one a genuine `SessionStart` set here
+    /// ([`Self::pane_generation_announced`]), because neither side of that pair
+    /// can be ordered against the other from what this state holds: the
+    /// snapshot carries no position in the event stream, and a genuine start's
+    /// timestamp is not evidence of order (#424 D2). Of the two orderings,
+    /// keeping the local announcement is the one that converges by itself.
+    /// When it landed between `ListAgents` and this call it is the newer, and
+    /// replacing it would leave this state on a superseded id with nothing
+    /// left in flight to correct it. When it is the OLDER one — this state's
+    /// stream lags the daemon, which has already moved to a later announcement
+    /// — that later announcement is still in flight on the same ordered stream
+    /// and moves the pane when it is applied. What stays open is a stream that
+    /// drops that later announcement: this state then holds the older id until
+    /// the next one, and its guarded sends are refused rather than delivered,
+    /// as for any announcement a lagged or reconnected subscriber misses. The
+    /// same generation keeps the later of the two timestamps either way, so a
+    /// fresher frame already applied here is not rolled back.
+    ///
+    /// Moves the generation without counting a closure: hydration runs before
+    /// any delivery exists for this state to protect. Absent on an older
+    /// daemon's snapshot, which leaves the event-built generation alone.
+    fn adopt_hydrated_generation(&mut self, pane_id: &str, generation: Option<&HookGeneration>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let Some(established_at) =
+            DateTime::<Utc>::from_timestamp_millis(generation.established_ms)
+        else {
+            return;
+        };
+        let established_at = match self.pane_hook_session.get(pane_id) {
+            Some((current, current_ts)) if *current == generation.session_id => {
+                established_at.max(*current_ts)
+            }
+            Some(_) if self.pane_generation_announced.contains(pane_id) => return,
+            _ => {
+                self.pane_generation_announced.remove(pane_id);
+                established_at
+            }
+        };
+        self.pane_hook_session.insert(
+            pane_id.to_string(),
+            (generation.session_id.clone(), established_at),
+        );
+    }
+
+    /// Issue #1520: see [`Self::event_stream_gaps`].
+    pub fn event_stream_gaps(&self) -> u64 {
+        self.event_stream_gaps
+    }
+
+    /// Issue #1520: the event stream just broke, so from now until
+    /// [`Self::resync_after_event_gap`] this state is missing whatever the
+    /// daemon broadcasts. Counted at the break rather than only at the
+    /// resubscribe so a delivery written before it stops at once instead of
+    /// acting on missing evidence while the subscriber is backing off. See
+    /// [`Self::event_stream_gaps`].
+    pub fn note_event_stream_gap(&mut self) {
+        self.event_stream_gaps = self.event_stream_gaps.saturating_add(1);
+        self.event_stream_down = true;
+    }
+
+    /// Issue #1520: whether the event stream is down right now; see the
+    /// `event_stream_down` field.
+    pub fn event_stream_down(&self) -> bool {
+        self.event_stream_down
+    }
+
+    /// Issue #1520: bring this state back into agreement with the daemon after
+    /// the event subscriber resubscribed, from the daemon's `ListAgents` reply.
+    ///
+    /// Called with the new subscription already open and BEFORE any of its
+    /// events are applied, so the reply was built after everything this state
+    /// holds and is the newer account of every pane it covers. Issue #1555:
+    /// where the daemon offers `SubscribeEventsWithSnapshot`, the reply and the
+    /// subscription are one request, and the daemon opens the subscription at the
+    /// instant it reads the reply's live state, so none of the subscription's
+    /// events is one the reply already includes.
+    ///
+    /// For each record whose pane this state manages and which carries a live
+    /// snapshot:
+    ///
+    /// * **The pane's generation becomes the daemon's**
+    ///   ([`SessionSnapshot::hook_generation`]), whoever set the local one. Unlike
+    ///   [`Self::adopt_hydrated_generation`], a local announcement does not
+    ///   outrank it: that rule protects an announcement applied AFTER the snapshot
+    ///   was built, and nothing here was. Where the local generation was a
+    ///   different one, that conversation ended or was superseded while the
+    ///   stream was down, and [`Self::pane_generation_closures`] counts it — the
+    ///   transition the stream would have counted. Where the local view had no
+    ///   generation, adopting one counts nothing, exactly as a first
+    ///   `SessionStart` does not.
+    /// * **A pane the daemon has no generation for loses its local one**, and
+    ///   that counts as a closure, when the same reply shows the daemon reports
+    ///   generations at all. From a daemon predating #532 (v0.45.0 and earlier),
+    ///   which omits the field for a pane that has one, the local generation is
+    ///   left alone.
+    /// * **An existing card takes the snapshot's fields.** No card is minted:
+    ///   which panes this TUI hosts is the render loop's business, not this
+    ///   task's.
+    ///
+    /// What it does NOT repair, deliberately. A record with no live snapshot, and
+    /// a pane this state does not manage, are left as they are, and an agent the
+    /// reply no longer lists keeps its card: a pane whose agent is gone is ended
+    /// by its own attach stream closing, not by this one. From a daemon that
+    /// predates `SubscribeEventsWithSnapshot`, which is resynchronized with
+    /// `SubscribeEvents` then `ListAgents`, events broadcast between those two
+    /// requests are queued on the new subscription AND included in the reply,
+    /// and are applied after it: they can replay a transition it already
+    /// includes, counting a closure twice or briefly moving the generation back
+    /// until the rest of the queue lands. None of these can mis-deliver a prompt:
+    /// a delivery that may have written before the gap stops on the gap itself
+    /// ([`Self::event_stream_gaps`], bumped here as well, so one written while
+    /// the subscriber was disconnected stops too), and one that has not written
+    /// binds the generation it is about to name and is refused `stale` by the
+    /// daemon if that is not the pane's.
+    pub fn resync_after_event_gap(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        self.note_event_stream_gap();
+        self.event_stream_down = false;
+        // Whether THIS daemon reports pane generations at all. The field shipped
+        // in v0.45.1, and an older daemon omits it for a pane that has one, so a
+        // missing value is proof of "no generation" only from a daemon that is
+        // seen sending it. One daemon answers the whole reply, so a single record
+        // carrying one settles it for every record.
+        let reports_generations = records.iter().any(|record| {
+            record
+                .live
+                .as_ref()
+                .is_some_and(|snap| snap.hook_generation.is_some())
+        });
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            if !self.managed_pane_ids.contains(pane_id) {
+                continue;
+            }
+            let Some(snap) = record.live.as_ref() else {
+                continue;
+            };
+            match snap.hook_generation.as_ref() {
+                Some(generation) => self.resync_generation(pane_id, generation),
+                None if reports_generations => self.resync_generation_ended(pane_id),
+                None => {}
+            }
+            let observed = snap
+                .last_activity_ms
+                .and_then(DateTime::<Utc>::from_timestamp_millis);
+            if let Some(card) = self
+                .sessions
+                .values_mut()
+                .filter(|s| {
+                    s.pane_id.as_deref() == Some(pane_id)
+                        && s.agent_id.as_deref() == Some(record.id.as_str())
+                })
+                .max_by(|a, b| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                })
+            {
+                // Unconditionally, unlike hydration's kept-card rule (Greptile on
+                // #1553): that rule exists because events applied BEFORE
+                // hydration can be newer than the snapshot, and here none are —
+                // the reply was built after everything this state holds. So the
+                // snapshot's fields win whatever its stamp, which also covers an
+                // older daemon that sends no `last_activity_ms` and a stamp that
+                // millisecond truncation made equal. The stamp itself only ever
+                // moves forward, and never past now.
+                if let Some(agent_type) = snap.agent_type.clone() {
+                    card.agent_type = agent_type;
+                }
+                if let Some(observed) = observed
+                    && observed > card.last_activity
+                    && observed <= Utc::now()
+                {
+                    card.last_activity = observed;
+                }
+                overlay_snapshot_fields(card, snap);
+                // Qodo, PR #1559: the overlay can push a live-target carrier
+                // outside the accounted path; see `forget_unproven_journal_count`.
+                if let Some(entry) = self.unproven_sessions.get_mut(&card.session_id) {
+                    entry.journal_bytes = None;
+                }
+            }
+        }
+    }
+
+    /// Issue #1520: the generation half of [`Self::resync_after_event_gap`].
+    fn resync_generation(&mut self, pane_id: &str, generation: &HookGeneration) {
+        let Some(established_at) =
+            DateTime::<Utc>::from_timestamp_millis(generation.established_ms)
+        else {
+            return;
+        };
+        self.pane_generation_announced.remove(pane_id);
+        let established_at = match self.pane_hook_session.get(pane_id) {
+            Some((current, current_ts)) if *current == generation.session_id => {
+                established_at.max(*current_ts)
+            }
+            Some(_) => {
+                self.count_generation_closure(pane_id);
+                established_at
+            }
+            None => established_at,
+        };
+        self.pane_hook_session.insert(
+            pane_id.to_string(),
+            (generation.session_id.clone(), established_at),
+        );
+    }
+
+    /// Issue #1520 (Qodo on #1553): the daemon, which reports generations, has
+    /// none for `pane_id` — the conversation this state still holds ended while
+    /// the stream was down and nothing succeeded it. The same transition a
+    /// `SessionEnd` makes here: the generation goes and the closure counts.
+    fn resync_generation_ended(&mut self, pane_id: &str) {
+        self.pane_generation_announced.remove(pane_id);
+        if self.pane_hook_session.remove(pane_id).is_some() {
+            self.count_generation_closure(pane_id);
+        }
+    }
+
+    fn count_generation_closure(&mut self, pane_id: &str) {
+        let closures = self
+            .pane_generation_closures
+            .entry(pane_id.to_string())
+            .or_insert(0);
+        *closures = closures.saturating_add(1);
+    }
+
     fn newest_activity_for(&self, pane_id: &str, agent_id: Option<&str>) -> Option<DateTime<Utc>> {
         self.sessions
             .values()
@@ -10847,14 +12169,14 @@ impl AppState {
     /// alias of a live orchestration's directory is the same key.
     ///
     /// Called under the state write lock, so the check and the claim are one
-    /// step: two concurrent starts of one title cannot both pass. What this does
-    /// NOT cover, stated narrowly: the daemon's own spawn paths
-    /// ([`crate::spawn::spawn`] — dispatch, a scheduled fire, issue dispatch)
-    /// record their titles through [`Self::record_orchestration_title`] without
-    /// being checked, so a client start is refused against them but they are
-    /// never refused; and a legacy client that sends no per-tab token is scoped
-    /// by `(name, cwd)`, so two such tabs of one orchestration in one directory
-    /// read as one tab here exactly as they already do to `handle_delegate`.
+    /// step: two concurrent starts of one title cannot both pass. The daemon's
+    /// own spawn paths ([`crate::spawn::spawn`] — dispatch, a scheduled fire,
+    /// issue dispatch) are admitted through this same check by
+    /// [`Self::claim_dispatched_orchestration_title`], which suffixes a taken
+    /// title rather than refusing (issue #1339). What this does NOT cover: a
+    /// legacy client that sends no per-tab token is scoped by `(name, cwd)`, so
+    /// two such tabs of one orchestration in one directory read as one tab here
+    /// exactly as they already do to `handle_delegate`.
     pub fn claim_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -10894,8 +12216,7 @@ impl AppState {
                 pending_claims: 0,
             });
         // A live entry keeps the title its first role stamped; every role of a
-        // tab carries the same one, so this only matters for a legacy `NameCwd`
-        // identity two tabs can share. A dead entry is a previous run under a
+        // tab carries the same one. A dead entry is a previous run under a
         // reused identity, and the new start's title replaces it.
         if !live {
             entry.display_title = display_title.map(str::to_string);
@@ -10905,6 +12226,65 @@ impl AppState {
         }
         entry.pending_claims += 1;
         Ok(())
+    }
+
+    /// Issue #1339: admit an orchestration the daemon spawns ITSELF (dispatch,
+    /// a scheduled fire, issue dispatch — [`crate::spawn::spawn`]) under a run
+    /// title no other live orchestration in `cwd` holds, and hold it for the
+    /// spawn until [`Self::release_orchestration_title_claim`]. Returns the
+    /// title the run must be stamped with (`None`: its canonical name).
+    ///
+    /// `derived` is the daemon-generated title
+    /// ([`crate::spawn`]'s `<name> · <cwd basename>`) and is tried first, so a
+    /// run that collides with nothing keeps exactly the label it always had.
+    /// When it is taken, the run gets the first free `<title> · 2`,
+    /// `<title> · 3`, … instead of being refused. That is the opposite of
+    /// [`Self::claim_orchestration_title`]'s answer for a client start, on
+    /// purpose: #555 refuses there because a person chose that name, and
+    /// renaming it would leave them a run under a name they do not know. Nobody
+    /// chose this one — the daemon derived it from the orchestration and the
+    /// directory — and `delegate` / `work-done` route by the
+    /// [`OrchestrationIdentity`] token rather than by the title. A refusal would
+    /// also have no form to send a scheduled fire back to, so it would turn a
+    /// label clash into a run that did not happen.
+    ///
+    /// Admission goes through [`Self::claim_orchestration_title`] itself, so
+    /// the key, the liveness rule and the atomicity are the client path's: two
+    /// concurrent spawns under the state write lock cannot pick the same
+    /// suffix, and a client start is refused against whichever title this
+    /// claimed. A derived title the registry would drop
+    /// ([`crate::agent_pty::is_valid_display_name`]) is treated as absent, as
+    /// the tab will show the canonical name.
+    pub fn claim_dispatched_orchestration_title(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        derived: Option<&str>,
+        cwd: &str,
+        registry: &AgentPtyRegistry,
+    ) -> Option<String> {
+        let derived = derived.filter(|t| crate::agent_pty::is_valid_display_name(t));
+        if self
+            .claim_orchestration_title(identity, derived, cwd, registry)
+            .is_ok()
+        {
+            return derived.map(str::to_string);
+        }
+        let base = derived.unwrap_or(identity.name()).to_string();
+        // Each held entry blocks at most one candidate, so `len() + 1`
+        // candidates always include a free one.
+        for n in 2..=self.orchestration_titles.len() + 2 {
+            let candidate = suffixed_run_title(&base, n);
+            if self
+                .claim_orchestration_title(identity, Some(&candidate), cwd, registry)
+                .is_ok()
+            {
+                return Some(candidate);
+            }
+        }
+        // Unreachable by the bound above; degrade to the pre-#1339 behaviour
+        // (an unchecked record) rather than panic inside the daemon.
+        self.record_orchestration_title(identity, derived, cwd);
+        derived.map(str::to_string)
     }
 
     /// Issue #555: end one start's claim taken by
@@ -10921,9 +12301,10 @@ impl AppState {
     /// Issue #962: record the title an orchestration the daemon spawned ITSELF
     /// is flying under (dispatch, a scheduled fire, issue dispatch — see
     /// [`crate::spawn::spawn`]), or restore it after a re-created pane put the
-    /// identity back. No uniqueness check and no claim: see
-    /// [`Self::claim_orchestration_title`] for what that leaves uncovered. Keeps
-    /// an existing non-`None` title.
+    /// identity back. No uniqueness check and no claim: a fresh spawn has
+    /// already been admitted by [`Self::claim_dispatched_orchestration_title`]
+    /// before its first role (issue #1339), and a restore puts back a title its
+    /// own run already held. Keeps an existing non-`None` title.
     pub fn record_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -10987,13 +12368,44 @@ impl AppState {
     /// Issue #1395: record the per-publish context file `identity`'s
     /// coordinator was started with. Called by the daemon's start paths with
     /// the path from their own preparation binding or publish.
+    ///
+    /// A different file already recorded for `identity` is kept for deletion
+    /// when the orchestration ends ([`Self::orchestration_superseded_contexts`]),
+    /// as a re-arm's is (Qodo on PR #1554): a start recorded after a re-arm
+    /// must not drop that re-arm's file from the cleanup.
     pub fn record_orchestration_context(
         &mut self,
         identity: &OrchestrationIdentity,
         context_path: std::path::PathBuf,
     ) {
-        self.orchestration_context_paths
-            .insert(identity.clone(), context_path);
+        if let Some(displaced) = self
+            .orchestration_context_paths
+            .insert(identity.clone(), context_path.clone())
+            .filter(|displaced| *displaced != context_path)
+        {
+            self.supersede_context(identity, displaced, &context_path);
+        }
+    }
+
+    /// Issue #1445: remember `displaced` for deletion at the end — once, and
+    /// within [`MAX_SUPERSEDED_CONTEXTS`] — while `newest` is `identity`'s
+    /// recorded file: one `newest` just replaced, or an older re-arm file the
+    /// record never moved to ([`Self::keep_older_rearmed_orchestration_context`]).
+    fn supersede_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        displaced: std::path::PathBuf,
+        newest: &std::path::Path,
+    ) {
+        let superseded = self
+            .orchestration_superseded_contexts
+            .entry(identity.clone())
+            .or_default();
+        superseded.retain(|path| path != newest && *path != displaced);
+        superseded.push(displaced);
+        if superseded.len() > MAX_SUPERSEDED_CONTEXTS {
+            superseded.remove(0);
+        }
     }
 
     /// Issue #1395 item 1: stamp each live start-role record with the context
@@ -11021,10 +12433,12 @@ impl AppState {
     }
 
     /// Issue #1395 item 2: once no pane maps to `identity` any more, forget
-    /// its context file and answer it for deletion — unless another live
-    /// orchestration still references the same file, in which case the entry
-    /// is dropped and `None` is answered. Never the fixed-path mirror (the
-    /// deletion helper refuses any other name shape too).
+    /// its context files and answer them for deletion — the newest one and,
+    /// since issue #1445, every file a re-arm replaced
+    /// ([`Self::orchestration_superseded_contexts`]) — except any file another
+    /// live orchestration still references, which is forgotten and kept. Never
+    /// the fixed-path mirror (the deletion helper refuses any other name shape
+    /// too).
     ///
     /// Bookkeeping under the state lock; the caller does the unlink after
     /// releasing it ([`Self::unregister_pane`]).
@@ -11056,7 +12470,7 @@ impl AppState {
     pub fn take_ended_orchestration_context(
         &mut self,
         identity: &OrchestrationIdentity,
-    ) -> Option<std::path::PathBuf> {
+    ) -> Vec<std::path::PathBuf> {
         // Still running, or another of its roles is mid-start (the same
         // in-flight claim that keeps its title held).
         let held = self
@@ -11068,18 +12482,175 @@ impl AppState {
                 .get(identity)
                 .is_some_and(|held| held.pending_claims > 0);
         if held {
-            return None;
+            return Vec::new();
         }
-        let path = self.orchestration_context_paths.remove(identity)?;
-        let still_referenced = self
+        let superseded = self
+            .orchestration_superseded_contexts
+            .remove(identity)
+            .unwrap_or_default();
+        let Some(current) = self.orchestration_context_paths.remove(identity) else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        for path in superseded.into_iter().chain(std::iter::once(current)) {
+            if released.contains(&path) || self.context_path_recorded(&path, None) {
+                continue;
+            }
+            crate::prep_token::revoke_context_path(&path);
+            released.push(path);
+        }
+        released
+    }
+
+    /// Issue #1445: whether any orchestration other than `except` records
+    /// `path`, as its newest context file or as one a re-arm replaced.
+    fn context_path_recorded(
+        &self,
+        path: &std::path::Path,
+        except: Option<&OrchestrationIdentity>,
+    ) -> bool {
+        let other = |identity: &OrchestrationIdentity| except != Some(identity);
+        self.orchestration_context_paths
+            .iter()
+            .any(|(identity, recorded)| other(identity) && recorded == path)
+            || self
+                .orchestration_superseded_contexts
+                .iter()
+                .any(|(identity, files)| {
+                    other(identity) && files.iter().any(|recorded| recorded == path)
+                })
+    }
+
+    /// Issue #1445: the context file a re-arm report from `pane_id` would
+    /// replace — the newest file recorded for the orchestration that pane is
+    /// the coordinator of — provided `reported` could follow it. Read-only, so
+    /// the daemon can compare the two files
+    /// ([`crate::orchestrator_context::compare_rearmed_context`]) off the state
+    /// lock before [`Self::record_rearmed_orchestration_context`] re-checks and
+    /// records.
+    pub fn rearmed_context_target(
+        &self,
+        pane_id: &str,
+        reported: &std::path::Path,
+    ) -> Result<std::path::PathBuf, RearmedContextRefusal> {
+        self.check_rearmed_context(pane_id, reported)
+            .map(|(_, current, _)| current.clone())
+    }
+
+    /// Issue #1445: follow a re-arm publication. `pane_id` reported that it
+    /// re-armed its orchestration's coordinator from `reported`; make that the
+    /// file the orchestration's start role is advertised with, and keep the one
+    /// it replaces for deletion at the end
+    /// ([`Self::orchestration_superseded_contexts`]). Answers whether the record
+    /// changed (`false` when `reported` already is the newest file).
+    ///
+    /// The checks ([`RearmedContextRefusal`]) are lexical and against this
+    /// state only: `pane_id` must be a registered orchestrator seat whose
+    /// orchestration has a recorded file, and `reported` must be a per-publish
+    /// file in that recorded file's own `.dot-agent-deck` that no other
+    /// orchestration records. That `reported` carries the same brief as, and
+    /// is not older than, the recorded file is the caller's to establish first,
+    /// off the lock, because it reads both files — the daemon's dispatch does
+    /// ([`crate::orchestrator_context::compare_rearmed_context`]) — and
+    /// `compared` is the recorded file it compared against. If the record has
+    /// moved since (another report, or a new start, recorded a file in
+    /// between), this refuses with [`RearmedContextRefusal::RecordMoved`] and
+    /// records nothing, so a comparison is never applied to a file it was not
+    /// made against (Qodo on PR #1554); the caller compares again.
+    pub fn record_rearmed_orchestration_context(
+        &mut self,
+        pane_id: &str,
+        reported: &std::path::Path,
+        compared: &std::path::Path,
+    ) -> Result<bool, RearmedContextRefusal> {
+        let (identity, current, reported) = self.check_rearmed_context(pane_id, reported)?;
+        if reported == *current {
+            return Ok(false);
+        }
+        if current != compared {
+            return Err(RearmedContextRefusal::RecordMoved);
+        }
+        let (identity, current) = (identity.clone(), current.clone());
+        self.supersede_context(&identity, current, &reported);
+        self.orchestration_context_paths.insert(identity, reported);
+        Ok(true)
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): keep `reported` for deletion at the end
+    /// without following it — the report of a re-arm file dated before the
+    /// recorded file, which reached the daemon after a later one. The record
+    /// stays where it is, and the file joins
+    /// ([`Self::orchestration_superseded_contexts`]), so ending the
+    /// orchestration removes it rather than leaving it to the retention sweep.
+    /// Answers whether it was added (`false` when it is the recorded file).
+    ///
+    /// The same checks and the same `compared` contract as
+    /// [`Self::record_rearmed_orchestration_context`]: the caller has
+    /// established, off the lock, that `reported` carries the brief of
+    /// `compared` and is older than it, and if the record has moved since this
+    /// refuses with [`RearmedContextRefusal::RecordMoved`] so the caller
+    /// compares again.
+    pub fn keep_older_rearmed_orchestration_context(
+        &mut self,
+        pane_id: &str,
+        reported: &std::path::Path,
+        compared: &std::path::Path,
+    ) -> Result<bool, RearmedContextRefusal> {
+        let (identity, current, reported) = self.check_rearmed_context(pane_id, reported)?;
+        if reported == *current {
+            return Ok(false);
+        }
+        if current != compared {
+            return Err(RearmedContextRefusal::RecordMoved);
+        }
+        let (identity, current) = (identity.clone(), current.clone());
+        self.supersede_context(&identity, reported, &current);
+        Ok(true)
+    }
+
+    /// The shared checks of [`Self::rearmed_context_target`] and
+    /// [`Self::record_rearmed_orchestration_context`]: the orchestration
+    /// `pane_id` coordinates, its newest recorded file, and `reported` rebuilt
+    /// from that file's directory and `reported`'s own file name.
+    fn check_rearmed_context(
+        &self,
+        pane_id: &str,
+        reported: &std::path::Path,
+    ) -> Result<
+        (
+            &OrchestrationIdentity,
+            &std::path::PathBuf,
+            std::path::PathBuf,
+        ),
+        RearmedContextRefusal,
+    > {
+        let identity = Some(pane_id)
+            .filter(|pane| self.orchestrator_pane_ids.contains(*pane))
+            .and_then(|pane| self.pane_orchestration_map.get(pane))
+            .ok_or(RearmedContextRefusal::NotACoordinator)?;
+        let current = self
             .orchestration_context_paths
-            .values()
-            .any(|other| *other == path);
-        if still_referenced {
-            return None;
+            .get(identity)
+            .ok_or(RearmedContextRefusal::NoRecordedContext)?;
+        let dir = current
+            .parent()
+            .ok_or(RearmedContextRefusal::NotBesideTheRecordedContext)?;
+        let name = reported
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| crate::orchestrator_context::is_unique_context_file_name(name))
+            .filter(|_| {
+                reported.parent() == Some(dir)
+                    && reported
+                        .components()
+                        .all(|c| !matches!(c, std::path::Component::ParentDir))
+            })
+            .ok_or(RearmedContextRefusal::NotBesideTheRecordedContext)?;
+        let reported = dir.join(name);
+        if self.context_path_recorded(&reported, Some(identity)) {
+            return Err(RearmedContextRefusal::AnotherOrchestrationsContext);
         }
-        crate::prep_token::revoke_context_path(&path);
-        Some(path)
+        Ok((identity, current, reported))
     }
 
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
@@ -11251,6 +12822,7 @@ impl AppState {
     /// identity for the pane goes with the entry regardless of variant.
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
+        self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -11264,10 +12836,16 @@ impl AppState {
             // Issue #1395 item 2: and so does its per-publish context file.
             // Decided here, under the caller's lock; the unlink runs on a
             // blocking thread so no caller holds the state lock across IO.
-            if let Some(path) = self.take_ended_orchestration_context(&identity) {
+            for path in self.take_ended_orchestration_context(&identity) {
                 spawn_context_removal(path);
             }
         }
+    }
+
+    /// Issue #1507: the daemon registry id `pane_id`'s card-surfacing
+    /// `SessionStart` named, as a number — see `pane_surfaced_agent_seq`.
+    pub fn pane_surfaced_agent_seq(&self, pane_id: &str) -> Option<u64> {
+        self.pane_surfaced_agent_seq.get(pane_id).copied()
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -11308,8 +12886,8 @@ impl AppState {
     ///
     /// Before PRD #140 this came straight out of `pane_orchestration_map`, whose
     /// value was a `(name, orchestration_cwd)` tuple. #140 replaced that value
-    /// with an [`OrchestrationIdentity`] whose `Instance` variant keys on a
-    /// per-tab token and carries **no cwd at all**, so reading it back out of the
+    /// with an [`OrchestrationIdentity`] that keys on a per-tab token and
+    /// carries **no cwd at all**, so reading it back out of the
     /// routing identity would silently resolve `None` for every modern client and
     /// quietly downgrade the resolution to the worker cwd. Instead this rebuilds
     /// the same value the daemon folded into the legacy tuple at `StartAgent`
@@ -11335,9 +12913,8 @@ impl AppState {
     /// we don't want the orchestrator's pane fed its own delegate prompt).
     ///
     /// PRD #140 M2.1: "same orchestration" is [`OrchestrationIdentity`]
-    /// equality — `Instance` vs `Instance` on the per-tab token, `NameCwd` vs
-    /// `NameCwd` on the legacy tuple, never across variants. The
-    /// orchestrator-self-exclusion and the role-name match are unchanged.
+    /// equality — the per-tab token. The orchestrator-self-exclusion and the
+    /// role-name match are unchanged.
     ///
     /// PRD #126 M1 audit (finding 3): a role repeated within one signal
     /// (`to: ["coder", "coder"]`) is de-duplicated. It used to dispatch the
@@ -11351,6 +12928,18 @@ impl AppState {
     /// this has decided the targets, so a test of this function is a test of
     /// where a delegate actually lands (M5.0).
     pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        self.route_delegate(sender_pane_id, to, true)
+    }
+
+    /// [`Self::delegate_targets`], logging the roles it drops only when
+    /// `log_dropped` is set — so a caller that needs the routing before the delegate is
+    /// handled (issue #1387's config read) does not log those warnings twice.
+    fn route_delegate(
+        &self,
+        sender_pane_id: &str,
+        to: &[String],
+        log_dropped: bool,
+    ) -> Vec<(String, String)> {
         let orchestration = self.pane_orchestration_map.get(sender_pane_id);
         let mut targets: Vec<(String, String)> = Vec::new();
         let mut seen_roles: HashSet<&str> = HashSet::new();
@@ -11367,10 +12956,12 @@ impl AppState {
                 // own note treats `signal.to` as already safe because the daemon
                 // logs the whole array with `?`-Debug; that holds for the array
                 // and not for an element interpolated with `%` here.
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: duplicate target role in one signal; ignored"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: duplicate target role in one signal; ignored"
+                    );
+                }
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -11384,10 +12975,12 @@ impl AppState {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
             if role_panes.is_empty() {
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: no worker pane found for role"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: no worker pane found for role"
+                    );
+                }
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -11407,8 +13000,8 @@ impl AppState {
     /// `None` when the worker's orchestration has no live orchestrator.
     ///
     /// PRD #140 M2.2: scoped by [`OrchestrationIdentity`] equality. With a
-    /// per-tab `Instance` token at most ONE orchestrator can match, so the
-    /// answer is deterministic. Pre-#140 (and still, for the `NameCwd`
+    /// per-tab token at most ONE orchestrator can match, so the answer is
+    /// deterministic. Pre-#140 (and, until issue #463, for the token-less
     /// fallback) two same-`(name, cwd)` tabs both matched and the winner was
     /// decided by `HashSet` iteration order — the non-deterministic half of
     /// issue #140.
@@ -11478,23 +13071,59 @@ impl AppState {
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
-        self.handle_attested_delegate(signal, registry, event_tx, state, None)
-            .await
+        // Issue #1387: read off the runtime's thread, but with `&self` — which
+        // may be a guard on the daemon's state — still held, so this is for a
+        // caller holding no shared guard (a bare `AppState` in a fixture). The
+        // daemon goes through the free [`handle_attested_delegate`], which
+        // reads with no guard held at all.
+        let configs = ProjectConfigs::load(self.delegate_config_dirs(&signal, registry)).await;
+        self.handle_attested_delegate_with_configs(
+            signal, registry, event_tx, state, None, &configs,
+        )
+        .await
     }
 
-    /// [`Self::handle_delegate_with_state`] for a delegate whose sender the hook
-    /// provenance gate attested: `sender_agent_id` is the registry agent id its
-    /// capability token was minted for. The daemon's hook loop calls this; see
-    /// [`record_delegation_commission`] for what the identity decides (issue #580
-    /// review, Qodo, #1285). `None` behaves exactly as
-    /// [`Self::handle_delegate_with_state`].
-    pub async fn handle_attested_delegate(
+    /// Issue #1387: every directory a delegate from `signal` resolves a project
+    /// config from — the orchestration's, and the cwd of each pane it routes
+    /// to — and none at all for a sender it is about to refuse, so neither a
+    /// refused caller nor a pane the delegate does not reach can make it wait
+    /// on a slow file.
+    fn delegate_config_dirs(
+        &self,
+        signal: &DelegateSignal,
+        registry: &AgentPtyRegistry,
+    ) -> Vec<String> {
+        if !self.is_orchestrator_caller(&signal.pane_id) {
+            return Vec::new();
+        }
+        let mut dirs: Vec<String> = self
+            .orchestration_cwd_of(&signal.pane_id, registry)
+            .into_iter()
+            .collect();
+        dirs.extend(
+            self.route_delegate(&signal.pane_id, &signal.to, false)
+                .into_iter()
+                .filter_map(|(_, pane_id)| self.pane_cwd_map.get(&pane_id).cloned()),
+        );
+        dirs
+    }
+
+    /// The body of [`Self::handle_delegate_with_state`] and of the free
+    /// [`handle_attested_delegate`], resolving every project config it needs
+    /// from `configs` — it reads no file itself (issue #1387).
+    ///
+    /// `sender_agent_id` is the registry agent id the sender's capability token
+    /// was minted for, when the hook provenance gate attested it; see
+    /// [`record_delegation_commission`] for what the identity decides (issue
+    /// #580 review, Qodo, #1285).
+    async fn handle_attested_delegate_with_configs(
         &self,
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
         sender_agent_id: Option<&str>,
+        configs: &ProjectConfigs,
     ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
@@ -11509,7 +13138,7 @@ impl AppState {
         // orchestration, for resolving `worker_response_timeout_minutes`. Read
         // once per delegate (it is a property of the orchestrator pane, not of
         // each target) and separately from the routing identity, because #140's
-        // `Instance` variant carries no cwd — see [`Self::orchestration_cwd_of`].
+        // identity carries no cwd — see [`Self::orchestration_cwd_of`].
         let orchestration_cwd = self.orchestration_cwd_of(&signal.pane_id, registry);
         // PRD #140 M2.1: routing (same-orchestration identity + never the
         // orchestrator's own pane) lives in `delegate_targets`, which also
@@ -11535,7 +13164,7 @@ impl AppState {
         // Issue #580: "resolved" is no longer "delivered". A resolved role whose
         // worker still owes a `work-done` is refused below and reported in `busy`
         // instead, so `delivered` is filled by the fan-out loop itself.
-        let unresolved_roles: Vec<String> = {
+        let mut unresolved_roles: Vec<String> = {
             let mut missing: Vec<String> = Vec::new();
             for role in &signal.to {
                 if !targets.iter().any(|(r, _)| r == role) && !missing.iter().any(|r| r == role) {
@@ -11548,6 +13177,7 @@ impl AppState {
         let mut busy: Vec<crate::event::BusyWorker> = Vec::new();
         let mut superseded: Vec<crate::event::BusyWorker> = Vec::new();
         let mut blocked: Vec<crate::event::BlockedWorker> = Vec::new();
+        let mut exited_roles: Vec<String> = Vec::new();
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -11570,6 +13200,33 @@ impl AppState {
         // the per-pane dispatch mutex acquired inside the task body —
         // see [`AgentPtyRegistry::pane_dispatch_lock`].
         for (target_role, pane_id) in targets {
+            // Issue #524: a worker that crashed or quit on its own is still in
+            // the role maps — nothing on the natural-exit path takes it out — so
+            // the role resolved to its pane. A `clear = true` role is respawned by the
+            // dispatch below and really does get the task. Any other role has
+            // nothing left to receive it: the pointer write would fail inside the
+            // detached dispatch, long after this reply said "delivered". Decided
+            // the way `dispatch_one_owned` decides whether to respawn, from the
+            // same `cwd` and orchestration, before anything is armed.
+            if registry.pane_occupant_has_exited(&pane_id)
+                && !delegate_respawns_worker(
+                    configs,
+                    self.pane_cwd_map.get(&pane_id).map(String::as_str),
+                    orchestration.as_ref(),
+                    &target_role,
+                )
+            {
+                warn!(
+                    pane_id = %pane_id,
+                    role = %target_role,
+                    "delegate: the worker in this pane has exited and the role is not respawned \
+                     on delegate; reporting the role as unreached"
+                );
+                if !exited_roles.contains(&target_role) {
+                    exited_roles.push(target_role);
+                }
+                continue;
+            }
             // Issue #714: note a worker whose card reads `Blocked`, whether it is
             // delivered to or refused as busy below. A warning and never a
             // refusal: the status is reported by the agent's own hooks or session
@@ -11669,7 +13326,12 @@ impl AppState {
             // pointer is actually written to, and to the fresh agent on a
             // `clear = true` respawn.
             if let Some(in_flight) = commission_in_flight.as_ref()
-                && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
+                && !delegate_respawns_worker(
+                    configs,
+                    cwd.as_deref(),
+                    orchestration.as_ref(),
+                    &target_role,
+                )
             {
                 if let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) {
                     registry.bind_commission_worker_agent_id(
@@ -11710,8 +13372,7 @@ impl AppState {
                 &target_role,
                 &orchestrator_pane_id,
                 orchestration.as_ref(),
-                orchestration_cwd.as_deref(),
-                cwd.as_deref(),
+                worker_response_timeout_in(configs, orchestration_cwd.as_deref(), cwd.as_deref()),
             );
             // Issue #544 (PR #1398 review): the guard that ends the "queued"
             // mark the arm just set, built before anything else can fail and
@@ -11731,8 +13392,8 @@ impl AppState {
             // while the delegate is still live, not on the dispatch task's first
             // poll, which can land after the pane changed hands.
             let silence_watch =
-                delegate_no_event_window(orchestration_cwd.as_deref(), cwd.as_deref()).map(
-                    |window| SilenceWatch {
+                delegate_no_event_window(configs, orchestration_cwd.as_deref(), cwd.as_deref())
+                    .map(|window| SilenceWatch {
                         window,
                         target: SilenceReportTarget {
                             pane_id: orchestrator_pane_id.clone(),
@@ -11741,8 +13402,7 @@ impl AppState {
                         },
                         redeliveries: None,
                         retry_done: None,
-                    },
-                );
+                    });
 
             // Issue #962: read NOW, under the guard this delegate is being handled
             // with — see `dispatch_one_owned`'s `recorded_title`.
@@ -11767,6 +13427,17 @@ impl AppState {
                 )
                 .await;
             });
+        }
+
+        // Issue #524: a role whose every pane held an exited worker reached no
+        // worker, and is reported exactly like a role that resolved to no pane.
+        for role in exited_roles {
+            if !delivered.contains(&role)
+                && !busy.iter().any(|worker| worker.role == role)
+                && !unresolved_roles.contains(&role)
+            {
+                unresolved_roles.push(role);
+            }
         }
 
         // Issue #580: nothing was dispatched and at least one worker was refused
@@ -11908,6 +13579,14 @@ impl AppState {
         }
     }
 
+    /// Whether [`Self::refuse_unless_orchestrator_caller`] would let `pane_id`
+    /// through, without its warnings. Issue #1387: a verb asks this before
+    /// reading the project config, so a caller about to be refused waits on no
+    /// file read.
+    fn is_orchestrator_caller(&self, pane_id: &str) -> bool {
+        self.pane_role_map.contains_key(pane_id) && self.orchestrator_pane_ids.contains(pane_id)
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -11937,6 +13616,37 @@ impl AppState {
         }
         None
     }
+}
+
+/// The daemon's `delegate` verb: [`AppState::handle_delegate_with_state`] for a
+/// delegate whose sender the hook provenance gate attested, `sender_agent_id`
+/// being the registry agent id its capability token was minted for. `None`
+/// behaves exactly as an unattested delegate.
+///
+/// Issue #1387: a FREE function taking the [`SharedState`] handle rather than an
+/// `AppState` method called through the caller's read guard, so the project
+/// configs the delegate resolves roles and timeouts from are read with no guard
+/// held — see [`read_guard_with_project_configs`]. The routing that follows
+/// runs under one guard, as before.
+pub async fn handle_attested_delegate(
+    signal: DelegateSignal,
+    state: &SharedState,
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    sender_agent_id: Option<&str>,
+) -> crate::event::DelegateResponse {
+    let (guard, configs) =
+        read_guard_with_project_configs(state, |s| s.delegate_config_dirs(&signal, registry)).await;
+    guard
+        .handle_attested_delegate_with_configs(
+            signal,
+            registry,
+            event_tx,
+            Some(state),
+            sender_agent_id,
+            &configs,
+        )
+        .await
 }
 
 /// Shared by [`handle_restart_role_with_state`]'s early (pre-lock) crash
@@ -12046,7 +13756,28 @@ pub async fn handle_restart_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a request one of the checks below refuses before it gets to
+        // the role's config.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            let targets =
+                s.route_delegate(&signal.pane_id, std::slice::from_ref(&signal.role), false);
+            let [(_, pane_id)] = targets.as_slice() else {
+                return Vec::new();
+            };
+            if restart_refusal_for_crashed_pane(registry, pane_id, &signal.role, signal.force)
+                .is_some()
+            {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "restart a role")
         {
@@ -12105,11 +13836,27 @@ pub async fn handle_restart_role_with_state(
         let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
         let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+                lookup_orchestration_role_indexed(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
         let Some((role_index, role_config)) = role_config_indexed else {
+            // Issue #1396 item 2 (agent review, PR #1557): a directory that has
+            // been deleted has no config to read either, and "could not resolve
+            // the role" sends the user to the wrong file. Name the cause, in the
+            // words the respawn's own check would have used.
+            if let Some(c) = cwd.as_deref()
+                && !std::path::Path::new(c).is_dir()
+            {
+                return RestartRoleResponse {
+                    error: Some(format!(
+                        "failed to restart role `{}`: {}. Nothing was restarted.",
+                        signal.role,
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(c.to_string())
+                    )),
+                    ..Default::default()
+                };
+            }
             return RestartRoleResponse {
                 error: Some(format!(
                     "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
@@ -12177,10 +13924,7 @@ pub async fn handle_restart_role_with_state(
                 .title
                 .as_ref()
                 .and_then(|held| held.display_title.clone()),
-            orchestration_id: match resolved.orchestration.as_ref() {
-                Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
-                _ => None,
-            },
+            orchestration_id: resolved.orchestration.as_ref().map(|o| o.id.clone()),
         }),
         agent_type: resolved.role_config.resolved_agent_type(),
         env: vec![(
@@ -12244,6 +13988,7 @@ pub async fn handle_restart_role_with_state(
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
                 let title = resolved.title.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let mut state = state.write().await;
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
@@ -12263,6 +14008,7 @@ pub async fn handle_restart_role_with_state(
                         identity,
                         cwd.as_deref(),
                     );
+                    state.announce_unproven_evictions(&event_tx);
                 });
             }
             RestartRoleResponse {
@@ -12322,7 +14068,17 @@ pub async fn handle_spawn_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a caller the first check below refuses.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "spawn a role")
         {
@@ -12337,7 +14093,7 @@ pub async fn handle_spawn_role_with_state(
 
         let role_config_seated = match (cwd.as_deref(), identity.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_seated(c, identity.name(), &signal.role)
+                lookup_orchestration_role_seated(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
@@ -12431,10 +14187,7 @@ pub async fn handle_spawn_role_with_state(
     };
 
     let pane_id = crate::spawn::next_pane_id(resolved.identity.name(), Some(resolved.role_index));
-    let orchestration_id = match &resolved.identity {
-        OrchestrationIdentity::Instance { id, .. } => Some(id.clone()),
-        OrchestrationIdentity::NameCwd { .. } => None,
-    };
+    let orchestration_id = Some(resolved.identity.id.clone());
 
     let spawn_result = registry.spawn_agent(crate::agent_pty::SpawnOptions {
         command: Some(resolved.role_config.command.as_str()),
@@ -12509,6 +14262,7 @@ pub async fn handle_spawn_role_with_state(
             resolved.identity,
             resolved.cwd.as_deref(),
         );
+        state_guard.announce_unproven_evictions(event_tx);
     }
 
     // Best-effort, like `surface_spawned_orchestration`'s own
@@ -13049,13 +14803,39 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, event: AgentEvent) {
-        let _ = self.apply_event_reporting(event);
+        let _ = self.apply_event_reporting(event, None);
     }
 
     /// [`Self::apply_event`], reporting what it did with the event — see
     /// [`AppliedEvent`]. The daemon's waiting-for-input watch is the one caller
     /// that needs the answer (issue #447).
-    fn apply_event_reporting(&mut self, mut event: AgentEvent) -> AppliedEvent {
+    ///
+    /// `attested_agent` is the generation an attested hook event's token was
+    /// minted for (see [`Self::apply_hook_event_watching_waiting`]); `None` for
+    /// every other event.
+    fn apply_event_reporting(
+        &mut self,
+        event: AgentEvent,
+        attested_agent: Option<&str>,
+    ) -> AppliedEvent {
+        self.applied_unproven = false;
+        let applied = self.apply_event_unsettled(event, attested_agent);
+        // Issue #697: whatever the event removed, the unproven bookkeeping
+        // follows it — see [`Self::settle_unproven`].
+        self.settle_unproven(None);
+        if self.applied_unproven {
+            self.enforce_unproven_journal_budget();
+        }
+        applied
+    }
+
+    /// The body of [`Self::apply_event_reporting`], before the unproven-session
+    /// bookkeeping is settled.
+    fn apply_event_unsettled(
+        &mut self,
+        mut event: AgentEvent,
+        attested_agent: Option<&str>,
+    ) -> AppliedEvent {
         // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
         // a pane, not a producer's conversation ending, so none of the
         // `SessionEnd` machinery below applies to it — in particular its
@@ -13065,6 +14845,14 @@ impl AppState {
                 self.apply_daemon_pane_closed(pane_id, event.agent_id.as_deref());
             }
             return AppliedEvent::StatusAsserted;
+        }
+        // Issue #697: the daemon evicted an outside agent's card to stay within
+        // `MAX_UNPROVEN_SESSIONS`. Like the pane-closed announcement it is a
+        // statement about a card, not a conversation ending, and it must not
+        // restore a placeholder for what it removes.
+        if event.is_unproven_eviction() {
+            self.apply_unproven_eviction(&event);
+            return AppliedEvent::Rejected;
         }
         // Issue #714: the daemon's lift of a replaced agent's block is a
         // statement about ONE existing card — the replaced agent's. A client
@@ -13195,81 +14983,137 @@ impl AppState {
         // through, and the daemon's answer binds it to `event.pane_id` — a pane
         // is a reusable slot, so "someone owns P" was never evidence that THIS
         // report belongs to P's current occupant. See [`AgentOwnership`].
+        //
+        // Issue #601: and admission now records HOW an event was admitted. An
+        // event admitted on nothing but its sender's word — an outside agent's
+        // pane, or a paneless agent this deck never spawned — is UNPROVEN: it
+        // may draw and update its own card, but that card never makes its pane
+        // one of ours and counts against `MAX_UNPROVEN_SESSIONS` (#697). The
+        // daemon decides it (its oracle, plus the hook gate's
+        // `crate::event::UNPROVEN_METADATA_KEY` marker); an attached client has
+        // no registry and reads the daemon's marker.
+        //
+        // The marker is AUTHORITATIVE (audit finding 3). It is the hook gate's
+        // verdict that the sender holds no capability for what it names, and a
+        // later ownership lookup on the ids the sender chose must not overturn
+        // it: a pane can be issued a token between the gate classifying an
+        // event and this applying it, and the lookup would then credit the
+        // forgery to the agent that just arrived. So a marked event never takes
+        // the owned arm, in the daemon or in a client.
+        //
+        // One exception, in a client only, and it is NOT an ownership grant: an
+        // event the daemon ALSO marked as coming from a pane it holds no live
+        // agent on — an orphaned orchestration role pane (issue #770), or any
+        // pane ([`crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY`], round 3) —
+        // on a pane this client registered as its own, may update the bounded
+        // reporting state (and, for a role pane, the orphan badge) of the ONE
+        // card already on that pane: the daemon-restart survivor's, which a
+        // client attached across the restart still shows, and whose reports the
+        // new daemon cannot attest. It goes through
+        // [`Self::apply_orphan_survivor_report`] and nothing below: it creates,
+        // re-keys, adopts, retires and removes no card, writes no per-agent or
+        // per-pane record, and only lands when it names the card's own agent
+        // (round-2 audit findings 1-3). The daemon stamps both verdicts under
+        // its state lock, from a registry and role map read there, so a pane it
+        // has since spawned an agent on is not stamped.
+        let marked_unproven = event.is_unproven();
+        // Audit finding 2: the generation an attested event that named no agent
+        // is judged by — its token's own spawn (see
+        // [`Self::apply_hook_event_watching_waiting`]).
+        let admission_agent = event
+            .agent_id
+            .clone()
+            .or(attested_agent.map(str::to_string));
+        let unproven;
         if let Some(ref pane_id) = event.pane_id {
-            if !self.owns_pane_event(pane_id, event.agent_id.as_deref()) {
-                if event.event_type == EventType::SessionStart {
-                    // Defense in depth (auditor finding #1 follow-up):
-                    // reject the synthetic dead-slot id format from the
-                    // auto-register branch so a forged hook event can't
-                    // bring an `__dead-slot__-…` id into existence.
-                    // Production never sets a synthetic id as
-                    // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
-                    // admits the format on its own (it only checks for
-                    // `[A-Za-z0-9_-]`).
-                    if crate::ui::is_dead_slot_pane_id(pane_id) {
-                        return AppliedEvent::Rejected;
-                    }
-                    // Round 2, and the reason this is NOT a widening of the
-                    // pre-existing `SessionStart` escape hatch (#601, out of
-                    // scope): auto-registration exists for the STARTUP RACE, a
-                    // hook that fires before `register_pane` is called for a
-                    // pane this process is about to own. A pane the registry
-                    // ALREADY has a generation for is not in that race — the
-                    // generation-scoped check just above has looked and found
-                    // one, under a different id. Registering it here would be
-                    // strictly worse than doing nothing: `managed_pane_ids` is
-                    // permanent and pane-scoped, so one forged `SessionStart`
-                    // would turn a generation-checked pane into a bearer-token
-                    // one for the rest of the daemon's life. Deny instead.
-                    //
-                    // A pane the registry has never heard of keeps the
-                    // historical behaviour verbatim, so #601 is neither fixed
-                    // nor made worse here.
-                    //
-                    // Round 3 (reviewer blocker 2), and the reason this branch
-                    // is a `match` rather than an `if`: promoting a pane on the
-                    // strength of the registry NOT claiming it is a case where
-                    // absence GRANTS, so only a positive `Unclaimed` will do. A
-                    // `bool` answer made a registry that could not be asked —
-                    // poisoned lock, dropped `Weak` — indistinguishable from one
-                    // that had looked and found nothing, and the fail-closed
-                    // denial inside the oracle therefore arrived here as an
-                    // admission: one forged `SessionStart` against a real,
-                    // registry-held pane promoted it into `managed_pane_ids`
-                    // permanently, and every later event for it then matched the
-                    // pane-scoped ground and skipped the oracle entirely.
-                    match self.oracle_ownership(Some(pane_id.as_str()), None) {
-                        // The registry claims this pane; it is not in the
-                        // startup race and stays generation-checked.
-                        Some(Ownership::Owned) => return AppliedEvent::Rejected,
-                        // The registry could not answer. That is not evidence
-                        // that the pane is free, and this is the one place where
-                        // treating it as evidence would hand out a permanent
-                        // bearer token.
-                        Some(Ownership::Unknown) => return AppliedEvent::Rejected,
-                        // Genuinely unclaimed, or no registry at all (the TUI,
-                        // whose own panes are exactly what this race is about).
-                        Some(Ownership::Unclaimed) | None => {}
-                    }
-                    // Auto-register the pane to handle the startup race where
-                    // the hook fires before register_pane is called.
-                    //
-                    // The check above and this insert are still not atomic
-                    // against a concurrent spawn reserving the pane — they take
-                    // different locks and cannot be made atomic here. They do
-                    // not have to be: `Self::registration_admits` makes what
-                    // this inserts SUBORDINATE to a registry claim at every
-                    // later use, so a pane the registry claims by then is
-                    // generation-checked regardless of how it got into this set
-                    // (reviewer finding 3).
-                    self.managed_pane_ids.insert(pane_id.clone());
-                } else {
+            let owned =
+                !marked_unproven && self.owns_pane_event(pane_id, admission_agent.as_deref());
+            if owned {
+                unproven = false;
+            } else if marked_unproven && self.managed_pane_ids.contains(pane_id) {
+                if self.agent_ownership.is_none()
+                    && (event.is_orchestration_orphaned() || event.is_daemon_no_live_agent())
+                    && let Some(card) =
+                        self.orphan_survivor_card(pane_id, event.agent_id.as_deref())
+                {
+                    return self.apply_orphan_survivor_report(&card, event);
+                }
+                // A pane this process registered as its own: an unproven event
+                // is neither its owner's report nor an outside agent's pane.
+                return AppliedEvent::Rejected;
+            } else if self.foreign_admits(pane_id) {
+                unproven = true;
+            } else if event.event_type == EventType::SessionStart {
+                // Defense in depth (auditor finding #1 follow-up):
+                // reject the synthetic dead-slot id format from the
+                // auto-register branch so a forged hook event can't
+                // bring an `__dead-slot__-…` id into existence.
+                // Production never sets a synthetic id as
+                // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
+                // admits the format on its own (it only checks for
+                // `[A-Za-z0-9_-]`).
+                if crate::ui::is_dead_slot_pane_id(pane_id) {
                     return AppliedEvent::Rejected;
                 }
+                // Round 2: a pane the registry ALREADY has a generation for is
+                // not an unknown pane — the generation-scoped check just above
+                // has looked and found one, under a different id. Admitting it
+                // here would let one forged `SessionStart` draw a card on a
+                // generation-checked pane. Deny instead.
+                //
+                // Round 3 (reviewer blocker 2), and the reason this branch is a
+                // `match` rather than an `if`: admitting a pane on the strength
+                // of the registry NOT claiming it is a case where absence
+                // GRANTS, so only a positive `Unclaimed` will do. A registry that
+                // could not be asked — poisoned lock, dropped `Weak` — is not
+                // evidence that the pane is free.
+                match self.oracle_ownership(Some(pane_id.as_str()), None) {
+                    Some(Ownership::Owned) | Some(Ownership::Unknown) => {
+                        return AppliedEvent::Rejected;
+                    }
+                    // Genuinely unclaimed, or no registry at all (the TUI,
+                    // whose own panes are exactly what the startup race is
+                    // about).
+                    Some(Ownership::Unclaimed) | None => {}
+                }
+                if marked_unproven || self.agent_ownership.is_some() {
+                    // Issue #601: an outside agent's start. With an oracle
+                    // installed (the daemon), anything reaching this branch is
+                    // by definition not registry-proven; a client reads the
+                    // daemon's marker. Either way the card is admitted, but the
+                    // pane is NOT promoted into `managed_pane_ids` — before
+                    // this, one forged `SessionStart` made a pane "ours" for the
+                    // life of the process. The pane joins the unproven set when
+                    // its session is created below, so a start a later guard
+                    // rejects records nothing.
+                    unproven = true;
+                } else {
+                    // The TUI's startup race: a hook from one of its own panes
+                    // fires before `register_pane` is called. The daemon never
+                    // marks such a pane (it issued it a token), so an unmarked
+                    // start is this process's own pane arriving early.
+                    //
+                    // Not atomic against a concurrent claim; it does not have to
+                    // be: `Self::registration_admits` makes what this inserts
+                    // SUBORDINATE to a registry claim at every later use
+                    // (reviewer finding 3).
+                    self.managed_pane_ids.insert(pane_id.clone());
+                    unproven = false;
+                }
+            } else {
+                return AppliedEvent::Rejected;
             }
         } else if !self.admits_paneless_event(event.agent_id.as_deref()) {
             return AppliedEvent::Rejected;
+        } else {
+            unproven = marked_unproven
+                || (self.agent_ownership.is_some()
+                    && !matches!(
+                        self.oracle_ownership(None, event.agent_id.as_deref()),
+                        Some(Ownership::Owned)
+                    ));
         }
+        self.applied_unproven = unproven;
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
         // is not evidence of a takeover and may retire nothing. Hoisted above
         // the reuse guard for issue #398 — the adoption fallback below needs the
@@ -13375,6 +15219,59 @@ impl AppState {
             }
         }
 
+        // Issue #601, audit finding 1: an unproven event may reach only an
+        // outside agent's own card. Checked here, on the key every later seam
+        // resolves the frame through, and before any of them mutates anything:
+        // a key naming a card this process holds as PROVEN is refused whatever
+        // either side's pane is. The re-key above only separates two panes that
+        // are both named, so a paneless frame naming a paned card's key, or a
+        // paned frame naming a paneless card's key, arrives here still on that
+        // card — and would otherwise update it, enrol it in the evictable
+        // unproven set, relocate it, or end it.
+        if unproven && self.is_proven_session(&event.session_id) {
+            return AppliedEvent::Rejected;
+        }
+
+        // Issue #318 (Greptile, PR #1559): a frame the daemon attested to one
+        // agent that names no agent itself may not reach a card of ANOTHER
+        // agent's. The daemon re-checks that such a frame's token generation
+        // still holds its pane, but a successor can claim the pane between that
+        // check and the broadcast, and this client — which has no registry —
+        // would then land the replaced generation's report on the successor's
+        // card: the direct key (Pi reports every generation under one
+        // pane-derived key), or the one card on the pane the untagged adoption
+        // below picks. For a `SessionEnd` that would remove the successor's card
+        // and restore a bare placeholder. Checked before anything below mutates,
+        // and only in a client: the daemon judges the same frame by the token's
+        // generation (`attested_agent`). The frame's own absent `agent_id` is
+        // left as it is, so the untagged rules downstream are unchanged. See
+        // [`crate::event::ATTESTED_OWNER_METADATA_KEY`].
+        if self.agent_ownership.is_none()
+            && event.agent_id.is_none()
+            && let Some(owner) = event.attested_owner()
+        {
+            let foreign = |session: &SessionState| {
+                session
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|agent| agent != owner)
+            };
+            let direct_is_foreign = self.sessions.get(&event.session_id).is_some_and(foreign);
+            let adopted_is_foreign = claims_generation
+                && event.pane_id.as_deref().is_some_and(|pane_id| {
+                    let mut others = self.sessions.iter().filter(|(id, session)| {
+                        session.pane_id.as_deref() == Some(pane_id) && **id != event.session_id
+                    });
+                    match (others.next(), others.next()) {
+                        (Some((_, only)), None) => foreign(only),
+                        _ => false,
+                    }
+                });
+            if direct_is_foreign || adopted_is_foreign {
+                return AppliedEvent::Rejected;
+            }
+        }
+
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -13418,50 +15315,54 @@ impl AppState {
         // guess — the pane is already ambiguous at that point, and picking one
         // would be the same coin-flip this fix exists to remove.
         if let Some(ref pane_id) = event.pane_id {
-            let on_pane =
-                |session: &SessionState| session.pane_id.as_ref().is_some_and(|p| p == pane_id);
-            let existing_id = self
-                .sessions
-                .iter()
-                .find_map(|(id, session)| {
-                    (on_pane(session)
-                        && id != &event.session_id
-                        && session.agent_id == event.agent_id)
-                        .then(|| id.clone())
-                })
-                .or_else(|| {
-                    if event.agent_id.is_some() {
-                        return None;
-                    }
-                    // Greptile PR #443 finding #1: a TERMINAL frame must never
-                    // adopt. `SessionEnd` is not handled by the status path
-                    // below — it hits the terminal branch, which REMOVES
-                    // `event.session_id` and rebuilds a bare placeholder. So
-                    // adopting one would hand that branch the tagged session
-                    // and destroy exactly what the `None` carve-out exists to
-                    // protect: `recent_events`, `tool_count`, `first_prompts`.
-                    // Before this PR an untagged `SessionEnd` resolved to no
-                    // session at all and was a silent no-op; excluding it here
-                    // keeps precisely that behaviour, so the fix cannot lose
-                    // history on any path.
-                    //
-                    // The narrower reading — "an untagged end can't name a
-                    // generation, so it cannot prove THIS one ended" — is the
-                    // same rule the retire block applies one screen down, where
-                    // `claims_generation` excludes `SessionEnd` for its own
-                    // reasons. An untagged end simply is not evidence.
-                    if !claims_generation {
-                        return None;
-                    }
-                    let mut candidates = self
-                        .sessions
-                        .iter()
-                        .filter(|(id, session)| on_pane(session) && *id != &event.session_id);
-                    match (candidates.next(), candidates.next()) {
-                        (Some((id, _)), None) => Some(id.clone()),
-                        _ => None,
-                    }
-                });
+            // An unproven frame may adopt only an outside agent's card (audit
+            // finding 1); a proven one may adopt any.
+            let unproven_sessions = &self.unproven_sessions;
+            let on_pane = |id: &String, session: &SessionState| {
+                session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                    && (!unproven || unproven_sessions.contains_key(id))
+            };
+            let existing_id =
+                self.sessions
+                    .iter()
+                    .find_map(|(id, session)| {
+                        (on_pane(id, session)
+                            && id != &event.session_id
+                            && session.agent_id == event.agent_id)
+                            .then(|| id.clone())
+                    })
+                    .or_else(|| {
+                        if event.agent_id.is_some() {
+                            return None;
+                        }
+                        // Greptile PR #443 finding #1: a TERMINAL frame must never
+                        // adopt. `SessionEnd` is not handled by the status path
+                        // below — it hits the terminal branch, which REMOVES
+                        // `event.session_id` and rebuilds a bare placeholder. So
+                        // adopting one would hand that branch the tagged session
+                        // and destroy exactly what the `None` carve-out exists to
+                        // protect: `recent_events`, `tool_count`, `first_prompts`.
+                        // Before this PR an untagged `SessionEnd` resolved to no
+                        // session at all and was a silent no-op; excluding it here
+                        // keeps precisely that behaviour, so the fix cannot lose
+                        // history on any path.
+                        //
+                        // The narrower reading — "an untagged end can't name a
+                        // generation, so it cannot prove THIS one ended" — is the
+                        // same rule the retire block applies one screen down, where
+                        // `claims_generation` excludes `SessionEnd` for its own
+                        // reasons. An untagged end simply is not evidence.
+                        if !claims_generation {
+                            return None;
+                        }
+                        let mut candidates = self.sessions.iter().filter(|(id, session)| {
+                            on_pane(id, session) && *id != &event.session_id
+                        });
+                        match (candidates.next(), candidates.next()) {
+                            (Some((id, _)), None) => Some(id.clone()),
+                            _ => None,
+                        }
+                    });
             if let Some(existing_id) = existing_id {
                 let old_id = std::mem::replace(&mut event.session_id, existing_id);
                 if old_id != event.session_id {
@@ -13649,6 +15550,7 @@ impl AppState {
                     session.pane_id.as_ref().is_some_and(|p| p == pane_id)
                         && *id != &event.session_id
                         && session.agent_id != event.agent_id
+                        && (!unproven || self.unproven_sessions.contains_key(*id))
                         && self.supersedes_generation(&event, session)
                 })
                 .map(|(id, _)| id.clone())
@@ -13827,6 +15729,7 @@ impl AppState {
                     })
             {
                 self.pane_hook_session.remove(pane_id);
+                self.pane_generation_announced.remove(pane_id);
                 // Issue #424 H4: the conversation this pane was in is over. The
                 // session and its journal are removed below, so this counter is
                 // the only thing left to tell a TUI pass that sampled the
@@ -13847,10 +15750,13 @@ impl AppState {
                 // ROUND-2 AUDIT (finding 1): the named id is not taken at face
                 // value, and that check is the whole difference between a
                 // witness and a weapon. `owns_pane_event` admits an event whose
-                // pane is merely in `managed_pane_ids`, and an entry there is
-                // itself establishable by posting a `SessionStart` for an
-                // INVENTED pane id ([`Self::apply_event`]'s `SessionStart`
-                // branch inserts one when no oracle claims the pane). So without
+                // pane is merely in `managed_pane_ids`, and in a process with no
+                // oracle an entry there is still establishable by posting an
+                // unmarked `SessionStart` for an INVENTED pane id (the TUI's
+                // startup-race branch). In the daemon it no longer is (issue
+                // #601: an outside start is recorded as unproven, never in
+                // `managed_pane_ids`), but the registry check below is what
+                // holds in every process, so it stays. So without
                 // this, any same-uid process holding the hook socket could post
                 // a `SessionEnd` for a pane it invented while naming a VICTIM
                 // agent that sits on a different pane, and the victim's every
@@ -13883,7 +15789,17 @@ impl AppState {
                 // hook loop, `crate::daemon_protocol::serve_attach_with_counter`
                 // ahead of its accept loop, idempotently), so in the daemon this
                 // is an ownership check and not the historical fallback.
-                if let Some(agent_id) = event.agent_id.as_deref()
+                //
+                // Issue #697: and never for an unproven event. A client with no
+                // oracle reads the `None` arm above, so without this an outside
+                // agent's `SessionEnd` naming any id it liked would grow this
+                // agent-keyed map without bound there. A frame carrying the
+                // daemon's unproven marker is always unproven here: the one
+                // marked frame that reaches a card of this process's own, the
+                // orphan survivor's report, returned above without getting here.
+                if !unproven
+                    && !marked_unproven
+                    && let Some(agent_id) = event.agent_id.as_deref()
                     && matches!(
                         self.oracle_ownership(Some(pane_id.as_str()), Some(agent_id)),
                         None | Some(Ownership::Owned)
@@ -13961,13 +15877,13 @@ impl AppState {
         // continuity, but the generation tracked here rolls forward, so the send
         // guard refuses an old queued prompt against the new conversation.
         //
-        // Greptile finding #4 (monotonic): the generation only ADVANCES; it never
-        // regresses. Advance to the incoming id when it is a genuinely newer
-        // generation — a different id whose event timestamp is at least the
-        // established one (or a fresher timestamp for the same id). A delayed
-        // event from a PRIOR generation (older timestamp, different id) is
-        // IGNORED, so it can neither restore a stale generation nor overwrite the
-        // current one.
+        // Greptile finding #4 (monotonic): the generation never regresses. A
+        // frame naming the current generation refreshes its timestamp; a delayed
+        // event from a PRIOR generation is IGNORED, so it can neither restore a
+        // stale generation nor overwrite the current one. Issue #532 narrowed the
+        // ordinary-frame half further: a non-start frame naming a DIFFERENT
+        // session never moves a pane that already has a generation, however new
+        // it is (see the `Some` arm below).
         //
         // Issue #424 D2 (both reviewers): the monotonic rule above has ONE
         // exception, and it is the same policy `latch_generation` applies. A
@@ -13978,14 +15894,15 @@ impl AppState {
         // future pins this pane's generation permanently, every real
         // announcement afterwards is discarded as a straggler, and the TUI keeps
         // reporting — and authorizing sends against — a conversation that no
-        // longer exists. Ordinary frames keep the monotonic rule, so a delayed
-        // `Thinking` still cannot restore a superseded generation.
+        // longer exists. Ordinary frames cannot move an established generation
+        // at all (issue #532), so a delayed `Thinking` still cannot restore a
+        // superseded generation.
         //
         // A LAUNCHER-ORIGIN start is excluded from the carve-out on purpose: it
         // is explicitly not a conversation announcing itself (PRD #225 M3), and a
         // wrapped pane legitimately has two producers under one registry agent,
         // so letting the wrapper's fork-time start win unconditionally would make
-        // the #532 alternation worse rather than better.
+        // the pane alternate between them (issue #532).
         //
         // Issue #424 F3 (auditor HIGH): that exclusion has to cut BOTH ways. A
         // launcher-origin start naming a DIFFERENT generation used to fall
@@ -14006,9 +15923,10 @@ impl AppState {
         // writes, so a generation established by something that announced no
         // conversation became the target the prompt claimed, and the real agent's
         // announcement then read as that target being lost. See `provisional_start`
-        // below. That also strictly improves
-        // #532: the wrapper's fork-time start can no longer take the generation
-        // off the wrapped agent's native session.
+        // below. That closed the boot-provenance half of #532: the wrapper's
+        // fork-time start can no longer take the generation off the wrapped
+        // agent's native session. Issue #532 itself closed the ordinary-frame
+        // half.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
@@ -14060,13 +15978,36 @@ impl AppState {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
-                    } else if provisional_start {
-                        // Boot provenance never replaces a live conversation.
-                        false
                     } else {
-                        // Different generation: an announcement always wins; any
-                        // other frame must not be older.
-                        announces_generation || incoming_ts >= *current_ts
+                        // Different generation: only an ANNOUNCEMENT moves a pane
+                        // that already has one, and it moves it whatever its
+                        // producer clock says (#424 D2). Boot provenance never
+                        // replaces a live conversation (#424 F3), and neither
+                        // does an ordinary frame (issue #532).
+                        //
+                        // An ordinary frame naming another session is either a
+                        // straggler from a superseded generation or a SECOND
+                        // PRODUCER on the same pane, and neither is a
+                        // conversation beginning. The second producer is the
+                        // normal shape of a wrapped agent: `dot-agent-deck wrap`
+                        // reports under `{pane}-session` while the agent's native
+                        // hooks report under their own id, so letting the newer
+                        // frame win made the pane's generation alternate with
+                        // whichever producer spoke last, and the daemon's send
+                        // guard (an exact match against this value) refused
+                        // deliveries into the very conversation the agent had
+                        // announced. This is the rule `latch_generation` already
+                        // applies on the daemon's own delivery path, so the two
+                        // now agree.
+                        //
+                        // What it gives up: a producer whose session id rolls
+                        // over WITHOUT a `SessionStart` keeps the pane on its
+                        // first generation. Claude Code, Codex, Devin and
+                        // OpenCode each map a native session-start hook to
+                        // `SessionStart`, Pi reports under one pane-derived id
+                        // for its whole life, and such a producer was already
+                        // invisible to `latch_generation`.
+                        announces_generation
                     }
                 }
             };
@@ -14079,12 +16020,14 @@ impl AppState {
                 // Two exclusions, both the discriminator [`latch_generation`] and
                 // `crate::ui`'s witness already apply, for their reasons:
                 //
-                // * only an ANNOUNCEMENT counts. This map advances on any frame
-                //   carrying a pane id, so a pane whose ordinary events drift
-                //   through session ids (`prompt/pane-input/026`, and the #532
-                //   wrapped-agent alternation) would otherwise report a rolling
-                //   series of ended conversations and abandon deliveries nothing
-                //   endangered.
+                // * only an ANNOUNCEMENT counts. An ordinary frame can still
+                //   ESTABLISH a generation on a pane that has none, and that is
+                //   not a closure either (next point). Since issue #532 it can
+                //   no longer replace one, so this guard is now belt and braces
+                //   for the `advance` rule above rather than the only thing
+                //   keeping a pane whose ordinary events drift through session
+                //   ids (`prompt/pane-input/026`) from reporting a rolling series
+                //   of ended conversations.
                 // * establishing a generation where the pane had NONE is not a
                 //   closure. That is the launcher case #424 exists for: the first
                 //   genuine announcement after our write is the conversation we
@@ -14108,10 +16051,38 @@ impl AppState {
                 {
                     self.note_generation_closed(pane_id);
                 }
+                let replaces = self
+                    .pane_hook_session
+                    .get(pane_id)
+                    .is_none_or(|(current, _)| *current != incoming_session_id);
                 self.pane_hook_session
                     .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+                // Issue #532: a refresh of the same generation keeps whatever
+                // established it; a new entry records whether it was announced.
+                if announces_generation {
+                    self.pane_generation_announced.insert(pane_id.clone());
+                } else if replaces {
+                    self.pane_generation_announced.remove(pane_id);
+                }
             }
         }
+
+        // Issue #697: account for the card this event lands on. An unproven
+        // event's card is (or becomes) an unproven session, and creating one at
+        // `MAX_UNPROVEN_SESSIONS` evicts the least recently active first — here,
+        // before the card is resolved, so the eviction can never remove it. A
+        // proven event landing on a card this state held as unproven is the
+        // owner speaking for it, and the card stops counting.
+        if unproven {
+            self.note_unproven_activity(&event.session_id, event.pane_id.as_deref());
+        } else {
+            self.unproven_sessions.remove(&event.session_id);
+        }
+        let journal_cap = if unproven {
+            MAX_UNPROVEN_RECENT_EVENTS
+        } else {
+            MAX_RECENT_EVENTS
+        };
 
         let pane_started = event
             .pane_id
@@ -14149,6 +16120,8 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -14176,6 +16149,9 @@ impl AppState {
         // so delivery order does not follow producer stamps. Now it advances
         // with the newest frame OBSERVED for the session and never regresses
         // (`status/supersede/004`).
+        // Issue #1493 (Qodo on PR #1523): the newest frame seen BEFORE this
+        // one: a Codex wrapper frame stamped before it is stale (the arms below).
+        let newest_before = session.last_activity;
         if event.timestamp > session.last_activity {
             session.last_activity = event.timestamp;
         }
@@ -14211,6 +16187,22 @@ impl AppState {
             .and_then(|n| crate::untrusted_text::sanitize_display_name(n))
         {
             session.display_name = Some(name);
+        }
+
+        // Issue #1507: a daemon card-surfacing start names the registry id of
+        // the agent it draws, for creation order only — the session's own
+        // `agent_id` stays `None` so the agent's real `SessionStart` still
+        // supersedes it. Only the daemon's marked start is read: a hook cannot
+        // move a card by claiming an id. (The marker is producer-writable, so a
+        // forged one can reorder a card, which is all this key can do.)
+        if event.is_card_surface_session_start()
+            && let Some(pane_id) = event.pane_id.as_ref()
+            && let Some(seq) = event
+                .metadata
+                .get(crate::event::SURFACED_AGENT_ID_METADATA_KEY)
+                .and_then(|id| id.parse::<u64>().ok())
+        {
+            self.pane_surfaced_agent_seq.insert(pane_id.clone(), seq);
         }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
@@ -14263,6 +16255,109 @@ impl AppState {
         // arm reports for itself rather than being classified from outside,
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
+        let asserted_status = Self::apply_status_transition(session, &event, newest_before);
+
+        // Issue #770: carry the daemon's orphaned-role verdict onto the card.
+        // One-way: the marker only ever ARRIVES (see the field's doc comment for
+        // why there is no un-orphaning edge), and an unmarked event from an
+        // older daemon must not clear a verdict a newer one already reported.
+        if event.is_orchestration_orphaned() {
+            session.orchestration_orphaned = true;
+        }
+
+        // Issue #559: the same one-way shape, for the same reason — the marker
+        // only withdraws standing, so no later frame may restore it. See
+        // `SessionState::prompt_reports_unavailable`.
+        if event.declares_prompt_reports_unavailable() {
+            session.prompt_reports_unavailable = true;
+        }
+        // Issue #1567: sticky for the same reason — a producer that declared it
+        // reports every prompt is still that producer when one of its frames
+        // goes out bare. Unlike the marker above this one GRANTS standing, so
+        // it is taken only from a frame the daemon's hook-provenance gate
+        // attested (`AgentEvent::declares_prompt_reports`) and never onto an
+        // outside agent's unproven card. See
+        // `SessionState::prompt_reports_declared`.
+        if !unproven && event.declares_prompt_reports() {
+            session.prompt_reports_declared = true;
+        }
+
+        // PRD #20 blocker-2: keep the live-target durable across the bounded
+        // journal. An event that omits `live_target` inherits the session's
+        // last-declared one, so the descriptor is never lost when the original
+        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
+        // A new declaration on the event itself always wins.
+        if event.live_target.is_none() {
+            event.live_target = session
+                .recent_events
+                .iter()
+                .rev()
+                .find_map(|e| e.live_target);
+        }
+
+        // Qodo, PR #1559: an outside card's journal is counted against
+        // `MAX_UNPROVEN_JOURNAL_BYTES` as it changes.
+        let mut journal_entry = if unproven {
+            self.unproven_sessions.get_mut(&event.session_id)
+        } else {
+            None
+        };
+        let pushed = journal_entry
+            .as_ref()
+            .and_then(|entry| entry.journal_bytes)
+            .map(|_| retained_event_bytes(&event));
+        session.recent_events.push_back(event);
+        let mut popped = 0;
+        while session.recent_events.len() > journal_cap {
+            if let Some(old) = session.recent_events.pop_front()
+                && pushed.is_some()
+            {
+                popped += retained_event_bytes(&old);
+            }
+        }
+        if let (Some(entry), Some(pushed)) = (journal_entry.as_mut(), pushed) {
+            entry.journal_bytes = entry
+                .journal_bytes
+                .map(|bytes| (bytes + pushed).saturating_sub(popped));
+        }
+
+        // The `session` borrow is done, so the pane-level provenance captured
+        // above can be recorded — but ONLY if this frame actually asserted the
+        // status now on the card. A tagged frame that asserted CLEARS the mark:
+        // an identified producer stating the current status is exactly the
+        // evidence the gate wants, so a pane recovers the carve-out on the next
+        // real hook rather than being poisoned for the session by one untagged
+        // frame. A frame that asserted nothing changes nothing here, so it can
+        // neither launder an untagged status into a trusted one nor cast doubt
+        // on a status it did not write.
+        if asserted_status && let Some(pane_id) = provenance_pane {
+            if provenance_untagged {
+                self.untagged_status_panes.insert(pane_id);
+            } else {
+                self.untagged_status_panes.remove(&pane_id);
+            }
+        }
+        if asserted_status {
+            AppliedEvent::StatusAsserted
+        } else {
+            AppliedEvent::StatusKept
+        }
+    }
+
+    /// The status a frame writes on `session`, and whether it ASSERTED one
+    /// (see the comment at the call in [`Self::apply_event_unsettled`]). Every
+    /// event type but `SessionEnd`, which the caller handles first. Shared with
+    /// [`Self::apply_orphan_survivor_report`], so the one card an orphaned role
+    /// pane's report may reach follows exactly the status rules every card does.
+    ///
+    /// `newest_before` is the session's `last_activity` as it stood BEFORE this
+    /// frame advanced it: issue #1493's wrapper frames stamped older than it are
+    /// stale and assert nothing.
+    fn apply_status_transition(
+        session: &mut SessionState,
+        event: &AgentEvent,
+        newest_before: DateTime<Utc>,
+    ) -> bool {
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
         // `session.idle` after its `session.error`, Claude Code's `idle_prompt`
@@ -14281,7 +16376,7 @@ impl AppState {
         if session.status == SessionStatus::Blocked
             && !quota_blocked
             && !quota_lift
-            && crate::quota_block::is_work_evidence(&event)
+            && crate::quota_block::is_work_evidence(event)
         {
             session.status = SessionStatus::Thinking;
             session.blocked = None;
@@ -14303,6 +16398,60 @@ impl AppState {
                     session.active_tool = None;
                 }
                 asserted
+            }
+            // Issue #1493: what `dot-agent-deck wrap` reads off a Codex pane's
+            // output is NOT a status. The interactive Codex TUI paints its
+            // screen on boot and redraws it while idle, and the wrapper calls
+            // every printed line activity, so a freshly started Codex read as
+            // busy with no prompt sent. Its native hooks are what say a turn
+            // started, ran a tool, asked for permission and ended, the way
+            // Claude Code's do, so they decide the card and the wrapper's frame
+            // is journalled as liveness only.
+            //
+            // Unless the wrapper declared that the deck's prompt hook is not
+            // running (`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`): then
+            // nothing will ever announce a turn, and output is the only sign of
+            // one. The wrapper then reports output going quiet as a classified
+            // `Idle`, so the card reads Thinking while Codex is drawing and Idle
+            // once it stops, rather than busy forever. Each frame may only
+            // move a status that output itself could have set, so it never
+            // repaints a hook's Needs Input, Working tool or Error.
+            _ if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() => {
+                // Out of order: the wrapper sends these from more than one
+                // thread, each on its own connection, so one can land after a
+                // frame it predates — its own quiet Idle or settled start, a
+                // native hook, the exit status. Stamped older than anything the
+                // card has already seen, it is a status the pane has moved past.
+                let stale = event.timestamp < newest_before;
+                if stale || !event.declares_prompt_reports_unavailable() {
+                    false
+                } else {
+                    match event.event_type {
+                        EventType::Thinking
+                            if matches!(
+                                session.status,
+                                SessionStatus::Idle | SessionStatus::Unknown
+                            ) =>
+                        {
+                            session.status = SessionStatus::Thinking;
+                            session.active_tool = None;
+                            session.output_set_status = true;
+                            true
+                        }
+                        // Only a Thinking output itself set (Qodo on PR #1523):
+                        // a prompt hook's Thinking is the turn, and quiet is
+                        // not its end.
+                        EventType::Idle
+                            if session.status == SessionStatus::Thinking
+                                && session.output_set_status =>
+                        {
+                            session.status = SessionStatus::Idle;
+                            session.output_set_status = false;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
             }
             EventType::QuotaBlocked => {
                 // The daemon normalised the keys on arrival
@@ -14331,6 +16480,21 @@ impl AppState {
                 });
                 session.active_tool = None;
                 true
+            }
+            // Issue #1493: a wrapper start for a Codex pane — the fork-time one
+            // or the interface one — can be handled after frames it predates (a
+            // classified Thinking, or the first native hook): the interface
+            // start is sent from a thread of its own, and the daemon handles
+            // each hook connection in its own task. Stamped older than anything
+            // the card has already seen, it is a boot observation the card has
+            // moved past, and asserts nothing. Codex's native `SessionStart`
+            // carries no wrapper origin and is not affected.
+            EventType::SessionStart
+                if event.agent_type == AgentType::Codex
+                    && event.is_wrapper_session_start()
+                    && event.timestamp < newest_before =>
+            {
+                false
             }
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
@@ -14396,17 +16560,38 @@ impl AppState {
                         Some(SubagentWait {
                             subagent_ids: vec![id],
                             resume_idle: session.status == SessionStatus::Idle,
+                            overflow: 0,
                         })
                     }
                     Some(id) => session.subagent_wait.take().map(|mut wait| {
                         if !wait.subagent_ids.contains(&id) {
-                            wait.subagent_ids.push(id);
+                            // Issue #697: bounded — past the cap an ask is
+                            // counted rather than remembered, so the wait stays
+                            // open for it instead of forgetting its prompt (see
+                            // `SubagentWait::overflow` for what that costs).
+                            if wait.subagent_ids.len() >= MAX_SUBAGENT_IDS {
+                                wait.overflow = wait.overflow.saturating_add(1);
+                            } else {
+                                wait.subagent_ids.push(id);
+                            }
                         }
                         wait
                     }),
                 };
                 session.status = SessionStatus::WaitingForInput;
                 true
+            }
+            // OpenCode ends every run with `session.idle`, a failed one
+            // included, milliseconds after its `session.error`; repainting Idle
+            // there erased every OpenCode Error (`status/blocked/023`). The card
+            // stays Error until OpenCode works again — its next prompt or busy
+            // status. An interrupted turn arrives as `Idle` instead of `Error`
+            // (`crate::hook::build_opencode_event`).
+            EventType::Idle
+                if event.agent_type == AgentType::OpenCode
+                    && session.status == SessionStatus::Error =>
+            {
+                false
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -14427,10 +16612,16 @@ impl AppState {
                     && let Some(ended) =
                         event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
                     && let Some(wait) = session.subagent_wait.as_mut()
-                    && wait.subagent_ids.contains(ended) =>
+                    && (wait.subagent_ids.contains(ended) || wait.overflow > 0) =>
             {
-                wait.subagent_ids.retain(|id| id != ended);
-                let asserted = wait.subagent_ids.is_empty();
+                // Issue #697: an id the wait does not hold is one of the
+                // subagents counted past the cap (see `SubagentWait::overflow`).
+                if wait.subagent_ids.contains(ended) {
+                    wait.subagent_ids.retain(|id| id != ended);
+                } else {
+                    wait.overflow -= 1;
+                }
+                let asserted = wait.subagent_ids.is_empty() && wait.overflow == 0;
                 if asserted {
                     session.status = if wait.resume_idle {
                         SessionStatus::Idle
@@ -14515,62 +16706,100 @@ impl AppState {
         // another route. A subagent event that DID assert (its `ToolEnd`
         // answering a `WaitingForInput`) wrote the current status, so it clears.
         let subagent_left_status = event.is_from_subagent() && !asserted_status;
+        // Issue #1493 (Qodo on PR #1523): and a Codex pane's output frame that
+        // asserted nothing, for the same reason — it is liveness, not evidence of
+        // what the agent is doing, so it must not turn the `ShellIdle` that ends
+        // a detached command into a no-op and strand the card on Working.
+        let codex_output =
+            event.agent_type == AgentType::Codex && event.is_wrapper_output_classified();
+        let codex_output_left_status = codex_output && !asserted_status;
+        // Issue #1493: any other frame that wrote the status took it over from
+        // output, so the wrapper's quiet Idle may no longer end it.
+        if asserted_status && !codex_output {
+            session.output_set_status = false;
+        }
         if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown)
             && !subagent_left_status
+            && !codex_output_left_status
         {
             session.shell_synthetic_working = false;
         }
+        asserted_status
+    }
 
-        // Issue #770: carry the daemon's orphaned-role verdict onto the card.
-        // One-way: the marker only ever ARRIVES (see the field's doc comment for
-        // why there is no un-orphaning edge), and an unmarked event from an
-        // older daemon must not clear a verdict a newer one already reported.
+    /// Round-2 audit findings 1-3: the card a restart survivor's report — from
+    /// an orphaned role pane, or (round 3) any pane the daemon holds no live
+    /// agent on — may reach on a client — the ONE card on `pane_id` this process holds as its
+    /// own, and only when the report names that card's agent (both absent
+    /// counts). Anything else on the pane, more than one card, or a different
+    /// agent, and there is no such card: the report is an outside agent's and
+    /// is refused like any other unproven report on a registered pane.
+    ///
+    /// Bound to the agent so a report the daemon stamped orphaned cannot drive
+    /// a card a NEW generation drew on the pane, even if the stamp were wrong.
+    fn orphan_survivor_card(&self, pane_id: &str, agent_id: Option<&str>) -> Option<String> {
+        let mut on_pane = self.sessions.iter().filter(|(id, session)| {
+            session.pane_id.as_deref() == Some(pane_id) && !self.unproven_sessions.contains_key(*id)
+        });
+        match (on_pane.next(), on_pane.next()) {
+            (Some((id, session)), None) if session.agent_id.as_deref() == agent_id => {
+                Some(id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #770 on a client, narrowed by round-2 audit findings 1-3 and
+    /// widened to plain panes in round 3: apply a restart survivor's report to
+    /// its card `card_id` (see [`Self::orphan_survivor_card`]) and to nothing
+    /// else. The report keeps its unproven standing: it may move that card's
+    /// bounded reporting state — status, the status transition's tool, block
+    /// and wait fields, last activity and the capped event journal — and, for
+    /// a report the daemon stamped orphaned, set its orphan badge. Whatever
+    /// session key it names is ignored, so it cannot reach another card; it
+    /// creates, re-keys and removes no card, a `SessionEnd` only settles the
+    /// card `Idle`, and it writes none of the per-pane or per-agent records an
+    /// owner's report keeps, so no number of them can grow this process's
+    /// state.
+    fn apply_orphan_survivor_report(
+        &mut self,
+        card_id: &str,
+        mut event: AgentEvent,
+    ) -> AppliedEvent {
+        self.applied_unproven = true;
+        let Some(session) = self.sessions.get_mut(card_id) else {
+            return AppliedEvent::Rejected;
+        };
+        // The badge is for a role pane's survivor only; a plain pane's has
+        // no role to have lost.
         if event.is_orchestration_orphaned() {
             session.orchestration_orphaned = true;
         }
-
-        // Issue #559: the same one-way shape, for the same reason — the marker
-        // only withdraws standing, so no later frame may restore it. See
-        // `SessionState::prompt_reports_unavailable`.
-        if event.declares_prompt_reports_unavailable() {
-            session.prompt_reports_unavailable = true;
+        let newest_before = session.last_activity;
+        if event.timestamp > session.last_activity {
+            session.last_activity = event.timestamp;
         }
-
-        // PRD #20 blocker-2: keep the live-target durable across the bounded
-        // journal. An event that omits `live_target` inherits the session's
-        // last-declared one, so the descriptor is never lost when the original
-        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
-        // A new declaration on the event itself always wins.
-        if event.live_target.is_none() {
-            event.live_target = session
-                .recent_events
-                .iter()
-                .rev()
-                .find_map(|e| e.live_target);
+        if event.event_type == EventType::SessionEnd {
+            session.status = SessionStatus::Idle;
+            session.active_tool = None;
+            session.blocked = None;
+            session.subagent_wait = None;
+            session.shell_synthetic_working = false;
+            return AppliedEvent::StatusAsserted;
         }
-
+        let asserted = Self::apply_status_transition(session, &event, newest_before);
+        event.session_id = card_id.to_string();
+        // Qodo, PR #1559: the card's live target is not reporting state, so the
+        // report carries the card's own — never one of its own, which would
+        // let an unproven report make the card writable — and it stays durable
+        // once the declaring event ages out of the bounded journal, as the
+        // owner's path keeps it (PRD #20 blocker-2).
+        event.live_target = session.live_target();
         session.recent_events.push_back(event);
-        if session.recent_events.len() > MAX_RECENT_EVENTS {
+        while session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
         }
-
-        // The `session` borrow is done, so the pane-level provenance captured
-        // above can be recorded — but ONLY if this frame actually asserted the
-        // status now on the card. A tagged frame that asserted CLEARS the mark:
-        // an identified producer stating the current status is exactly the
-        // evidence the gate wants, so a pane recovers the carve-out on the next
-        // real hook rather than being poisoned for the session by one untagged
-        // frame. A frame that asserted nothing changes nothing here, so it can
-        // neither launder an untagged status into a trusted one nor cast doubt
-        // on a status it did not write.
-        if asserted_status && let Some(pane_id) = provenance_pane {
-            if provenance_untagged {
-                self.untagged_status_panes.insert(pane_id);
-            } else {
-                self.untagged_status_panes.remove(&pane_id);
-            }
-        }
-        if asserted_status {
+        if asserted {
             AppliedEvent::StatusAsserted
         } else {
             AppliedEvent::StatusKept
@@ -14702,7 +16931,10 @@ mod tests {
 
         // `a` still has a pane: nothing is released and its entry stays.
         state.pane_orchestration_map.remove("a0");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             state
                 .orchestration_context_paths
@@ -14711,7 +16943,10 @@ mod tests {
 
         // `a` ends, but live `b` references the same file: forget, keep file.
         state.pane_orchestration_map.remove("a1");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             !state
                 .orchestration_context_paths
@@ -14722,7 +16957,7 @@ mod tests {
         state.pane_orchestration_map.remove("c0");
         assert_eq!(
             state.take_ended_orchestration_context(&instance("c")),
-            Some(own)
+            vec![own]
         );
         // `b` still runs, untouched.
         assert_eq!(
@@ -14762,7 +16997,10 @@ mod tests {
 
         // `a` ends while `b` still records the file: kept, token still live.
         state.pane_orchestration_map.remove("a0");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             crate::prep_token::binding(&token).is_some(),
             "a file still in use keeps the token that minted it"
@@ -14773,12 +17011,218 @@ mod tests {
         state.pane_orchestration_map.remove("b0");
         assert_eq!(
             state.take_ended_orchestration_context(&instance("b")),
-            Some(path)
+            vec![path]
         );
         assert!(
             crate::prep_token::binding(&token).is_none(),
             "a reused token must not re-verify against a file answered for deletion"
         );
+    }
+
+    /// Issue #1445: a re-arm report from the coordinator's pane moves the
+    /// record to the reported file, keeps every file it replaces, and the end
+    /// of the orchestration answers all of them for deletion — so a reattached
+    /// tab is handed the newest file and none of them waits for the sweep.
+    #[test]
+    fn the_recorded_context_follows_rearms_and_all_of_them_end_together() {
+        let ctx = |hex: char| {
+            std::path::PathBuf::from(format!(
+                "/p/.dot-agent-deck/orchestrator-context-{}.md",
+                hex.to_string().repeat(32)
+            ))
+        };
+        let (startup, first, second) = (ctx('a'), ctx('b'), ctx('c'));
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        state.record_orchestration_context(&instance("a"), startup.clone());
+
+        assert_eq!(
+            state.rearmed_context_target("a0", &first),
+            Ok(startup.clone())
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &first, &startup),
+            Ok(true)
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &first, &first),
+            Ok(false),
+            "a repeated report changes nothing"
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &second, &startup),
+            Err(RearmedContextRefusal::RecordMoved),
+            "a comparison against the startup file does not apply once the record moved"
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &second, &first),
+            Ok(true)
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&second),
+            "the record names the newest re-arm"
+        );
+        // A start recorded after the re-arms keeps them in the cleanup (Qodo
+        // on PR #1554).
+        let restarted = ctx('d');
+        state.record_orchestration_context(&instance("a"), restarted.clone());
+
+        state.pane_orchestration_map.remove("a0");
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            vec![startup, first, second, restarted]
+        );
+        assert!(
+            state.orchestration_superseded_contexts.is_empty(),
+            "nothing is kept for an ended orchestration"
+        );
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): an older re-arm file is kept for
+    /// deletion at the end without moving the record — once, never when it is
+    /// the recorded file, and only against the file it was compared with; a
+    /// report the shared checks refuse is not kept.
+    #[test]
+    fn an_older_rearm_file_is_kept_for_the_end_without_moving_the_record() {
+        let ctx = |hex: char| {
+            std::path::PathBuf::from(format!(
+                "/p/.dot-agent-deck/orchestrator-context-{}.md",
+                hex.to_string().repeat(32)
+            ))
+        };
+        let (startup, older, newer, other) = (ctx('a'), ctx('b'), ctx('c'), ctx('d'));
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        state.record_orchestration_context(&instance("a"), startup.clone());
+        state.record_orchestration_context(&instance("b"), other.clone());
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &newer, &startup),
+            Ok(true)
+        );
+
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &older, &startup),
+            Err(RearmedContextRefusal::RecordMoved),
+            "a comparison against a file no longer recorded does not apply"
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a1", &older, &newer),
+            Err(RearmedContextRefusal::NotACoordinator)
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &other, &newer),
+            Err(RearmedContextRefusal::AnotherOrchestrationsContext)
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &newer, &newer),
+            Ok(false),
+            "the recorded file is not also kept as superseded"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                state.keep_older_rearmed_orchestration_context("a0", &older, &newer),
+                Ok(true)
+            );
+        }
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&newer),
+            "keeping an older file never moves the record"
+        );
+
+        state.pane_orchestration_map.remove("a0");
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            vec![startup, older, newer],
+            "each file once, the older one included"
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("b")),
+            Some(&other),
+            "another orchestration's record is untouched"
+        );
+    }
+
+    /// Issue #1445: a report the daemon cannot attribute to the reporting
+    /// coordinator's own orchestration is refused and leaves every record as
+    /// it was — a worker's pane, an unknown pane, an orchestration with no
+    /// recorded file, a file outside the recorded `.dot-agent-deck`, the
+    /// fixed-path mirror, and a file another orchestration records.
+    #[test]
+    fn a_rearm_report_that_is_not_the_coordinators_own_is_refused() {
+        let own = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let other = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md",
+        );
+        let fresh = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+        );
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        register_role_pane(&mut state, "c0", "orchestrator", true, instance("c"));
+        state.record_orchestration_context(&instance("a"), own.clone());
+        state.record_orchestration_context(&instance("c"), other.clone());
+
+        use RearmedContextRefusal::*;
+        for (case, pane, path, refusal) in [
+            ("a worker's pane", "a1", fresh.clone(), NotACoordinator),
+            ("an unknown pane", "zz", fresh.clone(), NotACoordinator),
+            ("no recorded file", "b0", fresh.clone(), NoRecordedContext),
+            (
+                "another project",
+                "a0",
+                std::path::PathBuf::from(
+                    "/q/.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+                ),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "a parent-directory escape",
+                "a0",
+                std::path::PathBuf::from(
+                    "/p/.dot-agent-deck/../.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+                ),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "the mirror",
+                "a0",
+                std::path::PathBuf::from("/p/.dot-agent-deck/orchestrator-context.md"),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "another orchestration's file",
+                "a0",
+                other.clone(),
+                AnotherOrchestrationsContext,
+            ),
+        ] {
+            assert_eq!(
+                state.record_rearmed_orchestration_context(pane, &path, &own),
+                Err(refusal),
+                "{case}"
+            );
+            assert_eq!(state.rearmed_context_target(pane, &path), Err(refusal));
+        }
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&own)
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("c")),
+            Some(&other)
+        );
+        assert!(state.orchestration_superseded_contexts.is_empty());
     }
 
     /// Issue #1395 item 1: the `ListAgents` stamp lands on the start role's
@@ -14839,7 +17283,7 @@ mod tests {
     #[test]
     fn the_daemon_title_store_scopes_by_tab_and_frees_with_the_last_pane() {
         let registry = AgentPtyRegistry::new();
-        let instance = |id: &str| OrchestrationIdentity::Instance {
+        let instance = |id: &str| OrchestrationIdentity {
             id: id.to_string(),
             name: "team".into(),
         };
@@ -14889,19 +17333,6 @@ mod tests {
             .claim_orchestration_title(&instance("empty"), Some(""), "/d", &registry)
             .expect("an empty title is admitted as the canonical name");
         assert_eq!(state.orchestration_display_title(&instance("empty")), None);
-
-        // The legacy token-less identity is scoped by exactly the `(name, cwd)`
-        // pair the daemon routes that client's delegates on.
-        let legacy = OrchestrationIdentity::NameCwd {
-            name: "team".into(),
-            cwd: "/l".into(),
-        };
-        state
-            .claim_orchestration_title(&legacy, Some("legacy"), "/l", &registry)
-            .expect("a legacy tab is admitted");
-        state
-            .claim_orchestration_title(&legacy, Some("legacy"), "/l", &registry)
-            .expect("a second role of the legacy tab is the same tab");
 
         // Releasing tab A's claims with its roles registered keeps the title
         // while a pane still maps to the identity — it is the recorded value a
@@ -14960,6 +17391,124 @@ mod tests {
         state
             .claim_orchestration_title(&instance("rival"), Some("respawning"), "/r", &registry)
             .expect("released once the re-create is done, with no live pane left");
+    }
+
+    /// Issue #1339: a daemon-spawned run is admitted through the same check
+    /// as a client start, and a taken title is SUFFIXED rather than refused —
+    /// in order, against client-typed titles as well as other runs, never past
+    /// the length the registry keeps, and freed with its holder like any other
+    /// claim. As above, every holder holds through an unreleased claim.
+    #[test]
+    fn a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title() {
+        let registry = AgentPtyRegistry::new();
+        let run = |id: &str| OrchestrationIdentity {
+            id: id.to_string(),
+            name: "team".into(),
+        };
+        let mut state = AppState::default();
+
+        // Nothing collides: the derived title, unchanged.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r1"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+        // The second and third live runs get the next free suffixes.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r2"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 2".to_string())
+        );
+        // A client tab already holding `· 3` is skipped, not shared.
+        state
+            .claim_orchestration_title(&run("typed"), Some("team · repo · 3"), "/w", &registry)
+            .expect("a client may type any free title");
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r3"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 4".to_string())
+        );
+        // And a client start is refused against a suffixed run's title.
+        assert!(
+            state
+                .claim_orchestration_title(&run("late"), Some("team · repo · 2"), "/w", &registry)
+                .is_err(),
+            "a suffixed title is held exactly like any other"
+        );
+        // Another directory is another key: no suffix.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r4"),
+                Some("team · repo"),
+                "/elsewhere",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+
+        // A run under its canonical name (`None`) suffixes the name itself.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c1"), None, "/c", &registry),
+            None
+        );
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c2"), None, "/c", &registry),
+            Some("team · 2".to_string())
+        );
+        // A derived title the registry would drop is the canonical name the
+        // tab will show, so it collides with `c1` and gets `· 3`.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("c3"),
+                Some("bad\u{7}title"),
+                "/c",
+                &registry
+            ),
+            Some("team · 3".to_string())
+        );
+
+        // Never longer than the registry keeps: the BASE is shortened, the
+        // suffix survives, and the result is a valid display name.
+        let long = "é".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN / 2);
+        assert!(crate::agent_pty::is_valid_display_name(&long));
+        state
+            .claim_dispatched_orchestration_title(&run("l1"), Some(&long), "/l", &registry)
+            .expect("the full-length title is free");
+        let suffixed = state
+            .claim_dispatched_orchestration_title(&run("l2"), Some(&long), "/l", &registry)
+            .expect("a suffixed title");
+        assert!(suffixed.ends_with(" · 2"), "{suffixed:?}");
+        assert!(
+            crate::agent_pty::is_valid_display_name(&suffixed),
+            "an over-long title would be dropped and the tab fall back to the canonical name: \
+             {} bytes",
+            suffixed.len()
+        );
+
+        // Freed with its holder: once `r1` has no claim and no live pane, the
+        // next run takes the unsuffixed title back.
+        state.release_orchestration_title_claim(&run("r1"));
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r5"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
     }
 
     /// Issue #555 (PR #1336 review): the directory half of the title key is
@@ -16131,27 +18680,18 @@ mod tests {
         )
         .expect("write project config");
         let cwd = dir.path().to_str().expect("utf8 cwd");
-        let identity = OrchestrationIdentity::Instance {
+        let configs = ProjectConfigs::load_blocking([cwd]);
+        let identity = OrchestrationIdentity {
             id: "tab-1".to_string(),
             name: "orch".to_string(),
         };
-        assert!(delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "fresh"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "kept"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "unknown-role"
-        ));
-        assert!(!delegate_respawns_worker(None, Some(&identity), "fresh"));
-        assert!(!delegate_respawns_worker(Some(cwd), None, "fresh"));
+        let respawns =
+            |cwd, identity, role| delegate_respawns_worker(&configs, cwd, identity, role);
+        assert!(respawns(Some(cwd), Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), Some(&identity), "kept"));
+        assert!(!respawns(Some(cwd), Some(&identity), "unknown-role"));
+        assert!(!respawns(None, Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), None, "fresh"));
     }
 
     /// Issue #447: the waiting-for-input notice is one line, fences both
@@ -17030,18 +19570,11 @@ mod tests {
     }
 
     fn instance(id: &str) -> OrchestrationIdentity {
-        OrchestrationIdentity::Instance {
+        OrchestrationIdentity {
             id: id.to_string(),
             // Same orchestration, same directory, same config name — the
             // exact collision issue #140 reports. Only the token differs.
             name: "tdd-cycle".to_string(),
-        }
-    }
-
-    fn name_cwd(name: &str, cwd: &str) -> OrchestrationIdentity {
-        OrchestrationIdentity::NameCwd {
-            name: name.to_string(),
-            cwd: cwd.to_string(),
         }
     }
 
@@ -17468,6 +20001,49 @@ mod tests {
         );
     }
 
+    /// Issue #1387 (Greptile, Qodo, #1514): a delegate reads the configs of the
+    /// orchestration and of the workers it routes to — not of another worker in
+    /// the same orchestration, whose slow file would otherwise hold up a
+    /// handoff it plays no part in — and none at all for a sender it refuses.
+    #[test]
+    fn delegate_config_dirs_names_only_the_routed_workers() {
+        let mut state = AppState::default();
+        let identity = instance("orch-1387");
+        state.register_orchestration_role(
+            "orch",
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some("/o"),
+        );
+        state.register_orchestration_role("coder", "coder", false, identity.clone(), Some("/c"));
+        state.register_orchestration_role("tester", "tester", false, identity, Some("/t"));
+        let registry = AgentPtyRegistry::new();
+        let signal = |from: &str| DelegateSignal {
+            pane_id: from.to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let mut dirs = state.delegate_config_dirs(&signal("orch"), &registry);
+        dirs.sort();
+        assert_eq!(dirs, vec!["/c".to_string(), "/o".to_string()]);
+        assert!(
+            state
+                .delegate_config_dirs(&signal("tester"), &registry)
+                .is_empty(),
+            "a worker's delegate is refused, so it must read nothing first"
+        );
+        assert!(
+            state
+                .delegate_config_dirs(&signal("stranger"), &registry)
+                .is_empty()
+        );
+    }
+
     /// Issue #580 review (Qodo, #1285): the busy check reads the ATTESTED sender,
     /// not the orchestrator pane's current occupant. Here the pane has no live
     /// agent at all, so a re-resolving check would see no identity and refuse;
@@ -17475,7 +20051,7 @@ mod tests {
     /// attested predecessor identity is what keeps its own refusal.
     #[tokio::test]
     async fn handle_attested_delegate_decides_on_the_attested_sender() {
-        let state = two_same_name_cwd_tabs(true);
+        let state: SharedState = Arc::new(RwLock::new(two_same_name_cwd_tabs(true)));
         let registry = Arc::new(AgentPtyRegistry::new());
         match registry.arm_delegation_commission("A_coder", "A_orch", Some("orch-agent-1"), false) {
             crate::agent_pty::CommissionArm::Armed { .. } => {}
@@ -17491,18 +20067,18 @@ mod tests {
             token: None,
         };
 
-        let predecessor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-1"))
-            .await;
+        let predecessor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-1"))
+                .await;
         assert_eq!(
             predecessor.busy.len(),
             1,
             "the delegating orchestrator is refused: {predecessor:?}"
         );
 
-        let successor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-2"))
-            .await;
+        let successor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-2"))
+                .await;
         assert_eq!(
             successor.delivered,
             vec!["coder".to_string()],
@@ -17558,7 +20134,9 @@ mod tests {
         let seat = |toml: &str, role: &str| -> Option<(usize, bool)> {
             let cwd = tempfile::tempdir().expect("tempdir");
             std::fs::write(cwd.path().join(".dot-agent-deck.toml"), toml).expect("write toml");
-            lookup_orchestration_role_seated(cwd.path().to_str().expect("utf8"), "team", role)
+            let cwd = cwd.path().to_str().expect("utf8");
+            let configs = ProjectConfigs::load_blocking([cwd]);
+            lookup_orchestration_role_seated(&configs, cwd, "team", role)
                 .map(|(index, _, is_orchestrator)| (index, is_orchestrator))
         };
         let unflagged = "[[orchestrations]]\nname = \"team\"\n\n\
@@ -17687,7 +20265,7 @@ mod tests {
              that is the pane-reuse mis-delivery #140's token exists to expose"
         );
 
-        // Token-less (pre-#140 client) panes fall back to the name comparison,
+        // A live membership with no token falls back to the name comparison,
         // which is all such a pane can be compared on.
         assert!(orchestration_still_matches(
             Some(&armed_under),
@@ -17696,10 +20274,6 @@ mod tests {
         assert!(!orchestration_still_matches(
             Some(&armed_under),
             Some(&live("some-other-orchestration", None))
-        ));
-        assert!(orchestration_still_matches(
-            Some(&name_cwd("foo", "/home/u/project-a")),
-            Some(&live("foo", Some("orch-aaaa-0")))
         ));
 
         // Absence is never a mismatch: a pane with no orchestration membership
@@ -17737,49 +20311,15 @@ mod tests {
         );
     }
 
-    /// M4.1: cross-directory regression. Two orchestrations sharing a `name`
-    /// but living in different directories carry `NameCwd` identities (no
-    /// instance token — the older-client path) and must never cross-deliver.
-    /// This is the round-11 fix; it has to keep holding after the value-type
-    /// change.
+    /// M5.2: a single orchestration routes a fan-out delegate to every named
+    /// worker and each worker's work-done back to its one orchestrator. Issue
+    /// #463: this used to run on the token-less `NameCwd` fallback, to pin that
+    /// an older TUI's single orchestration still routed; with that fallback
+    /// retired it pins the same routing on the per-tab token.
     #[test]
-    fn name_cwd_identities_never_cross_deliver_across_directories() {
-        for _ in 0..64 {
-            let mut state = AppState::default();
-            let a = name_cwd("foo", "/home/u/project-a");
-            let b = name_cwd("foo", "/home/u/project-b");
-            register_role_pane(&mut state, "A_orch", "orchestrator", true, a.clone());
-            register_role_pane(&mut state, "A_coder", "coder", false, a);
-            register_role_pane(&mut state, "B_orch", "orchestrator", true, b.clone());
-            register_role_pane(&mut state, "B_coder", "coder", false, b);
-
-            assert_eq!(
-                state.delegate_targets("A_orch", &["coder".to_string()]),
-                vec![("coder".to_string(), "A_coder".to_string())]
-            );
-            assert_eq!(
-                state.delegate_targets("B_orch", &["coder".to_string()]),
-                vec![("coder".to_string(), "B_coder".to_string())]
-            );
-            assert_eq!(
-                state.orchestrator_for_worker("A_coder").as_deref(),
-                Some("A_orch")
-            );
-            assert_eq!(
-                state.orchestrator_for_worker("B_coder").as_deref(),
-                Some("B_orch")
-            );
-        }
-    }
-
-    /// M5.2: the fallback path. An orchestration whose memberships carry NO
-    /// instance token builds `NameCwd` identities, and a single such
-    /// orchestration routes delegate + work-done exactly as it did pre-#140.
-    /// This is what a newer daemon does for an older TUI.
-    #[test]
-    fn name_cwd_fallback_routes_a_single_orchestration_unchanged() {
+    fn a_single_orchestration_routes_fan_out_and_work_done() {
         let mut state = AppState::default();
-        let id = name_cwd("tdd-cycle", "/home/u/project");
+        let id = instance("orch-aaaa-0");
         register_role_pane(&mut state, "orch", "orchestrator", true, id.clone());
         register_role_pane(&mut state, "coder", "coder", false, id.clone());
         register_role_pane(&mut state, "tester", "tester", false, id);
@@ -17799,41 +20339,6 @@ mod tests {
         assert_eq!(
             state.orchestrator_for_worker("tester").as_deref(),
             Some("orch")
-        );
-    }
-
-    /// A tokened pane and a token-less pane were produced by different
-    /// clients; nothing says they share a tab, so the two identity variants
-    /// must never compare equal. Otherwise a mid-upgrade daemon could route a
-    /// new client's delegate into an old client's pane.
-    #[test]
-    fn instance_and_name_cwd_identities_never_match_each_other() {
-        let mut state = AppState::default();
-        register_role_pane(
-            &mut state,
-            "new_orch",
-            "orchestrator",
-            true,
-            instance("orch-aaaa-0"),
-        );
-        register_role_pane(
-            &mut state,
-            "old_coder",
-            "coder",
-            false,
-            name_cwd("tdd-cycle", "/home/u/project"),
-        );
-
-        assert!(
-            state
-                .delegate_targets("new_orch", &["coder".to_string()])
-                .is_empty(),
-            "a tokened orchestrator must not reach a token-less worker"
-        );
-        assert_eq!(
-            state.orchestrator_for_worker("old_coder"),
-            None,
-            "a token-less worker must not resolve a tokened orchestrator"
         );
     }
 
@@ -18726,7 +21231,11 @@ mod tests {
 
         let disabled = config_dir("0");
         assert_eq!(
-            delegate_no_event_window(disabled.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(disabled.path().to_str()),
+                disabled.path().to_str(),
+                None
+            ),
             None,
             "a disabled idle detector must not produce a silent-worker watch either"
         );
@@ -18734,7 +21243,11 @@ mod tests {
         // Two minutes of "owes an answer" is 30 s of "has said nothing at all".
         let long = config_dir("2");
         assert_eq!(
-            delegate_no_event_window(long.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(long.path().to_str()),
+                long.path().to_str(),
+                None
+            ),
             Some(MAX_DELEGATE_NO_EVENT_WINDOW),
         );
     }
@@ -18779,7 +21292,7 @@ mod tests {
             // SAFETY: lock held for the duration; restored below.
             unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS, raw) };
             assert_eq!(
-                delegate_no_event_window(cwd, None),
+                delegate_no_event_window(&ProjectConfigs::load_blocking(cwd), cwd, None),
                 expected,
                 "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS}={raw:?} must resolve to {expected:?}"
             );
@@ -18838,6 +21351,18 @@ mod tests {
                 "{no_proof:?} can be emitted by an agent that never saw the prompt"
             );
         }
+        // Issue #1493: a Codex pane's painted output proves no turn, while a
+        // hookless wrapped agent's still does — it has no other evidence.
+        let mut codex_output = event(EventType::Thinking);
+        codex_output.agent_type = AgentType::Codex;
+        codex_output.metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        assert!(!worker_event_proves_delivery(&codex_output));
+        let mut generic_output = codex_output.clone();
+        generic_output.agent_type = AgentType::None;
+        assert!(worker_event_proves_delivery(&generic_output));
         for turn in [
             // Every supported agent maps "a user prompt was submitted" here.
             EventType::Thinking,
@@ -19251,9 +21776,9 @@ mod tests {
         dispatch_one_owned(
             registry.clone(),
             event_tx,
-            Some(OrchestrationIdentity::NameCwd {
+            Some(OrchestrationIdentity {
+                id: "orch-test-0".to_string(),
                 name: "test-orchestration".to_string(),
-                cwd: cwd_str.clone(),
             }),
             "respawn-fails-orch".to_string(),
             "coder".to_string(),
@@ -20086,9 +22611,9 @@ while True:
                 .expect("spawn the first occupant");
             let (event_tx, _event_rx) = broadcast::channel::<BroadcastMsg>(64);
             let mut state = AppState::default();
-            let orchestration = OrchestrationIdentity::NameCwd {
+            let orchestration = OrchestrationIdentity {
+                id: "orch-test-0".to_string(),
                 name: "test-orchestration".to_string(),
-                cwd: cwd_str.clone(),
             };
             state
                 .pane_role_map
@@ -21971,6 +24496,8 @@ while True:
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
 
@@ -22535,6 +25062,127 @@ while True:
         registry.shutdown_all();
     }
 
+    /// Issue #698, the control at the admission layer: the test above with the
+    /// producer naming NO generation — a pre-F9 hook script, or a wrapper that
+    /// lost `DOT_AGENT_DECK_AGENT_ID` (PRD #110 / issue #398). Its final
+    /// `SessionEnd`, read after the PTY EOF, must still remove the pane's
+    /// session when nothing has taken the pane over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_late_untagged_final_report_lands_after_the_pty_eof() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "untagged-farewell-pane-698";
+        let agent_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )],
+                ..Default::default()
+            })
+            .expect("spawn a short-lived agent onto the pane");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let untagged = |event_type| {
+            let mut event = report_454(pane, &agent_id, event_type);
+            event.agent_id = None;
+            event
+        };
+        state.apply_event(untagged(EventType::SessionStart));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "precondition: the untagged SessionStart must be admitted"
+        );
+        let farewell = untagged(EventType::SessionEnd);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        state.apply_event(farewell);
+
+        assert!(
+            state.sessions.is_empty(),
+            "an untagged final report for a pane whose generation exited with no \
+             successor must still land after the PTY EOF; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698: an untagged report naming a pane whose retired generation
+    /// was handed over, and whose successor was then reaped, drives nothing.
+    ///
+    /// Both generations are gone, and the keyed form of the same report — the
+    /// predecessor's id on its own pane — has been refused since the handover.
+    /// The untagged form must not be the way around that: it used to be owned,
+    /// because the pane-only ownership arm matched any record still naming the
+    /// pane, and so it minted a session in the daemon's state for a defunct
+    /// pane. (Attached TUIs receive the broadcast before this admission runs,
+    /// so their cards are not what this test is about.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untagged_report_for_a_handed_over_then_reaped_pane_drives_nothing() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "handed-over-reaped-pane-698";
+        let opts = |command| crate::agent_pty::SpawnOptions {
+            command: Some(command),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane.to_string(),
+            )],
+            ..Default::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once its child is gone");
+        registry.close_agent(&new).expect("close the successor");
+
+        let keyed = report_454(pane, &old, EventType::Thinking);
+        let mut untagged = report_454(pane, &old, EventType::Thinking);
+        untagged.agent_id = None;
+
+        state.apply_event(keyed);
+        assert!(
+            state.sessions.is_empty(),
+            "precondition: the handed-over predecessor's own report is refused"
+        );
+        state.apply_event(untagged);
+        assert!(
+            state.sessions.is_empty(),
+            "the same report with its generation stripped must be refused too — \
+             nothing is left on the pane to speak for it; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
     /// Round-2 audit, blocker D, and the boundary that keeps the grace above
     /// from being a hole. A pane id is a REUSABLE slot: the registry explicitly
     /// lets a live agent take over a dead one's pane. A pane-scoped oracle
@@ -22607,6 +25255,7 @@ while True:
         registry.shutdown_all();
     }
 
+    /// Scenario: A forged start cannot register a registry-owned pane, while an external agent's start and later status still produce its own foreign card without promoting its pane into managed ownership.
     /// Binding admission to the generation opens a door that has to be shut in
     /// the same change: an event whose `agent_id` does not match now FAILS the
     /// ownership check, and a `SessionStart` that fails it lands in the
@@ -22651,16 +25300,135 @@ while True:
             "the generation that actually owns the pane must still be admitted"
         );
 
-        // And an UNCLAIMED pane keeps the historical escape hatch verbatim.
+        // An unclaimed pane keeps the external-card compatibility path, but
+        // a declaration by its sender must never become proof of ownership.
         let mut startup_race = agent_event_cli_payload("unclaimed-pane-454", "tui-agent-454");
         startup_race.session_id = "startup-race-session-454".to_string();
         startup_race.event_type = EventType::SessionStart;
+        state.apply_event(startup_race.clone());
+        startup_race.event_type = EventType::Thinking;
         state.apply_event(startup_race);
+        assert_eq!(
+            state.sessions["startup-race-session-454"].status,
+            SessionStatus::Thinking
+        );
+        assert_eq!(
+            state.sessions["startup-race-session-454"]
+                .pane_id
+                .as_deref(),
+            Some("unclaimed-pane-454")
+        );
         assert!(
-            state.managed_pane_ids.contains("unclaimed-pane-454"),
-            "a pane the registry has never heard of still auto-registers — that \
-             is the TUI startup race, and narrowing it is #601's job, not this \
-             change's"
+            !state.managed_pane_ids.contains("unclaimed-pane-454"),
+            "issue #601: a foreign SessionStart must not promote its pane into managed_pane_ids"
+        );
+    }
+
+    fn foreign_provenance_event(index: usize, kind: EventType, activity: i64) -> AgentEvent {
+        let mut event = agent_event_cli_payload(
+            &format!("foreign-pane-{index}"),
+            &format!("foreign-agent-{index}"),
+        );
+        event.session_id = format!("foreign-card-{index}");
+        event.event_type = kind;
+        event.timestamp = Utc::now() + chrono::Duration::seconds(activity);
+        event
+    }
+
+    /// Scenario: Admit a small number of external agents and let each report status after its start. All their foreign cards must remain visible and independently update, without acquiring managed ownership.
+    #[test]
+    fn hook_provenance_foreign_subcap_cards_are_retained() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+        for index in 0..8 {
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::SessionStart,
+                index as i64,
+            ));
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::Thinking,
+                index as i64 + 10,
+            ));
+        }
+        assert_eq!(
+            state.sessions.len(),
+            8,
+            "sub-cap foreign cards must all remain visible"
+        );
+        for index in 0..8 {
+            assert_eq!(
+                state.sessions[&format!("foreign-card-{index}")].status,
+                SessionStatus::Thinking
+            );
+        }
+        assert!(
+            state.managed_pane_ids.is_empty(),
+            "foreign cards cannot assert managed ownership"
+        );
+    }
+
+    /// Scenario: Fill the external-card budget, refresh the oldest card, then admit one more external agent. Only the least recently active foreign card must disappear, its later token-less status must not resurrect it, and the older managed card must survive outside the budget.
+    #[test]
+    fn hook_provenance_foreign_flood_evicts_lru_and_preserves_managed_card() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.to_string());
+        let mut managed = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        managed.session_id = "managed-card".to_string();
+        managed.event_type = EventType::SessionStart;
+        state.apply_event(managed);
+        for index in 0..crate::state::MAX_UNPROVEN_SESSIONS {
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::SessionStart,
+                index as i64 + 1,
+            ));
+        }
+        assert_eq!(
+            state.sessions.len(),
+            crate::state::MAX_UNPROVEN_SESSIONS + 1,
+            "managed cards must not consume the foreign-card budget"
+        );
+        state.apply_event(foreign_provenance_event(0, EventType::Thinking, 1000));
+        state.apply_event(foreign_provenance_event(
+            crate::state::MAX_UNPROVEN_SESSIONS,
+            EventType::SessionStart,
+            1001,
+        ));
+        let foreign_count = state
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() != Some(CLI_PANE))
+            .count();
+        assert!(
+            foreign_count <= crate::state::MAX_UNPROVEN_SESSIONS,
+            "issue #697: unproven cards exceed the {}-entry cap: {foreign_count}",
+            crate::state::MAX_UNPROVEN_SESSIONS,
+        );
+        assert!(
+            state.sessions.contains_key("managed-card"),
+            "an older managed card must never be evicted"
+        );
+        assert!(
+            state.sessions.contains_key("foreign-card-0"),
+            "recent activity must refresh LRU position"
+        );
+        assert!(
+            !state.sessions.contains_key("foreign-card-1"),
+            "least recently active foreign card must be evicted"
+        );
+        assert_eq!(
+            state.managed_pane_ids,
+            HashSet::from([CLI_PANE.to_string()]),
+            "foreign pane auto-registration must not grow the managed set"
+        );
+        state.apply_event(foreign_provenance_event(1, EventType::Thinking, 1002));
+        assert!(
+            !state.sessions.contains_key("foreign-card-1"),
+            "eviction must remove foreign pane admission as well as the session; a status without SessionStart resurrected the card"
         );
     }
 
@@ -23012,6 +25780,339 @@ while True:
         assert_eq!((stats.blocked, stats.errors, stats.idle), (1, 0, 0));
     }
 
+    /// Scenario: An OpenCode card gets a provider failure and then the
+    /// `session.idle` OpenCode sends as every run ends. The card stays Error
+    /// until the next prompt starts a turn; a Claude Code card whose Error is
+    /// followed by Idle still goes Idle (the control).
+    #[spec("status/blocked/027")]
+    #[test]
+    fn status_blocked_027_an_opencode_error_survives_the_idle_that_ends_its_run() {
+        let frame = |agent_type: AgentType, event_type: EventType, secs: i64| {
+            let mut event = codex_status_frame(event_type, false, secs);
+            event.agent_type = agent_type;
+            event
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(frame(AgentType::OpenCode, EventType::Thinking, 1));
+        state.apply_event(frame(AgentType::OpenCode, EventType::Error, 2));
+        for secs in 3..7 {
+            state.apply_event(frame(AgentType::OpenCode, EventType::Idle, secs));
+        }
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Error);
+        state.apply_event(frame(AgentType::OpenCode, EventType::Thinking, 8));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(frame(AgentType::OpenCode, EventType::Idle, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(frame(AgentType::ClaudeCode, EventType::Error, 1));
+        state.apply_event(frame(AgentType::ClaudeCode, EventType::Idle, 2));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+    }
+
+    /// Issue #1493: one frame on the Codex pane `pane-x`, from the wrapper
+    /// (`wrap-x`, the wrapper's own session) or from Codex's native hooks
+    /// (`codex-x`).
+    fn codex_status_frame(event_type: EventType, from_wrapper: bool, secs: i64) -> AgentEvent {
+        AgentEvent {
+            session_id: if from_wrapper { "wrap-x" } else { "codex-x" }.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane-x".to_string()),
+            agent_id: Some("agent-x".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// The wrapper's fork-time start, then output it classified, each declaring
+    /// the prompt hook unavailable when `untrusted`.
+    fn codex_wrapper_frame(event_type: EventType, untrusted: bool, secs: i64) -> AgentEvent {
+        let mut event = codex_status_frame(event_type.clone(), true, secs);
+        if event_type == EventType::SessionStart {
+            event.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+        } else {
+            event.metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+        }
+        if untrusted {
+            event.metadata.insert(
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+            );
+        }
+        event
+    }
+
+    fn pane_x_card(state: &AppState) -> SessionState {
+        let cards: Vec<_> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("pane-x"))
+            .collect();
+        assert_eq!(cards.len(), 1, "one Codex pane keeps one card: {cards:#?}");
+        cards[0].clone()
+    }
+
+    /// Scenario: Feed one deck-launched Codex card the wrapper's start and its
+    /// classified output, interleaved with a whole turn of Codex's native
+    /// hooks. With the hooks trusted the card reads Idle before any prompt,
+    /// Thinking, Working with the tool, Needs Input, Idle after Stop, and stays
+    /// Idle through the redraws that follow; with the prompt hook declared
+    /// unavailable, output reads Thinking until it goes quiet, never forever.
+    #[spec("codex/status/002")]
+    #[test]
+    fn codex_status_002_hooks_decide_a_codex_card_and_output_only_when_they_cannot() {
+        // Trusted hooks.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 2));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "started, no prompt yet: the boot paint is not work"
+        );
+
+        state.apply_event(codex_status_frame(EventType::SessionStart, false, 3));
+        let mut prompt = codex_status_frame(EventType::Thinking, false, 4);
+        prompt.user_prompt = Some("list the files".to_string());
+        state.apply_event(prompt);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        let mut tool = codex_status_frame(EventType::ToolStart, false, 5);
+        tool.tool_name = Some("Bash".to_string());
+        tool.tool_detail = Some("ls".to_string());
+        state.apply_event(tool);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 6));
+        let card = pane_x_card(&state);
+        assert_eq!(card.status, SessionStatus::Working, "tool running");
+        assert_eq!(card.active_tool.map(|t| t.name).as_deref(), Some("Bash"));
+
+        state.apply_event(codex_status_frame(EventType::PermissionRequest, false, 7));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 8));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::WaitingForInput,
+            "permission prompt on screen"
+        );
+        state.apply_event(codex_status_frame(EventType::ToolEnd, false, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        state.apply_event(codex_status_frame(EventType::Idle, false, 10));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "turn finished"
+        );
+        for secs in 11..14 {
+            state.apply_event(codex_wrapper_frame(EventType::Thinking, false, secs));
+            state.apply_event(codex_wrapper_frame(EventType::Idle, false, secs));
+        }
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "redraws after Stop must leave the finished turn Idle"
+        );
+
+        // Prompt hook not running: output is the only sign of a turn.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 3));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "output gone quiet ends the Working, rather than it lasting until exit"
+        );
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        // A hook that does run (trust from an earlier install) still outranks
+        // output: silence does not end a permission prompt.
+        state.apply_event(codex_status_frame(EventType::PermissionRequest, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 6));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 7));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::WaitingForInput);
+
+        // The wrapper's frames can arrive out of order (PR #1523 review): a
+        // quiet Idle stamped before a newer Thinking, or a Thinking stamped
+        // before the start that says the output settled, changes nothing.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 10));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut settled = codex_wrapper_frame(EventType::SessionStart, true, 20);
+        settled.metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(settled);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 19));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 21));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        // A classified Thinking still in flight when the wrapper reported the
+        // child's exit lands after it and is older: the finished pane stays
+        // Idle (Qodo on PR #1523).
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        let mut exited = codex_status_frame(EventType::Idle, true, 7);
+        exited.metadata.insert(
+            crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+        );
+        state.apply_event(exited);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        // A prompt hook that does run on such a pane (trust left by an earlier
+        // install) owns its Thinking: the wrapper's quiet Idle, however new,
+        // does not end it (Qodo on PR #1523). Output's own Thinking still ends.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 3));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(codex_status_frame(EventType::Idle, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 7));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        // A reconnect overlays the daemon's status with the daemon's answer
+        // about who set it (Qodo on PR #1523): a Thinking output set still
+        // ends on the wrapper's quiet Idle, and one a prompt hook set does not.
+        for (hook_set, expected) in [
+            (false, SessionStatus::Idle),
+            (true, SessionStatus::Thinking),
+        ] {
+            let mut daemon = AppState::default();
+            daemon.register_pane("pane-x".to_string());
+            daemon.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+            if hook_set {
+                daemon.apply_event(codex_status_frame(EventType::Thinking, false, 2));
+            } else {
+                daemon.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+            }
+            let key = daemon
+                .sessions
+                .iter()
+                .find(|(_, s)| s.pane_id.as_deref() == Some("pane-x"))
+                .map(|(k, _)| k.clone())
+                .expect("the card");
+            let snap = daemon.sessions[&key].live_snapshot();
+            assert_eq!(snap.status, SessionStatus::Thinking);
+            assert_eq!(snap.output_set_status, !hook_set);
+            let wire: SessionSnapshot =
+                serde_json::from_str(&serde_json::to_string(&snap).expect("serialize"))
+                    .expect("deserialize");
+
+            let mut tui = AppState::default();
+            tui.register_pane("pane-x".to_string());
+            tui.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+            let card = tui
+                .sessions
+                .values_mut()
+                .find(|s| s.pane_id.as_deref() == Some("pane-x"))
+                .expect("the card");
+            overlay_snapshot_fields(card, &wire);
+            tui.apply_event(codex_wrapper_frame(EventType::Idle, true, 4));
+            assert_eq!(
+                pane_x_card(&tui).status,
+                expected,
+                "hook_set={hook_set}: the overlaid Thinking's owner decides whether quiet ends it"
+            );
+        }
+
+        // A wrapper interface start that arrives after frames it predates — an
+        // untrusted Thinking, or a native prompt — does not reset the card
+        // (Qodo on PR #1523).
+        let late_start = |secs| {
+            let mut start = codex_wrapper_frame(EventType::SessionStart, true, secs);
+            start.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+            );
+            start
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 5));
+        state.apply_event(late_start(4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 5));
+        state.apply_event(late_start(4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        // The same for the wrapper's fork-time start, which the daemon can
+        // also handle after a frame sent later (Qodo on PR #1523).
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 5));
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(late_start(2));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        // A detached command's Working (the shell monitor's) still ends with
+        // its `ShellIdle` when the wrapper reports output in between that
+        // asserts nothing (PR #1523 review).
+        for untrusted in [false, true] {
+            let mut state = AppState::default();
+            state.register_pane("pane-x".to_string());
+            state.apply_event(codex_wrapper_frame(EventType::SessionStart, untrusted, 1));
+            state.apply_event(codex_status_frame(EventType::ShellBusy, true, 2));
+            assert_eq!(pane_x_card(&state).status, SessionStatus::Working);
+            state.apply_event(codex_wrapper_frame(EventType::Thinking, untrusted, 3));
+            state.apply_event(codex_wrapper_frame(EventType::Idle, untrusted, 4));
+            state.apply_event(codex_status_frame(EventType::ShellIdle, true, 5));
+            assert_eq!(
+                pane_x_card(&state).status,
+                SessionStatus::Idle,
+                "untrusted={untrusted}: the command's end must still end its Working"
+            );
+        }
+
+        // Control: an agent the wrapper hosts with no hooks at all keeps its
+        // output-derived Working, as before.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        let mut generic = codex_wrapper_frame(EventType::Thinking, false, 1);
+        generic.agent_type = AgentType::None;
+        state.apply_event(generic);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+    }
+
     /// Scenario: Block a card with a quota event, then send it the tool
     /// start, tool end and subagent stop of a background subagent (events
     /// stamped with a subagent id) that keeps running after the main turn
@@ -23058,6 +26159,121 @@ while True:
         assert!(session(&state).blocked.is_none());
     }
 
+    fn subagent_event(event_type: EventType, subagent_id: &str, secs: i64) -> AgentEvent {
+        let mut event = quota_event(event_type, secs);
+        event.metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            subagent_id.to_string(),
+        );
+        event
+    }
+
+    /// Issue #697 (Qodo on #1559): more subagents waiting at once than a
+    /// [`SubagentWait`] remembers by id must not end the wait while one of
+    /// them still has its prompt open. One more subagent than
+    /// [`MAX_SUBAGENT_IDS`] asks for permission, all but the first stop —
+    /// the last of them the one counted rather than remembered — and the card
+    /// must still read Needs Input until the first one stops too.
+    #[test]
+    fn subagent_wait_over_the_id_cap_stays_open_until_every_subagent_stops() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        let total = MAX_SUBAGENT_IDS + 1;
+        for i in 0..total {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        assert_eq!(status(&state), SessionStatus::WaitingForInput);
+
+        for i in (1..total).rev() {
+            state.apply_event(subagent_event(
+                EventType::SubagentStop,
+                &format!("sub-{i}"),
+                3,
+            ));
+            assert_eq!(
+                status(&state),
+                SessionStatus::WaitingForInput,
+                "sub-0 still has its prompt open after sub-{i} stopped"
+            );
+        }
+
+        state.apply_event(subagent_event(EventType::SubagentStop, "sub-0", 4));
+        assert_eq!(
+            status(&state),
+            SessionStatus::Thinking,
+            "the last waiting subagent stopping ends the wait"
+        );
+    }
+
+    /// Issue #697 (Qodo on #1559, r4176756571): a subagent that asks twice is
+    /// still one subagent. 65 subagents ask — past the 64 ids a wait once
+    /// remembered — the 65th asks again, and once all 65 have stopped the wait
+    /// must be over: counting the repeat as a second subagent left the card on
+    /// Needs Input after every subagent had stopped.
+    #[test]
+    fn subagent_wait_a_repeated_ask_is_not_a_new_subagent() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        let total = 65;
+        for i in 0..total {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        let repeated = format!("sub-{}", total - 1);
+        state.apply_event(subagent_event(EventType::PermissionRequest, &repeated, 3));
+
+        for i in 0..total - 1 {
+            state.apply_event(subagent_event(
+                EventType::SubagentStop,
+                &format!("sub-{i}"),
+                4,
+            ));
+            assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, &repeated, 5));
+        assert_eq!(
+            status(&state),
+            SessionStatus::Thinking,
+            "every subagent has stopped, so the wait is over"
+        );
+    }
+
+    /// Issue #697 control: under the cap the wait behaves as before — it ends
+    /// on the stop of the last subagent recorded, and a stop from a subagent
+    /// that never asked does not end it early.
+    #[test]
+    fn subagent_wait_under_the_id_cap_ends_on_the_last_recorded_stop() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        for id in ["a", "b", "c"] {
+            state.apply_event(subagent_event(EventType::PermissionRequest, id, 2));
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, "never-asked", 3));
+        assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        for id in ["a", "b"] {
+            state.apply_event(subagent_event(EventType::SubagentStop, id, 3));
+            assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, "c", 4));
+        assert_eq!(status(&state), SessionStatus::Thinking);
+    }
+
     /// Scenario: Serialize a live snapshot whose status is Blocked and decode it
     /// with a reader that predates the variant. The older reader must decode
     /// the whole record with the status as Unknown and ignore the reason, and
@@ -23067,6 +26283,7 @@ while True:
     #[test]
     fn status_blocked_007_older_reader_decodes_blocked_as_unknown() {
         let snap = SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::Codex),
@@ -23082,6 +26299,7 @@ while True:
                 detail: Some("You\u{2019}ve hit your usage limit.".to_string()),
                 resets_at_ms: Some(9_000),
             }),
+            hook_generation: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -23130,6 +26348,7 @@ while True:
     fn a_hydrated_blocked_snapshot_keeps_only_a_plausible_reset() {
         let now_ms = Utc::now().timestamp_millis();
         let snap = |resets_at_ms| SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::ClaudeCode),
@@ -23145,6 +26364,7 @@ while True:
                 detail: None,
                 resets_at_ms,
             }),
+            hook_generation: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();
@@ -23403,5 +26623,1147 @@ while True:
         }]);
         assert!(windowed.contains("; resets in 2 hours"), "{windowed}");
         assert!(!windowed.contains("credits do not reset"), "{windowed}");
+    }
+
+    fn hook_provenance_audit_unproven(mut event: AgentEvent) -> AgentEvent {
+        event.metadata.insert(
+            crate::event::UNPROVEN_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        event
+    }
+
+    /// Scenario: The daemon's registry owns a pane, and an event carrying the
+    /// daemon's unproven marker arrives for it — a start naming no agent, then
+    /// a running report naming the owner — after the owner's own card exists.
+    /// Neither may draw a card or move the owner's, because the marker is the
+    /// gate's verdict and a later ownership lookup must not overturn it.
+    #[test]
+    fn hook_provenance_audit_daemon_reads_the_unproven_marker_as_authoritative() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "owner-card".to_string();
+        own.event_type = EventType::SessionStart;
+        state.apply_event(own.clone());
+        let before = state.sessions["owner-card"].clone();
+
+        let mut start = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        start.agent_id = None;
+        start.session_id = "forged-start".to_string();
+        start.event_type = EventType::SessionStart;
+        state.apply_event(hook_provenance_audit_unproven(start));
+        assert!(!state.sessions.contains_key("forged-start"));
+
+        let mut status = own;
+        status.event_type = EventType::Thinking;
+        state.apply_event(hook_provenance_audit_unproven(status));
+        assert_eq!(state.sessions["owner-card"].status, before.status);
+        assert_eq!(state.unproven_session_count(), 0);
+    }
+
+    /// Scenario: A client with no registry registered a pane as its own and
+    /// holds its card. An event the daemon marked unproven for that pane must
+    /// not drive the card or draw a second one; one that the daemon ALSO marked
+    /// as coming from an orphaned role pane (the daemon-restart survivor) still
+    /// reaches the card and badges it.
+    #[test]
+    fn hook_provenance_audit_client_marker_is_authoritative_except_for_an_orphan() {
+        let mut client = AppState::default();
+        client.register_pane(CLI_PANE.to_string());
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "owner-card".to_string();
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own.clone());
+        let before = client.sessions["owner-card"].status.clone();
+
+        let mut status = own.clone();
+        status.event_type = EventType::Thinking;
+        client.apply_event(hook_provenance_audit_unproven(status.clone()));
+        assert_eq!(client.sessions["owner-card"].status, before);
+        let mut start = own.clone();
+        start.agent_id = None;
+        start.session_id = "forged-start".to_string();
+        client.apply_event(hook_provenance_audit_unproven(start));
+        assert!(!client.sessions.contains_key("forged-start"));
+
+        let mut orphaned = hook_provenance_audit_unproven(status);
+        orphaned.metadata.insert(
+            crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY.to_string(),
+            crate::event::ORCHESTRATION_ORPHANED_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(orphaned);
+        assert_eq!(
+            client.sessions["owner-card"].status,
+            SessionStatus::Thinking
+        );
+        assert!(client.sessions["owner-card"].orchestration_orphaned);
+    }
+
+    /// Scenario: An outside agent draws a card on a pane, and the deck then
+    /// registers that pane as its own. The outside card must go with the
+    /// registration rather than linger as an untracked second card.
+    #[test]
+    fn hook_provenance_audit_registering_a_pane_removes_its_outside_cards() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+        let mut outside = agent_event_cli_payload("collide-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        state.apply_event(outside);
+        assert_eq!(state.unproven_session_count(), 1, "precondition");
+        state.register_pane("collide-pane".to_string());
+        assert!(
+            !state.sessions.contains_key("outside-card"),
+            "an outside card on a pane the deck now owns must be removed"
+        );
+        assert_eq!(state.unproven_session_count(), 0);
+    }
+
+    /// Scenario: In a process with no registry, an outside agent's marked
+    /// paneless start, status and end name the key of a card on a pane the
+    /// process registered; and an outside agent's marked events on its own
+    /// pane name the key of a paneless card the process admitted earlier.
+    /// Neither may change, relocate or remove the card it collides with.
+    #[test]
+    fn hook_provenance_audit_client_unproven_collisions_leave_proven_cards_alone() {
+        let mut client = AppState::default();
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "paneless-own".to_string();
+        own.pane_id = None;
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own);
+        assert!(client.sessions.contains_key("paneless-own"), "precondition");
+
+        let mut outside = agent_event_cli_payload("outside-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        client.apply_event(hook_provenance_audit_unproven(outside.clone()));
+        for kind in [EventType::Thinking, EventType::SessionEnd] {
+            let mut collide = outside.clone();
+            collide.session_id = "paneless-own".to_string();
+            collide.event_type = kind.clone();
+            client.apply_event(hook_provenance_audit_unproven(collide));
+            let card = client
+                .sessions
+                .get("paneless-own")
+                .unwrap_or_else(|| panic!("{kind:?}: the card is gone"));
+            assert_eq!(card.pane_id, None, "{kind:?}");
+            assert_eq!(card.status, SessionStatus::Idle, "{kind:?}");
+        }
+    }
+
+    /// Scenario: Agent B owns a pane and has its card. An attested report that
+    /// names no agent arrives for that pane, but its token was minted for the
+    /// replaced agent A — the successor claimed the pane after the gate looked.
+    /// Judged under the state lock by A's generation, it must leave B's card
+    /// alone; the same report attested to B itself still lands.
+    #[test]
+    fn hook_provenance_audit_apply_judges_an_untagged_report_by_its_tokens_generation() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::owning(CLI_PANE, "agent-b"));
+        let mut own = agent_event_cli_payload(CLI_PANE, "agent-b");
+        own.session_id = "successor-card".to_string();
+        own.event_type = EventType::SessionStart;
+        state.apply_event(own.clone());
+        let mut untagged = own;
+        untagged.agent_id = None;
+        untagged.event_type = EventType::Thinking;
+
+        let _ = state.apply_event_reporting(untagged.clone(), Some("agent-a"));
+        assert_eq!(
+            state.sessions["successor-card"].status,
+            SessionStatus::Idle,
+            "a replaced generation's untagged report must not drive its successor's card"
+        );
+
+        let _ = state.apply_event_reporting(untagged, Some("agent-b"));
+        assert_eq!(
+            state.sessions["successor-card"].status,
+            SessionStatus::Thinking
+        );
+    }
+
+    /// The role pane the round-2 orphan regressions use, and the survivor
+    /// agent the client's card on it belongs to.
+    const AUDIT_ORPHAN_PANE: &str = "sched-audit-orphan-7-r0";
+    const AUDIT_SURVIVOR: &str = "survivor-3";
+
+    /// An event as the daemon broadcasts an outside report from an orphaned
+    /// role pane: stamped orphaned by the real stamp of a post-restart daemon,
+    /// and marked unproven because that daemon never issued the pane a token.
+    fn hook_provenance_audit_orphan_frame(
+        session: &str,
+        agent: Option<&str>,
+        kind: EventType,
+    ) -> AgentEvent {
+        let mut event = agent_event_cli_payload(AUDIT_ORPHAN_PANE, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        AppState::default().stamp_orchestration_orphan(&mut event, false);
+        assert!(event.is_orchestration_orphaned(), "precondition: stamped");
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// A client with no registry that still holds a daemon-restart survivor's
+    /// card on its registered role pane, beside a proven paneless card.
+    fn hook_provenance_audit_orphan_client() -> AppState {
+        // The paneless card first: a client admits one only while it manages
+        // no pane, and it keeps the card once it registers one.
+        let mut client = AppState::default();
+        let mut paneless = agent_event_cli_payload(AUDIT_ORPHAN_PANE, "paneless-agent");
+        paneless.session_id = "paneless-victim".to_string();
+        paneless.pane_id = None;
+        paneless.event_type = EventType::SessionStart;
+        client.apply_event(paneless);
+        client.register_pane(AUDIT_ORPHAN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_ORPHAN_PANE, AUDIT_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        client.apply_event(survivor);
+        assert_eq!(client.sessions.len(), 2, "precondition: two cards");
+        client
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane, beside an unrelated paneless card. Outside reports the daemon
+    /// stamped orphaned for that pane — a running report, a start under a
+    /// fresh key and a session end, each naming the paneless card's key or an
+    /// invented agent — must never change, re-key or remove the paneless card,
+    /// draw a new card, or remove the survivor's card. The survivor's own
+    /// reports still update its card's status and orphan badge.
+    #[test]
+    fn hook_provenance_audit_client_orphan_exception_reaches_only_the_survivors_card() {
+        let mut client = hook_provenance_audit_orphan_client();
+        let victim = client.sessions["paneless-victim"].clone();
+        for (session, agent, kind) in [
+            ("paneless-victim", Some("invented-9"), EventType::Thinking),
+            ("paneless-victim", Some(AUDIT_SURVIVOR), EventType::Thinking),
+            ("fresh-key", Some("invented-9"), EventType::SessionStart),
+            ("fresh-key", Some(AUDIT_SURVIVOR), EventType::SessionStart),
+            (
+                "paneless-victim",
+                Some("invented-9"),
+                EventType::SessionStart,
+            ),
+            ("paneless-victim", Some("invented-9"), EventType::SessionEnd),
+            (
+                "paneless-victim",
+                Some(AUDIT_SURVIVOR),
+                EventType::SessionEnd,
+            ),
+            ("survivor-card", Some("invented-9"), EventType::SessionEnd),
+        ] {
+            client.apply_event(hook_provenance_audit_orphan_frame(
+                session,
+                agent,
+                kind.clone(),
+            ));
+            let what = format!("{kind:?} naming {session} as {agent:?}");
+            let card = client
+                .sessions
+                .get("paneless-victim")
+                .unwrap_or_else(|| panic!("{what}: the paneless card was removed"));
+            assert_eq!(
+                (&card.pane_id, &card.status, &card.agent_id),
+                (&victim.pane_id, &victim.status, &victim.agent_id),
+                "{what}: the paneless card must be untouched"
+            );
+            assert!(!card.orchestration_orphaned, "{what}: badge leaked");
+            assert!(
+                client.sessions.contains_key("survivor-card"),
+                "{what}: the survivor's card must not be removed"
+            );
+            assert_eq!(client.sessions.len(), 2, "{what}: no card may be drawn");
+            assert_eq!(client.unproven_session_count(), 0, "{what}");
+        }
+
+        // The survivor's own running report still reaches its card.
+        let mut client = hook_provenance_audit_orphan_client();
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some(AUDIT_SURVIVOR),
+            EventType::Thinking,
+        ));
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(card.status, SessionStatus::Thinking);
+        assert!(card.orchestration_orphaned);
+        assert_eq!(card.agent_id.as_deref(), Some(AUDIT_SURVIVOR));
+        // An invented agent's report on the pane does not.
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some("invented-9"),
+            EventType::Idle,
+        ));
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Thinking,
+            "the exception is bound to the survivor's own identity"
+        );
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane, and the daemon announces it evicted an outside card under the
+    /// survivor card's own key and pane — the daemon files the survivor's
+    /// reports as an outside agent's. The client's own card must stay; an
+    /// outside card the client holds under an announced key still goes.
+    #[test]
+    fn hook_provenance_audit_client_eviction_removes_only_an_outside_card() {
+        let mut client = hook_provenance_audit_orphan_client();
+        let mut eviction = agent_event_cli_payload(AUDIT_ORPHAN_PANE, AUDIT_SURVIVOR);
+        eviction.session_id = "survivor-card".to_string();
+        eviction.event_type = EventType::SessionEnd;
+        eviction.metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(eviction);
+        assert!(
+            client.sessions.contains_key("survivor-card"),
+            "an eviction announcement removes only a card the client holds as an outside agent's"
+        );
+
+        let mut outside = agent_event_cli_payload("outside-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        client.apply_event(hook_provenance_audit_unproven(outside.clone()));
+        assert!(client.sessions.contains_key("outside-card"), "precondition");
+        outside.event_type = EventType::SessionEnd;
+        outside.metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(outside);
+        assert!(!client.sessions.contains_key("outside-card"));
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane. Outside reports stamped orphaned for that pane arrive as far more
+    /// start/end pairs than the outside-card budget, each naming a fresh
+    /// session and a fresh agent id. No map the client keeps may grow with
+    /// them — in particular no agent-keyed closure record may be written.
+    #[test]
+    fn hook_provenance_audit_client_orphan_flood_retains_nothing_per_agent() {
+        let mut client = hook_provenance_audit_orphan_client();
+        for index in 0..MAX_UNPROVEN_SESSIONS * 3 {
+            let session = format!("orphan-flood-{index}");
+            let agent = format!("orphan-flood-agent-{index}");
+            for kind in [EventType::SessionStart, EventType::SessionEnd] {
+                client.apply_event(hook_provenance_audit_orphan_frame(
+                    &session,
+                    Some(&agent),
+                    kind,
+                ));
+            }
+        }
+        // The survivor's own end writes no agent-keyed witness either: the
+        // frame is still an outside report.
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some(AUDIT_SURVIVOR),
+            EventType::SessionEnd,
+        ));
+        let sizes = client.retained_map_sizes();
+        for (map, size) in &sizes {
+            assert!(
+                *size <= 2,
+                "`{map}` retains {size} entries after an orphan flood: {sizes:?}"
+            );
+        }
+        let closures = sizes
+            .iter()
+            .find(|(map, _)| *map == "agent_generation_closures")
+            .map(|(_, size)| *size);
+        assert_eq!(closures, Some(0), "{sizes:?}");
+        assert!(!client.agent_generation_ended(AUDIT_SURVIVOR));
+    }
+
+    /// An outside agent's start on `pane`, as the daemon relays it.
+    fn hook_provenance_audit_outside_start(session: &str, pane: &str) -> AgentEvent {
+        let mut event = agent_event_cli_payload(pane, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = None;
+        event.event_type = EventType::SessionStart;
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// The cards `state` holds that are counted nowhere: neither on a pane it
+    /// registered nor in its outside-card accounting. Such a card is outside
+    /// the budget and is read as one of the process's own.
+    fn hook_provenance_audit_unaccounted_cards(state: &AppState) -> Vec<String> {
+        let mut ids: Vec<String> = state
+            .sessions
+            .iter()
+            .filter(|(id, session)| {
+                !state.unproven_sessions.contains_key(*id)
+                    && !session
+                        .pane_id
+                        .as_ref()
+                        .is_some_and(|pane| state.managed_pane_ids.contains(pane))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Scenario: Before a client attaches, the daemon holds an outside card
+    /// `s` on pane A, close to its outside-card budget. After the client
+    /// attaches, an outside start for `s` arrives on pane B: the daemon files
+    /// it under a pane-qualified key, the client under `s`. The daemon then
+    /// evicts its card on A and announces it. The client's card on B must stay
+    /// an outside card, counted against its budget, and must go when the daemon
+    /// later evicts the card it holds for B.
+    #[test]
+    fn hook_provenance_audit_mismatched_eviction_neither_promotes_nor_strands() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        // What an attached client sees: the frame as relayed, then whatever
+        // the daemon evicted to make room for it.
+        let relay = |daemon: &mut AppState, client: &mut AppState, event: AgentEvent| {
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+        };
+
+        // Before the client attaches.
+        daemon.apply_event(hook_provenance_audit_outside_start("s", "pane-a"));
+        for index in 0..MAX_UNPROVEN_SESSIONS - 2 {
+            daemon.apply_event(hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            ));
+        }
+        assert!(daemon.take_unproven_evictions().is_empty(), "precondition");
+
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("s", "pane-b"),
+        );
+        assert!(
+            daemon.sessions.contains_key("pane-b::s"),
+            "precondition: the daemon qualified the key"
+        );
+        assert_eq!(
+            client.sessions["s"].pane_id.as_deref(),
+            Some("pane-b"),
+            "precondition: the client did not"
+        );
+
+        // The daemon is at its budget: this evicts its card `s` on pane A.
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("trigger", "pane-t"),
+        );
+        assert!(!daemon.sessions.contains_key("s"), "precondition: evicted");
+        assert!(
+            client.sessions.contains_key("s"),
+            "the announcement named pane A; the client's card is on pane B"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new(),
+            "a mismatched eviction must not drop a card's accounting and keep the card"
+        );
+        assert!(!client.is_proven_session("s"), "the card was promoted");
+
+        // Refresh the daemon's fillers, which the client does not hold, so its
+        // card for pane B is the least recently active; the next start evicts
+        // it, under the daemon's own key for it.
+        for index in 0..MAX_UNPROVEN_SESSIONS - 2 {
+            let mut refresh = hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            );
+            refresh.event_type = EventType::Thinking;
+            relay(&mut daemon, &mut client, refresh);
+        }
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("trigger-2", "pane-u"),
+        );
+        assert!(
+            !daemon.sessions.contains_key("pane-b::s"),
+            "precondition: the daemon evicted its card for pane B"
+        );
+        assert!(
+            !client.sessions.contains_key("s"),
+            "the client's card for pane B must go with the daemon's, whatever \
+             key each side filed it under"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A plain (non-role) pane a client registered before a daemon restart,
+    /// and the survivor agent its card belongs to.
+    const AUDIT_PLAIN_PANE: &str = "audit-plain-survivor-pane";
+    const AUDIT_PLAIN_SURVIVOR: &str = "plain-survivor-5";
+
+    /// An event as a post-restart daemon broadcasts a report from a plain pane
+    /// it holds no live agent on: unproven, and stamped as such.
+    fn hook_provenance_audit_plain_frame(
+        session: &str,
+        agent: Option<&str>,
+        kind: EventType,
+    ) -> AgentEvent {
+        assert!(!crate::spawn::is_orchestration_role_pane_id(
+            AUDIT_PLAIN_PANE
+        ));
+        let mut event = agent_event_cli_payload(AUDIT_PLAIN_PANE, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        event.metadata.insert(
+            crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// A client with no registry that still holds a plain pane's restart
+    /// survivor card, beside a proven paneless card.
+    fn hook_provenance_audit_plain_client() -> AppState {
+        let mut client = AppState::default();
+        let mut paneless = agent_event_cli_payload(AUDIT_PLAIN_PANE, "paneless-agent");
+        paneless.session_id = "paneless-victim".to_string();
+        paneless.pane_id = None;
+        paneless.event_type = EventType::SessionStart;
+        client.apply_event(paneless);
+        client.register_pane(AUDIT_PLAIN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_PLAIN_PANE, AUDIT_PLAIN_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        client.apply_event(survivor);
+        assert_eq!(client.sessions.len(), 2, "precondition: two cards");
+        client
+    }
+
+    /// Scenario: A client stayed attached across a daemon restart and still
+    /// shows a plain pane's surviving agent, beside an unrelated paneless card.
+    /// The survivor's own running report, which the new daemon marks as coming
+    /// from a pane it holds no live agent on, updates the card without an
+    /// orphan badge, and its end settles the card Idle. Reports naming an
+    /// invented agent, the paneless card's key or a fresh key change no other
+    /// card and draw none, and a report without the daemon's verdict is refused.
+    #[test]
+    fn hook_provenance_audit_client_plain_survivor_reaches_only_its_own_card() {
+        let mut client = hook_provenance_audit_plain_client();
+        client.apply_event(hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        ));
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(
+            card.status,
+            SessionStatus::Thinking,
+            "the plain survivor's own report must update its card"
+        );
+        assert!(!card.orchestration_orphaned, "a plain pane has no role");
+        assert_eq!(card.agent_id.as_deref(), Some(AUDIT_PLAIN_SURVIVOR));
+
+        let victim = client.sessions["paneless-victim"].clone();
+        for (session, agent, kind) in [
+            ("survivor-card", Some("invented-9"), EventType::Idle),
+            ("paneless-victim", Some("invented-9"), EventType::Idle),
+            ("fresh-key", Some("invented-9"), EventType::SessionStart),
+            (
+                "fresh-key",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                EventType::SessionStart,
+            ),
+            (
+                "paneless-victim",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                EventType::SessionEnd,
+            ),
+            ("survivor-card", Some("invented-9"), EventType::SessionEnd),
+        ] {
+            client.apply_event(hook_provenance_audit_plain_frame(
+                session,
+                agent,
+                kind.clone(),
+            ));
+            let what = format!("{kind:?} naming {session} as {agent:?}");
+            let card = client
+                .sessions
+                .get("paneless-victim")
+                .unwrap_or_else(|| panic!("{what}: the paneless card was removed"));
+            assert_eq!(
+                (&card.pane_id, &card.status, &card.agent_id),
+                (&victim.pane_id, &victim.status, &victim.agent_id),
+                "{what}: the paneless card must be untouched"
+            );
+            assert!(
+                client.sessions.contains_key("survivor-card"),
+                "{what}: the survivor's card must not be removed"
+            );
+            assert_eq!(client.sessions.len(), 2, "{what}: no card may be drawn");
+            assert_eq!(client.unproven_session_count(), 0, "{what}");
+            assert!(!client.sessions["survivor-card"].orchestration_orphaned);
+        }
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Idle,
+            "the survivor's own end settles its card"
+        );
+
+        // An invented agent's report does not reach the survivor's card.
+        let mut client = hook_provenance_audit_plain_client();
+        client.apply_event(hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some("invented-9"),
+            EventType::Thinking,
+        ));
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Idle,
+            "the exception is bound to the survivor's own identity"
+        );
+        // Nor does an unproven report the daemon did not mark.
+        let mut unmarked = hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        );
+        unmarked
+            .metadata
+            .remove(crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY);
+        client.apply_event(unmarked);
+        assert_eq!(client.sessions["survivor-card"].status, SessionStatus::Idle);
+        assert_eq!(client.agent_generation_closures.len(), 0);
+    }
+
+    /// Scenario: A client stayed attached across a daemon restart and still
+    /// shows a plain pane's surviving agent, whose start declared a
+    /// history-only live target. The survivor then reports more times than the
+    /// card's journal holds, and finally sends a report declaring a live,
+    /// writable target. The card must stay history-only throughout: a restart
+    /// survivor's reports move reporting state, never what the card accepts.
+    #[test]
+    fn hook_provenance_audit_survivor_reports_keep_the_cards_live_target() {
+        let history_only = crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Process,
+            writable: crate::event::Writable::HistoryOnly,
+        };
+        let mut client = AppState::default();
+        client.register_pane(AUDIT_PLAIN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_PLAIN_PANE, AUDIT_PLAIN_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        survivor.live_target = Some(history_only);
+        client.apply_event(survivor);
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "precondition: a history-only card"
+        );
+
+        for round in 0..MAX_RECENT_EVENTS + 5 {
+            let kind = if round % 2 == 0 {
+                EventType::Thinking
+            } else {
+                EventType::Idle
+            };
+            client.apply_event(hook_provenance_audit_plain_frame(
+                "survivor-card",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                kind,
+            ));
+        }
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(card.recent_events.len(), MAX_RECENT_EVENTS);
+        assert_eq!(
+            card.live_target(),
+            Some(history_only),
+            "the declaration must outlive the journal's capacity"
+        );
+        assert_eq!(card.writable(), crate::event::Writable::HistoryOnly);
+
+        let mut redeclare = hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        );
+        redeclare.live_target = Some(crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Pty,
+            writable: crate::event::Writable::Live,
+        });
+        client.apply_event(redeclare);
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Thinking,
+            "precondition: the report landed"
+        );
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "an unproven survivor report must not make its card writable"
+        );
+    }
+
+    /// Scenario: Round after round, a client holds an outside card and the
+    /// daemon announces an eviction under that card's key but a different
+    /// pane — what a key the two sides filed differently produces. The client
+    /// must never hold more outside cards than its budget, and every card it
+    /// holds must stay counted.
+    #[test]
+    fn hook_provenance_audit_mismatched_evictions_keep_the_client_bounded() {
+        let mut client = AppState::default();
+        for round in 0..MAX_UNPROVEN_SESSIONS * 3 {
+            let session = format!("round-{round}");
+            client.apply_event(hook_provenance_audit_outside_start(
+                &session,
+                &format!("held-pane-{round}"),
+            ));
+            let mut eviction =
+                hook_provenance_audit_outside_start(&session, &format!("other-pane-{round}"));
+            eviction.metadata.clear();
+            eviction.event_type = EventType::SessionEnd;
+            eviction.metadata.insert(
+                crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+            );
+            client.apply_event(eviction);
+            assert_eq!(
+                hook_provenance_audit_unaccounted_cards(&client),
+                Vec::<String>::new(),
+                "round {round}"
+            );
+            assert!(
+                client.sessions.len() <= MAX_UNPROVEN_SESSIONS,
+                "round {round}: {} cards",
+                client.sessions.len()
+            );
+        }
+    }
+
+    /// An outside report at a fixed instant, `seconds` past the epoch.
+    fn hook_provenance_audit_outside_at(
+        session: &str,
+        pane: &str,
+        agent: Option<&str>,
+        kind: EventType,
+        seconds: i64,
+    ) -> AgentEvent {
+        let mut event = hook_provenance_audit_outside_start(session, pane);
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        event.timestamp = DateTime::from_timestamp(seconds, 0).expect("in range");
+        event
+    }
+
+    /// Scenario: Before a client attaches, the daemon holds an outside card
+    /// `s` on pane A. After it attaches, an outside start for `s` arrives on
+    /// pane B — the daemon files it as `pane-b::s`, the client as `s` — and
+    /// then a running report from a different agent under the literal key
+    /// `pane-b::s`, which the client files as a second card. When the daemon
+    /// evicts its own `pane-b::s`, which names no agent, the client must keep
+    /// the other agent's card: it is not the card the daemon evicted.
+    #[test]
+    fn hook_provenance_audit_eviction_reconciliation_matches_the_evicted_agent() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        let relay = |daemon: &mut AppState, client: &mut AppState, event: AgentEvent| {
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+        };
+
+        // Before the client attaches.
+        daemon.apply_event(hook_provenance_audit_outside_at(
+            "s",
+            "pane-a",
+            None,
+            EventType::SessionStart,
+            10,
+        ));
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_at("s", "pane-b", None, EventType::SessionStart, 10),
+        );
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_at(
+                "pane-b::s",
+                "pane-b",
+                Some("other-agent"),
+                EventType::Thinking,
+                0,
+            ),
+        );
+        assert_eq!(
+            daemon.sessions["pane-b::s"].agent_id, None,
+            "precondition: the daemon's pane-b::s names no agent"
+        );
+        assert_eq!(client.sessions["s"].agent_id, None, "precondition");
+        assert_eq!(
+            client.sessions["pane-b::s"].agent_id.as_deref(),
+            Some("other-agent"),
+            "precondition: the client holds the other agent's card under the literal key"
+        );
+
+        // Fill the daemon's budget until it evicts its pane-b::s, and hand the
+        // client only the announcements. Relaying the fillers as well would
+        // grow the client in step, so its own budget would retire the same
+        // cards at the same moment and hide which path removed them.
+        let mut index = 0;
+        while daemon.sessions.contains_key("pane-b::s") {
+            daemon.apply_event(hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            ));
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+            index += 1;
+            assert!(
+                index <= MAX_UNPROVEN_SESSIONS * 2,
+                "the daemon never evicted"
+            );
+        }
+        let other = client
+            .sessions
+            .get("pane-b::s")
+            .expect("the other agent's card must survive an eviction naming no agent");
+        assert_eq!(other.agent_id.as_deref(), Some("other-agent"));
+        assert!(
+            !client.sessions.contains_key("s"),
+            "the client's card naming no agent is the one the daemon evicted"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Scenario: A client holds two outside cards on one pane under keys that
+    /// differ only by that pane's qualification, and both name no agent. The
+    /// daemon announces an eviction under each of those spellings, naming no
+    /// agent either. The client cannot tell which card the daemon meant, so it
+    /// removes neither; its own budget must still bound it afterwards, with
+    /// every card counted.
+    ///
+    /// No sequence of reports tried reaches this state — the client folds a
+    /// second same-agent report on a pane into the card already there — so the
+    /// second card is filed directly, the way the outside-card accounting
+    /// would file it.
+    #[test]
+    fn hook_provenance_audit_ambiguous_eviction_removes_nothing() {
+        let mut client = AppState::default();
+        client.apply_event(hook_provenance_audit_outside_at(
+            "s",
+            "pane-b",
+            None,
+            EventType::SessionStart,
+            10,
+        ));
+        let twin = client.sessions["s"].clone();
+        client.sessions.insert("pane-b::s".to_string(), twin);
+        client.note_unproven_activity("pane-b::s", Some("pane-b"));
+        assert!(
+            client.sessions.contains_key("s") && client.sessions.contains_key("pane-b::s"),
+            "precondition: two cards on pane-b"
+        );
+        assert_eq!(client.unproven_session_count(), 2, "precondition");
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new(),
+            "precondition"
+        );
+
+        for announced in ["pane-b::s", "s", "pane-b::pane-b::s"] {
+            let mut eviction = hook_provenance_audit_outside_at(
+                announced,
+                "pane-b",
+                None,
+                EventType::SessionEnd,
+                20,
+            );
+            eviction.metadata.clear();
+            eviction.metadata.insert(
+                crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+            );
+            client.apply_event(eviction);
+            assert!(
+                client.sessions.contains_key("s") && client.sessions.contains_key("pane-b::s"),
+                "an ambiguous eviction under `{announced}` must remove nothing"
+            );
+            assert_eq!(
+                hook_provenance_audit_unaccounted_cards(&client),
+                Vec::<String>::new(),
+                "{announced}"
+            );
+        }
+
+        // The client's own budget still bounds it.
+        for index in 0..MAX_UNPROVEN_SESSIONS * 2 {
+            client.apply_event(hook_provenance_audit_outside_start(
+                &format!("flood-{index}"),
+                &format!("flood-pane-{index}"),
+            ));
+            assert!(client.sessions.len() <= MAX_UNPROVEN_SESSIONS, "{index}");
+        }
+        assert!(!client.sessions.contains_key("s"));
+        assert!(!client.sessions.contains_key("pane-b::s"));
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Scenario: The daemon and an attached client both hold an outside card
+    /// on pane P, and the client also holds one of its own cards on pane Q and
+    /// an outside card on pane R. The daemon then spawns an agent on P and
+    /// registers it. The client, which never registers P itself, must drop its
+    /// outside card on P from the daemon's announcement and keep the other two.
+    #[test]
+    fn hook_provenance_daemon_register_pane_announces_the_outside_cards_it_drops() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        client.register_pane("pane-q".to_string());
+        let mut own = agent_event_cli_payload("pane-q", "agent-q");
+        own.session_id = "own-card".to_string();
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own);
+        for (session, pane) in [("outside-p", "pane-p"), ("outside-r", "pane-r")] {
+            let event = hook_provenance_audit_outside_start(session, pane);
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+        }
+        assert!(daemon.take_unproven_evictions().is_empty(), "precondition");
+        assert!(client.sessions.contains_key("outside-p"), "precondition");
+
+        daemon.register_pane("pane-p".to_string());
+        assert!(!daemon.sessions.contains_key("outside-p"));
+        for announcement in daemon.take_unproven_evictions() {
+            client.apply_event(announcement);
+        }
+
+        assert!(
+            !client.sessions.contains_key("outside-p"),
+            "the client must drop the outside card the daemon dropped"
+        );
+        assert!(client.sessions.contains_key("outside-r"));
+        assert!(client.sessions.contains_key("own-card"));
+        assert_eq!(client.unproven_session_count(), 1);
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The bytes `state` holds cached for the outside card `id`, beside what its
+    /// journal actually retains.
+    fn hook_provenance_journal_accounting(state: &AppState, id: &str) -> (Option<usize>, usize) {
+        (
+            state.unproven_sessions[id].journal_bytes,
+            state.sessions[id]
+                .recent_events
+                .iter()
+                .map(retained_event_bytes)
+                .sum(),
+        )
+    }
+
+    /// Scenario: An outside agent reports five times under one session key with
+    /// a large tool detail, just inside a lowered budget. A new outside agent
+    /// then starts on the same pane under the same key, superseding the first
+    /// card, and reports three times. The new card's accounting must equal what
+    /// its journal holds, and its three reports must all stay whole, since the
+    /// journal is far under budget.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_card_is_superseded_under_its_key() {
+        const DETAIL: usize = 2048;
+        let session = "outside-reused";
+        let pane = "outside-reused-pane";
+        let report = |agent: &str, round: usize| {
+            let mut event = hook_provenance_audit_outside_start(session, pane);
+            event.agent_id = Some(agent.to_string());
+            if round > 0 {
+                event.event_type = EventType::ToolStart;
+                event.tool_name = Some("Bash".to_string());
+            }
+            event.tool_detail = Some(format!("{agent}-{round}-{}", "x".repeat(DETAIL)));
+            event
+        };
+        let mut state = AppState::default();
+        state.set_unproven_journal_budget(6 * (DETAIL + 512));
+        for round in 0..5 {
+            state.apply_event(report("agent-old", round));
+        }
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            (cached, state.sessions[session].recent_events.len()),
+            (Some(retained), 5),
+            "precondition: the first card is counted and nothing was stripped"
+        );
+
+        for round in 0..3 {
+            state.apply_event(report("agent-new", round));
+        }
+
+        let card = &state.sessions[session];
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some("agent-new"),
+            "precondition: the new generation superseded the card"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            cached,
+            Some(retained),
+            "the accounting must equal what the replacement card retains"
+        );
+        let details: Vec<_> = card
+            .recent_events
+            .iter()
+            .map(|event| event.tool_detail.clone())
+            .collect();
+        let expected: Vec<_> = (0..3)
+            .map(|round| report("agent-new", round).tool_detail)
+            .collect();
+        assert_eq!(
+            details, expected,
+            "a replacement journal under budget must keep every report whole"
+        );
+    }
+
+    /// Scenario: An outside card on a pane is counted, then the pane's
+    /// placeholder card is minted under the same key, replacing its journal.
+    /// The cached accounting must not survive the replacement.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_placeholder_replaces_the_card() {
+        let pane = "outside-placeholder-pane";
+        let session = placeholder_session_id(pane);
+        let mut state = AppState::default();
+        let mut event = hook_provenance_audit_outside_start(&session, pane);
+        event.tool_detail = Some("x".repeat(4096));
+        state.apply_event(event);
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert_eq!(cached, Some(retained), "precondition: counted");
+
+        state.insert_placeholder_session(pane.to_string(), None, None, None);
+
+        assert!(
+            state.sessions[&session].recent_events.is_empty(),
+            "precondition: the placeholder replaced the journal"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert!(
+            cached.is_none_or(|bytes| bytes == retained),
+            "the cached count of the replaced journal must not survive: \
+             {cached:?} cached against {retained} retained"
+        );
+    }
+
+    /// The bytes [`hook_provenance_journal_budget_keeps_every_card`] counts
+    /// for one retained event: its strings and its metadata.
+    fn hook_provenance_journal_payload_bytes(event: &AgentEvent) -> usize {
+        [
+            Some(&event.session_id),
+            event.tool_name.as_ref(),
+            event.tool_detail.as_ref(),
+            event.cwd.as_ref(),
+            event.user_prompt.as_ref(),
+            event.pane_id.as_ref(),
+            event.agent_id.as_ref(),
+            event.agent_version.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum::<usize>()
+            + event
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+    }
+
+    /// Scenario: Thirty-two outside agents each send eight reports carrying a
+    /// large tool detail, far more than this state's lowered budget for
+    /// outside-card journals. Every card must stay, with the status, pane and
+    /// agent its last report gave it; the journals must fit the budget; and
+    /// the most recently active card must keep its newest report whole.
+    #[test]
+    fn hook_provenance_journal_budget_keeps_every_card() {
+        const CARDS: usize = 32;
+        const DETAIL: usize = 2048;
+        const BUDGET: usize = 64 * 1024;
+        let mut bounded = AppState::default();
+        bounded.set_unproven_journal_budget(BUDGET);
+        let mut reference = AppState::default();
+        for card in 0..CARDS {
+            let session = format!("outside-{card}");
+            let pane = format!("outside-pane-{card}");
+            for round in 0..MAX_UNPROVEN_RECENT_EVENTS {
+                let mut event = hook_provenance_audit_outside_start(&session, &pane);
+                event.agent_id = Some(format!("agent-{card}"));
+                if round > 0 {
+                    event.event_type = if round % 2 == 0 {
+                        EventType::Thinking
+                    } else {
+                        EventType::ToolStart
+                    };
+                    event.tool_name = Some("Bash".to_string());
+                }
+                event.tool_detail = Some(format!("{card}-{round}-{}", "x".repeat(DETAIL)));
+                bounded.apply_event(event.clone());
+                reference.apply_event(event);
+            }
+        }
+
+        assert_eq!(bounded.unproven_session_count(), CARDS);
+        let retained: usize = bounded
+            .sessions
+            .values()
+            .flat_map(|session| session.recent_events.iter())
+            .map(hook_provenance_journal_payload_bytes)
+            .sum();
+        assert!(
+            retained <= BUDGET,
+            "outside journals retain {retained} payload bytes against a {BUDGET}-byte budget"
+        );
+        for (id, expected) in &reference.sessions {
+            let card = bounded
+                .sessions
+                .get(id)
+                .unwrap_or_else(|| panic!("card {id} must survive the budget"));
+            assert_eq!(card.status, expected.status, "{id}");
+            assert_eq!(card.pane_id, expected.pane_id, "{id}");
+            assert_eq!(card.agent_id, expected.agent_id, "{id}");
+            assert_eq!(card.agent_type, expected.agent_type, "{id}");
+        }
+        let last = format!("outside-{}", CARDS - 1);
+        assert_eq!(
+            bounded.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            reference.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            "the most recently active card keeps its newest report whole"
+        );
     }
 }

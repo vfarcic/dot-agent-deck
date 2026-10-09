@@ -1013,6 +1013,7 @@ fn status_supersede_016_a_reconnected_card_is_superseded_exactly_where_the_daemo
 fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
     let quiet_since = whole_ms(-Duration::hours(1));
     let snapshot_at = |at: chrono::DateTime<Utc>| SessionSnapshot {
+        output_set_status: false,
         subagent_wait: None,
         status: SessionStatus::Working,
         agent_type: Some(AgentType::Pi),
@@ -1025,6 +1026,7 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
         live_target: Some(history_only()),
         last_activity_ms: Some(at.timestamp_millis()),
         blocked: None,
+        hook_generation: None,
     };
     let early_key = "zz-early-session";
 
@@ -1296,6 +1298,7 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
 fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_card() {
     let future = whole_ms(Duration::hours(1));
     let snapshot = SessionSnapshot {
+        output_set_status: false,
         subagent_wait: None,
         status: SessionStatus::Working,
         agent_type: Some(AgentType::Pi),
@@ -1306,6 +1309,7 @@ fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_car
         live_target: Some(history_only()),
         last_activity_ms: Some(future.timestamp_millis()),
         blocked: None,
+        hook_generation: None,
     };
     let mut tui = AppState::default();
     let before_seed = Utc::now();

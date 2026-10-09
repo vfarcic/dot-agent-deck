@@ -39,6 +39,7 @@ import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } fr
 import {
   DIALOG_MOVED_ON,
   VOICE_CHOICE_DIALOG_MOVED_ON,
+  VOICE_SUBMIT_SETTLE_MS,
   VOICE_CHOICE_SCREEN_MOVED_ON,
   NOTHING_DISPATCHED,
   VOICE_CHOICE_DECK_MOVED_ON,
@@ -1816,6 +1817,8 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     voice.deliver("send it");
     await completeUtterance();
+    // The words landed a moment ago, so Enter waits for them to settle.
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
 
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
@@ -1975,7 +1978,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, "one more prompt ");
   });
 
-  /** Scenario: one utterance ends with a separate send sentence in typing mode. The panel writes only the prompt, waits for that write, then presses Enter through the spoken-send path. */
+  /** Scenario: one utterance ends with a separate send sentence in typing mode. The panel writes only the prompt, waits for that write and then a moment more for the words to settle in the agent, so the agent reads Enter on its own and submits rather than starting a new line, then presses Enter through the spoken-send path. */
   it("types a trailing-send prompt before pressing Enter", async () => {
     const said = "What's the weather over there? Send it.";
     const prompt = "What's the weather over there?";
@@ -1994,6 +1997,10 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
     await act(async () => { finishWrite(); });
     await flush();
+    // PRD #1541 — an Enter in the same read as the words is a newline in
+    // Claude Code, so it does not follow the write straight away.
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
     expect(deck.sendTerminalInput).toHaveBeenNthCalledWith(2, { deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
   });
@@ -2260,6 +2267,44 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).not.toHaveBeenCalled();
   });
 
+  /** A remote deck whose daemon the app offers to upgrade (PRD #1487), with an
+   * upgrade that never finishes, so its dialog stays open. */
+  function startUpgradable(initialView: { kind: "deck" } | { kind: "overview" }) {
+    const voice = microphone([]);
+    const resolveVoice: ResolveVoice = vi.fn(async (said: string) => (said === "type on" ? modeOn : inModeText(said)));
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = { ...snapshot.connection, deckKind: "remote", upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
+    const upgradeDaemon = vi.fn(() => new Promise<never>(() => {}));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], upgradeDaemon } as Partial<DeckRuntimeState>);
+    render(<AppDeckShell runtime={deck} initialView={initialView} />);
+    return { voice, deck };
+  }
+
+  /** Scenario: with Coder's pane open and spoken typing on, pressing Upgrade
+   * (on the deck screen's top bar, or on the overview's deck card) opens the
+   * restart question. Typing ends as it does for any confirmation, and words
+   * spoken while that dialog is open never reach Coder's terminal. */
+  it.each([
+    ["the deck screen", { kind: "deck" } as const, "upgrade-daemon"],
+    ["the overview", { kind: "overview" } as const, "daemon-upgrade"],
+  ])("ends dictation when the Upgrade dialog opens on %s", async (_screen, initialView, button) => {
+    const { voice, deck } = startUpgradable(initialView);
+    await enter(voice);
+    expect(screen.getByTestId("voice-dictating")).toHaveTextContent(/typing to coder/i);
+
+    fireEvent.click(screen.getByTestId(button));
+    expect(screen.getByTestId("upgrade-dialog")).toBeVisible();
+    await flush();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.queryByTestId("voice-dictating")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Typing mode off — a confirmation is open. Nothing was sent to coder.");
+
+    voice.deliver("restart it now");
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+  });
+
   /** Scenario: Stop typing while a spoken send is still resolving. Its late
    * answer must not press Enter or leave a send countdown behind. */
   it("drops an in-flight send after Stop typing", async () => {
@@ -2437,6 +2482,7 @@ describe("sticky dictation in the open agent pane", () => {
       expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
       await act(async () => { settle(outcome === "succeeds"); });
       await flush();
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
       if (outcome === "fails") expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
       else expect(deck.sendTerminalInput, outcome).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
       unmount();
@@ -5218,6 +5264,83 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
       expect.objectContaining({ endpoints: expect.objectContaining({ selection: "local", remote: [expect.objectContaining({ host: "new-box" })] }) }),
     );
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("new-box");
+  });
+
+  /** A settings document with two daemons configured and This machine shown (issue #1491). */
+  function storeWithTwoDaemons() {
+    let document: DesktopSettingsDto = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: {
+        remote: [structuredClone(buildBox), { id: "deck0000000000bb", host: "staging-box", port: 22, socket: "/run/deck.sock" }],
+        selection: "local",
+      },
+    };
+    return {
+      get current() { return document; },
+      getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+      saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+        document = structuredClone(next);
+        return structuredClone(document);
+      }),
+    };
+  }
+
+  /**
+   * Scenario (issue #1491): the Daemon selector is on This machine with two
+   * daemons configured, and the user says "select all daemons". Rust answers
+   * with the switch it now resolves — the selector's `all` token — and the
+   * selector reads All daemons, stored through the same write a click makes.
+   * Saying it again is a no-op with the same report.
+   */
+  it("switches the selector to All daemons when the user says select all daemons", async () => {
+    const said = "select all daemons";
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => dispatch("switch_deck", "switchDeck", "Showing All daemons.", utterance, [{
+      name: "deck", kind: "deck_ref", spoken: "all daemons", value: "all", label: "All daemons",
+    }]));
+    const store = storeWithTwoDaemons();
+    render(<DeckShell runtime={runtime(resolveVoice, microphone([said, said]), { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await flush();
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("This machine");
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing All daemons.");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
+    expect(store.current.endpoints?.selection).toBe("all");
+    expect(store.current.endpoints?.remote).toHaveLength(2);
+    const writes = store.saveSettings.mock.calls.length;
+
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing All daemons.");
+    expect(store.saveSettings).toHaveBeenCalledTimes(writes);
+  });
+
+  /**
+   * Scenario (issue #1491): with voice on and the Daemon selector's menu
+   * open, All daemons shows a number like the daemons below it, and saying
+   * "one" switches the selector to All daemons.
+   */
+  it("numbers All daemons in the open selector menu and switches to it by number", async () => {
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => ({ resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: utterance, sentence: "No match." } }) as VoiceResultDto);
+    const voice = microphone([]);
+    const store = storeWithTwoDaemons();
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await flush();
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    await turnVoiceOn();
+
+    const menu = screen.getByTestId("deck-selector-menu");
+    expect(within(menu).getAllByRole("radio").map((option) => option.textContent))
+      .toEqual(["1. All daemons", "2. This machine", "3. deploy@build-box", "4. staging-box"]);
+
+    voice.deliver("one");
+    await completeUtterance();
+
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
+    expect(store.current.endpoints?.selection).toBe("all");
+    expect(resolveVoice).not.toHaveBeenCalled();
   });
 
   it("still shows the success sentence when a switch runs", async () => {

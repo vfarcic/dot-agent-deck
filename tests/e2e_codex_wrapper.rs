@@ -82,9 +82,12 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
 
+    // The stand-in sleeps 10 s before it paints anything, so a 15 s budget left
+    // 5 s for the wrapper's boot and the event's round trip, which a starved
+    // machine overran (seen while working on issue #1493).
     let working = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,
-        Duration::from_secs(15),
+        Duration::from_secs(40),
     );
     assert_eq!(working.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
     assert_eq!(working.agent_type, AgentType::Codex);
@@ -137,8 +140,15 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         deck.snapshot_grid()
     );
 
+    // Issue #1493: a wrapper that could not get Codex's hooks trusted (no
+    // `codex` on this host's PATH) also reports quiet output as a classified
+    // Idle, so wait for the hook's.
     let idle = events.wait_for(
-        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.event_type == EventType::Idle
+                && !event.is_wrapper_output_classified()
+        },
         Duration::from_secs(15),
     );
     // Issue #540: the turn ends through Codex's native `Stop` hook, as it does
@@ -302,8 +312,12 @@ fn codex_wrap_002_preserves_tty_resize_input_and_interrupt() {
         .launch_with_fixture("codex-tty-probe");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     let record = deck.workdir().join("tty-probe.log");
+    // Wait for the probe's traps, not its first output: the isatty lines are
+    // written BEFORE the traps are installed, and a resize landing in that gap
+    // is delivered to a shell that still ignores SIGWINCH, so the WINCH wait
+    // below failed under load.
     let started =
-        common::wait_for_file_substr_count(&record, "isatty(2)=", 1, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&record, "TRAPS-READY", 1, Duration::from_secs(10));
 
     deck.resize(150, 50);
     let resized = common::wait_for_file_substr_count(&record, "WINCH", 1, Duration::from_secs(5));

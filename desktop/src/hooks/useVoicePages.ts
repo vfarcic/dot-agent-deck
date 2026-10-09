@@ -5,10 +5,12 @@ import type { VoicePager } from "../lib/voicePages";
 /**
  * PR #1451 round 3, change 4 — where a list split into pages tells the shell
  * how to turn it, in the same two layers a numbered list declares in
- * (`useVoiceNumbers`): `dialog` while the New agent dialog is open, `screen`
- * for the dashboard or the Daemons screen under it. "next page" turns the
+ * (`useVoiceNumbers`): `dialog` while the New agent dialog or the Daemon
+ * selector is open, `screen` for the Daemons screen. "next page" turns the
  * dialog's list while there is one and the screen's otherwise; a layer that
- * pages nothing publishes `undefined`.
+ * pages nothing publishes `undefined`. The agent dashboard publishes nothing:
+ * it scrolls rather than paging (issue #1492), and the shell scrolls it on a
+ * page turn when no layer pages.
  */
 export interface VoicePaging {
   publish: (layer: NumberedLayer, pager: VoicePager | undefined) => void;

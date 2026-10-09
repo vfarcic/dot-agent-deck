@@ -4,8 +4,9 @@
  *
  * While voice is on, a list voice selects from that does not fit where it is
  * shown is split into pages instead of scrolling: the New agent dialog's
- * directories and Mode chips, the agent dashboard's agents and the Daemons
- * screen's tiles. Each page fills the space the list has (directories and
+ * directories and Mode chips and the Daemons screen's tiles. The agent
+ * dashboard is not paged: it scrolls, voice on or off, so nothing on it is
+ * hidden (issue #1492). Each page fills the space the list has (directories and
  * modes in as many columns as fit), "Page N of M" is shown beside it, and
  * "next page" / "previous page" turn it. A list that fits is shown whole, with
  * no marker, and with voice off every list scrolls as it always has. The New
@@ -55,6 +56,19 @@ export interface GridFit {
 export function gridFit(width: number, height: number, cell: { rowHeight: number; minColumnWidth: number; gap: number }): GridFit {
   const fit = (room: number, size: number) => Math.max(1, Math.floor((room + cell.gap) / (size + cell.gap)));
   return { columns: fit(width, cell.minColumnWidth), rows: fit(height, cell.rowHeight) };
+}
+
+/**
+ * Issue #1494 — how many of `fit`'s columns `count` cells use: only as many as
+ * they need, so a few cells share the whole width instead of each squeezed
+ * into one of many narrow columns. Cells filled top to bottom (`"column"`)
+ * need a column per `fit.rows` of them; cells filled left to right (`"row"`)
+ * a column each. Never more than fit, never fewer than one. A page's capacity
+ * stays `fit.columns × fit.rows`: this narrows only how a page is drawn.
+ */
+export function usedColumns(fit: GridFit, count: number, flow: "column" | "row"): number {
+  const needed = flow === "column" ? Math.ceil(count / fit.rows) : count;
+  return Math.max(1, Math.min(fit.columns, needed));
 }
 
 /** The visible marker beside a paged list. */

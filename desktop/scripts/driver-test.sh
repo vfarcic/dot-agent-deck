@@ -34,6 +34,9 @@
 #     for the same reason as the EGL driver — built from that same nixpkgs
 #     revision. `terminal_002` reads the display's clipboard with it from
 #     outside the app (issue #1403). CI installs it with apt.
+#   * xdotool: `DAD_DRIVER_XDOTOOL`, else PATH, else built the same way as
+#     xclip. `terminal_003` moves the display's focus to and from the app's
+#     window with it (issue #1457). CI installs it with apt.
 
 set -euo pipefail
 
@@ -122,6 +125,23 @@ if [ -z "$xclip" ]; then
   esac
 fi
 export DAD_DRIVER_XCLIP=$xclip
+
+xdotool=${DAD_DRIVER_XDOTOOL:-$(command -v xdotool || true)}
+if [ -z "$xdotool" ]; then
+  case "$webkit_libdir" in
+    /nix/store/*)
+      rev=$(jq -r '.nodes.nixpkgs.locked.rev' "$REPO_ROOT/tauri-deps/flake.lock")
+      echo "driver-test: resolving xdotool from nixpkgs $rev" >&2
+      xdotool=$(nix --extra-experimental-features 'nix-command flakes' build --no-link --print-out-paths \
+        "github:NixOS/nixpkgs/$rev#xdotool")/bin/xdotool
+      ;;
+    *)
+      echo "driver-test: xdotool not found (apt: xdotool), which terminal_003 moves the window's focus with" >&2
+      exit 1
+      ;;
+  esac
+fi
+export DAD_DRIVER_XDOTOOL=$xdotool
 
 if [ "$build" = 1 ]; then
   (cd "$REPO_ROOT" && cargo build --locked --bin dot-agent-deck)

@@ -41,7 +41,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::choice::{Ordinal, count_said, ordinal, said_as_count};
+use super::choice::{MAX_NUMBER_WORDS, Ordinal, count_said, ordinal, said_as_count};
 use super::outcome::whole_utterance;
 use super::table::spoken_words;
 
@@ -410,7 +410,7 @@ fn is_named(entry: &VoiceNumberedEntry, word: &str, number: usize) -> bool {
     std::iter::once(&entry.label)
         .chain(&entry.names)
         .any(|name| match spoken_words(name).as_slice() {
-            [first, rest @ ..] if (1..=2).contains(&rest.len()) => {
+            [first, rest @ ..] if (1..=MAX_NUMBER_WORDS).contains(&rest.len()) => {
                 first == word && count_said(rest) == Some(number)
             }
             _ => false,
@@ -425,18 +425,13 @@ fn ends_in(entry: &VoiceNumberedEntry, number: usize) -> bool {
         .any(|name| trailing_count(&spoken_words(name)) == Some(number))
 }
 
-/// The count a name ends in: its last two words when they are one number
-/// ("worker twenty three" is 23, not 3), else its last word.
+/// The count a name ends in: the longest run of its last words that is one
+/// number ("worker twenty three" is 23, not 3; "worker one hundred and
+/// thirty four" is 134), else its last word.
 fn trailing_count(words: &[String]) -> Option<usize> {
-    words
-        .len()
-        .checked_sub(2)
-        .and_then(|at| count_said(&words[at..]))
-        .or_else(|| {
-            words
-                .last()
-                .and_then(|last| count_said(std::slice::from_ref(last)))
-        })
+    (1..=MAX_NUMBER_WORDS.min(words.len()))
+        .rev()
+        .find_map(|len| count_said(&words[words.len() - len..]))
 }
 
 #[cfg(test)]
@@ -667,10 +662,84 @@ mod tests {
             "twenty twenty",
             "ten three",
             "twenty tenth",
-            "one hundred",
         ] {
             assert_eq!(answer(said, &heard, 7), NumberAnswer::NotNumber, "{said}");
         }
+    }
+
+    /// Scenario: the dashboard numbers every row, up to 1,000, so a number
+    /// past ninety-nine can be said in words as well as digits: "one hundred
+    /// thirty four", "a hundred and five", "the hundredth", "one thousand"
+    /// (issue #1492). Anything that is not one number stays a command.
+    #[test]
+    fn numbers_past_ninety_nine_are_understood_in_words() {
+        let heard = long_page(1000);
+        for (said, number) in [
+            ("one hundred", 100),
+            ("a hundred", 100),
+            ("hundred", 100),
+            ("one hundred and five", 105),
+            ("a hundred five", 105),
+            ("one hundred one", 101),
+            ("one hundred thirty four", 134),
+            ("one hundred and thirty-four", 134),
+            ("number one hundred thirty four", 134),
+            ("agent one hundred thirty four", 134),
+            ("select agent a hundred and twelve", 112),
+            ("134", 134),
+            ("two hundred", 200),
+            ("nine hundred ninety nine", 999),
+            ("Nine hundred and ninety-nine.", 999),
+            ("hundredth", 100),
+            ("the hundredth one", 100),
+            ("one hundred and first", 101),
+            ("the one hundred thirty fourth one", 134),
+            ("three hundredth", 300),
+            ("one thousand", 1000),
+            ("a thousand", 1000),
+            ("the thousandth", 1000),
+        ] {
+            assert_eq!(answer(said, &heard, 7), agent(number), "{said}");
+        }
+        assert_eq!(
+            answer("nine hundred", &long_page(200), 7),
+            out_of_range(900)
+        );
+        for said in [
+            "one hundred agents",
+            "hundred and",
+            "one hundred and",
+            "one hundred zero",
+            "one hundred 5",
+            "hundred hundred",
+            "ten hundred",
+            "two thousand",
+            "one thousand and one",
+            "hundredth first",
+            "twenty hundred",
+        ] {
+            assert_eq!(answer(said, &heard, 7), NumberAnswer::NotNumber, "{said}");
+        }
+    }
+
+    /// Scenario: a count past ninety-nine collides with an item whose name
+    /// ends in it, in words or digits, as "twelve" does with `worker 12`; the
+    /// same number said as a position does not.
+    #[test]
+    fn a_count_past_ninety_nine_collides_with_a_name_ending_in_it() {
+        let mut heard = long_page(140);
+        heard.sections[0].entries[139].label = "worker 134".to_string();
+        assert_eq!(
+            answer("one hundred thirty four", &heard, 7),
+            agents(&[134, 140])
+        );
+        assert_eq!(
+            answer("the one hundred thirty fourth", &heard, 7),
+            agent(134)
+        );
+        heard.sections[0].entries[139].label = "worker one hundred and thirty four".to_string();
+        assert_eq!(answer("134", &heard, 7), agents(&[134, 140]));
+        assert_eq!(answer("agent 134", &heard, 7), agent(134));
     }
 
     /// Scenario: "twelve" said as a count collides with another item whose

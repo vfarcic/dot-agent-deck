@@ -34,9 +34,56 @@ function microphone() {
   };
 }
 
+/** Issue #1492 — the four scroll rows, as Rust dispatches them. */
+const SCROLLS: Record<string, { action: string; invoke: string; report: string }> = {
+  "scroll down": { action: "scroll_down", invoke: "scrollDown", report: "Scrolling down." },
+  "scroll up": { action: "scroll_up", invoke: "scrollUp", report: "Scrolling up." },
+  "scroll to the top": { action: "scroll_to_top", invoke: "scrollToTop", report: "Scrolled to the top." },
+  "scroll to the bottom": { action: "scroll_to_bottom", invoke: "scrollToBottom", report: "Scrolled to the bottom." },
+};
+
+/**
+ * jsdom lays nothing out and does not scroll, so the dashboard's scroll region
+ * (`.overview-body`) is given content `height` tall in a 640px box, and
+ * `scrollBy` / `scrollTo` — which jsdom does not define on elements — move its
+ * `scrollTop` within that the way a browser would. Removed again by
+ * {@link restoreScrolling}.
+ */
+function scrollableDashboard(height: number) {
+  const box = 640;
+  let y = 0;
+  const isRegion = (element: Element) => element.classList.contains("overview-body");
+  const clamp = (top: number) => { y = Math.min(Math.max(0, height - box), Math.max(0, top)); };
+  vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (this: Element) { return isRegion(this) ? height : 0; });
+  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return isRegion(this) ? box : 0; });
+  vi.spyOn(Element.prototype, "scrollTop", "get").mockImplementation(function (this: Element) { return isRegion(this) ? y : 0; });
+  const scrollBy = vi.fn(function (this: Element, options: ScrollToOptions) { if (isRegion(this)) clamp(y + (options.top ?? 0)); });
+  const scrollTo = vi.fn(function (this: Element, options: ScrollToOptions) { if (isRegion(this)) clamp(options.top ?? 0); });
+  Object.assign(Element.prototype, { scrollBy, scrollTo });
+  return { at: () => y, scrollBy, scrollTo };
+}
+
+function restoreScrolling() {
+  delete (Element.prototype as Partial<Element>).scrollBy;
+  delete (Element.prototype as Partial<Element>).scrollTo;
+}
+
+/** Voice-pages daemons, a daemon running a second orchestration (`orc-release`), and a daemon with no agents. */
+function tallFleet() {
+  const [, release] = createFixtureFleet("fleet");
+  const idle = { ...release, runId: "run_idle", connection: { ...release.connection, deckId: "dev@idle", socketPath: "dev@idle", name: "Idle box" }, agents: [], totalNodes: 0 };
+  return { fleet: [...createFixtureFleet("voice-pages"), release, idle], release };
+}
+
 function runtime(voice: ReturnType<typeof microphone>, crowded = false) {
   const snapshot = createFixtureSnapshot(crowded ? "crowded" : "docs");
   const resolveVoice = vi.fn(async (transcript: string): Promise<VoiceResultDto> => {
+    const scroll = SCROLLS[transcript];
+    if (scroll) {
+      return { backend: "stub", resolveMs: 21, outcome: {
+        kind: "dispatch", transcript, action: scroll.action, invoke: scroll.invoke, params: [], sentence: scroll.report,
+      } };
+    }
     if (transcript === "next page" || transcript === "previous page") {
       const next = transcript === "next page";
       return { backend: "stub", resolveMs: 21, outcome: {
@@ -351,48 +398,243 @@ describe("visible pages for voice-selected lists", () => {
     expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent(HOME);
   });
 
-  /** Scenario: the crowded dashboard shows only agents on its current voice page and names that page. A small dashboard leaves its agents unpaged. */
-  it("pages crowded dashboard agents but not a fitting dashboard", async () => {
-    const view = render(<DeckShell runtime={runtime(microphone(), true)} initialView={{ kind: "overview" }} />);
+});
+
+describe("the agent dashboard scrolls while voice is on", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); restoreScrolling(); });
+
+  /** Scenario: with All daemons and voice on, a fleet taller than the window — the voice-pages daemons, a daemon running a second orchestration and a daemon with no agents — shows every daemon section, every orchestration card and every agent row, exactly as with voice off. */
+  it("shows every daemon section and orchestration card of a tall fleet while voice is on", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    const { fleet, release } = tallFleet();
+    deck.snapshot = fleet[0];
+    deck.fleet = fleet;
+    const connected = fleet.filter((item) => item.connection.status === "connected");
+    const orchestrations = new Set(connected.flatMap((item) => item.agents.flatMap((agent) => agent.tab.kind === "orchestration" ? [`${item.connection.deckId}/${agent.tab.orchestrationId}`] : [])));
+    const rows = connected.reduce((total, item) => total + item.agents.length, 0);
+    expect(orchestrations.has(`${release.connection.deckId}/orc-release`)).toBe(true);
+
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    const shown = () => ({
+      sections: screen.getAllByTestId("daemon-group").length,
+      orchestrations: document.querySelectorAll("[data-group-kind='orchestration']").length,
+      rows: document.querySelectorAll(".overview-row").length,
+    });
+    const expected = { sections: fleet.length, orchestrations: orchestrations.size, rows };
+    expect(shown()).toEqual(expected);
     await turnOnVoice();
-    expect(screen.getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
-    expect(screen.queryAllByTestId("agent-pane-overlay")).toHaveLength(0);
-    view.unmount();
-    render(<DeckShell runtime={runtime(microphone())} initialView={{ kind: "overview" }} />);
-    await turnOnVoice();
+    expect(shown()).toEqual(expected);
+    expect(document.querySelector("[data-group-id='orc-release']")).not.toBeNull();
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
   });
 
-  /** Scenario: two daemons without reported ids have no agent rows and fall on opposite sides of a crowded dashboard's page break. Each daemon's section appears only on its own voice page. */
-  it("shows each id-less row-less daemon on only its own dashboard page", async () => {
+  /** Scenario: on a dashboard of 140 agents, saying “one hundred thirty four” in words opens the agent on the row numbered 134, scrolled into view. */
+  it("opens a row past ninety-nine by its number in words", async () => {
     const voice = microphone();
     const deck = runtime(voice, true);
-    const rowless = createFixtureSnapshot("disconnected");
-    const waiting = (name: string) => ({
-      ...rowless,
-      runId: `run_${name}`,
-      connection: { ...rowless.connection, deckKind: "remote" as const, name, socketPath: name },
-      agents: [],
-      totalNodes: 0,
-    });
-    deck.fleet = [waiting("Waiting Alpha"), deck.snapshot, waiting("Waiting Beta")];
-    const sections = () => screen.getAllByTestId("daemon-group")
-      .map((section) => within(section).getByTestId("daemon-identity").textContent);
-
-    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    await turnOnVoice();
-    expect(screen.getByTestId("overview-page")).toHaveTextContent("Page 1 of 2");
-    expect(sections()).toContain("Waiting Alpha");
-    expect(sections()).not.toContain("Waiting Beta");
-
-    await speak(voice, "next page");
-    expect(screen.getByTestId("overview-page")).toHaveTextContent("Page 2 of 2");
-    expect(sections()).toContain("Waiting Beta");
-    expect(sections()).not.toContain("Waiting Alpha");
+    const base = deck.snapshot;
+    const template = base.agents.find((agent) => agent.tab.kind === "dashboard")!;
+    const letters = (at: number) => `${String.fromCharCode(97 + (at % 26))}${String.fromCharCode(97 + Math.floor(at / 26))}`;
+    deck.snapshot = {
+      ...base,
+      agents: Array.from({ length: 140 }, (_, index) => ({ ...template, id: `bulk-${index + 1}`, displayName: `bulk ${letters(index)}` })),
+      totalNodes: 140,
+    };
+    deck.fleet = [deck.snapshot];
+    const revealed: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) { revealed.push(this); });
+    try {
+      render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+      await turnOnVoice();
+      const row = document.querySelector(".overview-row[data-voice-number='134']");
+      expect(row).not.toBeNull();
+      const agentId = decodeURIComponent(row!.getAttribute("data-testid")!.split(":").at(-1)!);
+      await speak(voice, "one hundred thirty four");
+      expect(screen.queryByTestId("agent-pane-overlay"), screen.getByTestId("voice-report").textContent ?? "no voice report").not.toBeNull();
+      expect(screen.getByTestId(`terminal-${agentId}`)).toBeInTheDocument();
+      expect(revealed).toContain(row);
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
   });
 
-  /** Scenario: two daemons have agents with the same id. Naming the one visible on page one opens it, even though its namesake on another daemon is on a later page. */
-  it("opens a visible named agent despite an off-page agent with the same id", async () => {
+  /** Scenario: a fleet of 1,001 agents numbers its first 1,000 rows and leaves the last one unnumbered, since a numbered list voice can answer holds at most 1,000 items. */
+  it("numbers at most 1,000 dashboard rows", async () => {
+    const deck = runtime(microphone(), true);
+    const base = deck.snapshot;
+    const template = base.agents.find((agent) => agent.tab.kind === "dashboard")!;
+    deck.snapshot = {
+      ...base,
+      agents: Array.from({ length: 1001 }, (_, index) => ({ ...template, id: `bulk-${index + 1}`, displayName: `bulk ${index + 1}` })),
+      totalNodes: 1001,
+    };
+    deck.fleet = [deck.snapshot];
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    const rows = Array.from(document.querySelectorAll(".overview-row"));
+    expect(rows).toHaveLength(1001);
+    expect(rows[999]).toHaveAttribute("data-voice-number", "1000");
+    expect(rows[1000]).not.toHaveAttribute("data-voice-number");
+  });
+
+  /** Scenario: with voice on, the dashboard's agent rows carry one continuous sequence of numbers across every daemon, 1 to the last row, with no number repeated. */
+  it("numbers every dashboard row once, continuously across daemons", async () => {
+    const deck = runtime(microphone(), true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    const numbers = Array.from(document.querySelectorAll(".overview-row")).map((row) => Number(row.getAttribute("data-voice-number")));
+    expect(numbers.length).toBeGreaterThan(20);
+    expect(numbers).toEqual(numbers.map((_, at) => at + 1));
+  });
+
+  /** Scenario: with voice on and a fleet taller than the window, “scroll down”, “scroll up”, “scroll to the bottom” and “scroll to the top” move the dashboard by about a window or to either end. A scroll past an end moves nothing and says the dashboard is already there. */
+  it("scrolls down, up and to either end by voice", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+
+    await speak(voice, "scroll up");
+    expect(page.at()).toBe(0);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/already at the top/i);
+
+    await speak(voice, "scroll down");
+    const screenful = page.at();
+    expect(screenful).toBeGreaterThan(300);
+    expect(screenful).toBeLessThanOrEqual(640);
+    await speak(voice, "scroll down");
+    expect(page.at()).toBe(2 * screenful);
+    await speak(voice, "scroll up");
+    expect(page.at()).toBe(screenful);
+
+    await speak(voice, "scroll to the bottom");
+    expect(page.at()).toBe(2360);
+    await speak(voice, "scroll down");
+    expect(page.at()).toBe(2360);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/already at the bottom/i);
+
+    await speak(voice, "scroll to the top");
+    expect(page.at()).toBe(0);
+  });
+
+  /** Scenario: on a dashboard that fits the window, “scroll down” moves nothing and says the whole dashboard is already on screen. */
+  it("says there is nothing to scroll on a dashboard that fits", async () => {
+    const voice = microphone();
+    const page = scrollableDashboard(600);
+    render(<DeckShell runtime={runtime(voice)} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    await speak(voice, "scroll down");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/whole dashboard is already on screen/i);
+  });
+
+  /** Scenario: on the dashboard, “next page” and “previous page” scroll it down and back up instead of turning pages, so the old phrasing keeps working. */
+  it("scrolls the dashboard on next page and previous page", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    await speak(voice, "next page");
+    expect(page.at()).toBeGreaterThan(300);
+    expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
+    await speak(voice, "previous page");
+    expect(page.at()).toBe(0);
+  });
+
+  /** Scenario: with the Daemon selector's menu open over a tall dashboard, “scroll down” and “next page” leave the dashboard where it is and say something is open over it. */
+  it("does not scroll the dashboard behind the open Daemon selector", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    expect(screen.getByTestId("deck-selector-menu")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    await speak(voice, "next page");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(page.at()).toBe(0);
+  });
+
+  /** Scenario: with the Settings sheet open, or a stop confirmation open, over a tall dashboard, “scroll down” and “next page” leave the dashboard where it is and say something is open over it. */
+  it("does not scroll the dashboard behind Settings or a stop confirmation", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    await speak(voice, "next page");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByTestId("settings-panel")).getByRole("button", { name: /^close/i }));
+    expect(screen.queryByTestId("settings-panel")).toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]);
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(page.at()).toBe(0);
+  });
+
+  /** Scenario: control — with the New agent dialog open over a tall dashboard, “next page” turns the directory browser's page and leaves the dashboard behind it where it was. */
+  it("turns the directory page, not the dashboard, while the New agent dialog is open", async () => {
+    const voice = microphone();
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={runtime(voice, true)} initialView={{ kind: "overview" }} />);
+    await openBrowser();
+    await turnOnVoice();
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 2 of \d+/i);
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(page.at()).toBe(0);
+  });
+
+  /** Scenario: saying the number of a row scrolled out of view — “twenty five” on a tall fleet — scrolls that row into view and opens its agent's pane. */
+  it("scrolls a numbered row into view when its number is said", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const revealed: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) { revealed.push(this); });
+    try {
+      render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+      await turnOnVoice();
+      const row = document.querySelector(".overview-row[data-voice-number='25']");
+      expect(row).not.toBeNull();
+      const agentId = row!.getAttribute("data-testid")!.split(":").at(-1)!;
+      await speak(voice, "twenty five");
+      expect(revealed).toContain(row);
+      expect(screen.queryByTestId("agent-pane-overlay"), screen.getByTestId("voice-report").textContent ?? "no voice report").not.toBeNull();
+      expect(screen.getByTestId(`terminal-${decodeURIComponent(agentId)}`)).toBeInTheDocument();
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
+  /** Scenario: two daemons have agents with the same id. Naming the selected daemon's agent opens it, not its namesake on another daemon further down the dashboard. */
+  it("opens the selected daemon's named agent despite a namesake on another daemon", async () => {
     const voice = microphone();
     const fleet = createFixtureFleet("voice-pages");
     const selected = fleet[0].agents[0];
@@ -408,10 +650,27 @@ describe("visible pages for voice-selected lists", () => {
     }));
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
-    expect(screen.getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
-    expect(screen.getByRole("button", { name: new RegExp(`open ${selected.displayName} agent`, "i") })).toBeVisible();
     await speak(voice, `open ${selected.displayName}`);
     expect(screen.queryByTestId("agent-pane-overlay"), screen.getByTestId("voice-report").textContent ?? "no voice report").not.toBeNull();
     expect(screen.getByTestId(`terminal-${selected.id}`)).toBeVisible();
+  });
+
+  /** Scenario: two daemons without reported ids have no agent rows and sit on either side of a crowded daemon. With voice on, both of their sections are on the dashboard together. */
+  it("shows every id-less row-less daemon with voice on", async () => {
+    const deck = runtime(microphone(), true);
+    const rowless = createFixtureSnapshot("disconnected");
+    const waiting = (name: string) => ({
+      ...rowless,
+      runId: `run_${name}`,
+      connection: { ...rowless.connection, deckKind: "remote" as const, name, socketPath: name },
+      agents: [],
+      totalNodes: 0,
+    });
+    deck.fleet = [waiting("Waiting Alpha"), deck.snapshot, waiting("Waiting Beta")];
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    const sections = screen.getAllByTestId("daemon-group").map((section) => within(section).getByTestId("daemon-identity").textContent);
+    expect(sections).toEqual(expect.arrayContaining(["Waiting Alpha", "Waiting Beta"]));
+    expect(screen.queryByTestId("overview-page")).toBeNull();
   });
 });

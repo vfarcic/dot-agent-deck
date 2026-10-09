@@ -416,6 +416,30 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
 
 describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
   /**
+   * Scenario: a directory whose name is longer than the 128 characters a row
+   * shows (issue #1494). Its row carries the whole name as a tooltip, so a
+   * name cut short on screen can still be read in full.
+   */
+  it("keeps a directory's whole name in its tooltip, past the shown name's limit", async () => {
+    const long = `${"long-directory-name-".repeat(7)}end`;
+    expect(long.length).toBeGreaterThan(128);
+    const runtime = fakeRuntime({
+      listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({
+        kind: "listing",
+        path: "/home/dev",
+        displayPath: "/home/dev",
+        entries: [{ path: `/home/dev/${long}`, displayName: long, isProject: false }],
+        truncated: false,
+      })),
+    });
+    renderDialog(runtime);
+    await currentPath("/home/dev");
+    const name = directoryList().querySelector<HTMLElement>(`[data-path='/home/dev/${long}'] .new-agent-row-name`)!;
+    expect(name.textContent!.length).toBeLessThan(long.length);
+    expect(name.title).toBe(long);
+  });
+
+  /**
    * Scenario: browse with the TUI picker's keys. The home listing opens with
    * the cursor on its first subdirectory, the project marked; `j` moves to
    * `beta` and Enter lists it by the path the daemon gave. Left goes up by the

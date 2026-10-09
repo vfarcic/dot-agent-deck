@@ -185,10 +185,14 @@ fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
     // `get-seed` pull — making the `seed_delivered_native` assertion a clean
     // native-vs-fallback discriminator (the fallback can't race in and win).
     //
-    // SAFETY: set here, at the very top of the sync test entry point — BEFORE the
-    // tokio runtime (and therefore any daemon worker thread) is created below —
-    // so no concurrent `getenv` can race this `setenv`. nextest runs each test in
-    // its own process, so this never leaks to another test.
+    // SAFETY: a stated residual, not a proof (issue #1516). Set at the top of
+    // the sync test entry point, before the tokio runtime (and so any daemon
+    // worker thread) is created below, and never written again. The threads
+    // that exist here: this test's own and libtest's runner thread, which waits
+    // for it. The availability check above only runs `pi --version` to
+    // completion and allocates no harness temp dir, so the `load-context`
+    // heartbeat has not started. nextest runs each test in its own process, so
+    // this never leaks to another test.
     unsafe {
         std::env::set_var(
             dot_agent_deck::agent_pty::DOT_AGENT_DECK_SEED_FALLBACK_SECS,
@@ -318,9 +322,9 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         st.pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+        let orch = dot_agent_deck::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
             name: "pi-worker-orchestration".to_string(),
-            cwd: cwd_str.clone(),
         };
         st.pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orch.clone());
@@ -403,7 +407,14 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     //        exists with the expected contents (proves pi pulled the seed via
     //        get-seed, read its task file, and ran the work).
     let sentinel = cwd.path().join(SENTINEL_NAME);
-    let sentinel_ok = common::wait_for_path_async(&sentinel, Duration::from_secs(240)).await;
+    // Poll the CONTENT, not existence: a shell redirect creates the file before
+    // the write lands, so an existence wait can read it empty (issue #244).
+    let sentinel_result = common::wait_for_file_containing_async(
+        &sentinel,
+        SENTINEL_CONTENT,
+        Duration::from_secs(240),
+    )
+    .await;
 
     let worker_pane = current_worker_pane();
 
@@ -416,21 +427,16 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     let api_errored = ["quota", "exceeded", "billing", "unauthorized", "rate limit"]
         .iter()
         .any(|k| worker_lower.contains(k));
-    assert!(
-        sentinel_ok,
-        "the pi WORKER never created the sentinel {SENTINEL_NAME:?} within 240s. \
-         task_reached_pane={task_reached} (if false, the native seed never reached the \
-         respawned pi — a delivery failure, NOT the model). \
-         api_error_in_pane={api_errored} (if true, an account/quota is the blocker, not the \
-         pi-worker path).\n=== pi worker pane ===\n{worker_pane}\n=== end ==="
-    );
-
-    let contents = std::fs::read_to_string(&sentinel).expect("read sentinel file");
-    assert!(
-        contents.contains(SENTINEL_CONTENT),
-        "sentinel {SENTINEL_NAME:?} exists but does not contain {SENTINEL_CONTENT:?}; \
-         got:\n{contents}"
-    );
+    if let Err(observed) = sentinel_result {
+        panic!(
+            "the pi WORKER never wrote {SENTINEL_CONTENT:?} into the sentinel {SENTINEL_NAME:?} \
+             within 240s; observed: {observed}. \
+             task_reached_pane={task_reached} (if false, the native seed never reached the \
+             respawned pi — a delivery failure, NOT the model). \
+             api_error_in_pane={api_errored} (if true, an account/quota is the blocker, not the \
+             pi-worker path).\n=== pi worker pane ===\n{worker_pane}\n=== end ==="
+        );
+    }
 
     // 3. The pi worker signalled work-done: the daemon wrote the per-role summary
     //    file (`handle_work_done`), proving the pi worker ran `dot-agent-deck

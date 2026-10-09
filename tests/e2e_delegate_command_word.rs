@@ -53,9 +53,13 @@ fn delegate_020_work_done_line_reaches_the_deck_under_the_workers_own_path() {
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     // The deck's own `$PATH`: its install directory first, which is the shape
     // in which a bare `dot-agent-deck` resolves to the deck *in this process*.
-    // SAFETY: set at the very top of the sync entry point, before the tokio
-    // runtime (and so any daemon worker thread) exists; nextest runs each test
-    // in its own process, so the change cannot reach another test.
+    // SAFETY: a stated residual, not a proof (issue #1516). Set at the top of
+    // the sync entry point, before the tokio runtime (and so any daemon worker
+    // thread) exists, and never written again. The threads that exist here:
+    // this test's own and libtest's runner thread, which waits for it; nothing
+    // above allocates a harness temp dir, so the `load-context` heartbeat has
+    // not started. nextest runs each test in its own process, so the change
+    // cannot reach another test.
     unsafe {
         std::env::set_var("PATH", format!("{bin_dir}:{inherited_path}"));
     }
@@ -131,9 +135,9 @@ async fn delegate_020_inner(bin_dir: &str, inherited_path: &str) {
         st.pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+        let orch = dot_agent_deck::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
             name: "test-orchestration".to_string(),
-            cwd: cwd_str.clone(),
         };
         st.pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orch.clone());
