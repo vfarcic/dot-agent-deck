@@ -2156,7 +2156,9 @@ fn normalize_quota_blocked_metadata(
 ///
 /// Review RV-B1: a Codex turn is reported twice — by its `Stop` hook, whose
 /// payload names no turn, and by its rollout's `task_complete`, which does —
-/// and the hub delivers a turn once only when both name it. So the turn a
+/// and the hub can drop the second report only when both name the turn (and
+/// only within the bounds [`crate::turn_reply::TurnReplyHub::publish`]
+/// defines). So the turn a
 /// Codex `UserPromptSubmit` (a `Thinking` carrying
 /// [`crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY`]) begins is
 /// recorded here, and a Codex turn end whose reply names no turn is given it.
@@ -2256,11 +2258,13 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent, line
             // so the watch stays armed, but only for the bounded drain.
             if crate::turn_reply::reply_from_line(line).is_none() {
                 ArmCommand::StoppedWithoutReply {
+                    pane_id: pane_id.to_string(),
                     agent_id: agent_id.to_string(),
                     turn_id,
                 }
             } else {
                 ArmCommand::Disarm {
+                    pane_id: pane_id.to_string(),
                     agent_id: agent_id.to_string(),
                     turn_id,
                 }
@@ -2321,8 +2325,9 @@ async fn run_codex_rollout_monitor(
         (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
         // PRD #1497: a watched turn's reply, published before its failure (if
         // any) is reported, as the hook loop publishes a reply before its
-        // event. A turn whose `Stop` hook already delivered it is not
-        // delivered again (`crate::turn_reply::TurnReplyHub::publish`).
+        // event. It is dropped as a duplicate of the turn's `Stop` report only
+        // under the conditions `crate::turn_reply::TurnReplyHub::publish`
+        // defines (both name the turn, nothing else recorded between them).
         for found in tailers.take_replies() {
             registry.publish_turn_reply(&found.pane_id, &found.agent_id, found.reply);
         }

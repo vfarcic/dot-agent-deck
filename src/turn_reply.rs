@@ -11,15 +11,12 @@
 //! text is empty ([`crate::daemon_protocol::FinalReply::is_empty`]), from the
 //! same report that would have carried the text. So each turn end a producer
 //! reports is published as one frame, and a subscriber never has to guess from
-//! the agent's status and a timer whether a turn ended without a reply. A
-//! reply naming the same turn id as the agent's last delivered turn is dropped
-//! ([`TurnReplyHub::publish`]), which keeps a Codex turn reported by both its
-//! `Stop` hook and its rollout to one frame when the two reports arrive back to
-//! back. Only that last turn is remembered, per agent and for the most recent
-//! [`MAX_REMEMBERED_TURNS`] agents, so a report naming an earlier turn, or
-//! coming from an agent forgotten past that bound, is delivered again. A reply
-//! without a turn id is always delivered, and a subscriber that falls behind
-//! has its stream ended as lagged.
+//! the agent's status and a timer whether a turn ended without a reply.
+//! [`TurnReplyHub::publish`] defines the one de-duplication there is, and what
+//! it does not cover: it keeps a Codex turn reported by both its `Stop` hook
+//! and its rollout to one frame when both reports name the turn and nothing
+//! else is recorded for that agent between them. A subscriber that falls
+//! behind has its stream ended as lagged.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +39,10 @@ pub const TURN_REPLY_LINE_KEY: &str = "turn_reply";
 /// lagged. Replies come one per finished turn, so this is generous.
 const CAPACITY: usize = 64;
 
-/// How many agents' last delivered turn ids are remembered for
-/// de-duplication. Past it the oldest is forgotten, which at worst lets one
-/// turn reported through both routes be delivered twice.
+/// How many agents' last recorded turn ids are remembered for
+/// de-duplication ([`TurnReplyHub::publish`]). Recording a turn id for one
+/// agent more forgets the agent that least recently recorded a new one, which
+/// at worst lets one turn reported through both routes be delivered twice.
 const MAX_REMEMBERED_TURNS: usize = 1024;
 
 /// The longest [`FinalReply::turn_id`] kept; a longer one is dropped (the reply
@@ -112,8 +110,9 @@ pub struct TurnReplyHub {
     subscribers: Arc<Semaphore>,
 }
 
-/// One turn id per agent, the oldest agent forgotten past
-/// [`MAX_REMEMBERED_TURNS`].
+/// One turn id per agent, for the [`MAX_REMEMBERED_TURNS`] agents that most
+/// recently recorded a new one: recording a different id moves the agent to
+/// the newest position, and past the bound the least recent is forgotten.
 #[derive(Debug, Default)]
 struct AgentTurns {
     last: HashMap<String, String>,
@@ -129,13 +128,15 @@ impl AgentTurns {
         if self
             .last
             .insert(agent_id.to_owned(), turn_id.to_owned())
-            .is_none()
+            .is_some()
         {
-            self.order.push_back(agent_id.to_owned());
-            while self.order.len() > MAX_REMEMBERED_TURNS {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.last.remove(&oldest);
-                }
+            // An agent recording a new turn is the most recent again.
+            self.order.retain(|agent| agent != agent_id);
+        }
+        self.order.push_back(agent_id.to_owned());
+        while self.order.len() > MAX_REMEMBERED_TURNS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.last.remove(&oldest);
             }
         }
         true
@@ -210,11 +211,23 @@ impl TurnReplyHub {
     }
 
     /// Publish `reply` as `agent_id`'s, in `pane_id`, and return its sequence
-    /// number — or `None` when `reply` names the turn last delivered for this
-    /// agent (Codex reports a turn both through its `Stop` hook and in its
-    /// rollout; whichever reaches here first is the turn's one frame, an empty
-    /// one included, as long as no other turn of the agent's was delivered in
-    /// between and the agent was not forgotten past [`MAX_REMEMBERED_TURNS`]).
+    /// number — or `None` when it is dropped as a duplicate.
+    ///
+    /// **De-duplication, exactly** (the definition the rest of the codebase
+    /// links to). A reply that carries a `turn_id` is dropped when that id
+    /// equals the turn id last RECORDED for the same agent; otherwise it is
+    /// published and its id becomes the agent's recorded one. A reply with no
+    /// `turn_id` is always published and leaves the recorded id unchanged. One
+    /// id is recorded per agent, for the [`MAX_REMEMBERED_TURNS`] agents that
+    /// most recently recorded a new one; recording one for another agent past
+    /// that forgets the least recent. An id is recorded whether or not anyone
+    /// is subscribed. So two reports of one turn (Codex reports a turn both
+    /// through its `Stop` hook and in its rollout) are one frame, an empty one
+    /// included, only when both name the turn, no other turn id of that
+    /// agent's is recorded between them, and the agent is not forgotten
+    /// between them; a report of an earlier turn after a later one was
+    /// recorded is published again.
+    ///
     /// The caller has already checked that `agent_id` is the pane's live
     /// owner.
     pub fn publish(&self, agent_id: &str, pane_id: &str, reply: FinalReply) -> Option<u64> {
@@ -270,6 +283,43 @@ mod tests {
     /// Audit AU-S2: past [`MAX_TURN_REPLY_SUBSCRIBERS`] open receivers a
     /// subscription is refused, and dropping one frees its slot. Every
     /// receiver shares the one published reply rather than a copy of it.
+    /// PRD #1497 re-audit R4.1: the remembered agents are the ones that most
+    /// recently recorded a new turn id, not the first ones inserted: an agent
+    /// that records a new turn is moved to the newest position, so filling
+    /// the bound with other agents after that forgets the others first.
+    #[test]
+    fn recording_a_new_turn_refreshes_the_agents_place() {
+        let hub = TurnReplyHub::default();
+        assert!(hub.publish("first", "p", reply(Some("t1"), "a")).is_some());
+        for i in 1..MAX_REMEMBERED_TURNS {
+            assert!(
+                hub.publish(&format!("other-{i}"), "p", reply(Some("t"), "b"))
+                    .is_some()
+            );
+        }
+        // "first" records a new turn: now the newest.
+        assert!(hub.publish("first", "p", reply(Some("t2"), "c")).is_some());
+        // A duplicate is dropped and does not count as recording.
+        assert_eq!(hub.publish("first", "p", reply(Some("t2"), "c")), None);
+        // One agent more: the least recent ("other-1") is forgotten, "first"
+        // is not.
+        assert!(
+            hub.publish("newcomer", "p", reply(Some("t"), "d"))
+                .is_some()
+        );
+        assert_eq!(hub.publish("first", "p", reply(Some("t2"), "c")), None);
+        assert!(
+            hub.publish("other-1", "p", reply(Some("t"), "e")).is_some(),
+            "the least recent agent was forgotten"
+        );
+        // A reply with no turn id changes nothing recorded.
+        assert!(hub.publish("first", "p", reply(None, "f")).is_some());
+        assert_eq!(hub.publish("first", "p", reply(Some("t2"), "c")), None);
+        let delivered = hub.delivered.lock().unwrap();
+        assert_eq!(delivered.last.len(), MAX_REMEMBERED_TURNS);
+        assert_eq!(delivered.order.len(), MAX_REMEMBERED_TURNS);
+    }
+
     #[test]
     fn subscriptions_are_bounded_and_share_one_reply() {
         let hub = TurnReplyHub::default();

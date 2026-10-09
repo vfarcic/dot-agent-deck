@@ -879,15 +879,17 @@ pub fn clamp_turn_reply(text: &str) -> &str {
 /// **An empty `text` is the report of a turn that ended with no reply to
 /// read** ([`Self::is_empty`]), sent by the same producer and on the same
 /// stream as a reply with text would have been, so a turn end is reported
-/// whether or not it has text to read (audit A2). A reply carrying the same
-/// [`Self::turn_id`] as the agent's last delivered turn is not delivered
-/// again; the daemon remembers only that last turn per agent, so an earlier
-/// turn reported again is delivered again.
+/// whether or not it has text to read (audit A2). The daemon drops a reply as
+/// a duplicate only by its [`Self::turn_id`], within the bounds
+/// `crate::turn_reply::TurnReplyHub::publish` defines (one recorded turn per
+/// agent, for a bounded number of agents), so a client may still see one turn
+/// twice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalReply {
     /// The agent's own id for the turn, when it reports one (Codex does;
-    /// Claude Code does not). The daemon uses it to deliver a turn reported
-    /// through two routes once.
+    /// Claude Code does not). The daemon uses it to drop the second of two
+    /// reports of a turn when both name it, within the bounds
+    /// `crate::turn_reply::TurnReplyHub::publish` defines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     /// The reply, at most [`MAX_TURN_REPLY_BYTES`]; empty when the turn ended
