@@ -1806,11 +1806,12 @@ fn resolve_param(
             // the one that is not Codex.
             AgentRefMatch::None => {
                 let (said, content) = heard_reference();
+                let located = location_words(&word_sequence(&heard_facts));
                 let in_state: Vec<&DesktopAgent> =
                     agents_in_state(spoken, transcript.text(), agents)
                         .into_iter()
                         .filter(|agent| !heard_against(&agent.id))
-                        .filter(|agent| accounts_for_the_rest(agent, &content, &said))
+                        .filter(|agent| accounts_for_the_rest(agent, &content, &said, &located))
                         .collect();
                 let (mut said, _) = reference_words(&heard_facts);
                 let in_state = match Recency::said(&mut said) {
@@ -3630,12 +3631,17 @@ const STATE_REFERENCE_CARRIERS: [&str; 28] = [
 /// one fixing the scroll"). And never a word of an agent type's name, which
 /// says what the agent IS whatever its prompt mentions: "Codex" shares a
 /// stem with "code" in "review the code", and is still not this Claude Code
-/// agent. (A word another agent's names account for has already ruled this
+/// agent. Nor a word that says where the agent is or which run it is in
+/// (`located`, [`location_words`]): "the stuck agent in the billing project"
+/// names a directory, and an agent in `docs-site` last asked to "Fix
+/// billing" is not in it, so only the agent's own names account for such a
+/// word. (A word another agent's names account for has already ruled this
 /// one out, [`excluded_by_another`].)
 fn accounts_for_the_rest(
     agent: &DesktopAgent,
     content: &BTreeSet<String>,
     said: &BTreeSet<String>,
+    located: &BTreeSet<String>,
 ) -> bool {
     let facts: BTreeSet<String> = content
         .iter()
@@ -3657,8 +3663,76 @@ fn accounts_for_the_rest(
         .collect();
     facts.difference(&named).all(|word| {
         TASK_FILLER_WORDS.contains(&word.as_str())
-            || (!a_type.contains(word) && task.iter().any(|typed| same_stem(word, typed)))
+            || (!a_type.contains(word)
+                && !located.contains(word)
+                && task.iter().any(|typed| same_stem(word, typed)))
     })
+}
+
+/// The nouns that introduce where an agent is, or the run it belongs to —
+/// "in the billing project", "from the prd-1487 run" — and the prepositions
+/// such a phrase opens with (issue #1496).
+const LOCATION_NOUNS: [&str; 11] = [
+    "dir",
+    "directory",
+    "folder",
+    "project",
+    "repo",
+    "repository",
+    "workspace",
+    "codebase",
+    "orchestration",
+    "run",
+    "mode",
+];
+const LOCATION_PREPOSITIONS: [&str; 5] = ["in", "inside", "within", "from", "under"];
+const LOCATION_ARTICLES: [&str; 7] = ["the", "a", "an", "this", "that", "my", "our"];
+
+/// The words of `sequence` (the transcript's words, in order) that say WHERE
+/// an agent is or which run it is in, rather than what it was asked to do —
+/// so [`accounts_for_the_rest`] holds them to the agent's names and never to
+/// its last prompt (issue #1496).
+///
+/// A word counts when it is:
+/// - between a location preposition ("in", "inside", "within", "from",
+///   "under") and a [`LOCATION_NOUNS`] noun at most four words later —
+///   "billing" in "in the billing project";
+/// - right before such a noun with no preposition — "the billing repo agent";
+/// - right after such a noun that only a preposition or an article precedes —
+///   "billing" in "in project billing" or "in the repo billing";
+/// - the first word after a location preposition, articles skipped — "billing"
+///   in "in billing" — since that is a place too.
+///
+/// Over-reading costs a refusal (a task reference that happens to say "in
+/// the parser" is read as a place, and its prompt no longer accounts for
+/// it), never the wrong agent, which is the side to err on.
+fn location_words(sequence: &[String]) -> BTreeSet<String> {
+    let is =
+        |list: &[&str], at: usize| sequence.get(at).is_some_and(|w| list.contains(&w.as_str()));
+    let mut located = BTreeSet::new();
+    for (at, word) in sequence.iter().enumerate() {
+        if LOCATION_PREPOSITIONS.contains(&word.as_str())
+            && let Some(first) = sequence[at + 1..]
+                .iter()
+                .find(|next| !LOCATION_ARTICLES.contains(&next.as_str()))
+        {
+            located.insert(first.clone());
+        }
+        if !LOCATION_NOUNS.contains(&word.as_str()) {
+            continue;
+        }
+        match (at.saturating_sub(4)..at)
+            .rev()
+            .find(|&from| is(&LOCATION_PREPOSITIONS, from))
+        {
+            Some(from) => located.extend(sequence[from + 1..at].iter().cloned()),
+            None => located.extend(at.checked_sub(1).map(|before| sequence[before].clone())),
+        }
+        if at == 0 || is(&LOCATION_PREPOSITIONS, at - 1) || is(&LOCATION_ARTICLES, at - 1) {
+            located.extend(sequence.get(at + 1).cloned());
+        }
+    }
+    located
 }
 
 /// `text`'s words as an agent reference reads them, and the ones of those
@@ -5553,6 +5627,70 @@ mod tests {
             matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
             "{outcome:?}"
         );
+    }
+
+    /// Scenario: the only stuck agent is the Claude Code agent in
+    /// `docs-site`, last asked to "Fix the billing issue". The user opens or
+    /// stops "the stuck agent in the billing project" (or repo, folder, run,
+    /// orchestration…) and the model answers only "the one that's stuck".
+    /// Billing is where the user said the agent is, and this one is in
+    /// docs-site, so nothing is opened or offered for stopping: a prompt that
+    /// mentions billing does not put the agent there. Asked for as "the stuck
+    /// agent fixing the billing issue", the same agent is reached by its task,
+    /// and so it is when the user also says the place it really is in.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for place in [
+                "in the billing project",
+                "in the billing repo",
+                "in the billing repository",
+                "in the billing folder",
+                "in the billing directory",
+                "in the billing workspace",
+                "in the billing codebase",
+                "in the billing orchestration",
+                "in the billing run",
+                "from the billing folder",
+                "in project billing",
+                "in billing",
+            ] {
+                let said = format!("{verb} the stuck agent {place}");
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
+                );
+            }
+            for task in [
+                "fixing the billing issue",
+                "in the docs-site project fixing the billing issue",
+            ] {
+                let said = format!("{verb} the stuck agent {task}");
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                        if action == row && params[0].value == "agent-vega"),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: two reviewers are stuck, one in the prd-1487 run and one in
