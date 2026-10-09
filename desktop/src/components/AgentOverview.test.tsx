@@ -125,6 +125,130 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   };
 }
 
+describe("disconnected daemon actions (issue #1490)", () => {
+  const cases = (["local", "remote"] as const).flatMap((deckKind) =>
+    (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind })));
+
+  /// Scenario: With experimental features off, a local or remote deck offers one remedy selected by its disconnected reason.
+  /// An unreachable host explains why retrying is the available action.
+  it.each(cases)("offers one action for $deckKind / $kind with experimental off", ({ deckKind, kind }) => {
+    window.history.replaceState({}, "", "/");
+    const snapshot = createFixtureSnapshot("disconnected");
+    const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+    const message = kind === "unknown"
+      ? `The app cannot reach ${host} over ssh. Check that the host is up and reachable from this machine.`
+      : kind === "not-running" ? `No daemon is running on ${host}.` : `A daemon is running on ${host}, but the app is not connected to it. Reconnect to try again.`;
+    snapshot.connection = {
+      ...snapshot.connection, deckKind,
+      disconnectedReason: { kind, action: kind === "not-running" ? "start-daemon" : "reconnect", message, host },
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
+    const note = screen.getByTestId("overview-disconnected");
+    const buttons = within(note).getAllByRole("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+    expect(note).toHaveTextContent(message);
+    if (kind === "not-running") {
+      expect(within(note).getByTestId("start-daemon")).toBeVisible();
+      expect(within(note).queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+      expect(note).not.toHaveTextContent("Start one, then reconnect.");
+    } else {
+      expect(within(note).queryByRole("button", { name: "Start daemon" })).not.toBeInTheDocument();
+    }
+  });
+});
+
+describe("failed starts and connection errors per deck (PR #1623 review)", () => {
+  /** A disconnected deck with no daemon, named by `deckId`. */
+  function notRunningDeck(deckId: string, host: string): DeckSnapshot {
+    const snapshot = createFixtureSnapshot("disconnected");
+    snapshot.agents = [];
+    snapshot.connection = {
+      ...snapshot.connection, deckId, deckKind: "remote", socketPath: host,
+      message: `ssh tunnel to ${host} failed: Connection refused`,
+      disconnectedReason: { kind: "not-running", action: "start-daemon", message: `No daemon is running on ${host}.`, host },
+    };
+    return snapshot;
+  }
+
+  function card(deckId: string): HTMLElement {
+    const group = screen.getAllByTestId("daemon-group").find((section) => section.getAttribute("data-daemon-id") === deckId);
+    expect(group).toBeDefined();
+    return group!;
+  }
+
+  async function startOn(deckId: string) {
+    fireEvent.click(within(card(deckId)).getByTestId("start-daemon"));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+  }
+
+  /// Scenario: Two decks with no daemon both fail to start. Each card keeps its own failure sentence and technical detail;
+  /// Reconnect on one clears only that one, and the other deck connecting clears only its own.
+  it("keeps each deck's start error on its own card", async () => {
+    const { StartDaemonError } = await import("../lib/actionError");
+    const first = notRunningDeck("deck-00000000000000a1", "deploy@alpha");
+    const second = notRunningDeck("deck-00000000000000b2", "deploy@beta");
+    const runAction = vi.fn(async (action: import("../types").DeckAction) => {
+      const deckId = "deckId" in action ? action.deckId : undefined;
+      throw new StartDaemonError(`Could not start the daemon on ${deckId}.`, "start-failed", `ssh said no to ${deckId}`);
+    });
+    const reconnect = vi.fn(async () => undefined);
+    const live = (fleet: DeckSnapshot[]) => runtime({ mode: "live", snapshot: fleet[0], fleet, runAction, reconnect, desktopFeatures: fixtureDesktopFeatures("") });
+    window.history.replaceState({}, "", "/");
+    const { rerender } = render(<AgentOverview runtime={live([first, second])} onNavigate={vi.fn()} />);
+
+    await startOn(first.connection.deckId!);
+    await startOn(second.connection.deckId!);
+    for (const deckId of [first.connection.deckId!, second.connection.deckId!]) {
+      const error = within(card(deckId)).getByTestId("overview-start-error");
+      expect(error).toHaveTextContent(`Could not start the daemon on ${deckId}.`);
+      expect(within(error).getByTestId("connection-detail")).toHaveTextContent(`ssh said no to ${deckId}`);
+    }
+
+    // Reconnect on the second card clears the second card's error alone.
+    const secondReason = { ...second, connection: { ...second.connection, disconnectedReason: { ...second.connection.disconnectedReason!, kind: "running-not-connected" as const, action: "reconnect" as const } } };
+    rerender(<AgentOverview runtime={live([first, secondReason])} onNavigate={vi.fn()} />);
+    expect(within(card(second.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+    fireEvent.click(within(card(second.connection.deckId!)).getByRole("button", { name: "Reconnect" }));
+    expect(reconnect).toHaveBeenCalledOnce();
+    expect(within(card(second.connection.deckId!)).queryByTestId("overview-start-error")).not.toBeInTheDocument();
+    expect(within(card(first.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+
+    // The second deck connecting leaves the first deck's error where it is.
+    const connectedSecond = createFixtureSnapshot("connected");
+    connectedSecond.connection = { ...connectedSecond.connection, deckId: second.connection.deckId };
+    rerender(<AgentOverview runtime={live([first, connectedSecond])} onNavigate={vi.fn()} />);
+    expect(within(card(first.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+
+    // The first deck connecting clears its own: disconnected again, it shows none.
+    const connectedFirst = createFixtureSnapshot("connected");
+    connectedFirst.connection = { ...connectedFirst.connection, deckId: first.connection.deckId };
+    rerender(<AgentOverview runtime={live([connectedFirst, connectedSecond])} onNavigate={vi.fn()} />);
+    rerender(<AgentOverview runtime={live([first, connectedSecond])} onNavigate={vi.fn()} />);
+    expect(within(card(first.connection.deckId!)).queryByTestId("overview-start-error")).not.toBeInTheDocument();
+  });
+
+  /// Scenario: A disconnected deck whose reason replaces the headline still shows the real connection error on its card,
+  /// and its technical details carry the connection's own detail beside the reason's.
+  it("keeps the connection error visible beside the reason", () => {
+    window.history.replaceState({}, "", "/");
+    const deck = notRunningDeck("deck-00000000000000c3", "deploy@gamma");
+    deck.connection = {
+      ...deck.connection,
+      detail: "handshake refused: untrusted socket owner",
+      disconnectedReason: { ...deck.connection.disconnectedReason!, detail: "daemon probe: nothing at /run/deck.sock" },
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot: deck, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
+    const group = card("deck-00000000000000c3");
+    expect(within(group).getByTestId("overview-disconnected")).toHaveTextContent("No daemon is running on deploy@gamma.");
+    expect(within(group).getByTestId("daemon-state")).toHaveTextContent("ssh tunnel to deploy@gamma failed: Connection refused");
+    const detail = within(within(group).getByTestId("overview-disconnected")).getByTestId("connection-detail");
+    expect(detail).toHaveTextContent("handshake refused: untrusted socket owner");
+    expect(detail).toHaveTextContent("daemon probe: nothing at /run/deck.sock");
+  });
+});
+
 describe.each(["selector", "overview", "deck"] as const)("%s voice toggle", (surface) => {
   /// Scenario: Turning voice on and off keeps this numbered desktop surface mounted without React reporting a changed hook order.
   /// The selector, overview, and deck each have hooks after their voice-number visibility check.

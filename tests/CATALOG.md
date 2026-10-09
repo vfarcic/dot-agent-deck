@@ -5000,6 +5000,40 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
 - **Platform coverage:** mac+linux+windows.
 
+### Starting a deck daemon (issue #1490)
+
+#### remote/start
+
+##### remote/start/001 — A stopped remote daemon starts at its configured socket.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** the initial reason is not-running; start returns Started; the daemon answers Hello and probes as running at a deliberately non-default configured socket, leaving the inherited default unused.
+- **Does not assert:** a real SSH server, desktop rendering, authentication or real-agent work.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/002 — Starting a running remote daemon preserves its single process.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** a second start returns AlreadyRunning; the original daemon still answers Hello; exactly one daemon spawn and one Attach protocol listening line are recorded.
+- **Does not assert:** concurrent start requests, a real SSH server or desktop rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/003 — Missing installs and unreachable remote hosts explain the failure.
+- **Layer:** L2 (lane 1, shared start functions, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** probes and starts classify a missing binary as not-installed with a remote add remedy, and an SSH connection refusal as host-unreachable naming the host; the suggested action is Reconnect and no daemon spawns.
+- **Does not assert:** real network failure, SSH authentication or host-key verification.
+- **Platform coverage:** linux+mac.
+
+#### lifecycle/daemon-start
+
+##### lifecycle/daemon-start/001 — A local start launches one real daemon at its owned socket.
+- **Layer:** L2 (lane 1, shared local start functions and real daemon subprocess).
+- **Agent:** none.
+- **Asserts:** a stopped endpoint becomes a running daemon answering Hello; a second start returns AlreadyRunning without invoking spawn; one daemon spawn and attach listener are recorded.
+- **Does not assert:** local TUI lazy-spawn, desktop rendering or concurrent start requests.
+- **Platform coverage:** linux+mac.
+
 ### Remote upgrade and connect (PRD #1487)
 
 #### remote/upgrade

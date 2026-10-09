@@ -1285,7 +1285,19 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
     }
 
     fn installed(&self, build: &InstalledBuild) {
-        self.set_binary(build.binary.clone());
+        // Where the upgrade's raw string reaches the port's binary (issue
+        // #1490): validated here, so a value that is neither the default install nor a
+        // safe absolute path never reaches a remote shell. The remote installer
+        // records a validated row's binary, so a refusal means a bug, and the
+        // port keeps running the binary it already had.
+        match crate::remote::RemoteDeckBinary::try_from(build.binary.as_str()) {
+            Ok(binary) => self.set_binary(binary),
+            Err(error) => tracing::warn!(
+                target: "remote",
+                %error,
+                "not repointing the remote daemon port at an unsafe binary path"
+            ),
+        }
     }
 }
 
@@ -2487,7 +2499,7 @@ mod tests {
         let port = SshDaemonPort::new(
             ProbesButCannotRestart,
             SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         );
         let (outcome, _) = run(
             &FakeInstaller::ok("0.40.0", InstallMethod::Homebrew),
@@ -2507,6 +2519,46 @@ mod tests {
         assert!(summary.contains("0.40.0 is too old"), "{summary}");
         assert!(!summary.contains("daemon (0.39.0) is too old"), "{summary}");
         assert!(!summary.contains("too old to restart itself"), "{summary}");
+    }
+
+    /// Issue #1490 audit A2: an installed build's binary repoints the remote
+    /// port only when it is the default install or a safe absolute path; a
+    /// value a remote shell would reinterpret is refused and the port keeps
+    /// the binary it had.
+    #[test]
+    fn an_unsafe_installed_binary_never_reaches_the_remote_port() {
+        use crate::remote::{SshOutput, SshTarget};
+        struct Unused;
+        impl SshExecutor for Unused {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                panic!("nothing runs here: {command}")
+            }
+        }
+        let port = SshDaemonPort::new(
+            Unused,
+            SshTarget::parse("u@h", 22, None),
+            crate::remote::RemoteDeckBinary::DefaultInstall,
+        );
+        let build = |binary: &str| InstalledBuild {
+            version: "0.40.0".into(),
+            method: InstallMethod::Homebrew,
+            binary: binary.into(),
+        };
+        for unsafe_binary in [
+            "/opt/homebrew/bin/dot-agent-deck; rm -rf ~",
+            "/opt/home brew/bin/dot-agent-deck",
+            "/opt/homebrew/bin/$(id)",
+            "dot-agent-deck",
+        ] {
+            DaemonPort::installed(&port, &build(unsafe_binary));
+            assert_eq!(
+                port.binary(),
+                "~/.local/bin/dot-agent-deck",
+                "{unsafe_binary}"
+            );
+        }
+        DaemonPort::installed(&port, &build("/opt/homebrew/bin/dot-agent-deck"));
+        assert_eq!(port.binary(), "/opt/homebrew/bin/dot-agent-deck");
     }
 
     /// The same case through the real ssh port: the remote binary exits with
@@ -2535,7 +2587,7 @@ mod tests {
                 commands: commands.clone(),
             },
             SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         );
         let probed = DaemonPort::probe(&port);
         assert!(
@@ -2582,7 +2634,7 @@ mod tests {
         let port = SshDaemonPort::new(
             Broken,
             SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         );
         let (outcome, _) = run(
             &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
@@ -2652,7 +2704,7 @@ mod tests {
                     restarted: Cell::new(false),
                 },
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             )
         };
 
@@ -2845,7 +2897,7 @@ mod tests {
             SshDaemonPort::new(
                 Probes(DaemonProbe { running, hello }),
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             )
         };
         let install = FakeInstaller::ok("0.40.0", InstallMethod::LocalBin);
@@ -2944,7 +2996,7 @@ mod tests {
                     restarted: Cell::new(false),
                 },
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             )
         };
         let install = FakeInstaller::ok("0.40.0", InstallMethod::LocalBin);
@@ -3204,7 +3256,7 @@ mod tests {
         let port = SshDaemonPort::new(
             upgrade_ssh_executor().with_program(&script),
             crate::remote::SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         )
         .with_deadlines(Duration::from_secs(60), Duration::from_secs(60));
         // The first probe is killed at 2s (2.9s rounded down); ~0.9s is then
@@ -3583,7 +3635,7 @@ mod tests {
             let port = SshDaemonPort::new(
                 Fails(outcome),
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             );
             let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
             if may_have_been_sent {
@@ -3648,7 +3700,7 @@ mod tests {
                     restarted: Cell::new(false),
                 },
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             );
             let (outcome, _) = run(
                 &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
@@ -3707,7 +3759,7 @@ mod tests {
         let port = SshDaemonPort::new(
             ExitsAfterProbe,
             SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         );
         let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
         assert!(

@@ -1,6 +1,6 @@
 # Installation
 
-dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app connects to a daemon but does not start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
+dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app is a client of a daemon, and can start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
 
 After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ. If `dot-agent-deck docs` reports an unrecognized subcommand, the installed version predates it: read the documentation at [agent-deck.devopstoolkit.ai/llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt) instead, keeping in mind that the website follows the latest release rather than your installed version.
 
@@ -258,7 +258,7 @@ Launch it from the application menu or with `dot-agent-deck-desktop`. Remove it 
 
 ### How the desktop app gets a daemon
 
-The desktop app connects to a daemon and does not start one. With no daemon running, its Dashboard shows **Daemon disconnected** with a **Reconnect** button. (Starting a daemon from inside the app is one of the [features behind the `experimental` flag](desktop/index.md#features-behind-the-experimental-flag).) Start a daemon, then press **Reconnect**:
+With no daemon running, the desktop app's Dashboard shows **Daemon disconnected** with a **Start daemon** button: press it and confirm, and the app starts the daemon and connects ([Desktop app → Daemons → Start a daemon from the app](desktop/daemons.md#start-a-daemon-from-the-app)). You can also start a daemon yourself:
 
 - **Run the TUI**: `dot-agent-deck` starts a daemon if none is running. Both clients can be open at once.
 - **Run the daemon alone**: `dot-agent-deck daemon serve` runs it in the foreground of that terminal until `Ctrl+C`. On macOS without a CLI install: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
@@ -270,7 +270,7 @@ A daemon with no clients, no agents and no enabled [schedules](scheduled-tasks.m
 - Quitting the TUI with **Detach** leaves the daemon running under the same rule. Quitting it with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
 - Quitting the desktop app leaves agents running.
 
-The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon must already be running on its host; see [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
+The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon needs the deck installed on its host; the app can then start the daemon there. See [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
 
 ### Keep the app and the daemon on the same release
 
