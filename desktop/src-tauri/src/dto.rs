@@ -2591,6 +2591,46 @@ pub struct StartDaemonResultDto {
     pub snapshot: DesktopSnapshot,
 }
 
+/// What `desktop_start_daemon` rejects with (issue #1490): a bare sentence for
+/// every failure but a start that failed, which rejects with
+/// `{ message, failure, detail }` so the technical half — the spawn error, what
+/// ssh printed — reaches a disclosure instead of being dropped (PR #1623
+/// review). `desktop/src/lib/actionError.ts`'s `StartDaemonError` is the
+/// webview's half. Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopStartDaemonError {
+    Message(String),
+    Failed(DesktopStartFailure),
+}
+
+impl From<String> for DesktopStartDaemonError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A start that failed — see [`DesktopStartDaemonError`]. Every string
+/// through [`safe_message`]: the detail can quote what a remote printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStartFailure {
+    pub message: String,
+    pub failure: dot_agent_deck::daemon_start::StartFailure,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DesktopStartFailure {
+    pub(crate) fn new(problem: &dot_agent_deck::daemon_start::StartProblem) -> Self {
+        Self {
+            message: safe_message(&problem.message),
+            failure: problem.failure,
+            detail: problem.detail.as_deref().map(safe_message),
+        }
+    }
+}
+
 /// [`disconnected_snapshot`], carrying why the deck is not connected and the
 /// control that earns (issue #1490).
 pub(crate) fn disconnected_snapshot_because(
@@ -4710,6 +4750,32 @@ mod tests {
                 "showAgentProfiles": true,
                 "showAgentDetails": false,
             })
+        );
+    }
+
+    /// PR #1623 review: a failed start rejects with its failure kind and its
+    /// technical detail beside the sentence, every string scrubbed; any other
+    /// rejection stays the bare string every `catch` already reads.
+    #[test]
+    fn a_failed_start_rejects_with_its_detail() {
+        use dot_agent_deck::daemon_start::{StartFailure, StartProblem};
+        let failed = DesktopStartDaemonError::Failed(DesktopStartFailure::new(&StartProblem {
+            failure: StartFailure::StartFailed,
+            message: "Could not start the daemon on this machine.".into(),
+            detail: Some("spawn: \u{7}No such file or directory".into()),
+        }));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            serde_json::json!({
+                "message": "Could not start the daemon on this machine.",
+                "failure": "start-failed",
+                "detail": "spawn: No such file or directory",
+            })
+        );
+        let plain = DesktopStartDaemonError::from("not observed".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!("not observed")
         );
     }
 }

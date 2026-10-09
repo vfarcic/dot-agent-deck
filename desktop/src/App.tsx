@@ -46,7 +46,7 @@ import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPane
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
-import { CONNECT_ANYWAY_BODY, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
+import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
@@ -72,7 +72,7 @@ import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
 import { deckScreenSnapshot } from "./lib/deckScreen";
-import { LaunchCleanupError } from "./lib/actionError";
+import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
@@ -1885,7 +1885,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           await runtime.runAction({ type: "start_daemon", ...(deckId === undefined ? {} : { deckId }) });
           setNotice(remoteDeck ? `Daemon started on ${host} and connected.` : "Local daemon started and control channel reconnected.");
         } catch (cause) {
-          setNotice(cause instanceof Error ? cause.message : String(cause));
+          // PR #1623 review: a failed start's technical detail — the spawn
+          // error, what ssh printed — is said with its sentence, not dropped.
+          const message = cause instanceof Error ? cause.message : String(cause);
+          setNotice(cause instanceof StartDaemonError && cause.detail !== undefined ? `${message} (${cause.detail})` : message);
         }
       },
     });
@@ -2132,7 +2135,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a daemon from a different version") : incompatibleDaemon ? "Incompatible daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{disconnectedReason ? displayText(disconnectedReason.message, DISPLAY_LIMITS.message) : snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{bannerRemedy && <span data-testid="connection-banner-remedy">{bannerRemedy}</span>}<ConnectionDetail detail={snapshot.connection.detail ?? disconnectedReason?.detail} />{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a daemon from a different version") : incompatibleDaemon ? "Incompatible daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{disconnectedReason ? displayText(disconnectedReason.message, DISPLAY_LIMITS.message) : snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{bannerRemedy && <span data-testid="connection-banner-remedy">{bannerRemedy}</span>}<ConnectionDetail detail={disconnectedReason ? disconnectedDetails(snapshot.connection, { message: true }) : snapshot.connection.detail} />{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a

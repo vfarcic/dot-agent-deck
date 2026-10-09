@@ -204,6 +204,17 @@ pub enum StartFailure {
     NotCheckedYet,
 }
 
+impl StartFailure {
+    /// Whether ssh itself failed — the host was not reached, not logged in
+    /// to, or its key is not trusted — rather than something on the host.
+    pub fn is_ssh(self) -> bool {
+        matches!(
+            self,
+            Self::HostUnreachable | Self::AuthFailed | Self::HostKeyNotTrusted
+        )
+    }
+}
+
 /// A problem in the user's terms: what kind, the sentence to show, and the
 /// technical detail behind it for a disclosure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,7 +453,12 @@ pub fn start_remote<E: SshExecutor>(deck: &RemoteDeck<E>, timing: StartTiming) -
     }
 
     // The last check's problem, if it could not tell, is the detail of the
-    // failure below.
+    // failure below — unless ssh itself failed: then the host was not reached
+    // (or not logged in to), which is that problem and not a daemon that did
+    // not answer. A refused login or an untrusted key will not change while
+    // the start waits, so it ends the wait at once; an unreachable host may be
+    // a passing network blip, so the wait goes on and reports it only if it is
+    // still the last answer.
     let deadline = Instant::now() + timing.wait;
     let last_problem = loop {
         std::thread::sleep(timing.poll);
@@ -451,10 +467,23 @@ pub fn start_remote<E: SshExecutor>(deck: &RemoteDeck<E>, timing: StartTiming) -
             DisconnectedReason::NotRunning => None,
             DisconnectedReason::Unknown(problem) => Some(problem),
         };
+        if let Some(problem) = &problem
+            && matches!(
+                problem.failure,
+                StartFailure::AuthFailed | StartFailure::HostKeyNotTrusted
+            )
+        {
+            return StartOutcome::Failed(problem.clone());
+        }
         if Instant::now() >= deadline {
             break problem;
         }
     };
+    if let Some(problem) = &last_problem
+        && problem.failure.is_ssh()
+    {
+        return StartOutcome::Failed(problem.clone());
+    }
     StartOutcome::Failed(StartProblem::new(
         StartFailure::DidNotAnswer,
         format!(
@@ -983,6 +1012,67 @@ mod tests {
             "{}",
             problem.message
         );
+    }
+
+    /// PR #1623 review: an ssh failure on the checks after the start is that
+    /// ssh failure, not a daemon that did not answer — the host was never
+    /// asked. A refused login or an untrusted key ends the wait at once; an
+    /// unreachable host is reported when it is still the last answer.
+    #[test]
+    fn an_ssh_failure_after_the_start_is_reported_as_that_failure() {
+        let auth = || {
+            Err(SshError::AuthFailed {
+                target: "deploy@build-box".into(),
+                detail: "Permission denied (publickey).".into(),
+            })
+        };
+        let host_key = || {
+            Err(SshError::HostKeyVerificationFailed {
+                target: "deploy@build-box".into(),
+                remedy: "ssh -p 2222 -J bastion deploy@build-box".into(),
+            })
+        };
+        for (after_start, expected) in [
+            (unreachable as fn() -> Answer, StartFailure::HostUnreachable),
+            (auth, StartFailure::AuthFailed),
+            (host_key, StartFailure::HostKeyNotTrusted),
+        ] {
+            let fake = FakeSsh::default();
+            fake.version.borrow_mut().push_back(version_ok());
+            fake.probe
+                .borrow_mut()
+                .extend([probe_says(false), after_start()]);
+            fake.start.borrow_mut().push_back(out(0, "", ""));
+            let deck = deck(fake);
+            let problem = failed(start_remote(&deck, quick()));
+            assert_eq!(problem.failure, expected, "{problem:?}");
+            assert!(
+                !problem.message.contains("did not answer"),
+                "{}",
+                problem.message
+            );
+            if expected != StartFailure::HostUnreachable {
+                let probes = commands(&deck)
+                    .iter()
+                    .filter(|c| c.ends_with("daemon probe --json"))
+                    .count();
+                assert_eq!(probes, 2, "a {expected:?} ends the wait at once");
+            }
+        }
+    }
+
+    /// An unreachable host that comes back with no daemon is still a daemon
+    /// that did not answer: only the last answer decides.
+    #[test]
+    fn a_passing_ssh_blip_after_the_start_is_still_did_not_answer() {
+        let fake = FakeSsh::default();
+        fake.version.borrow_mut().push_back(version_ok());
+        fake.probe
+            .borrow_mut()
+            .extend([probe_says(false), unreachable(), probe_says(false)]);
+        fake.start.borrow_mut().push_back(out(0, "", ""));
+        let problem = failed(start_remote(&deck(fake), quick()));
+        assert_eq!(problem.failure, StartFailure::DidNotAnswer);
     }
 
     #[test]

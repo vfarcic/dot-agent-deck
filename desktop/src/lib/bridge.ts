@@ -1,6 +1,6 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
-import { actionErrorFrom, LaunchCleanupError } from "./actionError";
+import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
@@ -42,8 +42,9 @@ import type { HandoffEdge,
 
 /**
  * Exact DTO `desktop_start_daemon` resolves with (issue #1490). It rejects
- * with the sentence to show instead of resolving when the deck did not end up
- * connected.
+ * instead of resolving when the deck did not end up connected: with
+ * `{ message, failure, detail }` for a failed start (see `StartDaemonError`),
+ * and with the sentence to show otherwise.
  */
 export interface StartDaemonResultDto {
   outcome: "started" | "already-running";
@@ -4337,12 +4338,14 @@ export class TauriDeckBridge implements DeckBridge {
     }
     if (action.type === "start_daemon") {
       // Issue #1490: one command for every deck, local or remote. It resolves
-      // only once the deck is connected and rejects with the sentence to show.
+      // only once the deck is connected, and rejects with the sentence to show
+      // — for a failed start, with its technical detail beside it, rethrown as
+      // a `StartDaemonError`.
       let result: StartDaemonResultDto;
       try {
         result = await invoke<StartDaemonResultDto>("desktop_start_daemon", { deckId: action.deckId ?? null });
       } catch (cause) {
-        throw cause instanceof Error ? cause : new Error(String(cause));
+        throw startDaemonErrorFrom(cause);
       }
       if (result?.snapshot?.connection?.status !== "connected") {
         throw new Error(result?.snapshot?.connection?.error ?? "The daemon did not become connected.");

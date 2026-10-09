@@ -333,25 +333,36 @@ pub(crate) struct DaemonLinks {
 /// watcher asks the host again.
 pub(crate) const REMOTE_REASON_TTL: Duration = Duration::from_secs(15);
 
-/// One remote deck's stored answer.
-#[derive(Debug, Clone)]
+/// One deck's stored answer.
+#[derive(Debug, Clone, Default)]
 struct StoredReason {
     reason: Option<DisconnectedReason>,
     checked_at: Option<Instant>,
     /// A check is running; a second one waits for it rather than starting.
     checking: bool,
+    /// Bumped by [`DaemonLinks::forget_reason`] — around every start. A check
+    /// or an unconnected snapshot begun under an older generation describes
+    /// the deck from before that start, so it is neither stored nor emitted
+    /// (PR #1623 review): otherwise a remote check that began before the start
+    /// finished could land its "not running" after the connected snapshot.
+    generation: u64,
 }
 
 /// A remote check in flight: clears its stored reason's `checking` flag when
 /// dropped, so a cancelled check does not block every later one (issue #1490).
+/// Only its own generation's flag: a check superseded by a start must not
+/// clear the flag of the check that began after it.
 struct CheckInFlight<'a> {
     links: &'a DaemonLinks,
     key: EndpointIdentity,
+    generation: u64,
 }
 
 impl Drop for CheckInFlight<'_> {
     fn drop(&mut self) {
-        if let Some(stored) = self.links.stored_reasons().get_mut(&self.key) {
+        if let Some(stored) = self.links.stored_reasons().get_mut(&self.key)
+            && stored.generation == self.generation
+        {
             stored.checking = false;
         }
     }
@@ -394,16 +405,30 @@ impl DaemonLinks {
     /// has something new to say. A local deck is never asked here.
     pub(crate) async fn refresh_disconnected_reason(&self, endpoint: &Endpoint) -> bool {
         self.refresh_disconnected_reason_with(endpoint, |remote| {
-            let binary = remote_binary_for(&Endpoint::Remote(remote.clone()));
-            let deck =
-                dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(&remote, binary.as_ref());
-            dot_agent_deck::daemon_start::probe_remote(&deck)
+            let endpoint = Endpoint::Remote(remote.clone());
+            match remote_binary_for(&endpoint) {
+                Ok(binary) => {
+                    let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
+                        &remote,
+                        binary.as_ref(),
+                    );
+                    dot_agent_deck::daemon_start::probe_remote(&deck)
+                }
+                Err(error) => DisconnectedReason::Unknown(deck_list_problem(
+                    &endpoint,
+                    dot_agent_deck::daemon_start::StartFailure::CheckFailed,
+                    error,
+                )),
+            }
         })
         .await
     }
 
     /// [`Self::refresh_disconnected_reason`], asking the host with `probe`
     /// (run on the blocking pool) — a test's stand-in for the ssh check.
+    ///
+    /// The answer is stored, and `true` returned, only when no start has
+    /// begun or ended since the check began (its generation still stands).
     async fn refresh_disconnected_reason_with(
         &self,
         endpoint: &Endpoint,
@@ -415,13 +440,9 @@ impl DaemonLinks {
             return false;
         };
         let key = endpoint.identity();
-        {
+        let generation = {
             let mut reasons = self.stored_reasons();
-            let stored = reasons.entry(key.clone()).or_insert(StoredReason {
-                reason: None,
-                checked_at: None,
-                checking: false,
-            });
+            let stored = reasons.entry(key.clone()).or_default();
             let fresh = stored
                 .checked_at
                 .is_some_and(|at| at.elapsed() < REMOTE_REASON_TTL);
@@ -429,12 +450,17 @@ impl DaemonLinks {
                 return false;
             }
             stored.checking = true;
-        }
+            stored.generation
+        };
         // Clears `checking` however this future ends — including being
         // dropped at the await below when its watcher is aborted, which would
         // otherwise leave the flag set for every later watcher, since the
         // stored reasons outlive any one of them.
-        let _checking = CheckInFlight { links: self, key };
+        let _checking = CheckInFlight {
+            links: self,
+            key: key.clone(),
+            generation,
+        };
         let asked = tokio::task::spawn_blocking({
             let remote = remote.clone();
             move || probe(remote)
@@ -447,26 +473,69 @@ impl DaemonLinks {
                 detail: Some(error.to_string()),
             })
         });
-        self.store_reason(endpoint, reason);
+        let mut reasons = self.stored_reasons();
+        let stored = reasons.entry(key).or_default();
+        if stored.generation != generation {
+            // A start began or ended while the host was asked: the answer
+            // describes the deck from before it.
+            return false;
+        }
+        stored.reason = Some(reason);
+        stored.checked_at = Some(Instant::now());
         true
     }
 
-    /// Record `reason` as `endpoint`'s answer, asked now.
+    /// Record `reason` as `endpoint`'s answer, asked now — a test's stand-in
+    /// for a check that answered.
+    #[cfg(test)]
     pub(crate) fn store_reason(&self, endpoint: &Endpoint, reason: DisconnectedReason) {
-        self.stored_reasons().insert(
-            endpoint.identity(),
-            StoredReason {
-                reason: Some(reason),
-                checked_at: Some(Instant::now()),
-                checking: false,
-            },
-        );
+        let mut reasons = self.stored_reasons();
+        let stored = reasons.entry(endpoint.identity()).or_default();
+        stored.reason = Some(reason);
+        stored.checked_at = Some(Instant::now());
+        stored.checking = false;
     }
 
-    /// Forget `endpoint`'s stored answer — after a start, so the next
-    /// disconnect is asked about rather than answered from before it.
+    /// Forget `endpoint`'s stored answer — around a start, so the next
+    /// disconnect is asked about rather than answered from before it — and
+    /// supersede every check and unconnected snapshot still in flight for it
+    /// (see [`StoredReason::generation`]).
     pub(crate) fn forget_reason(&self, endpoint: &Endpoint) {
-        self.stored_reasons().remove(&endpoint.identity());
+        let mut reasons = self.stored_reasons();
+        let stored = reasons.entry(endpoint.identity()).or_default();
+        *stored = StoredReason {
+            generation: stored.generation.wrapping_add(1),
+            ..StoredReason::default()
+        };
+    }
+
+    /// `endpoint`'s current reason generation: what an unconnected snapshot
+    /// reads before it is built, and hands back to [`Self::if_current`].
+    pub(crate) fn reason_generation(&self, endpoint: &Endpoint) -> u64 {
+        self.stored_reasons()
+            .get(&endpoint.identity())
+            .map_or(0, |stored| stored.generation)
+    }
+
+    /// Run `emit` only if no start has begun or ended for `endpoint` since
+    /// `generation` was read, and return whether it ran. Held under the same
+    /// lock [`Self::forget_reason`] bumps under, so an unconnected snapshot is
+    /// either emitted before a start's connected one or not at all.
+    pub(crate) fn if_current(
+        &self,
+        endpoint: &Endpoint,
+        generation: u64,
+        emit: impl FnOnce(),
+    ) -> bool {
+        let reasons = self.stored_reasons();
+        let current = reasons
+            .get(&endpoint.identity())
+            .map_or(0, |stored| stored.generation);
+        if current != generation {
+            return false;
+        }
+        emit();
+        true
     }
 
     fn stored_reasons(&self) -> std::sync::MutexGuard<'_, HashMap<EndpointIdentity, StoredReason>> {
@@ -1732,15 +1801,42 @@ pub(crate) fn spawn_local_daemon() -> Result<(), String> {
 }
 
 /// The deck-list row's recorded deck binary for a remote `endpoint` — a
-/// Homebrew install records its own — or `None`, which runs the default
-/// install path. Validated when the row was read, so it is safe to put in a
-/// remote command.
+/// Homebrew install records its own — `Ok(None)` when the row records none,
+/// which runs the default install path, and `Err` when the deck list could
+/// not be read or holds no row for this deck. The two are kept apart (PR #1623
+/// review): running the default path on a failed lookup would report a
+/// recorded non-default install as "not installed". Validated when the row
+/// was read, so it is safe to put in a remote command.
 pub(crate) fn remote_binary_for(
     endpoint: &Endpoint,
-) -> Option<dot_agent_deck::remote::RemoteBinaryPath> {
-    crate::upgrade::remote_entry_for(endpoint, &crate::decks::remotes_path())
-        .ok()
-        .and_then(|entry| entry.binary)
+) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
+    remote_binary_in(endpoint, &crate::decks::remotes_path())
+}
+
+/// [`remote_binary_for`] against the deck list at `path`.
+fn remote_binary_in(
+    endpoint: &Endpoint,
+    path: &Path,
+) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
+    crate::upgrade::remote_entry_for(endpoint, path).map(|entry| entry.binary)
+}
+
+/// What a failed deck-list lookup means for a check or a start on
+/// `endpoint`'s host: the app does not know which `dot-agent-deck` to run
+/// there, so it runs none.
+fn deck_list_problem(
+    endpoint: &Endpoint,
+    failure: dot_agent_deck::daemon_start::StartFailure,
+    error: String,
+) -> dot_agent_deck::daemon_start::StartProblem {
+    dot_agent_deck::daemon_start::StartProblem {
+        failure,
+        message: format!(
+            "The app could not read this deck's entry in the deck list (remotes.toml), so it does not know which dot-agent-deck to run on {}.",
+            dot_agent_deck::daemon_start::host_label(endpoint)
+        ),
+        detail: Some(error),
+    }
 }
 
 /// Start `endpoint`'s daemon through the shared procedure
@@ -1766,7 +1862,16 @@ pub(crate) async fn start_deck_daemon(endpoint: &Endpoint) -> StartOutcome {
             let remote = remote.clone();
             let lookup = endpoint.clone();
             tokio::task::spawn_blocking(move || {
-                let binary = remote_binary_for(&lookup);
+                let binary = match remote_binary_for(&lookup) {
+                    Ok(binary) => binary,
+                    Err(error) => {
+                        return StartOutcome::Failed(deck_list_problem(
+                            &lookup,
+                            dot_agent_deck::daemon_start::StartFailure::StartFailed,
+                            error,
+                        ));
+                    }
+                };
                 let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
                     &remote,
                     binary.as_ref(),
@@ -1793,8 +1898,25 @@ pub(crate) async fn start_and_snapshot(
     endpoint: &Endpoint,
     links: &DaemonLinks,
 ) -> (StartOutcome, DesktopSnapshot) {
+    // Bumped on both sides of the start: a check or an unconnected snapshot
+    // begun before or during it describes the deck from before it.
+    links.forget_reason(endpoint);
     let outcome = start_deck_daemon(endpoint).await;
     links.forget_reason(endpoint);
+    if let StartOutcome::Failed(problem) = &outcome {
+        // The desktop's log is its stderr (no tracing subscriber runs here).
+        eprintln!(
+            "dot-agent-deck-desktop: starting the daemon on {} failed ({:?}): {}{}",
+            dot_agent_deck::daemon_start::host_label(endpoint),
+            problem.failure,
+            safe_message(&problem.message),
+            problem
+                .detail
+                .as_deref()
+                .map(|detail| format!(" — {}", safe_message(detail)))
+                .unwrap_or_default()
+        );
+    }
     let snapshot = match &outcome {
         // A daemon now answers at this address, so nothing held about the one
         // that was not answering a moment ago describes it. Drop the link
@@ -1805,10 +1927,23 @@ pub(crate) async fn start_and_snapshot(
         }
         StartOutcome::Failed(problem) => {
             let reason = links.disconnected_reason(endpoint).await;
-            disconnected_snapshot_because(endpoint, &problem.message, &reason)
+            failed_start_snapshot(endpoint, problem, &reason)
         }
     };
     (outcome, snapshot)
+}
+
+/// The snapshot after a failed start: the failure's sentence as the
+/// connection's error and its technical detail — the spawn error, what ssh
+/// printed — as the error's detail, so neither is dropped (PR #1623 review).
+fn failed_start_snapshot(
+    endpoint: &Endpoint,
+    problem: &dot_agent_deck::daemon_start::StartProblem,
+    reason: &DisconnectedReason,
+) -> DesktopSnapshot {
+    let mut snapshot = disconnected_snapshot_because(endpoint, &problem.message, reason);
+    snapshot.connection.error_detail = problem.detail.as_deref().map(safe_message);
+    snapshot
 }
 
 /// Snapshot the selected deck, and start a daemon for it if nothing is
@@ -7755,6 +7890,173 @@ start = true
         assert_eq!(
             links.disconnected_reason(&endpoint).await,
             DisconnectedReason::NotRunning
+        );
+    }
+
+    /// PR #1623 review: a remote check that began before a start finished
+    /// answers about the deck from before the start. Its answer is neither
+    /// stored nor reported as new (so no snapshot is emitted for it), and an
+    /// unconnected snapshot begun before the start is not emitted either.
+    #[tokio::test]
+    async fn a_check_begun_before_a_start_is_discarded() {
+        use dot_agent_deck::daemon_client::RemoteEndpoint;
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        let endpoint = Endpoint::Remote(RemoteEndpoint::new(
+            Hostname::parse("build-box").unwrap(),
+            RemoteSocketPath::parse("/run/deck/attach.sock").unwrap(),
+        ));
+        let links = Arc::new(DaemonLinks::default());
+        let snapshot_generation = links.reason_generation(&endpoint);
+
+        let (asked, on_host) = std::sync::mpsc::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let check = tokio::spawn({
+            let links = Arc::clone(&links);
+            let endpoint = endpoint.clone();
+            async move {
+                links
+                    .refresh_disconnected_reason_with(&endpoint, move |_| {
+                        asked.send(()).unwrap();
+                        let _ = held.recv();
+                        DisconnectedReason::NotRunning
+                    })
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking(move || on_host.recv().unwrap())
+            .await
+            .unwrap();
+        // The start: `start_and_snapshot` forgets the reason around it.
+        links.forget_reason(&endpoint);
+        release.send(()).unwrap();
+
+        assert!(
+            !check.await.unwrap(),
+            "a superseded check must not report a new answer"
+        );
+        assert_eq!(
+            links.disconnected_reason(&endpoint).await,
+            DisconnectedReason::not_checked_yet("build-box"),
+            "a superseded check must not store its answer"
+        );
+        let mut emitted = false;
+        assert!(!links.if_current(&endpoint, snapshot_generation, || emitted = true));
+        assert!(!emitted, "a snapshot begun before the start is not emitted");
+
+        // The check that begins after the start is stored, and reported.
+        assert!(
+            links
+                .refresh_disconnected_reason_with(&endpoint, |_| {
+                    DisconnectedReason::RunningNotConnected
+                })
+                .await
+        );
+        assert_eq!(
+            links.disconnected_reason(&endpoint).await,
+            DisconnectedReason::RunningNotConnected
+        );
+        let current = links.reason_generation(&endpoint);
+        assert!(links.if_current(&endpoint, current, || emitted = true));
+        assert!(emitted);
+    }
+
+    /// PR #1623 review: the deck list's recorded binary, a row with none (the
+    /// default install) and a failed lookup are three answers, not two — a
+    /// failed lookup must not run the default path and call a Homebrew install
+    /// "not installed".
+    #[test]
+    fn a_failed_deck_list_lookup_is_not_the_default_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[remotes]]
+            name = "brew-box"
+            type = "ssh"
+            host = "dev@brew-box"
+            port = 22
+            socket = "/run/user/1000/dot-agent-deck/attach.sock"
+            version = "0.44.0"
+            added_at = "2026-10-01T00:00:00Z"
+            binary = "/opt/homebrew/bin/dot-agent-deck"
+
+            [[remotes]]
+            name = "plain-box"
+            type = "ssh"
+            host = "plain-box"
+            port = 22
+            socket = "/run/user/1000/dot-agent-deck/attach.sock"
+            version = "0.44.0"
+            added_at = "2026-10-01T00:00:00Z"
+            "#,
+        )
+        .unwrap();
+        let file = dot_agent_deck::remote::RemotesFile::load(&path).unwrap();
+        let endpoint_of = |index: usize| {
+            Endpoint::Remote(
+                crate::decks::row_from_entry(&file.remotes[index])
+                    .unwrap()
+                    .endpoint()
+                    .unwrap(),
+            )
+        };
+        let (brew, plain) = (endpoint_of(0), endpoint_of(1));
+
+        assert_eq!(
+            remote_binary_in(&brew, &path)
+                .unwrap()
+                .map(|binary| binary.as_str().to_string()),
+            Some("/opt/homebrew/bin/dot-agent-deck".to_string())
+        );
+        assert_eq!(remote_binary_in(&plain, &path).unwrap(), None);
+
+        // The row is gone, and then the file is unreadable: both fail.
+        std::fs::write(&path, "").unwrap();
+        assert!(remote_binary_in(&brew, &path).is_err());
+        std::fs::write(&path, "[[remotes]\nnot toml").unwrap();
+        let error = remote_binary_in(&brew, &path).unwrap_err();
+
+        let problem = deck_list_problem(
+            &brew,
+            dot_agent_deck::daemon_start::StartFailure::CheckFailed,
+            error.clone(),
+        );
+        assert_eq!(
+            problem.failure,
+            dot_agent_deck::daemon_start::StartFailure::CheckFailed
+        );
+        assert_eq!(
+            problem.message,
+            "The app could not read this deck's entry in the deck list (remotes.toml), so it does not know which dot-agent-deck to run on dev@brew-box."
+        );
+        assert_eq!(problem.detail, Some(error));
+    }
+
+    /// PR #1623 review: a failed start's technical detail reaches the
+    /// snapshot as the error's detail, scrubbed, beside its sentence.
+    #[test]
+    fn a_failed_start_keeps_its_detail() {
+        use dot_agent_deck::daemon_start::{StartFailure, StartProblem};
+        let endpoint = Endpoint::Local(LocalEndpoint::at("/tmp/dad-i1490.sock"));
+        let problem = StartProblem {
+            failure: StartFailure::StartFailed,
+            message: "Could not start the daemon on this machine.".into(),
+            detail: Some("spawn failed: \u{1b}[31mPermission denied".into()),
+        };
+        let snapshot = failed_start_snapshot(&endpoint, &problem, &DisconnectedReason::NotRunning);
+        assert_eq!(
+            snapshot.connection.error.as_deref(),
+            Some("Could not start the daemon on this machine.")
+        );
+        let detail = snapshot
+            .connection
+            .error_detail
+            .expect("the detail is kept");
+        assert!(detail.contains("Permission denied"), "{detail}");
+        assert!(
+            !detail.contains('\u{1b}'),
+            "the detail is scrubbed: {detail:?}"
         );
     }
 

@@ -1696,16 +1696,25 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
 /// [`crate::daemon_bridge::REMOTE_REASON_TTL`], rather than on every snapshot:
 /// the snapshot goes out first with the stored answer, and again once a fresh
 /// one arrives.
+///
+/// Both emits are dropped when a start began or ended for this deck since the
+/// snapshot was begun (PR #1623 review): the snapshot then describes the deck
+/// from before the start, and emitted after the start's connected one it would
+/// paint a connected deck as disconnected. The check and the emit run under
+/// the lock a start bumps the generation under, so neither can land after it.
 async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+    let generation = links.reason_generation(endpoint);
     let mut snapshot = snapshot_with(endpoint, links, None).await;
-    emit_snapshot(app, &snapshot);
+    if !links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot)) {
+        return;
+    }
     if snapshot.connection.status == ConnectionStatus::Disconnected
         && links.refresh_disconnected_reason(endpoint).await
     {
         let reason = links.disconnected_reason(endpoint).await;
         snapshot.connection.disconnected_reason =
             Some(crate::dto::DisconnectedReasonDto::new(endpoint, &reason));
-        emit_snapshot(app, &snapshot);
+        links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot));
     }
 }
 
@@ -2310,17 +2319,18 @@ async fn new_agent_orchestrations_on(
 /// `dot_agent_deck::daemon_start` procedure, then connect to it as usual.
 ///
 /// Resolves once the deck is connected, with what the start did and the deck's
-/// snapshot. Rejects with the sentence to show when it is not: the start's own
-/// failure in the user's terms (host unreachable, ssh login refused,
-/// `dot-agent-deck` not installed there, the daemon not answering at the deck's
-/// socket), or a daemon that runs and still did not connect.
+/// snapshot. Rejects when it is not: with the start's own failure in the
+/// user's terms (host unreachable, ssh login refused, `dot-agent-deck` not
+/// installed there, the daemon not answering at the deck's socket) as
+/// `{ message, failure, detail }`, or with a bare sentence for a daemon that
+/// runs and still did not connect ([`crate::dto::DesktopStartDaemonError`]).
 #[tauri::command]
 async fn desktop_start_daemon(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
     deck_id: Option<String>,
-) -> Result<crate::dto::StartDaemonResultDto, String> {
+) -> Result<crate::dto::StartDaemonResultDto, crate::dto::DesktopStartDaemonError> {
     use dot_agent_deck::daemon_start::StartOutcome;
 
     ensure_main_webview(&webview)?;
@@ -2332,18 +2342,24 @@ async fn desktop_start_daemon(
     emit_snapshot(&app, &snapshot);
     ensure_snapshot_watchers(&app, &state);
     let outcome = match outcome {
-        StartOutcome::Failed(problem) => return Err(safe_message(problem.message)),
+        StartOutcome::Failed(problem) => {
+            return Err(crate::dto::DesktopStartDaemonError::Failed(
+                crate::dto::DesktopStartFailure::new(&problem),
+            ));
+        }
         StartOutcome::Started => "started",
         StartOutcome::AlreadyRunning => "already-running",
     };
     if snapshot.connection.status != ConnectionStatus::Connected {
-        return Err(safe_message(format!(
-            "The daemon is running on {host}, but the app could not connect to it: {}",
-            snapshot
-                .connection
-                .error
-                .as_deref()
-                .unwrap_or("it did not respond as expected")
+        return Err(crate::dto::DesktopStartDaemonError::Message(safe_message(
+            format!(
+                "The daemon is running on {host}, but the app could not connect to it: {}",
+                snapshot
+                    .connection
+                    .error
+                    .as_deref()
+                    .unwrap_or("it did not respond as expected")
+            ),
         )));
     }
     Ok(crate::dto::StartDaemonResultDto {

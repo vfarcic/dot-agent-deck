@@ -95,7 +95,7 @@ A daemon started from the app follows the same rule as any other: while the app 
 
 ### When Start daemon fails
 
-The section shows why, under its message. The usual reasons:
+The section shows why, under its message; **Technical details** under it holds what went wrong underneath, such as the error the daemon failed to start with or what ssh printed. The usual reasons:
 
 | Message | What to do |
 | --- | --- |
@@ -104,8 +104,9 @@ The section shows why, under its message. The usual reasons:
 | `The ssh host key of <host> is not trusted yet. …` | The app uses only a host key this computer has already accepted, even when your ssh config would accept a new one automatically. Run the command the message names once in a terminal, check the key and accept it, then try again. |
 | `dot-agent-deck is not installed on <host>. …` | Run `dot-agent-deck remote add <name> <user@host>` from a terminal, then press **Start daemon** again. |
 | `The dot-agent-deck on <host> is too old to report whether its daemon is running. …` | Upgrade it with `dot-agent-deck remote upgrade <name>`. |
+| `The app could not read this deck's entry in the deck list (remotes.toml), so it does not know which dot-agent-deck to run on <host>.` | Check that the daemon is still listed by `dot-agent-deck remote list` and that its entry in `remotes.toml` is valid; **Technical details** says what the app could not read. |
 | `The daemon was started on <host> but did not answer at <socket> within 25s. …` | The daemon started, but not where the app looks for it. Check that **Daemon socket** in this daemon's settings is where its daemon listens; clearing it and pressing **Test connection** finds the path. |
-| `Could not start the daemon on this machine.` or `The daemon was started on this machine but did not answer at <socket> in time.` | Start one from a terminal with `dot-agent-deck daemon serve` to see the error it prints; [Troubleshooting](../troubleshooting.md) covers the common causes. |
+| `Could not start the daemon on this machine.` or `The daemon was started on this machine but did not answer at <socket> in time.` | Open **Technical details** for the error. To see everything the daemon prints, start one from a terminal with `dot-agent-deck daemon serve`; [Troubleshooting](../troubleshooting.md) covers the common causes. |
 | `The daemon is running on <host>, but the app could not connect to it: …` | Press **Reconnect**. If it keeps happening, press **Test connection** and follow what it says. |
 
 ## Upgrade a remote daemon

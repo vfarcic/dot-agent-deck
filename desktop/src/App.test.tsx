@@ -256,6 +256,31 @@ describe("ControlDeck", () => {
       expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: snapshot.connection.deckId });
     });
 
+    /// Scenario: A failed start on the dashboard card shows its sentence with the technical detail behind a disclosure (PR #1623 review).
+    it("shows a failed start's technical detail on the overview deck", async () => {
+      window.history.replaceState({}, "", "/");
+      const { StartDaemonError } = await import("./lib/actionError");
+      const snapshot = disconnectedDeck("local");
+      const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures(""), runAction: vi.fn(async () => { throw new StartDaemonError("Could not start the daemon on this machine.", "start-failed", "spawn: No such file or directory"); }) });
+      render(<DeckShell runtime={live} />);
+      fireEvent.click(screen.getByTestId("start-daemon"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      const error = await screen.findByTestId("overview-start-error");
+      expect(error).toHaveTextContent("Could not start the daemon on this machine.");
+      expect(within(error).getByTestId("connection-detail")).toHaveTextContent("spawn: No such file or directory");
+    });
+
+    /// Scenario: On the Daemons screen a disconnected deck's banner leads with the reason's sentence and keeps the
+    /// connection's own error in its technical details rather than dropping it (PR #1623 review).
+    it("keeps the connection error in the Daemons banner's details", () => {
+      const snapshot = disconnectedDeck("remote", "running-not-connected");
+      snapshot.connection = { ...snapshot.connection, message: "ssh tunnel to deploy@build-box:2222 failed: handshake refused", detail: undefined };
+      render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+      const banner = screen.getByRole("alert");
+      expect(within(banner).getByTestId("connection-banner-message")).toHaveTextContent(snapshot.connection.disconnectedReason!.message);
+      expect(within(banner).getByTestId("connection-detail")).toHaveTextContent("ssh tunnel to deploy@build-box:2222 failed: handshake refused");
+    });
+
     /// Scenario: The experimental Daemons screen offers one remedy for a local or remote disconnected deck, and its Start confirmation uses that host.
     it.each((["local", "remote"] as const).flatMap((deckKind) =>
       (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind }))))(

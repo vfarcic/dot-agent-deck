@@ -398,6 +398,20 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
+  /// Scenario: A start that failed rejects with its failure kind and technical detail beside the sentence (PR #1623 review);
+  /// the bridge rethrows it as a StartDaemonError carrying both, so the detail reaches a disclosure.
+  it("keeps a failed start's technical detail", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const { StartDaemonError } = await import("./actionError");
+    invoke.mockRejectedValue({ message: "Could not start the daemon on this machine.", failure: "start-failed", detail: "spawn: No such file or directory" });
+
+    const bridge = new TauriDeckBridge();
+    const rejection = await bridge.runAction({ type: "start_daemon" }).catch((cause: unknown) => cause);
+    expect(rejection).toBeInstanceOf(StartDaemonError);
+    expect(rejection).toMatchObject({ message: "Could not start the daemon on this machine.", failure: "start-failed", detail: "spawn: No such file or directory" });
+    await bridge.dispose();
+  });
+
   it("starts the named deck's daemon through desktop_start_daemon (issue #1490)", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     invoke.mockResolvedValue({ outcome: "started", host: "deploy@build-box:2222", snapshot });
