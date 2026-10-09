@@ -1964,6 +1964,16 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
     );
   }
 
+  /*
+    Issue #1496 — a daemon none of whose agents the filter shows is one line.
+    Before the first-run note, because a daemon with no agents is one the filter
+    shows none of: while filtering it reads like every other empty daemon. The
+    connection notes above stay first — they say why nothing can be listed.
+  */
+  if (filtering && !sections.some((section) => section.matching)) {
+    return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
+  }
+
   if (!agents.length) {
     return (
       <OverviewNote className={noteClass} testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
@@ -1980,11 +1990,6 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
         </div>
       </OverviewNote>
     );
-  }
-
-  /* Issue #1496 — a daemon none of whose agents the filter shows is one line. */
-  if (filtering && !sections.some((section) => section.matching)) {
-    return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
   }
 
   return (

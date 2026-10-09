@@ -360,6 +360,23 @@ describe("dashboard filter controls", () => {
     expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
   });
 
+  /// Scenario: filter a fleet in which one connected daemon has no agents at all. While the filter is active that daemon collapses to its "no matching agents" line like any other daemon the filter empties, instead of its first-run card; Show all brings the first-run card back.
+  it("collapses a connected daemon with no agents while filtering", () => {
+    const input = filterFleet();
+    const empty: DeckSnapshot = {
+      ...input.snapshot,
+      connection: { ...input.snapshot.connection, deckId: "filter-empty", name: "empty-box", socketPath: "empty@remote" },
+      agents: [],
+    };
+    renderOverviewWithStoredColumns(undefined, { ...input, fleet: [...input.fleet, empty] });
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/empty-box: no matching agents/i)).toBeVisible();
+    expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+  });
+
   /// Scenario: remove the active text facet with its own chip control. Its query empties and every previously hidden agent returns without using Show all.
   it("removes the text facet through its chip", () => {
     renderOverviewWithStoredColumns(undefined, filterFleet());
