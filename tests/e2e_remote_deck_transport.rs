@@ -522,6 +522,8 @@ fn start_stand_in(daemon: &DaemonProc, display_name: &str, pane_id: &str) {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -581,9 +583,13 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
     // `XDG_RUNTIME_DIR` — `RemoteTunnel::open`'s, which decides where the
     // reaping sweep points.
     //
-    // SAFETY: both e2e aliases run under nextest, which is process-per-test, so
-    // this process is this test and nothing else is touching the environment.
-    // It is also the first statement in the body, so no thread exists yet.
+    // SAFETY: a stated residual, not a proof (issue #678). Both e2e aliases run
+    // under nextest, which is process-per-test, so no sibling test shares this
+    // process — but that is not the same as no other thread. Two exist here:
+    // libtest's runner thread, waiting for this test, and the harness's
+    // `load-context` heartbeat, which `harness_temp_root()` just above starts
+    // and which sleeps and reads `/proc`, never the environment. Nothing this
+    // test drives has started yet.
     let runtime_dir = common::harness_temp_root().join("rt");
     std::fs::create_dir_all(&runtime_dir).expect("create the sandbox XDG_RUNTIME_DIR");
     unsafe {
@@ -791,17 +797,40 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
         "the ssh child must still be running while the connection is held"
     );
     drop(connection);
-    // `process_running` reads `/proc` and treats a zombie as exited, so this
-    // cannot be satisfied by an unreaped child — which is half of what the
-    // assertion below is about.
+    // `process_running` treats a zombie as exited, so this observes the ssh
+    // child exiting and nothing more; the reap is checked separately below.
     common::wait_until(TEARDOWN_TIMEOUT, || {
         !common::process_running(ssh_pid as i32)
     });
     assert!(
         !common::process_running(ssh_pid as i32),
-        "`EndpointConnection`'s Drop must kill and reap the ssh child (pid \
-         {ssh_pid}); an app that leaks one per reconnect is the orphan this \
-         transport was built to avoid"
+        "`EndpointConnection`'s Drop must kill the ssh child (pid {ssh_pid}); \
+         an app that leaks one per reconnect is the orphan this transport was \
+         built to avoid"
+    );
+    // The ssh child is this test process's own child, and Drop reaps it before
+    // returning. `waitid` sees only this process's children, alive or zombie,
+    // so `ECHILD` shows the reap happened rather than just the exit, and an
+    // unrelated process that has since reused the pid cannot answer for it.
+    // `WNOWAIT` leaves a zombie unreaped, so the probe cannot do Drop's job.
+    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter; WNOHANG|WNOWAIT
+    // neither blocks nor reaps.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let probe = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            ssh_pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    let reaped =
+        probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    assert!(
+        reaped,
+        "`EndpointConnection`'s Drop must also reap the ssh child (pid \
+         {ssh_pid}): it exited but is still a zombie, which every reconnect \
+         would leave behind"
     );
     assert!(
         !forwarded.exists(),

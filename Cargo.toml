@@ -130,7 +130,7 @@ serial_test = "4"
 toml = "1.0"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
-insta = { version = "=1.48.0", features = ["yaml"] }
+insta = { version = "=1.49.0", features = ["yaml"] }
 spec = { path = "xtask/spec" }
 # PRD #77 Decision 30 / M4: the L2 harness's recording dump also
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
@@ -251,3 +251,14 @@ path = "examples/render_config_gen_prompt.rs"
 [[example]]
 name = "diff_config"
 path = "examples/diff_config.rs"
+
+# Issue #1450: the desktop's voice check (`desktop/src-tauri/src/voice/human_voice.rs`)
+# runs `earshot`, a small neural network, over every utterance before it is
+# transcribed. Unoptimised it scores 30 s of audio in about 4 s, which in a
+# `tauri dev` build is latency added to every spoken command and in
+# `cargo test-fast` is seconds per test; optimised it is milliseconds. This
+# optimises that one dependency in debug builds and changes nothing else —
+# release builds are optimised already, and this crate's own code still builds
+# at the dev profile's settings.
+[profile.dev.package.earshot]
+opt-level = 3

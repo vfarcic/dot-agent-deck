@@ -70,7 +70,8 @@ use crate::probe::Probe;
 use crate::report::{Evidence, RunVerdict};
 use crate::sandbox::{Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 use crate::{
-    buildgate, buildns, ctl, inner, isolation, previous, probe, probes, proc, report, sandbox, stub,
+    buildgate, buildlock, buildns, ctl, inner, isolation, previous, probe, probes, proc, report,
+    sandbox, stub,
 };
 
 /// The hidden flag the outer half passes to the copy of this binary it starts
@@ -247,6 +248,15 @@ struct Opts {
     #[arg(long, default_value_t = 1200)]
     run_timeout_secs: u64,
 
+    /// How long to wait for another `cargo xver` run to release the build
+    /// clone and target dir this run needs (issue #1530). A run holds both
+    /// from before its first `git` command in the clone until its branch
+    /// binary is staged into its sandbox, so the wait is for one fetch and
+    /// build, not for a whole run. `0` refuses at once. Either way the message
+    /// names the run holding them.
+    #[arg(long, default_value_t = 1200)]
+    lock_wait_secs: u64,
+
     /// Which pairing to run.
     ///
     /// `forward` (the default, and rule 12's pairing): the previous release's
@@ -259,9 +269,11 @@ struct Opts {
 
     /// The branch-specific stimulus a reverse run carries after the four tells.
     ///
-    /// `auto` (the default) selects it from the branch's `dispatch-issue-<n>`
-    /// path component, and refuses the run when it cannot tie the branch to
-    /// exactly one probe — it never falls back. `generic` asks for no stimulus
+    /// `auto` (the default) selects it from the issue number in the branch's
+    /// `dispatch-issue-<n>` or `dispatch-issue-<n>-<slug>` path component, and
+    /// refuses the run when it cannot tie the branch to exactly one probe — a
+    /// coupled unit's `dispatch-issue-<a>-<b>` names two issues and is refused
+    /// — it never falls back. `generic` asks for no stimulus
     /// on purpose: the four tells plus a `role-set` tell, in any endpoint mode,
     /// which is how the #1179 negative control runs (`--branch main --direction
     /// reverse --probe generic --endpoint-mode resolved
@@ -270,6 +282,46 @@ struct Opts {
     /// than silently ignored.
     #[arg(long, value_enum, default_value_t = ProbeArg::Auto)]
     probe: ProbeArg,
+}
+
+impl Opts {
+    /// Anchor every path option to `cwd`, the directory the command was run
+    /// from, before any of them reaches a command with a working directory of
+    /// its own (issue #1453).
+    ///
+    /// A relative path is otherwise resolved by whichever process reads it,
+    /// from wherever that process runs: [`create_clone`] runs `git clone` from
+    /// the clone's PARENT, so `--source-clone ../x` passed through still
+    /// relative landed one directory above where it names. Lexical
+    /// (`Path::join`) rather than `canonicalize`, because most of these paths
+    /// do not exist yet, and an absolute path is kept exactly as given.
+    /// The standalone build clone: `--source-clone`, else
+    /// `<repo parent>/dot-agent-deck-xver-src`.
+    fn clone_path(&self, repo_parent: &Path) -> PathBuf {
+        self.source_clone
+            .clone()
+            .unwrap_or_else(|| repo_parent.join("dot-agent-deck-xver-src"))
+    }
+
+    fn anchored_at(mut self, cwd: &Path) -> Self {
+        for path in [
+            &mut self.old_binary,
+            &mut self.source_clone,
+            &mut self.target_dir,
+            &mut self.cargo_cache,
+            &mut self.runs_root,
+            &mut self.releases_dir,
+            &mut self.evidence,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -348,8 +400,8 @@ fn select_probe(
             Ok((
                 p,
                 format!(
-                    "selected by `--probe auto` from the branch's `dispatch-issue-{issue}` \
-                     component"
+                    "selected by `--probe auto` from issue #{issue} in the branch's \
+                     `dispatch-issue-<n>` component"
                 ),
             ))
         }
@@ -369,10 +421,11 @@ fn evidence_path(explicit: Option<&Path>, root: &Path, slug: &str, d: Direction)
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    let name = match d {
-        Direction::Forward => format!("{slug}.md"),
-        Direction::Reverse => format!("{slug}-reverse.md"),
+    let suffix = match d {
+        Direction::Forward => ".md",
+        Direction::Reverse => "-reverse.md",
     };
+    let name = format!("{}{suffix}", fit_component(slug, NAME_MAX - suffix.len()));
     root.join(".dot-agent-deck")
         .join("xver-evidence")
         .join(name)
@@ -422,15 +475,35 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|a| a == "--") {
         args.remove(1);
     }
-    let opts = Opts::parse_from(args);
+    let opts = match parse_invocation(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("xver: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&opts) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+        Ok(Outcome::Pass) => ExitCode::SUCCESS,
+        Ok(Outcome::DeclaredBreak) => ExitCode::from(DECLARED_BREAK_EXIT),
+        Ok(Outcome::NotPass) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("\nxver: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the command line and anchor its path options to this process's
+/// working directory — the directory the command was run from (issue #1453).
+/// `main` and the regression test both go through here.
+fn parse_invocation<I, T>(args: I) -> Result<Opts, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
+    Ok(Opts::parse_from(args).anchored_at(&cwd))
 }
 
 // ---------------------------------------------------------------------------
@@ -701,16 +774,20 @@ impl Domain {
     /// repository and branch together: a readable slug of the branch, plus a
     /// digest of both, since the slug alone collides (`feature/x` and
     /// `feature-x`) and a branch of another `--repo` is another trust domain.
+    ///
+    /// The slug is cut short when the whole name would not fit `NAME_MAX`
+    /// (issue #1562's maximal dispatch branch does not); the digest after it is
+    /// what keeps two such branches apart.
     fn dir(self, base: &Path, repo: &str, branch: &str) -> PathBuf {
         match self {
             Domain::Mainline => base.to_path_buf(),
             Domain::OptedIn => {
+                let digest = format!("-{:016x}", fnv1a64(format!("{repo}\0{branch}").as_bytes()));
+                let used = base.file_name().map_or(0, |n| n.len()) + "-opted-in-".len();
+                let mut slug = branch_slug(branch);
+                slug.truncate(NAME_MAX.saturating_sub(used + digest.len()));
                 let mut s = base.as_os_str().to_owned();
-                s.push(format!(
-                    "-opted-in-{}-{:016x}",
-                    branch_slug(branch),
-                    fnv1a64(format!("{repo}\0{branch}").as_bytes())
-                ));
+                s.push(format!("-opted-in-{slug}{digest}"));
                 PathBuf::from(s)
             }
         }
@@ -777,12 +854,128 @@ fn prepare_domain_dir(dir: &Path, label: &str) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", marker.display()))
 }
 
+/// `--runs-root` when it is not given.
+fn default_runs_root(repo_parent: &Path) -> PathBuf {
+    repo_parent.join("dot-agent-deck-xver-runs")
+}
+
+/// How much of the branch a sandbox name keeps, as a label for whoever lists
+/// the runs root. See [`sandbox_name`].
+const SANDBOX_LABEL_MAX: usize = 16;
+
+/// The per-run sandbox directory's name under the runs root:
+/// `<label>-<digest>[-rev]-<epoch>`, at most 40 bytes whatever the branch is
+/// called (issue #1562).
+///
+/// The sandbox's sockets live directly under it (`$S/attach.sock`), and a Unix
+/// socket path has 108 bytes including the NUL. The name used to be the whole
+/// branch slug, so a dispatched unit's `agent/dispatch-issue-<n>-<slug>`
+/// overflowed that under the default runs root, after the build had finished.
+/// The label is the branch's last path component with a leading `dispatch-`
+/// dropped, cut to [`SANDBOX_LABEL_MAX`] bytes (`issue-1540-share`); the digest
+/// is of the whole branch, so two branches the cut makes alike still get
+/// different names. [`check_sandbox_socket_paths`] refuses, before the build,
+/// a runs root too long for even this.
+fn sandbox_name(branch: &str, direction: Direction, epoch: u64) -> String {
+    let last = branch.rsplit('/').find(|c| !c.is_empty()).unwrap_or("");
+    let last = last.strip_prefix("dispatch-").unwrap_or(last);
+    let mut label = branch_slug(last);
+    label.truncate(SANDBOX_LABEL_MAX);
+    if label.is_empty() {
+        label.push_str("branch");
+    }
+    let digest = fnv1a64(branch.as_bytes()) & 0xffff_ffff;
+    let rev = match direction {
+        Direction::Forward => "",
+        Direction::Reverse => "-rev",
+    };
+    format!("{label}-{digest:08x}{rev}-{epoch}")
+}
+
+/// [`sandbox_name`] at `epoch`, or at the first later second whose name is not
+/// already taken under `runs_root`. Two runs of one branch, or of two branches
+/// the label and digest make alike, can reach this in the same second, and
+/// [`Sandbox::create`] refuses an existing entry — after the build, losing it
+/// (Greptile, PR #1570). The name keeps its length, so the preflight's socket
+/// check still holds for it. A race between this look and the `mkdir` is still
+/// refused by [`Sandbox::create`]; this only stops the common case costing a run.
+fn free_sandbox_name(runs_root: &Path, branch: &str, direction: Direction, epoch: u64) -> String {
+    (epoch..)
+        .map(|e| sandbox_name(branch, direction, e))
+        .find(|name| std::fs::symlink_metadata(runs_root.join(name)).is_err())
+        .expect("an unbounded range of seconds has a free one")
+}
+
+/// Every Unix socket path a run in `<runs_root>/<name>` may bind or probe must
+/// fit `sun_path`. Run in the preflight, against the canonical runs root
+/// [`Sandbox::create`] will use, so a runs root too long for the sandbox's
+/// sockets is refused before anything is downloaded or built (issue #1562).
+fn check_sandbox_socket_paths(
+    runs_root: &Path,
+    name: &str,
+    mode: EndpointMode,
+    keep_xdg: bool,
+    uid: u32,
+) -> Result<(), String> {
+    let sb = Sandbox::at(runs_root.join(name));
+    for m in &EndpointMatrix::candidates(&sb, mode, keep_xdg, uid) {
+        sandbox::check_socket_path_lengths(m)?;
+    }
+    Ok(())
+}
+
+/// The longest file name Linux filesystems take, in bytes.
+const NAME_MAX: usize = 255;
+
+/// `slug` as it is when it is at most `max` bytes; otherwise its first bytes
+/// and a digest of the whole, `max` bytes in all, so two long slugs that share
+/// a prefix stay apart. `slug` is ASCII ([`branch_slug`]).
+fn fit_component(slug: &str, max: usize) -> String {
+    if slug.len() <= max {
+        return slug.to_string();
+    }
+    let digest = format!("-{:016x}", fnv1a64(slug.as_bytes()));
+    let keep = max.saturating_sub(digest.len());
+    format!("{}{digest}", &slug[..keep])
+}
+
 /// The branch name with everything but ASCII alphanumerics replaced by `-`.
 fn branch_slug(branch: &str) -> String {
     branch
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// `git clone --no-checkout <url> <clone>`, run from the clone's parent.
+///
+/// `clone` must be absolute, and [`Opts::anchored_at`] is what makes
+/// `--source-clone` so: a relative one would be resolved against the parent this
+/// runs from rather than the directory the command was run from, which is issue
+/// #1453. Refused here too, so a future caller cannot reopen it silently.
+fn create_clone(url: &str, clone: &Path) -> Result<(), String> {
+    if !clone.is_absolute() {
+        return Err(format!(
+            "the build clone path {} is relative; it must be anchored to the invoking \
+             directory first (issue #1453)",
+            clone.display()
+        ));
+    }
+    let parent = clone
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", clone.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    must_run(
+        git(parent).args([
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            url,
+            &clone.to_string_lossy(),
+        ]),
+        "git clone (standalone build clone)",
+    )?;
+    Ok(())
 }
 
 /// Point the standalone build clone at `origin/<branch>` and build it.
@@ -823,20 +1016,7 @@ fn new_binary(
     let url = format!("https://github.com/{}.git", opts.repo);
     let fresh = std::fs::symlink_metadata(clone).is_err();
     if fresh {
-        let parent = clone
-            .parent()
-            .ok_or_else(|| format!("{} has no parent", clone.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        must_run(
-            git(parent).args([
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                &url,
-                &clone.to_string_lossy(),
-            ]),
-            "git clone (standalone build clone)",
-        )?;
+        create_clone(&url, clone)?;
         ev.preflight.push(format!(
             "created the standalone build clone {} from {url}",
             clone.display()
@@ -1103,6 +1283,20 @@ fn new_binary(
             run.report.pid_ns
         ));
         ev.build.push(buildns::LINK_POOL_NOTE.to_string());
+        let head_now = must_run(
+            git(&clone).args(["rev-parse", "HEAD"]),
+            "git rev-parse HEAD",
+        )?;
+        let status_now = must_run(
+            git(&clone).args(["status", "--porcelain", "--untracked-files=no"]),
+            "git status",
+        )?;
+        if let Some(moved) = clone_moved(&sha, &head_now, &status_now) {
+            return Err(moved);
+        }
+        ev.build.push(format!(
+            "the build clone was still at {sha}, with no tracked modification, after the build"
+        ));
     }
     let bin = target.join("debug").join("dot-agent-deck");
     if !bin.exists() {
@@ -1129,6 +1323,56 @@ fn new_binary(
 /// environment injected a `DAD_BUILD_ID` — so the note reports it as that
 /// rather than as a measurement, and says so plainly when there is none.
 fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
+    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
+                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
+                      independent measurement.";
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => format!(
+            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
+             from is NOT knowable from this run. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::NoCommit { build_id } => format!(
+            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
+             it was built from is NOT knowable. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::Other { build_id, short } => format!(
+            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
+             `{head_sha}`. This run tested another build, and its tells say nothing about that \
+             HEAD. {provenance}"
+        ),
+        BuiltFrom::DirtyHead { build_id } => format!(
+            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
+             built from that commit PLUS uncommitted changes in the build clone, which is not \
+             the commit under test. {provenance}"
+        ),
+        BuiltFrom::Head { build_id, short } => format!(
+            "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
+             the binary's own stamp it is a build of the commit under test. {provenance}"
+        ),
+    }
+}
+
+/// Which commit the branch binary says it was built from, against the HEAD
+/// the run fetched and checked out.
+#[derive(Debug, PartialEq, Eq)]
+enum BuiltFrom {
+    /// No `daemon hello` was recorded: the scenario stopped before it ran.
+    NoHello,
+    /// The build id carries no `-g<sha>` component.
+    NoCommit { build_id: String },
+    /// The build id names the HEAD, clean.
+    Head { build_id: String, short: String },
+    /// The build id names the HEAD, with `-dirty`.
+    DirtyHead { build_id: String },
+    /// The build id names another commit.
+    Other { build_id: String, short: String },
+}
+
+/// Read the commit out of the branch binary's own build id,
+/// `<version>-g<short-sha>[-dirty]` (`build.rs`), from its `daemon hello`.
+fn built_from(head_sha: &str, new_hello: &str) -> BuiltFrom {
     let build_id = serde_json::from_str::<serde_json::Value>(new_hello.trim())
         .ok()
         .and_then(|v| {
@@ -1137,11 +1381,7 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
                 .map(str::to_string)
         });
     let Some(build_id) = build_id else {
-        return format!(
-            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
-             from is NOT knowable from this run. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoHello;
     };
     let (stem, dirty) = match build_id.strip_suffix("-dirty") {
         Some(stem) => (stem, true),
@@ -1150,45 +1390,96 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
     let short = stem
         .rsplit_once("-g")
         .map(|(_, sha)| sha)
-        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string);
     let Some(short) = short else {
-        return format!(
-            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
-             it was built from is NOT knowable. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoCommit { build_id };
     };
-    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
-                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
-                      independent measurement.";
     if !head_sha
         .to_ascii_lowercase()
         .starts_with(&short.to_ascii_lowercase())
     {
-        return format!(
-            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
-             `{head_sha}`. This run tested another build, and its tells say nothing about that \
-             HEAD. {provenance}"
-        );
+        return BuiltFrom::Other { build_id, short };
     }
     if dirty {
-        return format!(
-            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
-             built from that commit PLUS uncommitted changes in the build clone, which is not \
-             the commit under test. {provenance}"
-        );
+        return BuiltFrom::DirtyHead { build_id };
     }
-    format!(
-        "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
-         the binary's own stamp it is a build of the commit under test. {provenance}"
-    )
+    BuiltFrom::Head { build_id, short }
+}
+
+/// For a run that built the branch itself (issue #1530): the evidence row
+/// naming the commit the binary was actually built from, and — when that is
+/// not provably the HEAD the run fetched — why the run cannot pass.
+///
+/// A missing `daemon hello` is recorded but not a mismatch of its own: the
+/// scenario stopped before it ran, and that already keeps the run from passing.
+fn built_commit_check(head_sha: &str, new_hello: &str) -> (String, Option<String>) {
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => (
+            "not recorded — the branch binary's `daemon hello` never ran in this run".to_string(),
+            None,
+        ),
+        BuiltFrom::Head { build_id, short } => (
+            format!(
+                "`{short}`, the branch HEAD it fetched, by the binary's own build id `{build_id}`"
+            ),
+            None,
+        ),
+        BuiltFrom::Other { build_id, short } => (
+            format!(
+                "**`{short}` — NOT the branch HEAD `{head_sha}` it fetched** (build id `{build_id}`)"
+            ),
+            Some(format!(
+                "its build id `{build_id}` names commit `{short}`, not the branch HEAD \
+                 `{head_sha}` the run fetched and checked out — something else checked out in \
+                 the build clone during the build, so the tells measured another commit"
+            )),
+        ),
+        BuiltFrom::DirtyHead { build_id } => (
+            format!("**the branch HEAD plus uncommitted changes** (build id `{build_id}`)"),
+            Some(format!(
+                "its build id `{build_id}` says it was built from the branch HEAD `{head_sha}` \
+                 plus uncommitted changes in the build clone, which is not the commit under test"
+            )),
+        ),
+        BuiltFrom::NoCommit { build_id } => (
+            format!("**not knowable** — the build id `{build_id}` names no commit"),
+            Some(format!(
+                "its build id `{build_id}` names no commit, so the run cannot confirm it built \
+                 the branch HEAD `{head_sha}` it fetched"
+            )),
+        ),
+    }
+}
+
+/// The build clone's HEAD and status after the build, against the commit the
+/// run checked out before it (issue #1530). Anything that checked out in the
+/// clone while Cargo read it — a run that ignored the build lock, such as one
+/// from a harness that predates it — shows here.
+fn clone_moved(fetched: &str, head_now: &str, status_now: &str) -> Option<String> {
+    if head_now.trim() != fetched {
+        return Some(format!(
+            "the build clone's HEAD moved during the build: it is now {}, but the run fetched, \
+             checked out and built {fetched}. Another process checked out in the clone while \
+             Cargo was reading it, so the binary may be a build of either commit or a mix of \
+             both. Give each concurrent run its own --source-clone and --target-dir",
+            head_now.trim()
+        ));
+    }
+    if !status_now.trim().is_empty() {
+        return Some(format!(
+            "the build clone has tracked modifications after the build of {fetched} — something \
+             other than this harness edited it while Cargo was reading it:\n{status_now}"
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
-fn run(opts: &Opts) -> Result<bool, String> {
+fn run(opts: &Opts) -> Result<Outcome, String> {
     check_evidence_arg(opts.evidence.as_deref(), opts.direction)?;
     let directions = opts.direction.directions();
     // Refuse a probe/direction combination before anything is built. With
@@ -1227,21 +1518,21 @@ fn run(opts: &Opts) -> Result<bool, String> {
         previous.tag,
         previous.describe()
     );
-    let mut all_passed = true;
+    let mut worst = Outcome::Pass;
     let mut first_err = None;
     for (d, (probe, how)) in directions.into_iter().zip(probes) {
         match run_one(opts, &previous, d, probe, how) {
-            Ok(passed) => all_passed &= passed,
+            Ok(outcome) => worst = worst.max(outcome),
             Err(e) => {
                 eprintln!("\nxver ({}): {e}", d.name());
-                all_passed = false;
+                worst = Outcome::NotPass;
                 first_err.get_or_insert(e);
             }
         }
     }
     match first_err {
         Some(e) => Err(e),
-        None => Ok(all_passed),
+        None => Ok(worst),
     }
 }
 
@@ -1253,16 +1544,13 @@ fn run_one(
     direction: Direction,
     probe: Probe,
     probe_selection: String,
-) -> Result<bool, String> {
+) -> Result<Outcome, String> {
     let root = repo_root()?;
     let parent = root
         .parent()
         .ok_or_else(|| "the repository root has no parent".to_string())?
         .to_path_buf();
-    let clone = opts
-        .source_clone
-        .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-src"));
+    let clone = opts.clone_path(&parent);
     let target_dir = opts
         .target_dir
         .clone()
@@ -1270,7 +1558,7 @@ fn run_one(
     let runs_root = opts
         .runs_root
         .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-runs"));
+        .unwrap_or_else(|| default_runs_root(&parent));
     let releases = opts
         .releases_dir
         .clone()
@@ -1335,6 +1623,17 @@ fn run_one(
         "runs root: {}",
         sandbox::require_disk_backed("runs root", &runs_root, opts.min_free_gib)?
     ));
+    // The name is minted again once the build is done, so two runs of one
+    // branch queued on the build lock still get a sandbox each; the length it
+    // is checked at here is the same.
+    check_sandbox_socket_paths(
+        &std::fs::canonicalize(&runs_root)
+            .map_err(|e| format!("canonicalize runs root {}: {e}", runs_root.display()))?,
+        &sandbox_name(&opts.branch, direction, epoch_secs()),
+        mode,
+        spec.keep_xdg_runtime_dir,
+        uid,
+    )?;
     ev.preflight.push(format!(
         "cargo target dir: {}",
         sandbox::require_disk_backed("cargo target dir", &target_dir, opts.min_free_gib)?
@@ -1378,15 +1677,43 @@ fn run_one(
 
     println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
+    // One run at a time on this clone and target dir (issue #1530), held
+    // until the branch binary is staged into the sandbox below.
+    let holder = format!(
+        "pid {}, branch `{}` ({}), since {}, --source-clone {}, --target-dir {}",
+        std::process::id(),
+        opts.branch,
+        direction.name(),
+        utc_now(),
+        clone.display(),
+        target_dir.display()
+    );
+    let lock = buildlock::acquire(
+        &[
+            buildlock::Need {
+                what: "build clone",
+                flag: "--source-clone",
+                dir: &clone,
+            },
+            buildlock::Need {
+                what: "target dir",
+                flag: "--target-dir",
+                dir: &target_dir,
+            },
+        ],
+        &holder,
+        Duration::from_secs(opts.lock_wait_secs),
+        buildlock::POLL,
+        |m| println!("xver ({}): {m}", direction.name()),
+    )?;
+    ev.build.push(build_lock_note(&lock));
+    let mut build_lock = Some(lock);
     let (new_src, head_sha) =
         new_binary(opts, &clone, &target_dir, &cargo_cache, &runs_root, &mut ev)?;
     ev.head_sha = head_sha;
 
     let slug = branch_slug(&opts.branch);
-    let sb_name = match direction {
-        Direction::Forward => format!("{slug}-{}", epoch_secs()),
-        Direction::Reverse => format!("{slug}-rev-{}", epoch_secs()),
-    };
+    let sb_name = free_sandbox_name(&runs_root, &opts.branch, direction, epoch_secs());
     let sb = Sandbox::create(&runs_root, &sb_name)?;
     let runs_root = std::fs::canonicalize(&runs_root).map_err(|e| format!("{e}"))?;
     ev.sandbox_root = sb.root.clone();
@@ -1416,6 +1743,16 @@ fn run_one(
         }
         for (src, dst) in staging {
             ev.preflight.push(sandbox::stage_binary(src, &dst)?);
+        }
+        if let Some(lock) = build_lock.take() {
+            lock.still_held()?;
+            drop(lock);
+            ev.build.push(
+                "released the build lock once the branch binary was staged into the sandbox, \
+                 its lock files still the ones it locked; another run may check out in the \
+                 clone and build into the target dir from here"
+                    .to_string(),
+            );
         }
         ev.old_binary = sb.old_bin();
         ev.new_binary = sb.new_bin(direction);
@@ -1498,6 +1835,11 @@ fn run_one(
         let note = skip_build_note(&ev.head_sha, &ev.new_hello);
         println!("xver ({}): --skip-build: {note}", direction.name());
         ev.skip_build = Some(note);
+    } else {
+        let (row, mismatch) = built_commit_check(&ev.head_sha, &ev.new_hello);
+        println!("xver ({}): commit built — {row}", direction.name());
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
     }
 
     println!("xver ({}): postconditions", direction.name());
@@ -1511,18 +1853,23 @@ fn run_one(
     );
 
     let verdict = ev.verdict();
-    let passed = run_passed(&verdict, outcome.is_ok(), clean);
-    let disposal = if passed && !opts.keep_sandbox {
+    let result = run_outcome(&verdict, outcome.is_ok(), clean);
+    let disposal = if result != Outcome::NotPass && !opts.keep_sandbox {
         match remove_sandbox(&sb, &runs_root) {
             Ok(()) => format!(
-                "the sandbox `{}` was removed after the clean pass",
-                sb.root.display()
+                "the sandbox `{}` was removed after the clean {}",
+                sb.root.display(),
+                if result == Outcome::Pass {
+                    "pass"
+                } else {
+                    "declared break"
+                }
             ),
             Err(e) => format!("the sandbox `{}` was kept: {e}", sb.root.display()),
         }
     } else {
         format!(
-            "the sandbox `{}` was kept (not a clean pass, or --keep-sandbox)",
+            "the sandbox `{}` was kept (not a clean pass or declared break, or --keep-sandbox)",
             sb.root.display()
         )
     };
@@ -1535,7 +1882,29 @@ fn run_one(
         evidence_path.display()
     );
     println!("xver ({}): {}", direction.name(), verdict.label());
-    Ok(passed)
+    Ok(result)
+}
+
+/// What the evidence says about the build lock a run took.
+fn build_lock_note(lock: &buildlock::BuildLock) -> String {
+    format!(
+        "held an exclusive lock on the build clone and the target dir ({}) from before the first \
+         `git` command in the clone until the branch binary was staged; {}",
+        lock.files()
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if lock.waited_for.is_empty() {
+            "no other run held them".to_string()
+        } else {
+            format!(
+                "waited {:.1}s for another run to release them: {}",
+                lock.waited.as_secs_f64(),
+                lock.waited_for.join("; then ")
+            )
+        }
+    )
 }
 
 /// Record an error the outer half hit before or around the namespace. With no
@@ -1553,12 +1922,40 @@ fn record_outer_abort(ev: &mut Evidence, e: &str) {
     }
 }
 
-/// Whether a run counts as a clean pass: the exit status, and whether the
-/// sandbox may be removed. Only a PASS verdict qualifies — FAIL, INCOMPLETE
-/// and a measured non-discovery all exit non-zero — and only when the outer
-/// half itself completed and every postcondition held.
-fn run_passed(verdict: &RunVerdict, outer_completed: bool, postconditions_clean: bool) -> bool {
-    *verdict == RunVerdict::Pass && outer_completed && postconditions_clean
+/// How a run ended, ordered from best to worst so `both` reports the worse of
+/// its two directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Outcome {
+    /// A PASS, with the outer half complete and every postcondition met.
+    Pass,
+    /// The same, except that the verdict is a declared contract break
+    /// (`breaks.rs`): the intended outcome of a break the two builds declare
+    /// differently, recorded rather than failed (issue #1596).
+    DeclaredBreak,
+    /// Everything else: FAIL, INCOMPLETE, a measured non-discovery, an outer
+    /// abort, or a postcondition that did not hold.
+    NotPass,
+}
+
+/// The exit status of a command whose every direction was a clean pass or a
+/// clean declared break, and at least one a declared break. Distinct from 0 so
+/// a script cannot take it for a pass, and from 1 so CI can record it instead
+/// of failing (`.github/workflows/ci.yml`'s `cross-version` job).
+const DECLARED_BREAK_EXIT: u8 = 3;
+
+/// How a run ended: the exit status, and whether the sandbox may be removed.
+/// Only a PASS verdict, or a DECLARED BREAK one, qualifies — FAIL, INCOMPLETE
+/// and a measured non-discovery are all [`Outcome::NotPass`] — and only when
+/// the outer half itself completed and every postcondition held.
+fn run_outcome(verdict: &RunVerdict, outer_completed: bool, postconditions_clean: bool) -> Outcome {
+    if !(outer_completed && postconditions_clean) {
+        return Outcome::NotPass;
+    }
+    match verdict {
+        RunVerdict::Pass => Outcome::Pass,
+        RunVerdict::DeclaredBreak(_) => Outcome::DeclaredBreak,
+        _ => Outcome::NotPass,
+    }
 }
 
 /// Write a file only its owner can read.
@@ -1976,7 +2373,8 @@ mod tests {
             ),
             Ok((
                 Probe::TeardownInventory,
-                "selected by `--probe auto` from the branch's `dispatch-issue-1109` component"
+                "selected by `--probe auto` from issue #1109 in the branch's \
+                 `dispatch-issue-<n>` component"
                     .to_string()
             ))
         );
@@ -1991,13 +2389,58 @@ mod tests {
         );
     }
 
+    /// Issue #1563: the dispatch verb names a unit `issue-<n>-<slug>` as often
+    /// as `issue-<n>`, so `auto` reads the issue out of both — and a coupled
+    /// unit's `issue-<a>-<b>` is refused as naming two issues, never resolved
+    /// to either one.
+    #[test]
+    fn auto_reads_the_issue_out_of_a_slugged_dispatch_branch_and_refuses_a_coupled_one() {
+        for branch in [
+            "agent/dispatch-issue-1109-teardown-disclosure",
+            "agent/dispatch-issue-1109-v2",
+        ] {
+            assert_eq!(
+                select_probe(ProbeArg::Auto, branch, Direction::Reverse),
+                Ok((
+                    Probe::TeardownInventory,
+                    "selected by `--probe auto` from issue #1109 in the branch's \
+                     `dispatch-issue-<n>` component"
+                        .to_string()
+                )),
+                "{branch}"
+            );
+        }
+        let err = select_probe(
+            ProbeArg::Auto,
+            "agent/dispatch-issue-1109-1121",
+            Direction::Reverse,
+        )
+        .expect_err("a coupled unit names two issues");
+        assert!(
+            err.contains("more than one issue") && err.contains("#1109, #1121"),
+            "says which issues it could not choose between: {err}"
+        );
+        assert!(err.contains("--probe generic"), "{err}");
+        let err = select_probe(
+            ProbeArg::Auto,
+            "agent/dispatch-issue-1540-shared-last-command",
+            Direction::Reverse,
+        )
+        .expect_err("no probe was written for #1540");
+        assert!(
+            err.contains("found issue #1540") && err.contains("no probe"),
+            "the slug is read past, and the refusal is about the issue: {err}"
+        );
+    }
+
     #[test]
     fn auto_refuses_a_reverse_run_it_cannot_tie_to_one_probe() {
         for branch in [
             "some/other-branch",
-            "agent/dispatch-issue-1181-v2",
             "agent/dispatch-issue-1109-1121",
+            "agent/dispatch-issue-1562-1563",
             "agent/dispatch-issue-1",
+            "agent/dispatch-issue-1-some-slug",
         ] {
             let err = select_probe(ProbeArg::Auto, branch, Direction::Reverse)
                 .expect_err("no silent fallback to generic");
@@ -2015,6 +2458,147 @@ mod tests {
         let err = select_probe(ProbeArg::LogEscaping, "x", Direction::Forward)
             .expect_err("a forward run carries no probe");
         assert!(err.contains("reverse direction only"), "{err}");
+    }
+
+    /// Issue #1562: the longest branch the dispatch verb can create. Its
+    /// worktree is the sibling directory `<repo>-dispatch-<name>`, one path
+    /// component, so `<name>` is bounded only by `NAME_MAX` (255 bytes) less
+    /// `dot-agent-deck-dispatch-`.
+    fn maximal_dispatch_branch() -> String {
+        let name_max = 255 - "dot-agent-deck-dispatch-".len();
+        let mut name = "issue-1540-shared-last-command".to_string();
+        while name.len() < name_max {
+            name.push_str("-x");
+        }
+        name.truncate(name_max);
+        format!("agent/dispatch-{name}")
+    }
+
+    /// Issue #1562: with the default `--runs-root`, the sandbox's socket paths
+    /// fit `sun_path` whatever the branch is called. Three dispatched units each
+    /// lost a full build to a long `agent/dispatch-issue-<n>-<slug>` overflowing
+    /// it. `/home/vfarcic/code` is the repository parent those runs had.
+    #[test]
+    fn the_default_runs_root_fits_sun_path_for_any_dispatch_branch_name() {
+        let runs_root = default_runs_root(Path::new("/home/vfarcic/code"));
+        for branch in [
+            "agent/dispatch-issue-1540-shared-last-command".to_string(),
+            maximal_dispatch_branch(),
+        ] {
+            for direction in [Direction::Forward, Direction::Reverse] {
+                let name = sandbox_name(&branch, direction, 9_999_999_999);
+                for mode in [EndpointMode::SandboxSockets, EndpointMode::Resolved] {
+                    for keep_xdg in [true, false] {
+                        assert_eq!(
+                            check_sandbox_socket_paths(&runs_root, &name, mode, keep_xdg, 1000),
+                            Ok(()),
+                            "{branch} ({direction:?}, {mode:?}, keep_xdg {keep_xdg})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The control for the test above: the bound is the sandbox NAME's, and a
+    /// runs root too long for even that is still refused — by the check the
+    /// preflight runs before anything is downloaded or built — naming the
+    /// option to pass.
+    #[test]
+    fn the_sandbox_name_is_bounded_and_a_runs_root_too_long_for_it_is_refused() {
+        let long = maximal_dispatch_branch();
+        let a = sandbox_name(&long, Direction::Reverse, 9_999_999_999);
+        assert!(a.len() <= 40, "{a} is {} bytes", a.len());
+        assert!(a.starts_with("issue-1540-share-"), "readable label: {a}");
+        assert_ne!(
+            a,
+            sandbox_name(&format!("{long}y"), Direction::Reverse, 9_999_999_999),
+            "branches alike in their first bytes get different sandboxes"
+        );
+        assert_ne!(
+            sandbox_name("main", Direction::Forward, 1),
+            sandbox_name("main", Direction::Reverse, 1)
+        );
+        assert!(sandbox_name("weird/", Direction::Forward, 1).starts_with("weird-"));
+        let too_long = PathBuf::from(format!("/{}", "r".repeat(80)));
+        let err = check_sandbox_socket_paths(
+            &too_long,
+            &sandbox_name("main", Direction::Forward, 1),
+            EndpointMode::SandboxSockets,
+            true,
+            1000,
+        )
+        .expect_err("a runs root this long cannot hold the sandbox's sockets");
+        assert!(err.contains("--runs-root"), "{err}");
+    }
+
+    /// Greptile on PR #1570: a sandbox name already taken under the runs root
+    /// — the same branch and direction in the same second — moves to the next
+    /// free second instead of failing [`Sandbox::create`] after the build.
+    #[test]
+    fn a_taken_sandbox_name_moves_to_the_next_free_second() {
+        let root = std::env::temp_dir().join(format!("xver-free-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let branch = "agent/dispatch-issue-1540-shared-last-command";
+        let first = sandbox_name(branch, Direction::Forward, 100);
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Forward, 100),
+            first
+        );
+        std::fs::create_dir(root.join(&first)).unwrap();
+        std::fs::create_dir(root.join(sandbox_name(branch, Direction::Forward, 101))).unwrap();
+        let got = free_sandbox_name(&root, branch, Direction::Forward, 100);
+        assert_eq!(got, sandbox_name(branch, Direction::Forward, 102));
+        assert_eq!(got.len(), first.len(), "the length the preflight checked");
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Reverse, 100),
+            sandbox_name(branch, Direction::Reverse, 100),
+            "the other direction's name is its own"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #1562's other two branch-derived names: the evidence file and an
+    /// opted-in target dir are each ONE path component, so a maximal dispatch
+    /// branch overflowed `NAME_MAX` with both — the evidence file only once the
+    /// whole run was over. A name that fits is left exactly as it was.
+    #[test]
+    fn branch_derived_file_names_fit_name_max_for_any_dispatch_branch_name() {
+        let branch = maximal_dispatch_branch();
+        let root = Path::new("/repo");
+        for d in [Direction::Forward, Direction::Reverse] {
+            let path = evidence_path(None, root, &branch_slug(&branch), d);
+            let name = path.file_name().expect("a file name").len();
+            assert!(name <= 255, "{d:?}: evidence file name is {name} bytes");
+            assert_eq!(
+                path.parent(),
+                Some(Path::new("/repo/.dot-agent-deck/xver-evidence"))
+            );
+        }
+        assert_ne!(
+            evidence_path(None, root, &branch_slug(&branch), Direction::Forward),
+            evidence_path(
+                None,
+                root,
+                &branch_slug(&format!("{branch}y")),
+                Direction::Forward
+            ),
+            "two long branches that share a prefix keep separate evidence files"
+        );
+        let base = Path::new("/home/vfarcic/code/dot-agent-deck-xver-target");
+        let dir = Domain::OptedIn.dir(base, "vfarcic/dot-agent-deck", &branch);
+        let name = dir.file_name().expect("a dir name").len();
+        assert!(name <= 255, "opted-in target dir name is {name} bytes");
+        assert_eq!(dir.parent(), base.parent());
+        assert_eq!(
+            Domain::OptedIn.dir(base, "o/r", "feature/x"),
+            PathBuf::from(format!(
+                "/home/vfarcic/code/dot-agent-deck-xver-target-opted-in-feature-x-{:016x}",
+                fnv1a64(b"o/r\0feature/x")
+            )),
+            "a short branch's target dir is named exactly as before"
+        );
     }
 
     #[test]
@@ -2129,7 +2713,7 @@ mod tests {
     }
 }
 
-/// The outer half's verdict glue: `run_passed`, `record_outer_abort` and the
+/// The outer half's verdict glue: `run_outcome`, `record_outer_abort` and the
 /// postcondition judging decide the exit status and whether the run was clean,
 /// so they are covered here rather than trusted.
 #[cfg(test)]
@@ -2170,9 +2754,40 @@ mod verdict_tests {
     fn only_a_pass_with_the_outer_half_complete_and_every_postcondition_met_is_clean() {
         let v = with_tells(&[Verdict::Pass; 4]).verdict();
         assert_eq!(v, RunVerdict::Pass);
-        assert!(run_passed(&v, true, true));
-        assert!(!run_passed(&v, false, true), "the outer half aborted");
-        assert!(!run_passed(&v, true, false), "a postcondition did not hold");
+        assert_eq!(run_outcome(&v, true, true), Outcome::Pass);
+        assert_eq!(
+            run_outcome(&v, false, true),
+            Outcome::NotPass,
+            "the outer half aborted"
+        );
+        assert_eq!(
+            run_outcome(&v, true, false),
+            Outcome::NotPass,
+            "a postcondition did not hold"
+        );
+    }
+
+    /// Issue #1530: four passing tells measured on a binary that is not a
+    /// build of the fetched HEAD are not a pass for that HEAD.
+    #[test]
+    fn a_binary_built_from_another_commit_voids_even_four_passing_tells() {
+        let head = "e2bbb2050f00ba5eba11c0ffee00000000000000";
+        let hello = r#"{"ok":true,"server_version":10,"build_version":"0.41.0-g3715d563"}"#;
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        let (row, mismatch) = built_commit_check(head, hello);
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
+        let v = ev.verdict();
+        assert!(
+            matches!(v, RunVerdict::Incomplete(ref why) if why.contains("3715d563") && why.contains(head)),
+            "{v:?}"
+        );
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
+        let md = ev.render();
+        assert!(
+            md.contains("| commit built | **`3715d563` — NOT the branch HEAD"),
+            "{md}"
+        );
     }
 
     #[test]
@@ -2184,14 +2799,14 @@ mod verdict_tests {
             matches!(v, RunVerdict::Incomplete(ref why) if why.contains("host endpoint changed")),
             "{v:?}"
         );
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
     fn any_failing_tell_is_a_fail_even_beside_an_unmeasured_one() {
         let v = with_tells(&[Verdict::Pass, Verdict::NotChecked, Verdict::Fail]).verdict();
         assert_eq!(v, RunVerdict::Fail);
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2204,7 +2819,7 @@ mod verdict_tests {
         ])
         .verdict();
         assert!(matches!(v, RunVerdict::Incomplete(_)), "{v:?}");
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2219,7 +2834,7 @@ mod verdict_tests {
         ev.discovery = Some("the old TUI lazy-spawned its own daemon".into());
         let v = ev.verdict();
         assert!(matches!(v, RunVerdict::OldClientCannotDiscover(_)), "{v:?}");
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2229,7 +2844,7 @@ mod verdict_tests {
         assert_eq!(ev.verdict(), RunVerdict::Fail);
         assert_eq!(ev.tells.len(), 1);
         assert_eq!(ev.tells[0].id, "aborted");
-        assert!(!run_passed(&ev.verdict(), false, true));
+        assert_eq!(run_outcome(&ev.verdict(), false, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2243,9 +2858,33 @@ mod verdict_tests {
         );
         let v = ev.verdict();
         assert_eq!(v, RunVerdict::Pass);
-        assert!(
-            !run_passed(&v, false, true),
+        assert_eq!(
+            run_outcome(&v, false, true),
+            Outcome::NotPass,
             "the abort alone keeps it from being a clean pass"
+        );
+    }
+
+    /// Issue #1596: a declared break is its own outcome, with its own exit
+    /// status — clean only under the same conditions a pass is, and the worse
+    /// of the two when `both` reports one direction of each.
+    #[test]
+    fn a_declared_break_is_its_own_outcome_and_only_when_clean() {
+        let v = RunVerdict::DeclaredBreak("tell-4 (status half)".into());
+        assert_eq!(run_outcome(&v, true, true), Outcome::DeclaredBreak);
+        assert_eq!(run_outcome(&v, false, true), Outcome::NotPass);
+        assert_eq!(run_outcome(&v, true, false), Outcome::NotPass);
+        assert_eq!(
+            Outcome::Pass.max(Outcome::DeclaredBreak),
+            Outcome::DeclaredBreak
+        );
+        assert_eq!(
+            Outcome::DeclaredBreak.max(Outcome::NotPass),
+            Outcome::NotPass
+        );
+        assert_eq!(
+            DECLARED_BREAK_EXIT, 3,
+            "0 is a pass, 1 a failure, and ci.yml reads 3"
         );
     }
 
@@ -2323,7 +2962,11 @@ mod verdict_tests {
                 "{name}: {:?}",
                 ev.verdict()
             );
-            assert!(!run_passed(&ev.verdict(), true, clean), "{name}");
+            assert_eq!(
+                run_outcome(&ev.verdict(), true, clean),
+                Outcome::NotPass,
+                "{name}"
+            );
             assert!(
                 ev.postconditions
                     .iter()
@@ -2467,6 +3110,50 @@ mod skip_build_tests {
         assert!(note.contains("build of the commit under test"), "{note}");
     }
 
+    /// Issue #1530: a run that built the branch records the commit its binary
+    /// was built from, and only the fetched HEAD itself, clean, is no mismatch.
+    #[test]
+    fn a_built_run_records_the_commit_built_and_flags_anything_but_the_fetched_head() {
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205"));
+        assert!(
+            row.contains("`e2bbb205`, the branch HEAD it fetched"),
+            "{row}"
+        );
+        assert_eq!(mismatch, None);
+
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-g3715d563"));
+        assert!(row.contains("NOT the branch HEAD"), "{row}");
+        let why = mismatch.expect("another commit is a mismatch");
+        assert!(why.contains("3715d563") && why.contains(HEAD), "{why}");
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205-dirty"));
+        assert!(mismatch.expect("dirty").contains("uncommitted changes"));
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-unknown"));
+        assert!(mismatch.expect("no commit").contains("cannot confirm"));
+
+        let (row, mismatch) = built_commit_check(HEAD, "");
+        assert!(row.contains("never ran"), "{row}");
+        assert_eq!(mismatch, None, "a run with no hello already cannot pass");
+    }
+
+    /// Issue #1530: the clone is re-read after the build, and a HEAD that moved
+    /// while Cargo read it — the reported interleaving — refuses the run.
+    #[test]
+    fn a_clone_that_moved_during_the_build_is_caught() {
+        assert_eq!(clone_moved(HEAD, &format!("{HEAD}\n"), ""), None);
+        let moved = clone_moved(HEAD, "3715d563aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "")
+            .expect("another HEAD is caught");
+        assert!(moved.contains("moved during the build"), "{moved}");
+        assert!(
+            moved.contains("3715d563") && moved.contains(HEAD),
+            "{moved}"
+        );
+        assert!(moved.contains("--source-clone"), "{moved}");
+        let edited = clone_moved(HEAD, HEAD, " M src/main.rs\n").expect("an edit is caught");
+        assert!(edited.contains("tracked modifications"), "{edited}");
+    }
+
     #[test]
     fn a_missing_hello_says_the_commit_is_not_knowable() {
         for raw in ["", "not json", r#"{"ok":true}"#] {
@@ -2562,5 +3249,152 @@ mod domain_tests {
         for d in [absent, empty, legacy] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+}
+
+/// A relative path option lands where it names (issue #1453).
+#[cfg(test)]
+mod path_anchor_tests {
+    use super::*;
+
+    /// Set in the re-exec'd child: the `file://` URL of the bare repository it
+    /// clones from. Its absence makes [`a_relative_source_clone_child`] a no-op.
+    const CHILD: &str = "XVER_TEST_1453_CHILD";
+    const CHILD_TEST: &str = "outer::path_anchor_tests::a_relative_source_clone_child";
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xver-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        std::fs::canonicalize(&d).expect("canonicalize scratch dir")
+    }
+
+    #[test]
+    fn every_relative_path_option_is_anchored_to_the_invoking_directory() {
+        let opts = Opts::parse_from([
+            "xver",
+            "--branch",
+            "b",
+            "--old-binary",
+            "old/dot-agent-deck",
+            "--source-clone",
+            "../src",
+            "--target-dir",
+            "t",
+            "--cargo-cache",
+            "./c",
+            "--runs-root",
+            "../../runs",
+            "--releases-dir",
+            "/abs/releases",
+            "--evidence",
+            "e.md",
+        ])
+        .anchored_at(Path::new("/w/repo"));
+        assert_eq!(
+            opts.old_binary.as_deref(),
+            Some(Path::new("/w/repo/old/dot-agent-deck"))
+        );
+        assert_eq!(
+            opts.source_clone.as_deref(),
+            Some(Path::new("/w/repo/../src"))
+        );
+        assert_eq!(opts.target_dir.as_deref(), Some(Path::new("/w/repo/t")));
+        assert_eq!(opts.cargo_cache.as_deref(), Some(Path::new("/w/repo/./c")));
+        assert_eq!(
+            opts.runs_root.as_deref(),
+            Some(Path::new("/w/repo/../../runs"))
+        );
+        assert_eq!(
+            opts.releases_dir.as_deref(),
+            Some(Path::new("/abs/releases")),
+            "an absolute path is kept exactly as given"
+        );
+        assert_eq!(opts.evidence.as_deref(), Some(Path::new("/w/repo/e.md")));
+
+        let defaults = Opts::parse_from(["xver", "--branch", "b"]).anchored_at(Path::new("/w"));
+        assert_eq!(
+            defaults.source_clone, None,
+            "an omitted path stays omitted, so `run_one` still picks its default"
+        );
+    }
+
+    #[test]
+    fn a_relative_clone_path_is_refused_rather_than_resolved_from_the_parent() {
+        let e = create_clone("file:///nonexistent", Path::new("../x")).unwrap_err();
+        assert!(e.contains("is relative") && e.contains("#1453"), "{e}");
+    }
+
+    /// The bug as the operator met it: the process's own working directory is
+    /// `<root>/a/b`, `--source-clone ../x` is given, and the clone must land at
+    /// `<root>/a/x`, not at `<root>/x` one directory higher. Only a process
+    /// started in that directory reproduces it, so this re-execs the test
+    /// binary there rather than changing the working directory of a process
+    /// other tests share.
+    #[test]
+    fn a_relative_source_clone_lands_where_it_names() {
+        let root = scratch_dir("source-clone-1453");
+        let invoked_from = root.join("a").join("b");
+        std::fs::create_dir_all(&invoked_from).expect("invoking dir");
+        let origin = root.join("origin.git");
+        must_run(
+            git(&root)
+                .args(["init", "--quiet", "--bare"])
+                .arg(&origin)
+                .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+            "git init --bare",
+        )
+        .expect("a bare origin");
+
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let out = Command::new(&exe)
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .current_dir(&invoked_from)
+            .env(CHILD, format!("file://{}", origin.display()))
+            .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child clone failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have run exactly {CHILD_TEST}; zero matches exit 0 too\n{stdout}"
+        );
+        assert!(
+            root.join("a").join("x").join(".git").is_dir(),
+            "`../x` from {} must create {}",
+            invoked_from.display(),
+            root.join("a").join("x").display()
+        );
+        assert!(
+            !root.join("x").exists(),
+            "the clone landed one directory too high, at {} (issue #1453)",
+            root.join("x").display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The child half of [`a_relative_source_clone_lands_where_it_names`]: the
+    /// command's own path for `--source-clone ../x`, from this process's
+    /// working directory — `main`'s [`parse_invocation`], `run_one`'s
+    /// [`Opts::clone_path`], and the [`create_clone`] that `new_binary` calls
+    /// for a clone that does not exist yet. The rest of `new_binary` fetches
+    /// from GitHub and builds, so it is not run here; the live `cargo xver`
+    /// run in PR #1498 covered it.
+    #[test]
+    fn a_relative_source_clone_child() {
+        let Ok(url) = std::env::var(CHILD) else {
+            return;
+        };
+        let opts = parse_invocation(["xver", "--branch", "b", "--source-clone", "../x"])
+            .expect("parse the invocation");
+        let clone = opts.clone_path(Path::new("/never/the/default"));
+        create_clone(&url, &clone).expect("git clone");
     }
 }

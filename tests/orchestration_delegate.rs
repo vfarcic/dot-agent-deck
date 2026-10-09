@@ -106,9 +106,9 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "pi-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
 
     // The Pi orchestrator is the ONLY valid delegate source; the coder worker
@@ -178,9 +178,9 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "pi-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
 
     // The Pi agent is a WORKER — registered in the role map but deliberately

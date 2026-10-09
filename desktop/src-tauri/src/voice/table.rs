@@ -109,6 +109,38 @@ impl fmt::Display for Screen {
 /// than a matter of care: every value of this kind goes through
 /// [`super::dictation::strip_opening`], which either finds the marked words at
 /// the front of our own transcript or refuses.
+///
+/// [`ParamKind::FilterText`] resolves against the transcript too, from the
+/// other side (PR #1451 round 3, change 5): the text for the New agent dialog's
+/// directory Filter box. "show only those starting with letter D" means `d`,
+/// and no boundary in that sentence has `d` alone after it, so here the model
+/// DOES supply the value — and [`super::filter::grounded_filter_text`] holds it
+/// to the user's words before anything reaches the box: its words must occur in
+/// the transcript, adjacent and in order, or a single letter must be spelled
+/// after the word "letter". A value the user did not say is refused, never
+/// applied. That is acceptable here where it is not for dictation because the
+/// value goes into a visible filter box, changes only which directories are
+/// listed, and is quoted back in the report.
+///
+/// [`ParamKind::CommandText`] is the third kind held to the transcript (PR
+/// #1451 round 4, decision D8): the New agent dialog's Command field. The
+/// model locates the command in the sentence — "Set the command to devbox run
+/// agent." is `devbox run agent` — and
+/// [`super::command_text::grounded_command_text`] accepts it only when it
+/// occurs in the transcript as written, on word boundaries, and returns the
+/// TRANSCRIPT's slice of it: a command the model added a flag to or
+/// corrected is not there, so it is refused. Only surrounding quotes and a
+/// sentence's trailing full stop are dropped. Unlike filter text it is not
+/// lowercased, because a command line is case-sensitive.
+///
+/// [`ParamKind::AgentKind`] and [`ParamKind::AgentStatus`] are the agent
+/// dashboard filter's two closed sets (issue #1496): what kind of agent a row
+/// is (an orchestration role, a single agent, or one of the dispatcher,
+/// schedule and schedule: issues modes) and what it is doing (working,
+/// thinking, waiting for input, idle, blocked, error). They are this app's own
+/// vocabulary rather than names it observed, so they resolve against a fixed
+/// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
+/// form's resolves against the agent types the deck knows the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -119,10 +151,14 @@ pub enum ParamKind {
     AgentTypeRef,
     OrchestrationRef,
     SpokenPrefix,
+    FilterText,
+    CommandText,
+    AgentKind,
+    AgentStatus,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 7] = [
+    pub const ALL: [ParamKind; 11] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -130,6 +166,10 @@ impl ParamKind {
         ParamKind::AgentTypeRef,
         ParamKind::OrchestrationRef,
         ParamKind::SpokenPrefix,
+        ParamKind::FilterText,
+        ParamKind::CommandText,
+        ParamKind::AgentKind,
+        ParamKind::AgentStatus,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -141,6 +181,10 @@ impl ParamKind {
             ParamKind::AgentTypeRef => "agent_type_ref",
             ParamKind::OrchestrationRef => "orchestration_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
+            ParamKind::FilterText => "filter_text",
+            ParamKind::CommandText => "command_text",
+            ParamKind::AgentKind => "agent_kind",
+            ParamKind::AgentStatus => "agent_status",
         }
     }
 
@@ -167,7 +211,10 @@ impl ParamKind {
             | ParamKind::OrchestrationRef => true,
             // The user's own words, verified against the transcript; nothing
             // observed is involved.
-            ParamKind::SpokenPrefix => false,
+            ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
+            // This app's own closed vocabulary (issue #1496), the same on
+            // every deck: nothing observed is involved.
+            ParamKind::AgentKind | ParamKind::AgentStatus => false,
         }
     }
 }
@@ -415,9 +462,10 @@ pub struct CommandRow {
     /// The row that answers the same words where this one cannot run — the
     /// `unavailable_redirects` column (PRD #1223, D3; named `unavailable_opens`
     /// while its only use opened something). A pick of this row that is not
-    /// callable dispatches that row instead, with no params, when it is
-    /// callable and grounded by the same words. Two rows use it, and they are
-    /// each other's targets across the New agent dialog's one boundary:
+    /// callable dispatches that row instead when it is callable and grounded by
+    /// the same words — with no params, or, for a target that requires one,
+    /// with the pick's own. Three rows use it, across the New agent dialog's
+    /// one boundary:
     ///
     /// - `start_new_agent` → `open_new_agent`: a bare "start it" with the
     ///   dialog closed was answered with the start row in every measured run,
@@ -429,11 +477,17 @@ pub struct CommandRow {
     ///   through its OWN grounding — a start word in the transcript — which is
     ///   what lets it start without a confirmation at all, so the redirect adds
     ///   no path to a start that saying "start it" did not already have.
+    /// - `switch_deck` → `choose_deck` (#1260): with the dialog open, "use the
+    ///   build box deck" was answered with the app's Daemon selector, which the
+    ///   dialog blocks, in 13 of 15 measured runs. The dialog's own Daemon
+    ///   field takes the same `deck` and answers the same words, so the pick is
+    ///   resolved as that row's — against the decks a new agent can start on.
     ///
-    /// The two can never chain: each redirects only where its target is
-    /// callable, and their requirements are exact complements. The parser holds
-    /// the target to existing, being another row, and taking no required param
-    /// ([`TableError::UnknownUnavailableRedirect`]).
+    /// None can chain: each redirects only where its target is callable, the
+    /// first two's requirements are exact complements, and `choose_deck`
+    /// redirects nowhere. The parser holds the target to existing, being
+    /// another row, and taking no required param or exactly the redirecting
+    /// row's params by name and kind ([`TableError::UnknownUnavailableRedirect`]).
     pub unavailable_redirects: Option<String>,
 }
 
@@ -490,8 +544,9 @@ pub enum ActionGrounding {
     /// merely occurs in it (PRD #1223, closing audit G1). Drawn from the row's own
     /// words under the same rule as [`ActionGrounding::HeardAs`].
     ///
-    /// **For a row whose action cannot be taken back**, and today that is
-    /// exactly `submit_prompt`. Token presence is evidence that the user
+    /// **First, for a row whose action cannot be taken back** — `submit_prompt`
+    /// was the first; every row using it, and why, is pinned by
+    /// `voice_table_whole_utterance_rows_are_the_deliberate_set`. Token presence is evidence that the user
     /// talked ABOUT a thing, and for most rows that is enough: a wrong
     /// navigation is one more utterance to undo. A prompt submitted to an
     /// agent cannot be recalled once the agent has it, and this row's
@@ -881,9 +936,33 @@ impl CommandTable {
             let Some(target) = row.unavailable_redirects.as_deref() else {
                 continue;
             };
+            // Dispatched with no params, or — when it requires one — with the
+            // pick's own, so it must take none, or exactly the same (names,
+            // kinds AND optionality: an optional param handed to a target that
+            // requires it may be absent), or only optional ones when the pick
+            // requires none either. A target with optional params is
+            // dispatched only when the pick carries no value, which a pick
+            // with a required param always does — and one declaring the pick's
+            // required param as optional is a mismatch the author should see.
+            let same_params = |candidate: &CommandRow| {
+                let shape = |row: &CommandRow| {
+                    let mut shape: Vec<(String, ParamKind, bool)> = row
+                        .params
+                        .iter()
+                        .map(|param| (param.name.clone(), param.kind, param.optional))
+                        .collect();
+                    shape.sort_by(|a, b| a.0.cmp(&b.0));
+                    shape
+                };
+                shape(candidate) == shape(row)
+            };
+            let none_required = |row: &CommandRow| row.params.iter().all(|param| param.optional);
             let valid = target != row.id
                 && commands.iter().any(|candidate| {
-                    candidate.id == target && candidate.params.iter().all(|param| param.optional)
+                    candidate.id == target
+                        && (candidate.params.is_empty()
+                            || (none_required(candidate) && none_required(row))
+                            || same_params(candidate))
                 });
             if !valid {
                 return Err(TableError::UnknownUnavailableRedirect {
@@ -1055,8 +1134,10 @@ pub enum TableError {
     /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
     /// or that also declares `heard_as_whole_while`.
     MisplacedGroundingAlso { id: String },
-    /// An `unavailable_redirects` naming no row, the row itself, or a row with a
-    /// required param — none of which a redirect with no params can dispatch.
+    /// An `unavailable_redirects` naming no row, the row itself, or a row
+    /// with params that differ from the redirecting row's (name, kind or
+    /// optionality) when either of the two requires one — none of which a
+    /// redirect can dispatch with no params or with the pick's own.
     UnknownUnavailableRedirect { id: String, target: String },
 }
 
@@ -1176,7 +1257,7 @@ impl fmt::Display for TableError {
             ),
             TableError::UnknownUnavailableRedirect { id, target } => write!(
                 f,
-                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row that takes no required param"
+                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row taking no params, exactly its own (the same names, kinds and optionality), or — when neither requires one — only optional ones"
             ),
         }
     }
@@ -1275,6 +1356,14 @@ mod tests {
             vec![
                 ("open_agent", "openAgent", vec!["deck", "overview"]),
                 ("open_overview", "openOverview", vec!["deck", "overview"]),
+                (
+                    "filter_dashboard",
+                    "filterDashboard",
+                    vec!["deck", "overview"]
+                ),
+                // No screens: clearing the filter shows the whole dashboard
+                // from wherever it is said (issue #1496).
+                ("clear_dashboard_filter", "clearDashboardFilter", vec![]),
                 ("open_deck", "openDeck", vec!["deck", "overview"]),
                 // No screens: callable everywhere. `close` is here because the
                 // voice surface's own overlay can be up on any of the three and
@@ -1291,7 +1380,14 @@ mod tests {
                 // targeting rule is "the pane the user is looking at", so with
                 // no pane open there is no one agent to mean.
                 ("dictate_to_agent", "dictateToAgent", vec!["agent"]),
+                ("dictation_on", "startDictation", vec!["agent"]),
+                ("dictation_off", "stopDictation", vec!["agent"]),
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
+                // PRD #1541's typing-mode prompt commands, dispatched only by
+                // the dictation mode's local intercept.
+                ("interrupt_agent", "interruptAgent", vec!["agent"]),
+                ("clear_prompt", "clearAgentPrompt", vec!["agent"]),
+                ("scratch_that", "scratchLastDictation", vec!["agent"]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
                 // The directory browser inside that dialog — `overview`, plus
@@ -1299,11 +1395,34 @@ mod tests {
                 ("open_dir", "openDirectory", vec!["overview"]),
                 ("go_to_parent", "goToParentDirectory", vec!["overview"]),
                 ("use_this_directory", "useThisDirectory", vec!["overview"]),
+                // The browser's Filter box (PR #1451 round 3, change 5).
+                ("filter_directories", "filterDirectories", vec!["overview"]),
+                (
+                    "clear_directory_filter",
+                    "clearDirectoryFilter",
+                    vec!["overview"]
+                ),
+                // Turning the page of a list shown a page at a time while
+                // voice is on (PR #1451 round 3, change 4).
+                ("next_page", "nextPage", vec!["deck", "overview"]),
+                ("previous_page", "previousPage", vec!["deck", "overview"]),
+                // Scrolling the agent dashboard, which no longer pages (issue
+                // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
+                ("scroll_down", "scrollDown", vec!["overview"]),
+                ("scroll_up", "scrollUp", vec!["overview"]),
+                ("scroll_to_top", "scrollToTop", vec!["overview"]),
+                ("scroll_to_bottom", "scrollToBottom", vec!["overview"]),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
                 ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
                 ("name_new_agent", "nameNewAgent", vec!["overview"]),
+                // The Command field (PR #1451 round 4, decision D8).
+                (
+                    "set_new_agent_command",
+                    "setNewAgentCommand",
+                    vec!["overview"]
+                ),
                 // The deck field once the dialog is open (#1263) — `overview`,
                 // plus `requires = ["new_agent_dialog"]`.
                 ("choose_deck", "chooseNewAgentDeck", vec!["overview"]),
@@ -1615,7 +1734,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains(
-                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`"
+                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`, `filter_text`, `command_text`"
             ),
             "{message}"
         );
@@ -1882,8 +2001,24 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         // `discard_new_agent` (#1247) for `submit_prompt`'s reason: it cannot
-        // be taken back, and "discard" is an ordinary word.
-        assert_eq!(whole, vec!["submit_prompt", "discard_new_agent"]);
+        // be taken back, and "discard" is an ordinary word. The dictation
+        // mode's pair (PRD #1260) because a switch changes how every later
+        // utterance is treated, so it must not ground on words said in passing.
+        // PRD #1541's three prompt commands because their whole-utterance
+        // vocabulary is exactly what the agent screen answers locally outside
+        // typing mode, which is what keeps the model from ever dispatching them.
+        assert_eq!(
+            whole,
+            vec![
+                "dictation_on",
+                "dictation_off",
+                "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
+                "discard_new_agent"
+            ]
+        );
     }
 
     /// The rows whose grounding changes with a declared context (PRD #1223,
@@ -2230,7 +2365,15 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(everywhere, vec!["close", "voice_off", "list_commands"]);
+        assert_eq!(
+            everywhere,
+            vec![
+                "clear_dashboard_filter",
+                "close",
+                "voice_off",
+                "list_commands"
+            ]
+        );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -2295,12 +2438,16 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
                 "switch_deck",
                 "voice_off",
-                "list_commands"
+                "list_commands",
+                "next_page",
+                "previous_page"
             ]
         );
         assert_eq!(
@@ -2308,6 +2455,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -2315,6 +2464,13 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "open_new_agent",
+                "next_page",
+                "previous_page",
+                // Scrolling the dashboard (issue #1492): met by no dialog declared.
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2324,13 +2480,118 @@ mod tests {
         assert_eq!(
             callable(Screen::Agent),
             vec![
+                "clear_dashboard_filter",
                 "close",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
-                "submit_prompt"
+                "dictation_on",
+                "dictation_off",
+                "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that"
             ]
         );
+    }
+
+    /// Scenario: load the shipped dashboard filter rows. Their prompts explain
+    /// filtering a set versus opening one pane, and clearing is available from
+    /// every screen so returning to the whole dashboard is always one step.
+    #[test]
+    fn voice_table_dashboard_filter_rows_describe_the_navigation_split() {
+        let table = super::table();
+        let filter = table
+            .row("filter_dashboard")
+            .expect("missing filter_dashboard voice command");
+        let clear = table
+            .row("clear_dashboard_filter")
+            .expect("missing clear_dashboard_filter voice command");
+        assert_eq!(filter.invoke, "filterDashboard");
+        assert_eq!(clear.invoke, "clearDashboardFilter");
+        for row in [filter, clear] {
+            assert!(
+                row.description.to_lowercase().contains("filter"),
+                "{}: {}",
+                row.id,
+                row.description
+            );
+            assert!(
+                matches!(&row.grounding, ActionGrounding::HeardAs(words) if !words.is_empty()),
+                "{} needs grounded spoken vocabulary",
+                row.id
+            );
+        }
+        for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
+            assert!(
+                clear.callable(screen, None, None),
+                "clear the filter must work on {screen:?}"
+            );
+        }
+        assert!(filter.callable(Screen::Overview, None, None));
+        assert!(
+            filter.description.contains("open_agent"),
+            "explain the distinction from one-agent navigation"
+        );
+        let overview = table.row("open_overview").expect("overview row");
+        assert!(
+            overview.description.contains("clear_dashboard_filter"),
+            "explain which row owns show everything now"
+        );
+    }
+
+    /// Scenario: each mode switch is an agent-pane-only command whose phrases
+    /// ground the whole utterance. A word mentioned inside a prompt cannot
+    /// switch the mode through the Commands path.
+    #[test]
+    fn voice_table_dictation_switch_rows_are_agent_only_and_whole_utterance_grounded() {
+        let table = super::table();
+        for (id, invoke, phrases) in [
+            (
+                "dictation_on",
+                "startDictation",
+                [
+                    "type on",
+                    "typing on",
+                    "start typing",
+                    "dictation on",
+                    "start dictation",
+                    "keep typing",
+                    "talking on",
+                    "start talking",
+                    "speaking on",
+                    "start speaking",
+                    "dictate on",
+                ],
+            ),
+            (
+                "dictation_off",
+                "stopDictation",
+                [
+                    "type off",
+                    "typing off",
+                    "stop typing",
+                    "dictation off",
+                    "stop dictation",
+                    "done typing",
+                    "talking off",
+                    "stop talking",
+                    "speaking off",
+                    "stop speaking",
+                    "dictate off",
+                ],
+            ),
+        ] {
+            let row = table.row(id).unwrap_or_else(|| panic!("missing {id} row"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Agent], "{id}");
+            assert!(row.params.is_empty(), "{id} takes no params");
+            assert_eq!(
+                row.grounding,
+                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -2357,6 +2618,19 @@ mod tests {
         assert_eq!(
             ParamKind::parse("agent_type_ref"),
             Some(ParamKind::AgentTypeRef)
+        );
+        assert_eq!(ParamKind::parse("filter_text"), Some(ParamKind::FilterText));
+        assert!(
+            !ParamKind::FilterText.names_something_observed(),
+            "filter text is the user's own words, not an observed name"
+        );
+        assert_eq!(
+            ParamKind::parse("command_text"),
+            Some(ParamKind::CommandText)
+        );
+        assert!(
+            !ParamKind::CommandText.names_something_observed(),
+            "a command is the user's own words, not an observed name"
         );
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
@@ -2415,6 +2689,7 @@ mod tests {
             path: "/home/dev".to_string(),
             has_parent,
             entries: Vec::new(),
+            paging: None,
         }
     }
 
@@ -2457,6 +2732,33 @@ mod tests {
         assert!(confirm.params.is_empty());
         assert_eq!(confirm.report, "Using this directory.");
 
+        // PR #1451 round 3, change 5: the Filter box, set to text the model
+        // takes from the user's words and the app holds against them.
+        let filter = table
+            .row("filter_directories")
+            .expect("filter_directories is in the table");
+        assert_eq!(filter.invoke, "filterDirectories");
+        assert_eq!(filter.screens, vec![Screen::Overview]);
+        assert_eq!(filter.requires, vec![Requirement::DirectoryListing]);
+        assert_eq!(
+            filter.params,
+            vec![ParamSpec {
+                name: "text".to_string(),
+                kind: ParamKind::FilterText,
+                optional: false,
+            }]
+        );
+        assert_eq!(filter.report, "Filtering by \u{201c}{text}\u{201d}.");
+
+        let clear = table
+            .row("clear_directory_filter")
+            .expect("clear_directory_filter is in the table");
+        assert_eq!(clear.invoke, "clearDirectoryFilter");
+        assert_eq!(clear.screens, vec![Screen::Overview]);
+        assert_eq!(clear.requires, vec![Requirement::DirectoryListing]);
+        assert!(clear.params.is_empty());
+        assert_eq!(clear.report, "Filter cleared.");
+
         // The directory rows require the browser, and nothing else in the
         // table does.
         let needs_browser: Vec<&str> = table
@@ -2474,7 +2776,13 @@ mod tests {
             .collect();
         assert_eq!(
             needs_browser,
-            vec!["open_dir", "go_to_parent", "use_this_directory"]
+            vec![
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
+            ]
         );
     }
 
@@ -2486,13 +2794,15 @@ mod tests {
                 modes: Vec::new(),
                 agent_types: Vec::new(),
                 withheld_modes: Vec::new(),
+                mode_paging: None,
             }),
         }
     }
 
-    /// PRD #1223: the three fill rows pinned by value. Command has no row of
-    /// its own — `voice_table_no_row_dictates_the_command` says so as a
-    /// property.
+    /// PRD #1223: the fill rows pinned by value — Mode, the agent and Name,
+    /// and since PR #1451 round 4 (decision D8) Command, whose value is the
+    /// user's own words held to the transcript
+    /// (`voice_table_the_command_row_takes_only_the_users_words`).
     #[test]
     fn voice_table_form_rows_are_pinned_by_value() {
         let table = super::table();
@@ -2535,6 +2845,13 @@ mod tests {
             ParamKind::SpokenPrefix,
             "Name set.",
         );
+        pinned(
+            "set_new_agent_command",
+            "setNewAgentCommand",
+            "command",
+            ParamKind::parse("command_text").expect("the command_text kind exists"),
+            "Command: \u{201c}{command}\u{201d}.",
+        );
     }
 
     /// The form rows run only while the form is live, and only on the
@@ -2545,7 +2862,12 @@ mod tests {
         let table = super::table();
         let live = form();
         let no_form = VoiceNewAgent { form: None };
-        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
+        for id in [
+            "choose_mode",
+            "choose_agent_type",
+            "name_new_agent",
+            "set_new_agent_command",
+        ] {
             let row = table.row(id).expect("present");
             assert!(!row.callable(Screen::Overview, None, None), "{id}");
             assert!(
@@ -2612,9 +2934,18 @@ mod tests {
         assert_eq!(start.screens, vec![Screen::Overview]);
         assert!(start.params.is_empty());
         assert_eq!(start.report, "Starting the agent.");
+        // Two mentions of a confirmation are the row saying it has NONE, and
+        // are blanked before the check: "skip the confirmation" is a phrasing
+        // this row must claim, and "has no confirmation" is what keeps it from
+        // drifting to a stop, whose rows are the only others that talk about
+        // one (PR #1451 round 3). Any other "confirm" still fails.
+        let description = start
+            .description
+            .replace("\"skip the confirmation\"", "")
+            .replace("has no confirmation", "");
         for claim in ["confirm", "by itself", "nothing has"] {
             assert!(
-                !start.description.contains(claim) && !start.report.contains(claim),
+                !description.contains(claim) && !start.report.contains(claim),
                 "start_new_agent still claims `{claim}`: {} / {}",
                 start.description,
                 start.report
@@ -2625,7 +2956,8 @@ mod tests {
     /// The rows whose unavailable pick dispatches another row instead (PRD
     /// #1223, D3), pinned: a start with the New agent dialog closed opens it,
     /// an opener picked with the dialog open presses its Start when the words
-    /// ask to start, and nothing else redirects.
+    /// ask to start, a Daemon-selector switch picked with it open chooses the
+    /// dialog's daemon (#1260), and nothing else redirects.
     #[test]
     fn voice_table_redirecting_rows_are_the_deliberate_set() {
         let redirecting: Vec<(&str, &str)> = super::table()
@@ -2640,6 +2972,8 @@ mod tests {
         assert_eq!(
             redirecting,
             vec![
+                ("clear_dashboard_filter", "clear_directory_filter"),
+                ("switch_deck", "choose_deck"),
                 ("open_new_agent", "start_new_agent"),
                 ("start_new_agent", "open_new_agent"),
             ]
@@ -2659,8 +2993,32 @@ mod tests {
                 "{declared:?}"
             );
         }
+        // The switch hands its deck to the dialog's field, which takes exactly
+        // that param and redirects nowhere, so the two cannot chain; and on the
+        // overview one of them is always the row that can run.
+        let switch = table.row("switch_deck").expect("present");
+        let choose = table.row("choose_deck").expect("present");
+        assert_eq!(switch.requires, vec![Requirement::NewAgentDialogClosed]);
+        assert_eq!(choose.requires, vec![Requirement::NewAgentDialog]);
+        assert_eq!(choose.unavailable_redirects, None);
+        let shape = |row: &CommandRow| {
+            row.params
+                .iter()
+                .map(|param| (param.name.clone(), param.kind, param.optional))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(switch), shape(choose));
+        for declared in [None, Some(&dialog), Some(&form())] {
+            assert_ne!(
+                switch.callable(Screen::Overview, None, declared),
+                choose.callable(Screen::Overview, None, declared),
+                "{declared:?}"
+            );
+        }
     }
 
+    /// Scenario: a redirect can only use the same required parameters or a
+    /// target with none; optionality changes the dispatch contract too.
     #[test]
     fn voice_table_rejects_an_unavailable_redirects_it_cannot_dispatch() {
         // A second row with no params, which a redirect can dispatch.
@@ -2700,12 +3058,62 @@ mod tests {
                 "{bad}"
             );
         }
-        // A target with a required param cannot be dispatched with none.
-        let needs_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
-        assert!(matches!(
-            CommandTable::parse(&first_opens("second", &needs_param)),
-            Err(TableError::UnknownUnavailableRedirect { .. })
-        ));
+        // A target with a required param takes the pick's own params (#1260),
+        // so it must declare exactly those: the same name and kind parses...
+        let same_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
+        assert!(CommandTable::parse(&first_opens("second", &same_param)).is_ok());
+        let optional_target = same_param
+            .replace(
+                "kind = \"agent_ref\"",
+                "kind = \"agent_ref\"\noptional = true",
+            )
+            .replace(
+                "report = \"Opening {agent}.\"",
+                "report = \"Opening an agent.\"",
+            )
+            .replace(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open an agent\"",
+            );
+        let required_to_optional = first_opens("second", &optional_target);
+        let optional_to_required = first_opens("second", &same_param)
+            .replacen(
+                "kind = \"agent_ref\"",
+                "kind = \"agent_ref\"\noptional = true",
+                1,
+            )
+            .replacen(
+                "report = \"Opening {agent}.\"",
+                "report = \"Opening an agent.\"",
+                1,
+            )
+            .replacen(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open an agent\"",
+                1,
+            );
+        let results: Vec<_> = [required_to_optional, optional_to_required]
+            .iter()
+            .map(|source| CommandTable::parse(source))
+            .collect();
+        let rejected: Vec<bool> = results.iter().map(Result::is_err).collect();
+        assert_eq!(rejected, [true, true], "redirect errors: {results:?}");
+        // ...and a required param the pick does not carry, or carries as
+        // another kind, cannot be dispatched.
+        for other in [
+            format!(
+                "{same_param}\n\n  [[commands.params]]\n  name = \"extra\"\n  kind = \"agent_ref\""
+            ),
+            same_param.replace("kind = \"agent_ref\"", "kind = \"deck_ref\""),
+        ] {
+            assert!(
+                matches!(
+                    CommandTable::parse(&first_opens("second", &other)),
+                    Err(TableError::UnknownUnavailableRedirect { .. })
+                ),
+                "{other}"
+            );
+        }
     }
 
     /// The rows that need a SECOND list heard beside `heard_as` (PRD #1223,
@@ -2871,31 +3279,45 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "daemon" (or "deck", its name before #1045)
-        // alone — no shared verb — so a steered pick needs the user to have
-        // talked about a daemon (see commands.toml).
+        // Grounded by the word "daemon" (or "deck", its name before #1045,
+        // or "demon", how speech-to-text writes it) alone — no shared verb —
+        // so a steered pick needs the user to have talked about a daemon (see
+        // commands.toml).
         assert_eq!(
             table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec!["daemon".to_string(), "deck".to_string()])
+            ActionGrounding::HeardAs(vec![
+                "daemon".to_string(),
+                "deck".to_string(),
+                "demon".to_string()
+            ])
         );
     }
 
-    /// The Command decision, as a property: no row DICTATES the command line,
-    /// and every fill row says so. It is the one field that executes, so the
-    /// only thing voice puts there is an agent's registry default
-    /// (`choose_agent_type`, since the Agent picker was removed) and anything
-    /// else stays typed by hand (see `commands.toml`).
+    /// The Command decision, as a property (PR #1451 round 4, decision D8 —
+    /// which reversed "no row dictates the command line"): exactly one row
+    /// sets Command to words, it takes them only through the transcript-held
+    /// `command_text` kind, and it starts nothing — a start stays the separate
+    /// `start_new_agent`. No form row tells the model any more that Command is
+    /// typed by hand, since that would steer "set the command to …" away
+    /// from the row that does it.
     #[test]
-    fn voice_table_no_row_dictates_the_command() {
+    fn voice_table_the_command_row_takes_only_the_users_words() {
         let table = super::table();
-        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
-            let row = table.row(id).expect("present");
-            assert!(
-                row.description.contains("typed by hand"),
-                "{id} must keep the command line out of reach: {}",
-                row.description
-            );
-        }
+        let command_text = ParamKind::parse("command_text").expect("the command_text kind exists");
+        let takes_command_text: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|row| row.params.iter().any(|param| param.kind == command_text))
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(takes_command_text, vec!["set_new_agent_command"]);
+        let row = table.row("set_new_agent_command").expect("present");
+        assert_ne!(row.invoke, "startNewAgent");
+        assert!(
+            !row.description.to_lowercase().contains("starts at once"),
+            "{}",
+            row.description
+        );
         let form_rows: Vec<&str> = table
             .rows()
             .iter()
@@ -2904,9 +3326,117 @@ mod tests {
             .collect();
         assert_eq!(
             form_rows,
-            vec!["choose_mode", "choose_agent_type", "name_new_agent"],
+            vec![
+                "choose_mode",
+                "choose_agent_type",
+                "name_new_agent",
+                "set_new_agent_command",
+            ],
             "a new form row is a decision about the Command field too — see commands.toml"
         );
+        for id in &form_rows {
+            let row = table.row(id).expect("present");
+            assert!(
+                !row.description.contains("typed by hand"),
+                "{id} still tells the model Command is typed by hand: {}",
+                row.description
+            );
+        }
+    }
+
+    /// PR #1451 round 3, change 4: turning the page of whatever list on screen
+    /// is split into pages while voice is on — the Daemons screen's tiles, the
+    /// New agent dialog's directories and modes. On the agent dashboard, which
+    /// scrolls instead (issue #1492), the app scrolls it by a screen.
+    /// Pinned by value; neither takes a param or needs a declaration, because
+    /// the app answers "nothing here has pages" itself, and neither is
+    /// callable over an agent's pane, where nothing pages.
+    #[test]
+    fn voice_table_page_rows_are_pinned_by_value() {
+        let table = super::table();
+        for (id, invoke, report, word) in [
+            ("next_page", "nextPage", "Next page.", "next"),
+            (
+                "previous_page",
+                "previousPage",
+                "Previous page.",
+                "previous",
+            ),
+        ] {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Deck, Screen::Overview], "{id}");
+            assert!(row.requires.is_empty(), "{id}");
+            assert!(row.params.is_empty(), "{id}");
+            assert_eq!(row.report, report, "{id}");
+            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
+                panic!("{id} is grounded by `heard_as`");
+            };
+            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert!(row.callable(Screen::Overview, None, None), "{id}");
+            assert!(row.callable(Screen::Deck, None, None), "{id}");
+            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+        }
+        let back = table.row("previous_page").expect("present");
+        assert!(
+            matches!(&back.grounding, ActionGrounding::HeardAs(heard_as) if heard_as.iter().any(|heard| heard == "back"))
+        );
+    }
+
+    /// Issue #1492: scrolling the agent dashboard, which no longer splits into
+    /// pages while voice is on. Pinned by value: no params, `overview` only,
+    /// and callable only while the New agent dialog is closed, since the
+    /// dashboard is what they scroll and the dialog covers it. Each is grounded
+    /// by its direction's word, so "scroll up" never grounds a scroll down.
+    #[test]
+    fn voice_table_scroll_rows_are_pinned_by_value() {
+        let table = super::table();
+        let dialog = VoiceNewAgent { form: None };
+        for (id, invoke, report, word, opposite) in [
+            ("scroll_down", "scrollDown", "Scrolling down.", "down", "up"),
+            ("scroll_up", "scrollUp", "Scrolling up.", "up", "down"),
+            (
+                "scroll_to_top",
+                "scrollToTop",
+                "Scrolled to the top.",
+                "top",
+                "bottom",
+            ),
+            (
+                "scroll_to_bottom",
+                "scrollToBottom",
+                "Scrolled to the bottom.",
+                "bottom",
+                "top",
+            ),
+        ] {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            assert_eq!(
+                row.requires,
+                vec![Requirement::NewAgentDialogClosed],
+                "{id}"
+            );
+            assert!(row.params.is_empty(), "{id}");
+            assert_eq!(row.report, report, "{id}");
+            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
+                panic!("{id} is grounded by `heard_as`");
+            };
+            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert!(!heard_as.iter().any(|heard| heard == opposite), "{id}");
+            assert!(row.callable(Screen::Overview, None, None), "{id}");
+            assert!(
+                !row.callable(Screen::Overview, None, Some(&dialog)),
+                "{id}: under the New agent dialog"
+            );
+            assert!(!row.callable(Screen::Deck, None, None), "{id}");
+            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+        }
     }
 
     #[test]
@@ -2915,7 +3445,12 @@ mod tests {
         let with_parent = listing(true);
         let at_root = listing(false);
         let row = |id: &str| table.row(id).expect("present");
-        for id in ["open_dir", "use_this_directory"] {
+        for id in [
+            "open_dir",
+            "use_this_directory",
+            "filter_directories",
+            "clear_directory_filter",
+        ] {
             assert!(
                 !row(id).callable(Screen::Overview, None, None),
                 "{id}: dialog closed"

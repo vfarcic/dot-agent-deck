@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the "No agent on reconnect" fix (PRD-less
 //! bugfix). Drives the real `dot-agent-deck` daemon binary over its hook and
@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{DaemonProc, TuiDeck, spawn_daemon_serve, write_hook_line};
+use common::{DaemonProc, TuiDeck, spawn_daemon_serve_with_env, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::SessionStatus;
@@ -33,7 +33,8 @@ use std::time::Duration;
 #[spec("hooks/delivery/007")]
 #[test]
 fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
 
     // Start a shell agent whose command yields no inferable `AgentType`
     // (`from_command("/bin/sh") == None`), tagged with a known pane id so the
@@ -50,6 +51,8 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -128,7 +131,8 @@ fn launch_tui_against(daemon: &DaemonProc) -> TuiDeck {
 #[spec("session/live/006")]
 #[test]
 fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
 
     // A shell agent with no inferable type (`from_command("sh …") == None`),
     // tagged with a known pane id and a distinctive display name.
@@ -144,6 +148,8 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -272,7 +278,8 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     const PANE_ID: &str = "pane-agent-event-reconnect";
     const LABEL: &str = "agent-event-reconnect-42";
 
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some("sh -c 'sleep 600'".into()),
@@ -285,6 +292,8 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
             agent_type: Some(AgentType::Pi),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent ordinary pane over the real daemon attach socket");
     assert!(
@@ -336,5 +345,79 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     assert!(
         !header.contains("Idle"),
         "the reconnected card must preserve Thinking rather than fall back to Idle; header={header:?}\nGrid:\n{grid}"
+    );
+}
+
+/// Scenario: Start an ordinary pane through the real daemon `StartAgent` path and attach a real TUI whose event stream is set to break once, losing the event that triggers it, the way a lagged stream loses what it never forwarded. Drive the card to `Thinking` with the real `agent-event --type running` CLI — the one event the broken stream loses — and assert the same TUI, once it has reconnected, shows the card `Thinking` from the daemon's state rather than staying `Idle`.
+#[spec("session/live/019")]
+#[test]
+fn live_019_a_reconnected_event_stream_catches_the_card_up() {
+    const PANE_ID: &str = "pane-stream-gap";
+    const LABEL: &str = "stream-gap-19";
+
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
+    let response = daemon
+        .send_attach_request(&AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 600'".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE_ID.into())],
+            display_name: Some(LABEL.into()),
+            tab_membership: None,
+            agent_type: Some(AgentType::Pi),
+            seed: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
+        })
+        .expect("StartAgent ordinary pane over the real daemon attach socket");
+    assert!(
+        response.error.is_none(),
+        "StartAgent should succeed, got error: {:?}",
+        response.error
+    );
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
+    let agent_id = records
+        .first()
+        .unwrap_or_else(|| panic!("ordinary StartAgent pane never registered: {records:?}"))
+        .id
+        .clone();
+
+    // The `e2e`-build seam in `main.rs` (`e2e_subscriber_breaks`): the first
+    // `Thinking` for this pane is dropped and the subscription torn down, once.
+    let tui = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_E2E_BREAK_STREAM_ON",
+            format!("{PANE_ID}/Thinking"),
+        )
+        .launch_with_fixture("minimal");
+    tui.wait_for_string(LABEL);
+
+    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tui.wait_until_grid(
+        "the card catches up to Thinking after the event stream reconnects",
+        |grid| {
+            grid.contains(LABEL)
+                && grid
+                    .lines()
+                    .any(|line| line.contains("Pi") && line.contains("Thinking"))
+        },
     );
 }

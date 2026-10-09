@@ -419,7 +419,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
@@ -584,7 +584,7 @@ jobs:
       # `shasum -a 256 dot-agent-deck-*` cannot cope with the space in Tauri's
       # `Agent Deck_<version>_amd64.deb` output name. The desktop job therefore
       # names its artifacts `desktop-bundle-*`, which this pattern excludes.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dot-agent-deck-*
           path: dist
@@ -613,7 +613,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Download the release body
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-body
           path: ${{ runner.temp }}/release-body
@@ -765,7 +765,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
@@ -791,7 +791,7 @@ jobs:
       # what is shipped. pnpm is also the exact version devbox.json pins, and
       # `scripts/check-pin-lockstep.sh` fails if any of those sites disagree
       # (issue #1262). Node is a major here as in ci.yml, and not in that guard.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: pnpm
@@ -1033,7 +1033,7 @@ jobs:
       # defaulting to either claim. `desktop-publish`'s note reads it.
       signed: ${{ steps.result.outputs.signed }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         id: app
         # Tolerated so the step below can say WHY there is nothing to sign,
         # instead of the action's own "Artifact not found".
@@ -1775,7 +1775,7 @@ jobs:
     if: ${{ !cancelled() && needs.finalize.result == 'success' && !inputs.skip_desktop }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         # Tolerated deliberately: with a partial matrix now a legitimate state,
         # this step's own failure mode (no artifact matches the pattern at all)
         # is one the guard below reports far better than "Unable to find any
@@ -2039,12 +2039,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dot-agent-deck-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         # Tolerated for the same reason `desktop-publish` tolerates it: a
         # partial or wholly failed desktop matrix is a legitimate state, and the
         # CLI assets must still be attested when it happens.
@@ -2063,11 +2063,11 @@ jobs:
       # `finalize` succeeded, and `finalize` cannot succeed without publishing
       # `checksums.txt`. A missing artifact here means the wiring broke, and
       # the release must say so rather than quietly attest one asset fewer.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-checksums
           path: dist
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         # Tolerated for exactly the reason the bundle download above is: this
         # artifact exists only when `desktop-publish` ran, and a wholly failed
         # desktop matrix is a legitimate state in which the CLI assets must

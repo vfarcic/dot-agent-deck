@@ -39,6 +39,7 @@ use dot_agent_deck::agent_pty::{
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
+use dot_agent_deck::env_override;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::{
     AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
@@ -187,6 +188,23 @@ enum OrchestratorStub {
 
 /// Serializes process-environment changes when these tests are run with plain
 /// `cargo test`; nextest already runs each test in its own process.
+///
+/// **What the lock does not cover** (issue #1516). `set_var` / `remove_var` race
+/// any *thread* reading the environment at that moment, and this lock excludes
+/// sibling tests, not threads. So [`EnvGuard`] and [`DebounceEnvGuard`] write
+/// only while no Tokio runtime exists, and refuse otherwise
+/// (`common::env_write`): every test sets them before building its runtime and
+/// drops them after the runtime has dropped, which joins the runtime's threads.
+/// `scheduler/idle-worker/003`, which changes the timeout between delegates on
+/// one running harness, does it through `dot_agent_deck::env_override`. At a
+/// guard's write, the threads that can exist are the test's own, libtest's
+/// runner thread waiting for it, and the harness's `load-context` heartbeat once
+/// a harness temp dir exists, which sleeps and reads `/proc`, never the
+/// environment. When a guard drops, the detached PTY reader of an agent whose
+/// PTY has not reached EOF can still be running (`agent_pty::pump_reader`); it
+/// reads its PTY and updates the registry, and reads no environment variable.
+/// Under plain `cargo test` a sibling test that takes no lock and reads the
+/// environment races these writes (issue #245).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
@@ -195,9 +213,10 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set(value: Option<&str>) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let previous = std::env::var(TIMEOUT_ENV).ok();
-        // SAFETY: every test in this integration-test binary holds ENV_LOCK for
-        // the guard's full lifetime, so this environment mutation is serialized.
+        // SAFETY: a stated residual — see `ENV_LOCK` for the threads that exist
+        // here. The caller holds that lock for the guard's lifetime.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -207,12 +226,12 @@ impl EnvGuard {
         Self { previous }
     }
 
-    /// Re-point the seam mid-test. Used by `003`, whose whole contract is that
-    /// the SAME harness and cwd behave differently for `0` and a positive
-    /// value — the timeout is resolved per delegate, so flipping it between
-    /// delegates is the decisive comparison.
+    /// Re-point the seam mid-test, between calls to the resolver. Used by
+    /// `007`, which runs no runtime. `003` flips the timeout between delegates
+    /// on a running harness, so it uses `env_override` instead (issue #1516).
     fn repoint(&self, value: Option<&str>) {
-        // SAFETY: the caller still holds ENV_LOCK.
+        common::env_write::assert_no_tokio_runtime("EnvGuard::repoint");
+        // SAFETY: as in `EnvGuard::set`.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -224,7 +243,11 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: the caller still holds ENV_LOCK while this guard is dropped.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvGuard::drop");
+        }
+        // SAFETY: as in `EnvGuard::set`, and the caller still holds ENV_LOCK.
+        // `ENV_LOCK` names what can still run at a drop.
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -297,7 +320,7 @@ impl IdleHarness {
         // PRD #140: the daemon's routing identity. `Instance` is what a current
         // client produces — two tabs of one orchestration in one directory are
         // told apart by this token, not by `(name, cwd)`.
-        let orchestration = OrchestrationIdentity::Instance {
+        let orchestration = OrchestrationIdentity {
             id: ORCHESTRATION_INSTANCE.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -795,7 +818,7 @@ fn idle_worker_002_work_done_cancels_idle_prompt() {
 #[test]
 fn idle_worker_003_zero_disables_the_detector_from_either_source() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(Some("500"));
+    let _env = EnvGuard::set(Some("500"));
     runtime().block_on(async {
         let harness = IdleHarness::with_workers(
             &[
@@ -821,7 +844,10 @@ fn idle_worker_003_zero_disables_the_detector_from_either_source() {
 
         // Same harness, same cwd, same worker shape — only the seam changes.
         // A prompt here would therefore be attributable to nothing but the 0.
-        env.repoint(Some("0"));
+        // Through `env_override` rather than the environment (issue #1516): the
+        // positive control's tasks are still on this runtime's workers. The
+        // value goes through the resolver's own parse either way.
+        let timeout = env_override::override_for_tests(TIMEOUT_ENV, Some("0"));
         harness.delegate(&["env-zero-worker"]).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let after_env_zero = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
@@ -831,8 +857,9 @@ fn idle_worker_003_zero_disables_the_detector_from_either_source() {
              not fire immediately; snapshot = {after_env_zero:?}"
         );
 
-        // Seam unset: resolution now reads the config's own 0.
-        env.repoint(None);
+        // Seam unset: resolution now reads the config's own 0. A `None`
+        // override reads as unset whatever the environment holds.
+        timeout.repoint(None);
         harness.delegate(&["file-zero-worker"]).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let after_file_zero = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
@@ -1210,7 +1237,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead.
+/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead. Run twice: once for a worker delegated to in place, and once for a pi-native `clear = true` role, whose delegate respawns the worker and hands the task over as the replacement's seed before that replacement exits on its own (issue #1448).
 #[spec("scheduler/idle-worker/016")]
 #[test]
 fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
@@ -1222,111 +1249,148 @@ fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
     // EOF-triggered sweep, never from either timer running out.
     let _env = EnvGuard::set(Some("60000"));
     runtime().block_on(async {
-        let harness = IdleHarness::with_workers(
-            &[("vanishing-worker", WORKER_EXITS_ON_ITS_OWN_COMMAND)],
-            None,
+        natural_worker_exit_reports_promptly("vanishing-worker", None).await;
+        // Issue #1448: a pi-native `clear = true` delegate delivers its pointer
+        // as the respawned pi's seed and returns before the inline injection.
+        // The idle-worker record must still learn the REPLACEMENT's agent id on
+        // that path, or the replacement's own exit matches nothing and the
+        // orchestrator hears about it only when the 60 s idle timer runs out.
+        natural_worker_exit_reports_promptly(
+            "vanishing-pi-worker",
+            Some(&format!(
+                "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+                 [[orchestrations.roles]]\nname = \"vanishing-pi-worker\"\n\
+                 command = \"{WORKER_EXITS_ON_ITS_OWN_COMMAND}\"\nagent = \"pi\"\nclear = true\n"
+            )),
         )
         .await;
+    });
+}
 
-        let worker_pane_id = worker_pane("vanishing-worker");
-        let worker_agent_id = harness.worker_agent_ids["vanishing-worker"].clone();
+/// `scheduler/idle-worker/016`'s body for one worker `role`. With a
+/// `project_config` that makes the role `clear = true`, the delegate replaces
+/// the worker first, and it is the REPLACEMENT whose natural exit is awaited.
+async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option<&str>) {
+    let harness =
+        IdleHarness::with_workers(&[(role, WORKER_EXITS_ON_ITS_OWN_COMMAND)], project_config).await;
 
-        // Wait for the worker's own readiness marker before delegating — the
-        // same precondition every other harness test in this file relies on
-        // (a delegate landing before termios is raw could be swallowed).
-        let ready = harness
-            .wait_for_snapshot_of(
-                &worker_agent_id,
-                |snapshot| snapshot.contains("WORKER-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("WORKER-READY"),
-            "the vanishing-worker stub never became ready; snapshot = {ready:?}"
-        );
+    let worker_pane_id = worker_pane(role);
+    let worker_agent_id = harness.worker_agent_ids[role].clone();
 
-        harness.delegate(&["vanishing-worker"]).await;
+    // Wait for the worker's own readiness marker before delegating — the
+    // same precondition every other harness test in this file relies on
+    // (a delegate landing before termios is raw could be swallowed).
+    let ready = harness
+        .wait_for_snapshot_of(
+            &worker_agent_id,
+            |snapshot| snapshot.contains("WORKER-READY"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        ready.contains("WORKER-READY"),
+        "the {role} stub never became ready; snapshot = {ready:?}"
+    );
 
-        // The worker's own script exits on its own shortly after — no
-        // StopAgent, no explicit close of any kind. Wait until the registry
-        // genuinely has no live owner for its pane, mirroring
-        // `end_orchestrator_process`'s freed-pane wait.
-        let freed = tokio::time::timeout(Duration::from_secs(5), async {
-            while harness
-                .registry
-                .pane_current_agent_id(&worker_pane_id)
-                .is_some()
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    harness.delegate(&[role]).await;
+
+    if project_config.is_some() {
+        // The `clear = true` delegate respawns the worker: wait for the
+        // replacement to own the pane, so the exit awaited below is ITS exit
+        // and not the original's.
+        let replaced = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match harness.registry.pane_current_agent_id(&worker_pane_id) {
+                    Some(current) if current != worker_agent_id => return,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
             }
         })
         .await;
         assert!(
-            freed.is_ok(),
-            "the vanishing-worker stub never exited on its own, so the scenario under test \
-             could not occur"
+            replaced.is_ok(),
+            "precondition: the clear = true delegate never respawned the {role} worker"
         );
-        assert!(
-            !harness.registry.is_pane_closing(&worker_pane_id),
-            "the worker pane is in a CLOSE transition, so a deliberate close's own record sweep \
-             — not the EOF-triggered sweep — would be what retired the records, and this test \
-             would stop covering the natural-exit path"
-        );
+    }
 
-        // The notice must land promptly — well before either timeout watch's
-        // (60s / 30s) window could have fired it instead.
-        //
-        // Issue #708: the wait includes the terminator byte, so it cannot end one
-        // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
-        // read a terminator that simply had not landed yet.
-        let snapshot = harness
-            .wait_for_snapshot(
-                |snapshot| worker_exited_terminator(snapshot).is_some(),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            snapshot.contains(WORKER_EXITED_NEEDLE),
-            "no EOF-triggered 'worker exited without work-done' notice appeared in the \
-             orchestrator's pane within 5s of the worker's natural exit; snapshot = {snapshot:?}"
-        );
-        // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
-        // orchestrator's input box reaches nobody in an unattended dispatched
-        // unit — there is no human to press Enter — so the orchestrator would
-        // wait forever for a `work-done` the dead process can never send. The
-        // report must be a turn of its own (CR) and say what to do about it.
-        let terminator = worker_exited_terminator(&snapshot);
-        let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
-            .into_iter()
-            .filter(|option| !snapshot.contains(option))
-            .collect();
-        assert!(
-            terminator == Some(b'\r') && missing_options.is_empty(),
-            "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
-             an LF-terminated line in the orchestrator's scrollback) and must name the \
-             remediation options (notify the user, re-delegate, reassign); terminator = \
-             {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
-        );
-        assert!(
-            snapshot.contains(&worker_pane_id),
-            "the notice must name the exited worker's pane so the orchestrator knows which \
-             worker to check; snapshot = {snapshot:?}"
-        );
-        assert_eq!(
-            idle_count(&snapshot),
-            0,
-            "the OLDER timeout-based idle prompt fired instead of (or alongside) the new \
-             EOF-triggered notice, meaning the sweep did not retire the OutstandingDelegation \
-             record before its own timer ran out; snapshot = {snapshot:?}"
-        );
-        assert!(
-            !snapshot.contains(SILENCE_NEEDLE),
-            "the OLDER timeout-based silence notice fired instead of (or alongside) the new \
-             EOF-triggered notice, meaning the sweep did not retire the SilenceWatchRecord \
-             before its own timer ran out; snapshot = {snapshot:?}"
-        );
-    });
+    // The worker's own script exits on its own shortly after — no
+    // StopAgent, no explicit close of any kind. Wait until the registry
+    // genuinely has no live owner for its pane, mirroring
+    // `end_orchestrator_process`'s freed-pane wait.
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        while harness
+            .registry
+            .pane_current_agent_id(&worker_pane_id)
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        freed.is_ok(),
+        "the {role} stub never exited on its own, so the scenario under test could not occur"
+    );
+    assert!(
+        !harness.registry.is_pane_closing(&worker_pane_id),
+        "the worker pane is in a CLOSE transition, so a deliberate close's own record sweep \
+         — not the EOF-triggered sweep — would be what retired the records, and this test \
+         would stop covering the natural-exit path"
+    );
+
+    // The notice must land promptly — well before either timeout watch's
+    // (60s / 30s) window could have fired it instead.
+    //
+    // Issue #708: the wait includes the terminator byte, so it cannot end one
+    // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
+    // read a terminator that simply had not landed yet.
+    let snapshot = harness
+        .wait_for_snapshot(
+            |snapshot| worker_exited_terminator(snapshot).is_some(),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        snapshot.contains(WORKER_EXITED_NEEDLE),
+        "no EOF-triggered 'worker exited without work-done' notice appeared in the \
+         orchestrator's pane within 5s of the {role} worker's natural exit; \
+         snapshot = {snapshot:?}"
+    );
+    // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
+    // orchestrator's input box reaches nobody in an unattended dispatched
+    // unit — there is no human to press Enter — so the orchestrator would
+    // wait forever for a `work-done` the dead process can never send. The
+    // report must be a turn of its own (CR) and say what to do about it.
+    let terminator = worker_exited_terminator(&snapshot);
+    let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
+        .into_iter()
+        .filter(|option| !snapshot.contains(option))
+        .collect();
+    assert!(
+        terminator == Some(b'\r') && missing_options.is_empty(),
+        "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
+         an LF-terminated line in the orchestrator's scrollback) and must name the \
+         remediation options (notify the user, re-delegate, reassign); terminator = \
+         {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
+    );
+    assert!(
+        snapshot.contains(&worker_pane_id),
+        "the notice must name the exited worker's pane so the orchestrator knows which \
+         worker to check; snapshot = {snapshot:?}"
+    );
+    assert_eq!(
+        idle_count(&snapshot),
+        0,
+        "the OLDER timeout-based idle prompt fired instead of (or alongside) the new \
+         EOF-triggered notice, meaning the sweep did not retire the OutstandingDelegation \
+         record before its own timer ran out; snapshot = {snapshot:?}"
+    );
+    assert!(
+        !snapshot.contains(SILENCE_NEEDLE),
+        "the OLDER timeout-based silence notice fired instead of (or alongside) the new \
+         EOF-triggered notice, meaning the sweep did not retire the SilenceWatchRecord \
+         before its own timer ran out; snapshot = {snapshot:?}"
+    );
 }
 
 /// Scenario: Delegate to a silent control worker and to a worker that ignores SIGTERM, then StopAgent the TERM-resistant one so its three-second grace window brackets the detector deadline. The test asserts the overlap actually happened, then requires a prompt for the control and none for the worker whose close was in flight.
@@ -1657,8 +1721,9 @@ struct DebounceEnvGuard {
 
 impl DebounceEnvGuard {
     fn set(value: &str) -> Self {
+        common::env_write::assert_no_tokio_runtime("DebounceEnvGuard::set");
         let previous = std::env::var(WAITING_DEBOUNCE_ENV).ok();
-        // SAFETY: the caller holds ENV_LOCK, serializing environment mutation.
+        // SAFETY: as in `EnvGuard::set`; the caller holds ENV_LOCK.
         unsafe { std::env::set_var(WAITING_DEBOUNCE_ENV, value) };
         Self { previous }
     }
@@ -1666,7 +1731,10 @@ impl DebounceEnvGuard {
 
 impl Drop for DebounceEnvGuard {
     fn drop(&mut self) {
-        // SAFETY: the caller still holds ENV_LOCK while this guard is dropped.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("DebounceEnvGuard::drop");
+        }
+        // SAFETY: as in `EnvGuard::drop`.
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(WAITING_DEBOUNCE_ENV, value),
@@ -2586,6 +2654,151 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
             settled.matches(WAITING_NEEDLE).count(),
             5,
             "exactly five waiting notices may reach the orchestrator; snapshot = {settled:?}"
+        );
+    });
+}
+
+/// Scenario: Two workers are already waiting for input when they are delegated to, and the orchestrator has an unsent draft in its pane, so each worker's waiting-for-input notice fires and then waits on that draft. The test holds `held-pointer-worker`'s dispatch on its pane's dispatch lock until its notice is waiting, then lets the task pointer through, so the pointer reaches the worker while the notice is still waiting; `control-worker`'s pointer arrives straight away, before its notice fires. When the user presses Enter on the draft, the orchestrator must receive exactly one notice about each worker.
+#[spec("scheduler/idle-worker/030")]
+#[test]
+fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_waits() {
+    use std::io::Write as _;
+
+    const HELD: &str = "held-pointer-worker";
+    const CONTROL: &str = "control-worker";
+    const DRAFT: &[u8] = b"orchestrator-draft-1526";
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("600000"));
+    let debounce = Duration::from_millis(600);
+    let _debounce = DebounceEnvGuard::set("600");
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&[HELD, CONTROL], None).await;
+        for role in [HELD, CONTROL] {
+            harness.manage_worker_pane(role).await;
+            harness.worker_event(role, "session_start").await;
+            // At its prompt BEFORE the delegate, so the delegate-time path
+            // opens the episode and its clock starts before the pointer lands.
+            harness.worker_event(role, "waiting_for_input").await;
+        }
+
+        // The user has typed into the orchestrator's pane and not sent it, so
+        // every first write into that pane waits for Enter (issue #544).
+        {
+            let handle = harness
+                .registry
+                .subscribe(&harness.orchestrator_agent_id)
+                .expect("attach the orchestrator");
+            let mut writer = handle.writer.lock().await;
+            writer
+                .write_all(DRAFT)
+                .expect("type the orchestrator's draft");
+            writer.flush().expect("flush the orchestrator's draft");
+        }
+        let typed = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains("orchestrator-draft-1526"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            typed.contains("orchestrator-draft-1526"),
+            "precondition: the orchestrator's draft never reached its PTY; snapshot = {typed:?}"
+        );
+
+        let held_pane = worker_pane(HELD);
+        let dispatch_lock = harness.registry.pane_dispatch_lock(&held_pane);
+        let held = dispatch_lock.lock().await;
+        harness.delegate(&[HELD, CONTROL]).await;
+        let control_agent = harness.worker_agent_ids[CONTROL].clone();
+        let control_pointer = harness
+            .wait_for_snapshot_of(
+                &control_agent,
+                |snapshot| snapshot.contains("worker-task-control-worker.md"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            control_pointer.contains("worker-task-control-worker.md"),
+            "precondition: the control worker never received its task pointer; \
+             snapshot = {control_pointer:?}"
+        );
+        // Well past the debounce: both notices have fired and are waiting on
+        // the orchestrator's draft.
+        tokio::time::sleep(common::load_scaled(debounce * 3)).await;
+        let waiting = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert_eq!(
+            waiting.matches(WAITING_NEEDLE).count(),
+            0,
+            "precondition: the waiting notices did not wait for the orchestrator's draft, so \
+             the held pointer cannot land while one waits; snapshot = {waiting:?}"
+        );
+
+        // The held worker's pointer now lands while its notice waits.
+        drop(held);
+        let held_agent = harness.worker_agent_ids[HELD].clone();
+        let held_pointer = harness
+            .wait_for_snapshot_of(
+                &held_agent,
+                |snapshot| snapshot.contains("worker-task-held-pointer-worker.md"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            held_pointer.contains("worker-task-held-pointer-worker.md"),
+            "precondition: the held worker never received its task pointer once released; \
+             snapshot = {held_pointer:?}"
+        );
+        // Let the dispatch finish settling the delivery it just made.
+        tokio::time::sleep(common::load_scaled(Duration::from_millis(500))).await;
+
+        // The user sends the draft, which releases every write waiting on it.
+        {
+            let handle = harness
+                .registry
+                .subscribe(&harness.orchestrator_agent_id)
+                .expect("attach the orchestrator");
+            let mut writer = handle.writer.lock().await;
+            writer
+                .write_all(b"\r")
+                .expect("submit the orchestrator's draft");
+            writer.flush().expect("flush the orchestrator's Enter");
+        }
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| {
+                    waiting_notices_for(snapshot, HELD) > 0
+                        && waiting_notices_for(snapshot, CONTROL) > 0
+                },
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(
+            waiting_notices_for(&snapshot, CONTROL),
+            1,
+            "control: a worker whose pointer landed before its notice fired was not reported \
+             once the orchestrator's draft was sent; snapshot = {snapshot:?}"
+        );
+        // The notice quotes the worker's screen as it stood when the notice
+        // fired, so a quote without the held pointer proves the notice fired
+        // before the pointer landed — the race this test exists for — rather
+        // than after it, which a starved machine could otherwise turn into a
+        // pass that exercised nothing (Greptile, #1548).
+        let held_needle = idle_role_needle(HELD);
+        assert!(
+            snapshot
+                .split(['\r', '\n'])
+                .filter(|line| line.contains(WAITING_NEEDLE) && line.contains(&held_needle))
+                .all(|line| !line.contains("worker-task-held-pointer-worker.md")),
+            "precondition: the held worker's notice fired after its pointer had landed, so this \
+             run did not exercise the race; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, HELD),
+            1,
+            "a waiting notice was dropped because the worker's own task pointer landed while \
+             the notice waited on the orchestrator's draft (issue #1526): the delivery of the \
+             delegation the notice is about was treated as resolving it; \
+             snapshot = {snapshot:?}"
         );
     });
 }

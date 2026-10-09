@@ -6,6 +6,10 @@ sleep 2
 printf '%s\n' '• Running ls'
 if IFS= read -r line; then
     printf '%s\n' "$line" > managed-wrapper-input.log
+    # A submitted prompt starts a turn, and real Codex says so through its
+    # native `UserPromptSubmit` hook. The card's Thinking comes from that, not
+    # from anything painted (issue #1493).
+    printf '%s\n' "{\"session_id\":\"codex-standin\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"$PWD\",\"prompt\":\"$line\"}" | dot-agent-deck hook --agent codex
 fi
 sleep 2
 # A turn ends the way it does for real Codex: through its NATIVE `Stop` hook,

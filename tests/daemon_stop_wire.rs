@@ -157,7 +157,7 @@ fn spawn_stand_in(registry: &Arc<AgentPtyRegistry>, pane: &str) {
 /// An `AppState` holding the two live orchestration roles.
 fn state_with_roles() -> AppState {
     let mut state = AppState::default();
-    let identity = OrchestrationIdentity::Instance {
+    let identity = OrchestrationIdentity {
         id: "inst-1049".to_string(),
         name: "issue-work".to_string(),
     };
@@ -437,6 +437,97 @@ async fn wire_stop_004_inner() {
         "the accepted stop must drain the registry through the SAME graceful path \
          `KIND_SHUTDOWN` uses"
     );
+}
+
+/// A `tracing` writer that keeps everything in memory, so `wire_stop/009` can
+/// assert on what the daemon's handler actually logged.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Scenario: Serve a real attach socket holding two live orchestration roles
+/// and a plain live pane, capture the daemon's own log, and send `StopDaemon`
+/// with `force: true`. Before the drain stops them, the daemon's log names
+/// every agent and every role the forced stop destroys — the disclosure the
+/// signal and `KIND_SHUTDOWN` paths already gave (PRD #1487 audit D1).
+#[spec("lifecycle/wire-stop/009")]
+#[test]
+fn wire_stop_009_a_forced_stop_names_what_it_destroys() {
+    child_lifetime_bound::arm();
+    // Current-thread, so the handler task runs on the thread the capturing
+    // subscriber is installed on.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    rt.block_on(wire_stop_009_inner());
+    drop(guard);
+    let log = capture.text();
+    for expected in [
+        "stop-daemon",
+        "terminating 3 managed agent(s)",
+        "destroying 2 orchestration role registration(s)",
+        ORCHESTRATOR_PANE,
+        WORKER_PANE,
+        PLAIN_PANE,
+        "(orchestrator)",
+    ] {
+        assert!(
+            log.contains(expected),
+            "a forced wire stop must name {expected:?} before it drains\nlog was:\n{log}"
+        );
+    }
+}
+
+async fn wire_stop_009_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    for pane in [ORCHESTRATOR_PANE, WORKER_PANE, PLAIN_PANE] {
+        spawn_stand_in(&registry, pane);
+    }
+    let shared = Arc::new(tokio::sync::RwLock::new(state_with_roles()));
+    let server = start_server(registry.clone(), shared).await;
+
+    let resp = ask_stop(&server.path, true).await;
+    assert!(resp.ok, "--force is accepted: {:?}", resp.error);
+    let drained = wait_until(Duration::from_secs(10), || {
+        [ORCHESTRATOR_PANE, WORKER_PANE, PLAIN_PANE]
+            .iter()
+            .all(|pane| !registry.has_live_pane(pane))
+    })
+    .await;
+    assert!(drained, "the accepted stop drains the registry");
 }
 
 /// Scenario: Ask a path nothing is listening on to stop. It must report no

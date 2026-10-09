@@ -1,0 +1,41 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 3613
+expression: control
+---
+ dot-agent-deck — 7 agent(s)                                                   
+┏ ▸ 1 ClaudeCode · orchestrator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓
+┃Dir:  dot-agent-deck                                                         ┃
+┃                                                                             ┃
+┃                                                                             ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛
+┌ 2 ClaudeCode · developer ─────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+┌ 3 ClaudeCode · tester ────────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+┌ 4 ClaudeCode · reviewer ──────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+┌ 5 ClaudeCode · releaser ──────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+┌ 6 ClaudeCode · researcher ────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+┌ 7 ClaudeCode · documenter ────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                         │
+│                                                                             │
+│                                                                             │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘

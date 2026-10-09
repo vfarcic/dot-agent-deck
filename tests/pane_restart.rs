@@ -100,7 +100,7 @@ async fn fixture(worker_command: &str) -> Fixture {
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -406,11 +406,11 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
 
     {
         let mut state = daemon.state.write().await;
-        let identity_a = OrchestrationIdentity::Instance {
+        let identity_a = OrchestrationIdentity {
             id: "restart-iso-instance-a".to_string(),
             name: ORCHESTRATION.to_string(),
         };
-        let identity_b = OrchestrationIdentity::Instance {
+        let identity_b = OrchestrationIdentity {
             id: "restart-iso-instance-b".to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -1032,9 +1032,15 @@ impl EnvRestore {
             .iter()
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
+        common::env_write::assert_no_tokio_runtime("EnvRestore::set");
         for (key, value) in vars {
-            // SAFETY: called before the test starts its runtime, so this thread
-            // is the only one of the test reading the environment.
+            // SAFETY: a stated residual, not a proof (issue #1516). Called
+            // before the test builds its runtime, which the assertion above
+            // checks, so no deck code is running. The threads that can exist:
+            // this test's own, libtest's runner thread waiting for it, and the
+            // harness's `load-context` heartbeat once a harness temp dir exists,
+            // which sleeps and reads `/proc`, never the environment. Under plain
+            // `cargo test` the other tests of this file race it (issue #245).
             unsafe { std::env::set_var(key, value) };
         }
         Self(saved)
@@ -1043,8 +1049,16 @@ impl EnvRestore {
 
 impl Drop for EnvRestore {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvRestore::drop");
+        }
         for (key, value) in &self.0 {
-            // SAFETY: dropped after the test's runtime has shut down.
+            // SAFETY: as for `EnvRestore::set`. Dropped after the runtime, whose
+            // drop joins its threads. What can still be running besides the
+            // threads named there is the detached PTY reader of an agent whose
+            // PTY has not reached EOF yet (`agent_pty::pump_reader`), which
+            // reads its PTY and updates the registry, and reads no environment
+            // variable.
             match value {
                 Some(value) => unsafe { std::env::set_var(key, value) },
                 None => unsafe { std::env::remove_var(key) },
@@ -1273,4 +1287,163 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 String::from_utf8_lossy(&replacement_snapshot)
             );
         });
+}
+
+/// The orchestrator and worker of [`fixture`], with the worker started the way
+/// a prepared launch starts it: through `spawn_agent_in`, in the project
+/// directory opened and identified as a `VerifiedProjectDir` (issue #1233).
+/// `project` is a subdirectory of the returned tempdir, so a test can rename it
+/// away and put a replacement at its path.
+async fn prepared_fixture(
+    worker_restart_command: &str,
+) -> (
+    common::InProcDaemon,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let root = common::race_safe_tempdir();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).expect("create the project dir");
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        config(worker_restart_command),
+    )
+    .expect("write orchestration config");
+    let cwd = project.to_string_lossy().into_owned();
+
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn orchestrator stand-in");
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&project)
+        .expect("verify the project dir");
+    let worker_agent_id = daemon
+        .registry
+        .spawn_agent_in(
+            SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd),
+                display_name: Some(WORKER_ROLE),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("spawn the prepared worker stand-in");
+    drop(verified);
+
+    {
+        let mut state = daemon.state.write().await;
+        let identity = OrchestrationIdentity {
+            id: ORCHESTRATION_ID.to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
+        state.register_orchestration_role(
+            ORCH_PANE,
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some(&cwd),
+        );
+        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
+    }
+    (daemon, root, project, worker_agent_id)
+}
+
+/// Scenario: a worker role is started as a prepared launch in a verified
+/// project directory, which is then moved away, and `pane restart --force` of
+/// that role is refused as "not a directory" with the worker left running. A
+/// different directory with its own config is then put at the same path, and
+/// the restart is refused again rather than run there; once the verified
+/// directory is back, the same restart succeeds and runs in it (issue #1396).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/016")]
+async fn pane_restart_016_a_prepared_role_is_not_restarted_in_a_replaced_directory() {
+    const MARKER: &str = "restarted-here";
+    let (daemon, root, project, worker_agent_id) =
+        prepared_fixture(&format!("touch {MARKER} && exec cat")).await;
+    let fx = Fixture {
+        daemon,
+        _dir: root,
+        worker_agent_id,
+    };
+
+    // Deleted: the verified directory is moved away and nothing takes its
+    // path. The restart is refused as a directory that is not there, not as a
+    // stale preparation — "prepare again" is no remedy for a project that is
+    // gone (agent review, PR #1557) — and the running worker is left alone.
+    let moved = project.with_extension("old");
+    std::fs::rename(&project, &moved).expect("move the verified directory away");
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    let error = response.error.clone().unwrap_or_default();
+    assert!(
+        !response.restarted && error.contains("is not a directory"),
+        "a restart whose verified directory was deleted must be refused as not a directory; \
+         response = {response:?}"
+    );
+    assert!(
+        !error.contains("Prepared project directory changed"),
+        "a deleted directory is not a stale preparation; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
+    );
+
+    // Rename-and-replace: the verified object sits at `<project>.old`, and a
+    // directory with its own config (the same role, so the restart resolves a
+    // command) takes the pathname.
+    std::fs::create_dir(&project).expect("put a replacement at the verified path");
+    std::fs::copy(
+        moved.join(".dot-agent-deck.toml"),
+        project.join(".dot-agent-deck.toml"),
+    )
+    .expect("give the replacement a config");
+
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    // A restart that was (wrongly) served starts its command asynchronously;
+    // give it the time a `touch` needs before looking for the marker.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !project.join(MARKER).exists(),
+        "the prepared role was restarted in the REPLACEMENT directory; response = {response:?}"
+    );
+    assert!(
+        !response.restarted && response.error.is_some(),
+        "a restart whose verified directory was replaced must be refused; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
+    );
+
+    // Control: put the verified directory back. The pathname names the object
+    // the start verified again, so the same restart is served and runs there.
+    std::fs::remove_dir_all(&project).expect("remove the replacement");
+    std::fs::rename(&moved, &project).expect("restore the verified directory");
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        response.restarted && response.error.is_none(),
+        "control: a restart in the verified directory must succeed; response = {response:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !project.join(MARKER).exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        project.join(MARKER).exists(),
+        "control: the restarted worker must have run in the verified directory"
+    );
 }

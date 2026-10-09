@@ -440,7 +440,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 ### One task per worker at a time
 
-A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a card can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy.
+A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a worker's card (TUI) or row (desktop) can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy, until a different agent takes over its pane: a task the exited agent had received does not make the new agent busy.
 
 When the earlier task is not coming back:
 
@@ -513,7 +513,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts | What the orchestrator is told: its `prompt_template`, the available workers, and how to delegate. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |
@@ -648,6 +648,7 @@ The pane is not part of a running orchestration in the daemon. If the orchestrat
 - The `--to` value must match a role `name` exactly, including case.
 - A role renamed in the file after the orchestration started keeps its old name until the orchestration is started again.
 - A role added after the orchestration started, or whose pane was closed, is not running: have the orchestrator run `dot-agent-deck pane spawn <role>`.
+- A worker that crashed or quit on its own is not running either, unless its role has `clear = true`, which starts a fresh worker for every task: have the orchestrator run `dot-agent-deck pane restart <role>`, then delegate again.
 - The orchestrator cannot delegate to itself.
 - Delegation does not cross orchestrations: the worker must be in the same orchestration as the orchestrator.
 
@@ -680,6 +681,14 @@ The report names the worker's pane; the daemon log names the role and, for a fai
 
 Without `--force`, `pane restart` restarts only a worker whose agent has exited. An agent that is running but hung has not exited, so it is refused the same way. Look at the worker's pane; if it is stuck, run `dot-agent-deck pane restart <role> --force`. The orchestrator can use `--force` when it sees this message; if you want force-restarts to stay your decision, say so in its `prompt_template`.
 
+### `pane restart` says the worker's working directory "is not a directory"
+
+The directory the worker runs in has been deleted, or a file now has its path. Nothing was restarted and the running worker was left as it was. Put the directory back, or close the orchestration and start it again from a directory that exists.
+
+### `pane restart` says the prepared working directory "was replaced"
+
+The role was started from the desktop app's New agent dialog or Runs screen, and the directory at its path is no longer the one that launch checked: the project was moved away and another directory put in its place. Nothing was restarted and the running worker was left as it was. Move the original directory back, or start the orchestration again from the desktop app.
+
 ### `pane spawn` says the role "is already running in this orchestration"
 
 `pane spawn` starts a role that has no pane; it does not start a second copy. To run two workers of the same kind, give the second its own role name in `.dot-agent-deck.toml` (for example `reviewer2`) and spawn that.
@@ -698,6 +707,7 @@ A `work-done` the deck cannot match to a task the orchestrator delegated reaches
 - the task never reached the worker (the orchestrator saw `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up`);
 - the task was sent more than seven days ago;
 - `pane restart` dropped the task the worker owed.
+- the worker the task went to exited before reporting, and the report came from a different agent started in its pane since.
 
 ### The report went to a different file than `work-done-<role>.md`
 

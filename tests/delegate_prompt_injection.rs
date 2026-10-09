@@ -30,6 +30,8 @@ use tokio::sync::broadcast;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
+#[cfg(unix)]
+use dot_agent_deck::env_override;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
 };
@@ -86,19 +88,36 @@ const OBSERVED_READINESS_DELIVERY_CEILING: Duration = Duration::from_secs(10);
 
 /// Serializes process-environment changes when this integration-test binary is
 /// run through plain `cargo test`; nextest already gives each test a process.
+///
+/// **What the lock does not cover** (issue #1516). `set_var` / `remove_var` race
+/// any *thread* reading the environment at that moment, and this lock excludes
+/// sibling tests, not threads. So [`EnvGuard`] writes only while no Tokio
+/// runtime exists, and refuses otherwise (`common::env_write`): every test sets
+/// its guards before building its runtime and drops them after the runtime has
+/// dropped, which joins the runtime's threads. A test that changes a knob
+/// between two delegates does it through `dot_agent_deck::env_override`, which
+/// is behind a lock of its own. At a guard's write, the threads that can exist
+/// are the test's own, libtest's runner thread waiting for it, and the harness's
+/// `load-context` heartbeat once a harness temp dir exists, which sleeps and
+/// reads `/proc`, never the environment. When a guard drops, the detached PTY
+/// reader of an agent whose PTY has not reached EOF can still be running
+/// (`agent_pty::pump_reader`); it reads its PTY and updates the registry, and
+/// reads no environment variable. Under plain `cargo test` a sibling test that
+/// takes no lock and reads the environment races these writes (issue #245).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
+    previous: Vec<(String, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    fn set(values: &[(&'static str, &str)]) -> Self {
+    fn set(values: &[(&str, &str)]) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let mut previous = Vec::with_capacity(values.len());
         for (key, value) in values {
-            previous.push((*key, std::env::var_os(key)));
-            // SAFETY: every env-mutating test in this integration-test binary
-            // holds ENV_LOCK for the guard's full lifetime.
+            previous.push(((*key).to_string(), std::env::var_os(key)));
+            // SAFETY: a stated residual — see `ENV_LOCK` for the threads that
+            // exist here. The caller holds that lock for the guard's lifetime.
             unsafe { std::env::set_var(key, value) };
         }
         Self { previous }
@@ -115,30 +134,26 @@ impl EnvGuard {
     /// has almost certainly left one behind, which would silently floor the very
     /// skip the caller is measuring.
     #[cfg(unix)]
-    fn unset(keys: &[&'static str]) -> Self {
+    fn unset(keys: &[&str]) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::unset");
         let mut previous = Vec::with_capacity(keys.len());
         for key in keys {
-            previous.push((*key, std::env::var_os(key)));
-            // SAFETY: the caller holds ENV_LOCK for the guard's full lifetime.
+            previous.push(((*key).to_string(), std::env::var_os(key)));
+            // SAFETY: as in `EnvGuard::set`.
             unsafe { std::env::remove_var(key) };
         }
         Self { previous }
-    }
-
-    fn repoint(&self, key: &'static str, value: &str) {
-        assert!(
-            self.previous.iter().any(|(saved, _)| *saved == key),
-            "cannot repoint an environment key this guard does not own: {key}"
-        );
-        // SAFETY: the caller still holds ENV_LOCK while this guard is alive.
-        unsafe { std::env::set_var(key, value) };
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvGuard::drop");
+        }
         for (key, previous) in self.previous.drain(..).rev() {
-            // SAFETY: the caller still holds ENV_LOCK while this guard drops.
+            // SAFETY: as in `EnvGuard::set`, and the caller still holds
+            // ENV_LOCK. `ENV_LOCK` names what can still run at a drop.
             unsafe {
                 match previous {
                     Some(value) => std::env::set_var(key, value),
@@ -300,6 +315,19 @@ async fn advance_and_run(duration: Duration) {
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
+    let owned_contents;
+    let contents = if path.file_name().is_some_and(|name| name == "codex") {
+        // Execute this check on the stand-in itself, including every respawn;
+        // checking only the parent SpawnOptions would miss lost inherited env.
+        owned_contents = contents.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n[ -n \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\" ] || { echo FIXTURE-ROOT-MISSING >&2; exit 93; }\nfor value in \"$HOME\" \"$CODEX_HOME\" \"$XDG_CONFIG_HOME\"; do\ncase \"$value\" in \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\"/*) ;; *) echo FIXTURE-HOME-ESCAPE >&2; exit 93 ;; esac\ndone\n",
+            1,
+        );
+        owned_contents.as_str()
+    } else {
+        contents
+    };
     std::fs::write(path, contents).expect("write synthetic agent executable");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod synthetic agent executable");
@@ -318,10 +346,47 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
     )
 }
 
+/// Pin every agent-config destination in the initial spawn's saved environment;
+/// the registry carries this same environment into replacement/respawn launches.
+#[cfg(unix)]
+fn owned_wrapped_agent_env(
+    root: &std::path::Path,
+    mut env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let home = root.join("agent-home");
+    let codex = home.join(".codex");
+    let xdg = home.join(".config");
+    for dir in [&home, &codex, &xdg] {
+        std::fs::create_dir_all(dir).expect("create owned wrapped-agent home");
+    }
+    let installed = home.join(".local/bin/dot-agent-deck");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    write_executable(&installed, "#!/bin/sh\nexit 0\n");
+    for (key, path) in [
+        ("HOME", home.clone()),
+        ("CODEX_HOME", codex),
+        ("XDG_CONFIG_HOME", xdg),
+        ("CLAUDE_CONFIG_DIR", home.join(".claude")),
+        ("DEVIN_CONFIG_DIR", home.join(".config/devin")),
+        ("PI_CODING_AGENT_DIR", home.join(".pi/agent")),
+        (
+            "DOT_AGENT_DECK_STATE_DIR",
+            home.join(".local/state/dot-agent-deck"),
+        ),
+        ("DOT_AGENT_DECK_TEST_CONFIG_ROOT", root.to_path_buf()),
+    ] {
+        debug_assert!(path.starts_with(root), "{key} escaped the owned fixture");
+        env.retain(|(existing, _)| existing != key);
+        env.push((key.to_string(), path.display().to_string()));
+    }
+    env.push(("DOT_AGENT_DECK_TEST_CONFIG_WRITE".into(), "1".into()));
+    env
+}
+
 #[cfg(unix)]
 fn clear_true_config(command: &str) -> String {
     format!(
-        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{command}\"\nclear = true\n"
+        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )
 }
 
@@ -468,7 +533,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let cwd = common::race_safe_tempdir();
     let stub = cwd.path().join("slow-readiness-agent.py");
     write_slow_readiness_stub(&stub);
-    let command = stub.to_string_lossy().into_owned();
+    let command = common::capability_export_command(&stub.to_string_lossy());
     tokio::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         clear_true_config(&command),
@@ -529,7 +594,13 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize slow-stub SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize slow-stub SessionStart"),
     )
     .expect("write slow-stub SessionStart");
     // Issue #709: NOT a boot wait — the stub has already printed — but still a
@@ -609,9 +680,9 @@ async fn wait_for_replacement_agent(
 
 #[cfg(unix)]
 fn register_orchestration(state: &mut AppState, cwd: &str) {
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd.to_string(),
     };
     state
         .pane_role_map
@@ -724,9 +795,9 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     // StartAgent path records for a live orchestration tab: an
     // orchestrator pane (the only valid delegate source) and a worker
     // pane in the SAME orchestration.
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
     let mut state = AppState::default();
     state
@@ -821,12 +892,14 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives.
+/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives. The test runs as it would from inside a developer's deck pane — with that deck's default endpoint reachable through its `XDG_RUNTIME_DIR`, stood in for by a decoy — and nothing it spawns may reach that deck: the user saw this test's `worker-pane` appear on their real dashboard (PR #1451).
 #[spec("orchestration/delegate/007")]
 #[test]
 #[cfg(unix)]
 fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let real_deck = DecoyDeck::bind();
+    let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
         (
             DELEGATE_READINESS_BUFFER_ENV,
@@ -842,6 +915,73 @@ fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
         .build()
         .expect("build wrapper readiness runtime")
         .block_on(delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inner());
+    real_deck.assert_untouched("delegate_007");
+}
+
+/// The deck a developer runs this suite from, stood in for: a hook and an
+/// attach socket that nothing in a test may ever reach. [`DecoyDeck::ambient`]
+/// puts it at the default endpoint under `XDG_RUNTIME_DIR` — the address a
+/// child with its endpoint scrubbed falls back to, which is how a socketless
+/// registry's wrapped worker reached the real deck before PR #1451.
+///
+/// Not also in `DOT_AGENT_DECK_SOCKET` / `DOT_AGENT_DECK_ATTACH_SOCKET`, though
+/// a developer's pane does put the real deck there. Inherited copies of those
+/// are cleared before `main` (`common::detach_before_main`), and since issue
+/// #678 the harness refuses to run with them set again in-process rather than
+/// scrubbing them at run time, which raced threads already reading the
+/// environment. They never reached a child here anyway: both callers run
+/// `common::init_test_env()` before spawning anything, and it used to remove
+/// them at that point. The inheritance shape itself is covered where it can be
+/// set up honestly, in a re-executed child's environment
+/// (`tests/harness_isolation.rs`).
+#[cfg(unix)]
+struct DecoyDeck {
+    dir: tempfile::TempDir,
+    listeners: Vec<std::os::unix::net::UnixListener>,
+}
+
+#[cfg(unix)]
+impl DecoyDeck {
+    fn bind() -> Self {
+        let dir = common::race_safe_tempdir();
+        let listeners = ["dot-agent-deck.sock", "dot-agent-deck-attach.sock"]
+            .into_iter()
+            .map(|name| {
+                let listener = std::os::unix::net::UnixListener::bind(dir.path().join(name))
+                    .expect("bind decoy deck endpoint");
+                listener
+                    .set_nonblocking(true)
+                    .expect("decoy deck endpoint non-blocking");
+                listener
+            })
+            .collect();
+        Self { dir, listeners }
+    }
+
+    fn ambient(&self) -> EnvGuard {
+        let runtime = self.dir.path().display().to_string();
+        EnvGuard::set(&[("XDG_RUNTIME_DIR", &runtime)])
+    }
+
+    /// Fails with what reached the decoy, if anything did.
+    fn assert_untouched(&self, test: &str) {
+        use std::io::Read;
+        let mut reached = Vec::new();
+        for listener in &self.listeners {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("decoy read timeout");
+                let mut frame = Vec::new();
+                let _ = stream.read_to_end(&mut frame);
+                reached.push(String::from_utf8_lossy(&frame).into_owned());
+            }
+        }
+        assert!(
+            reached.is_empty(),
+            "{test}: something it spawned reached the developer's real deck, which would paint a ghost card there: {reached:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -850,7 +990,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create synthetic Codex bin dir");
-    write_executable(&bin_dir.join("codex"), "#!/bin/sh\nexec cat\n");
+    write_executable(
+        &bin_dir.join("codex"),
+        &format!(
+            "#!/bin/sh\n{}\n",
+            common::capability_export_command("exec cat")
+        ),
+    );
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"codex\"\nclear = true\n",
@@ -862,14 +1008,17 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped Codex stand-in");
@@ -911,7 +1060,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let native = session_start_event(AgentType::Codex, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&native).expect("serialize native Codex SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &native,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize native Codex SessionStart"),
     )
     .expect("write native Codex SessionStart");
     let after_native = wait_for_snapshot_needle(
@@ -1036,7 +1191,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write observed-readiness orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -1074,7 +1229,13 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize matching SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize matching SessionStart"),
     )
     .expect("write matching SessionStart");
     // MEASURE the hold rather than racing it (issue #243).
@@ -1128,7 +1289,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
 #[cfg(unix)]
 fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (
             DELEGATE_READINESS_BUFFER_ENV,
             &DELEGATE_READINESS_BUFFER_MS.to_string(),
@@ -1143,11 +1304,15 @@ fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
         .expect("build timeout-fallback readiness runtime")
         .block_on(async {
             delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1");
+            // Issue #1516: the later arms change the buffer through
+            // `env_override`, not the environment. Each value still goes through
+            // the deck's own parser, so " 1 \t" and the overflow arm test what
+            // they did; the first arm above is the one that reads the variable.
+            let buffer = env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1"));
             delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, " 1 \t");
+            buffer.repoint(Some(" 1 \t"));
             delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "18446744073709551616");
+            buffer.repoint(Some("18446744073709551616"));
             delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner().await;
         });
 }
@@ -1366,7 +1531,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
 #[cfg(unix)]
 fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -1378,16 +1543,31 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         .build()
         .expect("build slow-readiness toggle runtime")
         .block_on(async {
-            let zero = run_slow_readiness_delegate(0).await;
+            // The control needs the zero-buffer pointer to land INSIDE the
+            // stub's 650 ms discard window. On a starved machine the delivery
+            // leg alone can outlast it (seen at load ~31 with I/O stalled 61%),
+            // and the pointer then arrives after the stub is ready — a fact
+            // about the machine, not the buffer. Up to three tries for it to
+            // land in the window; a stub whose window does not exist fails
+            // every one.
+            let mut zero = run_slow_readiness_delegate(0).await;
+            for _ in 1..3 {
+                if !snapshot_contains(&zero.snapshot, POINTER) {
+                    break;
+                }
+                zero = run_slow_readiness_delegate(0).await;
+            }
             assert!(
                 !snapshot_contains(&zero.snapshot, POINTER),
                 "the zero-buffer control unexpectedly delivered the pointer outside the stub's discard window; snapshot = {:?}",
                 String::from_utf8_lossy(&zero.snapshot)
             );
 
-            env.repoint(
+            // Issue #1516: through `env_override`, because the zero arm's daemon
+            // tasks are still on this runtime's workers.
+            let _buffer = env_override::override_for_tests(
                 DELEGATE_READINESS_BUFFER_ENV,
-                &DELEGATE_READINESS_BUFFER_MS.to_string(),
+                Some(&DELEGATE_READINESS_BUFFER_MS.to_string()),
             );
             let buffered = run_slow_readiness_delegate(DELEGATE_READINESS_BUFFER_MS).await;
             eprintln!(
@@ -1554,14 +1734,17 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped ready stand-in");
@@ -1868,14 +2051,17 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped interface-fact stand-in");
@@ -2258,9 +2444,8 @@ async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_r
 /// The production value is `SESSION_START_WAIT_TIMEOUT` (30 s), and the only
 /// knob that brings the post-release buffer within a fast-tier test's reach is
 /// the scheduler's own `DOT_AGENT_DECK_SESSION_START_WAIT_MS`. Two seconds
-/// leaves the weak fact (~0.8 s after the banner: a 750 ms settle window plus
-/// the wrapper's 50 ms poll) more than a second of room to arrive first, which
-/// is what makes the release a release ON the weak fact rather than a timeout.
+/// is advanced only after the real wrapper's weak fact has arrived. Child
+/// startup and hook delivery therefore cannot spend this virtual budget.
 #[cfg(unix)]
 const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 
@@ -2278,16 +2463,11 @@ const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 #[cfg(unix)]
 const REPRICE_FIXTURE_BUFFER_MS: u64 = 4000;
 
-/// Issue #724: the stand-in's cooked dwell for `scheduler/spawn/010`, in
-/// seconds as `sleep` spells it.
-///
-/// Sized so the strong fact lands inside the weak fact's buffer with room on
-/// both sides: the gate releases at ~`REPRICE_FIXTURE_WAIT_MS` (2 s), the strong
-/// fact arrives at ~3.55 s, and the weak buffer would end at ~6 s. So ~1.5 s of
-/// margin separates it from the release — the side where a miss makes the run
-/// vacuous, which the control checks — and ~2.5 s from the buffer's end.
+/// The stand-in stays cooked until the test has crossed the readiness wait
+/// and entered the weak fact's buffer. Only then may the real wrapper observe
+/// raw input. A file handshake replaces the old 3.5 s startup race.
 #[cfg(unix)]
-const REPRICE_FIXTURE_COOKED_DWELL: &str = "3.5";
+const REPRICE_ALLOW_RAW: &str = "reprice-allow-raw";
 
 /// The nonce-carrying banner `scheduler/spawn/010`'s stand-in paints.
 #[cfg(unix)]
@@ -2298,7 +2478,7 @@ const REPRICE_READY_BANNER: &str = "Ask Codex to do anything (reprice-5c1d)";
 #[cfg(unix)]
 const REPRICE_PROMPT: &str = "SCHEDREPRICEMARKER list the files";
 
-/// Scenario: Fire a scheduled single-agent Codex through the real spawn primitive, into a wrapped stand-in that paints its banner, stays in COOKED mode for 3.5 s and only then clears `ICANON`/`ECHO`, with the scheduler's readiness wait shortened to 2 s. The wait expires holding the wrapper's weak output-settled fact, so the gate releases on it and starts that fact's buffer; the strong raw-input fact then lands while that buffer is still running. Assert the prompt reaches the pane no sooner than a full buffer after the STRONG fact, not at the end of the buffer the weak fact started.
+/// Scenario: Fire a scheduled Codex stand-in through the real spawn primitive and wrapper, holding it in cooked mode until the wrapper's weak fact arrives and a paused clock crosses the readiness wait. Permit raw mode 300 ms into the weak buffer, then assert the prompt is absent at that buffer's original deadline and just before a full buffer from the real strong fact, and arrives after the repriced deadline.
 #[spec("scheduler/spawn/010")]
 #[test]
 #[cfg(unix)]
@@ -2306,21 +2486,7 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let wait_ms = REPRICE_FIXTURE_WAIT_MS.to_string();
     let buffer_ms = REPRICE_FIXTURE_BUFFER_MS.to_string();
-    let _env = EnvGuard::set(&[
-        (SESSION_START_WAIT_ENV, &wait_ms),
-        (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
-    ]);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("build re-pricing readiness runtime")
-        .block_on(spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner());
-}
-
-#[cfg(unix)]
-async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner() {
-    let daemon = common::spawn_inprocess_daemon().await;
+    common::init_test_env();
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create wrapped-agent bin dir");
@@ -2332,17 +2498,45 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
     write_executable(
         &bin_dir.join("codex"),
         &format!(
-            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nsleep {REPRICE_FIXTURE_COOKED_DWELL}\nstty raw -echo\nexec cat\n"
+            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nwhile [ ! -e {REPRICE_ALLOW_RAW} ]; do sleep 0.02; done\nstty raw -echo\nexec cat\n"
         ),
     );
     // The spawn primitive gives a scheduled pane no per-spawn environment of its
     // own beyond its pane id, so the child finds the stand-in (and the wrapper
-    // finds the built deck) through THIS process's `PATH`. The ENV_LOCK the
-    // caller holds covers it.
+    // finds the built deck) through THIS process's `PATH`. Set here, before the
+    // runtime and the in-process daemon exist (issue #1516); it used to be set
+    // inside the runtime, after the daemon's tasks had started.
     let path = path_with_built_deck(&bin_dir);
-    let _path = EnvGuard::set(&[("PATH", &path)]);
+    let _env = EnvGuard::set(&[
+        (SESSION_START_WAIT_ENV, &wait_ms),
+        (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
+        ("PATH", &path),
+    ]);
+    // SpawnRequest has no per-child config environment. The outer test holds
+    // ENV_LOCK, so pin the ambient homes for this entire scheduled spawn run —
+    // set here, before the runtime exists, like every other guard (issue #1516).
+    let homes = owned_wrapped_agent_env(cwd.path(), Vec::new());
+    let values: Vec<(&str, &str)> = homes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let _homes = EnvGuard::set(&values);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build re-pricing readiness runtime")
+        .block_on(
+            spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner(&cwd),
+        );
+}
 
+#[cfg(unix)]
+async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner(
+    cwd: &tempfile::TempDir,
+) {
+    let daemon = common::spawn_inprocess_daemon().await;
     let collector = EventCollector::start(&daemon.event_tx);
+    tokio::time::pause();
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
             task_name: "reprice".to_string(),
@@ -2355,16 +2549,14 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
         &daemon.registry,
         &SpawnTestNotifier,
         Some(&daemon.event_tx),
-        // Detached, so this returns once the delivery task is running and the
-        // readiness wait has (all but) begun. `returned` is the upper bound on
-        // when that wait started, which is what the release-ordering control
-        // below needs.
+        // Detached: the current-thread runtime runs the delivery task when the
+        // wall-clock poll below yields, without advancing the paused clock.
         true,
         Some(&daemon.state),
     )
     .await
     .expect("the scheduler spawn primitive must bring the wrapped Codex card up");
-    let returned = chrono::Utc::now();
+    let returned = tokio::time::Instant::now();
     let agent_id = handle.delivery_agent_id.clone();
     assert!(
         daemon.registry.agent_spawned_as_wrapper_host(&agent_id),
@@ -2372,84 +2564,94 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
          wrap`, or its strong fact is priced as an ordinary one and nothing here is re-priced"
     );
 
-    let weak = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let strong = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let wait = chrono::Duration::milliseconds(REPRICE_FIXTURE_WAIT_MS as i64);
-
-    // CONTROL 1: the weak fact arrived while the wait was still open, so the
-    // wait's expiry released the gate ON it and started its buffer. A weak fact
-    // that missed the wait would make this an unready timeout instead, which the
-    // scheduler writes with no buffer at all.
+    let has_fact = |origin: &str| {
+        collector
+            .interface_session_starts(&agent_id)
+            .iter()
+            .any(|event| {
+                event
+                    .metadata
+                    .get(SESSION_START_ORIGIN_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(origin)
+            })
+    };
+    // The real wrapper and hook socket use wall time. Keep yielding to the
+    // daemon without moving its readiness clock while they boot under load.
     assert!(
-        weak.timestamp < returned + wait,
-        "control: the weak fact was stamped {:?}, not inside the {REPRICE_FIXTURE_WAIT_MS} ms \
-         readiness wait that began by {returned:?}, so the gate did not release on it",
-        weak.timestamp
+        poll_until_after_time_advance(Duration::from_secs(30), || {
+            has_fact(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced its weak interface fact"
     );
-    // CONTROL 2, the one that keeps this from being vacuous: the strong fact
-    // came AFTER the release. Had it come inside the wait, the gate would have
-    // released on it directly and priced it from its own arrival with or
-    // without re-pricing, and the bound below would hold for the wrong reason.
-    // The wait began after `spawn` was called and, in ordinary scheduling,
-    // before it returned, so its expiry is at most `returned + wait`; the
-    // 250 ms is room for the delivery task's first poll.
+    assert_eq!(
+        tokio::time::Instant::now(),
+        returned,
+        "control: fixture startup must not spend the readiness wait"
+    );
+    advance_and_run(Duration::from_millis(REPRICE_FIXTURE_WAIT_MS) + TIMER_TICK_SLACK).await;
+    let prompt_seen = || {
+        snapshot_contains(
+            &daemon.registry.snapshot(&agent_id).unwrap_or_default(),
+            REPRICE_PROMPT.as_bytes(),
+        )
+    };
     assert!(
-        strong.timestamp > returned + wait + chrono::Duration::milliseconds(250),
-        "control: the strong fact was stamped {:?}, before the readiness wait that began by \
-         {returned:?} could have expired, so the gate released on it directly and this run \
-         says nothing about a buffer already in flight",
-        strong.timestamp
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "control: the prompt was written at release, so no weak buffer was in flight"
     );
-
-    let snapshot = wait_for_snapshot_needle(
-        &daemon.registry,
-        &agent_id,
-        REPRICE_PROMPT.as_bytes(),
-        HELD_POINTER_DELIVERY_CEILING,
+    assert!(
+        !has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
+        "control: the strong fact must not release the readiness wait directly"
+    );
+    let strong_at = Duration::from_millis(300);
+    advance_and_run(strong_at).await;
+    std::fs::write(cwd.path().join(REPRICE_ALLOW_RAW), "ready").unwrap();
+    assert!(
+        poll_until_after_time_advance(Duration::from_secs(10), || {
+            has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced raw input after permission"
+    );
+    // Cross the old weak-buffer deadline, leaving nearly 300 ms of the strong
+    // buffer unpaid. A scheduler that omits repricing writes here.
+    advance_and_run(
+        Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS) - strong_at + TIMER_TICK_SLACK * 10,
     )
     .await;
-    // Measured from the wrapper's own stamp on the strong event, which is at or
-    // before the daemon acted on it, so latency only pushes this UP — the same
-    // one-sided shape `orchestration/delegate/026` uses.
-    let held_from_strong = (chrono::Utc::now() - strong.timestamp)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
     assert!(
-        snapshot_contains(&snapshot, REPRICE_PROMPT.as_bytes()),
-        "the scheduled prompt never reached the pane within {HELD_POINTER_DELIVERY_CEILING:?} \
-         of the strong interface fact; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        !poll_until_after_time_advance(Duration::from_millis(500), prompt_seen).await,
+        "the scheduled prompt was written at the weak buffer's deadline instead of repricing \
+         from the real strong interface fact"
     );
+    advance_and_run(strong_at - TIMER_TICK_SLACK * 10 - Duration::from_millis(10)).await;
     assert!(
-        held_from_strong >= Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS),
-        "the scheduled prompt landed {held_from_strong:?} after the wrapper's STRONG interface \
-         fact, short of the {REPRICE_FIXTURE_BUFFER_MS} ms buffer that fact is priced at. The \
-         gate had already released on the weak output-settled fact, and the buffer that fact \
-         started ran to its end although the strong fact landed inside it: a full-screen TUI \
-         that has just taken raw mode is still initialising and eats input, so the prompt was \
-         written into it on the weak fact's schedule (issue #724)"
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "the scheduled prompt was written before the full strong interface buffer elapsed"
+    );
+    advance_and_run(Duration::from_millis(10) + TIMER_TICK_SLACK).await;
+    assert!(
+        poll_until_after_time_advance(HELD_POINTER_DELIVERY_CEILING, prompt_seen).await,
+        "the scheduled prompt never reached the pane after the repriced deadline; snapshot = {:?}",
+        String::from_utf8_lossy(&daemon.registry.snapshot(&agent_id).unwrap_or_default())
     );
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, and does reach it once the 5000 ms interface buffer measured from the strong fact has passed.
+/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, does reach it once the 5000 ms interface buffer measured from the strong fact has passed, and that the wrapped worker never reaches the decoy deck standing in for the developer's own.
 #[spec("orchestration/delegate/039")]
 #[test]
 #[cfg(unix)]
 fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Run as a developer runs it, with that deck's default endpoint reachable
+    // through `XDG_RUNTIME_DIR`: this test's wrapped worker reached the real
+    // deck that way and showed up as a `worker-pane` ghost card on the user's
+    // dashboard (PR #1451).
+    let real_deck = DecoyDeck::bind();
+    let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
@@ -2465,6 +2667,7 @@ fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() 
         .block_on(
             delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight_inner(),
         );
+    real_deck.assert_untouched("delegate_039");
 }
 
 #[cfg(unix)]
@@ -2476,13 +2679,15 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
     // A cooked-mode `cat` named `codex`, so the respawn resolves it to a
     // Wrapper-strategy agent and runs it under a REAL `dot-agent-deck wrap` —
     // which is what makes the pane a wrapper host in the deck's own launch
-    // record. This registry has no hook socket, so nothing the wrapper reports
-    // reaches THIS test, and the two interface facts below are the test's to
-    // place in time. It does still report: with no endpoint in its environment
-    // it resolves the platform default and posts a fork-time `SessionStart`
-    // there. Until issue #1473 that default was the developer's live deck —
-    // the ghost "Codex" card — and it now lands on the harness's redirected,
-    // listener-less `XDG_RUNTIME_DIR` (`common::detach_before_main`).
+    // record. This registry has no hook socket, so the registry hands that
+    // wrapper an endpoint that leads nowhere and the two interface facts below
+    // are the test's to place in time. The wrapper does still report — a
+    // fork-time `SessionStart` — and before PR #1451 the registry handed it NO
+    // endpoint, so it resolved the platform default: the developer's live deck,
+    // as a ghost "Codex" `worker-pane` card. Issue #1473 separately redirects
+    // that default for the whole test process (`common::detach_before_main`);
+    // `DecoyDeck::ambient` puts a live-looking `XDG_RUNTIME_DIR` back on top of
+    // that redirect, so this test still proves the registry's own pin holds.
     // `app-server` is the hook-listing probe; see `scheduler/spawn/010`.
     write_executable(
         &bin_dir.join("codex"),
@@ -2499,10 +2704,13 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped worker");
@@ -2661,11 +2869,17 @@ impl dot_agent_deck::scheduler::Notifier for SpawnTestNotifier {
 #[cfg(unix)]
 fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("build raw-input readiness runtime");
+    // One runtime per arm, built after that arm's guards and dropped before
+    // them (issue #1516): a runtime shared by both arms would still hold arm 1's
+    // threads, and any of its tasks still running, while arm 2's guard writes
+    // the environment.
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("build raw-input readiness runtime")
+    };
     let script = raw_input_agent_script();
 
     {
@@ -2680,7 +2894,7 @@ fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
         let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
-        runtime.block_on(delegate_027_raw_input_fact_pays_the_interface_buffer_inner(
+        runtime().block_on(delegate_027_raw_input_fact_pays_the_interface_buffer_inner(
             &script,
         ));
     }
@@ -2696,7 +2910,7 @@ fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
             (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
-        runtime.block_on(
+        runtime().block_on(
             delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner(&script),
         );
     }
@@ -2849,7 +3063,7 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate and be priced as an ORDINARY readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
+/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then authenticate its `SessionStart` while forging the wrapper's strong `wrapper_interface_ready` metadata marker. The marker must release the gate and be priced as an ordinary readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
 #[spec("orchestration/delegate/028")]
 #[test]
 #[cfg(unix)]
@@ -2878,7 +3092,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write forged-marker orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -2930,10 +3144,9 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let posted_at = Instant::now();
     // THE FORGERY. One JSON line on the daemon's hook socket, carrying the
     // wrapper's strong interface marker for a pane no wrapper is running on.
-    // #243's audit reproduced exactly this from a bare `python3` with no deck
-    // environment at all: `metadata` is free-form by contract and the socket
-    // authenticates nobody, so the marker is producer-writable and the daemon
-    // must not grant a privilege on it alone.
+    // Authenticate this ordinary pane with its own capability so admission
+    // reaches the metadata-trust check: a producer's interface marker alone
+    // must not grant the wrapper's readiness privilege.
     let forged = session_start_event_with_origin(
         AgentType::None,
         WORKER_PANE,
@@ -2942,7 +3155,13 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     );
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&forged).expect("serialize forged interface SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &forged,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize forged interface SessionStart"),
     )
     .expect("write forged interface SessionStart");
 
@@ -3653,8 +3872,11 @@ impl SilentWorkerArm {
                 &self.event_tx,
             )
             .await;
+        // A precondition, so its wait returns the moment the pointer lands;
+        // 2 s was overrun twice on a starved box (I/O stalled) while the test
+        // passed 3/3 alone (met on PR #1523). Nothing here times the product.
         let delivered =
-            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(2)).await;
+            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(10)).await;
         assert!(
             delivered.windows(POINTER.len()).any(|w| w == POINTER),
             "silent-worker visibility control failed: the worker never received the delegate \
@@ -3800,7 +4022,7 @@ fn write_generation_sentinel_worker(path: &std::path::Path, generation_marker: &
 #[cfg(unix)]
 fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -3919,7 +4141,10 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 String::from_utf8_lossy(&generation_a_delivered)
             );
 
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1400");
+            // Issue #1516: through `env_override`, because generation A's tasks
+            // are still alive on this runtime's workers.
+            let _buffer =
+                env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1400"));
             state
                 .handle_delegate(
                     DelegateSignal {
@@ -4124,7 +4349,11 @@ impl SilenceHarness {
         }
     }
 
-    async fn delegate_and_wait_for_pointer(&self) {
+    /// Returns the worker pane's pointer delivery epoch as it stood the moment
+    /// `handle_delegate` returned — before the dispatch it spawned has run, so
+    /// before the delivered pointer is confirmed and moves it. See
+    /// [`Self::wait_until_pointer_confirmed`].
+    async fn delegate_and_wait_for_pointer(&self) -> Option<u64> {
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -4139,11 +4368,14 @@ impl SilenceHarness {
                 &self.event_tx,
             )
             .await;
+        let armed = self.registry.pointer_delivery_epoch(WORKER_PANE);
+        // A precondition: returns as soon as the pointer lands. 2 s was overrun
+        // on a starved box while the test passed 3/3 alone (met on PR #1523).
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
             POINTER,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .await;
         assert!(
@@ -4151,6 +4383,30 @@ impl SilenceHarness {
             "silence-watch precondition failed: worker never received pointer; snapshot = {:?}",
             String::from_utf8_lossy(&delivered)
         );
+        armed
+    }
+
+    /// Drive the runtime, without moving a paused clock, until the pointer
+    /// write has returned and been confirmed delivered — which is what arms
+    /// the silent-worker watch — and the watch's task has been polled once,
+    /// so its window is counted from the clock as it stands now.
+    ///
+    /// The pointer being VISIBLE is not that moment: its CR follows the
+    /// payload, and the PTY writes it on the pane writer's own thread (issue
+    /// #525), so the confirmation lands a runtime turn after the bytes do. A
+    /// test that pauses the clock as soon as the pointer shows and then
+    /// advances it can otherwise arm the watch after the advance.
+    async fn wait_until_pointer_confirmed(&self, armed: Option<u64>) {
+        assert!(
+            poll_until_after_time_advance(Duration::from_secs(5), || {
+                self.registry.pointer_delivery_epoch(WORKER_PANE) != armed
+            })
+            .await,
+            "the delivered pointer was never confirmed, so the silent-worker watch never armed"
+        );
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn start_draft_delegate(&self, supersede: bool) {
@@ -4932,6 +5188,150 @@ fn idle_worker_029_waiting_silence_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Silence);
 }
 
+/// Scenario: A worker's first pointer lands, and the orchestrator delegates to
+/// it again with `--supersede` while the test holds that newer dispatch on the
+/// worker pane's dispatch lock, so the first delegation's "went quiet" report
+/// fires and waits on an unsent draft in the orchestrator's pane. The test then
+/// releases the lock, the newer pointer lands, and the orchestrator's draft is
+/// sent. The stale report about the first delegation must not arrive, while the
+/// newer delegation's own report still must.
+#[spec("scheduler/idle-worker/031")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_lands() {
+    // Scaled for a contended machine (issue #1526 was met on starved CI
+    // runners): the setup must fit inside the first window, and the waits
+    // below are measured in windows.
+    let window = common::load_scaled(Duration::from_millis(2000));
+    let window_ms = window.as_millis().to_string();
+    const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, window_ms.as_str()),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build displaced-silence-report runtime")
+        .block_on(async {
+            const ORCHESTRATOR_DRAFT: &[u8] = b"orchestrator-draft-1526";
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            let first_delivered = Instant::now();
+
+            // Inside the first delegation's window: the newer delegate's
+            // dispatch is held on the worker pane's dispatch lock, so its
+            // pointer cannot land until the test lets it.
+            let dispatch_lock = harness.registry.pane_dispatch_lock(WORKER_PANE);
+            let held = dispatch_lock.lock().await;
+            let pointers_before = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .unwrap_or_default()
+                .windows(POINTER.len())
+                .filter(|window| *window == POINTER)
+                .count();
+            let delivery_before = harness.registry.pointer_delivery_epoch(WORKER_PANE);
+            harness.start_draft_delegate(true).await;
+            harness
+                .send_orchestrator_user_bytes(ORCHESTRATOR_DRAFT)
+                .await;
+            let typed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                ORCHESTRATOR_DRAFT,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&typed, ORCHESTRATOR_DRAFT),
+                "orchestrator draft never reached its PTY: {:?}",
+                String::from_utf8_lossy(&typed)
+            );
+            assert!(
+                first_delivered.elapsed() < window,
+                "precondition: the setup outlasted the first delegation's window, so its report \
+                 may have fired before the newer delegate was armed"
+            );
+
+            // Past the first window: its report has fired and waits on the
+            // orchestrator's draft.
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1000))).await;
+            let waiting = harness.orchestrator_snapshot();
+            assert!(
+                !String::from_utf8_lossy(&waiting).contains(SILENCE_NEEDLE),
+                "the went-quiet report did not wait for the orchestrator's draft: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+
+            // The newer pointer lands while the report about the first
+            // delegation still waits.
+            drop(held);
+            let landed = wait_for_snapshot_where(
+                &harness.registry,
+                &harness.worker_agent_id,
+                Duration::from_secs(5),
+                |snapshot| {
+                    snapshot
+                        .windows(POINTER.len())
+                        .filter(|window| *window == POINTER)
+                        .count()
+                        > pointers_before
+                },
+            )
+            .await;
+            assert!(
+                landed
+                    .windows(POINTER.len())
+                    .filter(|window| *window == POINTER)
+                    .count()
+                    > pointers_before,
+                "the newer pointer never landed once its dispatch was released: {:?}",
+                String::from_utf8_lossy(&landed)
+            );
+            assert!(
+                poll_until_after_time_advance(Duration::from_secs(5), || {
+                    harness.registry.pointer_delivery_epoch(WORKER_PANE) != delivery_before
+                })
+                .await,
+                "the newer pointer's delivery was never confirmed"
+            );
+
+            harness.send_orchestrator_user_bytes(b"\r").await;
+            // The newer delegation's own report, armed when its pointer landed,
+            // is still owed and must arrive.
+            let reported = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                window + common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&reported),
+                "the newer delegation's went-quiet report never arrived: {:?}",
+                String::from_utf8_lossy(&reported)
+            );
+            // Every chance for a second report to land before counting: the
+            // newer delegation's own report fires a whole window after its
+            // pointer, so whichever arrived first, the other is due within one.
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1500))).await;
+            let after = harness.orchestrator_snapshot();
+            let text = String::from_utf8_lossy(&after);
+            assert_eq!(
+                text.matches(SILENCE_NEEDLE).count(),
+                1,
+                "a went-quiet report about a delegation whose question a newer pointer had \
+                 already answered was delivered once the orchestrator's draft was sent \
+                 (Qodo, PR #1502): {text:?}"
+            );
+        });
+}
+
 /// Scenario: Clear an unsent worker draft with Ctrl+U while a production
 /// delegate waits. The pointer must then arrive without submitting that draft.
 #[test]
@@ -5373,7 +5773,7 @@ fn delegate_startup_idle_does_not_suppress_silence_notice() {
 #[cfg(unix)]
 fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -5384,8 +5784,13 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
         .build()
         .expect("build no-event parser runtime")
         .block_on(async {
+            // Issue #1516: each value goes through `env_override`, not the
+            // environment: an earlier harness's tasks and PTY reader threads
+            // are still alive when the next value is set. The deck's own parser
+            // reads it either way, which is what this test is about.
+            let window = env_override::override_for_tests(DELEGATE_NO_EVENT_WINDOW_ENV, None);
             for raw in ["1", " 1 \t"] {
-                env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, raw);
+                window.repoint(Some(raw));
                 let harness = SilenceHarness::new(64).await;
                 harness.delegate_and_wait_for_pointer().await;
                 let notice = wait_for_silence_notice(
@@ -5401,14 +5806,12 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
                 );
             }
 
-            env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, "18446744073709551616");
+            window.repoint(Some("18446744073709551616"));
             let harness = SilenceHarness::new(64).await;
-            harness.delegate_and_wait_for_pointer().await;
+            let armed = harness.delegate_and_wait_for_pointer().await;
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..3 {
-                tokio::task::yield_now().await;
-            }
+            harness.wait_until_pointer_confirmed(armed).await;
             std::thread::sleep(Duration::from_millis(50));
             let early = harness.orchestrator_snapshot();
             assert!(

@@ -32,6 +32,7 @@ vi.mock("@xterm/addon-fit", () => ({
 }));
 
 import shared from "../../../tests/fixtures/editing-shortcuts.json";
+import { getTerminal } from "../lib/terminalRegistry";
 import { TerminalViewport } from "./TerminalViewport";
 
 // xterm's browser service watches the device pixel ratio through
@@ -113,7 +114,16 @@ const keyV = (mods: Partial<Key> = {}): Key => ({ key: "v", code: "KeyV", keyCod
 
 /** A row of the shared editing-shortcut table, as the browser delivers it. */
 function sharedKey(row: { key: string; modifiers: string[] }): Key {
-  const keyCodes: Record<string, number> = { ArrowLeft: 37, ArrowRight: 39, Backspace: 8, Delete: 46, Home: 36, End: 35 };
+  const keyCodes: Record<string, number> = {
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    Backspace: 8,
+    Delete: 46,
+    Home: 36,
+    End: 35,
+  };
   const keyCode = keyCodes[row.key];
   if (keyCode === undefined) throw new Error(`no key code for ${row.key}`);
   return {
@@ -271,6 +281,43 @@ describe("TerminalViewport editing and paste shortcuts (issue #1422)", () => {
     const { sent, press } = mountTerminal();
     press(sharedKey(row));
     expect(sent).toEqual([row.bytes]);
+  });
+
+  /**
+   * Scenario: on every platform, open an agent's terminal whose program then
+   * turns on application cursor mode (`ESC[?1h`, as a full-screen editor or
+   * pager does), and press each key of the shared table (issue #1477). The
+   * arrows, Home and End reach the agent in that mode's form, the same keys
+   * with a modifier and every other key are unchanged — the bytes the TUI
+   * sends in the same mode. Once the program turns the mode off (`ESC[?1l`),
+   * the ordinary form again.
+   */
+  it.each(["mac", "windows", "linux"] as const)("%s: follows the program's application cursor mode", async (platform) => {
+    onPlatform(platform);
+    const { sent, press } = mountTerminal();
+    const terminal = getTerminal(undefined, "agent-1");
+    if (!terminal) throw new Error("the terminal did not register");
+    const programWrites = (data: string) => new Promise<void>((resolve) => terminal.write(data, resolve));
+    const named = (row: { key: string; modifiers: string[] }) => `${[...row.modifiers, row.key].join("+")}`;
+    const same = (a: { key: string; modifiers: string[] }, b: { key: string; modifiers: string[] }) =>
+      a.key === b.key && [...a.modifiers].sort().join() === [...b.modifiers].sort().join();
+    const ordinary = [...shared.translated, ...shared.standard];
+    const application = [
+      ...shared.application_cursor,
+      ...ordinary.filter((row) => !shared.application_cursor.some((other) => same(row, other))),
+    ];
+
+    const pressAll = (rows: typeof ordinary) =>
+      rows.map((row) => {
+        sent.length = 0;
+        press(sharedKey(row));
+        return [named(row), sent.slice()];
+      });
+
+    await programWrites(`${ESC}[?1h`);
+    expect(pressAll(application)).toEqual(application.map((row) => [named(row), [row.bytes]]));
+    await programWrites(`${ESC}[?1l`);
+    expect(pressAll(ordinary)).toEqual(ordinary.map((row) => [named(row), [row.bytes]]));
   });
 
   /**

@@ -165,6 +165,14 @@
      order would win over it unconditionally. See `.voice-row` for what each one
      is and which surfaces subtract it. */
   --voice-row-height: 40px;
+  /* The row's least height while voice is ON (PR #1451): the resting height,
+     a constant rather than `--voice-row-height` itself, because that variable
+     is overwritten with the row's measured height while voice is on and a
+     least height that read it could only ever grow. The row grows past this
+     when its larger text needs more, or a sentence wraps, and then
+     `VoiceControlPanel` writes the measured height into `--voice-row-height`
+     on the root, so every surface below still keeps clear of it. */
+  --voice-row-min-height: 40px;
   /* The rail's height when it is a BOTTOM bar, which it is only under
      `max-width: 680px`. Zero everywhere else, so the row sits on the window's
      own bottom edge. */
@@ -505,6 +513,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .connection-banner > div { display: flex; flex-direction: column; gap: 2px; }
 .connection-banner strong { font-size: 11px; }
 .connection-banner span { font-size: 10px; }
+.connection-detail { font-size: 10px; }
+.connection-detail summary { cursor: pointer; width: fit-content; }
+.connection-detail > span { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+.overview-note .connection-detail { font-size: 12px; color: var(--muted); }
 .connection-banner .button { margin-left: auto; }
 .connection-actions { margin-left: auto; display: flex !important; flex-direction: row !important; gap: 6px !important; }
 .connection-actions .button { margin-left: 0; }
@@ -636,6 +648,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-jump:hover { background: var(--shell-teal-surface); }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
+/* Issue #1492: xterm shows its scrollbar only while the terminal is hovered or
+   scrolled, so output above or below the rows on screen was invisible at rest.
+   `has-scrollback` is set by `TerminalViewport` while there is any, and keeps
+   the bar shown and usable then; a terminal whose output fits has none. */
+.terminal-host.has-scrollback .xterm .xterm-scrollable-element > .scrollbar.vertical { opacity: 1; pointer-events: auto; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }
 .panel-caption { margin-bottom: 8px; display: flex; align-items: center; gap: 5px; color: var(--shell-faint); text-transform: uppercase; letter-spacing: .09em; }
 .diff-panel > code { padding: 4px 0; display: block; border-bottom: 1px solid var(--shell-line); color: var(--shell-teal-text); }
@@ -1009,6 +1026,19 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
+.upgrade-dialog { width: min(440px, 100%); }
+.upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }
+.upgrade-stages { list-style: none; margin: 12px auto 4px; padding: 0; max-width: 320px; display: grid; gap: 5px; text-align: left; font-size: 10.5px; }
+.upgrade-stages li { display: flex; align-items: center; gap: 7px; color: var(--muted); }
+.upgrade-stages li[data-state="active"] { color: var(--ink); font-weight: 600; }
+.upgrade-stages li[data-state="done"] { color: var(--ink); }
+.upgrade-stage-dot { width: 14px; height: 14px; display: inline-grid; place-items: center; }
+.upgrade-stage-dot::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
+.upgrade-stop-list { margin: 0 auto 12px; padding: 7px 10px 7px 24px; max-width: 360px; max-height: 180px; overflow: auto; text-align: left; font-size: 10px; line-height: 1.5; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); overflow-wrap: anywhere; }
+.upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
+.confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step
@@ -1026,11 +1056,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-row:hover { background: var(--paper-sunken); }
 .new-agent-row.is-active { background: var(--teal-soft); }
 .new-agent-row.is-chosen .new-agent-row-name { color: var(--teal-deep); }
-.new-agent-row.is-disabled { color: var(--faint); cursor: default; }
-.new-agent-row.is-disabled:hover { background: transparent; }
 .new-agent-row-name { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .new-agent-row-tag { padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }
-.new-agent-row-reason { flex-basis: 100%; color: var(--faint); font-size: 9.5px; }
 .new-agent-current input, .new-agent-field input, .new-agent-field select { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); font: inherit; font-size: 11px; }
 .new-agent-current { display: flex; align-items: center; gap: 9px; }
 .new-agent-current strong { min-width: 0; flex: 1; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -1050,8 +1077,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* The single surface (PRD #1223): deck, directory browser and form stacked in one scrolling body. */
 .new-agent-section { display: flex; flex-direction: column; gap: 7px; }
 .new-agent-section + .new-agent-section { padding-top: 9px; border-top: 1px solid var(--line); }
-.new-agent-section > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
-.new-agent-list.is-decks { max-height: 132px; }
+.new-agent-section > h3, .new-agent-section-head > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+/* PR #1451 round 3, change 4: the daemons are always shown in full. */
+.new-agent-list.is-decks { max-height: none; overflow: visible; }
 .new-agent-list.is-directories { max-height: 200px; }
 .new-agent-list[aria-disabled="true"] { opacity: .6; }
 .new-agent-current .new-agent-keys { flex: 1; }
@@ -1064,6 +1092,24 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-chip { min-height: 26px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 13px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 10px; font-weight: 650; }
 .new-agent-chip.is-active { border-color: var(--teal-deep); color: var(--on-accent); background: var(--teal); }
 .new-agent-chip.is-disabled { border-style: dashed; color: var(--faint); cursor: not-allowed; }
+/*
+  PR #1451 round 3, change 4 — while voice is on, the dialog takes its full
+  height and the directory rows fill what the body leaves, as a grid of as many
+  columns as fit (`NewAgentDialog` measures the list and pages it to what it
+  holds), so nothing voice can choose is scrolled out of sight. The list never
+  scrolls then: its height comes from the space, not from its rows. The Mode
+  chips become a grid of the field's width, paged to the rows the body shows.
+*/
+.new-agent-dialog.is-voice-pages { width: min(880px, 100%); height: calc(100vh - 11vh - 40px); }
+.new-agent-dialog.is-voice-pages .new-agent-body { flex: 1 1 auto; }
+.new-agent-dialog.is-voice-pages .new-agent-directory-panel { flex: 1 0 auto; }
+.new-agent-list.is-directories.is-paged { flex: 1 1 0; min-height: 106px; max-height: none; overflow: hidden; display: grid; grid-auto-flow: column; gap: 2px; align-content: stretch; }
+.new-agent-list.is-paged .new-agent-row { min-width: 0; flex-wrap: nowrap; }
+.new-agent-chips.is-paged { display: grid; gap: 5px; }
+.new-agent-chips.is-paged .new-agent-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; }
+.new-agent-page { color: var(--muted); font-size: 9.5px; font-weight: 650; white-space: nowrap; }
+.new-agent-field > span .new-agent-page { display: block; margin-top: 2px; font-weight: 500; }
 /* The overview's own line for what the New agent flow could not finish on
    screen — an agent that started and has not been listed yet. */
 .overview-banner { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); font-size: 10px; }
@@ -1071,6 +1117,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-banner button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 3px; color: inherit; background: transparent; cursor: pointer; }
 .daemon-new-agent { flex: 0 0 auto; margin-left: auto; }
 .daemon-pips + .daemon-new-agent { margin-left: 0; }
+.daemon-upgrade { flex: 0 0 auto; margin-left: auto; }
+.daemon-pips + .daemon-upgrade { margin-left: 0; }
+.daemon-upgrade + .daemon-new-agent { margin-left: 0; }
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
    otherwise sit on top of the report text, which is the same corner. The STACK
    is what is positioned (issue #1234): each undismissed cleanup warning is its
@@ -1212,6 +1261,32 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    fleet view; the gap is what separates two decks' cards from each other now
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+/* Issue #1492: the dashboard's daemons scroll in their own region, between the
+   top bar and the voice row, rather than the whole window scrolling. Its
+   scrollbar is then the dashboard's own and is drawn at rest: macOS and most
+   Linux desktops otherwise show a scrollbar only while it is being scrolled,
+   so a dashboard with more below looked complete. Styling it is what keeps
+   WebKit and WebView2 from treating it as an overlay that fades; it is still
+   drawn only when the daemons overflow. A region rather than the window, so
+   the full-window layers over the dashboard (an agent pane, a dialog, the
+   voice row) keep the whole window's width. Not beside
+   `scrollbar-color`/`scrollbar-width`, which make Chromium ignore these rules. */
+.overview-screen .deck-main { height: calc(100vh - var(--bottom-rail-height)); min-height: 0; display: flex; flex-direction: column; }
+/* `position: relative` makes the region the containing block of what is
+   absolutely positioned inside it — the visually hidden table headers — so it
+   clips them; otherwise they sit at their static place below the window and
+   make the window scroll as well. */
+.overview-screen .overview-body { position: relative; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* Focusable so the keyboard can scroll it; the ring sits inside the region, which would clip one drawn outside. */
+.overview-screen .overview-body:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.overview-body::-webkit-scrollbar { width: 12px; }
+.overview-body::-webkit-scrollbar-track { background: var(--canvas); }
+.overview-body::-webkit-scrollbar-thumb { min-height: 40px; border: 3px solid var(--canvas); border-radius: 6px; background: var(--line-strong); }
+.overview-body::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+.workspace-page { color: var(--ink); font-weight: 700; }
+/* Issue #1492: a row scrolled into view by voice (`revealAgent`) stops a
+   little inside the dashboard's scroll region rather than flush with its edge. */
+.overview-row { scroll-margin: 12px 0; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather
    than alarming: an unreachable deck in a fleet is a fact about that deck, and
@@ -1380,6 +1455,29 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
 .overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }
 
+/* ---- Issue #1496: the agent dashboard's filter ---- */
+.dashboard-filter { display: flex; align-items: center; gap: 6px; }
+.dashboard-filter .button span { white-space: nowrap; }
+.dashboard-filter-text { width: 120px; height: 28px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); font: inherit; font-size: 10px; }
+.dashboard-filter-text:focus { outline: 2px solid var(--line-strong); outline-offset: 1px; }
+.dashboard-filter-menu { min-width: 220px; max-height: min(420px, 70vh); overflow-y: auto; }
+.dashboard-filter-menu fieldset { margin: 0 0 6px; padding: 0; border: 0; }
+.dashboard-filter-menu legend { padding: 2px 4px; color: var(--faint); font-size: 8.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+/* What the filter shows, on its own line under the header; the counts in the header stay the whole fleet's. */
+.dashboard-filter-line { min-height: 34px; padding: 4px 22px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); color: var(--ink); background: var(--paper-strong); font-size: 10px; }
+.dashboard-filter-summary { font-weight: 700; }
+.dashboard-filter-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.dashboard-filter-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 3px 2px 8px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--paper); }
+.dashboard-filter-chip button { width: 18px; height: 18px; display: grid; place-items: center; border: 0; border-radius: 50%; color: var(--muted); background: transparent; cursor: pointer; }
+.dashboard-filter-chip button:hover { color: var(--ink); background: var(--paper-strong); }
+.dashboard-filter-line > .button { margin-left: auto; }
+/* A daemon or group none of whose agents the filter shows: one line, never dropped silently. */
+.overview-filter-empty { margin: 0; padding: 8px 12px; color: var(--muted); font-size: 10px; }
+@media (max-width: 760px) {
+  .dashboard-filter-text { width: 110px; }
+  .dashboard-filter-line { padding: 4px 10px; }
+}
+
 /* ---- PRD #1105: one agent's pane, over the screen it was opened from ---- */
 /* The frame around every tile, open or not. Closed it is `display: contents`,
    so `.agent-tile` stays the grid item it has always been and nothing about the
@@ -1394,6 +1492,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    what the browser tier measures. Between `.reader-overlay` (80) and
    `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
 .agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+/* PRD #1260 — the dictation mode, marked on the pane it is typing into so it is
+   visible where the user is looking. Pinned to the pane's top edge, over the
+   scrim's padding rather than over the tile's own header. */
+.agent-pane-dictating { position: absolute; z-index: 1; top: 0; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px); margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); background: var(--amber-ink); font-size: 11px; font-weight: 650; line-height: 14px; }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
    tile, and every one of them exists to outrank something. The compound
    `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
@@ -1565,3 +1667,67 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    name. `--amber` rather than the muted ink the hint uses, because this is the
    one line in the row that says something is ABOUT to happen. */
 .voice-dictation { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: 11px; font-weight: 600; }
+/* PRD #1260 — the dictation mode's non-voice exit, beside the Voice button and
+   never squeezed out by a long report. */
+.voice-stop-typing { flex: 0 0 auto; }
+/* PR #1451 — typing mode's nudge to send: the "“send it” to send" words lit
+   after a pause with dictated text unsent. Styling only — the sentence reads
+   the same lit or not — and a pulse that runs twice rather than forever, so it
+   catches the eye and then stays put. */
+.voice-send-hint { border-radius: 4px; transition: background-color .2s ease, color .2s ease; }
+.voice-send-hint[data-nudge="on"] { padding: 0 .3em; color: var(--ink); background: var(--amber-soft); box-shadow: 0 0 0 1px var(--amber-rim); animation: voice-nudge 1.1s ease-in-out 2; }
+@keyframes voice-nudge { 50% { box-shadow: 0 0 0 3px var(--amber-rim); } }
+@media (prefers-reduced-motion: reduce) { .voice-send-hint[data-nudge="on"] { animation: none; } }
+
+/* PR #1451 — while voice is ON what the row SAYS is half as large again, so it
+   can be read at a glance from the keyboard. Every text size below is 1.5
+   times its resting value above. The Voice button keeps its resting size: a
+   1.5x button made the row taller than its text, and the difference was empty
+   space (the maintainer's hand test). So the row is only as tall as what it
+   holds, never under `--voice-row-min-height`.
+
+   **It wraps instead of eliding while on**, which is a change to the row's
+   contract rather than an exception to it: the reservation every other surface
+   makes is `--voice-row-height`, and while voice is on that is the row's
+   measured height (see `--voice-row-min-height`), so a wrapped sentence grows
+   the reservation with it instead of running under the screen. At a narrow
+   window the larger text would otherwise lose most of a sentence to the
+   ellipsis. Off, none of this applies and the row is its resting 40px. */
+.voice-row[data-voice="on"] { height: auto; min-height: var(--voice-row-min-height); padding-top: 4px; padding-bottom: 4px; }
+.voice-row[data-voice="on"] .voice-report-card { flex-wrap: wrap; row-gap: 4px; column-gap: 15px; }
+.voice-row[data-voice="on"] .voice-sentence,
+.voice-row[data-voice="on"] .voice-dictation,
+.voice-row[data-voice="on"] .voice-hint { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+.voice-row[data-voice="on"] .voice-sentence,
+.voice-row[data-voice="on"] .voice-dictation { font-size: 16.5px; }
+.voice-row[data-voice="on"] .voice-hint { font-size: 15px; }
+.voice-row[data-voice="on"] .voice-note { font-size: 13.5px; }
+.voice-row[data-voice="on"] .voice-cost { font-size: 12px; }
+
+/* PRD #1261 — the numbered choice, a dialog centred over the screen in
+   `ConfirmDialog`'s card (`.confirm-dialog` on the same element) rather than a
+   strip in this row (PR #1451 round 3).
+
+   It is a DOM child of `.voice-row` so that it keeps the row's modal-peer
+   exemption, and a child cannot be drawn above its parent's stacking context —
+   so while a choice is open the ROW is raised over `.dialog-backdrop` (100),
+   which is what puts the choice above the New agent dialog, where the
+   daemon, directory and mode ties happen. The scrim stops at the row's top
+   edge (`--voice-reserved`), so the row stays readable below it, saying what
+   was heard. A D5 confirmation closes the choice, so the two never stack. */
+.voice-row[data-choice="open"] { z-index: 101; }
+.voice-choice-backdrop { position: fixed; inset: 0 0 var(--voice-reserved) 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgb(var(--scrim-rgb) / .42); }
+.voice-choice { width: min(420px, 100%); max-height: 100%; overflow-y: auto; }
+.voice-choice p { font-size: 11px; }
+.voice-choice-list { margin: 0 0 14px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.voice-choice-list button { width: 100%; justify-content: flex-start; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; text-align: left; }
+.voice-choice > div:last-child { align-items: center; gap: 12px; }
+/* Amber for the dictation countdown's reason — it is the one thing here that
+   says something is about to END. */
+.voice-choice-timer { color: var(--amber-ink); font-size: 13px; font-weight: 600; white-space: nowrap; }
+
+/* PR #1451 round 3, change 3 — the number an item shows while voice is on,
+   before its name. One look on every numbered list: the dashboard's rows, the
+   Daemons screen's tiles, and the New agent dialog's daemons, directories and
+   modes. Tabular figures, so 9 and 10 take the same width down a list. */
+.voice-number { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; min-width: 20px; height: 16px; padding: 0 4px; border-radius: 3px; color: var(--teal-deep); background: var(--teal-soft); font-family: "JetBrains Mono", monospace; font-size: 10px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }

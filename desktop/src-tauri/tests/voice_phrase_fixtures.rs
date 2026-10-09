@@ -52,19 +52,26 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice, VoiceDirectories,
-    VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice,
+    VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm,
+    VoiceOutcome,
     dictation::normalise,
-    handle_utterance_with, table,
+    handle_utterance_with_dictation,
+    schema::DECK_HIDDEN_HINT,
+    table,
     test_support::{
-        api_preset, api_resolver, in_orchestration, in_titled_orchestration, role_agent_in_state,
-        with_tool,
+        api_preset, api_resolver, facets_fleet, in_orchestration, in_titled_orchestration,
+        role_agent_in_state, with_tool,
     },
 };
 use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("../src/voice/phrase_fixtures.toml");
 const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+/// Run only the fixtures whose name contains this text — rule 6's "rerun only
+/// the failing test", for a manifest that is one test function. The manifest
+/// is still pre-validated in full; only the model calls are narrowed.
+const FIXTURE_FILTER_ENV: &str = "DOT_AGENT_DECK_VOICE_FIXTURE";
 /// The credential the keyed backend authenticates with, as the developer's own
 /// shell already spells it. Rule 5's lane 2: a developer's key on a developer's
 /// machine, and nothing registered on the repository.
@@ -78,9 +85,10 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 30;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
-/// The deck step's reason for the planted disabled deck — the fallback the
-/// webview shows for a deck whose daemon is not listening.
-const STALE_BOX_REASON: &str = "No deck is listening on the configured socket.";
+/// The short reason class the webview declares for the planted deck that
+/// cannot take a new agent — `DECK_SHORT_REASON.disconnected` in
+/// `desktop/src/lib/newAgent.ts` (PR #1451 round 3, change 6).
+const STALE_BOX_REASON: &str = "it is not connected";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,10 +113,19 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// On a `param_ambiguous` fixture over decks alone: the model may also
+    /// settle the tie itself, dispatching one of the `candidates` (issue
+    /// #1491). The instructions ask it to answer a tie with the user's words,
+    /// and the shipping model picks one of the tied decks instead; a switch is
+    /// undone by the next one, so either answer is correct and only a deck
+    /// outside the tie fails.
+    #[serde(default)]
+    tie_may_be_settled: bool,
     /// The report must say the deck the user named cannot take a new agent
-    /// (PRD #1223): the planted `ci@stale-box` is disabled at the New agent
-    /// dialog's deck step, so it is never offered to the model and never
-    /// preselected, and naming it must be answered with the step's reason.
+    /// (PRD #1223): the planted `ci@stale-box` cannot take one, so the New
+    /// agent dialog does not list it, the model is shown it only as one in
+    /// `decks_without_new_agent`, it is never preselected, and naming it must be
+    /// answered with its short reason.
     #[serde(default)]
     names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
@@ -136,6 +153,14 @@ struct PhraseFixture {
     /// The registry id an `agent_type_ref` param must resolve to.
     #[serde(default)]
     resolved_agent_type: Option<String>,
+    /// The dashboard filter's kind an `agent_kind` param must resolve to
+    /// (issue #1496).
+    #[serde(default)]
+    resolved_kind: Option<String>,
+    /// The dashboard filter's status an `agent_status` param must resolve to
+    /// (issue #1496).
+    #[serde(default)]
+    resolved_status: Option<String>,
     /// Whether the New agent dialog is open with NO live form (PRD #1223) —
     /// what a spoken "start it" meets before a directory is chosen.
     #[serde(default)]
@@ -149,6 +174,12 @@ struct PhraseFixture {
     /// fleet.
     #[serde(default)]
     generated_run: bool,
+    /// Plant [`facets_fleet`] instead of the `build` fleet (issue #1495):
+    /// agents whose labels say nothing about what they are doing, told apart
+    /// only by their mode, agent type, directory, orchestration, last prompt
+    /// or start time. The only value is `"facets"`.
+    #[serde(default)]
+    fleet: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -160,8 +191,33 @@ struct PhraseFixture {
     /// and its casing and punctuation are its own.
     #[serde(default)]
     dictate_prefix: Option<String>,
+    /// The text a `filter_text` param must resolve to — what the directory
+    /// Filter box would be set to (PR #1451 round 3, change 5). The app
+    /// lowercases it, so it is written lowercase here and compared exactly.
+    #[serde(default)]
+    resolved_filter: Option<String>,
+    /// The command a `command_text` param must resolve to — what the New agent
+    /// form's Command field would be set to (PR #1451 round 4, decision D8).
+    /// It is the transcript's own slice, so it is compared exactly.
+    #[serde(default)]
+    resolved_command: Option<String>,
     #[serde(default)]
     pending_action: bool,
+    /// PRD #1541 — run the utterance with typing mode on for the planted
+    /// tester's pane (`handle_utterance_with_dictation`), where nothing reaches
+    /// the model. Absent means `Idle`, which is every fixture that predates it.
+    /// Agent screen only, since typing mode lives there.
+    #[serde(default)]
+    typing_mode: bool,
+    /// The candidate values a `param_ambiguous` fixture must offer as a
+    /// numbered choice (PRD #1261), compared as a set: the order is the
+    /// resolver's and is pinned by the unit tests, while what a fixture can
+    /// prove is that the real model's answer lands on a tie the chooser can
+    /// offer — neither a lost candidate nor an extra one. Required on every
+    /// `param_ambiguous` fixture, so a tie that reached the user as a bare
+    /// sentence (no candidates) goes red instead of passing on the kind.
+    #[serde(default)]
+    candidates: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -322,6 +378,31 @@ fn marked_prefix(outcome: &VoiceOutcome) -> Option<&str> {
     }
 }
 
+/// The model's own value for the param a refusal or a tie is about — what the
+/// sentence cannot always show, since a refusal such as "I did not catch which
+/// daemon" deliberately does not quote it. Without it a red fixture cannot say
+/// whether the model or the app's check moved.
+fn model_value(outcome: &VoiceOutcome) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::ParamUnresolved { spoken, .. }
+        | VoiceOutcome::ParamAmbiguous { spoken, .. } => Some(spoken),
+        _ => None,
+    }
+}
+
+/// The values a tie offers as a numbered choice (PRD #1261), if it offers one.
+fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
+    match outcome {
+        VoiceOutcome::ParamAmbiguous { candidates, .. } => Some(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.clone())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Scenario: Validate every checked-in phrase and the planted fleet before any
 /// live-model gate. With local opt-in, verify outcomes through the shipping
 /// keyed API backend with the deck shown or hidden as each fixture specifies.
@@ -360,6 +441,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
     atlas_two.display_name = Some("Atlas".to_string());
     let ambiguous_name_agents = vec![atlas_one, atlas_two];
+    let facet_agents = facets_fleet();
     // The run title a real orchestration gets — `<basename>-orchestrator-N`,
     // inheriting the repository's name — which nobody says word for word.
     let generated_run_agents: Vec<_> = [
@@ -382,15 +464,29 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     .collect();
     // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
     // and one remote, labelled the way the overview labels them — plus a
-    // remote the New agent dialog shows DISABLED, which the model is never
-    // shown, so no fixture can preselect it (checked on every fixture below).
+    // remote the New agent dialog shows DISABLED, which the model sees only
+    // among `decks_without_new_agent` and no fixture may preselect (checked on
+    // every fixture below).
+    // Issue #1491 — and the Daemon selector's All daemons entry, which the app
+    // appends to every utterance's decks (`selector_voice_decks`) the same way:
+    // switchable, and never offered to the New agent dialog.
     let decks = vec![
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: dot_agent_deck_desktop::voice::ALL_DECKS_ID.to_string(),
+            label: dot_agent_deck_desktop::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
             label: "Local deck".to_string(),
             address: None,
             local: true,
             unavailable: None,
+            // The planted agents are this machine's.
+            holds_agents: true,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-build-box".to_string(),
@@ -398,6 +494,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: None,
+            holds_agents: false,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-stale-box".to_string(),
@@ -405,6 +502,27 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
+            holds_agents: false,
+        },
+        // A daemon named as one word, which speech-to-text splits ("mini PC"),
+        // and one the app is not connected to, as every daemon but the one
+        // shown is under a single-daemon selection: switchable, never offered
+        // to the New agent dialog.
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-minipc".to_string(),
+            label: "minipc".to_string(),
+            address: Some("ops@10.0.0.7".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+            holds_agents: false,
+        },
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-inmotion".to_string(),
+            label: "inmotion".to_string(),
+            address: Some("ops@10.0.0.8".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+            holds_agents: false,
         },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says
@@ -421,6 +539,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 path: format!("/home/dev/code/{name}"),
             })
             .collect(),
+        paging: None,
     };
     let mut hostile_directories = directories.clone();
     for name in [
@@ -458,6 +577,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             ],
             // What the dialog withholds with the flag off (PRD #1223).
             withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
+            mode_paging: None,
         }),
     };
     let form_choices = new_agent_form.form.as_ref().expect("planted");
@@ -469,7 +589,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.name
             );
         }
-        if let Some(expected) = fixture.resolved_agent_type.as_deref() {
+        // The dashboard filter's agent type (issue #1496) is any type the
+        // deck knows, so it needs no form.
+        if let Some(expected) = fixture
+            .resolved_agent_type
+            .as_deref()
+            .filter(|_| fixture.action != dot_agent_deck_desktop::voice::FILTER_DASHBOARD_ROW)
+        {
             assert!(
                 fixture.form
                     && form_choices
@@ -486,6 +612,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             fixture.name,
             fixture.screen
         );
+        if fixture.typing_mode {
+            assert_eq!(
+                fixture.screen, "agent",
+                "{}: typing mode lives on the agent screen",
+                fixture.name
+            );
+        }
         if fixture.deck_hidden {
             assert_eq!(
                 fixture.screen, "overview",
@@ -513,8 +646,33 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.action
             );
         }
+        assert_eq!(
+            fixture.candidates.is_some(),
+            fixture.outcome == OutcomeKind::ParamAmbiguous,
+            "{}: `candidates` is required on, and only on, a `param_ambiguous` fixture",
+            fixture.name
+        );
+        assert!(
+            !fixture.tie_may_be_settled || fixture.outcome == OutcomeKind::ParamAmbiguous,
+            "{}: `tie_may_be_settled` belongs only on a `param_ambiguous` fixture",
+            fixture.name
+        );
+        if let Some(fleet) = fixture.fleet.as_deref() {
+            assert_eq!(
+                fleet, "facets",
+                "{}: `fleet` names an unknown planted fleet",
+                fixture.name
+            );
+            assert!(
+                !fixture.generated_run,
+                "{}: `fleet` and `generated_run` each plant a fleet; pick one",
+                fixture.name
+            );
+        }
         if let Some(expected) = fixture.resolved_agent.as_deref() {
-            let planted = if fixture.generated_run {
+            let planted = if fixture.fleet.is_some() {
+                &facet_agents
+            } else if fixture.generated_run {
                 &generated_run_agents
             } else {
                 &agents
@@ -529,6 +687,27 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             assert!(
                 decks.iter().any(|deck| deck.id == expected),
                 "{}: fixture expects unknown deck id `{expected}`",
+                fixture.name
+            );
+        }
+        if let Some(expected) = fixture.resolved_filter.as_deref() {
+            assert!(
+                fixture.listing || fixture.hostile_listing,
+                "{}: a `resolved_filter` needs `listing = true` or `hostile_listing = true`, \
+                 since the Filter box is the directory browser's",
+                fixture.name
+            );
+            assert_eq!(
+                expected,
+                expected.to_lowercase(),
+                "{}: `resolved_filter` is compared with the app's lowercased value",
+                fixture.name
+            );
+        }
+        if fixture.resolved_command.is_some() {
+            assert!(
+                fixture.form,
+                "{}: a `resolved_command` needs `form = true`, since Command is the live form's",
                 fixture.name
             );
         }
@@ -579,7 +758,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let suite_started = Instant::now();
     let mut failures = Vec::new();
 
+    let filter = std::env::var(FIXTURE_FILTER_ENV)
+        .ok()
+        .filter(|filter| !filter.trim().is_empty());
     for fixture in fixtures.fixtures {
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !fixture.name.contains(filter))
+        {
+            continue;
+        }
         let Some(screen) = Screen::parse(&fixture.screen) else {
             failures.push(format!(
                 "{}: fixture names unknown screen `{}`",
@@ -591,6 +779,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         let started = Instant::now();
         let fixture_agents = if fixture.name == "open-agent-ambiguous-name" {
             &ambiguous_name_agents
+        } else if fixture.fleet.is_some() {
+            &facet_agents
         } else if fixture.generated_run {
             &generated_run_agents
         } else {
@@ -609,9 +799,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         } else {
             None
         };
+        let typing_target = VoiceDictationTarget {
+            deck_id: "deck-local".to_string(),
+            agent_id: "agent-tester".to_string(),
+        };
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance_with(
+            handle_utterance_with_dictation(
                 resolver.as_ref(),
                 table(),
                 screen,
@@ -619,6 +813,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 &decks,
                 fixture_directories,
                 fixture_new_agent,
+                fixture.typing_mode.then_some(&typing_target),
                 transcript,
                 Default::default(),
                 !fixture.deck_hidden,
@@ -658,10 +853,43 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     }
                     None => true,
                 };
+                let kind_matches = match fixture.resolved_kind.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::AgentKind) == Some(expected)
+                    }
+                    None => true,
+                };
+                let status_matches = match fixture.resolved_status.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::AgentStatus) == Some(expected)
+                    }
+                    None => true,
+                };
                 let orchestration_matches = match fixture.resolved_orchestration.as_deref() {
                     Some(expected) => {
                         resolved_label(&answer.outcome, ParamKind::OrchestrationRef)
                             == Some(expected)
+                    }
+                    None => true,
+                };
+                let candidates_match = match fixture.candidates.as_deref() {
+                    Some(expected) => offered_values(&answer.outcome).is_some_and(|mut offered| {
+                        let mut expected = expected.to_vec();
+                        offered.sort();
+                        expected.sort();
+                        offered == expected
+                    }),
+                    None => true,
+                };
+                let filter_matches = match fixture.resolved_filter.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::FilterText) == Some(expected)
+                    }
+                    None => true,
+                };
+                let command_matches = match fixture.resolved_command.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::CommandText) == Some(expected)
                     }
                     None => true,
                 };
@@ -681,7 +909,9 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // Both are claims about the New agent dialog's deck, so neither
                 // applies to `switch_deck` (PRD #1195): the Daemon selector
                 // switches to a deck the dialog disables, and its report is
-                // "Showing <deck>." rather than a preselection. The first is
+                // "Showing <deck>." rather than a preselection. Nor to the
+                // dashboard filter (issue #1496), whose daemon is one to filter
+                // by and is reported as "Daemon: <deck>.". The first is
                 // scoped to the rows that append "Preselected daemon:" at all —
                 // an OPTIONAL `deck_ref` — which also stops it failing every
                 // `choose_deck` fixture, whose report is "Daemon: <deck>.".
@@ -689,13 +919,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     VoiceOutcome::Dispatch { action, .. } => table().row(action),
                     _ => None,
                 };
-                let preselects = dispatched.is_some_and(|row| {
-                    row.params
-                        .iter()
-                        .any(|param| param.kind == ParamKind::DeckRef && param.optional)
+                let for_new_agent = dispatched.is_none_or(|row| {
+                    row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW
+                        && row.id != dot_agent_deck_desktop::voice::FILTER_DASHBOARD_ROW
                 });
-                let for_new_agent = dispatched
-                    .is_none_or(|row| row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW);
+                let preselects = for_new_agent
+                    && dispatched.is_some_and(|row| {
+                        row.params
+                            .iter()
+                            .any(|param| param.kind == ParamKind::DeckRef && param.optional)
+                    });
                 let deck_eligible = !for_new_agent
                     || resolved_deck(&answer.outcome).is_none_or(|id| {
                         decks
@@ -704,8 +937,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     });
                 let unavailable_named = !fixture.names_unavailable_deck
                     || answer.outcome.sentence().contains(&format!(
-                        "Daemon ci@stale-box cannot take a new agent, so none is preselected: {}",
-                        STALE_BOX_REASON.trim_end_matches('.')
+                        "\u{201c}ci@stale-box\u{201d} can't take a new agent: {STALE_BOX_REASON}, \
+                         so none is preselected."
                     ));
                 let deck_named = !preselects
                     || resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {
@@ -714,19 +947,40 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                             .sentence()
                             .contains(&format!("Preselected daemon: {label}."))
                     });
+                // Compared against the hint itself rather than against words
+                // it once contained: #1045 renamed the screen "Daemons", and a
+                // `contains("deck")` check went red on every deck-hidden
+                // fixture with the refusal reading exactly as intended.
                 let hidden_deck_explained = !fixture.deck_hidden
                     || fixture.action != "open_deck"
                     || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
-                        if hint.contains("deck") && hint.contains("experimental"));
+                        if hint == DECK_HIDDEN_HINT);
+                // A tie the model settled itself, on one of the decks tied.
+                let settled_tie = fixture.tie_may_be_settled
+                    && actual_outcome == OutcomeKind::Dispatch
+                    && resolved_deck(&answer.outcome).is_some_and(|id| {
+                        fixture
+                            .candidates
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|candidate| candidate == id)
+                    });
+                let outcome_matches =
+                    (actual_outcome == fixture.outcome && candidates_match) || settled_tie;
                 if action_matches
-                    && actual_outcome == fixture.outcome
+                    && outcome_matches
                     && agent_matches
                     && deck_matches
                     && dir_matches
                     && mode_matches
                     && agent_type_matches
+                    && kind_matches
+                    && status_matches
                     && orchestration_matches
                     && prefix_matches
+                    && filter_matches
+                    && command_matches
                     && deck_named
                     && deck_eligible
                     && unavailable_named
@@ -737,12 +991,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Err(format!(
                         "{}expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
-                         resolved_orchestration={:?} dictate_prefix={:?}, got action={:?} \
-                         outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_orchestration={:?} dictate_prefix={:?} resolved_filter={:?} \
+                         resolved_command={:?} candidates={:?} resolved_kind={:?} \
+                         resolved_status={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
-                         sentence={:?}",
-                        if !deck_named {
+                         resolved_filter={:?} resolved_command={:?} candidates={:?} resolved_kind={:?} \
+                         resolved_status={:?} model_value={:?} sentence={:?}",
+                        if !candidates_match {
+                            "the tie does not offer the expected candidates; "
+                        } else if !deck_named {
                             "the report does not name the preselected deck; "
                         } else if !deck_eligible {
                             "a deck the dialog disables was preselected; "
@@ -762,6 +1020,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         fixture.resolved_agent_type,
                         fixture.resolved_orchestration,
                         fixture.dictate_prefix,
+                        fixture.resolved_filter,
+                        fixture.resolved_command,
+                        fixture.candidates,
+                        fixture.resolved_kind,
+                        fixture.resolved_status,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
@@ -769,6 +1032,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         resolved_of(&answer.outcome, ParamKind::AgentTypeRef),
                         resolved_label(&answer.outcome, ParamKind::OrchestrationRef),
                         marked_prefix(&answer.outcome),
+                        resolved_of(&answer.outcome, ParamKind::FilterText),
+                        resolved_of(&answer.outcome, ParamKind::CommandText),
+                        offered_values(&answer.outcome),
+                        resolved_of(&answer.outcome, ParamKind::AgentKind),
+                        resolved_of(&answer.outcome, ParamKind::AgentStatus),
+                        model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal
                         // refused — the kinds alone cannot tell a model's
                         // substitution from a grounding refusal.

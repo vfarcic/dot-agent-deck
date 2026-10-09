@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 
 use crate::agent_hook_config::{
-    binary_names_match, executables_match, pin_is_same_named, rule_command_strs,
-    strip_deck_commands, unquote_if_needed,
+    binary_names_match, executables_match, rule_command_strs, strip_deck_commands,
+    unquote_if_needed,
 };
 // Exercised only by this module's own tests, which drive the platform-convention
 // arithmetic with both hosts' conventions injected (see `binary_names_match_under`).
@@ -87,25 +87,25 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
 /// for as long as anything else holds the pipe's write end: a launcher script
 /// that backgrounds a helper, or a descendant of the version command, exits
 /// the direct child while keeping stdout open, and this runs at TUI start with
-/// [`SETTINGS_LOCK`] held. So stdout is drained on a thread, which stops at the
-/// first newline, at EOF or after 4 KiB, and hands back what it read; the
-/// probe waits for that hand-off until the deadline. The line is accepted only
-/// when the child has also exited on its own by then. Past the deadline,
-/// whether or not a line arrived, the probe answers unknown, kills the child's
-/// whole tree — on Unix its process group, which it was given at spawn, and on
-/// Windows the Job Object it is adopted into right after spawn — reaps it, and
-/// abandons the reader thread, which ends when the pipe closes because a
-/// helper holding it died with the tree. What escapes the tree keeps the pipe,
-/// and with it that one detached thread: on Unix a descendant that moved itself
-/// to another group, on Windows one spawned in the instant between
-/// `CreateProcess` and the job assignment
-/// ([`crate::platform::proc::AgentProcessGroup::adopt`] documents that window).
-/// Either way the probe still returns on time.
+/// [`SETTINGS_LOCK`] held. So stdout is read with the deadline
+/// ([`read_version_line`]), stopping at the first newline, at EOF or after
+/// 4 KiB. The line is accepted only when the child has also exited on its own
+/// by then. Past the deadline, whether or not a line arrived, the probe answers
+/// unknown, kills the child's whole tree — on Unix its process group, which it
+/// was given at spawn, and on Windows the Job Object it is adopted into right
+/// after spawn — and reaps it.
+///
+/// **Nothing the probe started outlives it on its side of the pipe** (issue
+/// #1454). The read happens on the calling thread, so there is no reader to
+/// abandon, and the read end is closed when the probe returns. A descendant
+/// that escaped the tree — on Unix one that moved itself to another group, on
+/// Windows one spawned in the instant between `CreateProcess` and the job
+/// assignment ([`crate::platform::proc::AgentProcessGroup::adopt`] documents
+/// that window) — keeps only its own write end, and its next write fails.
 fn probe_claude_version(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
-    use std::io::Read as _;
     let mut command = std::process::Command::new(program);
     command
         .arg("--version")
@@ -129,25 +129,11 @@ fn probe_claude_version(
     #[cfg(not(windows))]
     let tree = ProbeTree;
     let deadline = std::time::Instant::now() + timeout;
-    let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut output = Vec::new();
-            let mut chunk = [0u8; 512];
-            while output.len() < 4096 && !output.contains(&b'\n') {
-                match stdout.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => output.extend_from_slice(&chunk[..n]),
-                }
-            }
-            output.truncate(4096);
-            let _ = tx.send(output);
-        });
-    } else {
-        drop(tx);
-    }
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let Ok(output) = rx.recv_timeout(remaining) else {
+    let output = match child.stdout.take() {
+        Some(mut stdout) => read_version_line(&mut stdout, deadline),
+        None => Some(Vec::new()),
+    };
+    let Some(output) = output else {
         // Deadline passed with no line. The child is not reaped yet (a zombie
         // at worst), so its pid still names its group.
         kill_probe(&mut child, &tree);
@@ -177,6 +163,122 @@ fn probe_claude_version(
             .is_some_and(claude_version_accepts_stop_failure),
         line,
     )
+}
+
+/// Read the version probe's stdout on the calling thread until a newline, EOF,
+/// a read error or 4 KiB, whichever comes first, and hand back what was read
+/// (at most 4 KiB). `None` when `deadline` passes first.
+///
+/// Every read is preceded by a wait for data that is itself bounded by the
+/// deadline, so the read never blocks: on Unix `poll(2)` on the pipe, on
+/// Windows `PeekNamedPipe` polled every 10ms (an anonymous pipe has no
+/// overlapped reads to cancel).
+fn read_version_line(
+    stdout: &mut std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 512];
+    while output.len() < 4096 && !output.contains(&b'\n') {
+        let available = match wait_for_probe_output(stdout, deadline) {
+            ProbeOutput::Ready(available) => available.clamp(1, chunk.len()),
+            ProbeOutput::Closed => break,
+            ProbeOutput::TimedOut => return None,
+        };
+        match stdout.read(&mut chunk[..available]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => output.extend_from_slice(&chunk[..n]),
+        }
+    }
+    output.truncate(4096);
+    Some(output)
+}
+
+/// What [`wait_for_probe_output`] found on the pipe.
+enum ProbeOutput {
+    /// A read of up to this many bytes will not block: on Windows the count
+    /// waiting in the pipe, on Unix `usize::MAX`, as a read after `poll(2)`
+    /// reports the pipe readable returns what is there without blocking.
+    Ready(usize),
+    /// The pipe is broken or failed: treat as EOF.
+    Closed,
+    TimedOut,
+}
+
+/// Wait until the probe's stdout has something to read — data, EOF or an
+/// error — or `deadline` passes.
+#[cfg(unix)]
+fn wait_for_probe_output(
+    stdout: &std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> ProbeOutput {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ProbeOutput::TimedOut;
+        }
+        // Round up so a sub-millisecond remainder still waits rather than
+        // spinning on a zero timeout.
+        let millis = remaining.as_nanos().div_ceil(1_000_000);
+        let timeout = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+        let mut fd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` for the duration of the call, on a
+        // descriptor `stdout` owns and keeps open.
+        let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+        if ready > 0 {
+            // POLLIN, POLLHUP and POLLERR all mean `read` returns at once:
+            // data, EOF or the error.
+            return ProbeOutput::Ready(usize::MAX);
+        }
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return ProbeOutput::Closed;
+        }
+        // Timed out or interrupted: the loop re-checks the deadline.
+    }
+}
+
+/// [`wait_for_probe_output`] on Windows: poll `PeekNamedPipe`, which reports
+/// the bytes waiting without blocking and fails once every write end is gone.
+#[cfg(windows)]
+fn wait_for_probe_output(
+    stdout: &std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> ProbeOutput {
+    use std::os::windows::io::AsRawHandle as _;
+    loop {
+        let mut available: u32 = 0;
+        // SAFETY: `stdout` owns the handle and keeps it open for the call; no
+        // buffer is passed, only the out-parameter for the available count.
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                stdout.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        // The deadline is checked before the result is used: bytes that
+        // arrived during the last sleep came after it, and are as late as the
+        // line a child prints after the deadline (Greptile on PR #1512).
+        if std::time::Instant::now() >= deadline {
+            return ProbeOutput::TimedOut;
+        }
+        if ok == 0 {
+            return ProbeOutput::Closed;
+        }
+        if available > 0 {
+            return ProbeOutput::Ready(available as usize);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Off Windows the probe's tree is its process group, named by the child's pid,
@@ -256,10 +358,10 @@ fn settings_path() -> PathBuf {
 /// lets two callers read the same "before" state and have the second one
 /// overwrite the first's rule with a stale copy.
 ///
-/// What this does NOT close is the cross-PROCESS lost update — two deck
-/// binaries at different paths starting at the same instant, or a deck racing a
-/// human's editor save. That needs an advisory file lock; neither sibling
-/// adapter has one either, and the atomic publish means the loser of such a
+/// The cross-PROCESS lost update — two deck binaries starting at the same
+/// instant — is closed by the advisory file lock [`lock_settings`] takes beside
+/// it (`agent_hook_config::lock_config`). A human's editor save takes no such
+/// lock and can still race a deck; the atomic publish means the loser of that
 /// race loses a whole update rather than leaving a torn file behind.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -267,8 +369,40 @@ static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 /// panicking: a previous caller panicking mid-install says nothing about
 /// whether the settings file is usable now, and the read is re-done from disk
 /// under the guard regardless.
-fn lock_settings() -> MutexGuard<'static, ()> {
-    SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+fn lock_settings(path: &Path) -> io::Result<SettingsGuard> {
+    let thread = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Issue #1493's follow-up: the mutex keeps this process's threads apart;
+    // the file lock keeps other deck processes out of the same read-merge-
+    // publish, which otherwise lost the earlier writer's changes.
+    let process = crate::agent_hook_config::lock_config(path)?;
+    Ok(SettingsGuard {
+        _process: process,
+        _thread: thread,
+    })
+}
+
+/// [`lock_settings`] for an INSTALL, which may be the first write ever: the
+/// settings directory is created before the lock is taken, because a lock beside
+/// a directory that does not exist yet is no lock at all — two first installs
+/// would each read empty settings and the later publish would drop the earlier
+/// one's hooks (Qodo on PR #1523). Uninstall keeps [`lock_settings`] and
+/// creates nothing.
+fn lock_settings_for_install(path: &Path) -> io::Result<SettingsGuard> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.is_dir()) {
+        // PRD #1487: before the directory. A missing directory means a missing
+        // settings file, so this install is never a no-op and would be refused
+        // by `write_settings` anyway.
+        crate::config_write_guard::ensure_config_write_allowed(path)?;
+        std::fs::create_dir_all(parent)?;
+    }
+    lock_settings(path)
+}
+
+/// [`lock_settings`]'s two locks, released together. The file lock is declared
+/// first so it is dropped first, before the mutex.
+struct SettingsGuard {
+    _process: crate::agent_hook_config::ConfigLock,
+    _thread: MutexGuard<'static, ()>,
 }
 
 /// Read `path` the STRICT way used by every install AND uninstall path. Only a
@@ -284,8 +418,10 @@ fn lock_settings() -> MutexGuard<'static, ()> {
 /// The copy aside goes through
 /// [`agent_hook_config::backup_malformed`](crate::agent_hook_config::backup_malformed)
 /// rather than a bare `std::fs::write`, which followed a symlink planted at that
-/// predictable `.bak` name (#731); the message names the backup only when there
-/// is one.
+/// predictable `.bak` name (#731). It never replaces a `settings.json.bak` that
+/// is already there — most plausibly the user's own copy from before the edit
+/// that broke the file (#537) — and the message names a backup only when it
+/// holds these bytes.
 ///
 /// Issue #522: this used to be the install path's reader only, with a
 /// `read_settings_lenient` twin still serving [`uninstall`] and
@@ -305,7 +441,7 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
                     format!(
                         "{} is not valid JSON (left unchanged, original {}): {parse_err}",
                         path.display(),
-                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
+                        crate::agent_hook_config::preserved_phrase(&backup)
                     ),
                 ))
             }
@@ -326,6 +462,8 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
 /// inside the window between the truncate and the write sees an empty file; a
 /// crash between them leaves one on disk permanently.
 fn write_settings(path: &Path, settings: &Value) -> io::Result<()> {
+    // PRD #1487: before the directory and the temp file exist.
+    crate::config_write_guard::ensure_config_write_allowed(path)?;
     if let Some(parent) = path.parent() {
         // `create_dir_all("")` is a documented no-op, so a bare relative
         // filename (whose parent is `""`) needs no special case here.
@@ -409,6 +547,8 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
+    // Removes the temp file on every early return and on unwind (PRD #1487).
+    let mut cleanup = crate::agent_hook_config::TempFileGuard::new(tmp.clone());
 
     let published = (|| {
         #[cfg(unix)]
@@ -424,10 +564,8 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     })();
 
     drop(file);
-    if let Err(e) = published.and_then(|()| std::fs::rename(&tmp, dest)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    published.and_then(|()| std::fs::rename(&tmp, dest))?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -567,40 +705,24 @@ fn ensure_hook_array<'a>(
         .unwrap()
 }
 
-/// What one [`install_impl`] pass did: which hook types got a fresh rule, which
-/// were already current, and how many deck-owned commands it removed as stale.
+/// What one [`install_impl`] pass did: which hook types it changed, which were
+/// already current, and how many deck-owned commands it removed.
 ///
-/// `repaired` is what makes PRD #381 M4's self-heal *observable*, and it is not
-/// cosmetic. `auto_install` returns early when nothing was installed — and a
-/// settings file holding BOTH a dead deck rule and the current one lands in
-/// exactly that state: the dead rule is pruned in memory, every hook type
-/// reports `skipped`, and the repair is then dropped on the floor instead of
-/// being written. Counting the prune separately is what gets it published, and
-/// logged.
+/// `repaired` is what makes PRD #381 M4's self-heal *observable* in the log.
+/// Whether anything is published is decided by comparing the settings before
+/// and after the pass instead (PRD #1487), so a pass that only pruned is still
+/// written and a pass that changed nothing is not.
 struct InstallOutcome {
     installed: Vec<&'static str>,
     skipped: Vec<&'static str>,
-    /// Deck-owned commands removed as stale: a rule whose binary is positively
-    /// gone ([`command_is_dead_deck`]), or any deck rule left under a hook type
-    /// the deck no longer installs. Never a user-authored command — both
-    /// predicates are gated on deck ownership first.
+    /// Deck-owned commands removed: a duplicate install's command
+    /// consolidated away, a stale pin, or any deck rule left under a hook type
+    /// the deck no longer installs. Never a user-authored command — every
+    /// predicate is gated on deck ownership first.
     repaired: usize,
-    /// Issue #1171: live deck rules for the same binary NAME at a different
-    /// path, which this install LEAVES IN PLACE and which therefore each
-    /// deliver the same hook event.
-    ///
-    /// Reported rather than pruned, deliberately.
-    /// `hook_rule_identification_011` pins the opposite policy — two on-disk
-    /// builds sharing a basename are distinct deployments and each keep their
-    /// rule — so collapsing them here would overturn a documented property
-    /// rather than fix a bug. What was actually wrong is that it happened in
-    /// silence: `remote add` on a host that already had the deck installed
-    /// produced two rules per event, and the only hint was `hooks uninstall`
-    /// later reporting twice the expected count.
-    ///
-    /// Sorted and de-duplicated across hook types, so a reader sees each other
-    /// install once rather than ten times.
-    coexisting: std::collections::BTreeSet<String>,
+    /// The binary the installed hook types name afterwards: `binary_path`,
+    /// unless an automatic install kept another live durable install's entry.
+    named: String,
 }
 
 fn install_impl(
@@ -608,6 +730,27 @@ fn install_impl(
     binary_path: &str,
     with_stop_failure: bool,
 ) -> InstallOutcome {
+    install_impl_in(
+        settings,
+        binary_path,
+        with_stop_failure,
+        crate::agent_hook_config::InstallMode::Explicit,
+    )
+}
+
+/// [`install_impl`] with the install mode spelled out. Under
+/// [`crate::agent_hook_config::InstallMode::Automatic`] a deck command naming
+/// another live, durable install is kept as the hook type's one entry, rule and
+/// all, and a hook type with none gets that install's command — the policy the
+/// Codex writer documents (PRD #1487).
+fn install_impl_in(
+    settings: &mut Value,
+    binary_path: &str,
+    with_stop_failure: bool,
+    mode: crate::agent_hook_config::InstallMode,
+) -> InstallOutcome {
+    use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
+
     let hook_types = hook_types(with_stop_failure);
     let hooks_obj = ensure_hooks_object(settings);
 
@@ -618,7 +761,6 @@ fn install_impl(
     // Claude Code that no longer accepts it (a downgrade), which would
     // otherwise switch off every hook in the file.
     let mut repaired = 0usize;
-    let mut coexisting = std::collections::BTreeSet::new();
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
         if !hook_types.contains(&key.as_str()) {
@@ -639,53 +781,87 @@ fn install_impl(
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
 
+    // Only current-format commands are kept: a legacy `<path> hook` rule is a
+    // retired shape, migrated whoever wrote it.
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            |cmd| current_format_executable(cmd).map(|exe| unquote_if_needed(exe).into_owned()),
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => hook_types.iter().find_map(|hook_type| {
+            hooks_obj
+                .get(*hook_type)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
+
     for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
+        let before = rules.clone();
+        let deck_commands_before = rule_command_strs(rules)
+            .into_iter()
+            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .count();
 
-        // Prune STALE deck-owned rules sharing the installing binary's own
-        // basename — the shape N worktree builds actually take: every
-        // `target/debug/dot-agent-deck` is a distinct real path with the SAME
-        // basename, so a rebuilt or removed worktree leaves a dead rule with
-        // that basename behind, and a fresh install from a surviving worktree
-        // is the natural point to drop it. Scoped narrowly two ways: (1) only
-        // rules ALREADY identified as deck-owned by `rule_is_ours` — never a
-        // general "delete anything pointing at a missing path" sweep, which
-        // would delete a user's own hooks for tools that simply are not
-        // installed right now (test 014's coexisting `nonexistent-tool` rule);
-        // (2) only rules whose basename matches the CURRENTLY installing
-        // binary's basename — a genuinely different-looking deck binary
-        // installed under a fictional/not-yet-real path (as most of this
-        // file's fixtures are) must not be swept up just because it happens
-        // not to exist on disk (test 003 pins this: installing `/b/…` must
-        // never prune `/a/…`'s unrelated rule).
-        repaired += strip_deck_commands(rules, |cmd| command_is_dead_deck(cmd, binary_path));
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(rules),
+        };
+        let mut expected = make_rule(binary_path, hook_type);
+        let own_command = expected["hooks"][0]["command"]
+            .as_str()
+            .expect("make_rule writes a command")
+            .to_string();
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), &own_command)
+            .to_string();
+        expected["hooks"][0]["command"] = Value::String(command.clone());
+        // Another install's rule is left exactly as that install wrote it,
+        // `matcher` included (PRD #1487).
+        let keeps_other = matches!(kept_here, Some(KeptDeckEntry::Other { .. }));
 
-        let expected = make_rule(binary_path, hook_type);
-
-        let already_current = rules.iter().any(|rule| rule == &expected);
-
-        // Normalize down to a single fresh rule, but only for THIS binary —
-        // leave rules belonging to a genuinely different deck binary alone —
-        // except a LEGACY rule under the historical default name, which always
-        // migrates to whichever binary is currently installing.
-        let removed = strip_deck_commands(rules, |cmd| command_matches_binary(cmd, binary_path));
-
-        // Issue #1171: whatever deck rules survived that strip and name the
-        // same binary as us are other installs of the deck, alive and at
-        // another path. They are left alone (see `coexisting`), but they are no
-        // longer left unmentioned.
-        for command in rule_command_strs(rules) {
-            if let Some(exe) = owned_command_executable(command)
-                && !executables_match(&exe, binary_path)
-                && pin_is_same_named(&exe, binary_path)
-            {
-                coexisting.insert(exe);
+        // ONE deck rule per hook type (PRD #1487), shared with the Codex and
+        // Devin writers: the first deck command — this binary's, a legacy
+        // rule, or any other install of the deck under its basename, live or
+        // dead — is refreshed where it sits and every other copy is
+        // consolidated away, leaving the user's handlers where they were.
+        // Before this, a second still-valid install kept its own rule and
+        // every hook event was delivered once per rule (issue #1171).
+        match crate::agent_hook_config::consolidate_deck_handlers_in_place(rules, &command, |cmd| {
+            command_is_deck_install(cmd, binary_path)
+        }) {
+            Some((rule_idx, _)) => {
+                // A rule holding only the deck's command is the deck's own:
+                // rewrite it whole so its `matcher` is the current one (the
+                // `Notification` rule carries one). A rule the user shares is
+                // left alone apart from the command.
+                let deck_only = !keeps_other
+                    && rules[rule_idx]
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|handlers| handlers.len() == 1)
+                    && rules[rule_idx].get("command").is_none();
+                if deck_only {
+                    rules[rule_idx] = expected;
+                }
+            }
+            None => {
+                strip_deck_commands(rules, |cmd| command_is_deck_install(cmd, binary_path));
+                rules.push(expected);
             }
         }
 
-        rules.push(expected);
-
-        if already_current && removed == 1 {
+        let deck_commands_after = rule_command_strs(rules)
+            .into_iter()
+            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .count();
+        repaired += deck_commands_before.saturating_sub(deck_commands_after);
+        if *rules == before {
             skipped.push(hook_type);
         } else {
             installed.push(hook_type);
@@ -696,7 +872,7 @@ fn install_impl(
         installed,
         skipped,
         repaired,
-        coexisting,
+        named: KeptDeckEntry::named_binary(keeper.as_ref(), binary_path),
     }
 }
 
@@ -916,6 +1092,19 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// begin with, the same way [`executables_match`]'s `canonicalize` call can
 /// already fail to resolve a path for reasons unrelated to the binary's
 /// health. That gap is unchanged by this fix.
+/// Whether an install by `binary_path` owns `command` under a hook type it
+/// installs (PRD #1487): this binary's command or a legacy rule
+/// ([`command_matches_binary`]), or any other install of the deck sharing its
+/// basename, live or dead
+/// ([`crate::agent_hook_config::is_replaceable_deck_install`]).
+fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
+    command_matches_binary(command, binary_path)
+        || owned_command_executable(command).is_some_and(|exe| {
+            crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path)
+        })
+}
+
+#[cfg(test)]
 fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
     // The no-basename fail-safe (an empty or `..`-terminated installing path,
     // or a non-UTF-8 one prunes nothing) lives in `pin_is_dead_sibling`. The
@@ -999,7 +1188,13 @@ pub fn auto_install_to_gated(
         }
     };
 
-    let _guard = lock_settings();
+    let _guard = match lock_settings(path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
         Err(e) => {
@@ -1007,12 +1202,17 @@ pub fn auto_install_to_gated(
             return;
         }
     };
-    let outcome = install_impl(&mut settings, &binary_path, stop_failure());
+    let before = settings.clone();
+    let outcome = install_impl_in(
+        &mut settings,
+        &binary_path,
+        stop_failure(),
+        crate::agent_hook_config::InstallMode::Automatic,
+    );
 
-    // A pass that only PRUNED (a dead deck rule sitting beside the current one)
-    // installs nothing, and returning here on `installed.is_empty()` alone
-    // would drop that repair instead of publishing it — PRD #381 M4.
-    if outcome.installed.is_empty() && outcome.repaired == 0 {
+    // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
+    // still a change and is published — PRD #381 M4.
+    if settings == before {
         return;
     }
 
@@ -1020,6 +1220,13 @@ pub fn auto_install_to_gated(
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
         return;
     }
+    let binary_path = outcome.named.clone();
+    crate::agent_hook_config::log_auto_install_change(
+        "claude-code",
+        path,
+        &binary_path,
+        "claude-code startup auto-install",
+    );
 
     // Repair logs what it changed. Silently mutating global config is the same
     // class of thing that caused this bug, so a self-heal that leaves no trace
@@ -1065,43 +1272,24 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
-    let _guard = lock_settings();
+    let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
+    let before = settings.clone();
     let InstallOutcome {
-        installed,
-        skipped,
-        coexisting,
-        ..
+        installed, skipped, ..
     } = install_impl(&mut settings, &binary_path, stop_failure);
 
-    write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    // Equal settings are not rewritten (PRD #1487).
+    if settings != before {
+        write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
 
     if !installed.is_empty() {
         println!("Installed hooks: {}", installed.join(", "));
     }
     if !skipped.is_empty() {
         println!("Already installed (skipped): {}", skipped.join(", "));
-    }
-    if !coexisting.is_empty() {
-        let (plural, verb) = if coexisting.len() == 1 {
-            ("", "has")
-        } else {
-            ("s", "have")
-        };
-        println!(
-            "Note: {} other dot-agent-deck install{plural} still {verb} hook rules here:",
-            coexisting.len()
-        );
-        for other in &coexisting {
-            println!("  {other}");
-        }
-        println!(
-            "  Every hook event is delivered once per rule, and all of them reach the same \
-             daemon, so the extra deliveries are redundant. To collapse them, run \
-             `dot-agent-deck hooks uninstall` and then `hooks install` from whichever \
-             install you want to keep."
-        );
     }
     if !stop_failure {
         let (major, minor, patch) = STOP_FAILURE_MIN_CLAUDE_VERSION;
@@ -1126,7 +1314,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
 /// `claude_install` alone.
 pub fn uninstall() -> Result<(), String> {
     let path = settings_path();
-    let _guard = lock_settings();
+    let _guard = lock_settings(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let outcome = uninstall_impl(&mut settings);
@@ -1170,9 +1358,13 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
-    let _guard = lock_settings();
+    let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
+    let before = settings.clone();
     install_impl(&mut settings, binary_path, stop_failure);
+    if settings == before {
+        return Ok(());
+    }
     write_settings(path, &settings)
 }
 
@@ -1181,7 +1373,7 @@ pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> i
 /// found and reported as an error, and nothing is written when nothing of the
 /// deck's was there.
 pub fn uninstall_from(path: &Path) -> io::Result<()> {
-    let _guard = lock_settings();
+    let _guard = lock_settings(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     if uninstall_impl(&mut settings).commands_removed == 0 {
         return Ok(());
@@ -1193,8 +1385,9 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A malformed `settings.json` is preserved at `settings.json.bak` — and the
-    /// copy must never be made THROUGH a symlink planted at that path.
+    /// A malformed `settings.json` is copied to `settings.json.bak` — but never
+    /// THROUGH a symlink planted at that path, and since #537 never over one
+    /// either.
     ///
     /// The backup destination is fully predictable, and `std::fs::write` follows
     /// a symlink, so a writer able to add an entry to `~/.claude` could point
@@ -1228,16 +1421,15 @@ mod tests {
             "the backup was written through the planted symlink and overwrote the victim"
         );
         assert!(
-            !std::fs::symlink_metadata(&backup)
+            std::fs::symlink_metadata(&backup)
                 .expect("stat backup")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "something already at the backup name is left as it was (#537)"
         );
-        assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            malformed,
-            "the user's bytes must still be preserved beside the original"
+        assert!(
+            !err.to_string().contains("preserved at"),
+            "the planted link must not be claimed as the backup: {err}"
         );
         assert_eq!(
             std::fs::read_to_string(&settings).expect("read settings"),
@@ -1246,28 +1438,28 @@ mod tests {
         );
     }
 
-    /// When the copy aside cannot be made, the error must not claim a backup.
+    /// When the copy aside is not made, the error must not claim a backup.
     ///
-    /// A directory at the `.bak` name is the portable way to make the publish's
-    /// `rename` fail (`EISDIR`); before #731 the message named `<path>.bak`
-    /// unconditionally, because the write's result was discarded.
+    /// A directory at the `.bak` name is the portable way to occupy it; before
+    /// #731 the message named `<path>.bak` unconditionally, because the write's
+    /// result was discarded.
     #[test]
     fn a_backup_that_cannot_be_written_is_not_claimed_in_the_error() {
         let dir = crate::test_temp::tempdir().expect("settings tempdir");
         let settings = dir.path().join("settings.json");
         std::fs::write(&settings, "{ nope").expect("seed settings.json");
-        // Occupied by something a file cannot be renamed onto.
+        // Occupied by something no copy can be made over.
         std::fs::create_dir(dir.path().join("settings.json.bak")).expect("occupy the backup name");
 
         let err = load_settings_or_refuse(&settings).expect_err("malformed settings are refused");
         let message = err.to_string();
 
         assert!(
-            !message.contains("settings.json.bak"),
+            !message.contains("preserved at"),
             "the error named a backup that was never written: {message}"
         );
         assert!(
-            message.contains("not preserved"),
+            message.contains("not copied") || message.contains("not preserved"),
             "the error must say the copy aside did not happen: {message}"
         );
         assert!(
@@ -1385,73 +1577,36 @@ mod tests {
         ));
     }
 
-    /// Issue #1171: two LIVE deck installs sharing a basename at different
-    /// paths each keep a rule — and the install now says so instead of leaving
-    /// it silent.
-    ///
-    /// The exact shape found in the wild: a Mac with the deck from Homebrew,
-    /// then `remote add` installing a second copy under `~/.local/bin`. Ten
-    /// events ended up with two rules each, every hook was delivered twice, and
-    /// the only hint was a later `hooks uninstall` reporting 20 removals.
-    ///
-    /// Not macOS-specific in the slightest — it fires on any host that already
-    /// has the deck installed by any means (apt, nix, Homebrew, a manual copy).
-    /// It was merely found on a Mac.
-    ///
-    /// Both files are real and executable on purpose: a dead sibling is already
-    /// pruned by `command_is_dead_deck`, so the duplicate only survives when the
-    /// other install is genuinely alive, which is exactly the Homebrew case.
-    /// The rules are deliberately NOT collapsed here — see `InstallOutcome::coexisting`.
+    /// Scenario: Install Claude hooks from one live deck, then another at a different path. The second replaces the first and leaves exactly one command per event.
     #[test]
-    fn a_live_same_named_deck_at_another_path_is_reported_not_pruned() {
-        let a_dir = crate::test_temp::tempdir().expect("install a tempdir");
-        let b_dir = crate::test_temp::tempdir().expect("install b tempdir");
-        let a = a_dir.path().join(DEFAULT_BINARY_NAME);
-        let b = b_dir.path().join(DEFAULT_BINARY_NAME);
-        for path in [&a, &b] {
-            crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+    fn a_live_same_named_deck_at_another_path_replaces_the_previous_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let a = fixture.path().join("first/dot-agent-deck");
+        let b = fixture.path().join("second/dot-agent-deck");
+        for binary in [&a, &b] {
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            crate::test_isolation::write_script(binary, b"#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-            }
+            std::fs::set_permissions(
+                binary,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
         }
-        let (a, b) = (
-            a.to_str().expect("utf-8").to_string(),
-            b.to_str().expect("utf-8").to_string(),
-        );
-
         let mut settings = serde_json::json!({});
-        let first = install_impl(&mut settings, &a, false);
-        assert!(
-            first.coexisting.is_empty(),
-            "the first install has nothing to coexist with: {:?}",
-            first.coexisting
+        install_impl(&mut settings, a.to_str().unwrap(), false);
+        install_impl(&mut settings, b.to_str().unwrap(), false);
+        let commands = crate::agent_hook_config::rule_command_strs(
+            settings["hooks"]["PreToolUse"].as_array().unwrap(),
         );
-
-        let second = install_impl(&mut settings, &b, false);
-        assert_eq!(
-            second.coexisting.iter().cloned().collect::<Vec<_>>(),
-            vec![a.clone()],
-            "installing `{b}` must REPORT the live same-named deck still at `{a}`"
-        );
-
-        // Reported, not pruned: `hook_rule_identification_011` pins that these
-        // stay two distinct deployments, and this must not quietly reverse it.
-        let rules = settings["hooks"]["PreToolUse"]
-            .as_array()
-            .expect("PreToolUse rules");
-        let commands = crate::agent_hook_config::rule_command_strs(rules);
         assert_eq!(
             commands.len(),
-            2,
-            "both installs keep their rule; got {commands:?}"
+            1,
+            "one deck command per event: {commands:?}"
         );
-        assert!(
-            commands.iter().any(|c| c.starts_with(&a))
-                && commands.iter().any(|c| c.starts_with(&b)),
-            "one rule per install, not one replacing the other: {commands:?}"
+        assert_eq!(
+            commands[0],
+            format!("{} {HOOK_COMMAND_SUFFIX}", b.display())
         );
     }
 
@@ -1584,6 +1739,40 @@ mod tests {
         assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
     }
 
+    /// Issue #537 item 4.6: what an install reports. `hooks install` prints
+    /// `installed` and `skipped` to the user, and `auto_install` skips the write
+    /// when nothing was installed, so a first install must report every hook
+    /// type as installed and a repeat of it every type as already there.
+    ///
+    /// The binary is a real executable: a pin naming a file that is not there
+    /// is dead, and an install rightly rewrites a dead pin every time.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_reports_what_it_wrote_and_a_repeat_reports_it_already_there() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().expect("binary tempdir");
+        let binary_path = dir.path().join(DEFAULT_BINARY_NAME);
+        crate::test_isolation::write_script(&binary_path, "#!/bin/sh\nexit 0\n")
+            .expect("write binary");
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod binary");
+        let binary = binary_path.to_str().expect("utf-8 tempdir");
+        let mut settings = serde_json::json!({});
+
+        let first = install_impl(&mut settings, binary, false);
+        assert_eq!(first.installed, hook_types(false));
+        assert!(first.skipped.is_empty(), "{:?}", first.skipped);
+
+        let second = install_impl(&mut settings, binary, false);
+        assert!(
+            second.installed.is_empty(),
+            "a repeat install reported types as newly installed: {:?}",
+            second.installed
+        );
+        assert_eq!(second.skipped, hook_types(false));
+        assert_eq!(second.repaired, 0);
+    }
+
     /// Write `body` as an executable stand-in `claude` in `dir`.
     #[cfg(unix)]
     fn stand_in_claude(dir: &Path, body: &str) -> PathBuf {
@@ -1641,6 +1830,76 @@ mod tests {
             }
             assert!(gone(helper), "the helper holding stdout outlived the probe");
         }
+    }
+
+    /// Issue #1454: a stand-in `claude` whose helper escapes the probe's
+    /// process group (`setsid`) and keeps stdout open past the deadline. Killing
+    /// the group cannot reach it, so the probe must not leave anything of its
+    /// own holding the pipe's read end: once the probe returns, the escaped
+    /// helper's next write to stdout fails with `EPIPE`. Before the fix a
+    /// detached reader thread owned the read end and sat blocked on it for as
+    /// long as the helper lived, so that write succeeded — the read end being
+    /// closed is the observable that no reader outlived the probe.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_leaves_no_reader_behind_when_a_descendant_escapes_its_group() {
+        if std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            eprintln!("SKIP: perl with POSIX is needed to escape the probe's process group");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("escapee.pid");
+        let go_file = dir.path().join("go");
+        let result_file = dir.path().join("result");
+        // The escapee: a new session (so a new process group), SIGPIPE ignored
+        // so a closed read end reads as a failed write rather than a death,
+        // then wait for the test's go-ahead, try to write, record whether the
+        // write went through, and exit. Without a go-ahead it gives up after
+        // 20s, so a failing run does not leave it behind for long.
+        let escapee = r#"use POSIX; POSIX::setsid() or die "setsid: $!"; $SIG{PIPE} = "IGNORE"; my (undef, $go, $result) = @ARGV; for (1 .. 400) { last if -e $go; select(undef, undef, undef, 0.05) } my $wrote = syswrite(STDOUT, "x"); open(my $f, ">", "$result.tmp") or die; print $f (defined $wrote ? "open" : "closed"); close $f; rename("$result.tmp", $result); exit 0"#;
+        let claude = stand_in_claude(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nperl -e '{escapee}' '{pid}' '{go}' '{result}' &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nsleep 0.5\nprintf '2.1.300'\nexit 0\n",
+                pid = pid_file.display(),
+                go = go_file.display(),
+                result = result_file.display(),
+            ),
+        );
+        let bound = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, (false, None), "an unfinished line is unknown");
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
+
+        // The escapee is never signalled: it exits on its own once it has
+        // written its result, or after its 20s cap, so there is no pid to
+        // outlive it and be reused (Greptile on PR #1512).
+        assert!(
+            pid_file.exists(),
+            "the stand-in started its helper before the deadline"
+        );
+        std::fs::write(&go_file, b"").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !result_file.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let result = std::fs::read_to_string(&result_file).expect(
+            "the escaped helper survived the probe's group kill and wrote its result \
+             (if it did not, it was killed with the group and this test lost its premise)",
+        );
+        assert_eq!(
+            result, "closed",
+            "the pipe's read end outlived the probe: something the probe started is still reading it"
+        );
     }
 
     /// Issue #714: a stand-in `claude` that prints a full, accepted version

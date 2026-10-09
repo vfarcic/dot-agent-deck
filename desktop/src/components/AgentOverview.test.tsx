@@ -36,13 +36,20 @@ vi.mock("./TerminalViewport", () => ({
   },
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell, DeckSurface } from "../App";
+import { VoiceOn } from "../hooks/useVoiceOn";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
-import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
+import { filterDashboardAgents } from "../lib/dashboardFilter";
+import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
-beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1"));
+beforeEach(() => {
+  window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+  window.sessionStorage.clear();
+});
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -59,6 +66,13 @@ const HOSTILE_CODEPOINTS = [
   "\u2066", "\u2067", "\u2068", "\u2069",
   "\u200e", "\u200f", "\u061c",
 ];
+
+/** What a reader sees without opening any `<details>`: the element's text with every disclosure removed. */
+function textOutsideDisclosures(element: HTMLElement): string {
+  const copy = element.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("details").forEach((disclosure) => disclosure.remove());
+  return copy.textContent ?? "";
+}
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const base = createFixtureSnapshot("crowded");
@@ -115,6 +129,161 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   };
 }
 
+describe("disconnected daemon actions (issue #1490)", () => {
+  const cases = (["local", "remote"] as const).flatMap((deckKind) =>
+    (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind })));
+
+  /// Scenario: With experimental features off, a local or remote deck offers one remedy selected by its disconnected reason.
+  /// An unreachable host explains why retrying is the available action.
+  it.each(cases)("offers one action for $deckKind / $kind with experimental off", ({ deckKind, kind }) => {
+    window.history.replaceState({}, "", "/");
+    const snapshot = createFixtureSnapshot("disconnected");
+    const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+    const message = kind === "unknown"
+      ? `The app cannot reach ${host} over ssh. Check that the host is up and reachable from this machine.`
+      : kind === "not-running" ? `No daemon is running on ${host}.` : `A daemon is running on ${host}, but the app is not connected to it. Reconnect to try again.`;
+    snapshot.connection = {
+      ...snapshot.connection, deckKind,
+      disconnectedReason: { kind, action: kind === "not-running" ? "start-daemon" : "reconnect", message, host },
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
+    const note = screen.getByTestId("overview-disconnected");
+    const buttons = within(note).getAllByRole("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+    expect(note).toHaveTextContent(message);
+    if (kind === "not-running") {
+      expect(within(note).getByTestId("start-daemon")).toBeVisible();
+      expect(within(note).queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+      expect(note).not.toHaveTextContent("Start one, then reconnect.");
+    } else {
+      expect(within(note).queryByRole("button", { name: "Start daemon" })).not.toBeInTheDocument();
+    }
+  });
+});
+
+describe("failed starts and connection errors per deck (PR #1623 review)", () => {
+  /** A disconnected deck with no daemon, named by `deckId`. */
+  function notRunningDeck(deckId: string, host: string): DeckSnapshot {
+    const snapshot = createFixtureSnapshot("disconnected");
+    snapshot.agents = [];
+    snapshot.connection = {
+      ...snapshot.connection, deckId, deckKind: "remote", socketPath: host,
+      message: `ssh tunnel to ${host} failed: Connection refused`,
+      disconnectedReason: { kind: "not-running", action: "start-daemon", message: `No daemon is running on ${host}.`, host },
+    };
+    return snapshot;
+  }
+
+  function card(deckId: string): HTMLElement {
+    const group = screen.getAllByTestId("daemon-group").find((section) => section.getAttribute("data-daemon-id") === deckId);
+    expect(group).toBeDefined();
+    return group!;
+  }
+
+  async function startOn(deckId: string) {
+    fireEvent.click(within(card(deckId)).getByTestId("start-daemon"));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+  }
+
+  /// Scenario: Two decks with no daemon both fail to start. Each card keeps its own failure sentence and technical detail;
+  /// Reconnect on one clears only that one, and the other deck connecting clears only its own.
+  it("keeps each deck's start error on its own card", async () => {
+    const { StartDaemonError } = await import("../lib/actionError");
+    const first = notRunningDeck("deck-00000000000000a1", "deploy@alpha");
+    const second = notRunningDeck("deck-00000000000000b2", "deploy@beta");
+    const runAction = vi.fn(async (action: import("../types").DeckAction) => {
+      const deckId = "deckId" in action ? action.deckId : undefined;
+      throw new StartDaemonError(`Could not start the daemon on ${deckId}.`, "start-failed", `ssh said no to ${deckId}`);
+    });
+    const reconnect = vi.fn(async () => undefined);
+    const live = (fleet: DeckSnapshot[]) => runtime({ mode: "live", snapshot: fleet[0], fleet, runAction, reconnect, desktopFeatures: fixtureDesktopFeatures("") });
+    window.history.replaceState({}, "", "/");
+    const { rerender } = render(<AgentOverview runtime={live([first, second])} onNavigate={vi.fn()} />);
+
+    await startOn(first.connection.deckId!);
+    await startOn(second.connection.deckId!);
+    for (const deckId of [first.connection.deckId!, second.connection.deckId!]) {
+      const error = within(card(deckId)).getByTestId("overview-start-error");
+      expect(error).toHaveTextContent(`Could not start the daemon on ${deckId}.`);
+      expect(within(error).getByTestId("connection-detail")).toHaveTextContent(`ssh said no to ${deckId}`);
+    }
+
+    // Reconnect on the second card clears the second card's error alone.
+    const secondReason = { ...second, connection: { ...second.connection, disconnectedReason: { ...second.connection.disconnectedReason!, kind: "running-not-connected" as const, action: "reconnect" as const } } };
+    rerender(<AgentOverview runtime={live([first, secondReason])} onNavigate={vi.fn()} />);
+    expect(within(card(second.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+    fireEvent.click(within(card(second.connection.deckId!)).getByRole("button", { name: "Reconnect" }));
+    expect(reconnect).toHaveBeenCalledOnce();
+    expect(within(card(second.connection.deckId!)).queryByTestId("overview-start-error")).not.toBeInTheDocument();
+    expect(within(card(first.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+
+    // The second deck connecting leaves the first deck's error where it is.
+    const connectedSecond = createFixtureSnapshot("connected");
+    connectedSecond.connection = { ...connectedSecond.connection, deckId: second.connection.deckId };
+    rerender(<AgentOverview runtime={live([first, connectedSecond])} onNavigate={vi.fn()} />);
+    expect(within(card(first.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
+
+    // The first deck connecting clears its own: disconnected again, it shows none.
+    const connectedFirst = createFixtureSnapshot("connected");
+    connectedFirst.connection = { ...connectedFirst.connection, deckId: first.connection.deckId };
+    rerender(<AgentOverview runtime={live([connectedFirst, connectedSecond])} onNavigate={vi.fn()} />);
+    rerender(<AgentOverview runtime={live([first, connectedSecond])} onNavigate={vi.fn()} />);
+    expect(within(card(first.connection.deckId!)).queryByTestId("overview-start-error")).not.toBeInTheDocument();
+  });
+
+  /// Scenario: A disconnected deck whose reason replaces the headline still shows the real connection error on its card,
+  /// and its technical details carry the connection's own detail beside the reason's.
+  it("keeps the connection error visible beside the reason", () => {
+    window.history.replaceState({}, "", "/");
+    const deck = notRunningDeck("deck-00000000000000c3", "deploy@gamma");
+    deck.connection = {
+      ...deck.connection,
+      detail: "handshake refused: untrusted socket owner",
+      disconnectedReason: { ...deck.connection.disconnectedReason!, detail: "daemon probe: nothing at /run/deck.sock" },
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot: deck, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
+    const group = card("deck-00000000000000c3");
+    expect(within(group).getByTestId("overview-disconnected")).toHaveTextContent("No daemon is running on deploy@gamma.");
+    expect(within(group).getByTestId("daemon-state")).toHaveTextContent("ssh tunnel to deploy@gamma failed: Connection refused");
+    const detail = within(within(group).getByTestId("overview-disconnected")).getByTestId("connection-detail");
+    expect(detail).toHaveTextContent("handshake refused: untrusted socket owner");
+    expect(detail).toHaveTextContent("daemon probe: nothing at /run/deck.sock");
+  });
+});
+
+describe.each(["selector", "overview", "deck"] as const)("%s voice toggle", (surface) => {
+  /// Scenario: Turning voice on and off keeps this numbered desktop surface mounted without React reporting a changed hook order.
+  /// The selector, overview, and deck each have hooks after their voice-number visibility check.
+  it("keeps the hook order stable off, on, and off", () => {
+    const deck = runtime();
+    const settings: DesktopSettingsState = {
+      settings: structuredClone(DEFAULT_DESKTOP_SETTINGS),
+      loaded: true,
+      chosen: true,
+      save: () => undefined,
+    };
+    const body = surface === "overview"
+      ? <AgentOverview runtime={deck} settings={settings} onNavigate={vi.fn()} />
+      : surface === "deck"
+        ? <DeckSurface runtime={deck} settings={settings} />
+        : <DeckSelector settings={settings} connection={deck.snapshot.connection} />;
+    const errors: string[] = [];
+    const error = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const { rerender } = render(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={true}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      expect(errors.filter((message) => /order of Hooks|Rendered (more|fewer) hooks/i.test(message))).toEqual([]);
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
 /**
  * The overview with EVERY column on screen, which is what most of this file is
  * about: what a cell says, not which cells are chosen. The choice is seeded
@@ -141,6 +310,126 @@ function renderOverviewWithStoredColumns(stored: string | undefined, overrides: 
   else window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, stored);
   return render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
 }
+
+describe("dashboard filter controls", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  function filterFleet() {
+    const snapshot = createFixtureSnapshot("connected");
+    const seed = snapshot.agents[0];
+    snapshot.connection.name = "local-box";
+    snapshot.agents = [
+      { ...seed, id: "keep", displayName: "Keep sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "hide", displayName: "Hide sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "role", displayName: "Review worker", tab: { kind: "orchestration", name: "Release review", orchestrationId: "review-run", roleName: "reviewer", roleIndex: 0, isStartRole: true } },
+    ];
+    const remote: DeckSnapshot = {
+      ...snapshot,
+      connection: { ...snapshot.connection, deckId: "filter-remote", name: "build-box", socketPath: "build@remote" },
+      agents: [{ ...seed, id: "remote", daemonId: "filter-remote", displayName: "Remote sentinel", tab: { kind: "dashboard" } }],
+    };
+    return { snapshot, fleet: [snapshot, remote] };
+  }
+
+  /// Scenario: enter a name in the shipped dashboard header, without experimental features enabled. Show all stays visible even with no matches and restores every agent in one click; fleet instrument counts retain their unfiltered meaning.
+  it("shows Show all for an active filter and restores the full fleet in one click", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    const counts = screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(screen.getByText(/Showing 1 of 4 agents/)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent)).toEqual(counts);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "no-such-agent" } });
+    expect(screen.queryAllByTestId(/^overview-agent-/)).toHaveLength(0);
+    const showAll = screen.getByRole("button", { name: "Show all" });
+    expect(showAll).toBeVisible();
+    fireEvent.click(showAll);
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+  });
+
+  /// Scenario: select a name that excludes a whole daemon and an orchestration card. Both empty groups collapse to a visible no-matching-agents line instead of disappearing without explanation.
+  it("explains empty daemon and orchestration groups", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/build-box: no matching agents/i)).toBeVisible();
+    expect(screen.getByText(/Release review: no matching agents/i)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
+  /// Scenario: type a space into the empty filter box, then a name after it. The box keeps the space as typed, every agent stays shown with no Show all until a name follows, and the name then matches with the space ignored.
+  it("keeps a leading space typed into the empty filter box", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    const box = screen.getByRole("textbox", { name: "Filter agents" });
+    fireEvent.change(box, { target: { value: " " } });
+    expect(box).toHaveValue(" ");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    fireEvent.change(box, { target: { value: " Keep sentinel" } });
+    expect(box).toHaveValue(" Keep sentinel");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
+  /// Scenario: filter a fleet in which one connected daemon has no agents at all. While the filter is active that daemon collapses to its "no matching agents" line like any other daemon the filter empties, instead of its first-run card; Show all brings the first-run card back.
+  it("collapses a connected daemon with no agents while filtering", () => {
+    const input = filterFleet();
+    const empty: DeckSnapshot = {
+      ...input.snapshot,
+      connection: { ...input.snapshot.connection, deckId: "filter-empty", name: "empty-box", socketPath: "empty@remote" },
+      agents: [],
+    };
+    renderOverviewWithStoredColumns(undefined, { ...input, fleet: [...input.fleet, empty] });
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/empty-box: no matching agents/i)).toBeVisible();
+    expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+  });
+
+  /// Scenario: remove the active text facet with its own chip control. Its query empties and every previously hidden agent returns without using Show all.
+  it("removes the text facet through its chip", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Remove text filter" }));
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+  });
+
+  /// Scenario: hide the first row while voice numbers are visible and press 1. The first remaining visible row opens, even though it was not number 1 in the unfiltered fleet.
+  it("numbers and opens the filtered rows", () => {
+    const input = filterFleet();
+    const navigate = vi.fn();
+    render(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(input)} onNavigate={navigate} /></VoiceOn.Provider>);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Hide sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    const row = screen.getByTestId(`overview-agent-${agentDomKey(input.snapshot.agents[1])}`);
+    expect(row).toHaveTextContent("1");
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(navigate).toHaveBeenCalledWith({ kind: "agent", deckId: input.snapshot.agents[1].daemonId, agentId: "hide", from: "overview" });
+  });
+
+  /// Scenario: filter a fleet whose agent's last prompt carries a sentinel, first by the agent's name and then by the sentinel itself. The window session's stored filter holds the sentinel only once the user typed it as the filter text — the fleet's prompts are never copied there.
+  it("stores an agent's prompt only when the user typed it as the filter text", () => {
+    const prompt = "PROMPT-SENTINEL-1496";
+    const input = filterFleet();
+    input.snapshot.agents[0] = { ...input.snapshot.agents[0], lastUserPrompt: `Fix ${prompt} now` };
+    renderOverviewWithStoredColumns(undefined, input);
+    const stored = () => Array.from({ length: window.sessionStorage.length }, (_, at) => window.sessionStorage.getItem(window.sessionStorage.key(at) ?? "") ?? "").join("\n");
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain("Keep sentinel");
+    expect(stored()).not.toContain(prompt);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: prompt } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain(prompt);
+  });
+});
 
 /** The legend's labels, which is the columns as a reader sees them named. */
 function legendLabels(): (string | null)[] {
@@ -1237,6 +1526,22 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario (issue #1496): a dispatcher started by a current client arrives
+   * as an ordinary dashboard pane carrying the authoring kind the daemon
+   * recorded. The dashboard row keeps that kind, so the Dispatchers filter
+   * shows it and Single agents does not.
+   */
+  it("keeps the daemon's authoring kind on the row the dashboard filter reads", () => {
+    const [agent] = createFixtureSnapshot("crowded").agents;
+    const dispatcher = toOverviewAgent({ ...(agent as AgentSession), tab: { kind: "dashboard" }, authoringKind: "dispatcher" });
+    expect(dispatcher.authoringKind).toBe("dispatcher");
+    const only = (kind: "dispatcher" | "single") =>
+      filterDashboardAgents([dispatcher], { kinds: [kind], statuses: [], agentTypes: [], daemonIds: [], text: "" }, overviewFilterFacts);
+    expect(only("dispatcher")).toEqual([dispatcher]);
+    expect(only("single")).toEqual([]);
+  });
+
+  /**
    * Scenario: `toOverviewAgent` is the boundary that reverses the daemon's one
    * remaining sentinel. A `"unknown"` lease becomes absent — no daemon value
    * spells it, so the reversal can only ever remove a placeholder — while an
@@ -1692,6 +1997,23 @@ describe("AgentOverview", () => {
     expect(screen.getByTestId("overview-loading")).toBeVisible();
   });
 
+  /** Scenario: the app's own connection fails before any daemon answers. The dashboard says so and offers Reconnect, without calling the daemon incompatible or advising a version update (Qodo on PR #1451). */
+  it("does not give version advice for a bridge failure no daemon answered", () => {
+    const snapshot = createFixtureSnapshot("error");
+    snapshot.connection = { status: "error", socketPath: FIXTURE_DAEMON_ID, message: "The control channel could not be opened." };
+    renderOverview({ snapshot });
+
+    expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
+    const note = screen.getByTestId("overview-bridge-error");
+    expect(note).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Desktop bridge error" })).toBeVisible();
+    expect(note).toHaveTextContent("The control channel could not be opened.");
+    expect(note.textContent).not.toMatch(/version|older|incompatible|match/i);
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(rows(document.body)).toHaveLength(0);
+  });
+
   /** Scenario: Refuses to imply a fleet it cannot read from an incompatible daemon. */
   it("refuses to imply a fleet it cannot read from an incompatible daemon", () => {
     const snapshot = createFixtureSnapshot("error");
@@ -1725,13 +2047,23 @@ describe("AgentOverview", () => {
    * declared break, not a stamp difference. Reported against v0.43.0, whose
    * hint read "Only the build stamps differ" under a contract mismatch.
    */
+  /*
+   * Found by hand on 2026-10-01 (PR #1451): the overview showed `contract
+   * mismatch: the daemon is behind this app across 505-…. Protocol 10 matched
+   * on both sides, so the frames decode — …`, which no user can act on. The
+   * message below is the plain sentence `daemon_bridge.rs` now produces, and
+   * the slug and protocol number travel in `detail` instead. What is asserted
+   * is what a reader sees OUTSIDE the disclosure: no developer vocabulary, and
+   * every button the note offers named with what it does.
+   */
   it("offers Connect anyway on the overview across a declared contract break", async () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "contract mismatch: the daemon is behind this app across 708-worker-failure-reports-submitted. Protocol 10 matched on both sides, so the frames decode — but a declared compatibility break sits between these two builds, so a field can be read with the wrong meaning rather than failing outright. Builds: desktop is 0.43.0, daemon is 0.42.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 708-worker-failure-reports-submitted. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1739,18 +2071,30 @@ describe("AgentOverview", () => {
     const deck = runtime({ mode: "live", snapshot, runAction, reconnect });
     render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
 
-    expect(screen.getByTestId("overview-incompatible")).toBeVisible();
-    const hint = within(screen.getByTestId("overview-incompatible")).getByText(/reports 9 running agents/);
-    expect(hint).not.toHaveTextContent("Only the build stamps differ");
-    expect(hint).toHaveTextContent("a declared compatibility break separates this daemon from this app");
+    const note = screen.getByTestId("overview-incompatible");
+    expect(note).toBeVisible();
+    expect(note).toHaveTextContent("This daemon is older than this app");
+    const visible = textOutsideDisclosures(note);
+    expect(visible).not.toMatch(/contract|protocol|mismatch|handshake|declared|wire|build stamp/i);
+    expect(visible).not.toContain("708-worker-failure-reports-submitted");
+    for (const button of within(note).getAllByRole("button")) {
+      const label = button.textContent?.trim() ?? "";
+      expect(visible, `the note explains its "${label}" button`).toMatch(new RegExp(`${label} (uses|tries|goes|stops) `));
+    }
+    const detail = within(note).getByTestId("connection-detail");
+    expect(detail.tagName).toBe("DETAILS");
+    expect(within(detail).getByText("Technical details")).toBeInTheDocument();
+    expect(detail).toHaveTextContent("708-worker-failure-reports-submitted");
+    expect(detail).toHaveTextContent("Both sides speak protocol 10");
+
     fireEvent.click(screen.getByTestId("overview-connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
-    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("stamp difference");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("may show some of this daemon's information wrongly");
+    expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
-    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: snapshot.connection.deckId }));
     // The crate connects and emits the deck's snapshot (issue #1472); a
     // reconnect would re-establish the whole fleet to show one deck.
     expect(reconnect).not.toHaveBeenCalled();
@@ -2924,7 +3268,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const { rerender } = render(<AgentOverview runtime={runtime({ mode: "live", snapshot: fleet[0], fleet, runAction, reconnect })} onNavigate={vi.fn()} />);
 
     fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("may show some of this daemon's information wrongly");
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: FIXTURE_REMOTE_DAEMON_ID }));

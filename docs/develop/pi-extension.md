@@ -4,7 +4,7 @@
 
 [Pi](https://github.com/earendil-works/pi) is integrated as a first-class agent (PRD #201). The user-facing setup lives in the published [Orchestration](../orchestration.md) and [Getting Started](../getting-started.md) pages; this page is the contract for maintainers.
 
-The guiding split: **bundle the glue, detect the engine.** Shipping Pi itself would mean shipping a Node runtime and forfeiting the single-static-binary story, so Pi is detected on PATH like `claude`/`opencode`. The only thing compiled into the `dot-agent-deck` binary is the small TypeScript **extension** that gives a Pi pane native tools and event-driven status. Tested against **Pi 0.80.6**.
+The guiding split: **bundle the glue, detect the engine.** Shipping Pi itself would mean shipping a Node runtime and forfeiting the single-static-binary story, so Pi is detected on PATH like `claude`/`opencode`. The only thing compiled into the `dot-agent-deck` binary is the small TypeScript **extension** that gives a Pi pane native tools and event-driven status. Tested against **Pi 0.80.6**; the card-detail events (issue #622) against **Pi 0.87.1**.
 
 ## Producer, not a second path
 
@@ -14,7 +14,7 @@ The extension is a higher-fidelity *producer* for the existing protocol — it d
 
 A self-contained TypeScript subdirectory; its whole JS toolchain lives there and is kept off the Rust critical path (cargo/nextest never touch it).
 
-- `src/orchestrator.ts` — **pure logic** (zero imports): argv construction for each command and the Pi-event → state-string mapping. This is what the unit tests target, so no running Pi is needed to test it.
+- `src/orchestrator.ts` — **pure logic** (zero imports): argv construction for each command, the Pi-event → report mapping and the tool-detail extraction. This is what the unit tests target, so no running Pi is needed to test it.
 - `src/index.ts` — the **Pi-API glue**: the default-export factory `(pi) => void` that registers tools and subscribes to events, wiring the pure functions to Pi.
 - `test/orchestrator.test.ts` — unit tests run with `node --import tsx --test` (Node 22; `bun` is not used). Run with `cd pi-extension && npm install && npm test`.
 
@@ -31,7 +31,7 @@ TypeBox and the Pi type definitions resolve from Pi's own runtime (jiti) at load
 
 ### Event → status mapping
 
-The extension subscribes with `pi.on(name, handler)` (note: `pi.events` is the *inter-extension* bus, not lifecycle) and reports status by shelling the CLI seam below. Mapping:
+The extension subscribes with `pi.on(name, handler)` (note: `pi.events` is the *inter-extension* bus, not lifecycle) and reports by shelling the CLI seam below. Every report carries `--cwd` from the handler's `ExtensionContext.cwd`, so the card has a directory however it was created (`piEventReport` in `orchestrator.ts`). Lifecycle mapping:
 
 | Pi event | Reported state |
 |---|---|
@@ -42,13 +42,48 @@ The extension subscribes with `pi.on(name, handler)` (note: `pi.events` is the *
 | `agent_end` | *(deliberately unmapped)* — Pi may auto-retry/compact/drain follow-ups after it, so it is not a reliable turn-end signal; `agent_settled` is |
 | anything else | *(no `agent-event` emitted)* — so a bogus `--type` can never reach the CLI |
 
+Card-detail mapping (issue #622). Before it the extension reported lifecycle only, so a Pi card had no `Prmt:` row and read `Tools: 0` however many tools Pi ran:
+
+| Pi event | Reported `--type` | Detail |
+|---|---|---|
+| `before_agent_start` | `prompt` (→ `Thinking` with `user_prompt`) | `--prompt` from the event's `prompt`, cut to `MAX_PROMPT_CHARS` (4000) for argv; nothing is reported for a blank prompt. Fires only for a prompt submitted while Pi is idle |
+| `input` with `streamingBehavior` set (issue #1567) | `prompt` | `--prompt` from the event's `text`, cut the same way. Pi sets `streamingBehavior` (`steer` / `followUp`) exactly when it is busy and is queueing the prompt instead of starting a run, which is the case `before_agent_start` never sees. An `input` without it is ignored, so an idle submission is reported once, by `before_agent_start` |
+| `tool_execution_start` | `tool-start` (→ `ToolStart`, card `Working`) | `--tool-name`, and `--tool-detail` from `piToolDetail`: `bash` → first command line (120), `read`/`write`/`edit`/`ls` → `path`, `grep`/`find` → `pattern`, anything else → first string argument (80) |
+| `tool_execution_end` | `tool-end` (→ `ToolEnd`, completed-tool count +1) | `--tool-name`; a failed call (`isError`) counts too, as a Claude `PostToolUse` does |
+| `tool_execution_update` | *(not subscribed)* | |
+
+Every report, with any older-CLI retry, runs through one serial queue (`createSerialQueue`), so the daemon receives reports in the order Pi emitted them: a call's `tool-end` cannot overtake its `tool-start`, nor a slow `agent_start` retry an `agent_settled`. Pi 0.87.1 already awaits each extension handler before emitting its next event (`processEvents` in `pi-agent-core`), and the queue keeps the order from depending on that. It holds only the CLI calls, never a whole handler, so an event Pi emits while another handler is still running (the seed delivery in `session_start` starts a turn) cannot wait on it. The prompt reports make a Pi pane a prompt-confirming agent; the next section has how and why.
+
 **Parity with the other backends.** A turn ending is `Idle`, not "Needs Input". Claude, OpenCode, and Codex map their turn-end signal (`Stop` / `session.idle`) and session-start to Idle, and surface "Needs Input" (`waiting`) only on a genuine user-blocking signal (a permission prompt / attention notification). Pi's `agent_settled` is its turn-end analog, so it reports `finished` → Idle; because Pi exposes no permission/attention lifecycle event today, it never reports `waiting` — like a Claude agent that never hits a permission prompt. `waiting` stays a valid CLI `--type` (below) so a future Pi user-blocking event can map to it with no wire change.
+
+## Prompt confirmation (issue #1567)
+
+The deck's automatic prompts (a dispatched unit's task, a scheduled job's prompt, a mode seed or orchestrator prompt when the native `get-seed` hand-off did not take it) are typed into the pane and stay **provisional** until the agent reports submitting that prompt (`src/prompt_delivery.rs`). A pane whose agent can report gets the delivery re-submitted when no report comes, and a dispatched unit that never reports gets the "task may never have arrived" notice on its card. A pane whose agent cannot report gets one write and nothing else.
+
+A Pi pane is now the first kind, but only while its extension says so. `prompt_delivery::agent_prompt_reporting(Pi)` is `WhenDeclared`: a Pi producer counts as reporting only when its events carry `prompt_reports_declared = "1"` (`event::PROMPT_REPORTS_DECLARED_METADATA_KEY`), which `agent-event --reports-prompts` stamps and this extension sends on every report. The declaration is sticky per session (`SessionState::prompt_reports_declared`), and a declared inability (`wrapper_prompt_reports_unavailable`) outranks it. Because it grants standing, it counts only on a frame the daemon's hook-provenance gate attested ([hook-provenance.md](hook-provenance.md)): `AgentEvent::declares_prompt_reports` requires the daemon-authoritative `daemon_attested_owner` stamp, which `ingest_event` sets only when the frame's per-spawn capability token resolved to the pane and agent it names, and never on a frame marked `daemon_unproven`. An outside agent's frame, a token-less one (refused outright for a deck-spawned pane, or admitted unstamped under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`), a producer's own copy of either stamp (stripped on ingest), or a frame relayed by a daemon from before #318 therefore declares nothing, and the session flag is never set on an unproven card. `tests/pi_prompt_report_provenance.rs` (`status/agent-event/007`, `/008`) drives each of those cases through a real daemon and the real CLI. What attestation does not reach is the same-uid residual that page names: a process that reads a deck agent's own token can speak for that pane here as everywhere. The reason for the declaration is the extensions already in the field, none of which reports every prompt:
+
+- before #622 the extension reported no prompt at all;
+- from #622 it reported `before_agent_start`, which Pi raises only for a prompt submitted while it is idle. Measured on Pi 0.87.1: a prompt typed while Pi ran a tool was queued as a steering message, submitted and acted on, and never reported — Pi starts no new run for it. Counting such an extension as confirming would re-submit a prompt Pi already took.
+
+A Pi process keeps the extension it loaded at start, so a deck upgraded under a running Pi meets an older one. Without the declaration it stays `CannotReport`, exactly the pre-#1567 behaviour.
+
+What a declared Pi pane changes, path by path:
+
+- **Daemon spawn-time delivery** (`crate::spawn`: `dispatch`, the scheduler, issue-dispatch, and `StartAgent`'s authoring kinds for agents other than a native-seeded Pi): `AgentEvent::reports_submitted_prompt` is true for the pane's frames, so the unconfirmed write is re-submitted under the usual backoff and confirmed by Pi's `prompt` report. A pane the deck spawned as Pi has the #570 standing to accept that producer when it announces itself after the write (`agent_spawned_as_reporting_agent`, which asks only whether the type *can* report).
+- **The quiet-unit notice** on a dispatched unit's card follows from the same delivery: a declared Pi unit that never reports its task gets it.
+- **TUI-owned deliveries** (an orchestrator role prompt and a mode seed typed in by the TUI): `pane_confirmation_capability` answers `Reports` for the pane, so they arm re-submission too. A Pi start role's prompt is delivered natively and does not go through this.
+- **Confirmation latency floor:** Pi stays on `SLOW_CONFIRMATION_LATENCY` (10 s). Its ordinary report is fast — 40 ms from write to confirmation in `scheduler/pi/002` — but a prompt submitted while Pi compacts is held in Pi's own queue and reported when compaction ends (4.4 s measured on a 10k-token context), and the 2 s floor would type a second copy behind it.
+- **Not changed:** delegate re-delivery (`delegate_retry`) already covered Pi and takes any turn event as proof; the #666 re-arm needs a `SessionStart`, which Pi never sends.
+
+Residuals, all in the direction of a missed re-submission rather than a duplicate unless noted: a busy-time prompt that another extension's `input` handler swallows after ours has reported it still counts as submitted (an idle one is reported from `before_agent_start`, after every handler and after Pi's model and key checks); if Pi stops being busy between the `input` event and its own check, the prompt is reported twice (once from `input`, once from `before_agent_start`), which is harmless; a compaction that holds a typed prompt for longer than the 10 s floor gets a second copy queued behind it (a duplicate, and the one that remains — a fresh pane, which is where the deck types automatic prompts, has nothing to compact).
 
 ## The `agent-event` CLI seam
 
-`dot-agent-deck agent-event --type <running|waiting|finished>` (in `src/main.rs`) is the only new CLI surface. It reads `DOT_AGENT_DECK_PANE_ID` (required) and `DOT_AGENT_DECK_AGENT_ID` (optional) from the pane env the daemon already injects, maps the state via `event::agent_event_type_from_state` (`running→Thinking`, `waiting→WaitingForInput`, `finished→Idle`, else error), builds a bare `AgentEvent` (agent type `Pi`), and sends it **raw** via `hook::send_to_socket` — the same path `delegate`/`work-done` use. The daemon's `run_hook_loop` already falls back to `AgentEvent` and `apply_event` drives the status.
+`dot-agent-deck agent-event --type <running|waiting|finished|prompt|tool-start|tool-end> [--reports-prompts] [--cwd D] [--prompt P] [--tool-name N] [--tool-detail T]` (in `src/main.rs`) is the only new CLI surface. It reads `DOT_AGENT_DECK_PANE_ID` (required) and `DOT_AGENT_DECK_AGENT_ID` (optional) from the pane env the daemon already injects, maps the type via `event::agent_event_type_from_state` (`running→Thinking`, `waiting→WaitingForInput`, `finished→Idle`, `prompt→Thinking`, `tool-start→ToolStart`, `tool-end→ToolEnd`, else error), builds a bare `AgentEvent` (agent type `Pi`) with `hook::build_agent_event_cli`, and sends it **raw** via `hook::send_to_socket` — the same path `delegate`/`work-done` use. The daemon's `run_hook_loop` already falls back to `AgentEvent` and `apply_event` drives the card. The builder bounds the detail like the hook builders do: blank values are dropped, the prompt goes through `record_submitted_prompt`, the tool detail keeps its first line cut to 120 bytes and the tool name 80.
 
-**This is zero new wire.** The `--type` vocabulary (`running`/`waiting`/`finished`) is the contract the extension's mapping and the docs must agree on.
+**This is zero new wire.** Every type lands on an existing `EventType` variant and every detail on an existing optional `AgentEvent` field (`cwd`, `user_prompt`, `tool_name`, `tool_detail`) with the meaning it already has for the hook-driven agents, so neither `PROTOCOL_VERSION` nor a `.breaking.md` applies. The `--type` vocabulary (`event::AGENT_EVENT_TYPES` / `AGENT_EVENT_TYPES` in `orchestrator.ts`) is the contract the extension's mapping and the docs must agree on. The lifecycle-only invocation (`--type running` and no other flag) is unchanged, so an older extension keeps working against a newer CLI. The reverse — this extension shelling a CLI from before #622 — is reachable: the daemon writes the extension into Pi's directory when it starts, so a newer daemon starting on the same machine hands its extension to the Pi panes an older, still-running daemon spawns, and those name the older binary in `DOT_AGENT_DECK_EXE`. The same happens to a CLI from #622 up to #1567, which knows the detail flags but not `--reports-prompts`. So the extension reports at one of three levels (`REPORT_LEVELS` / `createReporter` in `orchestrator.ts`): `declared` (detail plus `--reports-prompts`, which it puts first among the flags so an older CLI names it as the unknown one), `detail`, and `lifecycle` (the bare `--type <state>` every CLI accepts). It starts at `declared` and steps down one level only when the refusal was clap's own usage error — exit code 2 with stderr opening `error: unexpected argument '--` (`isUnsupportedFlagFailure`, which reads the CLI's exit code and stderr, never the argv) — retrying the same report at the lower level and staying at the level that then got through. A detail report has no lifecycle form and is dropped at that level. Any other failure leaves the level where it is and retries a lifecycle report once, bare, so a transient socket error costs neither the card's status nor the session's detail. A deck whose CLI predates the declaration therefore never gets it, and its Pi panes stay non-confirming, which is what that deck's delivery code expects anyway.
+
+The extension passes each detail as a single `--flag=value` argv element, and the CLI's detail args set `allow_hyphen_values`: both are free text, and a prompt like `--help me` or a command like `-rf build` passed as a separate element would otherwise be parsed as a flag and the whole report refused.
 
 ## Native prompt delivery
 

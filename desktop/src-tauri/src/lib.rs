@@ -32,6 +32,9 @@ mod secrets;
 mod selection_capture;
 mod settings;
 mod terminal;
+// PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
+// crate's shared upgrade procedure.
+mod upgrade;
 // Tests only: binding the production attach server's listener without the
 // process-umask flip (issue #1078).
 #[cfg(all(test, unix))]
@@ -53,7 +56,8 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
-    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
+    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, LastCommandKeeper,
+    StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
@@ -1607,8 +1611,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
                     view.resubscribed();
-                    let snapshot = snapshot_with(&endpoint, &links, None).await;
-                    emit_snapshot(&app, &snapshot);
+                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1633,8 +1636,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                     // machines in the fleet, and dropping their links would make
                     // one deck's bad moment cost N handshakes.
                     links.invalidate(&endpoint).await;
-                    let snapshot = snapshot_with(&endpoint, &links, None).await;
-                    emit_snapshot(&app, &snapshot);
+                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1684,6 +1686,36 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
         }
     });
     state.register_watcher(&key, claim, handle);
+}
+
+/// Emit the snapshot of a deck its watcher could not subscribe to, and when it
+/// is disconnected, why (issue #1490).
+///
+/// A remote deck's reason is asked on its host over ssh, so it is asked here,
+/// on this deck's own watcher and at most every
+/// [`crate::daemon_bridge::REMOTE_REASON_TTL`], rather than on every snapshot:
+/// the snapshot goes out first with the stored answer, and again once a fresh
+/// one arrives.
+///
+/// Both emits are dropped when a start began or ended for this deck since the
+/// snapshot was begun (PR #1623 review): the snapshot then describes the deck
+/// from before the start, and emitted after the start's connected one it would
+/// paint a connected deck as disconnected. The check and the emit run under
+/// the lock a start bumps the generation under, so neither can land after it.
+async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+    let generation = links.reason_generation(endpoint);
+    let mut snapshot = snapshot_with(endpoint, links, None).await;
+    if !links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot)) {
+        return;
+    }
+    if snapshot.connection.status == ConnectionStatus::Disconnected
+        && links.refresh_disconnected_reason(endpoint).await
+    {
+        let reason = links.disconnected_reason(endpoint).await;
+        snapshot.connection.disconnected_reason =
+            Some(crate::dto::DisconnectedReasonDto::new(endpoint, &reason));
+        links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot));
+    }
 }
 
 /// Drain one subscription into a channel until it ends.
@@ -2056,8 +2088,14 @@ const LISTING_OPTIONS_UNSUPPORTED: &str = "This daemon cannot show hidden or sym
 
 /// PRD #1223 M4: what the New agent form needs to know about the deck
 /// `deck_id` names — its default command, its agent registry, its experimental
-/// flag, the authoring kinds it can compose — plus the command this app last
-/// started a plain agent with there.
+/// flag, the authoring kinds it can compose — plus that deck's last command.
+///
+/// The last command comes from the deck itself when it keeps one (issue #1540,
+/// [`LastCommandKeeper::Daemon`]), so the TUI's form and this dialog offer the
+/// same value and it survives a restart of the app. Against a deck that does
+/// not, it is the command this app last started an agent with there, from
+/// [`DesktopState::last_command`]. Either way it is that deck's own value:
+/// one deck's command is never offered for another.
 ///
 /// A deck that predates the query answers
 /// [`DesktopNewAgentOptions::Unsupported`], carrying this app's own compiled
@@ -2153,7 +2191,18 @@ async fn new_agent_options_on(
         .new_agent_options()
         .await
         .map_err(|error| safe_message(error.to_string()))?;
-    let last_command = state.last_command(&scope.identity());
+    let keeper = daemon
+        .client
+        .last_command_keeper()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let last_command = match (&answer, keeper) {
+        // Issue #1540: the deck keeps it, so its answer is the value — even
+        // when that is "none", because this app records nothing for such a
+        // deck and an in-memory value here could only be stale.
+        (GatedQuery::Answered(options), LastCommandKeeper::Daemon) => options.last_command.clone(),
+        _ => state.last_command(&scope.identity()),
+    };
     Ok(match answer {
         GatedQuery::Answered(options) => DesktopNewAgentOptions::Deck {
             default_command: options.default_command,
@@ -2262,6 +2311,62 @@ async fn new_agent_orchestrations_on(
         }
         Err(error) => Err(safe_message(error.to_string())),
     }
+}
+
+/// Issue #1490: start the daemon of deck `deck_id` (the selected deck when
+/// absent), wherever it lives — on this machine, or on a remote deck's host
+/// over ssh with the deck's own ssh details and socket — through the shared
+/// `dot_agent_deck::daemon_start` procedure, then connect to it as usual.
+///
+/// Resolves once the deck is connected, with what the start did and the deck's
+/// snapshot. Rejects when it is not: with the start's own failure in the
+/// user's terms (host unreachable, ssh login refused, `dot-agent-deck` not
+/// installed there, the daemon not answering at the deck's socket) as
+/// `{ message, failure, detail }`, or with a bare sentence for a daemon that
+/// runs and still did not connect ([`crate::dto::DesktopStartDaemonError`]).
+#[tauri::command]
+async fn desktop_start_daemon(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: Option<String>,
+) -> Result<crate::dto::StartDaemonResultDto, crate::dto::DesktopStartDaemonError> {
+    use dot_agent_deck::daemon_start::StartOutcome;
+
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(deck_id.as_deref())?;
+    let endpoint = scope.endpoint().clone();
+    let host = dot_agent_deck::daemon_start::host_label(&endpoint);
+    let (outcome, snapshot) =
+        crate::daemon_bridge::start_and_snapshot(&endpoint, &state.daemon).await;
+    emit_snapshot(&app, &snapshot);
+    ensure_snapshot_watchers(&app, &state);
+    let outcome = match outcome {
+        StartOutcome::Failed(problem) => {
+            return Err(crate::dto::DesktopStartDaemonError::Failed(
+                crate::dto::DesktopStartFailure::new(&problem),
+            ));
+        }
+        StartOutcome::Started => "started",
+        StartOutcome::AlreadyRunning => "already-running",
+    };
+    if snapshot.connection.status != ConnectionStatus::Connected {
+        return Err(crate::dto::DesktopStartDaemonError::Message(safe_message(
+            format!(
+                "The daemon is running on {host}, but the app could not connect to it: {}",
+                snapshot
+                    .connection
+                    .error
+                    .as_deref()
+                    .unwrap_or("it did not respond as expected")
+            ),
+        )));
+    }
+    Ok(crate::dto::StartDaemonResultDto {
+        outcome,
+        host: safe_message(host),
+        snapshot,
+    })
 }
 
 #[tauri::command]
@@ -2951,7 +3056,9 @@ async fn desktop_voice_start(
     // open for the life of the app. The ticket is what stops a timer outliving
     // its own utterance and closing the next one.
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(voice::MAX_UTTERANCE).await;
+        // Not always the whole cap: a microphone kept open since the last
+        // utterance has been recording this one since then (PR #1451).
+        tokio::time::sleep(ticket.remaining()).await;
         // Blocking for the reason the open above is: releasing the device
         // joins its thread, which is as slow as the platform's teardown.
         let _ = tauri::async_runtime::spawn_blocking(move || hold.cap_reached(ticket)).await;
@@ -3061,7 +3168,15 @@ const MAX_VOICE_DECK_ID_BYTES: usize = 256;
 /// reach it.
 fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(), String> {
     let too_long = |value: &str, limit: usize| value.len() > limit;
-    if directories.entries.len() > MAX_VOICE_DIRECTORY_ENTRIES
+    // A paged listing's other pages are children of the same directory, so
+    // the pages together are bounded as one listing is (PR #1451 round 3,
+    // change 4).
+    let elsewhere = directories
+        .paging
+        .as_ref()
+        .map_or(&[][..], |paging| paging.elsewhere.as_slice());
+    if directories.entries.len() + elsewhere.len() > MAX_VOICE_DIRECTORY_ENTRIES
+        || !voice_paging_is_sound(directories.paging.as_ref(), MAX_VOICE_DIRECTORY_NAME_BYTES)
         || too_long(&directories.deck_id, MAX_VOICE_DECK_ID_BYTES)
         || too_long(&directories.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
         || directories.entries.iter().any(|entry| {
@@ -3075,6 +3190,19 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
         );
     }
     Ok(())
+}
+
+/// Whether a declared [`voice::VoicePaging`] is one a real paged list could
+/// have produced: pages counted from 1 and every name within `name_limit`.
+/// Absent paging is sound. How many items it may carry is the caller's bound.
+fn voice_paging_is_sound(paging: Option<&voice::VoicePaging>, name_limit: usize) -> bool {
+    paging.is_none_or(|paging| {
+        paging.page >= 1
+            && paging
+                .elsewhere
+                .iter()
+                .all(|item| item.page >= 1 && item.name.len() <= name_limit)
+    })
 }
 
 /// The bounds on the New agent form a webview may declare (PRD #1223), checked
@@ -3105,9 +3233,27 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
         || oversized(&form.modes)
         || oversized(&form.agent_types)
         || oversized(&form.withheld_modes)
+        || form
+            .mode_paging
+            .as_ref()
+            .is_some_and(|paging| paging.elsewhere.len() > MAX_VOICE_FORM_CHOICES)
+        || !voice_paging_is_sound(form.mode_paging.as_ref(), MAX_VOICE_FORM_CHOICE_BYTES)
     {
         return Err(
             "the New agent form sent with that command is larger than any form shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// PRD #1260 — the dictation target a webview may declare: two ids, each
+/// bounded like the deck id a form declares, and neither empty, since a mode
+/// aimed at nobody is not a mode.
+fn validate_voice_dictation(dictation: &voice::VoiceDictationTarget) -> Result<(), String> {
+    let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad(&dictation.deck_id) || bad(&dictation.agent_id) {
+        return Err(
+            "the typing target sent with that command names no agent a pane shows".to_string(),
         );
     }
     Ok(())
@@ -3226,6 +3372,14 @@ fn selector_rows_beyond_voice(
 /// an IPC argument between this app's own webview and its own Rust half, in
 /// one binary, and never reaches the daemon.
 ///
+/// **`dictation` is the sixth** (PRD #1260): the agent the voice panel is in
+/// the dictation mode for, present only while the mode is on. Its presence
+/// makes the utterance local — classified against the reserved phrases and
+/// otherwise typed, with no Commands backend call
+/// ([`voice::handle_utterance_with_dictation`]). Bounded like the deck id above
+/// and trusted no further: the typing itself goes through the webview's own
+/// `sendTerminalInput` to the pane on screen, never to whatever this names.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -3253,6 +3407,7 @@ async fn desktop_voice_resolve(
     new_agent: Option<voice::VoiceNewAgent>,
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
     endpoints: Option<crate::settings::EndpointSettings>,
+    dictation: Option<voice::VoiceDictationTarget>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3269,6 +3424,9 @@ async fn desktop_voice_resolve(
     if let Some(deck_step) = &deck_step {
         validate_voice_deck_step(deck_step)?;
     }
+    if let Some(dictation) = &dictation {
+        validate_voice_dictation(dictation)?;
+    }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
@@ -3281,12 +3439,14 @@ async fn desktop_voice_resolve(
         resolver.as_ref(),
         screen,
         &snapshot.agents,
+        Some(snapshot.connection.deck_id.as_str()),
         &snapshot.observed,
         VoiceDeclaration {
             directories: directories.as_ref(),
             new_agent: new_agent.as_ref(),
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
+            dictation: dictation.as_ref(),
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3304,30 +3464,32 @@ struct VoiceDeclaration<'a> {
     new_agent: Option<&'a voice::VoiceNewAgent>,
     deck_step: Option<&'a [voice::VoiceDeckChoice]>,
     endpoints: Option<&'a crate::settings::EndpointSettings>,
+    dictation: Option<&'a voice::VoiceDictationTarget>,
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
 /// resolves against, the utterance's outcome, and a switch addressed to the
 /// Deck selector's token. Separate so it runs without a webview or a daemon.
-// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with` takes them.
+// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with_dictation` takes them.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_declared_utterance(
     resolver: &dyn voice::IntentResolver,
     screen: voice::Screen,
     agents: &[voice::DesktopAgent],
+    agents_deck: Option<&str>,
     observed: &[crate::dto::ObservedDeckDto],
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
     show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
-    let mut decks = voice_decks(observed, declared.deck_step);
+    let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
     // them — the section the selector is rendering, not `desktop.toml`, which
     // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
-    let mut result = voice::handle_utterance_with(
+    let mut result = voice::handle_utterance_with_dictation(
         resolver,
         voice::table(),
         screen,
@@ -3335,6 +3497,7 @@ async fn resolve_declared_utterance(
         &decks,
         declared.directories,
         declared.new_agent,
+        declared.dictation,
         transcript,
         labels,
         show_deck,
@@ -3352,6 +3515,186 @@ async fn resolve_declared_utterance(
         );
     }
     Ok(result)
+}
+
+/// The most bytes one offered candidate's text may carry across the boundary
+/// ([`validate_voice_choice`]): a label or a value is a name, an id or a path.
+const MAX_VOICE_CHOICE_TEXT_BYTES: usize = 4 * 1024;
+
+/// Refuse an offered list no real choice could have produced: more entries
+/// than [`voice::choice::MAX_CHOICES`], or text longer than any name.
+fn validate_voice_choice(offered: &[voice::ResolvedParam]) -> Result<(), String> {
+    let too_long = |param: &voice::ResolvedParam| {
+        [&param.name, &param.spoken, &param.value, &param.label]
+            .iter()
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+    };
+    if offered.is_empty()
+        || offered.len() > voice::choice::MAX_CHOICES
+        || offered.iter().any(too_long)
+    {
+        return Err("the choice sent with that answer is not one this app offers".to_string());
+    }
+    Ok(())
+}
+
+/// PRD #1261: answer a pending numbered choice, locally.
+///
+/// **No Commands backend call.** The utterance is answered by
+/// [`voice::choice::answer`] against the list the panel offered and against
+/// what the app observes NOW — the selected deck's agents, read here as
+/// [`desktop_voice_resolve`] reads them, and the dialog's declarations, sent
+/// with the answer for that command's reasons. No model is asked anything, so
+/// no observed name can steer which entry is chosen.
+///
+/// `action` is the row the choice completes; it only decides how decks are
+/// keyed, because a switch's candidates carry the Deck selector's token
+/// ([`voice::address_deck_switch`]). The webview dispatches the chosen entry
+/// itself, through the same staleness checks a resolved dispatch meets.
+#[tauri::command]
+// Nine: each declaration piece is a parameter, for `desktop_voice_resolve`'s reason.
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_choice(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    utterance: String,
+    action: String,
+    offered: Vec<voice::ResolvedParam>,
+    directories: Option<voice::VoiceDirectories>,
+    new_agent: Option<voice::VoiceNewAgent>,
+    deck_step: Option<Vec<voice::VoiceDeckChoice>>,
+    endpoints: Option<crate::settings::EndpointSettings>,
+) -> Result<voice::ChoiceAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_choice(&offered)?;
+    if let Some(directories) = &directories {
+        validate_voice_directories(directories)?;
+    }
+    if let Some(new_agent) = &new_agent {
+        validate_voice_new_agent(new_agent)?;
+    }
+    if let Some(deck_step) = &deck_step {
+        validate_voice_deck_step(deck_step)?;
+    }
+    let snapshot = get_snapshot(&state.daemon).await;
+    Ok(answer_declared_choice(
+        &utterance,
+        &action,
+        &offered,
+        &snapshot.agents,
+        &snapshot.observed,
+        VoiceDeclaration {
+            directories: directories.as_ref(),
+            new_agent: new_agent.as_ref(),
+            deck_step: deck_step.as_deref(),
+            endpoints: endpoints.as_ref(),
+            dictation: None,
+        },
+    ))
+}
+
+/// The most items a numbered list may declare ([`validate_voice_numbered`]):
+/// the directory listing's own bound, which is the longest list voice numbers.
+const MAX_VOICE_NUMBERED_ENTRIES: usize = MAX_VOICE_DIRECTORY_ENTRIES;
+
+/// The most sections a numbered list may declare: one per kind of list
+/// (round 4, D7).
+const MAX_VOICE_NUMBERED_SECTIONS: usize = 4;
+
+/// Refuse a numbered list no screen could show: more items than the longest
+/// list voice numbers, more sections than kinds of list, or text longer than
+/// any name.
+fn validate_voice_numbered(heard: &voice::numbers::VoiceNumberedList) -> Result<(), String> {
+    let too_long = |entry: &voice::numbers::VoiceNumberedEntry| {
+        [&entry.value, &entry.label]
+            .into_iter()
+            .chain(entry.deck_id.as_ref())
+            .chain(&entry.names)
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+            || entry.names.len() > MAX_VOICE_NUMBERED_NAMES
+    };
+    if heard.len() > MAX_VOICE_NUMBERED_ENTRIES
+        || heard.sections.len() > MAX_VOICE_NUMBERED_SECTIONS
+        || heard
+            .sections
+            .iter()
+            .flat_map(|section| &section.entries)
+            .any(too_long)
+    {
+        return Err(
+            "the numbered list sent with that answer is larger than any screen shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The most other names one numbered item may carry: an agent's role, CLI
+/// name and id, with room to spare.
+const MAX_VOICE_NUMBERED_NAMES: usize = 8;
+
+/// PR #1451 round 3, change 3 (PRD #1261): answer a bare number said against
+/// the numbered list on screen, locally.
+///
+/// **No Commands backend call**, as for [`desktop_voice_choice`]: the
+/// utterance is read by [`voice::numbers::answer`] against `heard` — the list
+/// as it stood when the user spoke — and `generation`, the list's generation
+/// on screen now. The webview dispatches the item chosen itself, through the
+/// same checks a resolved dispatch meets.
+#[tauri::command]
+async fn desktop_voice_number(
+    webview: Webview,
+    utterance: String,
+    heard: voice::numbers::VoiceNumberedList,
+    generation: u64,
+) -> Result<voice::numbers::NumberAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_numbered(&heard)?;
+    Ok(voice::numbers::answer(&utterance, &heard, generation))
+}
+
+/// [`desktop_voice_choice`] once the live state is read. The decks are the
+/// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
+/// keyed by the Deck selector's token, as that row's candidates are, and a
+/// deck the selector does not list is not live for it.
+fn answer_declared_choice(
+    utterance: &str,
+    action: &str,
+    offered: &[voice::ResolvedParam],
+    agents: &[voice::DesktopAgent],
+    observed: &[crate::dto::ObservedDeckDto],
+    declared: VoiceDeclaration<'_>,
+) -> voice::ChoiceAnswer {
+    let mut decks = voice_decks(observed, declared.deck_step, None);
+    let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
+    if action == voice::SWITCH_DECK_ROW {
+        decks = decks
+            .into_iter()
+            .filter_map(|mut deck| {
+                deck.id = selections.get(&deck.id)?.token.clone();
+                Some(deck)
+            })
+            .collect();
+    }
+    voice::choice::answer(
+        utterance,
+        offered,
+        &voice::choice::ChoiceLive {
+            agents,
+            decks: &decks,
+            directories: declared.directories,
+            new_agent: declared.new_agent,
+        },
+    )
 }
 
 /// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
@@ -3381,9 +3724,9 @@ async fn resolve_declared_utterance(
 /// path — so a deck that later connects keeps its key, and labelled the way the
 /// overview labels it. It is appended as unable to take a new agent, since the
 /// New agent dialog lists only decks the app is connected to: with the deck
-/// step's own reason when the step names one, otherwise
-/// [`voice::DECK_NOT_CONNECTED`], or the fleet view's "not configured"
-/// sentence for a row with no address. That keeps the New agent flow exactly
+/// step's own short reason when the step names one, otherwise
+/// [`voice::DECK_NOT_CONNECTED`], or [`voice::DECK_NO_ADDRESS`] for a row with
+/// no address. That keeps the New agent flow exactly
 /// as it was — it never offers or preselects such a deck — while
 /// `switch_deck`, which ignores that reason, can switch to it.
 ///
@@ -3395,9 +3738,17 @@ async fn resolve_declared_utterance(
 /// switch to a deck only the selector lists then matches nothing, and
 /// [`resolve_declared_utterance`] says why.
 ///
-/// **All Decks is not in here.** It is a selection rather than a deck, so a
-/// `deck_ref` naming it would also be a deck the New agent dialog is asked
-/// about; see `commands.toml`'s `switch_deck` row.
+/// # All daemons (issue #1491)
+///
+/// The selector's first entry is appended too, as [`voice::ALL_DECKS_ID`]
+/// labelled [`voice::ALL_DECKS_LABEL`] and mapped to the `all` token, so "select
+/// all daemons" switches to it through the same write a click makes. It is a
+/// selection rather than a deck, which is why it carries
+/// [`voice::DECK_IS_EVERY_DAEMON`]: the reason keeps it out of the New agent
+/// dialog — listed to the model as a deck a new agent cannot start on, never
+/// preselected, refused with that reason when named there — exactly as a deck
+/// the app is not connected to is. It is added past
+/// [`MAX_VOICE_SELECTOR_ROWS`] as well, since the selector always lists it.
 fn selector_voice_decks(
     endpoints: Option<&crate::settings::EndpointSettings>,
     decks: &mut Vec<voice::VoiceDeck>,
@@ -3410,8 +3761,8 @@ fn selector_voice_decks(
             .and_then(|choice| choice.reason.clone())
     };
     let local = crate::dto::deck_wire_id(&crate::local_deck::local_endpoint());
-    // The local deck carries no identity: it has no remote address that
-    // Settings can change under its token.
+    // All daemons and the local deck carry no identity: neither has a remote
+    // address that Settings can change under its token.
     let mut listed: Vec<(voice::VoiceDeck, voice::VoiceDeckSelection)> = vec![(
         voice::VoiceDeck {
             unavailable: Some(
@@ -3421,12 +3772,27 @@ fn selector_voice_decks(
             label: "Local daemon".to_string(),
             address: None,
             local: true,
+            holds_agents: false,
         },
         voice::VoiceDeckSelection {
             token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
             identity: None,
         },
     )];
+    listed.push((
+        voice::VoiceDeck {
+            id: voice::ALL_DECKS_ID.to_string(),
+            label: voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        },
+        voice::VoiceDeckSelection {
+            token: crate::settings::ALL_SELECTION_TOKEN.to_string(),
+            identity: None,
+        },
+    ));
     for row in endpoints
         .map(|section| section.remote.as_slice())
         .unwrap_or_default()
@@ -3443,7 +3809,7 @@ fn selector_voice_decks(
             None => (
                 crate::dto::unconfigured_deck_id(&row.id),
                 crate::dto::safe_display_text(row.describe()),
-                crate::dto::UNCONFIGURED_DECK_REASON,
+                voice::DECK_NO_ADDRESS,
             ),
         };
         let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
@@ -3462,6 +3828,7 @@ fn selector_voice_decks(
                 id,
                 local: false,
                 unavailable,
+                holds_agents: false,
             },
             voice::VoiceDeckSelection {
                 token: row.id.as_str().to_string(),
@@ -3487,7 +3854,8 @@ fn selector_voice_decks(
     let adds_remote = selector_rows_beyond_voice(endpoints).is_none();
     let mut selections = HashMap::new();
     for (deck, selection) in listed {
-        if (deck.local || adds_remote) && !decks.iter().any(|known| known.id == deck.id) {
+        let always = deck.local || deck.id == voice::ALL_DECKS_ID;
+        if (always || adds_remote) && !decks.iter().any(|known| known.id == deck.id) {
             decks.push(deck.clone());
         }
         selections.entry(deck.id).or_insert(selection);
@@ -3512,13 +3880,20 @@ fn selector_voice_decks(
 ///
 /// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
 /// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is
-/// declared): a deck it gives a reason keeps that reason, word for word, and a
-/// deck it does not list at all is one the webview's fleet has not heard from
+/// declared): a deck it gives a short reason keeps that reason, word for word,
+/// and a deck it does not declare at all is one the webview's fleet has not
+/// heard from
 /// ([`voice::DECK_NOT_REPORTED`]). With no declaration every deck is taken as
 /// eligible, which is what voice assumed before it was told.
+///
+/// `agents_deck` is the wire id of the deck the agents voice resolves against
+/// were read from — the snapshot's own `connection.deck_id` — and marks that
+/// deck [`voice::VoiceDeck::holds_agents`], so an agent can be named by the
+/// daemon it is on (issue #1495). `None` where no agent is resolved.
 fn voice_decks(
     observed: &[crate::dto::ObservedDeckDto],
     deck_step: Option<&[voice::VoiceDeckChoice]>,
+    agents_deck: Option<&str>,
 ) -> Vec<voice::VoiceDeck> {
     observed
         .iter()
@@ -3545,6 +3920,7 @@ fn voice_decks(
                 address,
                 local,
                 unavailable,
+                holds_agents: agents_deck == Some(deck.deck_id.as_str()),
             }
         })
         .collect()
@@ -3641,8 +4017,8 @@ async fn desktop_voice_commands(
 ///
 /// 4. **Every terminal session is detached.** A session streams from ONE
 ///    daemon's PTY; after a selection change every one of them is showing the
-///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
-///    already make, and for the same reason: a tile left attached to a deck that
+///    deck the user has left. The same pairing `StopDaemon` and a restarting
+///    `desktop_upgrade_daemon` already make, and for the same reason: a tile left attached to a deck that
 ///    is no longer selected is a tile whose keystrokes go to another machine's
 ///    agent.
 /// 5. **The watcher is told** (M9). Its event subscription is a connection to
@@ -3902,6 +4278,15 @@ struct StartedAgent {
 /// `DOT_AGENT_DECK_PANE_ID` (which the deck requires here, because the seed is
 /// delivered to that pane), and the same last-command record.
 ///
+/// # The last command (PRD #1223 M4, issue #1540)
+///
+/// Both starts go through the client's form-start methods, which mark the
+/// start as one from the New agent form for a deck that keeps the last command
+/// itself; that deck records it once it has accepted the start. Against a deck
+/// that does not ([`LastCommandKeeper::Client`]), this app keeps it in memory
+/// per deck instead ([`DesktopState::remember_last_command`]), and only after
+/// the start was accepted. A refused start records nothing anywhere.
+///
 /// The command must already be resolved. A blank one means the deck's default
 /// shell, which cannot act on a seed, so the dialog resolves it the way the
 /// TUI's `resolve_authoring_command` does and this refuses one that arrives
@@ -3962,7 +4347,8 @@ async fn start_agent_action(
     // Kept for the per-deck last command (PRD #1223 M4), recorded only once the
     // deck has accepted the start — a refused start leaves the value it had.
     // An authoring start records too, as the TUI's `record_candidate` does for
-    // every form-submitted command.
+    // every form-submitted command. Recorded here only for a deck that does not
+    // keep it itself (issue #1540).
     let requested_command = command.clone();
     let options = StartAgentOptions {
         command,
@@ -3979,19 +4365,26 @@ async fn start_agent_action(
     // PRD #1223 audit F4: bounded like every role start, so the New agent
     // dialog — which cannot be closed while a start is in flight (audit F5) —
     // always gets an answer.
-    let agent_id = match authoring_kind {
-        None => bounded_plain_start(daemon.client.start_agent(options)).await?,
+    let started = match authoring_kind {
+        None => bounded_plain_start(daemon.client.start_form_agent(options)).await?,
         Some(kind) => {
-            match bounded_plain_start(daemon.client.start_authoring_agent(options, kind)).await? {
-                GatedQuery::Answered(agent_id) => agent_id,
+            match bounded_plain_start(daemon.client.start_form_authoring_agent(options, kind))
+                .await?
+            {
+                GatedQuery::Answered(started) => started,
                 GatedQuery::Unsupported => return Err(authoring_unsupported_message(kind)),
             }
         }
     };
-    if let Some(command) = requested_command.as_deref() {
+    if started.last_command == LastCommandKeeper::Client
+        && let Some(command) = requested_command.as_deref()
+    {
         state.remember_last_command(&scope.identity(), command);
     }
-    Ok(StartedAgent { agent_id, scope })
+    Ok(StartedAgent {
+        agent_id: started.agent_id,
+        scope,
+    })
 }
 
 /// One plain or authoring start under [`ORCHESTRATION_ROLE_START_TIMEOUT`] (PRD #1223
@@ -4591,6 +4984,190 @@ fn apply_zoom(webview: &Webview, level: settings::ZoomLevel) {
     }
 }
 
+/// PRD #1487 M5: upgrade the daemon of the deck `deck_id` names — the
+/// dashboard card's and the Daemons screen's **Upgrade** on a remote deck, and
+/// **Replace daemon** on the local one.
+///
+/// Both run the root crate's one procedure,
+/// [`dot_agent_deck::daemon_upgrade::upgrade_daemon`]; what differs is only
+/// what it runs with. A remote deck installs the app's version over SSH and
+/// restarts onto it through the freshly installed binary; the local deck
+/// installs nothing, and the app starts its own bundled build once the old
+/// daemon has gone (D10). The live-agent question is the daemon's and is
+/// asked through `desktop://upgrade-decision`, answered by
+/// [`desktop_upgrade_decide`].
+///
+/// Resolves with the outcome — including "installed, not restarted" and
+/// "failed while …", which are answers rather than errors. Rejects only when
+/// the upgrade could not start: a deck this app is not observing, a remote
+/// deck missing from the deck list, or a second press while one is running.
+///
+/// `attempt_id` is the webview's own id for this call, chosen before it is
+/// made: every event the run emits carries it, so the caller's listeners hear
+/// this run and no other — a second call refused here never hears the first
+/// run's question (PRD #1487, Qodo 4208054166).
+#[tauri::command]
+async fn desktop_upgrade_daemon(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    upgrades: State<'_, upgrade::UpgradeState>,
+    deck_id: String,
+    attempt_id: String,
+) -> Result<upgrade::UpgradeOutcomeDto, String> {
+    use dot_agent_deck::daemon_upgrade::UpgradeOutcome;
+    use dot_agent_deck::daemon_upgrade::{
+        NoInstall, SshInstaller, UpgradePlan, WireDaemonPort, upgrade_daemon, upgrade_ssh_executor,
+    };
+    use dot_agent_deck::remote_daemon::SshDaemonPort;
+
+    ensure_main_webview(&webview)?;
+    let attempt_id = upgrade::validate_attempt_id(&attempt_id)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let endpoint = scope.endpoint().clone();
+    let _in_flight = upgrades.begin(&deck_id)?;
+    let upgrade_id = upgrades.next_upgrade_id();
+
+    let target = if endpoint.as_local().is_some() {
+        upgrade::UpgradeTarget::Local
+    } else {
+        let lookup = endpoint.clone();
+        let path = crate::decks::remotes_path();
+        let entry =
+            tauri::async_runtime::spawn_blocking(move || upgrade::remote_entry_for(&lookup, &path))
+                .await
+                .map_err(|error| safe_message(error.to_string()))??;
+        upgrade::UpgradeTarget::Remote(Box::new(entry))
+    };
+
+    let handle = tokio::runtime::Handle::current();
+    let decider_state = upgrades.inner().clone();
+    let progress_app = app.clone();
+    let decision_app = app.clone();
+    let deck_for_run = deck_id.clone();
+    let id_for_run = upgrade_id.clone();
+    let endpoint_for_run = endpoint.clone();
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        let plan = UpgradePlan {
+            version: upgrade::plan_version(),
+            successor: target.successor(),
+        };
+        let deck_name = target.deck_name();
+        let decider = upgrade::DesktopDecider::new(
+            decider_state,
+            deck_for_run.clone(),
+            attempt_id.clone(),
+            id_for_run.clone(),
+            Box::new(move |event: &upgrade::UpgradeDecisionEvent| {
+                let _ = decision_app.emit(upgrade::DECISION_EVENT, event);
+            }),
+        );
+        let mut progress = |progress| {
+            let _ = progress_app.emit(
+                upgrade::PROGRESS_EVENT,
+                upgrade::UpgradeProgressEvent {
+                    deck_id: deck_for_run.clone(),
+                    attempt_id: attempt_id.clone(),
+                    upgrade_id: id_for_run.clone(),
+                    progress,
+                },
+            );
+        };
+        match target {
+            upgrade::UpgradeTarget::Remote(entry) => {
+                // What the installer prints along the way is for a terminal;
+                // the dialog shows the stages and the outcome instead.
+                // The row read once above, for the install as for the port,
+                // so both reach the same machine (Greptile 4208066970).
+                let installer = SshInstaller::for_entry(
+                    &entry,
+                    crate::decks::remotes_path(),
+                    Box::new(std::io::sink()),
+                );
+                let port = SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+                upgrade_daemon(
+                    &deck_name,
+                    &plan,
+                    &installer,
+                    &port,
+                    &decider,
+                    &mut progress,
+                )
+            }
+            upgrade::UpgradeTarget::Local => {
+                let port = match WireDaemonPort::new(
+                    &endpoint_for_run,
+                    handle,
+                    Box::new(crate::daemon_bridge::spawn_local_daemon),
+                ) {
+                    Ok(port) => port,
+                    Err(reason) => {
+                        return UpgradeOutcome::Failed {
+                            stage: dot_agent_deck::daemon_upgrade::UpgradeStage::Restarting,
+                            reason,
+                            installed_version: None,
+                            old_daemon_gone: false,
+                        };
+                    }
+                };
+                upgrade_daemon(
+                    &deck_name,
+                    &plan,
+                    &NoInstall,
+                    &port,
+                    &decider,
+                    &mut progress,
+                )
+            }
+        }
+    })
+    .await;
+    // A question a panicked run left waiting is closed, so a late answer is
+    // refused rather than read as accepted (Qodo 4222406400).
+    upgrades.end_upgrade(&upgrade_id);
+    // A run that panicked is settled too, not returned as an error: it may
+    // have installed the build or had the restart accepted, so the cleanup
+    // below runs for it as well (PRD #1487, Qodo #15).
+    let settled = upgrade::settle_run(run);
+
+    // Whatever happened, the handshake held for this deck may describe a
+    // daemon that is gone or replaced: drop it, and let the deck's watcher
+    // and the snapshot below re-establish against whatever answers now.
+    state.daemon.invalidate(&endpoint).await;
+    if settled.ends_deck_sessions {
+        // The old daemon's terminals ended with it — restarted, or accepted
+        // and not verified, or gone after a lost reply, or a run that stopped
+        // unexpectedly. This deck's only — the other decks were not touched.
+        // A daemon still answering as itself keeps them.
+        terminal::detach_deck(&state, &endpoint).await;
+    }
+    state.request_refetch(&endpoint.identity());
+    ensure_snapshot_watchers(&app, &state);
+    if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+        emit_snapshot(&app, &snapshot);
+    }
+    Ok(settled.outcome)
+}
+
+/// PRD #1487 M5: the decision dialog's answer to the restart question an
+/// upgrade is waiting on — `"restart-now"` or `"keep-current"`. Closing the
+/// dialog sends `"keep-current"`; an id with no question waiting is refused,
+/// and so is an answer to a question that has since been asked again
+/// (`question_id` is the one the decision event carried — Greptile
+/// 4208066960).
+#[tauri::command]
+fn desktop_upgrade_decide(
+    webview: Webview,
+    upgrades: State<'_, upgrade::UpgradeState>,
+    upgrade_id: String,
+    question_id: u64,
+    choice: String,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    let choice = upgrade::DecisionChoice::parse(&choice)?;
+    upgrades.decide(&upgrade_id, question_id, choice)
+}
+
 #[tauri::command]
 async fn desktop_run_action(
     app: AppHandle,
@@ -4767,44 +5344,6 @@ async fn desktop_run_action(
                 StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
                 StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
                 StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
-            });
-        }
-        DesktopAction::RestartDaemon => {
-            // Replace daemon is Stop plus a lazy-spawn of the desktop's own
-            // bundled build. Both halves are local acts, and on a remote deck
-            // the pair would be worse than either: terminate the ssh tunnel,
-            // then start a LOCAL daemon and report success. Refused by type.
-            let endpoint = selected_endpoint();
-            let local = endpoint
-                .require_local("Replace daemon")
-                .map_err(|error| safe_message(error.to_string()))?;
-            run_daemon_stop(local, false)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // Same as Stop: the held handshake describes the daemon just
-            // terminated, and the `bootstrap` below is about to start a
-            // different one at the same address.
-            state.daemon.invalidate(&endpoint).await;
-            // This deck's sessions only, for the same reason Stop's are.
-            terminal::detach_deck(&state, &endpoint).await;
-            let snapshot = bootstrap(
-                &BootstrapOptions {
-                    start_if_missing: true,
-                },
-                &state.daemon,
-            )
-            .await;
-            emit_snapshot(&app, &snapshot);
-            ensure_snapshot_watchers(&app, &state);
-            ensure_explicit_start_connected(true, &snapshot)?;
-            return Ok(DesktopActionResult {
-                ok: true,
-                agent_id: None,
-                agent_ids: Vec::new(),
-                send_result: None,
-                terminal: None,
-                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
-                snapshot,
             });
         }
         DesktopAction::AllowBuildMismatch { deck_id } => {
@@ -5031,6 +5570,8 @@ pub fn run() {
         .manage(DesktopState::default())
         // PRD #802 M7: the capture session. Opens no device until a `start`.
         .manage(VoiceState::default())
+        // PRD #1487 M5: the running upgrades and the restart questions they wait on.
+        .manage(upgrade::UpgradeState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -5158,6 +5699,7 @@ pub fn run() {
             desktop_list_directories,
             desktop_new_agent_options,
             desktop_bootstrap,
+            desktop_start_daemon,
             desktop_terminal_attach,
             desktop_terminal_write,
             desktop_terminal_resize,
@@ -5171,6 +5713,8 @@ pub fn run() {
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
+            desktop_upgrade_daemon,
+            desktop_upgrade_decide,
             desktop_secret_status,
             desktop_store_secret,
             desktop_forget_secret,
@@ -5179,6 +5723,8 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_choice,
+            desktop_voice_number,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
@@ -5190,6 +5736,9 @@ pub fn run() {
         ) {
             let state = app_handle.state::<DesktopState>();
             let voice_state = app_handle.state::<VoiceState>();
+            // PRD #1487 M5: a restart question still open is answered Keep
+            // current daemon — nothing is stopped by the app going away.
+            app_handle.state::<upgrade::UpgradeState>().abandon_all();
             tauri::async_runtime::block_on(release_on_exit(&state, &voice_state));
         }
     });
@@ -5239,6 +5788,7 @@ mod tests {
                     path: format!("/home/dev/dir-{index}"),
                 })
                 .collect(),
+            paging: None,
         }
     }
 
@@ -5267,6 +5817,82 @@ mod tests {
         let mut long_deck = voice_listing(1);
         long_deck.deck_id = "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1);
         assert!(validate_voice_directories(&long_deck).is_err());
+    }
+
+    /// PR #1451 round 3, change 4: a paged listing's other pages are part of
+    /// the same declaration and bounded with it — together never more children
+    /// than a deck lists, each name as short as an entry's, and a page counted
+    /// from 1. The webview's shape parses; an unknown key does not.
+    #[test]
+    fn voice_paged_declarations_are_bounded_and_webview_shaped() {
+        let parsed: voice::VoiceDirectories = serde_json::from_value(serde_json::json!({
+            "deckId": "deck-1",
+            "path": "/home/dev",
+            "hasParent": true,
+            "entries": [{ "name": "a", "path": "/home/dev/a" }],
+            "paging": { "page": 1, "elsewhere": [{ "name": "docs", "page": 3 }] },
+        }))
+        .expect("parses");
+        assert!(validate_voice_directories(&parsed).is_ok());
+        assert!(
+            serde_json::from_value::<voice::VoiceDirectories>(serde_json::json!({
+                "deckId": "deck-1", "path": "/home/dev", "hasParent": true, "entries": [],
+                "paging": { "page": 1, "elsewhere": [], "extra": true },
+            }))
+            .is_err()
+        );
+        let off_page = |count: usize, name: &str, page: u32| {
+            let mut listing = voice_listing(1);
+            listing.paging = Some(voice::VoicePaging {
+                page: 1,
+                elsewhere: (0..count)
+                    .map(|_| voice::VoiceOffPage {
+                        name: name.to_string(),
+                        page,
+                    })
+                    .collect(),
+            });
+            listing
+        };
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES - 1, "d", 2)).is_ok()
+        );
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES, "d", 2)).is_err()
+        );
+        assert!(
+            validate_voice_directories(&off_page(
+                1,
+                &"x".repeat(MAX_VOICE_DIRECTORY_NAME_BYTES + 1),
+                2
+            ))
+            .is_err()
+        );
+        assert!(validate_voice_directories(&off_page(1, "d", 0)).is_err());
+        let mut no_page = off_page(1, "d", 2);
+        no_page.paging.as_mut().expect("paged").page = 0;
+        assert!(validate_voice_directories(&no_page).is_err());
+
+        let form = |count: usize| voice::VoiceNewAgent {
+            form: Some(voice::VoiceNewAgentForm {
+                deck_id: "deck-1".to_string(),
+                path: "/home/dev".to_string(),
+                modes: Vec::new(),
+                agent_types: Vec::new(),
+                withheld_modes: Vec::new(),
+                mode_paging: Some(voice::VoicePaging {
+                    page: 1,
+                    elsewhere: (0..count)
+                        .map(|_| voice::VoiceOffPage {
+                            name: "Orch: x".to_string(),
+                            page: 2,
+                        })
+                        .collect(),
+                }),
+            }),
+        };
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES)).is_ok());
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES + 1)).is_err());
     }
 
     /// PRD #1223: a New agent form declaration is bounded like a listing —
@@ -5332,7 +5958,7 @@ mod tests {
         .expect("the webview's EndpointSettingsDto parses");
         assert_eq!(selector_rows_beyond_voice(Some(&sent)), None);
 
-        let mut decks = voice_decks(&[], None);
+        let mut decks = voice_decks(&[], None, None);
         let selections = selector_voice_decks(Some(&sent), &mut decks, None);
         let new_box = decks
             .iter()
@@ -5351,14 +5977,14 @@ mod tests {
             "selection": "local",
         }))
         .expect("parses; the schema caps no row count");
-        let mut decks = voice_decks(&[], None);
+        let mut decks = voice_decks(&[], None, None);
         let selections = selector_voice_decks(Some(&oversized), &mut decks, None);
         assert_eq!(
             decks
                 .iter()
                 .map(|deck| deck.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Local daemon"],
+            ["Local daemon", "All daemons"],
             "an oversized section adds no remote deck to what voice resolves against"
         );
         assert_eq!(
@@ -5406,18 +6032,229 @@ mod tests {
             &resolver,
             voice::Screen::Deck,
             &[],
+            None,
             &[],
             VoiceDeclaration {
                 directories: None,
                 new_agent: None,
                 deck_step: None,
                 endpoints: Some(endpoints),
+                dictation: None,
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
             true,
         )
         .await
+    }
+
+    /// Scenario (issue #1491): the Daemon selector is on This machine with two
+    /// daemons configured, and the user says "select all daemons" — or
+    /// "switch to all daemons", "show all daemons", "switch daemon to all".
+    /// Each is a switch to the selector's All daemons entry, carrying the token
+    /// clicking that entry stores. The control: "switch daemon to build box"
+    /// still switches to that one daemon.
+    #[tokio::test]
+    async fn saying_all_daemons_switches_the_selector_to_all_daemons() {
+        let section: crate::settings::EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [
+                { "id": "rowbuild", "host": "build-box", "port": 22, "socket": "/run/deck.sock" },
+                { "id": "rowstage", "host": "staging-box", "port": 22, "socket": "/run/deck.sock" },
+            ],
+            "selection": "local",
+        }))
+        .expect("parses");
+        let switched_to = |result: &voice::VoiceResult| match &result.outcome {
+            voice::VoiceOutcome::Dispatch {
+                invoke,
+                params,
+                sentence,
+                ..
+            } if invoke == "switchDeck" => Some((
+                params[0].value.clone(),
+                params[0].deck_identity.is_some(),
+                sentence.clone(),
+            )),
+            _ => None,
+        };
+        for (said, deck) in [
+            ("select all daemons", "all daemons"),
+            ("switch to all daemons", "all daemons"),
+            ("show all daemons", "all daemons"),
+            ("switch daemon to all", "all"),
+        ] {
+            let result = resolve_with_section(
+                &section,
+                said,
+                voice::IntentAnswer::new("switch_deck").with_param("deck", deck),
+            )
+            .await
+            .expect("resolves");
+            assert_eq!(
+                switched_to(&result),
+                Some((
+                    crate::settings::ALL_SELECTION_TOKEN.to_string(),
+                    false,
+                    "Showing All daemons.".to_string()
+                )),
+                "{said:?}: {:?}",
+                result.outcome
+            );
+        }
+
+        let control = resolve_with_section(
+            &section,
+            "switch daemon to build box",
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            switched_to(&control).map(|(token, identity, _)| (token, identity)),
+            Some(("rowbuild".to_string(), true)),
+            "{:?}",
+            control.outcome
+        );
+
+        // All daemons is a selection, not a daemon a new agent can start on:
+        // named for the New agent dialog, it is refused with that reason.
+        let mut decks = voice_decks(&[], None, None);
+        selector_voice_decks(Some(&section), &mut decks, None);
+        let said = "new agent on all daemons";
+        let resolver = voice::StubResolver::new().answering(
+            said,
+            voice::IntentAnswer::new("open_new_agent").with_param("deck", "all daemons"),
+        );
+        let refused = voice::handle_utterance(
+            &resolver,
+            voice::table(),
+            voice::Screen::Overview,
+            &[],
+            &decks,
+            None,
+            None,
+            voice::Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            refused.sentence().contains(&format!(
+                "\u{201c}All daemons\u{201d} can't take a new agent: {}",
+                voice::DECK_IS_EVERY_DAEMON
+            )),
+            "{refused:?}"
+        );
+    }
+
+    /// Scenario: remote daemons are named `minipc` and `inmotion`, and the
+    /// transcriber writes what the user said the way speech-to-text does:
+    /// "Select mini PC, Demon." (the one-word name split in two, a comma, and
+    /// "daemon" heard as its homophone) and "Switch to InMotionDeck" (the word
+    /// "deck" glued onto the name). The model answers with the listed daemon
+    /// the user meant, and the selector switches to it — the user's words are
+    /// not held against that answer (issue #1491). The controls: each name
+    /// said as configured switches too.
+    #[tokio::test]
+    async fn a_switch_reaches_a_daemon_however_the_transcript_spells_its_name() {
+        let section: crate::settings::EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [
+                { "id": "rowminipc", "host": "10.0.0.7", "port": 22, "socket": "/run/deck.sock", "name": "minipc" },
+                { "id": "rowinmotion", "host": "10.0.0.8", "port": 22, "socket": "/run/deck.sock", "name": "inmotion" },
+                { "id": "rowbuild", "host": "build-box", "port": 22, "socket": "/run/deck.sock" },
+            ],
+            "selection": "local",
+        }))
+        .expect("parses");
+        let switched_to = |result: &voice::VoiceResult| match &result.outcome {
+            voice::VoiceOutcome::Dispatch { invoke, params, .. } if invoke == "switchDeck" => {
+                Some(params[0].value.clone())
+            }
+            _ => None,
+        };
+        for (said, deck, row) in [
+            ("Select mini PC, Demon.", "minipc", "rowminipc"),
+            ("Demon mini PC.", "minipc", "rowminipc"),
+            ("switch daemon to minipc", "minipc", "rowminipc"),
+            ("Switch to InMotionDeck", "inmotion", "rowinmotion"),
+            ("Switch to InMotionDaemon.", "inmotion", "rowinmotion"),
+            ("switch to the inmotion deck", "inmotion", "rowinmotion"),
+        ] {
+            let result = resolve_with_section(
+                &section,
+                said,
+                voice::IntentAnswer::new("switch_deck").with_param("deck", deck),
+            )
+            .await
+            .expect("resolves");
+            assert_eq!(
+                switched_to(&result).as_deref(),
+                Some(row),
+                "{said:?}: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// Scenario: the Deck selector lists a build box and a staging box, and
+    /// the user says "switch deck to the box", which the model answers with
+    /// "box" — a name both decks answer to. The tie is
+    /// offered with each deck's selector token; "two" answers it with the
+    /// staging row, and once that row is gone from Settings the same answer
+    /// is refused rather than switching to whatever the second deck is now.
+    #[tokio::test]
+    async fn a_switch_choice_is_answered_against_the_selector_tokens() {
+        let section = |hosts: &[(&str, &str)]| -> crate::settings::EndpointSettings {
+            serde_json::from_value(serde_json::json!({
+                "remote": hosts
+                    .iter()
+                    .map(|(id, host)| serde_json::json!({ "id": id, "host": host, "port": 22 }))
+                    .collect::<Vec<_>>(),
+                "selection": "local",
+            }))
+            .expect("parses")
+        };
+        let both = section(&[("rowbuild", "build-box"), ("rowstage", "staging-box")]);
+        let said = "switch deck to the box";
+        let result = resolve_with_section(
+            &both,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "box"),
+        )
+        .await
+        .expect("resolves");
+        let voice::VoiceOutcome::ParamAmbiguous { candidates, .. } = &result.outcome else {
+            panic!("a choice: {:?}", result.outcome);
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["rowbuild", "rowstage"]
+        );
+        let declared = |endpoints| VoiceDeclaration {
+            directories: None,
+            new_agent: None,
+            deck_step: None,
+            endpoints: Some(endpoints),
+            dictation: None,
+        };
+        assert_eq!(
+            answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
+            voice::ChoiceAnswer::Selected(candidates[1].clone())
+        );
+        let without_staging = section(&[("rowbuild", "build-box")]);
+        assert_eq!(
+            answer_declared_choice(
+                "two",
+                "switch_deck",
+                candidates,
+                &[],
+                &[],
+                declared(&without_staging)
+            ),
+            voice::ChoiceAnswer::Refused
+        );
     }
 
     /// Scenario: the user keeps more remote decks in Settings than voice takes
@@ -5490,70 +6327,6 @@ mod tests {
         );
     }
 
-    /// Scenario: with that same oversized Deck selector, the user says "switch
-    /// decks, avoid the build box" — a row voice does not reach — and the model
-    /// answers with the build box. The switch is refused for the word "avoid",
-    /// as it would be with any selector, and the sentence still says so: it is
-    /// never replaced by advice to choose the build box in the Deck selector,
-    /// which is the deck the user just excluded (Qodo on PR #1340).
-    #[tokio::test]
-    async fn oversized_selector_section_keeps_a_contrast_refusal_its_own_sentence() {
-        let section = oversized_selector_section();
-        let said = "switch decks, avoid the build box";
-        let result = resolve_with_section(
-            &section,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
-        )
-        .await
-        .expect("an oversized section does not fail the utterance");
-        let voice::VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &result.outcome
-        else {
-            panic!("a refusal: {:?}", result.outcome);
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("\u{201c}avoid\u{201d}")
-                && sentence.contains("say just the daemon you want")
-                && !sentence.contains("Daemon selector"),
-            "{sentence}"
-        );
-    }
-
-    /// Scenario: with that same oversized Deck selector, the user says "switch
-    /// deck to the build box" and the model answers with a deck the user never
-    /// said, "staging box", which no deck voice holds either. The refusal says
-    /// it did not catch which deck, as it would with any selector — it does
-    /// not quote the model's "staging box" back inside a sentence pointing at
-    /// the Deck selector (Qodo on PR #1340).
-    #[tokio::test]
-    async fn oversized_selector_section_keeps_a_not_said_refusal_its_own_sentence() {
-        let section = oversized_selector_section();
-        let said = "switch deck to the build box";
-        let result = resolve_with_section(
-            &section,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "staging box"),
-        )
-        .await
-        .expect("an oversized section does not fail the utterance");
-        let voice::VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &result.outcome
-        else {
-            panic!("a refusal: {:?}", result.outcome);
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("I did not catch which daemon")
-                && !sentence.contains("staging box")
-                && !sentence.contains("Daemon selector"),
-            "{sentence}"
-        );
-    }
-
     /// Scenario: the app shows the local deck (a single-deck selection, so it
     /// observes only that one) and Settings holds a connectable build box,
     /// reached with an SSH key through a jump host, and a new box with no
@@ -5599,10 +6372,17 @@ mod tests {
             serde_json::from_value(serde_json::json!([{ "deckId": local_key }]))
                 .expect("the webview's shape parses");
 
-        let mut decks = voice_decks(&observed, Some(&step));
+        let mut decks = voice_decks(&observed, Some(&step), None);
         let selections = selector_voice_decks(Some(&endpoints), &mut decks, Some(&step));
         let find = |id: &str| decks.iter().find(|deck| deck.id == id).expect("listed");
-        assert_eq!(decks.len(), 3, "{decks:?}");
+        assert_eq!(decks.len(), 4, "{decks:?}");
+        // Issue #1491: the selector's All daemons entry, switchable and never
+        // a deck a new agent can start on.
+        assert_eq!(find(voice::ALL_DECKS_ID).label, "All daemons");
+        assert_eq!(
+            find(voice::ALL_DECKS_ID).unavailable.as_deref(),
+            Some(voice::DECK_IS_EVERY_DAEMON)
+        );
         assert_eq!(
             find(&local_key).unavailable,
             None,
@@ -5615,7 +6395,7 @@ mod tests {
         assert_eq!(find(&build_key).label, "build-box");
         assert_eq!(
             find("unconfigured-newbox01").unavailable.as_deref(),
-            Some(crate::dto::UNCONFIGURED_DECK_REASON)
+            Some(voice::DECK_NO_ADDRESS)
         );
         let token = |key: &str| {
             selections
@@ -5625,6 +6405,8 @@ mod tests {
         assert_eq!(token(&local_key), Some("local"));
         assert_eq!(token(&build_key), Some("buildbox01"));
         assert_eq!(token("unconfigured-newbox01"), Some("newbox01"));
+        assert_eq!(token(voice::ALL_DECKS_ID), Some("all"));
+        assert_eq!(selections[voice::ALL_DECKS_ID].identity, None);
         assert_eq!(
             selections[&local_key].identity, None,
             "local has no address"
@@ -5743,7 +6525,7 @@ mod tests {
                 name: None,
             },
         ];
-        let mut decks = voice_decks(&observed, None);
+        let mut decks = voice_decks(&observed, None, None);
         let called: Vec<(&str, Option<&str>)> = decks
             .iter()
             .map(|deck| (deck.label.as_str(), deck.address.as_deref()))
@@ -5791,13 +6573,13 @@ mod tests {
         ];
         let step: Vec<voice::VoiceDeckChoice> = serde_json::from_value(serde_json::json!([
             { "deckId": "deck-local" },
-            { "deckId": "deck-build", "reason": "No deck is listening on the configured socket." },
+            { "deckId": "deck-build", "reason": "it is not connected" },
             { "deckId": "deck-elsewhere", "reason": "not in this fleet" },
         ]))
         .expect("the webview's shape parses");
         assert!(validate_voice_deck_step(&step).is_ok());
 
-        let decks = voice_decks(&fleet, Some(&step));
+        let decks = voice_decks(&fleet, Some(&step), None);
         let unavailable = |id: &str| {
             decks
                 .iter()
@@ -5814,14 +6596,14 @@ mod tests {
         assert_eq!(unavailable("deck-local"), None);
         assert_eq!(
             unavailable("deck-build").as_deref(),
-            Some("No deck is listening on the configured socket.")
+            Some("it is not connected")
         );
         assert_eq!(
             unavailable("deck-new").as_deref(),
             Some(voice::DECK_NOT_REPORTED)
         );
         assert!(
-            voice_decks(&fleet, None)
+            voice_decks(&fleet, None, None)
                 .iter()
                 .all(voice::VoiceDeck::eligible),
             "no declaration, no narrowing"
@@ -5851,6 +6633,61 @@ mod tests {
             reason: None,
         }];
         assert!(validate_voice_deck_step(&long_id).is_err());
+    }
+
+    /// PR #1451 round 3 — a numbered list is bounded like the listing it can
+    /// carry: no more items than a listing, no name longer than any name.
+    #[test]
+    fn voice_numbered_lists_are_bounded() {
+        let item = |label: String| voice::numbers::VoiceNumberedEntry {
+            kind: voice::numbers::NumberedKind::Directory,
+            value: format!("/home/{label}"),
+            deck_id: None,
+            label,
+            names: Vec::new(),
+        };
+        let list = |entries| voice::numbers::VoiceNumberedList {
+            generation: 1,
+            sections: vec![voice::numbers::VoiceNumberedSection {
+                kind: voice::numbers::SectionKind::Directory,
+                entries,
+            }],
+        };
+        let fits = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&fits).is_ok());
+        let many = list(
+            (0..=MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&many).is_err());
+        assert!(
+            validate_voice_numbered(&list(vec![item(
+                "x".repeat(MAX_VOICE_CHOICE_TEXT_BYTES + 1)
+            )]))
+            .is_err()
+        );
+        let mut named = item("docs".to_string());
+        named.names = vec!["n".to_string(); MAX_VOICE_NUMBERED_NAMES + 1];
+        assert!(validate_voice_numbered(&list(vec![named])).is_err());
+        // The bound is on every section together, and on how many there are.
+        let mut split = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        split.sections.push(voice::numbers::VoiceNumberedSection {
+            kind: voice::numbers::SectionKind::Mode,
+            entries: vec![item("m".to_string())],
+        });
+        assert!(validate_voice_numbered(&split).is_err());
+        let mut sections = list(vec![item("d".to_string())]);
+        sections.sections = vec![sections.sections[0].clone(); MAX_VOICE_NUMBERED_SECTIONS + 1];
+        assert!(validate_voice_numbered(&sections).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

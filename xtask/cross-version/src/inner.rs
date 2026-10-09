@@ -45,6 +45,14 @@ const COMMAND_MODE_BUTTONS: [&str; 2] = ["[New Agent Ctrl+N]", "[New Pane Ctrl+N
 /// The deck's own experimental-flag label, drawn alone on the screen's last
 /// row below the footer — see [`footer_mode`].
 const EXPERIMENTAL_LABEL: &str = "experimental: on";
+/// The status line the deck paints when `Ctrl+E` toggles its command-entry
+/// lock (PRD #393, `ToggleOrchestrationLock` in `src/ui.rs`), naming the state
+/// the press left it in — see [`entry_lock`].
+const ENTRY_UNLOCKED: &str = "Pane entry: unlocked";
+const ENTRY_LOCKED: &str = "Pane entry: locked";
+/// What the deck paints instead of forwarding a keystroke into a locked worker
+/// pane (`ORCHESTRATION_LOCK_STATUS_MESSAGE` in `src/ui.rs`).
+pub(crate) const ENTRY_REFUSED: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -608,8 +616,54 @@ pub(crate) fn daemon_status(
         .collect()))
 }
 
-/// Poll `daemon status` until `pred` holds over its rows. Every poll is a client
-/// and passes the pre-connect assertion first.
+/// How a [`poll_status`] ended.
+pub(crate) enum StatusWait {
+    /// `pred` held over these rows.
+    Satisfied(Vec<StatusRow>),
+    /// The daemon answered with readable rows until the deadline, and `pred`
+    /// never held over them: these are the last ones.
+    Unsatisfied(Vec<StatusRow>, String),
+    /// The last poll before the deadline could not be read at all.
+    Failing(String),
+}
+
+/// Poll `daemon status` until `pred` holds over its rows, keeping apart a
+/// daemon that answered without the change from a query that failed. Every
+/// poll is a client and passes the pre-connect assertion first.
+pub(crate) fn poll_status(
+    g: &Guard<'_>,
+    bin: &Path,
+    label: &str,
+    timeout: Duration,
+    ev: &mut Evidence,
+    pred: impl Fn(&[StatusRow]) -> bool,
+) -> Result<StatusWait, Abort> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = daemon_status(g, bin, label, ev)?;
+        if let Ok(rows) = &last
+            && pred(rows)
+        {
+            return Ok(StatusWait::Satisfied(rows.clone()));
+        }
+        if Instant::now() >= deadline {
+            return Ok(match last {
+                Ok(rows) => {
+                    let why = format!(
+                        "daemon status never satisfied the condition within {timeout:?}; last rows: {rows:?}"
+                    );
+                    StatusWait::Unsatisfied(rows, why)
+                }
+                Err(e) => StatusWait::Failing(format!(
+                    "daemon status kept failing within {timeout:?}: {e}"
+                )),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// [`poll_status`], for a caller that only needs the rows or why not.
 pub(crate) fn wait_for_status(
     g: &Guard<'_>,
     bin: &Path,
@@ -618,26 +672,10 @@ pub(crate) fn wait_for_status(
     ev: &mut Evidence,
     pred: impl Fn(&[StatusRow]) -> bool,
 ) -> Result<Result<Vec<StatusRow>, String>, Abort> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let last = daemon_status(g, bin, label, ev)?;
-        if let Ok(rows) = &last
-            && pred(rows)
-        {
-            return Ok(Ok(rows.clone()));
-        }
-        if Instant::now() >= deadline {
-            return Ok(match last {
-                Ok(rows) => Err(format!(
-                    "daemon status never satisfied the condition within {timeout:?}; last rows: {rows:?}"
-                )),
-                Err(e) => Err(format!(
-                    "daemon status kept failing within {timeout:?}: {e}"
-                )),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    Ok(match poll_status(g, bin, label, timeout, ev, pred)? {
+        StatusWait::Satisfied(rows) => Ok(rows),
+        StatusWait::Unsatisfied(_, why) | StatusWait::Failing(why) => Err(why),
+    })
 }
 
 pub(crate) fn count_in_file(path: &Path, needle: &str) -> usize {
@@ -1527,6 +1565,27 @@ fn with_attached_tui(
             tui.grid(),
         );
     }
+    // `--experimental` engages PRD #393's command-entry lock, which drops every
+    // keystroke typed into a worker pane (issue #1456). Unlock it the TUI's own
+    // way, once: the lock is deck-global for the life of this TUI.
+    if plan.experimental {
+        match unlock_worker_entry(tui, plan, ROLE_REVIEWER) {
+            Ok(note) => ev.step(note),
+            Err(e) => {
+                ev.step(format!(
+                    "could NOT confirm the command-entry unlock under `--experimental`; the hook \
+                     commands below may be refused by the lock, so a tell-4 failure in this run \
+                     may be the lock rather than the contract: {}",
+                    e.lines().next().unwrap_or_default()
+                ));
+                ev.excerpt(
+                    "the TUI when the command-entry unlock was not confirmed",
+                    tui.grid(),
+                );
+                focus_role(tui, plan, ROLE_REVIEWER)?;
+            }
+        }
+    }
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
@@ -1540,6 +1599,7 @@ fn with_attached_tui(
             cast.pane_cli
         ),
     );
+    let mut refused = refused_by_lock(tui);
     focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let feedback = format!("Worker {ROLE_REVIEWER} has completed their task");
     let work_done_arrived = tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
@@ -1558,8 +1618,9 @@ fn with_attached_tui(
         tui,
         &format!("{} agent-event --type running", cast.pane_cli),
     );
+    refused |= refused_by_lock(tui);
     let client_cli = format!("{} CLI: daemon status", cast.client_side);
-    let status_rows = wait_for_status(
+    let status_wait = poll_status(
         g,
         &cast.client_bin,
         &client_cli,
@@ -1571,10 +1632,14 @@ fn with_attached_tui(
             })
         },
     )?;
-    let (status_ok, status_note) = match &status_rows {
-        Ok(rows) => {
+    // The status half is named `status` only when the daemon answered with
+    // readable rows that never showed the change; a query that could not be
+    // read is `status-query`, which no declared break explains (`breaks.rs`).
+    let (status_part, status_ok, status_note, reviewer_pane) = match &status_wait {
+        StatusWait::Satisfied(rows) => {
             let row = rows.iter().find(|r| r.role.contains(ROLE_REVIEWER));
             (
+                "status",
                 true,
                 format!(
                     "`daemon status --json`, asked by the {} binary of the {} daemon, reports the \
@@ -1583,33 +1648,55 @@ fn with_attached_tui(
                     cast.daemon_side.to_uppercase(),
                     row.map(|r| r.status.clone()).unwrap_or_default()
                 ),
+                None,
             )
         }
-        Err(e) => (false, format!("the status never changed: {e}")),
+        StatusWait::Unsatisfied(rows, why) => (
+            "status",
+            false,
+            format!("the status never changed: {why}"),
+            rows.iter()
+                .find(|r| r.role.contains(ROLE_REVIEWER))
+                .map(|r| r.pane_id.clone())
+                .filter(|p| !p.is_empty()),
+        ),
+        StatusWait::Failing(why) => (
+            "status-query",
+            false,
+            format!("the status could not be read: {why}"),
+            None,
+        ),
     };
-    ev.tell(
+    ev.tell_in_parts(
         "tell-4",
         "hooks (work-done, status) still arrived",
-        if work_done_arrived && status_ok {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
+        &[("work-done", work_done_arrived), (status_part, status_ok)],
         format!(
             "work-done: issued `{} work-done --task \"{work_done_sentinel}\"` from inside the \
              `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in the \
              orchestrator's pane.\n\
              status: issued `{} agent-event --type running` from inside the `{ROLE_REVIEWER}` \
-             pane, LAST as rule 12 requires. {status_note}",
+             pane, LAST as rule 12 requires. {status_note}{}",
             cast.pane_cli,
             if work_done_arrived {
                 "appeared"
             } else {
                 "did NOT appear"
             },
-            cast.pane_cli
+            cast.pane_cli,
+            if refused {
+                format!(
+                    "\nthe TUI REFUSED typed input into the `{ROLE_REVIEWER}` pane: its footer \
+                     read {ENTRY_REFUSED:?} (PRD #393's command-entry lock, issue #1456)"
+                )
+            } else {
+                String::new()
+            }
         ),
     );
+    if let Some(t) = ev.tells.last_mut() {
+        t.subject_pane = reviewer_pane;
+    }
 
     // --- the branch-specific stimulus, reverse only --------------------------
     if cast.direction == Direction::Reverse {
@@ -1816,10 +1903,11 @@ fn with_attached_tui(
         })?;
     }
 
-    ev.excerpt(
-        "sandbox deck.log (tail)",
-        tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
-    );
+    let deck_log = std::fs::read_to_string(&sb.log).unwrap_or_default();
+    // A failed tell that a break declared by the daemon's build, and not the
+    // client's, accounts for is that break's intended outcome (issue #1596).
+    crate::breaks::explain(ev, plan.direction, &deck_log);
+    ev.excerpt("sandbox deck.log (tail)", tail(&deck_log, 80));
     Ok(())
 }
 
@@ -2854,10 +2942,7 @@ pub(crate) enum FooterMode {
 /// `--experimental` the footer is the row above that label — which is skipped
 /// the same way a blank row is.
 pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
-    let row = grid
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)?;
+    let row = footer_row(grid)?;
     let head = row.trim_start();
     if head.starts_with("TYPING") {
         Some(FooterMode::Typing)
@@ -2870,6 +2955,131 @@ pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
     } else {
         None
     }
+}
+
+/// The deck's footer: the grid's last non-blank row that is not the
+/// `experimental: on` label drawn below it (see [`footer_mode`]).
+fn footer_row(grid: &str) -> Option<&str> {
+    grid.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)
+}
+
+/// The state of the deck's command-entry lock (PRD #393), as the footer last
+/// stated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryLock {
+    Locked,
+    Unlocked,
+}
+
+/// Read the command-entry lock's state off the footer.
+///
+/// The deck draws no standing lock indicator: the only on-screen statement of
+/// the state is the status line a `Ctrl+E` toggle paints into the footer, beside
+/// the mode chip, for its 15 s `STATUS_MESSAGE_TTL`. That line names the state
+/// the press LEFT, so while it is up it is the current state — any later toggle
+/// would have replaced it. `None` when the footer carries neither line: no
+/// toggle recently, or a build with no lock to toggle.
+pub(crate) fn entry_lock(grid: &str) -> Option<EntryLock> {
+    let row = footer_row(grid)?;
+    if row.contains(ENTRY_UNLOCKED) {
+        Some(EntryLock::Unlocked)
+    } else if row.contains(ENTRY_LOCKED) {
+        Some(EntryLock::Locked)
+    } else {
+        None
+    }
+}
+
+/// How long after a command is typed [`refused_by_lock`] watches the footer for
+/// [`ENTRY_REFUSED`]. The deck paints it on the first dropped keystroke and
+/// holds it for its 15 s `STATUS_MESSAGE_TTL`, and [`type_into_pane`] has
+/// already spent 700 ms by the time this starts, so a redraw that lands later
+/// than this is not one this needs to wait for.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether the deck refused the command just typed into the focused pane:
+/// [`ENTRY_REFUSED`] on its footer within [`REFUSAL_WINDOW`]. The PTY is parsed
+/// on a reader thread, so a single read of the grid could come before the
+/// refusal's redraw (Qodo, PR #1498). An accepted command costs the whole
+/// window, which is bounded.
+fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
+    deck.wait_for_grid(REFUSAL_WINDOW, |g| {
+        footer_row(g).is_some_and(|row| row.contains(ENTRY_REFUSED))
+    })
+}
+
+/// Unlock command entry into worker panes, proving it by the footer, so the
+/// hook commands typed into a worker pane reach its shell (issue #1456).
+///
+/// Under the experimental flag a deck starts with PRD #393's command-entry lock
+/// engaged: on an Orchestration tab it drops every keystroke typed into a
+/// focused pane other than the orchestrator's, painting [`ENTRY_REFUSED`]
+/// instead, so tell 4's `work-done` and `agent-event` never reached the daemon.
+/// The unlock is the TUI's own, `Ctrl+D` then `Ctrl+E` — the chord that refusal
+/// names — rather than anything that steps around the TUI: `focus_role` puts
+/// the deck on the Orchestration tab (the only place `Ctrl+E` is bound),
+/// [`ensure_command_mode`] reads the ` COMMAND ` chip before anything is
+/// pressed, and then `role` is focused again in `PaneInput`.
+///
+/// `Ctrl+E` TOGGLES, the same trap `Ctrl+D` is, so it is pressed only when the
+/// footer does not already say [`EntryLock::Unlocked`], and each press waits
+/// for the footer to state the result. A press that reports `locked` found the
+/// deck already unlocked and earns exactly one more. The lock is deck-global and
+/// lives as long as the TUI process, so one unlock covers every later worker
+/// pane in the run, the reverse probes' included.
+///
+/// `Ok(note)` for the evidence when the unlock was confirmed. `Err` when it was
+/// not, or `role` could not be focused: the caller records it and types anyway,
+/// so tell 4 fails on what the deck did with the input — [`ENTRY_REFUSED`] on
+/// screen says it was the lock — rather than on this step's guess.
+pub(crate) fn unlock_worker_entry(
+    deck: &pty::PtyDeck,
+    plan: &Plan,
+    role: &str,
+) -> Result<String, String> {
+    focus_role(deck, plan, role)?;
+    if !ensure_command_mode(deck) {
+        let grid = deck.grid();
+        return Err(format!(
+            "the TUI never showed a COMMAND footer, so `Ctrl+E` was not sent (the footer reads \
+             {:?}).\n=== grid ===\n{grid}",
+            footer_mode(&grid)
+        ));
+    }
+    let mut presses = 0;
+    while entry_lock(&deck.grid()) != Some(EntryLock::Unlocked) && presses < 2 {
+        let before = entry_lock(&deck.grid());
+        deck.send(b"\x05"); // Ctrl+E: toggle the command-entry lock
+        presses += 1;
+        // Wait for the state this press CHANGES: from no statement, any
+        // statement; from `locked`, `unlocked`.
+        deck.wait_for_grid(STEP_TIMEOUT, |g| match before {
+            None => entry_lock(g).is_some(),
+            Some(_) => entry_lock(g) == Some(EntryLock::Unlocked),
+        });
+        if entry_lock(&deck.grid()).is_none() {
+            // No answer on screen: pressing again could undo a toggle that was
+            // merely slow to paint.
+            break;
+        }
+    }
+    let grid = deck.grid();
+    if entry_lock(&grid) != Some(EntryLock::Unlocked) {
+        return Err(format!(
+            "pressed `Ctrl+E` {presses} time(s) in command mode and the footer never said \
+             {ENTRY_UNLOCKED:?} (it reads {:?}) — this TUI build may have no command-entry lock to \
+             toggle, or did not redraw.\n=== grid ===\n{grid}",
+            footer_row(&grid).map(str::trim)
+        ));
+    }
+    focus_role(deck, plan, role)?;
+    Ok(format!(
+        "unlocked command entry into worker panes (PRD #393's lock, on under \
+         `--experimental`) with the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read \
+         {ENTRY_UNLOCKED:?} after {presses} press(es), then `{role}` was focused again"
+    ))
 }
 
 /// Put the deck in command mode and prove it by the footer, sending `Ctrl+D`
@@ -3072,7 +3282,9 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
         format!(
             "CONTRACT_BREAKS differ: old {obr:?}, branch {nbr:?}. The desktop's \
              `classify_handshake` refuses across any difference in that list, so a new app would \
-             refuse this older daemon outright — a surface this harness does not exercise"
+             refuse this older daemon outright — a surface this harness does not exercise. A tell \
+             that fails the way one of these breaks says it will, with the daemon's refusal \
+             logged, is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
         )
     });
     Ok(notes)
@@ -3111,6 +3323,58 @@ mod tests {
         let typing =
             grid_with_footer(" TYPING  PaneInput mode\n                experimental: on   ");
         assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+    }
+
+    #[test]
+    fn entry_lock_reads_the_toggle_line_on_the_footer_only() {
+        let unlocked = grid_with_footer(" COMMAND  Pane entry: unlocked\nexperimental: on");
+        assert_eq!(entry_lock(&unlocked), Some(EntryLock::Unlocked));
+        assert_eq!(
+            footer_mode(&unlocked),
+            Some(FooterMode::Command),
+            "the toggle line sits beside the chip, so the mode still reads"
+        );
+        let locked = grid_with_footer(" COMMAND  Pane entry: locked\nexperimental: on");
+        assert_eq!(entry_lock(&locked), Some(EntryLock::Locked));
+        let bar = grid_with_footer(" COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N]");
+        assert_eq!(entry_lock(&bar), None, "no toggle line, no statement");
+        let refused = grid_with_footer(&format!(" TYPING  {ENTRY_REFUSED}  [Command Mode Ctrl+D]"));
+        assert_eq!(
+            entry_lock(&refused),
+            None,
+            "the refusal names the unlock chord; it is not a statement of the toggle's result"
+        );
+        let in_a_pane = "┌reviewer─────────┐\n│$ echo Pane entry: unlocked│\n└─────────────────┘\n \
+             COMMAND  [Back to Pane Ctrl+D]\n";
+        assert_eq!(
+            entry_lock(in_a_pane),
+            None,
+            "text in a pane is not the deck's footer"
+        );
+    }
+
+    /// The strings [`entry_lock`] and tell 4's refusal note read are the TUI's
+    /// own, so a rename in `src/ui.rs` turns this red instead of leaving
+    /// `--experimental` runs to fail tell 4 again (issue #1456). This checks the
+    /// TUI in this tree, which is the branch side of a run; the previous
+    /// release's TUI is whatever that release shipped.
+    #[test]
+    fn the_command_entry_lock_strings_are_the_tuis_own() {
+        let ui = include_str!("../../../src/ui.rs");
+        assert!(
+            ui.contains(&format!(
+                "const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = \"{ENTRY_REFUSED}\";"
+            )),
+            "src/ui.rs no longer paints {ENTRY_REFUSED:?} for a refused keystroke"
+        );
+        assert!(
+            ui.contains("format!(\"Pane entry: {lock_name}\")")
+                && ui.contains("\"locked\"")
+                && ui.contains("\"unlocked\""),
+            "src/ui.rs no longer paints `Pane entry: locked` / `Pane entry: unlocked` on Ctrl+E"
+        );
+        assert_eq!(ENTRY_LOCKED, "Pane entry: locked");
+        assert_eq!(ENTRY_UNLOCKED, "Pane entry: unlocked");
     }
 
     #[test]

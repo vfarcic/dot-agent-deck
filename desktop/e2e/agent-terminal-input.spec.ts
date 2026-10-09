@@ -15,7 +15,7 @@ interface SharedShortcut {
  */
 const sharedShortcuts = JSON.parse(
   readFileSync(new URL("../../tests/fixtures/editing-shortcuts.json", import.meta.url), "utf8"),
-) as { translated: SharedShortcut[]; standard: SharedShortcut[] };
+) as { translated: SharedShortcut[]; standard: SharedShortcut[]; application_cursor: SharedShortcut[] };
 
 /** A shared-table row as a Playwright chord: `super` is Meta (Cmd, the Windows key). */
 function chordFor(row: SharedShortcut): string {
@@ -24,7 +24,11 @@ function chordFor(row: SharedShortcut): string {
 }
 
 interface RecordingWindow {
-  __dadE2eTerminals?: { element?: HTMLElement; onData(listener: (data: string) => void): unknown }[];
+  __dadE2eTerminals?: {
+    element?: HTMLElement;
+    onData(listener: (data: string) => void): unknown;
+    write(data: string, callback?: () => void): void;
+  }[];
   __dadE2eSent?: string[];
 }
 
@@ -76,6 +80,18 @@ async function reportPlatform(page: Page, platform: "MacIntel" | "Win32" | "Linu
  * resolves to exactly what the terminal handed the app for the agent's PTY.
  */
 async function openWritableTerminal(page: Page): Promise<(chord: string) => Promise<string[]>> {
+  const { press } = await openWritableTerminalAndOutput(page);
+  return press;
+}
+
+/**
+ * `openWritableTerminal`, plus a function that writes to the terminal as the
+ * agent's program does, resolving once xterm.js has parsed it.
+ */
+async function openWritableTerminalAndOutput(page: Page): Promise<{
+  press: (chord: string) => Promise<string[]>;
+  programWrites: (data: string) => Promise<void>;
+}> {
   await captureTerminals(page);
   await page.goto("/?fixture=1&state=crowded");
   await enterDeck(page);
@@ -91,11 +107,24 @@ async function openWritableTerminal(page: Page): Promise<(chord: string) => Prom
     terminal.onData((data) => recording.__dadE2eSent?.push(data));
   });
 
-  return async (chord: string) => {
+  const press = async (chord: string) => {
     await page.evaluate(() => { (window as Window & RecordingWindow).__dadE2eSent = []; });
     await page.keyboard.press(chord);
     return page.evaluate(() => (window as Window & RecordingWindow).__dadE2eSent ?? []);
   };
+  const programWrites = (data: string) =>
+    viewport.evaluate(
+      (root, written) =>
+        new Promise<void>((resolve, reject) => {
+          const terminal = (window as Window & RecordingWindow).__dadE2eTerminals?.find(
+            (candidate) => candidate.element && root.contains(candidate.element),
+          );
+          if (!terminal) reject(new Error("the writable tile's xterm was not captured"));
+          else terminal.write(written, resolve);
+        }),
+      data,
+    );
+  return { press, programWrites };
 }
 
 /**
@@ -230,6 +259,33 @@ test.describe("agent terminal input", () => {
       const sentFor = await openWritableTerminal(page);
       for (const row of [...sharedShortcuts.translated, ...sharedShortcuts.standard]) {
         expect(await sentFor(chordFor(row)), `${chordFor(row)} (${row.action})`).toEqual([row.bytes]);
+      }
+    });
+  }
+
+  /**
+   * Scenario: with the webview reporting macOS, then Windows, then Linux, have
+   * the writable agent's program turn on application cursor mode (`ESC[?1h`,
+   * as a full-screen editor or pager does) and press every key of the table
+   * the TUI uses. The arrows, Home and End reach the agent in that mode's
+   * form, every other key unchanged, which is what the TUI sends in the same
+   * mode; once the program turns the mode off (`ESC[?1l`), the ordinary form
+   * again (issue #1477).
+   */
+  for (const platform of ["MacIntel", "Win32", "Linux x86_64"] as const) {
+    test(`follows the program's application cursor mode on ${platform}`, async ({ page }) => {
+      await reportPlatform(page, platform);
+      const { press, programWrites } = await openWritableTerminalAndOutput(page);
+      const ordinary = [...sharedShortcuts.translated, ...sharedShortcuts.standard];
+      const overridden = (row: SharedShortcut) =>
+        sharedShortcuts.application_cursor.some((other) => chordFor(other) === chordFor(row));
+      await programWrites("\x1b[?1h");
+      for (const row of [...sharedShortcuts.application_cursor, ...ordinary.filter((row) => !overridden(row))]) {
+        expect(await press(chordFor(row)), `${chordFor(row)} in application cursor mode`).toEqual([row.bytes]);
+      }
+      await programWrites("\x1b[?1l");
+      for (const row of ordinary) {
+        expect(await press(chordFor(row)), `${chordFor(row)} after application cursor mode`).toEqual([row.bytes]);
       }
     });
   }

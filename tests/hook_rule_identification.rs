@@ -427,25 +427,9 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
     );
 }
 
-/// Scenario: Two genuinely different on-disk binaries that happen to share the
-/// literal basename `dot-agent-deck` (e.g. two separate local builds at
-/// different paths) must be treated as distinct deployments — installing the
-/// second must not collapse onto the first's rule, and reinstalling either must
-/// not wipe the other's. Unlike `_003`'s fictional paths (where
-/// `canonicalize` always fails), both paths here are real files, so this
-/// exercises the canonicalize-success branch `_003` cannot reach.
-///
-/// **Before you relax this test, read issue #1171.** This is the property that
-/// makes a second install of the deck — Homebrew's alongside `~/.local/bin`'s,
-/// say — keep BOTH rules, so every hook event is delivered once per rule. That
-/// was reported as a bug. It was resolved by making the duplication *loud*
-/// rather than by collapsing the rules here (`hooks install` now names every
-/// live same-named deck at another path — see `InstallOutcome::coexisting`),
-/// precisely because this test says the coexistence is deliberate. Changing it
-/// is therefore a policy decision about two-builds-side-by-side users, not a
-/// bug fix, and it re-opens #1171's question rather than closing it.
+/// Scenario: Install Claude hooks from two valid deck binaries at different paths, then reinstall the first. Each install replaces the prior deck command, leaving exactly one rule per event.
 #[test]
-fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
+fn hook_rule_identification_011_distinct_deck_installs_replace_each_other() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
     write_deck_binary(&build_a);
@@ -461,18 +445,17 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_two.len(),
-        2,
-        "two distinct on-disk builds sharing a basename must each keep their own \
-         rule; got {after_two:?}"
+        1,
+        "two valid deck installations must consolidate to one rule; got {after_two:?}"
     );
 
+    assert!(after_two[0].contains(build_b.to_str().unwrap()));
     install_to(&path, build_a.to_str().expect("build a path is utf8")).expect("install");
     let after_reinstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_reinstall.len(),
-        2,
-        "reinstalling one build must refresh its own rule, not wipe the other's; \
-         got {after_reinstall:?}"
+        1,
+        "reinstalling a deck must replace the previous installation; got {after_reinstall:?}"
     );
 }
 
@@ -484,46 +467,59 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
 /// containing `"agent-deck"`) passes every other test in this file, so this
 /// case exists specifically to fail if identification is ever loosened to a
 /// substring/fragment match instead of the exact compiled binary name.
+///
+/// Issue #537 widened it to the two near-misses of the EXACT name that no other
+/// test held either way: a wrapper script whose file name is the default name
+/// plus an extension (`dot-agent-deck.sh` — a `file_stem` comparison would take
+/// it for the deck), and a program whose name merely ends in the word, with no
+/// space before `hook` (`dot-agent-deckhook` — dropping the separator check
+/// would read it as `dot-agent-deck hook`).
 #[test]
 fn hook_rule_identification_012_fragment_match_mutation_guard() {
     let (_dir, path) = settings_path();
-    let unrelated_command = "/usr/local/bin/my-deck-tool hook";
+    let unrelated = [
+        "/usr/local/bin/my-deck-tool hook",
+        "/usr/local/bin/dot-agent-deck.sh hook",
+        "/usr/local/bin/dot-agent-deckhook",
+    ];
     write_settings(
         &path,
         &json!({
             "hooks": {
-                "PreToolUse": [user_rule(unrelated_command)]
+                "PreToolUse": unrelated.iter().map(|c| user_rule(c)).collect::<Vec<_>>()
             }
         }),
     );
 
     install_to(&path, "/opt/tools/worker-agent-deck").expect("install");
     let after_install = rule_commands(&read_settings(&path), "PreToolUse");
-    assert!(
-        after_install.contains(&unrelated_command.to_string()),
-        "a user tool whose basename merely contains \"deck\" must survive install \
-         unless it is EXACTLY the historical default binary name; got {after_install:?}"
-    );
+    for command in unrelated {
+        assert!(
+            after_install.contains(&command.to_string()),
+            "`{command}` is not EXACTLY the historical default binary name in the \
+             legacy `<path> hook` shape, so it must survive install; got {after_install:?}"
+        );
+    }
 
     uninstall_from(&path).expect("uninstall");
     let after_uninstall = rule_commands(&read_settings(&path), "PreToolUse");
-    assert!(
-        after_uninstall.contains(&unrelated_command.to_string()),
-        "a user tool whose basename merely contains \"deck\" must survive uninstall; \
-         got {after_uninstall:?}"
-    );
+    for command in unrelated {
+        assert!(
+            after_uninstall.contains(&command.to_string()),
+            "`{command}` must survive uninstall; got {after_uninstall:?}"
+        );
+    }
 }
 
-/// Scenario: Two deck-owned rules exist, written by two distinct on-disk
-/// binaries sharing a basename (mirroring `_011`), alongside a coexisting
-/// non-deck user hook whose command names a path that never existed. One
-/// binary's file is then deleted from disk and install runs again via the
-/// surviving binary. The now-dead binary's rule must be pruned, the surviving
-/// binary's rule must remain, and the never-deck-owned user hook — whose
-/// command also names a nonexistent path — must be left untouched throughout:
-/// the prune applies only to rules already identified as deck-owned, never a
-/// general "delete anything pointing at a missing file" sweep, which would
-/// delete user hooks for tools not currently installed.
+/// Scenario: Install from one deck binary, then from a second sharing its
+/// basename (mirroring `_011`), beside a non-deck user hook whose command names
+/// a path that never existed; the second install replaces the first (one deck
+/// rule per event, PRD #1487). Delete the first binary and install again from
+/// the surviving one: no rule names the dead binary, the surviving binary's
+/// rule remains, and the never-deck-owned user hook — whose command also names
+/// a nonexistent path — is left untouched throughout, because consolidation
+/// applies only to rules already identified as deck-owned, never a general
+/// "delete anything pointing at a missing file" sweep.
 #[test]
 fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
@@ -561,9 +557,9 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_two.len(),
-        3,
-        "two distinct on-disk builds plus the coexisting user hook must all be \
-         present before any file is deleted; got {after_two:?}"
+        2,
+        "the second deck install replaces the first, beside the untouched user \
+         hook; got {after_two:?}"
     );
 
     std::fs::remove_file(&build_a).expect("delete build a from disk");
@@ -1170,5 +1166,85 @@ fn hook_rule_identification_024_symlinked_settings_are_refused_not_replaced() {
         after, original,
         "the file a symlinked settings.json points at must be left byte-for-byte as \
          found — the deck must not write outside the directory it was pointed at"
+    );
+}
+
+/// Scenario: A `settings.json` holding the SAME binary's rule twice — once in
+/// POSIX single quotes, once in `cmd.exe` double quotes, the two forms the two
+/// platforms' writers produce for a spaced path — goes through an install of
+/// that binary. Exactly one rule must remain, in this platform's own form:
+/// both foreign and native spellings are recognised as this binary's, so a
+/// settings file written on one platform and read on another is not stranded
+/// with a duplicate that fires every hook twice (issue #537 item 4.1).
+#[test]
+fn hook_rule_identification_025_either_platforms_quoting_is_recognised_as_this_binary() {
+    let (_dir, path) = settings_path();
+    let binary = "/Applications/My Deck/dot-agent-deck";
+    let single = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
+    let double = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
+    #[cfg(unix)]
+    let native = single;
+    #[cfg(windows)]
+    let native = double;
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(single), user_rule(double)]
+            }
+        }),
+    );
+
+    install_to(&path, binary).expect("install");
+
+    let rules = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        rules,
+        vec![native.to_string()],
+        "both quoting forms name this binary, so the install must collapse them into \
+         its one native rule; got {rules:?}"
+    );
+}
+
+/// Scenario: A `settings.json` holds hook types the deck does not install
+/// (a retired one, a real Claude Code event the deck never wrote): one holds
+/// only a deck rule for the installing binary, one holds a user hook beside a
+/// deck rule, one holds only a user hook. After an install, the deck rules
+/// under those types are gone, the type holding nothing else is removed, and
+/// every user hook is still there under its own type (issue #537 item 4.5).
+#[test]
+fn hook_rule_identification_026_deck_rules_under_types_it_no_longer_installs_are_removed() {
+    let (_dir, path) = settings_path();
+    let binary = "/opt/tools/worker-agent-deck";
+    let deck = format!("{binary} hook --agent claude-code");
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "RetiredDeckEvent": [user_rule(&deck)],
+                "PermissionRequest": [user_rule("notify-send permission"), user_rule(&deck)],
+                "PostToolUseFailure": [user_rule("logger tool failed")]
+            }
+        }),
+    );
+
+    install_to(&path, binary).expect("install");
+    let settings = read_settings(&path);
+
+    assert!(
+        settings["hooks"].get("RetiredDeckEvent").is_none(),
+        "a hook type left holding nothing once the deck's stale rule is removed must go \
+         too; got {}",
+        settings["hooks"]
+    );
+    assert_eq!(
+        rule_commands(&settings, "PermissionRequest"),
+        vec!["notify-send permission".to_string()],
+        "only the deck's rule may be removed from a type the deck does not install"
+    );
+    assert_eq!(
+        rule_commands(&settings, "PostToolUseFailure"),
+        vec!["logger tool failed".to_string()],
+        "a type holding only the user's own hook must be left as it was"
     );
 }

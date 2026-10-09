@@ -27,7 +27,7 @@ use crate::issue_dispatch_run::KeptWorktree;
 // `KbAction` = a remappable keybinding action (MoveDown, Help, …).
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
-use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
+use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome, SubmitReply};
 use crate::project_config::{OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
@@ -92,6 +92,7 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
+    Minimal,  // 3 rows: Dir only, used only when Compact cannot fit every card (issue #1568)
     Compact,  // 5 rows: 1 prompt, 1 tool
     Normal,   // 8 rows: 1 prompt, 3 tools
     Spacious, // 10 rows: 3 prompts, 3 tools
@@ -100,10 +101,11 @@ enum CardDensity {
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
+    ///   Dir (1) + prompts + [Normal/Spacious: blank separator] + tools, plus 2
     ///   rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    /// Resulting heights: Minimal 3, Compact 5, Normal 8, Spacious 10. Minimal
+    /// has no prompt or tool rows at all, so its one inner row is `Dir:`.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -116,32 +118,40 @@ impl CardDensity {
     fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
-        let separator = if matches!(self, CardDensity::Compact) {
-            0
-        } else {
-            1
-        };
+        let separator = u16::from(self.has_separator());
         (1 + prompts + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
             CardDensity::Compact => 1,
-            _ => 3,
+            CardDensity::Normal | CardDensity::Spacious => 3,
         }
     }
 
     fn max_prompts(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
+            CardDensity::Compact | CardDensity::Normal => 1,
             CardDensity::Spacious => 3,
-            _ => 1,
         }
+    }
+
+    /// Whether the card draws a blank row between its prompts and its tools.
+    fn has_separator(self) -> bool {
+        matches!(self, CardDensity::Normal | CardDensity::Spacious)
     }
 }
 
 /// The richest density that renders `total_cards` cards in `cols` columns
-/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// within `available_height` rows, or `None` when not even [`CardDensity::Minimal`]
 /// fits them all.
+///
+/// Minimal is the last tier, but this function alone does not decide when it is
+/// used: [`choose_grid_layout`] takes Minimal only once Compact has failed at
+/// every column count, so a deck that fits at Compact anywhere keeps the layout
+/// it had before Minimal existed (issue #1568).
 ///
 /// The `None` is the whole point (issue #588). The predecessor of this function
 /// — `choose_density` — returned `Compact` both when Compact fit and when
@@ -155,6 +165,7 @@ fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Op
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
+        CardDensity::Minimal,
     ]
     .into_iter()
     .find(|density| {
@@ -242,6 +253,13 @@ struct GridLayout {
 ///   columns with smaller cards") the way it suggests: prompt and tool lines are
 ///   the card's actual content, horizontal space is the cheaper sacrifice.
 ///
+/// Issue #1568 adds a second pass: only when no column count fits every card at
+/// Compact or richer does the search run again accepting the 3-row
+/// [`CardDensity::Minimal`] card, so Minimal replaces scrolling and never
+/// replaces Compact. Taking Minimal in the first pass would have changed decks
+/// that fit today: seven cards in 25 rows at 90 columns get two columns of
+/// Compact cards, and would instead have got one column of Minimal ones.
+///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
 /// every card is a real cost, paid here only for completeness; if completeness
@@ -254,9 +272,13 @@ fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> 
     // column it has today.
     let max_cols = max_columns_for_width(width).max(preferred_cols);
 
-    for cols in preferred_cols..=max_cols {
-        if let Some(density) = fitting_density(total_cards, cols, available_height) {
-            return GridLayout { cols, density };
+    for accept_minimal in [false, true] {
+        for cols in preferred_cols..=max_cols {
+            match fitting_density(total_cards, cols, available_height) {
+                Some(CardDensity::Minimal) if !accept_minimal => {}
+                Some(density) => return GridLayout { cols, density },
+                None => {}
+            }
         }
     }
 
@@ -630,6 +652,16 @@ impl BuiltinOption {
             Self::Schedule => SCHEDULE_MODE_NAME,
             Self::IssueDispatch => ISSUE_DISPATCH_MODE_NAME,
             Self::Dispatcher => DISPATCHER_MODE_NAME,
+        }
+    }
+
+    /// Issue #1496: the daemon's name for this option's kind, which it records
+    /// on the agent so every client can say what kind of agent the card is.
+    fn authoring_kind(self) -> crate::authoring_seeds::AuthoringKind {
+        match self {
+            Self::Schedule => crate::authoring_seeds::AuthoringKind::Schedule,
+            Self::IssueDispatch => crate::authoring_seeds::AuthoringKind::ScheduleIssues,
+            Self::Dispatcher => crate::authoring_seeds::AuthoringKind::Dispatcher,
         }
     }
 }
@@ -1891,6 +1923,59 @@ struct PromptDelivery {
     /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
     /// for the drifting-session-id pane it would abandon.
     observed_generation: Option<String>,
+    /// Issue #621: the generation the DAEMON named when it refused this
+    /// delivery `stale` for naming none — the pane's current conversation as
+    /// the authoritative state saw it, which this TUI's own view may never
+    /// learn. A `SessionStart` this view's stream dropped leaves
+    /// `AppState::pane_hook_session_id` at `None` for an agent that is sitting
+    /// idle, waiting for exactly the prompt it would take to make it emit
+    /// anything else. Since issue #1520 the event subscriber re-reads the
+    /// daemon's generations when it reconnects
+    /// (`AppState::resync_after_event_gap`), which repairs the reconnect case;
+    /// this still covers a gap that subscriber cannot see, and a daemon whose
+    /// snapshot omits the generation.
+    ///
+    /// Recorded only while the delivery is unbound AND has written nothing
+    /// (`attempts == 0`), and consumed by [`bind_delivery_generation`] under
+    /// that same precondition, so it is the snapshot bind with one more source
+    /// rather than a new kind of binding: it names the conversation the bytes
+    /// are about to enter and claims nothing retroactively. A delivery that has
+    /// already written cannot use one — from a point-in-time answer it cannot
+    /// tell the conversation it wrote into from a successor whose predecessor
+    /// ended while it was not looking (the #424 H4 sequence), which is what the
+    /// closure count exists to see and what a dropped event stream also drops.
+    /// Such a delivery stops at a reconnect instead
+    /// ([`delivery_outlived_event_gap`]).
+    ///
+    /// [`delivery_target_changed`] reads it as the pane's current generation
+    /// while the snapshot has none, which is the one place the snapshot's
+    /// silence would otherwise read as the bound conversation having gone.
+    ///
+    /// How it sits beside issue #532's rule that, once a pane has a generation,
+    /// only a genuine `SessionStart` moves it. It is never written into
+    /// `AppState`, so it cannot move the TUI's generation at all: it is
+    /// per-delivery, and consulted only where the snapshot has NO generation.
+    /// The moment the snapshot holds one — a `SessionStart`, a first frame on
+    /// a pane that had none, or the daemon's `SessionSnapshot::hook_generation`
+    /// adopted at hydration — the snapshot wins in both places. On the daemon
+    /// side the value it carries IS the `pane_hook_session` entry that rule
+    /// governs, read by the guard that refused, so it is exactly what a named
+    /// retry is compared against.
+    refusal_generation: Option<String>,
+    /// Issue #621 (review): some request of this delivery failed after it may
+    /// have reached the daemon's write, so it may have written although
+    /// `attempts` is still 0 — a write the daemon applied whose response was
+    /// lost. A failure the controller knows came before the request (a failed
+    /// capability probe or connection) does not set it. A refusal's generation must
+    /// not be adopted then: binding it would treat the delivery as unwritten
+    /// and name a conversation the earlier bytes may never have entered, which
+    /// is the #424 H4 hazard the snapshot bind answers with the closure count
+    /// and a refusal cannot. The daemon's delivery ledger normally replays such
+    /// a write's `Applied` for the same wire id, so this is the fallback for when
+    /// it does not (an evicted record, a changed wire identity), not the common
+    /// path. Sticky: one uncertain request keeps the delivery on the old
+    /// behaviour for its lifetime.
+    write_unacknowledged: bool,
     /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
     /// instant of the FIRST write. `None` until then — nothing is written, so
     /// nothing can have been revoked.
@@ -1922,6 +2007,14 @@ struct PromptDelivery {
     /// the identity of a generation this delivery saw, the count is the number of
     /// conversations it MISSED.
     closures_at_write: Option<u64>,
+    /// Issue #1520: [`crate::state::AppState::event_stream_gaps`] as of the
+    /// request that may have written first. Stamped beside
+    /// [`Self::closures_at_write`] and at the same moment (before the RPC), but
+    /// re-stamped on every request until one may have written: a request the
+    /// daemon refused wrote nothing, and a gap before the write that followed it
+    /// hid nothing the write depends on (Qodo on #1553). `None` until the first
+    /// request. See [`delivery_outlived_event_gap`].
+    gaps_at_write: Option<u64>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
     /// is on.
@@ -1966,7 +2059,8 @@ struct PromptDelivery {
     /// observed to have a producer that can report a submitted prompt. Sticky
     /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
     /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
-    /// never arms at all.
+    /// arms only once its extension declares that it reports every prompt
+    /// (issue #1567) — never, for an extension from an older deck.
     can_report_prompts: bool,
 }
 
@@ -2498,6 +2592,10 @@ struct UiState {
     /// those never overwrite the recorded value. Always (re)set right before each
     /// `Action::SpawnPane` dispatch, so a failed spawn never leaks a stale value.
     pending_last_command: Option<String>,
+    /// Issue #1540 — reads the attached daemon's remembered command for the
+    /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
+    /// (tests), and the form then seeds from [`Self::last_command`] as before.
+    last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2648,6 +2746,7 @@ impl UiState {
             // the event loop; defaults to None so a fresh install seeds blank.
             last_command: None,
             pending_last_command: None,
+            last_command_reader: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -2949,21 +3048,86 @@ fn dashboard_restore_pane_dims(
     )
 }
 
+/// Order an orchestration tab's cards by role config order (`role_pane_ids`),
+/// not by creation order, so a recreated pane (a `clear = true` respawn, which
+/// gets a new, newer daemon agent id) keeps its original card position. The
+/// sort is stable, so cards sharing a position keep [`filter_sessions`]'s
+/// creation order.
+fn sort_by_role_order(sessions: &mut [(&String, &SessionState)], role_pane_ids: &[String]) {
+    sessions.sort_by_key(|(_, s)| {
+        s.pane_id
+            .as_ref()
+            .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// The dashboard's creation-order sort key for one session (issue #1507).
+///
+/// First the daemon's agent id, compared as a number. The daemon mints it from
+/// a monotonic counter for every spawn, whatever started it (the TUI, the
+/// desktop app, `dispatch`, a schedule, an orchestration), and sorts its own
+/// `ListAgents` reply by it, which is the order the desktop app renders its
+/// tiles in. The pane id cannot serve: only a TUI-created pane's is numeric,
+/// and every daemon-minted one (`desktop-<nonce>-<n>`, `sched-…-<n>`) used to
+/// tie and fall back to `HashMap` order.
+///
+/// The id comes from the session's own `agent_id` when it has one (a hydrated
+/// card, or any card whose agent has sent a hook), else from the id the
+/// daemon's card-surfacing `SessionStart` named for its pane
+/// ([`AppState::pane_surfaced_agent_seq`]) — a live-surfaced card before its
+/// agent's first hook, or a pane that never sends one.
+///
+/// Sessions with neither (a hook from outside any pane, a legacy hook script,
+/// a card surfaced by a daemon too old to name the id) come after every agent
+/// that has one, ordered as before: by numeric pane id, paned before paneless,
+/// then start time. The pane id and session id as strings close the key, so
+/// equal keys cannot occur and the order never depends on the map's iteration
+/// order.
+#[allow(clippy::type_complexity)]
+fn creation_order_key<'a>(
+    state: &AppState,
+    session_id: &'a str,
+    session: &'a SessionState,
+) -> (
+    (bool, u64),
+    bool,
+    (bool, u64),
+    DateTime<Utc>,
+    &'a str,
+    &'a str,
+) {
+    // `(is_none, value)`: a present number sorts by value, ahead of every
+    // absent one (a bare `Option` would put `None` first).
+    fn last_if_absent(n: Option<u64>) -> (bool, u64) {
+        match n {
+            Some(n) => (false, n),
+            None => (true, 0),
+        }
+    }
+    fn numeric(id: Option<&str>) -> Option<u64> {
+        id.and_then(|id| id.parse::<u64>().ok())
+    }
+    let agent_seq = numeric(session.agent_id.as_deref()).or_else(|| {
+        session
+            .pane_id
+            .as_deref()
+            .and_then(|pane| state.pane_surfaced_agent_seq(pane))
+    });
+    (
+        last_if_absent(agent_seq),
+        session.pane_id.is_none(),
+        last_if_absent(numeric(session.pane_id.as_deref())),
+        session.started_at,
+        session.pane_id.as_deref().unwrap_or(""),
+        session_id,
+    )
+}
+
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by(|(_, a), (_, b)| {
-        // Sort by pane ID (numeric creation order) when available,
-        // falling back to started_at for sessions without a pane.
-        match (&a.pane_id, &b.pane_id) {
-            (Some(pa), Some(pb)) => {
-                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                na.cmp(&nb)
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.started_at.cmp(&b.started_at),
-        }
+    sessions.sort_by(|(a_id, a), (b_id, b)| {
+        creation_order_key(state, a_id, a).cmp(&creation_order_key(state, b_id, b))
     });
 
     if ui.filter_text.is_empty() {
@@ -3043,7 +3207,8 @@ use crate::orchestrator_context::{
 // ---------------------------------------------------------------------------
 
 /// One orchestration bucket from [`partition_hydrated_panes`]:
-/// the role slots for a single `(cwd, orchestration_name)` pairing. Each
+/// the role slots for a single orchestration tab, keyed by its per-tab
+/// [`crate::state::OrchestrationIdentity`]. Each
 /// entry carries the role's index, pane id, and the role identity
 /// metadata (`role_name`, `is_start_role`) the daemon echoed back via
 /// `TabMembership::Orchestration`. The hydration glue expands this to a
@@ -3065,13 +3230,13 @@ pub struct OrchestrationHydrationBucket {
     pub display_title: Option<String>,
     /// PRD #140 M3.0: the per-tab instance token this bucket was keyed on —
     /// `TabMembership::Orchestration.orchestration_id`, echoed back by the
-    /// daemon on every surviving role pane of the tab. `None` is a token-less
-    /// (pre-#140) client, in which case the bucket was keyed on the legacy
-    /// `(name, cwd)` tuple. Retained on the bucket (rather than consumed and
-    /// dropped by the partition) so the rebuild can re-derive the SAME
-    /// [`crate::state::OrchestrationIdentity`] the key used — see
-    /// [`Self::identity`].
-    pub orchestration_id: Option<String>,
+    /// daemon on every surviving role pane of the tab. Retained on the bucket
+    /// (rather than consumed and dropped by the partition) so the rebuild can
+    /// re-derive the SAME [`crate::state::OrchestrationIdentity`] the key
+    /// used — see [`Self::identity`]. Issue #463: never absent — a pane whose
+    /// membership carries no token is not bucketed at all
+    /// ([`HydrationRejection::TokenlessOrchestration`]).
+    pub orchestration_id: String,
     pub role_slots: Vec<OrchestrationRoleSlot>,
     /// Issue #1395 item 1: the per-publish context file the daemon recorded for
     /// this orchestration, read off its start-role pane's record or its start
@@ -3093,15 +3258,9 @@ impl OrchestrationHydrationBucket {
     /// buckets and anything derived per-bucket must be namespaced per-identity
     /// or it aliases across them (see [`dead_slot_pane_id`]).
     pub fn identity(&self) -> crate::state::OrchestrationIdentity {
-        match &self.orchestration_id {
-            Some(id) => crate::state::OrchestrationIdentity::Instance {
-                id: id.clone(),
-                name: self.orchestration_name.clone(),
-            },
-            None => crate::state::OrchestrationIdentity::NameCwd {
-                name: self.orchestration_name.clone(),
-                cwd: self.cwd.clone(),
-            },
+        crate::state::OrchestrationIdentity {
+            id: self.orchestration_id.clone(),
+            name: self.orchestration_name.clone(),
         }
     }
 }
@@ -3318,6 +3477,24 @@ fn legacy_mode_hydration_warning(mode_names: &[&str]) -> Option<String> {
     Some(format!(
         "Workspace modes were removed (#1199): panes started under mode(s) {names} were placed \
          on the dashboard as plain panes."
+    ))
+}
+
+/// Issue #463: the one `session_warnings` line for the hydrated panes whose
+/// orchestration membership carried no `orchestration_id`, naming each
+/// orchestration once. `None` when there were none.
+fn tokenless_orchestration_hydration_warning(orchestration_names: &[&str]) -> Option<String> {
+    if orchestration_names.is_empty() {
+        return None;
+    }
+    let names = orchestration_names
+        .iter()
+        .map(|n| crate::config_validation::escape_id_for_log(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Panes of orchestration(s) {names} were started by a client older than v0.35.0, which \
+         is no longer supported (#463), and were placed on the dashboard as plain panes."
     ))
 }
 
@@ -3569,6 +3746,18 @@ pub enum HydrationRejection {
         agent_id: String,
         pane_id: String,
     },
+    /// Issue #463: the daemon echoed a `TabMembership::Orchestration` with no
+    /// `orchestration_id` — a pane a client predating v0.35.0 started, which a
+    /// daemon before #463 accepted. Such clients are no longer supported and
+    /// there is no per-tab identity to rebuild the tab under, so the pane lands
+    /// on the dashboard as a plain card, and the hydration site tells the user
+    /// why.
+    TokenlessOrchestration {
+        cwd: String,
+        orchestration_name: String,
+        agent_id: String,
+        pane_id: String,
+    },
 }
 
 /// Output of [`partition_hydrated_panes`]: separates hydrated panes into
@@ -3601,18 +3790,20 @@ pub struct HydrationPartition {
 ///   [`HydrationRejection::LegacyWorkspaceMode`] record (issue #1199: the
 ///   variant is deprecated and only an older TUI produces it). Cwd defaults
 ///   to `""` when the daemon record omits it (older daemon shape).
+/// - `Some(Orchestration { orchestration_id: None, .. })` → dashboard, plus a
+///   [`HydrationRejection::TokenlessOrchestration`] record (issue #463: only a
+///   client predating v0.35.0 produces it, and those are no longer supported).
 /// - `Some(Orchestration { name, role_index })` → orchestration bucket
 ///   keyed by the same [`crate::state::OrchestrationIdentity`] the daemon
-///   routes on (PRD #140 M3.0): a per-tab `orchestration_id` token keys
-///   `Instance { id, name }`, and its absence falls back to the legacy
-///   `NameCwd { name, cwd }` tuple. Each bucket collects
+///   routes on (PRD #140 M3.0): the per-tab `orchestration_id` token plus the
+///   name. Each bucket collects
 ///   `(role_index, pane_id)` and may be sparse (a role can be missing if
 ///   its agent died before the TUI reattached); the dispatcher expands
 ///   this to a `Vec<Option<String>>` of full role-count length.
 ///
 /// Ordering is stable: dashboard panes preserve input order, and
-/// orchestration buckets preserve the order in which their (cwd, name)
-/// pairing was first seen so the user's mental "which tab opened first"
+/// orchestration buckets preserve the order in which their identity
+/// was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
 pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     let mut out = HydrationPartition::default();
@@ -3646,30 +3837,47 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
             }
             Some(TabMembership::Orchestration {
                 name,
+                orchestration_cwd,
+                orchestration_id: None,
+                ..
+            }) => {
+                // Issue #463: no per-tab token, so no identity to rebuild a
+                // tab under — the `(name, cwd)` fallback that used to key such
+                // a pane is retired. Record the reason for the caller to
+                // report and route the pane to the dashboard as a plain card,
+                // as a legacy workspace-mode pane is.
+                out.rejections
+                    .push(HydrationRejection::TokenlessOrchestration {
+                        cwd: orchestration_cwd.clone().unwrap_or(cwd),
+                        orchestration_name: name.clone(),
+                        agent_id: h.agent_id.clone(),
+                        pane_id: h.pane_id.clone(),
+                    });
+                out.dashboard_pane_ids.push(h.pane_id.clone());
+            }
+            Some(TabMembership::Orchestration {
+                name,
                 role_index,
                 role_name,
                 is_start_role,
                 orchestration_cwd,
                 display_title,
-                // PRD #140 M3.0: the per-tab instance token IS part of the
-                // hydration bucket key (see `key` below) so two
-                // same-`(name, cwd)` tabs rebuild as two tabs instead of
-                // merging into one and orphaning half the panes.
-                orchestration_id,
+                // PRD #140 M3.0: the per-tab instance token IS the hydration
+                // bucket key (see `key` below) so two same-`(name, cwd)` tabs
+                // rebuild as two tabs instead of merging into one and
+                // orphaning half the panes.
+                orchestration_id: Some(orchestration_id),
             }) => {
-                // Round-12 reviewer #1: bucket by `(orchestration_cwd,
-                // name)` — the same identity tuple the daemon uses for
-                // `pane_orchestration_map`. Round-9 #2 made each role
-                // pane's own cwd independent (workers can live in
-                // sub-directories of the orchestration); using the
-                // per-pane cwd here would split a 3-role orchestration
-                // across 3 buckets on reattach. The orchestration_cwd
-                // field is shared across roles, so all three end up in
-                // one bucket.
+                // Round-12 reviewer #1: the bucket's cwd is the shared
+                // `orchestration_cwd`, not the pane's own. Round-9 #2 made each
+                // role pane's own cwd independent (workers can live in
+                // sub-directories of the orchestration), so the per-pane cwd
+                // differs across the roles of one tab; the orchestration_cwd
+                // field is shared across roles and names the project whose
+                // config the rebuild loads.
                 //
                 // Older daemons/clients (pre-round-11) omit the field;
-                // fall back to per-pane cwd to keep the partition
-                // behaviour stable for that legacy data, but log a
+                // fall back to per-pane cwd for that legacy data, but log a
                 // debug breadcrumb so a stale producer is visible.
                 let bucket_cwd = match orchestration_cwd {
                     Some(c) => c.clone(),
@@ -3686,25 +3894,15 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                     }
                 };
                 // PRD #140 M3.0: mirror the daemon's `pane_orchestration_map`
-                // construct site (`daemon_protocol.rs` StartAgent) exactly — a
-                // stamped `orchestration_id` keys the tab by INSTANCE, and only
-                // its absence falls back to the legacy `(name, cwd)` tuple. Two
-                // tabs of the same orchestration in the same directory carry
+                // construct site (`daemon_protocol.rs` StartAgent) exactly — the
+                // stamped `orchestration_id` keys the tab by INSTANCE. Two tabs
+                // of the same orchestration in the same directory carry
                 // byte-identical `(name, cwd)` pairs, so without the token they
                 // merged into one bucket on reattach and half the role panes were
-                // orphaned to the dashboard. Mixed variants are never equal
-                // (derived `PartialEq`), which is the right answer here too: a
-                // tokened and a token-less pane came from different clients and
-                // there is no evidence they shared a tab.
-                let key = match orchestration_id {
-                    Some(id) => crate::state::OrchestrationIdentity::Instance {
-                        id: id.clone(),
-                        name: name.clone(),
-                    },
-                    None => crate::state::OrchestrationIdentity::NameCwd {
-                        name: name.clone(),
-                        cwd: bucket_cwd.clone(),
-                    },
+                // orphaned to the dashboard.
+                let key = crate::state::OrchestrationIdentity {
+                    id: orchestration_id.clone(),
+                    name: name.clone(),
                 };
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
@@ -3781,34 +3979,28 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
 /// the two tabs' distinct dead roles shared ONE `AppState.sessions` placeholder
 /// card (the second `insert_placeholder_session` overwrote the first, and the
 /// surviving card rendered in both tabs' card grids). Keying on the identity
-/// means the `Instance` token partitions the ids exactly as it partitions the
-/// routing groups; a token-less (`NameCwd`) bucket keeps the pre-review byte
-/// format, so legacy reconnects reproduce the same ids as before.
+/// means the per-tab token partitions the ids exactly as it partitions the
+/// routing groups.
 ///
 /// Follow-up to 0d5e651 (auditor finding #4): the variable-width
 /// components are length-prefixed so distinct identities can never
-/// collide. The previous `-`-separated form was ambiguous whenever cwd
-/// or orchestration_name contained hyphens: e.g. (cwd="/a", name="b-c",
-/// idx=1) and (cwd="/a-b", name="c", idx=1) both produced
-/// `__dead-slot__-/a-b-c-1`.
+/// collide. The previous `-`-separated form was ambiguous whenever a
+/// component contained hyphens: e.g. (cwd="/a", name="b-c", idx=1) and
+/// (cwd="/a-b", name="c", idx=1) both produced `__dead-slot__-/a-b-c-1`.
 pub fn dead_slot_pane_id(
     identity: &crate::state::OrchestrationIdentity,
     role_index: usize,
 ) -> String {
-    match identity {
-        // The `i-` discriminator can never be confused with the `NameCwd` arm
-        // below, whose first component is always a decimal length.
-        crate::state::OrchestrationIdentity::Instance { id, name } => format!(
-            "{DEAD_SLOT_PREFIX}i-{id_len}-{id}-{name_len}-{name}-{role_index}",
-            id_len = id.len(),
-            name_len = name.len(),
-        ),
-        crate::state::OrchestrationIdentity::NameCwd { name, cwd } => format!(
-            "{DEAD_SLOT_PREFIX}{cwd_len}-{cwd}-{name_len}-{name}-{role_index}",
-            cwd_len = cwd.len(),
-            name_len = name.len(),
-        ),
-    }
+    // The `i-` discriminator kept the instance form apart from the retired
+    // token-less form (issue #463), whose first component was a decimal
+    // length; it stays so the ids a live tab already minted do not change
+    // under it.
+    let crate::state::OrchestrationIdentity { id, name } = identity;
+    format!(
+        "{DEAD_SLOT_PREFIX}i-{id_len}-{id}-{name_len}-{name}-{role_index}",
+        id_len = id.len(),
+        name_len = name.len(),
+    )
 }
 
 /// Reserved prefix for synthetic dead-slot pane ids produced by
@@ -3926,7 +4118,7 @@ fn process_pending_seed_prompts(
         // seed falls through to the deadline below, which ends it without a
         // second write. See [`InFlightPromptSend`].
         if let Some(sending) = in_flight.get_mut(&sp.pane_id) {
-            let polled = sending.pending.poll();
+            let polled = sending.pending.poll_reply();
             if polled.is_none() && sp.created_at.elapsed() <= AUTOMATIC_PROMPT_DEADLINE {
                 return true;
             }
@@ -4052,6 +4244,20 @@ fn process_pending_seed_prompts(
             } else {
                 log_prompt_abandoned("seed", &sp.pane_id, &delivery_id, attempts);
             }
+            // Issue #1520 (Qodo on #1553): a seed held at its retry by an
+            // event-stream outage reaches this deadline instead of the stop
+            // below, so it says the same thing here rather than vanishing.
+            if deliveries.get(&sp.pane_id).is_some_and(|delivery| {
+                delivery_may_have_written(delivery)
+                    && (snapshot.event_stream_down()
+                        || delivery_outlived_event_gap(snapshot, delivery))
+            }) {
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+            }
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             return false;
@@ -4098,7 +4304,10 @@ fn process_pending_seed_prompts(
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
                     observed_generation: None,
+                    refusal_generation: None,
+                    write_unacknowledged: false,
                     closures_at_write: None,
+                    gaps_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
@@ -4123,6 +4332,33 @@ fn process_pending_seed_prompts(
             // mode the retry policy exists to avoid.
             if already_written && capability != ConfirmationCapability::Reports {
                 return true;
+            }
+            // Issue #1520: a retry is due, and the event stream broke after an
+            // earlier request may have written. Checked HERE, at the write, and
+            // not on every pass: until a retry is actually due, the confirmation
+            // above can still finalize the delivery, from evidence that arrived
+            // before the gap or on the resumed stream. While the stream is still
+            // down nothing can confirm it, so it is held rather than stopped
+            // (Qodo on #1553); the deadline above still bounds the hold. See
+            // [`delivery_outlived_event_gap`].
+            //
+            // The hold covers any delivery that may have written, not only one
+            // that outlived a gap: a first write made during an outage stamps
+            // the gap count it was made under, and its retry must wait for the
+            // stream as well (Qodo on #1553).
+            if delivery_may_have_written(delivery) && snapshot.event_stream_down() {
+                return true;
+            }
+            if delivery_outlived_event_gap(snapshot, delivery) {
+                log_prompt_stopped("seed", &sp.pane_id, &delivery_id, "event-stream-gap");
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
             }
             // Issue #424 D1: we are past every hold, so this frame WILL write
             // into whatever conversation the pane currently has. Name it before
@@ -4181,6 +4417,14 @@ fn process_pending_seed_prompts(
             {
                 delivery.closures_at_write = Some(closures);
             }
+            // Issue #1520: and the event-stream gap count, at the same instant,
+            // re-read for every request until one may have written — see
+            // [`PromptDelivery::gaps_at_write`].
+            if let Some(delivery) = deliveries.get_mut(&sp.pane_id)
+                && !delivery_may_have_written(delivery)
+            {
+                delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
+            }
             let issued = IssuedPromptSend {
                 delivery_id: Some(delivery_id),
                 attempt,
@@ -4203,7 +4447,7 @@ fn process_pending_seed_prompts(
                 expected_session_id.as_deref(),
                 Some(&wire_delivery_id),
             );
-            return match pending.poll() {
+            return match pending.poll_reply() {
                 Some(outcome) => apply_seed_send_outcome(
                     outcome,
                     &issued,
@@ -4239,7 +4483,7 @@ fn process_pending_seed_prompts(
 /// retained.
 #[allow(clippy::too_many_arguments)]
 fn apply_seed_send_outcome(
-    outcome: Result<SendResult, PaneError>,
+    reply: SubmitReply,
     issued: &IssuedPromptSend,
     pane_id: &str,
     snapshot: &AppState,
@@ -4257,6 +4501,11 @@ fn apply_seed_send_outcome(
         issued.capability,
         issued.already_written,
     );
+    let SubmitReply {
+        result: outcome,
+        current_session_id,
+        may_have_written,
+    } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this
         // means. Whether the agent's TUI was in submit-CR-aware mode
@@ -4277,8 +4526,9 @@ fn apply_seed_send_outcome(
                 log_prompt_probe_submitted("seed", pane_id, delivery_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report
-                // a submitted prompt (Pi). Retrying could never be
+                // A recognized producer that cannot report a submitted
+                // prompt (a Pi extension declaring nothing, a wrapped Codex
+                // whose prompt hook is untrusted). Retrying could never be
                 // confirmed — only retyped — so the write is final.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
@@ -4341,6 +4591,13 @@ fn apply_seed_send_outcome(
         // feedback. Bounded by the deadline checked at the top of the
         // delivery closure (finding #13) — never a forever loop.
         Ok(other) => {
+            // Issue #621: a `stale` may name the conversation the retry has to
+            // name — the one this TUI's event stream may never deliver.
+            if other == SendResult::Stale
+                && let Some(delivery) = deliveries.get_mut(pane_id)
+            {
+                note_refusal_generation(delivery, current_session_id);
+            }
             schedule_send_retry(backoff, pane_id, now);
             *feedback = Some(format!(
                 "Seed prompt not delivered ({}); will retry",
@@ -4350,6 +4607,13 @@ fn apply_seed_send_outcome(
         }
         // Transport failure: retain for retry, back off, surface feedback.
         Err(e) => {
+            // Issue #621 (review): not proof that nothing was written — see
+            // [`PromptDelivery::write_unacknowledged`] — unless the controller
+            // knows the failure came before the request could reach the
+            // daemon (a failed capability probe or connection), which is.
+            if may_have_written && let Some(delivery) = deliveries.get_mut(pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(backoff, pane_id, now);
             *feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
             true
@@ -4382,9 +4646,11 @@ fn schedule_send_retry(
 /// review): the coordinator may still be reading it — the re-arm is triggered
 /// by a compaction or `/clear` it is recovering from, and nothing tells the tab
 /// when the coordinator has finished with the previous brief. A file this
-/// leaves behind is removed by the coordination sweep once it ages past the
-/// retention window (`orchestrator_context::is_sweepable_coordination_name`);
-/// deleting each file when its orchestration ends is follow-up #1395.
+/// leaves behind is deleted when the orchestration ends if the daemon records
+/// the orchestration's context — the re-arm site reports each new file to it
+/// ([`crate::pane::PaneController::report_orchestrator_context`], issue #1445)
+/// — and otherwise by the coordination sweep once it ages past the retention
+/// window (`orchestrator_context::is_sweepable_coordination_name`).
 fn replace_orchestration_context_path(
     slot: &mut Option<std::path::PathBuf>,
     new: std::path::PathBuf,
@@ -4419,7 +4685,10 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             expected_agent_id,
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
@@ -4566,6 +4835,52 @@ enum SubmissionEvidence {
     Accumulated,
 }
 
+/// Issue #1520: the TUI's event stream broke after this delivery may have
+/// written — [`crate::state::AppState::event_stream_gaps`] has moved since
+/// [`PromptDelivery::gaps_at_write`].
+///
+/// Every other check on a written delivery reads the history the subscriber
+/// built: [`delivery_target_changed`]'s closure count and generation witness,
+/// and the per-pane journal [`prompt_submission_evidence`] confirms from. After a
+/// gap that history has a hole of unknown content. The subscriber re-reads the
+/// daemon's state when it reconnects, which tells this delivery what the pane's
+/// conversation IS, but not whether the one its bytes entered ended while nobody
+/// was listening (the #424 H4 sequence), nor whether the agent already reported
+/// submitting them. Retrying could type the task into a successor conversation
+/// or submit it twice; confirming could take a successor's events as evidence.
+///
+/// So a delivery with no confirmation on record stops instead of retrying, and
+/// writes nothing more — the same terminal outcome a counted closure already
+/// gives. Both callers check this at the WRITE, past every other hold, and not on
+/// every pass (Greptile and Qodo on #1553): until a retry is due the
+/// confirmation can still finalize the delivery, and a submission the agent
+/// reported, whether before the gap or on the resumed stream, records something
+/// that already happened, so confirming it writes nothing. While the stream is
+/// still down ([`AppState::event_stream_down`]) a due retry is held, since no
+/// confirmation can arrive yet; the deadline bounds that. A conversation the
+/// resync proved ended is caught earlier still, as a changed target. Stopping is chosen over a daemon-side closure
+/// counter
+/// because that needs a new wire field for an event (a broken subscription) that
+/// is rare, while stopping is safe with what the daemon already sends. A
+/// delivery that has written nothing is untouched: it binds against the
+/// resynchronized state like any other, and so is one whose every request so far
+/// was refused, which wrote nothing either (see [`delivery_may_have_written`]).
+fn delivery_outlived_event_gap(snapshot: &AppState, delivery: &PromptDelivery) -> bool {
+    delivery_may_have_written(delivery)
+        && delivery
+            .gaps_at_write
+            .is_some_and(|at_write| snapshot.event_stream_gaps() > at_write)
+}
+
+/// Issue #1520: whether any request of this delivery may have put bytes in the
+/// pane — an `Applied` or `Queued` outcome (`attempts`), or a request whose
+/// response was lost after it may have reached the daemon's write
+/// ([`PromptDelivery::write_unacknowledged`]). A refusal, which writes nothing,
+/// is neither.
+fn delivery_may_have_written(delivery: &PromptDelivery) -> bool {
+    delivery.attempts > 0 || delivery.write_unacknowledged
+}
+
 /// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
 /// conversation this delivery was written into GONE?
 ///
@@ -4595,17 +4910,13 @@ enum SubmissionEvidence {
 /// is the same one-handoff shape [`crate::state::latch_generation`] applies on
 /// the daemon side.
 ///
-/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
-/// producers under one registry agent id — `dot-agent-deck wrap` emits under
-/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
-/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
-/// "current generation" alternates between them. This check then reads that
-/// alternation as a lost target and abandons. The daemon's own send guard
-/// already refuses the same shape (it requires an EXACT match against the
-/// current generation), so this makes an existing intermittent refusal
-/// deterministic one frame earlier rather than introducing a new failure; the
-/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
-/// frame from a second producer as a generation.
+/// A pane hosting a wrapped agent has TWO producers under one registry agent
+/// id — `dot-agent-deck wrap` emits under `{pane}-session`, the wrapped agent's
+/// native hooks under their own id. Until issue #532 `AppState::pane_hook_session`
+/// followed whichever of them spoke last, so this check read the alternation as
+/// a lost target and abandoned. It now moves an established generation only on
+/// a genuine `SessionStart`, so the wrapper's ordinary frames leave the target
+/// this delivery bound alone (`prompt/pane-input/043`).
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
     // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
     // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
@@ -4645,8 +4956,15 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
     let Some(reference) = reference else {
         return false;
     };
+    // Issue #621: a snapshot with NO generation is not evidence that the bound
+    // one went away when the daemon itself named it and this view never
+    // received it — see [`PromptDelivery::refusal_generation`]. Only the
+    // absence is overridden: a generation the snapshot does observe still
+    // decides, and an end it observes was already caught by the closure count
+    // above.
     snapshot
         .pane_hook_session_id(pane_id)
+        .or_else(|| delivery.refusal_generation.clone())
         .is_none_or(|current| current != reference)
 }
 
@@ -4675,10 +4993,10 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 ///   appears after the write is not that conversation — we never addressed it —
 ///   so adopting it retroactively claims a target this delivery never had, and
 ///   any later generation on that pane then reads as a lost target. That is not
-///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
-///   carrying a pane id, including one from a producer that never announced a
-///   session, so a pane whose events carry drifting session ids would abandon
-///   deliveries it never endangered (`prompt/pane-input/026`).
+///   hypothetical: the snapshot's `pane_hook_session` is ESTABLISHED by any
+///   event carrying a pane id, including one from a producer that never
+///   announced a session, so binding retroactively would claim a target this
+///   delivery never addressed (`prompt/pane-input/026`).
 ///
 /// A prompt written into a pane that had NO generation — the 10 s-fallback
 /// launcher case — therefore stays UNBOUND for as long as it is merely being
@@ -4691,9 +5009,18 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 /// and is refreshed on EVERY frame — that half is what lets a late-identifying
 /// producer still arm its retries.
 fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    // Issue #621: the snapshot first, and the generation a `stale` refusal named
+    // only where the snapshot has none — the case where this view dropped the
+    // `SessionStart` and will not see it again. Same once-only, before-the-first-
+    // write precondition either way; see [`PromptDelivery::refusal_generation`].
     if delivery.expected_session_id.is_none()
         && delivery.attempts == 0
-        && let Some(current) = snapshot.pane_hook_session_id(pane_id)
+        && let Some(current) = snapshot.pane_hook_session_id(pane_id).or_else(|| {
+            delivery
+                .refusal_generation
+                .clone()
+                .filter(|_| !delivery.write_unacknowledged)
+        })
     {
         adopt_generation(delivery, current);
     }
@@ -4762,10 +5089,9 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
 /// The `prompt/pane-input/026` counter-example that argued against binding late
 /// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
 /// session ids, and the daemon-side latch now treats only a `SessionStart` as an
-/// announcement. The residual that does remain is #532's wrapped-agent
-/// alternation, which `AppState::pane_hook_session` still tracks across two
-/// producers; that shows up as an abandoned delivery — the safe direction — and
-/// is already documented on [`delivery_target_changed`].
+/// announcement — and since issue #532 so does `AppState::pane_hook_session`
+/// once a pane has a generation, which is what ended the wrapped-agent
+/// alternation documented on [`delivery_target_changed`].
 fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
     if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
         return;
@@ -4788,6 +5114,24 @@ fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
     if delivery.wire_issued {
         delivery.epoch = delivery.epoch.saturating_add(1);
         delivery.wire_issued = false;
+    }
+}
+
+/// Issue #621: keep the generation a `stale` refusal named, for
+/// [`bind_delivery_generation`] to bind on the next pass. Only for a delivery
+/// that is still unbound and has written nothing — the precondition the bind
+/// itself enforces, checked here too so the field never holds a value that
+/// could not be used — and none of whose requests ended in a transport error,
+/// which may have written regardless ([`PromptDelivery::write_unacknowledged`]). A newer refusal replaces an older one: until the
+/// delivery binds, the latest generation the daemon reported is the one the
+/// next attempt has to name.
+fn note_refusal_generation(delivery: &mut PromptDelivery, generation: Option<String>) {
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts == 0
+        && !delivery.write_unacknowledged
+        && let Some(generation) = generation
+    {
+        delivery.refusal_generation = Some(generation);
     }
 }
 
@@ -4936,12 +5280,11 @@ fn evidence_channel_is_unidentified(
 ///
 /// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
 /// `SessionStart` is self-describing and authoritative, and anything else is
-/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
-/// carrying a pane id — good for the send guard, useless as evidence that a
-/// conversation began — so reading it raw would make a pane whose ordinary
-/// events drift through session ids look like a rolling series of
-/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
-/// wrapped-agent alternation.
+/// inference. `AppState::pane_hook_session` deliberately lets ANY frame carrying
+/// a pane id ESTABLISH a generation on a pane that has none — good for the send
+/// guard, useless as evidence that a conversation began — so reading it raw
+/// would make an inferred generation look like an announced one. That pane is
+/// `prompt/pane-input/026`.
 ///
 /// Matched by TIMESTAMP rather than by session id, because the two are not the
 /// same string by the time they reach here: `AppState::apply_event`'s reuse
@@ -5177,7 +5520,7 @@ fn deliver_orchestrator_prompt(
     // deadline below, which ends it without a second write. See
     // [`InFlightPromptSend`].
     if let Some(sending) = ui.in_flight_prompt_sends.get_mut(start_pane_id.as_str()) {
-        let polled = sending.pending.poll();
+        let polled = sending.pending.poll_reply();
         if polled.is_none() && !deadline_passed {
             return;
         }
@@ -5327,13 +5670,30 @@ fn deliver_orchestrator_prompt(
             return;
         }
         log_prompt_abandoned("orchestrator", &start_pane_id, &delivery_id, attempts);
+        // Issue #1520 (Qodo on #1553): a prompt held at its retry by an
+        // event-stream outage may well have been delivered; say what is known —
+        // that it went unconfirmed — rather than that it was not delivered.
+        let lost_contact = ui
+            .prompt_delivery
+            .get(start_pane_id.as_str())
+            .is_some_and(|delivery| {
+                delivery_may_have_written(delivery)
+                    && (snapshot.event_stream_down()
+                        || delivery_outlived_event_gap(snapshot, delivery))
+            });
+        let message = if lost_contact {
+            "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+             not retried"
+        } else {
+            "Orchestrator prompt not delivered (timed out); abandoned"
+        };
         abandon_orchestrator_prompt(
             ui,
             tab_id,
             &start_pane_id,
             orchestrator_prompt,
             now,
-            "Orchestrator prompt not delivered (timed out); abandoned".to_string(),
+            message.to_string(),
         );
         return;
     }
@@ -5396,6 +5756,38 @@ fn deliver_orchestrator_prompt(
     if attempt > 1 && capability != ConfirmationCapability::Reports {
         return;
     }
+    // Issue #1520: see the seed path's twin — at the write, held while the
+    // stream is down — and [`delivery_outlived_event_gap`].
+    if ui
+        .prompt_delivery
+        .get(start_pane_id.as_str())
+        .is_some_and(delivery_may_have_written)
+        && snapshot.event_stream_down()
+    {
+        return;
+    }
+    if let Some(delivery) = ui.prompt_delivery.get(start_pane_id.as_str())
+        && delivery_outlived_event_gap(snapshot, delivery)
+    {
+        let delivery_id = delivery.delivery_id.clone();
+        log_prompt_stopped(
+            "orchestrator",
+            &start_pane_id,
+            &delivery_id,
+            "event-stream-gap",
+        );
+        abandon_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            orchestrator_prompt,
+            now,
+            "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+             not retried"
+                .to_string(),
+        );
+        return;
+    }
     // Issue #424 D1: past every hold, so this frame WILL write into whatever
     // conversation the pane currently has. Name it first, and read the epoch
     // AFTER — binding can rotate it. See [`bind_generation_before_retry`].
@@ -5448,6 +5840,12 @@ fn deliver_orchestrator_prompt(
     {
         delivery.closures_at_write = Some(closures);
     }
+    // Issue #1520: see the seed path's twin and [`PromptDelivery::gaps_at_write`].
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+        && !delivery_may_have_written(delivery)
+    {
+        delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
+    }
     let issued = IssuedPromptSend {
         delivery_id,
         attempt,
@@ -5466,7 +5864,7 @@ fn deliver_orchestrator_prompt(
         expected_session_id.as_deref(),
         wire_delivery_id.as_deref(),
     );
-    match pending.poll() {
+    match pending.poll_reply() {
         Some(outcome) => apply_orchestrator_send_outcome(
             ui,
             outcome,
@@ -5494,7 +5892,7 @@ fn deliver_orchestrator_prompt(
 #[allow(clippy::too_many_arguments)]
 fn apply_orchestrator_send_outcome(
     ui: &mut UiState,
-    outcome: Result<SendResult, PaneError>,
+    reply: SubmitReply,
     issued: &IssuedPromptSend,
     snapshot: &AppState,
     now: std::time::Instant,
@@ -5512,6 +5910,11 @@ fn apply_orchestrator_send_outcome(
         issued.watermark,
         issued.capability,
     );
+    let SubmitReply {
+        result: outcome,
+        current_session_id,
+        may_have_written,
+    } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this means. The
         // prompt, the role's non-`Working` status, the delivery identity and the
@@ -5531,9 +5934,10 @@ fn apply_orchestrator_send_outcome(
                 log_prompt_probe_submitted("orchestrator", start_pane_id, logged_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report a
-                // submitted prompt (Pi). Retrying could never be confirmed —
-                // only retyped — so the write is final and the role finalizes.
+                // A recognized producer that cannot report a submitted prompt
+                // (a Pi extension declaring nothing, a wrapped Codex whose
+                // prompt hook is untrusted). Retrying could never be confirmed
+                // — only retyped — so the write is final and the role finalizes.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
                         "orchestrator",
@@ -5590,6 +5994,12 @@ fn apply_orchestrator_send_outcome(
             );
         }
         Ok(other) => {
+            // Issue #621: the seed path's twin — see `apply_seed_send_outcome`.
+            if other == SendResult::Stale
+                && let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id)
+            {
+                note_refusal_generation(delivery, current_session_id);
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             let msg = if other == SendResult::HistoryOnly {
                 "History-only session cannot accept live input".to_string()
@@ -5602,6 +6012,10 @@ fn apply_orchestrator_send_outcome(
             ui.status_message = Some((msg, now));
         }
         Err(e) => {
+            // Issue #621 (review): the seed path's twin.
+            if may_have_written && let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             ui.status_message = Some((
                 format!("Orchestrator prompt not delivered ({e}); will retry"),
@@ -5902,6 +6316,20 @@ fn surface_one_orchestration(
         return;
     }
 
+    // Issue #463: no per-tab token means no identity to build the tab under —
+    // the same reason hydration leaves a token-less pane on the dashboard. Every
+    // producer in a daemon of this protocol stamps one, so this is a surface
+    // from a membership a client older than v0.35.0 started.
+    let Some(orchestration_id) = surface.orchestration_id.clone() else {
+        tracing::warn!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface carries no orchestration_id (a client older than \
+             v0.35.0, no longer supported, #463); not building a tab for it"
+        );
+        return;
+    };
+
     // Reuse the hydration partition's config resolution: the local project
     // config when present, else a minimal config synthesised from the surface's
     // role metadata (same as a remote reconnect whose local config is absent).
@@ -5916,9 +6344,9 @@ fn surface_one_orchestration(
         // directory. `pane spawn` (issue #868) broke that premise — it spawns
         // into the CALLING orchestration's own (non-unique) cwd — so the
         // daemon's `OrchestrationSurface` now carries the PRD #140 per-tab
-        // `Instance` token as an additive field (both producers populate it)
-        // and this bucket carries it through.
-        orchestration_id: surface.orchestration_id.clone(),
+        // token as an additive field (both producers populate it) and this
+        // bucket carries it through.
+        orchestration_id,
         role_slots: surface
             .roles
             .iter()
@@ -6297,7 +6725,7 @@ fn surface_one_orchestration(
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
-        bucket.orchestration_id.as_deref(),
+        Some(bucket.orchestration_id.as_str()),
         Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
@@ -6406,6 +6834,10 @@ pub struct NewPaneRequest {
     /// issue-dispatch authoring and the dispatcher — each of which is a
     /// dashboard card carrying its seed here.
     seed_prompt: Option<String>,
+    /// Issue #1496: the authoring kind of a built-in option's card, sent with
+    /// the start so the daemon records it on the agent. `None` for a plain
+    /// card and an orchestration.
+    authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -6766,7 +7198,6 @@ fn ctrl_c0_byte(c: char) -> Option<u8> {
     }
 }
 
-/// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 /// Issue #1422: the platform line-editing chords, as the bytes the desktop
 /// app's agent terminal sends for them (`desktop/src/lib/terminalKeys.ts`), so
 /// the same shortcut does the same thing in an agent whichever client it was
@@ -6804,7 +7235,19 @@ fn editing_chord_bytes(key: &KeyEvent) -> Option<&'static [u8]> {
     }
 }
 
+/// The bytes a pane in the ordinary cursor mode receives for `key`: what
+/// [`keyevent_to_pane_bytes`] sends before the pane's program has asked for
+/// application cursor mode, or after it has turned it off.
+#[cfg(test)]
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    keyevent_to_pane_bytes(key, false)
+}
+
+/// Convert a crossterm `KeyEvent` into the bytes the focused pane's program
+/// receives for it. `application_cursor` is whether that program has turned on
+/// application cursor mode (DECCKM, `ESC[?1h`), read from the pane's own vt100
+/// parser by [`focused_pane_application_cursor`].
+fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     if let Some(bytes) = editing_chord_bytes(key) {
         return Some(bytes.to_vec());
     }
@@ -6827,25 +7270,36 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
     // submitted instead of inserting a newline.
     //
-    // Only SHIFT/CONTROL open this path, plus ALT on an arrow. ALT on its own
-    // otherwise keeps its historical ESC-prefix form (Alt+Enter → `ESC\r`),
-    // because a genuine Alt+Enter is meaningful to some agents; when ALT
-    // accompanies SHIFT/CONTROL it is folded into the modifier bitmask rather
-    // than dropped.
+    // Only SHIFT/CONTROL open this path, plus ALT on an arrow, Home, End or
+    // Delete (below). ALT on its own otherwise keeps its historical ESC-prefix
+    // form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is meaningful to
+    // some agents; when ALT accompanies SHIFT/CONTROL it is folded into the
+    // modifier bitmask rather than dropped.
     //
     // Issue #1422: Alt+arrow is `ESC[1;3<dir>`, what xterm, the desktop app
     // and most terminals send, rather than `ESC` + the bare arrow. Claude Code
     // and Pi read that ESC-prefixed form as a one-character move and Codex and
     // Devin type its `[D` into the draft, so Option+Left (Alt+Left) did not
     // move by a word.
-    let alt_arrow = key.modifiers.contains(KeyModifiers::ALT)
+    //
+    // Issue #1477: Home, End and Delete carry their modifiers the same way —
+    // `ESC[1;<m>H`, `ESC[1;<m>F`, `ESC[3;<m>~`, Alt alone included — because
+    // that is what xterm.js sends for them on the desktop. The deck used to
+    // drop Shift and Ctrl on them and put Alt in front as an ESC.
+    let alt_modifier_form = key.modifiers.contains(KeyModifiers::ALT)
         && matches!(
             key.code,
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Delete
         );
     if key.modifiers.contains(KeyModifiers::SHIFT)
         || key.modifiers.contains(KeyModifiers::CONTROL)
-        || alt_arrow
+        || alt_modifier_form
     {
         let m = csi_modifier_param(key.modifiers);
         match key.code {
@@ -6858,9 +7312,27 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
             KeyCode::Down => return Some(format!("\x1b[1;{m}B").into_bytes()),
             KeyCode::Right => return Some(format!("\x1b[1;{m}C").into_bytes()),
             KeyCode::Left => return Some(format!("\x1b[1;{m}D").into_bytes()),
+            KeyCode::Home => return Some(format!("\x1b[1;{m}H").into_bytes()),
+            KeyCode::End => return Some(format!("\x1b[1;{m}F").into_bytes()),
+            KeyCode::Delete => return Some(format!("\x1b[3;{m}~").into_bytes()),
             _ => {}
         }
     }
+
+    // Issue #1477: in application cursor mode (DECCKM) an unmodified arrow,
+    // Home or End is sent in its SS3 form, as xterm.js sends it; a modified
+    // one has already left above in its CSI form, as xterm does it too. Only
+    // these six keys change: xterm.js reads the mode for nothing else.
+    let cursor_key = |normal: &[u8], application: &[u8]| {
+        Some(
+            if application_cursor {
+                application
+            } else {
+                normal
+            }
+            .to_vec(),
+        )
+    };
 
     // Base key bytes (without Alt). Alt prefix is added at the end.
     let base: Option<Vec<u8>> = match key.code {
@@ -6870,14 +7342,18 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Tab => Some(vec![b'\t']),
+        // Issue #1477: BS whenever Ctrl is held, as xterm.js sends it
+        // (Ctrl+Shift+Backspace, and Ctrl+Alt+Backspace as `ESC BS`). The bare
+        // Ctrl+Backspace is a word delete, translated above.
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => Some(vec![0x08]),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::Up => cursor_key(b"\x1b[A", b"\x1bOA"),
+        KeyCode::Down => cursor_key(b"\x1b[B", b"\x1bOB"),
+        KeyCode::Right => cursor_key(b"\x1b[C", b"\x1bOC"),
+        KeyCode::Left => cursor_key(b"\x1b[D", b"\x1bOD"),
+        KeyCode::Home => cursor_key(b"\x1b[H", b"\x1bOH"),
+        KeyCode::End => cursor_key(b"\x1b[F", b"\x1bOF"),
         KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
         KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
@@ -6949,6 +7425,24 @@ pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bo
     const ESC: u8 = 0x1b;
 
     byte == b'\r' && preceding != Some(ESC)
+}
+
+/// Issue #1477: whether the program in the focused pane has turned on
+/// application cursor mode (DECCKM), read from the vt100 parser that already
+/// renders that pane, so the mode is tracked per pane and by the one parser
+/// that sees the pane's output. xterm.js keeps the same flag per terminal on
+/// the desktop. Anything other than a focused embedded pane is the ordinary
+/// mode.
+fn focused_pane_application_cursor(pane: &dyn PaneController) -> bool {
+    pane.as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .and_then(|embedded| {
+            let pane_id = embedded.focused_pane_id()?;
+            let screen = embedded.get_screen(&pane_id)?;
+            let parser = screen.lock().ok()?;
+            Some(parser.screen().application_cursor())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -7163,8 +7657,8 @@ fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -
     (start, end)
 }
 
-fn handle_pane_input_key(key: KeyEvent) -> Action {
-    if let Some(bytes) = keyevent_to_bytes(&key) {
+fn handle_pane_input_key(key: KeyEvent, application_cursor: bool) -> Action {
+    if let Some(bytes) = keyevent_to_pane_bytes(&key, application_cursor) {
         Action::ForwardToPane(bytes)
     } else {
         Action::Continue
@@ -9533,10 +10027,11 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // PRD #196: seed via the fallback chain — explicit `default_command`
-            // (unchanged precedence) → recorded `last_command` → blank.
-            let command =
-                resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
+            // PRD #196 / issue #1540: seed via the fallback chain — explicit
+            // `default_command` (unchanged precedence) → the deck's last command
+            // (the daemon's, or this TUI's own against a daemon that keeps none)
+            // → blank.
+            let command = form_seed_command(ui);
             let orchestrations = match load_project_config(&dir) {
                 Ok(Some(config)) => {
                     if config.legacy_modes_declared {
@@ -9581,6 +10076,76 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
     ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// Issue #1540: the `Ctrl+n` form's Command pre-fill, read from the attached
+/// daemon when it keeps the deck's last command. Skips the daemon entirely when
+/// `default_command` is set, since that wins anyway. A daemon that keeps the
+/// value but has none yet is offered this TUI's own (`session.toml`) value —
+/// the migration, retried here so a daemon restarted since startup gets it too.
+/// A daemon that does not answer within [`FORM_SEED_TIMEOUT`] is treated like
+/// one that keeps nothing: the form opens on this TUI's own value.
+fn form_seed_command(ui: &UiState) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    let session = ui.last_command.as_deref();
+    let daemon = if ui.config.default_command.is_empty() {
+        ui.last_command_reader
+            .as_ref()
+            .and_then(|reader| reader.read(FORM_SEED_TIMEOUT))
+    } else {
+        None
+    };
+    let (keeper, daemon_command) = match &daemon {
+        Some(answer) => (answer.keeper, answer.command.as_deref()),
+        None => (LastCommandKeeper::Client, None),
+    };
+    if keeper == LastCommandKeeper::Daemon
+        && daemon_command.is_none_or(|c| c.trim().is_empty())
+        && let (Some(reader), Some(command)) = (
+            ui.last_command_reader.as_ref(),
+            session.filter(|c| !c.trim().is_empty()),
+        )
+    {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
+    resolve_form_seed_command(&ui.config.default_command, daemon_command, keeper, session)
+}
+
+/// Issue #1540: the budget for reading the daemon's last command when the
+/// `Ctrl+n` form opens. The same 500ms as [`CLOSE_PREVIEW_TIMEOUT`], the other
+/// interactive key path that waits on the daemon for what it shows, and larger
+/// than [`DAEMON_HINT_TIMEOUT`] because the answer is what the form shows rather
+/// than a hint beside it, so giving up early on a busy daemon would visibly show
+/// the wrong command. Still bounded, because the key press waits on it, and it
+/// fails open to this TUI's own value.
+const FORM_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Issue #1540: [`resolve_seed_command`] with the deck's last command chosen by
+/// who keeps it. A [`LastCommandKeeper::Daemon`] deck offers the daemon's value,
+/// and this TUI's own (`session`) only while the daemon has none — the value the
+/// migration is handing over. A [`LastCommandKeeper::Client`] deck (an older
+/// daemon) offers only this TUI's own, as before. Blank values are skipped;
+/// the chosen one is used verbatim.
+///
+/// [`LastCommandKeeper::Daemon`]: crate::daemon_client::LastCommandKeeper::Daemon
+/// [`LastCommandKeeper::Client`]: crate::daemon_client::LastCommandKeeper::Client
+fn resolve_form_seed_command(
+    default_command: &str,
+    daemon_last_command: Option<&str>,
+    keeper: crate::daemon_client::LastCommandKeeper,
+    session_last_command: Option<&str>,
+) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    fn nonblank(value: Option<&str>) -> Option<&str> {
+        value.filter(|s| !s.trim().is_empty())
+    }
+    let last = match keeper {
+        LastCommandKeeper::Daemon => {
+            nonblank(daemon_last_command).or(nonblank(session_last_command))
+        }
+        LastCommandKeeper::Client => nonblank(session_last_command),
+    };
+    resolve_seed_command(default_command, last)
 }
 
 /// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
@@ -9669,6 +10234,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             command,
             orchestration_config: None,
             seed_prompt: Some(seed),
+            authoring_kind: Some(builtin.authoring_kind()),
         };
     }
     NewPaneRequest {
@@ -9677,6 +10243,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         command: form.command.clone(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
+        authoring_kind: None,
     }
 }
 
@@ -10014,7 +10581,10 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
         return Some(action);
     }
     if mode == UiMode::PaneInput {
-        return match handle_pane_input_key(*key) {
+        // No pane is in scope here, so the ordinary cursor mode: what this
+        // helper answers is which keys reach a pane at all, and the cursor
+        // mode changes only the bytes of an arrow, Home or End, never that.
+        return match handle_pane_input_key(*key, false) {
             Action::Continue => None,
             forwarded => Some(forwarded),
         };
@@ -11475,6 +12045,13 @@ fn dispatch_action(
                             // PRD #201: single-pane spawn, not a Pi
                             // orchestrator — no native seed.
                             seed: None,
+                            // Issue #1540: this IS a New agent form submit,
+                            // so a deck that keeps the last command records
+                            // it once it has accepted the start.
+                            remember_command: true,
+                            // Issue #1496: a built-in option's card is an
+                            // authoring agent; the daemon records which.
+                            authoring_kind: req.authoring_kind,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -12638,7 +13215,7 @@ fn handle_key_event(
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
             UiMode::PaneInput => {
-                let candidate = handle_pane_input_key(key);
+                let candidate = handle_pane_input_key(key, focused_pane_application_cursor(pane));
                 // The gate needs live per-pane status for the
                 // `WaitingForInput` carve-out, and `UiState` caches none — so
                 // build the join from the `snapshot` already in scope here and
@@ -12888,6 +13465,20 @@ pub fn run_tui(
     // has to win over whichever landing tab they chose.
     let restored_session = config::SavedSession::load();
     ui.last_command = restored_session.last_command;
+    // Issue #1540: the form's pre-fill comes from the attached daemon when it
+    // keeps the deck's last command. Hand it the value this TUI kept before the
+    // daemon did; the daemon takes it only if it has none, so a newer command
+    // another client recorded is never overwritten.
+    ui.last_command_reader = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::last_command_reader);
+    if let (Some(reader), Some(command)) = (
+        ui.last_command_reader.as_ref(),
+        ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
+    ) {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
     let saved_focus = restored_session.focus;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
@@ -13005,6 +13596,7 @@ pub fn run_tui(
         // (M2.12 fixup reviewer #3: partition stays I/O-free; logging
         // lives at the hydration call site).
         let mut legacy_mode_names: Vec<&str> = Vec::new();
+        let mut tokenless_orchestration_names: Vec<&str> = Vec::new();
         for rejection in &partition.rejections {
             match rejection {
                 HydrationRejection::LegacyWorkspaceMode {
@@ -13025,9 +13617,33 @@ pub fn run_tui(
                         legacy_mode_names.push(mode_name);
                     }
                 }
+                HydrationRejection::TokenlessOrchestration {
+                    cwd,
+                    orchestration_name,
+                    agent_id,
+                    pane_id,
+                } => {
+                    let (safe_cwd, safe_name) =
+                        legacy_mode_hydration_log_fields(cwd, orchestration_name);
+                    tracing::warn!(
+                        cwd = %safe_cwd,
+                        orchestration = %safe_name,
+                        agent_id = %agent_id,
+                        pane_id = %pane_id,
+                        "hydration: orchestration pane carries no orchestration_id (started by a client older than v0.35.0, no longer supported, #463); placing it on the dashboard"
+                    );
+                    if !tokenless_orchestration_names.contains(&orchestration_name.as_str()) {
+                        tokenless_orchestration_names.push(orchestration_name);
+                    }
+                }
             }
         }
         if let Some(warning) = legacy_mode_hydration_warning(&legacy_mode_names) {
+            ui.session_warnings.push(warning);
+        }
+        if let Some(warning) =
+            tokenless_orchestration_hydration_warning(&tokenless_orchestration_names)
+        {
             ui.session_warnings.push(warning);
         }
         // Cache cwd → project config so the lookup happens once per
@@ -13198,7 +13814,7 @@ pub fn run_tui(
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
                 Some(start_role_index),
             ) {
                 Ok((tab_index, _)) => {
@@ -13538,6 +14154,9 @@ pub fn run_tui(
                     agent_type: agent_type.clone(),
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
+                    // Issue #1540: a restore is not a form submit.
+                    remember_command: false,
+                    authoring_kind: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -13774,14 +14393,7 @@ pub fn run_tui(
                             .is_some_and(|pid| role_pane_ids.contains(pid))
                     })
                     .collect();
-                // Sort by role config order, not numeric pane ID, so recreated
-                // panes (clear=true) keep their original card position.
-                orch_filtered.sort_by_key(|(_, s)| {
-                    s.pane_id
-                        .as_ref()
-                        .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
-                        .unwrap_or(usize::MAX)
-                });
+                sort_by_role_order(&mut orch_filtered, role_pane_ids);
                 orch_filtered
             }
         };
@@ -14217,6 +14829,10 @@ pub fn run_tui(
                         ui.orchestration_ready_since.remove(id);
 
                         *orchestrator_prompt = Some(published.prompt);
+                        // Issue #1445: tell the daemon, so a TUI attaching
+                        // later re-arms from this file and the end of the
+                        // orchestration removes it.
+                        pane.report_orchestrator_context(&start_pane_id, &published.context_path);
                         replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
@@ -14359,6 +14975,11 @@ pub fn run_tui(
                             ui.orchestration_ready_since.remove(id);
 
                             *orchestrator_prompt = Some(published.prompt);
+                            // Issue #1445: as the compaction re-arm above.
+                            pane.report_orchestrator_context(
+                                &start_pane_id,
+                                &published.context_path,
+                            );
                             replace_orchestration_context_path(
                                 context_path,
                                 published.context_path,
@@ -20601,9 +21222,9 @@ fn render_session_card(
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
-    // survives every density, and ahead of the prompt/tool rows because it is
-    // the fact that explains why those rows keep advancing while the run has in
-    // fact stalled.
+    // survives every density (at Minimal it takes `Dir:`'s place), and ahead
+    // of the prompt/tool rows because it is the fact that explains why those
+    // rows keep advancing while the run has in fact stalled.
     if is_orphaned {
         status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis("Orphaned — delegation unavailable", w),
@@ -20650,7 +21271,9 @@ fn render_session_card(
         )));
     }
 
-    let prompts = if is_placeholder {
+    let prompts = if density.max_prompts() == 0 {
+        Vec::new()
+    } else if is_placeholder {
         vec!["Launch an agent to get started".to_string()]
     } else {
         collect_recent_prompts(session, density.max_prompts())
@@ -20662,7 +21285,7 @@ fn render_session_card(
         inner.height as usize,
         status_lines.len(),
         prompts.len(),
-        density != CardDensity::Compact,
+        density.has_separator(),
         tool_lines.len(),
     );
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -20714,6 +21337,12 @@ struct CardRowPlan {
 /// tool history are never shed here; the tool rows are what the card is for, and
 /// the status row is why the card needs attention. A card with no status row at
 /// its own density's height already fits, so its layout is unchanged.
+///
+/// At [`CardDensity::Minimal`] the budget is one row and there are no prompts or
+/// tools to shed, so a status row takes `Dir:`'s place outright (issue #1568):
+/// being Blocked or orphaned matters more than the directory. A card that is
+/// both shows the `Orphaned` row, the first status row; its title still carries
+/// the `orphaned` marker and the `Blocked` badge.
 fn fit_card_rows(
     budget: usize,
     status_rows: usize,
@@ -20878,6 +21507,7 @@ fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardDensityKind {
+    Minimal,
     Compact,
     Normal,
     Spacious,
@@ -20886,6 +21516,7 @@ pub enum CardDensityKind {
 impl From<CardDensityKind> for CardDensity {
     fn from(kind: CardDensityKind) -> Self {
         match kind {
+            CardDensityKind::Minimal => CardDensity::Minimal,
             CardDensityKind::Compact => CardDensity::Compact,
             CardDensityKind::Normal => CardDensity::Normal,
             CardDensityKind::Spacious => CardDensity::Spacious,
@@ -21508,8 +22139,9 @@ pub fn render_orchestration_frame_to_buffer(
     let role_names = &role_names[..role_names.len().min(RENDER_SEAM_ROLES_MAX)];
     let focused_role_index = focused_role_index.min(role_names.len() - 1);
 
-    // Numeric pane ids so `filter_sessions`' pane-id sort reproduces role order
-    // and the rendered card column is deterministic.
+    // Numeric pane ids so `filter_sessions`' pane-id fallback (these sessions
+    // carry no daemon agent id) reproduces role order and the rendered card
+    // column is deterministic.
     let pane_ids: Vec<String> = (0..role_names.len()).map(|i| i.to_string()).collect();
 
     // One inert pane per role, the focused one focused. The seed geometry is a
@@ -21563,6 +22195,8 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22356,6 +22990,8 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
     }
@@ -23753,6 +24389,136 @@ mod tests {
         );
     }
 
+    /// Assert on the Command row drawn by the production form renderer.
+    fn assert_form_command_seed(command: String, expected: &str) {
+        let form = NewPaneFormState::new(
+            PathBuf::from("/fixture"),
+            "seed-check".to_string(),
+            command,
+            vec![],
+        );
+        let grid = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, &form);
+        }));
+        let row = grid
+            .lines()
+            .find(|row| row.contains("Command:"))
+            .expect("the New Agent form must render its Command row");
+        let actual = row
+            .split_once("Command:")
+            .expect("Command label")
+            .1
+            .split('\u{2502}')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        assert_eq!(
+            actual, expected,
+            "New Agent Command pre-fill.\nGrid:\n{grid}"
+        );
+    }
+
+    /// Scenario: Open a New Agent form with different configured, daemon and
+    /// session commands. The rendered Command row prefers the configured default,
+    /// then the daemon's remembered command, then blank when neither has a value.
+    #[test]
+    fn resolve_form_seed_command_daemon_precedence() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                Some("daemon-command"),
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("configured-command", None, None, "configured-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "daemon-command",
+            ),
+            ("", Some("daemon-command"), None, "daemon-command"),
+            ("", None, None, ""),
+            ("", Some(""), None, ""),
+            ("", Some("   "), None, ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form against an older daemon that leaves the
+    /// client in charge of remembering commands. Its rendered Command row keeps
+    /// using the session value below the configured default and ignores daemon values.
+    #[test]
+    fn resolve_form_seed_command_older_daemon_session_fallback() {
+        use crate::daemon_client::LastCommandKeeper::Client;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                None,
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("", None, Some("session-command"), "session-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "session-command",
+            ),
+            ("", Some("daemon-command"), None, ""),
+            ("", None, None, ""),
+            ("", None, Some(""), ""),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Client, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form after connecting to a capable daemon
+    /// with no remembered command and a session that remembers one. The rendered
+    /// Command row shows the migration value, while an existing daemon value wins.
+    #[test]
+    fn resolve_form_seed_command_migration_prefills_form() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "",
+                None,
+                Some("migrated-session-command"),
+                "migrated-session-command",
+            ),
+            (
+                "configured-command",
+                None,
+                Some("migrated-session-command"),
+                "configured-command",
+            ),
+            (
+                "",
+                Some("daemon-command"),
+                Some("migrated-session-command"),
+                "daemon-command",
+            ),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
     /// PRD #196: the record decision fires for ANY non-empty form-submitted
     /// command regardless of mode — a plain interactive spawn AND an authoring-mode
     /// form (schedule / issue-dispatch) both record — and only an empty/whitespace
@@ -24275,7 +25041,7 @@ mod tests {
             cwd: "/work".into(),
             orchestration_name: "team".into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: Vec::new(),
             context_path,
         };
@@ -24483,6 +25249,8 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
         state
@@ -24751,6 +25519,7 @@ mod tests {
                 command: String::new(),
                 orchestration_config: Some(cfg(name)),
                 seed_prompt: None,
+                authoring_kind: None,
             };
             let _ = dispatch_action(
                 Action::SpawnPane(Box::new(req)),
@@ -26183,6 +26952,21 @@ mod tests {
 
     /// Issue #1199: the hydration site turns those records into ONE
     /// `session_warnings` line naming the mode(s), and none when there were none.
+    /// Issue #463: the hydration warning for panes a client older than v0.35.0
+    /// started is one line naming each orchestration, says why they are on the
+    /// dashboard, and escapes a hostile name.
+    #[test]
+    fn tokenless_orchestration_hydration_warning_is_one_line_naming_the_orchestrations() {
+        assert_eq!(tokenless_orchestration_hydration_warning(&[]), None);
+        let line = tokenless_orchestration_hydration_warning(&["tdd-cycle", "evil\u{1b}[2J\nx"])
+            .expect("a warning when any pane carried no orchestration_id");
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        assert!(!line.contains('\u{1b}'), "escaped: {line:?}");
+        assert!(line.contains("tdd-cycle"), "{line}");
+        assert!(line.contains("v0.35.0") && line.contains("#463"), "{line}");
+        assert!(line.contains("dashboard"), "{line}");
+    }
+
     #[test]
     fn legacy_mode_hydration_warning_is_one_line_naming_the_modes() {
         assert_eq!(legacy_mode_hydration_warning(&[]), None);
@@ -26296,7 +27080,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -26310,7 +27094,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -26324,7 +27108,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -26359,7 +27143,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             );
             pane.orchestrator_context_path = Some(PathBuf::from(path));
@@ -26389,8 +27173,9 @@ mod tests {
     /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
     /// giving each tab's orchestrator and coder panes a distinct shared
     /// instance id. The tokened records must rebuild as two two-pane buckets,
-    /// while otherwise-identical legacy records without ids retain the
-    /// one-bucket fallback.
+    /// while otherwise-identical records without ids (a client older than
+    /// v0.35.0, issue #463) rebuild no tab: every pane lands on the dashboard
+    /// and each is reported as a token-less orchestration pane.
     #[test]
     fn partition_separates_same_name_cwd_orchestrations_by_instance_id() {
         fn orchestration_panes(ids: [Option<&str>; 2]) -> Vec<HydratedPane> {
@@ -26421,15 +27206,33 @@ mod tests {
         }
 
         let legacy = partition_hydrated_panes(&orchestration_panes([None, None]));
-        assert_eq!(
-            legacy.orchestration_buckets.len(),
-            1,
-            "legacy memberships without orchestration_id keep the (name, cwd) fallback"
+        assert!(
+            legacy.orchestration_buckets.is_empty(),
+            "memberships without orchestration_id rebuild no tab (issue #463); got {:?}",
+            legacy.orchestration_buckets
         );
         assert_eq!(
-            legacy.orchestration_buckets[0].role_slots.len(),
-            4,
-            "the legacy fallback keeps all four panes in its single bucket"
+            legacy.dashboard_pane_ids,
+            vec![
+                "pane-0-orchestrator".to_string(),
+                "pane-0-coder".to_string(),
+                "pane-1-orchestrator".to_string(),
+                "pane-1-coder".to_string(),
+            ],
+            "every token-less pane lands on the dashboard, in input order"
+        );
+        assert_eq!(legacy.rejections.len(), 4);
+        assert!(
+            legacy.rejections.iter().all(|r| matches!(
+                r,
+                HydrationRejection::TokenlessOrchestration {
+                    cwd,
+                    orchestration_name,
+                    ..
+                } if cwd == "/work/project" && orchestration_name == "tdd-cycle"
+            )),
+            "each token-less pane is reported with its orchestration and cwd: {:?}",
+            legacy.rejections
         );
 
         let tokened = partition_hydrated_panes(&orchestration_panes([
@@ -26545,7 +27348,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None, // leading slot omits the title
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -26559,7 +27362,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: Some("My Custom Run".into()),
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -26572,10 +27375,12 @@ mod tests {
         );
     }
 
-    /// Negative-case mirror of the above: two panes with the same
-    /// orchestration name but distinct orchestration_cwds must end
-    /// up in DIFFERENT buckets — the round-11 #C collision-fix
-    /// invariant carried through the hydration partition.
+    /// Negative-case mirror of the above: two tabs with the same
+    /// orchestration name but distinct orchestration_cwds end up in
+    /// DIFFERENT buckets, each under its own orchestration_cwd — the
+    /// round-11 #C collision-fix invariant carried through the hydration
+    /// partition. Issue #463: the bucket key is the per-tab token, which
+    /// two tabs never share, so it is the token that splits them.
     #[test]
     fn partition_separates_orchestrations_by_orchestration_cwd_not_pane_cwd() {
         let panes = vec![
@@ -26590,7 +27395,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-a".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-a".to_string()),
                 }),
             ),
             hydrated(
@@ -26604,7 +27409,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-b".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-b".to_string()),
                 }),
             ),
         ];
@@ -26614,6 +27419,12 @@ mod tests {
             2,
             "distinct orchestration_cwds must split into distinct buckets"
         );
+        let cwds: Vec<&str> = p
+            .orchestration_buckets
+            .iter()
+            .map(|b| b.cwd.as_str())
+            .collect();
+        assert_eq!(cwds, vec!["/home/u/project-a", "/home/u/project-b"]);
     }
 
     /// Legacy data path: a pre-round-11 daemon emits orchestration
@@ -26633,7 +27444,7 @@ mod tests {
                 is_start_role: true,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
         )];
         let p = partition_hydrated_panes(&panes);
@@ -26655,7 +27466,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -26669,7 +27480,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -26689,14 +27500,13 @@ mod tests {
             && !s.is_start_role));
     }
 
-    /// PRD #140 review: test shorthand for the LEGACY (token-less) routing
-    /// identity — the `OrchestrationIdentity` shape a pre-#140 client's
-    /// hydration bucket carries, and the one the dead-slot id namespace used to
-    /// be hard-coded to.
-    fn legacy_identity(cwd: &str, name: &str) -> crate::state::OrchestrationIdentity {
-        crate::state::OrchestrationIdentity::NameCwd {
+    /// Test shorthand for a routing identity. Issue #463: this used to build
+    /// the retired token-less `(name, cwd)` identity; the dead-slot tests that
+    /// used it only need SOME identity, so it now builds a tokened one.
+    fn test_identity(id: &str, name: &str) -> crate::state::OrchestrationIdentity {
+        crate::state::OrchestrationIdentity {
+            id: id.to_string(),
             name: name.to_string(),
-            cwd: cwd.to_string(),
         }
     }
 
@@ -26728,7 +27538,7 @@ mod tests {
         ];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -26765,14 +27575,14 @@ mod tests {
         // Same (identity, role_index) must produce the same id so a
         // reconnect doesn't keep minting fresh placeholder cards on
         // every reattach.
-        let a = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
-        let b = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
+        let a = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
+        let b = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
         assert_eq!(a, b);
         // Different role_index → different id.
-        let c = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 3);
+        let c = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 3);
         assert_ne!(a, c);
         // Different orchestration → different id.
-        let d = dead_slot_pane_id(&legacy_identity("/work", "other-cycle"), 4);
+        let d = dead_slot_pane_id(&test_identity("orch-tab-a", "other-cycle"), 4);
         assert_ne!(a, d);
         // is_dead_slot_pane_id accepts the synthesized id and rejects
         // a normal numeric pane id.
@@ -26788,7 +27598,7 @@ mod tests {
     /// happen.
     #[test]
     fn dead_slot_pane_id_is_namespaced_by_orchestration_instance() {
-        let instance = |id: &str| crate::state::OrchestrationIdentity::Instance {
+        let instance = |id: &str| crate::state::OrchestrationIdentity {
             id: id.to_string(),
             name: "tdd-cycle".to_string(),
         };
@@ -26801,31 +27611,26 @@ mod tests {
         );
         // Still idempotent per identity, so a reconnect reuses the same card.
         assert_eq!(tab_a, dead_slot_pane_id(&instance("orch-tab-a"), 4));
-        // A tokened id can never collide with a token-less one, whatever the
-        // cwd/name spelling — the two variants are different routing groups.
-        assert_ne!(
-            tab_a,
-            dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4)
-        );
         assert!(is_dead_slot_pane_id(&tab_a) && is_dead_slot_pane_id(&tab_b));
     }
 
     // Follow-up to 0d5e651 (auditor finding #4): the old format
-    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
-    // or orchestration_name contained hyphens. Two distinct tuples
-    // could produce the same synthetic id, which would then alias
-    // their placeholder sessions. Pin that the length-prefixed format
-    // disambiguates the textbook collision case.
+    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever a
+    // component contained hyphens. Two distinct identities could produce
+    // the same synthetic id, which would then alias their placeholder
+    // sessions. Pin that the length-prefixed format disambiguates the
+    // textbook collision case, now on the (token, name) pair the id is
+    // built from (issue #463).
     #[test]
     fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
-        // Under the old `-`-separated form both inputs formatted to
-        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
-        // they are guaranteed distinct.
-        let a = dead_slot_pane_id(&legacy_identity("/a", "b-c"), 1);
-        let b = dead_slot_pane_id(&legacy_identity("/a-b", "c"), 1);
+        // Under a `-`-separated form both inputs would format to
+        // `…a-b-c-1`. Under the length-prefixed form they are
+        // guaranteed distinct.
+        let a = dead_slot_pane_id(&test_identity("a", "b-c"), 1);
+        let b = dead_slot_pane_id(&test_identity("a-b", "c"), 1);
         assert_ne!(
             a, b,
-            "differently-hyphenated (cwd, orchestration_name) tuples \
+            "differently-hyphenated (id, orchestration_name) pairs \
              must produce distinct synthetic ids"
         );
     }
@@ -26850,7 +27655,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -26864,7 +27669,7 @@ mod tests {
         // so the helper short-circuits on each iteration).
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -26900,7 +27705,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -26912,7 +27717,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -26956,7 +27761,7 @@ mod tests {
             None,
         ];
         let assigned =
-            assign_synthetic_dead_slot_ids(&mut slots, &legacy_identity("/work", "tdd-cycle"));
+            assign_synthetic_dead_slot_ids(&mut slots, &test_identity("orch-tab-a", "tdd-cycle"));
         assert_eq!(
             assigned.len(),
             2,
@@ -27019,7 +27824,7 @@ mod tests {
         // dead slot. State must remain untouched.
         let synthetic_ids = assign_synthetic_dead_slot_ids(
             &mut role_pane_ids,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
         );
         assert_eq!(synthetic_ids.len(), 1, "exactly the role 2 slot is dead");
         assert!(state.sessions.is_empty(), "phase 1 must not seed sessions");
@@ -27142,7 +27947,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27205,7 +28010,8 @@ mod tests {
 
     #[test]
     fn partition_separates_orchestrations_by_cwd() {
-        // Same orchestration name, different cwds — two separate tabs.
+        // Same orchestration name, different cwds — two separate tabs, each
+        // with its own per-tab token.
         let panes = vec![
             hydrated(
                 "1",
@@ -27218,7 +28024,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-a".to_string()),
                 }),
             ),
             hydrated(
@@ -27232,7 +28038,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-b".to_string()),
                 }),
             ),
         ];
@@ -27263,7 +28069,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27299,7 +28105,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27313,7 +28119,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27359,7 +28165,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27373,7 +28179,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27471,7 +28277,7 @@ mod tests {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
             )
             .expect("synthesised-config hydration must succeed");
         assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
@@ -27504,7 +28310,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27518,7 +28324,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27620,7 +28426,7 @@ mod tests {
             cwd: "/remote/proj".into(),
             orchestration_name: "review".into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: vec![
                 OrchestrationRoleSlot {
                     role_index: 0,
@@ -27970,6 +28776,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -30764,6 +31572,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31556,6 +32366,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         }
     }
 
@@ -31843,6 +32655,7 @@ mod tests {
     /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
+        assert_eq!(CardDensity::Minimal.card_height(), 3);
         assert_eq!(CardDensity::Compact.card_height(), 5);
         assert_eq!(CardDensity::Normal.card_height(), 8);
         assert_eq!(CardDensity::Spacious.card_height(), 10);
@@ -31859,7 +32672,7 @@ mod tests {
                 budget,
                 status,
                 d.max_prompts(),
-                d != CardDensity::Compact,
+                d.has_separator(),
                 d.max_tools(),
             )
         };
@@ -31877,6 +32690,55 @@ mod tests {
         assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
         assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
         assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
+        // Issue #1568: Minimal's one inner row is `Dir:`, and a status row
+        // takes its place.
+        assert_eq!(plan(CardDensity::Minimal, 0), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Minimal, 1), row(false, 0, false));
+    }
+
+    /// Issue #1568: Minimal is taken only when Compact fails at EVERY column
+    /// count the width allows, so it replaces scrolling and never Compact.
+    #[test]
+    fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
+        // 90 columns allows two card columns. 25 rows: one column of Compact
+        // misses (35) but two fit (20). One column of Minimal (21) would fit too,
+        // and must not be preferred over the layout this deck already had.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 79 columns holds one card column. 23 rows: Compact needs 35, Minimal 21.
+        assert_eq!(
+            choose_grid_layout(7, 79, 23),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 90 columns, 14 rows: Compact needs 20 even at two columns; Minimal needs
+        // 21 at one column and 12 at two, so the deck widens to stay complete.
+        assert_eq!(
+            choose_grid_layout(7, 90, 14),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 79 columns, 20 rows: not even Minimal fits (21), so the deck scrolls at
+        // Compact exactly as it did before Minimal existed.
+        assert_eq!(
+            choose_grid_layout(7, 79, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
@@ -31938,6 +32800,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
 
         // Spacious: get all 3
@@ -31977,6 +32841,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32007,6 +32873,8 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
+            output_set_status: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32876,10 +33744,11 @@ mod tests {
                 KeyModifiers::CONTROL.union(KeyModifiers::ALT),
                 b"\x1b[1;7D",
             ),
+            // Issue #1477: Ctrl with anything else is BS, as xterm.js sends it.
             (
                 KeyCode::Backspace,
                 KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
-                b"\x7f",
+                b"\x08",
             ),
             (KeyCode::Char('h'), KeyModifiers::CONTROL, b"\x08"),
             (KeyCode::Enter, KeyModifiers::ALT, b"\x1b\r"),
@@ -32893,14 +33762,9 @@ mod tests {
         }
     }
 
-    /// Issue #1422: the TUI's editing shortcuts are the shared table in
-    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
-    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
-    /// translates exactly the `translated` rows: a chord added on this side
-    /// only, or dropped from it, fails here instead of drifting from the
-    /// desktop.
-    #[test]
-    fn keyevent_editing_chords_match_the_shared_table() {
+    /// One list of the shared key table, `tests/fixtures/editing-shortcuts.json`,
+    /// which the desktop app's tests read too, as `(key, modifiers, bytes)`.
+    fn shared_key_rows(list: &str) -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
         let table: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/editing-shortcuts.json"
@@ -32924,29 +33788,37 @@ mod tests {
             "super" => KeyModifiers::SUPER,
             other => panic!("the shared table names a modifier this test cannot map: {other}"),
         };
-        let rows = |list: &str| -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
-            table[list]
-                .as_array()
-                .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
-                .iter()
-                .map(|row| {
-                    let modifiers = row["modifiers"]
-                        .as_array()
-                        .expect("a row's modifiers are a list")
-                        .iter()
-                        .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
-                        .fold(KeyModifiers::NONE, KeyModifiers::union);
-                    let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
-                    (
-                        code_for(row["key"].as_str().expect("a row names its key")),
-                        modifiers,
-                        bytes.as_bytes().to_vec(),
-                    )
-                })
-                .collect()
-        };
-        let translated = rows("translated");
-        let standard = rows("standard");
+        table[list]
+            .as_array()
+            .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
+            .iter()
+            .map(|row| {
+                let modifiers = row["modifiers"]
+                    .as_array()
+                    .expect("a row's modifiers are a list")
+                    .iter()
+                    .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
+                    .fold(KeyModifiers::NONE, KeyModifiers::union);
+                let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
+                (
+                    code_for(row["key"].as_str().expect("a row names its key")),
+                    modifiers,
+                    bytes.as_bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Issue #1422: the TUI's editing shortcuts are the shared table in
+    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
+    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
+    /// translates exactly the `translated` rows: a chord added on this side
+    /// only, or dropped from it, fails here instead of drifting from the
+    /// desktop.
+    #[test]
+    fn keyevent_editing_chords_match_the_shared_table() {
+        let translated = shared_key_rows("translated");
+        let standard = shared_key_rows("standard");
         assert!(!translated.is_empty() && !standard.is_empty());
 
         for (code, modifiers, bytes) in translated.iter().chain(&standard) {
@@ -32997,6 +33869,138 @@ mod tests {
         }
     }
 
+    /// Issue #1477: Backspace, Delete, Home and End with Shift, Ctrl or Alt held
+    /// reach a pane as the bytes xterm.js 6.0.0 sends for them on the desktop
+    /// (`Keyboard.ts`, measured there), every combination of the three, apart
+    /// from the bare editing chords both clients translate. Delete, Home and
+    /// End carry the modifier as `;<1 + Shift 1 | Alt 2 | Ctrl 4>`; Backspace
+    /// is BS whenever Ctrl is held, behind an ESC when Alt is too.
+    #[test]
+    fn keyevent_modified_editing_keys_match_xterm_js() {
+        let bits = [
+            (KeyModifiers::SHIFT, 1u8),
+            (KeyModifiers::ALT, 2),
+            (KeyModifiers::CONTROL, 4),
+        ];
+        for mask in 1u8..8 {
+            let (modifiers, param) = bits.iter().filter(|(_, bit)| mask & bit != 0).fold(
+                (KeyModifiers::NONE, 1u8),
+                |(held, param), (modifier, bit)| (held.union(*modifier), param + bit),
+            );
+            let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+            let alt = modifiers.contains(KeyModifiers::ALT);
+            let backspace: Vec<u8> = match (ctrl, alt) {
+                (true, true) => vec![0x1b, 0x08],
+                (true, false) => vec![0x08],
+                (false, true) => vec![0x1b, 0x7f],
+                (false, false) => vec![0x7f],
+            };
+            let cases = [
+                (KeyCode::Backspace, backspace),
+                (KeyCode::Delete, format!("\x1b[3;{param}~").into_bytes()),
+                (KeyCode::Home, format!("\x1b[1;{param}H").into_bytes()),
+                (KeyCode::End, format!("\x1b[1;{param}F").into_bytes()),
+            ];
+            for (code, xterm_js) in cases {
+                let key = KeyEvent::new(code, modifiers);
+                let expected = editing_chord_bytes(&key).map_or(xterm_js, <[u8]>::to_vec);
+                assert_eq!(
+                    keyevent_to_bytes(&key).as_deref(),
+                    Some(expected.as_slice()),
+                    "{code:?} with {modifiers:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1477: while the pane's program has application cursor mode on,
+    /// an unmodified arrow, Home or End reaches it in the SS3 form
+    /// (`ESC O A`…`ESC O F`), as xterm and the desktop's xterm.js send them;
+    /// the same keys with a modifier keep their CSI form, and every other key
+    /// is unchanged. With the mode off, the ordinary form.
+    #[test]
+    fn keyevent_application_cursor_mode_sends_ss3_cursor_keys() {
+        let cases: &[(KeyCode, KeyModifiers, &[u8], &[u8])] = &[
+            (KeyCode::Up, KeyModifiers::NONE, b"\x1b[A", b"\x1bOA"),
+            (KeyCode::Down, KeyModifiers::NONE, b"\x1b[B", b"\x1bOB"),
+            (KeyCode::Right, KeyModifiers::NONE, b"\x1b[C", b"\x1bOC"),
+            (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D", b"\x1bOD"),
+            (KeyCode::Home, KeyModifiers::NONE, b"\x1b[H", b"\x1bOH"),
+            (KeyCode::End, KeyModifiers::NONE, b"\x1b[F", b"\x1bOF"),
+            // Modified: CSI in both modes.
+            (KeyCode::Up, KeyModifiers::SHIFT, b"\x1b[1;2A", b"\x1b[1;2A"),
+            (
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+                b"\x1b[1;5D",
+                b"\x1b[1;5D",
+            ),
+            (
+                KeyCode::Right,
+                KeyModifiers::ALT,
+                b"\x1b[1;3C",
+                b"\x1b[1;3C",
+            ),
+            (
+                KeyCode::End,
+                KeyModifiers::CONTROL,
+                b"\x1b[1;5F",
+                b"\x1b[1;5F",
+            ),
+            (
+                KeyCode::Home,
+                KeyModifiers::SHIFT,
+                b"\x1b[1;2H",
+                b"\x1b[1;2H",
+            ),
+            (KeyCode::Left, KeyModifiers::SUPER, b"\x01", b"\x01"),
+            // Not a cursor key: unchanged.
+            (KeyCode::Delete, KeyModifiers::NONE, b"\x1b[3~", b"\x1b[3~"),
+            (KeyCode::PageUp, KeyModifiers::NONE, b"\x1b[5~", b"\x1b[5~"),
+            (KeyCode::F(1), KeyModifiers::NONE, b"\x1bOP", b"\x1bOP"),
+            (KeyCode::Enter, KeyModifiers::NONE, b"\r", b"\r"),
+            (KeyCode::Char('a'), KeyModifiers::NONE, b"a", b"a"),
+        ];
+        for (code, modifiers, normal, application) in cases {
+            let key = KeyEvent::new(*code, *modifiers);
+            assert_eq!(
+                keyevent_to_pane_bytes(&key, false).as_deref(),
+                Some(*normal),
+                "{code:?} with {modifiers:?}, ordinary cursor mode"
+            );
+            assert_eq!(
+                keyevent_to_pane_bytes(&key, true).as_deref(),
+                Some(*application),
+                "{code:?} with {modifiers:?}, application cursor mode"
+            );
+        }
+    }
+
+    /// Issue #1477: in application cursor mode the TUI sends the shared table's
+    /// `application_cursor` rows, which the desktop app's tests read too, and
+    /// every row of the other two lists that those rows do not name unchanged.
+    #[test]
+    fn keyevent_application_cursor_rows_match_the_shared_table() {
+        let application = shared_key_rows("application_cursor");
+        assert!(!application.is_empty());
+        let others: Vec<_> = shared_key_rows("translated")
+            .into_iter()
+            .chain(shared_key_rows("standard"))
+            .filter(|(code, modifiers, _)| {
+                !application
+                    .iter()
+                    .any(|(c, m, _)| c == code && m == modifiers)
+            })
+            .collect();
+        for (code, modifiers, bytes) in application.iter().chain(&others) {
+            assert_eq!(
+                keyevent_to_pane_bytes(&KeyEvent::new(*code, *modifiers), true).as_deref(),
+                Some(bytes.as_slice()),
+                "{code:?} with {modifiers:?}, application cursor mode"
+            );
+        }
+    }
+
     #[test]
     fn keyevent_f_keys() {
         assert_eq!(
@@ -33040,7 +34044,7 @@ mod tests {
     #[test]
     fn handle_pane_input_forwards_printable() {
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
-        match handle_pane_input_key(key) {
+        match handle_pane_input_key(key, false) {
             Action::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
@@ -33972,6 +34976,34 @@ mod tests {
             AuthoringKind::ALL,
             "every kind the daemon can compose has a TUI option checked here"
         );
+    }
+
+    /// Issue #1496: each `Ctrl+n` authoring option sends the daemon its kind,
+    /// so the agent's record says what kind it is to every client, while a
+    /// plain card and an orchestration send none.
+    #[test]
+    fn each_authoring_option_names_its_kind_to_the_daemon() {
+        let dir = PathBuf::from("/tmp/picked repo");
+        let mut form = NewPaneFormState::new(dir, String::new(), String::new(), vec![]);
+        form.show_issue_dispatch = true;
+        form.show_dispatcher = true;
+        for (selection_index, kind) in [
+            (form.schedule_index(), AuthoringKind::Schedule),
+            (form.issue_dispatch_index(), AuthoringKind::ScheduleIssues),
+            (form.dispatcher_index(), AuthoringKind::Dispatcher),
+        ] {
+            form.selection_index = selection_index;
+            assert_eq!(
+                build_new_pane_request(&form, "claude").authoring_kind,
+                Some(kind)
+            );
+        }
+        form.selection_index = 0;
+        assert!(
+            form.selected_builtin().is_none(),
+            "precondition: a plain card"
+        );
+        assert_eq!(build_new_pane_request(&form, "claude").authoring_kind, None);
     }
 
     #[test]
@@ -35298,6 +36330,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(config),
             seed_prompt: None,
+            authoring_kind: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -35955,6 +36988,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(config),
             seed_prompt: None,
+            authoring_kind: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -36015,6 +37049,7 @@ mod tests {
             command: "echo hi".to_string(),
             orchestration_config: None,
             seed_prompt: None,
+            authoring_kind: None,
         }
     }
 
@@ -37737,6 +38772,1124 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    /// Issue #621: a TUI prompt-delivery consumer wired to the PRODUCTION daemon
+    /// handler over a real attach socket, rather than to a double that imitates
+    /// it. The daemon owns its own `AppState` — the authoritative one, which
+    /// knows the pane's hook generation — and the test hands the delivery loop a
+    /// SEPARATE client snapshot, so the two can disagree exactly the way they do
+    /// when the TUI's event subscriber dropped a `SessionStart` across a
+    /// reconnect.
+    ///
+    /// The target is `/bin/cat`, so a payload that reaches the PTY is visible in
+    /// the registry's buffer: that buffer, not the controller's own bookkeeping,
+    /// is what "delivered" means in the assertions.
+    #[cfg(unix)]
+    struct DaemonBackedPaneController {
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+        state: crate::state::SharedState,
+        agent_id: String,
+        client: crate::daemon_client::DaemonClient,
+        runtime: tokio::runtime::Runtime,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl DaemonBackedPaneController {
+        fn new(pane_id: &str) -> Self {
+            crate::test_isolation::detach_from_any_live_deck();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build the daemon test runtime");
+            let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane_id.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn the daemon-side byte-observation target");
+            let state: crate::state::SharedState =
+                Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            runtime.block_on(async {
+                state.write().await.register_pane(pane_id.to_string());
+            });
+            let (dir, path, listener) = {
+                // The listener registers with the reactor as it is built.
+                let _runtime = runtime.enter();
+                let dir = crate::test_temp::tempdir().expect("scratch dir for the socket");
+                let path = dir.path().join("attach.sock");
+                let listener = crate::daemon_protocol::bind_attach_listener(&path)
+                    .expect("bind the attach socket");
+                (dir, path, listener)
+            };
+            let (served_registry, served_state) = (registry.clone(), state.clone());
+            runtime.spawn(async move {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let _ = crate::daemon_protocol::serve_attach_with_counter(
+                    listener,
+                    served_registry,
+                    events,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    served_state,
+                    None,
+                    Arc::new(crate::scheduler::Scheduler::with_stderr_notifier()),
+                    crate::spawn::new_reuse_registry(),
+                    crate::issue_dispatch_run::new_worktree_registry(),
+                )
+                .await;
+            });
+            Self {
+                registry,
+                state,
+                agent_id,
+                client: crate::daemon_client::DaemonClient::new(path),
+                runtime,
+                _dir: dir,
+            }
+        }
+
+        /// Announce `session_id` on the DAEMON's state only — the client
+        /// snapshot the delivery loop reads never sees it.
+        fn announce_on_daemon(&self, pane_id: &str, session_id: &str) {
+            let event = AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(self.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(crate::event::LiveTarget {
+                    kind: crate::event::TargetKind::Pty,
+                    writable: crate::event::Writable::Live,
+                }),
+            };
+            self.runtime.block_on(async {
+                self.state.write().await.apply_event(event);
+            });
+        }
+
+        fn delivered(&self, payload: &str) -> bool {
+            let buffer = self
+                .registry
+                .snapshot(&self.agent_id)
+                .expect("daemon-side byte-observation snapshot");
+            buffer
+                .windows(payload.len())
+                .any(|window| window == payload.as_bytes())
+        }
+    }
+
+    #[cfg(unix)]
+    impl PaneController for DaemonBackedPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.agent_id.clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        /// The production controller's submit, verbatim: the render loop is
+        /// handed the same polled handle, carrying the same reply.
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            crate::embedded_pane::begin_guarded_submit(
+                self.runtime.handle(),
+                self.client.clone(),
+                pane_id,
+                text,
+                expected_agent_id,
+                expected_session_id,
+                delivery_id,
+            )
+        }
+        fn name(&self) -> &str {
+            "daemon-backed"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #621: run render passes of the seed path until `delivered` holds or
+    /// `frames` passes have run, collapsing every retry backoff so each pass is
+    /// a real attempt. An in-flight write is waited for (bounded) rather than
+    /// counted as a pass, because the daemon holds a submit's CR until it
+    /// renders.
+    #[cfg(unix)]
+    fn drive_seed_frames(
+        ui: &mut UiState,
+        pane: &Arc<dyn PaneController>,
+        snapshot: &AppState,
+        pane_id: &str,
+        frames: usize,
+        delivered: impl Fn() -> bool,
+    ) {
+        for _ in 0..frames {
+            if delivered() {
+                return;
+            }
+            process_pending_seed_prompts(ui, pane, snapshot);
+            let waited = std::time::Instant::now();
+            while ui.in_flight_prompt_sends.contains_key(pane_id)
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                process_pending_seed_prompts(ui, pane, snapshot);
+            }
+            if let Some(backoff) = ui.send_retry_backoff.get_mut(pane_id) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it, and a seed whose submission the agent reported, before the stream broke or on the resumed stream, is taken as delivered rather than reported unconfirmed; while the stream is still down a due retry is held.
+    #[spec("prompt/pane-input/047")]
+    #[test]
+    fn pane_input_047_a_written_seed_stops_after_an_event_stream_gap() {
+        const PROMPT: &str = "seed written before an event-stream gap";
+        #[derive(Clone, Copy, PartialEq)]
+        enum Case {
+            Gap,
+            Unbroken,
+            ConfirmedBeforeGap,
+            ConfirmedOnResumedStream,
+        }
+        for case_kind in [
+            Case::Gap,
+            Case::Unbroken,
+            Case::ConfirmedBeforeGap,
+            Case::ConfirmedOnResumedStream,
+        ] {
+            let (case, pane_id) = match case_kind {
+                Case::Gap => ("event-stream gap", "gap-pane"),
+                Case::Unbroken => ("control: unbroken stream", "unbroken-pane"),
+                Case::ConfirmedBeforeGap => {
+                    ("confirmed before the gap", "confirmed-before-gap-pane")
+                }
+                Case::ConfirmedOnResumedStream => (
+                    "confirmed on the resumed stream",
+                    "confirmed-on-resumed-stream-pane",
+                ),
+            };
+            let gap = case_kind != Case::Unbroken;
+            let agent_id = format!("{pane_id}-agent");
+            let controller = Arc::new(RecordingPaneController::default());
+            let writes = controller.writes.clone();
+            let pane: Arc<dyn PaneController> = controller;
+            let mut ui = default_ui();
+            // The `devbox run claude …` launcher case issue #424 exists for, and
+            // the one #1520 names: the fallback writes while the pane has no
+            // generation, so the agent's first announcement after it is the
+            // conversation the seed is waiting to reach.
+            ui.pending_seed_prompts
+                .push(aged_seed_prompt(pane_id, PROMPT));
+            let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+            assert_eq!(
+                writes.lock().unwrap().len(),
+                1,
+                "{case}: precondition — the fallback writes before the agent announces \
+                 itself"
+            );
+
+            let genuine = announced_generation(pane_id);
+            if case_kind == Case::ConfirmedBeforeGap {
+                // The agent announces itself and reports submitting the seed, and
+                // the stream delivers both BEFORE it breaks; the render pass that
+                // would have confirmed it simply has not run yet.
+                apply_generation_event(
+                    &mut snapshot,
+                    pane_id,
+                    &agent_id,
+                    &genuine,
+                    EventType::SessionStart,
+                );
+                apply_prompt_confirmation(&mut snapshot, pane_id, &agent_id, PROMPT);
+            }
+            if gap {
+                // The subscriber's stream ends; while it is down the daemon sees
+                // the agent announce `genuine` (if it had not already). On
+                // resubscribing it re-reads the daemon's `ListAgents` reply,
+                // joined as the daemon joins it.
+                snapshot.note_event_stream_gap();
+                if case_kind == Case::ConfirmedOnResumedStream {
+                    // A retry falls due while the subscriber is still backing
+                    // off. Nothing can confirm the seed yet, so it must be HELD:
+                    // neither written again nor stopped.
+                    ui.send_retry_backoff
+                        .get_mut(pane_id)
+                        .expect("an unconfirmed write arms retry")
+                        .next_attempt_at = std::time::Instant::now();
+                    process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+                    assert_eq!(
+                        writes.lock().unwrap().len(),
+                        1,
+                        "{case}: no retry while the stream is down"
+                    );
+                    assert!(
+                        ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the delivery must be held while the stream is down, not \
+                         stopped before the resumed stream can confirm it; status={:?}",
+                        ui.status_message
+                    );
+                }
+                let mut daemon = snapshot.clone();
+                if matches!(case_kind, Case::Gap | Case::ConfirmedOnResumedStream) {
+                    apply_generation_event(
+                        &mut daemon,
+                        pane_id,
+                        &agent_id,
+                        &genuine,
+                        EventType::SessionStart,
+                    );
+                }
+                let mut records: Vec<crate::agent_pty::AgentRecord> = vec![
+                    serde_json::from_value(
+                        serde_json::json!({ "id": agent_id, "pane_id_env": pane_id }),
+                    )
+                    .unwrap(),
+                ];
+                daemon.attach_live_sessions(&mut records);
+                snapshot.resync_after_event_gap(&records);
+                assert_eq!(
+                    snapshot.pane_hook_session_id(pane_id).as_deref(),
+                    Some(genuine.as_str()),
+                    "{case}: the resync must leave the TUI on the daemon's conversation"
+                );
+                if case_kind == Case::ConfirmedOnResumedStream {
+                    // The first event on the resumed stream: the agent reports
+                    // submitting the seed.
+                    apply_prompt_confirmation(&mut snapshot, pane_id, &agent_id, PROMPT);
+                }
+            } else {
+                apply_generation_event(
+                    &mut snapshot,
+                    pane_id,
+                    &agent_id,
+                    &genuine,
+                    EventType::SessionStart,
+                );
+            }
+
+            if let Some(backoff) = ui.send_retry_backoff.get_mut(pane_id) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            let records = writes.lock().unwrap().clone();
+            let status = format!("{:?}", ui.status_message);
+            match case_kind {
+                Case::Gap => {
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "{case}: a seed written before the gap must not be written again — \
+                         the TUI cannot tell whether `{genuine}` is the conversation its \
+                         bytes entered or a successor of one that ended unseen; \
+                         writes={records:?}"
+                    );
+                    assert!(
+                        !ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the delivery must stop, not stay armed"
+                    );
+                    assert!(
+                        status.contains("lost contact with the agent's events"),
+                        "{case}: the stop must say why; status={status}"
+                    );
+                }
+                Case::Unbroken => {
+                    assert_eq!(
+                        records.len(),
+                        2,
+                        "{case}: with no gap the retry goes into the announced \
+                         conversation; writes={records:?}"
+                    );
+                }
+                Case::ConfirmedBeforeGap | Case::ConfirmedOnResumedStream => {
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "{case}: a confirmed seed is never written again; \
+                         writes={records:?}"
+                    );
+                    assert!(
+                        !ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the confirmation finalizes the delivery"
+                    );
+                    assert!(
+                        !status.contains("lost contact"),
+                        "{case}: a submission the agent reported must be taken as \
+                         delivered, not reported as unconfirmed; status={status}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scenario: Start an agent whose daemon has recorded its conversation while the TUI's own view never received that `SessionStart` (the event stream dropped it across a reconnect), then let the seed and orchestrator prompts go out. Every unnamed write is refused `stale`, and the prompt must still reach the agent's pane, naming the conversation the daemon reported; a control where the TUI does see the start after one `stale` delivers too, without counting that refusal as an attempt.
+    #[cfg(unix)]
+    #[spec("prompt/pane-input/045")]
+    #[test]
+    fn pane_input_045_dropped_session_start_still_delivers_the_prompt() {
+        const GENERATION: &str = "daemon-only-generation-621";
+
+        // The reported case: the daemon knows the generation, the TUI never will.
+        const SEED_PANE: &str = "dropped-start-seed-pane";
+        const SEED_PROMPT: &str = "SEED-REACHED-THE-AGENT-621";
+        let seed_daemon = Arc::new(DaemonBackedPaneController::new(SEED_PANE));
+        seed_daemon.announce_on_daemon(SEED_PANE, GENERATION);
+        let seed_pane: Arc<dyn PaneController> = seed_daemon.clone();
+        let mut seed_ui = default_ui();
+        // Nothing announced a conversation in the TUI's view, so the 10-second
+        // fallback is the door — exactly what a dropped `SessionStart` leaves.
+        seed_ui
+            .pending_seed_prompts
+            .push(aged_seed_prompt(SEED_PANE, SEED_PROMPT));
+        let seed_snapshot = ready_prompt_snapshot(SEED_PANE, &seed_daemon.agent_id);
+        assert_eq!(
+            seed_snapshot.pane_hook_session_id(SEED_PANE),
+            None,
+            "precondition: the TUI's view never received the SessionStart"
+        );
+        drive_seed_frames(
+            &mut seed_ui,
+            &seed_pane,
+            &seed_snapshot,
+            SEED_PANE,
+            5,
+            || seed_daemon.delivered(SEED_PROMPT),
+        );
+        let seed_bound = seed_ui
+            .prompt_delivery
+            .get(SEED_PANE)
+            .and_then(|d| d.expected_session_id.clone());
+        let seed_delivered = seed_daemon.delivered(SEED_PROMPT);
+        // The pass AFTER the write: the TUI's view still has no generation, and
+        // that silence must not read as the bound conversation having ended —
+        // the seed stays held for its confirmation instead of being abandoned
+        // as "the agent's conversation changed" with its bytes already typed.
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_still_held = seed_ui
+            .pending_seed_prompts
+            .iter()
+            .any(|sp| sp.pane_id == SEED_PANE);
+        let seed_status = seed_ui
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.clone());
+        seed_daemon.registry.shutdown_all();
+        assert!(
+            seed_delivered && seed_bound.as_deref() == Some(GENERATION),
+            "a seed whose SessionStart the TUI never saw must still reach the agent, bound to the \
+             generation the daemon's refusal named; delivered={seed_delivered}, bound={seed_bound:?}"
+        );
+        assert!(
+            seed_still_held
+                && !seed_status
+                    .as_deref()
+                    .is_some_and(|m| m.contains("abandoned")),
+            "a delivered seed must stay held for confirmation on the next pass, not be abandoned \
+             because the TUI's own view never saw the generation; held={seed_still_held}, \
+             status={seed_status:?}"
+        );
+
+        // The orchestrator twin.
+        const ROLE_PANE: &str = "dropped-start-orchestrator-pane";
+        const ROLE_PROMPT: &str = "ROLE-PROMPT-REACHED-THE-AGENT-621";
+        let role_daemon = Arc::new(DaemonBackedPaneController::new(ROLE_PANE));
+        role_daemon.announce_on_daemon(ROLE_PANE, GENERATION);
+        let role_pane: Arc<dyn PaneController> = role_daemon.clone();
+        let tab_id: TabId = 62100;
+        let started = std::time::Instant::now();
+        let mut role_ui = default_ui();
+        role_ui.orchestration_prompt_anchor_at.insert(
+            tab_id,
+            started
+                .checked_sub(
+                    SPAWN_TIME_READINESS_TIMEOUT
+                        + SPAWN_TIME_READINESS_BUFFER
+                        + std::time::Duration::from_millis(100),
+                )
+                .expect("aged anchor timestamp"),
+        );
+        let role_snapshot = ready_prompt_snapshot(ROLE_PANE, &role_daemon.agent_id);
+        let role_panes = [ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(ROLE_PROMPT.to_string());
+        for _ in 0..5 {
+            if role_daemon.delivered(ROLE_PROMPT) {
+                break;
+            }
+            deliver_orchestrator_prompt(
+                &mut role_ui,
+                role_pane.as_ref(),
+                &role_snapshot,
+                std::time::Instant::now(),
+                tab_id,
+                &role_panes,
+                0,
+                &mut role_statuses,
+                &mut role_prompt,
+            );
+            let waited = std::time::Instant::now();
+            while role_ui.in_flight_prompt_sends.contains_key(ROLE_PANE)
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                deliver_orchestrator_prompt(
+                    &mut role_ui,
+                    role_pane.as_ref(),
+                    &role_snapshot,
+                    std::time::Instant::now(),
+                    tab_id,
+                    &role_panes,
+                    0,
+                    &mut role_statuses,
+                    &mut role_prompt,
+                );
+            }
+            if let Some(backoff) = role_ui.send_retry_backoff.get_mut(ROLE_PANE) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
+        }
+        let role_bound = role_ui
+            .prompt_delivery
+            .get(ROLE_PANE)
+            .and_then(|d| d.expected_session_id.clone());
+        let role_delivered = role_daemon.delivered(ROLE_PROMPT);
+        // The pass after the write, as for the seed above.
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            std::time::Instant::now(),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_abandoned = role_ui.orchestration_remit_abandoned.contains(&tab_id);
+        role_daemon.registry.shutdown_all();
+        assert!(
+            role_delivered && role_bound.as_deref() == Some(GENERATION),
+            "an orchestrator prompt whose SessionStart the TUI never saw must still reach the \
+             agent, bound to the generation the daemon's refusal named; \
+             delivered={role_delivered}, bound={role_bound:?}"
+        );
+        assert!(
+            role_prompt.is_some() && !role_abandoned,
+            "a delivered role prompt must stay held for confirmation on the next pass, not be \
+             abandoned because the TUI's own view never saw the generation; \
+             prompt_held={}, abandoned={role_abandoned}",
+            role_prompt.is_some()
+        );
+
+        // Control: the ordinary race. The TUI's view is one event behind for one
+        // pass — one safe `stale` — and then observes the start itself.
+        const RACE_PANE: &str = "ordinary-race-seed-pane";
+        const RACE_PROMPT: &str = "RACE-SEED-REACHED-THE-AGENT-621";
+        let race_daemon = Arc::new(DaemonBackedPaneController::new(RACE_PANE));
+        race_daemon.announce_on_daemon(RACE_PANE, GENERATION);
+        let race_pane: Arc<dyn PaneController> = race_daemon.clone();
+        let mut race_ui = default_ui();
+        race_ui
+            .pending_seed_prompts
+            .push(aged_seed_prompt(RACE_PANE, RACE_PROMPT));
+        let mut race_snapshot = ready_prompt_snapshot(RACE_PANE, &race_daemon.agent_id);
+        drive_seed_frames(
+            &mut race_ui,
+            &race_pane,
+            &race_snapshot,
+            RACE_PANE,
+            1,
+            || race_daemon.delivered(RACE_PROMPT),
+        );
+        let after_refusal = race_ui
+            .prompt_delivery
+            .get(RACE_PANE)
+            .map(|d| d.attempts)
+            .expect("a refused seed keeps its delivery");
+        apply_generation_event(
+            &mut race_snapshot,
+            RACE_PANE,
+            &race_daemon.agent_id,
+            GENERATION,
+            EventType::SessionStart,
+        );
+        drive_seed_frames(
+            &mut race_ui,
+            &race_pane,
+            &race_snapshot,
+            RACE_PANE,
+            3,
+            || race_daemon.delivered(RACE_PROMPT),
+        );
+        let race_delivered = race_daemon.delivered(RACE_PROMPT);
+        race_daemon.registry.shutdown_all();
+        assert_eq!(
+            after_refusal, 0,
+            "control: a `stale` refusal writes nothing, so it must not count as an attempt"
+        );
+        assert!(
+            race_delivered,
+            "control: once the TUI observes the start itself, the seed binds it and is delivered"
+        );
+    }
+
+    /// Issue #1520 (Qodo on #1553): an event-stream OUTAGE holds a seed that may
+    /// have written, however its stamp relates to the gap. A first write made
+    /// while the stream is already down is held at its retry too; and a seed
+    /// held until the delivery deadline says why it stopped instead of vanishing.
+    #[test]
+    fn a_seed_that_may_have_written_is_held_through_an_event_stream_outage() {
+        const PROMPT: &str = "seed written during an outage";
+
+        // The stream is already down when the fallback writes.
+        let pane_id = "written-during-outage-pane";
+        let agent_id = format!("{pane_id}-agent");
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(aged_seed_prompt(pane_id, PROMPT));
+        let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+        snapshot.note_event_stream_gap();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "precondition: a first write is not held by an outage"
+        );
+        apply_generation_event(
+            &mut snapshot,
+            pane_id,
+            &agent_id,
+            &announced_generation(pane_id),
+            EventType::SessionStart,
+        );
+        ui.send_retry_backoff
+            .get_mut(pane_id)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a retry due while the stream is still down must wait for it, even when the \
+             write it retries was made during the same outage"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(pane_id),
+            "held, not stopped"
+        );
+
+        // The outage outlasts the delivery deadline.
+        let pane_id = "outage-past-deadline-pane";
+        let agent_id = format!("{pane_id}-agent");
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(aged_seed_prompt(pane_id, PROMPT));
+        let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(writes.lock().unwrap().len(), 1, "precondition: written");
+        snapshot.note_event_stream_gap();
+        ui.pending_seed_prompts[0].created_at = std::time::Instant::now()
+            .checked_sub(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("a creation instant past the deadline");
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            !ui.prompt_delivery.contains_key(pane_id),
+            "the deadline still ends a held delivery"
+        );
+        let status = format!("{:?}", ui.status_message);
+        assert!(
+            status.contains("lost contact with the agent's events"),
+            "a seed the outage held to its deadline must say why it stopped; status={status}"
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
+    }
+
+    /// Scenario: An orchestration's start role is ready and the deck writes its role prompt; then the deck's event stream goes down. When the prompt's retry falls due the deck must wait rather than type it again, and when the outage outlasts the delivery deadline the status line must say the prompt went unconfirmed after losing contact with the agent's events, not that it was not delivered.
+    #[spec("prompt/pane-input/048")]
+    #[test]
+    fn pane_input_048_an_orchestrator_prompt_is_held_through_an_event_stream_outage() {
+        const PANE_ID: &str = "outage-orchestrator-pane";
+        const AGENT_ID: &str = "outage-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+        let tab_id: TabId = 1520;
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+        let roles = [PANE_ID.to_string()];
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "precondition: written");
+
+        snapshot.note_event_stream_gap();
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = now;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a retry due while the stream is down must wait for it"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT), "the prompt is still held");
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID),
+            "held, not stopped"
+        );
+
+        ui.orchestration_prompt_anchor_at.insert(
+            tab_id,
+            now.checked_sub(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+                .expect("an anchor past the deadline"),
+        );
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        let status = format!("{:?}", ui.status_message);
+        assert!(
+            status.contains("not confirmed (lost contact with the agent's events)"),
+            "a role prompt the outage held to its deadline must say it went unconfirmed, \
+             not that it was not delivered; status={status}"
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
+    }
+
+    /// Issue #1520 (Qodo on #1553): which deliveries an event-stream gap stops.
+    /// Only one that may have written: an `Applied`/`Queued` outcome, or a
+    /// response lost after the request may have reached the write. One whose
+    /// every request was refused wrote nothing, and is left to bind against the
+    /// resynchronized state; a gap that came before the stamp is not one it
+    /// outlived.
+    #[test]
+    fn an_event_stream_gap_stops_only_a_delivery_that_may_have_written() {
+        let mut snapshot = AppState::default();
+        let stamped = |attempts: u32, write_unacknowledged: bool| PromptDelivery {
+            expected_agent_id: Some("agent".to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged,
+            closures_at_write: Some(0),
+            gaps_at_write: Some(0),
+            delivery_id: "gap-policy".to_string(),
+            epoch: 0,
+            wire_issued: true,
+            attempts,
+            watermark: None,
+            can_report_prompts: false,
+        };
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &stamped(1, false)),
+            "no gap yet, so nothing to outlive"
+        );
+        snapshot.note_event_stream_gap();
+        assert!(
+            delivery_outlived_event_gap(&snapshot, &stamped(1, false)),
+            "an applied write before the gap stops"
+        );
+        assert!(
+            delivery_outlived_event_gap(&snapshot, &stamped(0, true)),
+            "a lost response may have written, so it stops too"
+        );
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &stamped(0, false)),
+            "a delivery whose every request was refused wrote nothing, so a gap must not \
+             stop it"
+        );
+        let mut after = stamped(1, false);
+        after.gaps_at_write = Some(snapshot.event_stream_gaps());
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &after),
+            "a write stamped after the gap did not outlive it"
+        );
+    }
+
+    /// Issue #621: the generation a `stale` refusal names is the snapshot bind
+    /// with one more source, so it inherits the bind's precondition exactly. A
+    /// delivery that has already WRITTEN must not adopt it — a point-in-time
+    /// answer cannot tell the conversation those bytes entered from a successor
+    /// whose predecessor ended while the event stream was down — and a delivery
+    /// already BOUND must never be redirected by it into another conversation.
+    #[test]
+    fn refusal_generation_binds_only_an_unwritten_unbound_delivery() {
+        const PANE_ID: &str = "refusal-generation-policy-pane";
+        let snapshot = AppState::default();
+        let fresh = || PromptDelivery {
+            expected_agent_id: Some("agent".to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
+            closures_at_write: Some(0),
+            gaps_at_write: None,
+            delivery_id: "refusal-policy".to_string(),
+            epoch: 0,
+            wire_issued: true,
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+        };
+
+        let mut unwritten = fresh();
+        note_refusal_generation(&mut unwritten, Some("reported".to_string()));
+        bind_delivery_generation(&mut unwritten, &snapshot, PANE_ID);
+        assert_eq!(
+            unwritten.expected_session_id.as_deref(),
+            Some("reported"),
+            "an unwritten, unbound delivery binds the generation the refusal named"
+        );
+        assert_eq!(
+            unwritten.epoch, 1,
+            "binding changes the wire identity, so it must rotate the epoch like any other bind"
+        );
+        assert!(
+            !delivery_target_changed(&snapshot, PANE_ID, &unwritten),
+            "the TUI's empty view of the pane is not evidence the reported generation ended"
+        );
+
+        let mut written = fresh();
+        written.attempts = 1;
+        note_refusal_generation(&mut written, Some("reported".to_string()));
+        bind_delivery_generation(&mut written, &snapshot, PANE_ID);
+        bind_generation_before_retry(&mut written, &snapshot, PANE_ID);
+        assert_eq!(
+            (written.refusal_generation, written.expected_session_id),
+            (None, None),
+            "a delivery that already wrote must not adopt a generation from a refusal"
+        );
+
+        // Greptile P1 on #1521: a request whose response was LOST may have
+        // written although `attempts` is 0, so a later refusal must not make
+        // the delivery look unwritten — whether the uncertainty came before the
+        // refusal or after it was recorded.
+        let mut lost_response = fresh();
+        lost_response.write_unacknowledged = true;
+        note_refusal_generation(&mut lost_response, Some("reported".to_string()));
+        bind_delivery_generation(&mut lost_response, &snapshot, PANE_ID);
+        assert_eq!(
+            (
+                lost_response.refusal_generation,
+                lost_response.expected_session_id
+            ),
+            (None, None),
+            "a delivery with an unacknowledged write must not adopt a refusal's generation"
+        );
+        let mut lost_after_refusal = fresh();
+        note_refusal_generation(&mut lost_after_refusal, Some("reported".to_string()));
+        lost_after_refusal.write_unacknowledged = true;
+        bind_delivery_generation(&mut lost_after_refusal, &snapshot, PANE_ID);
+        assert_eq!(
+            lost_after_refusal.expected_session_id, None,
+            "nor bind one recorded before the uncertain request"
+        );
+
+        let mut bound = fresh();
+        bound.expected_session_id = Some("original".to_string());
+        note_refusal_generation(&mut bound, Some("successor".to_string()));
+        bind_delivery_generation(&mut bound, &snapshot, PANE_ID);
+        assert_eq!(
+            (
+                bound.refusal_generation,
+                bound.expected_session_id.as_deref()
+            ),
+            (None, Some("original")),
+            "a bound delivery must never be redirected by a refusal's generation"
+        );
+    }
+
+    /// Issue #621 (Qodo on #1521): a controller that answers each submit from a
+    /// script of whole replies, and records the session each one named.
+    struct ScriptedReplyPaneController {
+        replies: std::sync::Mutex<std::collections::VecDeque<SubmitReply>>,
+        named: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedReplyPaneController {
+        fn new(replies: Vec<SubmitReply>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                named: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for ScriptedReplyPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some("scripted-agent".to_string())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            self.named
+                .lock()
+                .unwrap()
+                .push(expected_session_id.map(str::to_string));
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SubmitReply {
+                    result: Ok(SendResult::Stale),
+                    current_session_id: None,
+                    may_have_written: false,
+                });
+            crate::pane::PendingSubmit::ready_reply(reply)
+        }
+        fn name(&self) -> &str {
+            "scripted-reply"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #621 (Qodo on #1521): a failure that provably wrote nothing — a
+    /// failed capability probe or connection — must not cost a delivery its
+    /// recovery from a later `stale` that names the conversation, on either
+    /// TUI path; a failure after the request may have reached the daemon must.
+    #[test]
+    fn an_unsent_failure_keeps_refusal_recovery_and_a_maybe_written_one_does_not() {
+        const GENERATION: &str = "refused-against-621";
+        let failure = |may_have_written| SubmitReply {
+            result: Err(PaneError::CommandFailed(
+                "write_and_submit: injected".into(),
+            )),
+            current_session_id: None,
+            may_have_written,
+        };
+        let stale = || SubmitReply {
+            result: Ok(SendResult::Stale),
+            current_session_id: Some(GENERATION.to_string()),
+            may_have_written: false,
+        };
+        let applied = || SubmitReply {
+            result: Ok(SendResult::Applied),
+            current_session_id: None,
+            may_have_written: false,
+        };
+
+        let seed_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-seed-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let mut ui = default_ui();
+            ui.pending_seed_prompts
+                .push(aged_seed_prompt(PANE_ID, "scripted seed"));
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            for _ in 0..3 {
+                process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let role_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-role-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let tab_id: TabId = 62101;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(
+                tab_id,
+                std::time::Instant::now()
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
+                    .expect("aged anchor timestamp"),
+            );
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            let role_panes = [PANE_ID.to_string()];
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut role_prompt = Some("scripted role prompt".to_string());
+            for _ in 0..3 {
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    pane.as_ref(),
+                    &snapshot,
+                    std::time::Instant::now(),
+                    tab_id,
+                    &role_panes,
+                    0,
+                    &mut role_statuses,
+                    &mut role_prompt,
+                );
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let recovered = vec![None, None, Some(GENERATION.to_string())];
+        let held_back = vec![None, None, None];
+        assert_eq!(
+            (seed_named(false), role_named(false)),
+            (recovered.clone(), recovered),
+            "after a failure that wrote nothing, the attempt after the `stale` names the \
+             conversation it reported, on both paths"
+        );
+        assert_eq!(
+            (seed_named(true), role_named(true)),
+            (held_back.clone(), held_back),
+            "after a failure that may have written, a refusal's generation is never adopted"
+        );
     }
 
     /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
@@ -39986,7 +42139,10 @@ mod tests {
             expected_agent_id: Some("epoch-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
             watermark: None,
@@ -40092,7 +42248,10 @@ mod tests {
             expected_agent_id: Some("legacy-hook-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,
             watermark: pane_event_watermark(&snapshot, PANE_ID),
@@ -40619,6 +42778,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
+            authoring_kind: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -41949,6 +44109,396 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #1507 — the dashboard lists agents in creation order, whatever
+    // produced the pane id. The key is the daemon's agent id, a monotonic
+    // counter the daemon mints for every spawn and sorts its own `ListAgents`
+    // reply by, so the TUI and the desktop app agree on the order.
+    // -----------------------------------------------------------------------
+
+    /// Draw one full dashboard frame for `state` / `ui` into a `width` x
+    /// `height` `TestBackend` and return every row, right-trimmed.
+    fn order_frame_rows(
+        state: &AppState,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Seed one daemon agent the way the TUI's startup hydration does
+    /// (`seed_hydrated_session` with the daemon's agent id), and name its card.
+    fn order_seed_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+    ) {
+        state.register_pane(pane_id.to_string());
+        state.seed_hydrated_session(
+            pane_id.to_string(),
+            Some("/home/dev/dot-agent-deck".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some(agent_id.to_string()),
+            None,
+        );
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the hydrated agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// The names in `expected`, in the top-to-bottom order the frame draws
+    /// their cards. Each name is matched on a card title row, so a name that
+    /// is missing from the frame fails loudly rather than being skipped.
+    fn order_drawn_names<'a>(rows: &[String], expected: &[&'a str]) -> Vec<&'a str> {
+        let mut found: Vec<(usize, &str)> = expected
+            .iter()
+            .map(|name| {
+                let row = rows
+                    .iter()
+                    .position(|row| row.contains(&format!(" {name} ")))
+                    .unwrap_or_else(|| {
+                        panic!("`{name}` has no card in the frame:\n{}", rows.join("\n"))
+                    });
+                (row, *name)
+            })
+            .collect();
+        found.sort_by_key(|(row, _)| *row);
+        found.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Scenario: Start the TUI against a daemon that already runs a dispatcher
+    /// created from the desktop app (`desktop-…-0`) and eleven units started by
+    /// `dispatch` (`sched-dispatch-…-N`), none of which has a numeric pane id,
+    /// then draw the dashboard. The cards must read top to bottom in the order
+    /// the daemon created the agents — dispatcher first — as the desktop does.
+    #[spec("dashboard/order/001")]
+    #[test]
+    fn order_001_daemon_spawned_agents_are_listed_in_creation_order() {
+        // In creation order: the daemon minted agent ids 1..=12 for them in
+        // this sequence. Twelve agents, so the old code's `HashMap` order
+        // matches this one with odds of 1 in 12! — the failure it reproduces is
+        // deterministic in practice.
+        let agents: [(&str, &str); 12] = [
+            ("desktop-9ff5ffc73955d0fe-0", "dispatcher"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            (
+                "sched-dispatch-issue-1492-dashboard-voice-scroll-13",
+                "unit-1492",
+            ),
+            ("sched-dispatch-issue-1493-a-14", "unit-1493"),
+            ("sched-dispatch-issue-1494-b-15", "unit-1494"),
+            ("sched-dispatch-issue-1495-c-16", "unit-1495"),
+            ("sched-dispatch-issue-1496-d-17", "unit-1496"),
+            ("sched-dispatch-issue-1498-e-18", "unit-1498"),
+            ("sched-dispatch-issue-1499-f-19", "unit-1499"),
+            ("sched-dispatch-issue-1500-g-20", "unit-1500"),
+            ("sched-dispatch-issue-1501-h-21", "unit-1501"),
+            ("sched-dispatch-issue-1502-i-22", "unit-1502"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // The TUI learns of them newest first, so the stamps it gives them
+        // itself (`started_at`) run against creation order: only the daemon's
+        // agent id can put them right.
+        for (index, (pane_id, name)) in agents.iter().enumerate().rev() {
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 120);
+        let drawn = order_drawn_names(&rows, &names);
+        insta::assert_snapshot!(drawn.join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        unit-1493
+        unit-1494
+        unit-1495
+        unit-1496
+        unit-1498
+        unit-1499
+        unit-1500
+        unit-1501
+        unit-1502
+        ");
+
+        // Stable across renders: the order is a function of the agents, not of
+        // the map they sit in.
+        let again = order_frame_rows(&state, &mut ui, 60, 120);
+        assert_eq!(order_drawn_names(&again, &names), drawn);
+    }
+
+    /// Scenario: Start the TUI against a daemon running agents created from
+    /// the TUI (numeric pane ids `0`, `1`), from the desktop app and by
+    /// `dispatch`, interleaved in time, then draw the dashboard. The cards must
+    /// follow creation order across all three, not put every TUI-created pane
+    /// first.
+    #[spec("dashboard/order/002")]
+    #[test]
+    fn order_002_mixed_numeric_and_daemon_pane_ids_follow_creation_order() {
+        // Agent ids 1..=5 in this sequence. Before the fix the two numeric
+        // panes sorted first (`tui-two` jumped ahead of `desktop-one`), which is
+        // wrong for any `HashMap` order — this case fails deterministically.
+        let agents: [(&str, &str); 5] = [
+            ("0", "tui-one"),
+            ("desktop-9ff5ffc73955d0fe-0", "desktop-one"),
+            ("1", "tui-two"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            ("desktop-9ff5ffc73955d0fe-1", "desktop-two"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // Learned in an order that is not creation order, as above.
+        for index in [4, 1, 3, 0, 2] {
+            let (pane_id, name) = agents[index];
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        tui-one
+        desktop-one
+        tui-two
+        unit-1491
+        desktop-two
+        ");
+
+        // Agent ids compare as numbers, as the daemon's own list does: agent
+        // `10` was created after agent `9`, though it sorts first as a string.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-1", "10", "tenth");
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-0", "9", "ninth");
+        let rows = order_frame_rows(&state, &mut ui, 60, 40);
+        assert_eq!(
+            order_drawn_names(&rows, &["ninth", "tenth"]),
+            ["ninth", "tenth"]
+        );
+    }
+
+    /// Surface one dashboard agent to an attached TUI exactly as the daemon
+    /// does after an attach-socket start (`spawn::surface_attach_started_agent`,
+    /// the real producer), and apply what it broadcasts to `state`.
+    fn order_surface_live_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+        strip_surfaced_id: bool,
+    ) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let record = crate::agent_pty::AgentRecord {
+            id: agent_id.to_string(),
+            pane_id_env: Some(pane_id.to_string()),
+            display_name: Some(name.to_string()),
+            cwd: Some("/home/dev/dot-agent-deck".to_string()),
+            tab_membership: None,
+            agent_type: Some(AgentType::ClaudeCode),
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            crashed: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            prompt_keys: None,
+        };
+        crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));
+        let crate::event::BroadcastMsg::Event(mut event) =
+            rx.try_recv().expect("the daemon surfaces the card")
+        else {
+            panic!("expected the card-surfacing SessionStart");
+        };
+        assert!(event.is_card_surface_session_start());
+        assert_eq!(event.agent_id, None, "the surface names no agent identity");
+        if strip_surfaced_id {
+            // What an older daemon sends: no surfaced id at all.
+            event
+                .metadata
+                .remove(crate::event::SURFACED_AGENT_ID_METADATA_KEY);
+        }
+        state.register_pane(pane_id.to_string());
+        state.apply_event(event);
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the surfaced agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// Scenario: A TUI is attached to a daemon running a desktop-created
+    /// dispatcher, then `dispatch` starts two units the daemon surfaces to the
+    /// TUI live (neither has sent a hook yet), then the user creates a pane in
+    /// the TUI. The cards must read dispatcher, unit, unit, TUI pane — creation
+    /// order — not put the units last for lacking an agent id of their own.
+    #[spec("dashboard/order/004")]
+    #[test]
+    fn order_004_live_surfaced_agents_take_their_creation_position() {
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            false,
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1492-b-13",
+            "3",
+            "unit-1492",
+            false,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let names = ["dispatcher", "unit-1491", "unit-1492", "tui-pane"];
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        tui-pane
+        ");
+
+        // Control: the same live card surfaced by a daemon too old to name the
+        // id has nothing to order by, so it falls back after every card that
+        // has one — the documented limit, not a regression.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            true,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        assert_eq!(
+            order_drawn_names(&rows, &["dispatcher", "unit-1491", "tui-pane"]),
+            ["dispatcher", "tui-pane", "unit-1491"]
+        );
+    }
+
+    /// Scenario: An orchestration whose orchestrator was respawned in place
+    /// (`clear = true`), so it now carries the NEWEST daemon agent id of its
+    /// three roles, is scoped to its tab the way the deck's main loop does it.
+    /// Its cards must stay in role config order — orchestrator first — rather
+    /// than following creation order.
+    #[spec("dashboard/order/003")]
+    #[test]
+    fn order_003_orchestration_roles_keep_role_order() {
+        let roles = [
+            ("sched-orch-7-r0", "orchestrator", "9"),
+            ("sched-orch-7-r1", "coder", "4"),
+            ("sched-orch-7-r2", "reviewer", "5"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        for (pane_id, name, agent_id) in roles {
+            order_seed_agent(&mut state, &mut ui, pane_id, agent_id, name);
+        }
+        let role_pane_ids: Vec<String> =
+            roles.iter().map(|(pane, _, _)| pane.to_string()).collect();
+
+        let mut scoped = filter_sessions(&state, &ui);
+        // Precondition: creation order alone would put the orchestrator last,
+        // so the role-order sort is what this test is measuring.
+        assert_eq!(
+            scoped.last().and_then(|(_, s)| s.pane_id.as_deref()),
+            Some("sched-orch-7-r0"),
+            "the respawned orchestrator is the newest agent"
+        );
+        sort_by_role_order(&mut scoped, &role_pane_ids);
+        let order: Vec<&str> = scoped
+            .iter()
+            .filter_map(|(_, s)| s.pane_id.as_deref())
+            .collect();
+        assert_eq!(
+            order,
+            ["sched-orch-7-r0", "sched-orch-7-r1", "sched-orch-7-r2"]
+        );
+    }
+
     /// A controller whose every `focus_pane` fails with `CommandFailed` and
     /// whose on-demand attach finds nothing — the genuinely stale card.
     fn stale_card_pc() -> UnwiredPC {
@@ -42562,7 +45112,7 @@ mod config_drift_tests {
             cwd: "/work/proj".into(),
             orchestration_name: name.into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: slots
                 .iter()
                 .map(|(i, r)| OrchestrationRoleSlot {
@@ -42688,9 +45238,9 @@ mod config_drift_tests {
         ];
         let _ = assign_synthetic_dead_slot_ids(
             &mut ids,
-            &crate::state::OrchestrationIdentity::NameCwd {
+            &crate::state::OrchestrationIdentity {
+                id: "orch-test-0".to_string(),
                 name: "review".into(),
-                cwd: "/w".into(),
             },
         );
         let ids: Vec<String> = ids.into_iter().map(|p| p.expect("filled")).collect();

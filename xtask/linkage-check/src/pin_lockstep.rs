@@ -227,12 +227,21 @@ fn repository_pins_are_in_lockstep() {
     );
 }
 
-/// renovate.json's pnpm customManager (issue #1319), compiled: its one file
-/// pattern and its one matchString. Found by what it reads — depName `pnpm`
-/// from the `devbox` datasource — rather than by its position in the array, and
-/// required to be unique, so adding a second pnpm manager goes red here instead
-/// of leaving this test comparing the guard against half of what Renovate reads.
-fn renovate_pnpm_manager() -> (Regex, Regex) {
+/// One renovate.json customManager, compiled: its one file pattern and its one
+/// matchString.
+struct RenovateManager {
+    files: Regex,
+    matcher: Regex,
+}
+
+/// renovate.json's customManagers that read `dep_name` from the `devbox`
+/// datasource, compiled. Found by what they read rather than by position in the
+/// array, and required to number exactly `expected`, so adding another manager
+/// for the same package goes red here instead of leaving a test comparing the
+/// guard against part of what Renovate reads. pnpm has one (issue #1319); the
+/// Rust toolchain, read as package `rustc`, has two — the workflows and
+/// Cargo.toml's `rust-version` (issue #1478).
+fn renovate_devbox_managers(dep_name: &str, expected: usize) -> Vec<RenovateManager> {
     let text = fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json");
     let config: serde_json::Value =
         serde_json::from_str(&text).expect("renovate.json is not valid JSON");
@@ -240,84 +249,106 @@ fn renovate_pnpm_manager() -> (Regex, Regex) {
         .as_array()
         .expect("renovate.json has a customManagers array")
         .iter()
-        .filter(|m| m["depNameTemplate"] == "pnpm" && m["datasourceTemplate"] == "devbox")
+        .filter(|m| m["depNameTemplate"] == dep_name && m["datasourceTemplate"] == "devbox")
         .collect();
     assert_eq!(
         managers.len(),
-        1,
-        "renovate.json must carry exactly one customManager reading pnpm from the \
-         devbox datasource (issue #1319)"
+        expected,
+        "renovate.json must carry exactly {expected} customManager(s) reading {dep_name} \
+         from the devbox datasource (issues #1319, #1478)"
     );
-    let only = |key: &str| -> String {
-        let values = managers[0][key]
-            .as_array()
-            .unwrap_or_else(|| panic!("the pnpm customManager has no {key} array"));
-        assert_eq!(
-            values.len(),
-            1,
-            "the pnpm customManager must have exactly one {key}; this test and \
-             scripts/check-pin-lockstep.sh agree on ONE canonical layout"
-        );
-        values[0]
-            .as_str()
-            .unwrap_or_else(|| panic!("{key} holds a non-string"))
-            .to_string()
-    };
-    // managerFilePatterns wraps a regex in slashes, JavaScript-style.
-    let file_pattern = only("managerFilePatterns");
-    let file_pattern = file_pattern
-        .strip_prefix('/')
-        .and_then(|p| p.strip_suffix('/'))
-        .expect("the pnpm managerFilePatterns entry is a /regex/");
-    (
-        Regex::new(file_pattern).expect("the pnpm managerFilePatterns regex compiles"),
-        Regex::new(&only("matchStrings")).expect("the pnpm matchString compiles"),
-    )
+    managers
+        .into_iter()
+        .map(|manager| {
+            let only = |key: &str| -> String {
+                let values = manager[key]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("the {dep_name} customManager has no {key} array"));
+                assert_eq!(
+                    values.len(),
+                    1,
+                    "each {dep_name} customManager must have exactly one {key}; this test \
+                     and scripts/check-pin-lockstep.sh agree on ONE canonical layout"
+                );
+                values[0]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} holds a non-string"))
+                    .to_string()
+            };
+            // managerFilePatterns wraps a regex in slashes, JavaScript-style.
+            let file_pattern = only("managerFilePatterns");
+            let file_pattern = file_pattern
+                .strip_prefix('/')
+                .and_then(|p| p.strip_suffix('/'))
+                .unwrap_or_else(|| panic!("the {dep_name} managerFilePatterns entry is a /regex/"));
+            RenovateManager {
+                files: Regex::new(file_pattern)
+                    .unwrap_or_else(|e| panic!("the {dep_name} managerFilePatterns regex: {e}")),
+                matcher: Regex::new(&only("matchStrings"))
+                    .unwrap_or_else(|e| panic!("the {dep_name} matchString: {e}")),
+            }
+        })
+        .collect()
 }
 
-/// What renovate.json's pnpm customManager extracts under `root`, as
-/// `<file>:<line> <version>` — the same shape `--pnpm-sites` prints, with the
-/// line being the one the captured `currentValue` sits on.
-fn renovate_pnpm_sites(root: &Path) -> Vec<String> {
-    let (files, matcher) = renovate_pnpm_manager();
-    let dir = root.join(".github/workflows");
-    let mut rels: Vec<String> = fs::read_dir(&dir)
-        .expect("list .github/workflows")
-        .map(|e| e.expect("read a .github/workflows entry"))
-        .filter(|e| e.path().is_file())
-        .map(|e| format!(".github/workflows/{}", e.file_name().to_string_lossy()))
-        .filter(|rel| files.is_match(rel))
-        .collect();
+/// What `managers` extract under `root`, as `<file>:<line> <version>` — the
+/// same shape the guard's `--*-sites` modes print, with the line being the one
+/// the captured `currentValue` sits on.
+///
+/// The candidate files are the repository root's own files and
+/// `.github/workflows/`'s, which is every place a manager here points at; each
+/// manager's file pattern then picks among them, as Renovate's does among the
+/// repository's files.
+fn renovate_sites(managers: &[RenovateManager], root: &Path) -> Vec<String> {
+    let mut rels: Vec<String> = Vec::new();
+    for (dir, prefix) in [
+        (root.to_path_buf(), ""),
+        (root.join(".github/workflows"), ".github/workflows/"),
+    ] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.expect("read a directory entry");
+            if entry.path().is_file() {
+                rels.push(format!("{prefix}{}", entry.file_name().to_string_lossy()));
+            }
+        }
+    }
     rels.sort();
     let mut sites = Vec::new();
-    for rel in rels {
-        let text = fs::read_to_string(root.join(&rel)).expect("read a workflow");
-        for caps in matcher.captures_iter(&text) {
-            let value = caps
-                .name("currentValue")
-                .expect("the pnpm matchString captures currentValue");
-            let line = text[..value.start()].matches('\n').count() + 1;
-            sites.push(format!("{rel}:{line} {}", value.as_str()));
+    for manager in managers {
+        for rel in rels.iter().filter(|rel| manager.files.is_match(rel)) {
+            let text = fs::read_to_string(root.join(rel)).expect("read a candidate file");
+            for caps in manager.matcher.captures_iter(&text) {
+                let value = caps
+                    .name("currentValue")
+                    .expect("the matchString captures currentValue");
+                let line = text[..value.start()].matches('\n').count() + 1;
+                sites.push(format!("{rel}:{line} {}", value.as_str()));
+            }
         }
     }
     sites.sort();
     sites
 }
 
-/// What `scripts/check-pin-lockstep.sh --pnpm-sites` reports under `root`:
-/// the sites it reads, sorted, and its `!ERR` lines for the ones it rejects.
-fn guard_pnpm_sites(root: &Path) -> (Vec<String>, Vec<String>) {
+/// What renovate.json's pnpm customManager extracts under `root`.
+fn renovate_pnpm_sites(root: &Path) -> Vec<String> {
+    renovate_sites(&renovate_devbox_managers("pnpm", 1), root)
+}
+
+/// What `scripts/check-pin-lockstep.sh <mode>` reports under `root`, for
+/// `--pnpm-sites` or `--toolchain-sites`: the sites it reads, sorted, and its
+/// `!ERR` lines for the ones it rejects.
+fn guard_sites(mode: &str, root: &Path) -> (Vec<String>, Vec<String>) {
     let out = Command::new("bash")
         .arg(script())
-        .arg("--pnpm-sites")
+        .arg(mode)
         .arg(root)
         .output()
-        .expect("run scripts/check-pin-lockstep.sh --pnpm-sites");
-    assert!(
-        out.status.success(),
-        "--pnpm-sites failed:\n{}",
-        combined(&out)
-    );
+        .unwrap_or_else(|e| panic!("run scripts/check-pin-lockstep.sh {mode}: {e}"));
+    assert!(out.status.success(), "{mode} failed:\n{}", combined(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let (errors, mut sites): (Vec<String>, Vec<String>) = stdout
         .lines()
@@ -343,7 +374,7 @@ fn renovate_reads_exactly_the_pnpm_sites_the_guard_finds() {
         return;
     }
     let root = repo_root();
-    let (guard, errors) = guard_pnpm_sites(&root);
+    let (guard, errors) = guard_sites("--pnpm-sites", &root);
     assert!(
         errors.is_empty(),
         "scripts/check-pin-lockstep.sh rejects a pnpm site in .github/workflows/:\n{}",
@@ -361,6 +392,71 @@ fn renovate_reads_exactly_the_pnpm_sites_the_guard_finds() {
          disagree about which pnpm pins exist in .github/workflows/ (left: what \
          Renovate extracts, right: what the guard reads). A site only the guard \
          reads is one Renovate never bumps (issue #1319)."
+    );
+}
+
+/// The Rust toolchain's customManagers (issue #1478) — package `rustc` from the
+/// devbox datasource — split into the sites they extract under the workflows
+/// and the ones they extract anywhere else.
+fn renovate_rustc_sites(root: &Path) -> (Vec<String>, Vec<String>) {
+    renovate_sites(&renovate_devbox_managers("rustc", 2), root)
+        .into_iter()
+        .partition(|site| site.starts_with(".github/workflows/"))
+}
+
+/// Issue #1478, the Rust toolchain's copy of the pnpm test above. Since #1478
+/// Renovate reads the workflows' `toolchain:` pins only through renovate.json's
+/// `rustc` regex — the github-actions manager's `uses-with` lane, which parsed
+/// the YAML, is disabled for `rust` — so a pin the guard compares and the regex
+/// misses is one the grouped Rust PR would leave behind, failing the lockstep
+/// check on the PR meant to satisfy it. This runs the matchString out of
+/// renovate.json over the real workflows and requires exactly the sites, lines
+/// and versions the guard reads, with nothing rejected.
+#[test]
+fn renovate_reads_exactly_the_toolchain_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_sites("--toolchain-sites", &root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a Rust toolchain site in .github/workflows/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no `toolchain:` site at all, so this comparison would \
+         pass vacuously"
+    );
+    let (workflows, _) = renovate_rustc_sites(&root);
+    assert_eq!(
+        workflows, guard,
+        "renovate.json's workflow `rustc` customManager and scripts/check-pin-lockstep.sh \
+         disagree about which Rust toolchain pins exist in .github/workflows/ (left: \
+         what Renovate extracts, right: what the guard reads). A site only the guard \
+         reads is one the grouped Rust PR never bumps (issue #1478)."
+    );
+}
+
+/// Issue #1478: Cargo.toml's `[workspace.package] rust-version` moves in the
+/// grouped Rust PR only because a customManager reads it — Renovate's cargo
+/// manager does not — so this requires renovate.json's `rustc` managers to
+/// extract exactly one site outside the workflows: the declaration
+/// `the_declared_msrv_matches_the_pinned_toolchain` reads, at its line and
+/// value. Zero would leave the MSRV behind on every Rust PR; two would mean the
+/// regex also matches something that is not the declaration.
+#[test]
+fn renovate_reads_exactly_the_declared_msrv() {
+    let (line, declared) = declared_msrv();
+    let (_, elsewhere) = renovate_rustc_sites(&repo_root());
+    assert_eq!(
+        elsewhere,
+        vec![format!("Cargo.toml:{line} {declared}")],
+        "renovate.json's `rustc` customManagers must extract Cargo.toml's \
+         `[workspace.package] rust-version` and nothing else outside \
+         .github/workflows/ (issue #1478)"
     );
 }
 
@@ -1523,6 +1619,27 @@ fn a_quoted_scalar_spanning_lines_does_not_close_the_flow_mapping() {
     );
 }
 
+/// Cargo.toml's `[workspace.package] rust-version`: the 1-based line it sits on
+/// and the version it declares.
+fn declared_msrv() -> (usize, String) {
+    let manifest = std::fs::read_to_string(repo_root().join("Cargo.toml"))
+        .expect("the workspace manifest is readable");
+    manifest
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            let rest = l.trim().strip_prefix("rust-version")?.trim_start();
+            let value = rest.strip_prefix('=')?.trim().trim_matches('"');
+            (!value.is_empty()).then(|| (i + 1, value.to_string()))
+        })
+        .expect(
+            "Cargo.toml declares `[workspace.package] rust-version` (issue #451). If it was \
+             removed deliberately, the tests that read it go with it — but read the doc \
+             comment on `the_declared_msrv_matches_the_pinned_toolchain` first: the point \
+             of the declaration is that it agrees with what CI installs.",
+        )
+}
+
 /// Issue #451: the declared MSRV is a **third** copy of the pinned toolchain,
 /// and it drifts for the same reason the other two did.
 ///
@@ -1545,20 +1662,7 @@ fn a_quoted_scalar_spanning_lines_does_not_close_the_flow_mapping() {
 /// diagnostics rather than a pin.
 #[test]
 fn the_declared_msrv_matches_the_pinned_toolchain() {
-    let manifest = std::fs::read_to_string(repo_root().join("Cargo.toml"))
-        .expect("the workspace manifest is readable");
-    let declared = manifest
-        .lines()
-        .find_map(|l| {
-            let rest = l.trim().strip_prefix("rust-version")?.trim_start();
-            let value = rest.strip_prefix('=')?.trim().trim_matches('"');
-            (!value.is_empty()).then(|| value.to_string())
-        })
-        .expect(
-            "Cargo.toml declares `[workspace.package] rust-version` (issue #451). If it was \
-             removed deliberately, this test goes with it — but read its doc comment first: \
-             the point of the declaration is that it agrees with what CI installs.",
-        );
+    let (_, declared) = declared_msrv();
 
     let mut sites: Vec<(String, String)> = Vec::new();
     let workflows = repo_root().join(".github/workflows");

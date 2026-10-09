@@ -301,6 +301,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -308,14 +310,28 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
+                "next_page",
+                "previous_page",
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "set_new_agent_command",
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
@@ -388,16 +404,26 @@ mod tests {
             json!(["string", "null"])
         );
         assert_eq!(
+            schema["properties"]["params"]["properties"]["text"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
             schema["properties"]["params"]["required"],
             // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
             // which sits above the dictation pair in the table.
+            // The dashboard filter's facets (issue #1496) after `agent`.
             json!([
                 "agent",
+                "kind",
+                "status",
+                "agent_type",
+                "daemon",
+                "text",
                 "deck",
                 "prefix",
                 "dir",
                 "mode",
-                "agent_type",
+                "command",
                 "orchestration"
             ])
         );

@@ -7,6 +7,14 @@
 //! false positive truncated somebody mid-sentence. What replaces it is one
 //! utterance at a time: open the agent's pane, then say what you want typed.
 //!
+//! **PRD #1260 brought a mode back, on different terms.** *"type on"* enters
+//! it for the pane on screen and *"type off"* leaves it, each only as the
+//! WHOLE utterance ([`DICTATION_ON_PHRASES`], [`DICTATION_OFF_PHRASES`]), so a
+//! false positive cannot truncate anybody mid-sentence; and the mode arms no
+//! countdown, so a missed exit lands visibly and unsent in the prompt. While it
+//! is on, nothing reaches the model: `outcome::dictation_intercept` classifies
+//! each utterance against the reserved lists and types the rest whole.
+//!
 //! # The one property this module exists to hold
 //!
 //! **The app supplies the typed text; the model may only say where it starts.**
@@ -76,7 +84,9 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// defeats *"send it"* identically. Submitting is the last thing that happens
 /// to a prompt, so a half-finished instruction delivered to an agent is
 /// unrecoverable. Whole-utterance equality means only an utterance that IS one
-/// of these phrases submits anything.
+/// of these phrases submits anything. The one allowance is an edge politeness
+/// word — *"okay, send it please"* — stripped exactly as `submit_prompt`'s
+/// `heard_as_whole` grounding strips it, and never a word that carries content.
 ///
 /// The cost is stated rather than hidden: these six phrases are the words a
 /// user cannot dictate *alone*. *"type end"* types `end`; a bare *"end"*
@@ -101,6 +111,143 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// utterance is ever typed whole. *"type go ahead"* is how those words get
 /// typed.
 pub const SUBMIT_PHRASES: [&str; 6] = ["end", "send", "send it", "submit", "enter", "press enter"];
+
+/// What sends the prompt when said as a SEPARATE FINAL SENTENCE of an
+/// utterance in the dictation mode (PR #1451 round 3): *"What's the weather
+/// over there? Send it."* types the question and then presses Enter.
+///
+/// **Narrower than [`SUBMIT_PHRASES`] on purpose.** A sentence of its own is
+/// still a trailing rule, so it carries the false positive that list's doc
+/// describes; these four are the words that say *send* and nothing else.
+/// *"end"*, *"enter"*, *"finished"* and *"go ahead"* are ordinary closing words
+/// of a dictated sentence (*"…and stop at the end."*, *"Go ahead."* answering
+/// an agent's question), so they keep sending only as the whole utterance. A
+/// send phrase inside a sentence is never one: *"tell him to send it"* is
+/// typed.
+pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "press enter"];
+
+/// What enters the dictation mode (PRD #1260), said as the whole utterance.
+///
+/// **Whole-utterance equality only**, for the reason [`SUBMIT_PHRASES`] is:
+/// entering changes how every later utterance is treated, so it must never
+/// ground on words said in passing — *"type on the tester's prompt that the
+/// build is on"* is dictation, not a mode switch, and so is *"I was talking on
+/// the phone"*. Answered locally ahead of [`DICTATION_OPENERS`], because *"type
+/// on"* and *"dictate on"* open with the openers `type` and `dictate` and would
+/// otherwise type the word `on`. The cost is stated rather than hidden: a bare
+/// *"type on"* can no longer dictate the single word `on`; *"type the word on"*
+/// still can.
+///
+/// Every entry has its counterpart in [`DICTATION_OFF_PHRASES`] (#1544): a
+/// phrasing that enters the mode but has no matching exit would be typed into
+/// the prompt when the user says it to leave.
+pub const DICTATION_ON_PHRASES: [&str; 11] = [
+    "type on",
+    "typing on",
+    "start typing",
+    "dictation on",
+    "start dictation",
+    "keep typing",
+    "talking on",
+    "start talking",
+    "speaking on",
+    "start speaking",
+    "dictate on",
+];
+
+/// What leaves the dictation mode, said as the whole utterance.
+///
+/// Live in the mode, and answered locally in `Idle` too — where it reports
+/// there was nothing to stop rather than typing the word `off`. An exit is only
+/// ever a whole utterance, which is what keeps a false positive from
+/// truncating somebody mid-sentence: *"we should stop typing the logs"* is
+/// typed.
+///
+/// *"stop talking"* is here rather than in [`VOICE_OFF_PHRASES`], though it
+/// could be meant as voice off: it is the counterpart of *"start talking"*, and
+/// heard as an exit it costs nothing a user cannot see — the mode ends, the
+/// microphone stays open, and *"voice off"* still turns it off.
+pub const DICTATION_OFF_PHRASES: [&str; 11] = [
+    "type off",
+    "typing off",
+    "stop typing",
+    "dictation off",
+    "stop dictation",
+    "done typing",
+    "talking off",
+    "stop talking",
+    "speaking off",
+    "stop speaking",
+    "dictate off",
+];
+
+/// What turns voice off while the dictation mode is on, said as the whole
+/// utterance.
+///
+/// Outside the mode `voice_off` is the model's to answer, from its row's
+/// description; inside it nothing reaches the model, so the phrases that stay
+/// live have to be a list. The biggest stop is checked first — a future
+/// overlap with another list must not leave a live microphone after a user
+/// asked for it to stop.
+pub const VOICE_OFF_PHRASES: [&str; 8] = [
+    "voice off",
+    "turn off the voice",
+    "turn voice off",
+    "stop listening",
+    "stop voice control",
+    "stop voice",
+    "mute",
+    "mic off",
+];
+
+/// What interrupts the open agent's turn while the dictation mode is on (PRD
+/// #1541), said as the whole utterance — and, outside the mode on the agent
+/// screen, what is answered with "say typing on first" instead of running.
+///
+/// **Typing mode decides what a word means** (PRD #1541 M1 decision 2): with
+/// the mode on the user is talking to the agent about its prompt, so these are
+/// commands there and nowhere else. Whole-utterance equality, for
+/// [`SUBMIT_PHRASES`]' reason: *"interrupt the build if a test fails"* is
+/// typed. The cost is the usual one — none of these can be dictated alone.
+pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrupt that"];
+
+/// The bare *"stop"* forms, which interrupt the agent's turn **only while the
+/// dictation mode is on** (PRD #1541 M1 decision 4).
+///
+/// A list of their own rather than part of [`INTERRUPT_PHRASES`], because the
+/// two halves differ outside the mode: there a bare *"stop"* is NOT answered
+/// locally at all — it keeps today's model answer (`stop_agent`, which is not
+/// callable on the agent screen) and issue #1402 owns what it should become —
+/// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
+/// and *"stop listening"* are different whole phrases and keep their meanings.
+pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
+
+/// What empties the open agent's prompt while the dictation mode is on (PRD
+/// #1541), said as the whole utterance. Outside the mode on the agent screen
+/// these are answered with "say typing on first". *"clear the cache please and
+/// then run it"* is typed.
+pub const CLEAR_PROMPT_PHRASES: [&str; 6] = [
+    "clear the prompt",
+    "clear prompt",
+    "clear it",
+    "clear all",
+    "clear everything",
+    "delete everything",
+];
+
+/// What removes the last thing voice typed into the open agent's prompt while
+/// the dictation mode is on (PRD #1541), said as the whole utterance. Outside
+/// the mode on the agent screen these are answered with "say typing on first".
+/// *"we should work on the scratch feature"* is typed.
+pub const SCRATCH_PHRASES: [&str; 7] = [
+    "scratch that",
+    "scratch it",
+    "scratch the last part",
+    "scratch the last sentence",
+    "scratch the last prompt",
+    "delete that",
+    "undo that",
+];
 
 /// One transcript, reduced to the form the phrase lists are compared against.
 ///
@@ -338,6 +485,193 @@ mod tests {
         }
     }
 
+    /// Scenario: switching dictation on or off requires the entire utterance.
+    /// A phrase embedded in words to type must remain ordinary dictation.
+    #[test]
+    fn voice_dictation_mode_switches_match_only_whole_utterances() {
+        for phrase in [
+            "type on",
+            "typing on",
+            "start typing",
+            "dictation on",
+            "start dictation",
+            "keep typing",
+            "talking on",
+            "start talking",
+            "speaking on",
+            "start speaking",
+            "dictate on",
+        ] {
+            assert!(
+                whole_utterance_is(phrase, &DICTATION_ON_PHRASES),
+                "{phrase}"
+            );
+            assert!(
+                !whole_utterance_is(&format!("{phrase} the tests"), &DICTATION_ON_PHRASES),
+                "{phrase}"
+            );
+        }
+        for phrase in [
+            "type off",
+            "typing off",
+            "stop typing",
+            "dictation off",
+            "stop dictation",
+            "done typing",
+            "talking off",
+            "stop talking",
+            "speaking off",
+            "stop speaking",
+            "dictate off",
+        ] {
+            assert!(
+                whole_utterance_is(phrase, &DICTATION_OFF_PHRASES),
+                "{phrase}"
+            );
+            assert!(
+                !whole_utterance_is(
+                    &format!("we should {phrase} the logs"),
+                    &DICTATION_OFF_PHRASES
+                ),
+                "{phrase}"
+            );
+        }
+        assert!(!whole_utterance_is(
+            "type on the tester's prompt that the build is on",
+            &DICTATION_ON_PHRASES
+        ));
+        assert!(!whole_utterance_is(
+            "we should stop typing the logs to the file",
+            &DICTATION_OFF_PHRASES
+        ));
+        // #1544's control, in both directions.
+        for phrases in [&DICTATION_ON_PHRASES[..], &DICTATION_OFF_PHRASES[..]] {
+            assert!(!whole_utterance_is("I was talking on the phone", phrases));
+            assert!(!whole_utterance_is(
+                "she was speaking off the record",
+                phrases
+            ));
+        }
+    }
+
+    /// Scenario: every phrasing that starts typing mode has a matching phrasing
+    /// that stops it, so a user who enters by one word can leave by the same
+    /// word instead of having it typed into the prompt.
+    #[test]
+    fn voice_dictation_every_on_phrase_has_its_off_counterpart() {
+        for on in DICTATION_ON_PHRASES {
+            let off = match on.split_once(' ') {
+                Some((verb, "on")) => format!("{verb} off"),
+                Some(("start", rest)) => format!("stop {rest}"),
+                Some(("keep", "typing")) => "done typing".to_string(),
+                _ => panic!("{on:?} has no counterpart rule"),
+            };
+            assert!(
+                DICTATION_OFF_PHRASES.contains(&off.as_str()),
+                "{on:?} enters typing mode but {off:?} does not leave it"
+            );
+        }
+        assert_eq!(DICTATION_ON_PHRASES.len(), DICTATION_OFF_PHRASES.len());
+    }
+
+    /// Scenario: each prompt-control phrase (interrupt, clear, scratch) is
+    /// matched only as the whole utterance; a sentence that merely contains
+    /// one of the words, or opens with a dictation opener, is not a match.
+    #[test]
+    fn voice_dictation_prompt_control_phrases_match_only_whole_utterances() {
+        let lists: [(&[&str], &[&str]); 4] = [
+            (
+                &INTERRUPT_PHRASES,
+                &["interrupt", "interrupt it", "interrupt that"],
+            ),
+            (&TYPING_STOP_PHRASES, &["stop", "stop it", "stop that"]),
+            (
+                &CLEAR_PROMPT_PHRASES,
+                &[
+                    "clear the prompt",
+                    "clear prompt",
+                    "clear it",
+                    "clear all",
+                    "clear everything",
+                    "delete everything",
+                ],
+            ),
+            (
+                &SCRATCH_PHRASES,
+                &[
+                    "scratch that",
+                    "scratch it",
+                    "scratch the last part",
+                    "scratch the last sentence",
+                    "scratch the last prompt",
+                    "delete that",
+                    "undo that",
+                ],
+            ),
+        ];
+        for (list, expected) in lists {
+            assert_eq!(list, expected);
+            for phrase in list {
+                assert!(whole_utterance_is(phrase, list), "{phrase}");
+                assert!(
+                    whole_utterance_is(&format!("{}.", phrase.to_uppercase()), list),
+                    "{phrase}"
+                );
+                for opener in DICTATION_OPENERS {
+                    assert!(
+                        !whole_utterance_is(&format!("{opener} {phrase}"), list),
+                        "{opener} {phrase}"
+                    );
+                }
+            }
+        }
+        for (said, list) in [
+            (
+                "we should work on the scratch feature",
+                &SCRATCH_PHRASES[..],
+            ),
+            ("scratch that idea and start over", &SCRATCH_PHRASES[..]),
+            ("stop the build when tests fail", &TYPING_STOP_PHRASES[..]),
+            (
+                "interrupt the build if a test fails",
+                &INTERRUPT_PHRASES[..],
+            ),
+            (
+                "clear the cache please and then run it",
+                &CLEAR_PROMPT_PHRASES[..],
+            ),
+        ] {
+            assert!(!whole_utterance_is(said, list), "{said}");
+        }
+    }
+
+    /// Scenario: all locally reserved mode and submit words have one meaning.
+    /// A newly shared phrase would make classification order determine an action.
+    #[test]
+    fn voice_dictation_reserved_phrase_lists_are_pairwise_disjoint() {
+        let lists: [(&str, &[&str]); 9] = [
+            ("dictation on", &DICTATION_ON_PHRASES),
+            ("dictation off", &DICTATION_OFF_PHRASES),
+            ("submit", &SUBMIT_PHRASES),
+            ("voice off", &VOICE_OFF_PHRASES),
+            ("interrupt", &INTERRUPT_PHRASES),
+            ("typing stop", &TYPING_STOP_PHRASES),
+            ("clear prompt", &CLEAR_PROMPT_PHRASES),
+            ("scratch", &SCRATCH_PHRASES),
+            ("opener", &DICTATION_OPENERS),
+        ];
+        for (left_index, (left_name, left)) in lists.iter().enumerate() {
+            for (right_name, right) in lists.iter().skip(left_index + 1) {
+                for phrase in *left {
+                    assert!(
+                        !right.contains(phrase),
+                        "{phrase:?} is both {left_name} and {right_name}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn voice_dictation_no_opener_starts_another_row_s_own_trigger_phrase() {
         // The mechanical half of "unambiguous": a row's description offers its
@@ -345,7 +679,10 @@ mod tests {
         // opener. A row that started claiming `"type ..."` would make the fast
         // path steal utterances the model should have judged.
         for row in table().rows() {
-            if row.id == "dictate_to_agent" {
+            if matches!(
+                row.id.as_str(),
+                "dictate_to_agent" | "dictation_on" | "dictation_off"
+            ) {
                 continue;
             }
             for quoted in row.description.split('"').skip(1).step_by(2) {

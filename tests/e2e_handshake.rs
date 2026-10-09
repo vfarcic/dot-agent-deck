@@ -111,6 +111,8 @@ fn start_live_agent(daemon: &DaemonProc) {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(

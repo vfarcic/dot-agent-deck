@@ -233,6 +233,12 @@ pub struct DesktopConnection {
     pub deck_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The technical half of [`Self::error`] for an incompatible daemon: the
+    /// declared breaks by name, the protocol number on each side, the two
+    /// builds. The webview shows it behind a Technical details disclosure and
+    /// never in the sentence, which says only what a user can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
     pub client_protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_protocol_version: Option<u32>,
@@ -321,6 +327,67 @@ pub struct DesktopConnection {
     /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
     /// on it to decide whether a control EXISTS.
     pub listing_options: bool,
+    /// Whether to offer **Upgrade** for this deck (PRD #1487 D8), from
+    /// `daemon_upgrade::upgrade_offer` over the handshake's daemon version —
+    /// the one place the newer-only rule lives, so the webview never compares
+    /// versions itself. `offered` only when the daemon's release is older than
+    /// this app's; `unknown` when nothing answered or the version is unreadable.
+    pub upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer,
+    /// Why this deck is not connected, and the one control to offer for it
+    /// (issue #1490): **Start daemon** when no daemon is running there,
+    /// **Reconnect** when one is or when the app cannot tell. Decided by
+    /// `dot_agent_deck::daemon_start`; the webview only presents it.
+    ///
+    /// Present on every snapshot whose `status` is `disconnected` that the
+    /// live bridge builds, and absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnected_reason: Option<DisconnectedReasonDto>,
+}
+
+/// [`DesktopConnection::disconnected_reason`] on the wire.
+///
+/// `kind` is the state (`not-running`, `running-not-connected`, `unknown`),
+/// `action` the control it earns (`start-daemon` or `reconnect`), `message`
+/// the sentence to show, `detail` the technical half for a disclosure, and
+/// `host` the machine the daemon runs on, as the confirm dialog names it
+/// ("this machine", or `user@host[:port]`). `failure` names the problem when
+/// `kind` is `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectedReasonDto {
+    pub kind: &'static str,
+    pub action: dot_agent_deck::daemon_start::DisconnectedAction,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<dot_agent_deck::daemon_start::StartFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub host: String,
+}
+
+impl DisconnectedReasonDto {
+    /// The DTO for `reason` on `endpoint`'s deck. Every string is sanitized:
+    /// the detail can quote what a remote printed.
+    pub(crate) fn new(
+        endpoint: &Endpoint,
+        reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+    ) -> Self {
+        use dot_agent_deck::daemon_start::DisconnectedReason;
+        let host = dot_agent_deck::daemon_start::host_label(endpoint);
+        let (kind, failure) = match reason {
+            DisconnectedReason::NotRunning => ("not-running", None),
+            DisconnectedReason::RunningNotConnected => ("running-not-connected", None),
+            DisconnectedReason::Unknown(problem) => ("unknown", Some(problem.failure)),
+        };
+        Self {
+            kind,
+            action: reason.action(),
+            message: safe_message(reason.summary(&host)),
+            failure,
+            detail: reason.detail().map(safe_message),
+            host: safe_message(host),
+        }
+    }
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -483,7 +550,75 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
+    /// copied through, bounded by [`map_prompt_keys`], and never resolved from
+    /// this crate's own registry, for the reason `cli_name` gives (issue #856).
+    ///
+    /// Absent when the daemon has no measured keys for the agent (Devin, an
+    /// unrecognised type), when it predates the field, or when what it sent
+    /// fails [`map_prompt_keys`]'s bounds. The voice surface refuses the
+    /// command with a reason in every one of those cases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_keys: Option<DesktopPromptKeys>,
+    /// Issue #1496: the authoring kind this agent was started as —
+    /// `dispatcher`, `schedule` or `schedule-issues` — **as the daemon recorded
+    /// it** (`AgentRecord::authoring_kind`), whichever client started it. The
+    /// dashboard's kind filter reads it: an authoring agent is otherwise an
+    /// ordinary dashboard pane, with nothing in `tab` to tell it apart.
+    ///
+    /// Absent for every other agent and from a daemon predating the field,
+    /// whose authoring agents the webview then shows as single agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring_kind: Option<AuthoringKind>,
     pub tab: DesktopTab,
+}
+
+/// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
+/// voice control presses to interrupt a turn, clear the prompt and delete what
+/// it typed. Field meanings are the daemon's; see `PromptKeys` there.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPromptKeys {
+    /// Write each step's bytes in order, pausing `pause_after_ms` after each.
+    pub interrupt: Vec<DesktopKeyStep>,
+    pub clear: DesktopClearKey,
+    pub delete_char: DesktopDeleteCharKey,
+}
+
+/// PRD #1541: one write of an interrupt sequence.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopKeyStep {
+    pub bytes: String,
+    pub pause_after_ms: u32,
+}
+
+/// PRD #1541: the key that clears the prompt and how many presses it needs.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopClearKey {
+    pub bytes: String,
+    /// `per_wrapped_row` or `per_line` — the daemon's wire value. A rule this
+    /// build does not know never reaches the webview: [`map_prompt_keys`]
+    /// drops the whole set instead.
+    pub presses: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one clear, when it takes more
+    /// than one; absent where back-to-back writes work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
+}
+
+/// PRD #1541: the key that deletes one character, and the longest write the
+/// agent keeps as typed text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDeleteCharKey {
+    pub bytes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_literal_write_chars: Option<u32>,
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -678,7 +813,6 @@ pub enum DesktopAction {
         #[serde(default)]
         force: bool,
     },
-    RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
     /// hand back a freshly classified snapshot (issue #801). The allowance
     /// itself is an assertion by the user, not a parameter, and it can only
@@ -1271,7 +1405,9 @@ pub enum DesktopNewAgentOptions {
         experimental: bool,
         /// The authoring kinds the deck can compose a seed for.
         authoring_kinds: Vec<String>,
-        /// The command this app last started a plain agent with on this deck.
+        /// This deck's last New agent form command, plain or authoring: the
+        /// deck's own value when it keeps one (issue #1540), shared with the
+        /// TUI's form, and otherwise the one this app last started there.
         #[serde(skip_serializing_if = "Option::is_none")]
         last_command: Option<String>,
     },
@@ -1400,6 +1536,111 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
     }
 }
 
+/// PRD #1541: the most steps an interrupt may take. The longest measured is
+/// two (OpenCode's `ESC`, pause, `ESC`).
+const PROMPT_KEY_MAX_STEPS: usize = 2;
+/// PRD #1541: the bytes of every interrupt step — one `ESC`, alone in its write.
+const PROMPT_KEY_INTERRUPT: &str = "\x1b";
+/// PRD #1541: the clear key — `Ctrl+U` (NAK).
+const PROMPT_KEY_CLEAR: &str = "\x15";
+/// PRD #1541: the keys that delete one character — `DEL`, or `Backspace` as
+/// `0x08`.
+const PROMPT_KEY_DELETE_CHAR: [&str; 2] = ["\x7f", "\x08"];
+/// PRD #1541: the most an interrupt may pause in total, summed over every step.
+const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
+/// PRD #1541: the most a clear may pause in total between its writes.
+const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
+/// PRD #1541: how many times the panel presses the clear key, by rule — a
+/// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
+/// which a clear's pause budget is computed against; the two must move
+/// together, and `the_clear_press_mirror_matches_the_panel` fails when they
+/// do not.
+const PROMPT_KEY_CLEAR_PRESSES_PER_LINE: u64 = 32;
+const PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW: u64 = 64;
+
+/// PRD #1541: the daemon's prompt keys as the webview receives them — or
+/// `None` when any part is out of bounds, so the voice surface refuses the
+/// command rather than pressing half a key set. There is no local fallback.
+///
+/// The bounds are this client's own promises, kept at the seam where the
+/// daemon's data enters, and they are an exact allowlist rather than a shape
+/// check: an interrupt is one or two steps of exactly one `ESC` each, the
+/// clear key is exactly `Ctrl+U`, and the delete key is exactly `DEL` or
+/// `0x08`. Anything else — text after a control byte, `Ctrl+C` or `Ctrl+D`,
+/// two `ESC`s in one write, an escape-encoded Enter or `Ctrl+C` (CSI-u), the
+/// clear key offered as the delete key — drops the set. So do pauses over
+/// budget (an interrupt's, summed, over 2 s; a clear's, over the writes the
+/// panel would make, over 3 s), a per-write cap of zero, and a clear rule this
+/// build does not know. A daemon owns the PTY these keys are written to, so
+/// the bounds protect the desktop's behaviour rather than the agent from its
+/// deck.
+pub(crate) fn map_prompt_keys(
+    keys: &dot_agent_deck::agent_registry::PromptKeys,
+) -> Option<DesktopPromptKeys> {
+    use dot_agent_deck::agent_registry::ClearPresses;
+
+    if keys.interrupt.is_empty() || keys.interrupt.len() > PROMPT_KEY_MAX_STEPS {
+        return None;
+    }
+    if keys
+        .interrupt
+        .iter()
+        .any(|step| step.bytes != PROMPT_KEY_INTERRUPT)
+    {
+        return None;
+    }
+    let interrupt_pause: u64 = keys
+        .interrupt
+        .iter()
+        .map(|step| u64::from(step.pause_after_ms))
+        .sum();
+    if interrupt_pause > PROMPT_KEY_INTERRUPT_BUDGET_MS {
+        return None;
+    }
+    if keys.clear.bytes != PROMPT_KEY_CLEAR
+        || !PROMPT_KEY_DELETE_CHAR.contains(&keys.delete_char.bytes.as_ref())
+    {
+        return None;
+    }
+    let (presses, total) = match keys.clear.presses {
+        ClearPresses::PerWrappedRow => {
+            ("per_wrapped_row", PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW)
+        }
+        ClearPresses::PerLine => ("per_line", PROMPT_KEY_CLEAR_PRESSES_PER_LINE),
+        ClearPresses::Unknown => return None,
+    };
+    let per_write = match keys.clear.max_presses_per_write {
+        Some(0) => return None,
+        Some(cap) => u64::from(cap),
+        None => total,
+    };
+    let clear_pause = (total.div_ceil(per_write) - 1)
+        * u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0));
+    if clear_pause > PROMPT_KEY_CLEAR_BUDGET_MS {
+        return None;
+    }
+    Some(DesktopPromptKeys {
+        interrupt: keys
+            .interrupt
+            .iter()
+            .map(|step| DesktopKeyStep {
+                bytes: step.bytes.to_string(),
+                pause_after_ms: step.pause_after_ms,
+            })
+            .collect(),
+        clear: DesktopClearKey {
+            bytes: keys.clear.bytes.to_string(),
+            presses,
+            max_presses_per_write: keys.clear.max_presses_per_write,
+            pause_between_writes_ms: keys.clear.pause_between_writes_ms,
+        },
+        delete_char: DesktopDeleteCharKey {
+            bytes: keys.delete_char.bytes.to_string(),
+            max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+        },
+    })
+}
+
 fn session_status_name(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Thinking => "thinking",
@@ -1509,6 +1750,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // `agent_registry` — a fallback would reinstate the divergence the field
     // closes, and make the change cosmetic.
     let cli_name = record.cli_name;
+    // PRD #1541: the daemon's keys, bounded — never this crate's own registry.
+    let prompt_keys = record.prompt_keys.as_ref().and_then(map_prompt_keys);
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -1528,6 +1771,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        prompt_keys,
+        authoring_kind: record.authoring_kind,
         tab,
     }
 }
@@ -2315,6 +2560,7 @@ pub(crate) fn disconnected_snapshot(
             socket_path: deck_path_text(endpoint),
             deck_id: deck_wire_id(endpoint),
             error: Some(safe_message(error)),
+            error_detail: None,
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
             client_build_version: dot_agent_deck::build_id::local_build_id(),
@@ -2330,6 +2576,8 @@ pub(crate) fn disconnected_snapshot(
             project_actions_reason: None,
             new_agent_reason: None,
             listing_options: false,
+            upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
+            disconnected_reason: None,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -2341,6 +2589,69 @@ pub(crate) fn disconnected_snapshot(
         observed: observed_fleet_decks(),
         all_decks: all_decks_applied(),
     }
+}
+
+/// What `desktop_start_daemon` resolves with (issue #1490): `outcome` is
+/// `started` or `already-running`, `host` the machine the daemon runs on as
+/// the user reads it, and `snapshot` the deck, now connected.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDaemonResultDto {
+    pub outcome: &'static str,
+    pub host: String,
+    pub snapshot: DesktopSnapshot,
+}
+
+/// What `desktop_start_daemon` rejects with (issue #1490): a bare sentence for
+/// every failure but a start that failed, which rejects with
+/// `{ message, failure, detail }` so the technical half — the spawn error, what
+/// ssh printed — reaches a disclosure instead of being dropped (PR #1623
+/// review). `desktop/src/lib/actionError.ts`'s `StartDaemonError` is the
+/// webview's half. Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopStartDaemonError {
+    Message(String),
+    Failed(DesktopStartFailure),
+}
+
+impl From<String> for DesktopStartDaemonError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A start that failed — see [`DesktopStartDaemonError`]. Every string
+/// through [`safe_message`]: the detail can quote what a remote printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStartFailure {
+    pub message: String,
+    pub failure: dot_agent_deck::daemon_start::StartFailure,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DesktopStartFailure {
+    pub(crate) fn new(problem: &dot_agent_deck::daemon_start::StartProblem) -> Self {
+        Self {
+            message: safe_message(&problem.message),
+            failure: problem.failure,
+            detail: problem.detail.as_deref().map(safe_message),
+        }
+    }
+}
+
+/// [`disconnected_snapshot`], carrying why the deck is not connected and the
+/// control that earns (issue #1490).
+pub(crate) fn disconnected_snapshot_because(
+    endpoint: &Endpoint,
+    error: impl AsRef<str>,
+    reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+) -> DesktopSnapshot {
+    let mut snapshot = disconnected_snapshot(endpoint, error);
+    snapshot.connection.disconnected_reason = Some(DisconnectedReasonDto::new(endpoint, reason));
+    snapshot
 }
 
 pub(crate) fn validate_agent_id(agent_id: &str) -> Result<(), String> {
@@ -3069,6 +3380,7 @@ mod tests {
             rows: 32,
             cols: 120,
             live: Some(SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::Codex),
@@ -3082,13 +3394,16 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
             // Codex, and `codex` is what a codex daemon resolves.
             cli_name: Some("codex".into()),
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -3142,6 +3457,350 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["agentType"], "codex");
         assert!(value.get("cliName").is_none());
+    }
+
+    fn key_step(
+        bytes: &'static str,
+        pause_after_ms: u32,
+    ) -> dot_agent_deck::agent_registry::KeyStep {
+        dot_agent_deck::agent_registry::KeyStep {
+            bytes: std::borrow::Cow::Borrowed(bytes),
+            pause_after_ms,
+        }
+    }
+
+    fn registry_keys(agent_type: AgentType) -> dot_agent_deck::agent_registry::PromptKeys {
+        dot_agent_deck::agent_registry::spec(&agent_type)
+            .prompt_keys
+            .clone()
+            .expect("a measured agent carries prompt keys")
+    }
+
+    /// PRD #1541: the daemon's prompt keys reach the webview in its camelCase
+    /// vocabulary, with the bytes unchanged and an absent limit absent.
+    #[test]
+    fn prompt_keys_are_copied_from_the_daemon_in_the_webview_shape() {
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::ClaudeCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"],
+            serde_json::json!({
+                "interrupt": [{"bytes": "\u{1b}", "pauseAfterMs": 0}],
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "maxPressesPerWrite": 32, "pauseBetweenWritesMs": 1000},
+                "deleteChar": {"bytes": "\u{7f}", "maxLiteralWriteChars": 800},
+            })
+        );
+
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::OpenCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"]["interrupt"],
+            serde_json::json!([
+                {"bytes": "\u{1b}", "pauseAfterMs": 300},
+                {"bytes": "\u{1b}", "pauseAfterMs": 0},
+            ])
+        );
+        assert_eq!(value["promptKeys"]["clear"]["presses"], "per_line");
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("maxPressesPerWrite")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("pauseBetweenWritesMs")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["deleteChar"]
+                .get("maxLiteralWriteChars")
+                .is_none()
+        );
+    }
+
+    /// PRD #1541: a record the daemon served no keys for has none in the
+    /// webview — even for an agent type this crate's own registry has keys
+    /// for. A local fallback would answer for a deck whose agent versions this
+    /// build never measured (the #856 principle).
+    #[test]
+    fn absent_prompt_keys_are_never_filled_from_the_local_registry() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::ClaudeCode);
+        record.live = None;
+        record.prompt_keys = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "claude_code");
+        assert!(value.get("promptKeys").is_none());
+    }
+
+    /// PRD #1541: a key set that breaks one of the desktop's own promises is
+    /// dropped whole, so the voice surface refuses rather than pressing part of
+    /// it.
+    #[test]
+    fn out_of_bounds_prompt_keys_are_dropped_whole() {
+        use dot_agent_deck::agent_registry::{ClearPresses, KeyStep};
+        use std::borrow::Cow;
+
+        type Breaker = Box<dyn Fn(&mut dot_agent_deck::agent_registry::PromptKeys)>;
+        let cases: Vec<(&str, Breaker)> = vec![
+            (
+                "Ctrl+C in clear",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15\x03")),
+            ),
+            (
+                "Ctrl+C in an interrupt step",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x03"),
+                        pause_after_ms: 0,
+                    }]);
+                }),
+            ),
+            (
+                "empty delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("")),
+            ),
+            (
+                "text, not a key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("rm -rf ~ && echo")),
+            ),
+            (
+                "a key that submits",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7f\r")),
+            ),
+            (
+                "a key longer than the bound",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[1;2;3;4;5;6;7;8")),
+            ),
+            (
+                "no interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(Vec::new())),
+            ),
+            (
+                "too many steps",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![
+                        KeyStep {
+                            bytes: Cow::Borrowed("\x1b"),
+                            pause_after_ms: 0
+                        };
+                        5
+                    ]);
+                }),
+            ),
+            (
+                "a long pause",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x1b"),
+                        pause_after_ms: 60_000,
+                    }]);
+                }),
+            ),
+            (
+                "an unknown clear rule",
+                Box::new(|k| k.clear.presses = ClearPresses::Unknown),
+            ),
+            (
+                "zero presses per write",
+                Box::new(|k| k.clear.max_presses_per_write = Some(0)),
+            ),
+            (
+                "a long pause between clear writes",
+                Box::new(|k| k.clear.pause_between_writes_ms = Some(60_000)),
+            ),
+            // A-B1: the allowlist is exact, so a key that merely starts with
+            // a control byte is not enough.
+            (
+                "text after the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15INJECTED")),
+            ),
+            (
+                "text after the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7fINJECTED")),
+            ),
+            (
+                "Ctrl+D as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x04")),
+            ),
+            (
+                "Ctrl+D as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x04", 0)])),
+            ),
+            (
+                "two ESCs in one interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b\x1b", 0)])),
+            ),
+            (
+                "a CSI-u Enter as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[13u", 0)])),
+            ),
+            (
+                "a CSI-u Ctrl+C as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[99;5u", 0)])),
+            ),
+            (
+                "a CSI-u Enter as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[13u")),
+            ),
+            (
+                "the clear key as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x15")),
+            ),
+            (
+                "the delete key as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x7f")),
+            ),
+            (
+                "ESC as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x1b")),
+            ),
+            (
+                "a good step after a bad one",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![key_step("\x1b", 300), key_step("\x1b[13u", 0)]);
+                }),
+            ),
+            (
+                "three ESC steps",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b", 0); 3])),
+            ),
+            // A-S1: pauses are budgeted in aggregate, not only per step.
+            (
+                "an interrupt pausing over 2 s in total",
+                Box::new(|k| {
+                    k.interrupt =
+                        Cow::Owned(vec![key_step("\x1b", 1_500), key_step("\x1b", 1_500)]);
+                }),
+            ),
+            (
+                "a clear of one press per write, 2 s apart",
+                Box::new(|k| {
+                    k.clear.max_presses_per_write = Some(1);
+                    k.clear.pause_between_writes_ms = Some(2_000);
+                }),
+            ),
+            (
+                "a clear pausing just over 3 s in total",
+                Box::new(|k| {
+                    // 64 presses in writes of 16 is four writes, three pauses.
+                    k.clear.max_presses_per_write = Some(16);
+                    k.clear.pause_between_writes_ms = Some(1_001);
+                }),
+            ),
+        ];
+        for (name, break_it) in cases {
+            let mut keys = registry_keys(AgentType::ClaudeCode);
+            break_it(&mut keys);
+            assert_eq!(map_prompt_keys(&keys), None, "{name} must drop the key set");
+        }
+        // And the untouched set passes, so the cases above fail for their own
+        // reason.
+        assert!(map_prompt_keys(&registry_keys(AgentType::ClaudeCode)).is_some());
+    }
+
+    /// PRD #1541 A-B1/A-S1: the values just inside the allowlist and the
+    /// budgets pass, so the bounds are exactly where the docs put them.
+    #[test]
+    fn prompt_keys_at_the_edge_of_the_bounds_pass() {
+        use dot_agent_deck::agent_registry::ClearPresses;
+        use std::borrow::Cow;
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.delete_char.bytes = Cow::Borrowed("\x08");
+        assert!(map_prompt_keys(&keys).is_some(), "0x08 deletes a character");
+
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.interrupt = Cow::Owned(vec![key_step("\x1b", 1_000), key_step("\x1b", 1_000)]);
+        assert!(map_prompt_keys(&keys).is_some(), "2 s of interrupt pause");
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.clear.max_presses_per_write = Some(16);
+        keys.clear.pause_between_writes_ms = Some(1_000);
+        assert!(map_prompt_keys(&keys).is_some(), "3 s of clear pause");
+
+        // One write never pauses, however long the pause it names.
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.clear.presses = ClearPresses::PerLine;
+        keys.clear.max_presses_per_write = Some(32);
+        keys.clear.pause_between_writes_ms = Some(60_000);
+        assert!(map_prompt_keys(&keys).is_some(), "a one-write clear");
+        keys.clear.max_presses_per_write = Some(31);
+        assert_eq!(
+            map_prompt_keys(&keys),
+            None,
+            "per_line is budgeted at 32 presses"
+        );
+    }
+
+    /// PRD #1541 A-B1: every key set this tree's registry serves passes the
+    /// allowlist, so a deck built from the same tree is never refused.
+    #[test]
+    fn every_registry_key_set_passes_the_allowlist() {
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                assert!(
+                    map_prompt_keys(keys).is_some(),
+                    "{}'s keys must pass the desktop's allowlist",
+                    agent.label
+                );
+            }
+        }
+    }
+
+    /// PRD #1541 R-S2: the clear budget's press counts mirror the panel's
+    /// `VOICE_CLEAR_PRESSES`, so the budget is computed against the presses
+    /// the panel actually makes.
+    #[test]
+    fn the_clear_press_mirror_matches_the_panel() {
+        let panel = include_str!("../../src/components/VoiceControlPanel.tsx");
+        let declaration = panel
+            .lines()
+            .find(|line| line.starts_with("export const VOICE_CLEAR_PRESSES"))
+            .expect("the panel declares VOICE_CLEAR_PRESSES on one line");
+        let count = |rule: &str| -> u64 {
+            let at = declaration
+                .find(&format!("{rule}: "))
+                .unwrap_or_else(|| panic!("VOICE_CLEAR_PRESSES names {rule}"));
+            declaration[at + rule.len() + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("VOICE_CLEAR_PRESSES gives {rule} a number"))
+        };
+        assert_eq!(count("per_line"), PROMPT_KEY_CLEAR_PRESSES_PER_LINE);
+        assert_eq!(
+            count("per_wrapped_row"),
+            PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW
+        );
+    }
+
+    /// PRD #1541: the browser fixture's prompt keys
+    /// (`desktop/src/data/prompt-keys.json`) are what a deck built from this
+    /// tree serves — every measured agent, keyed by its wire type, in the
+    /// webview's shape — so `?fixture=1` previews the real keys rather than a
+    /// copy that drifted.
+    #[test]
+    fn the_browser_fixture_prompt_keys_match_the_registry() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/data/prompt-keys.json"))
+                .expect("the fixture is JSON");
+        let mut expected = serde_json::Map::new();
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                expected.insert(
+                    agent_type_name(&agent.agent_type).to_string(),
+                    serde_json::to_value(
+                        map_prompt_keys(keys).expect("registry keys are in bounds"),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert_eq!(fixture, serde_json::Value::Object(expected));
     }
 
     #[test]
@@ -3286,6 +3945,22 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
         assert!(value.get("lastActivityMs").is_none());
+    }
+
+    /// Issue #1496: the authoring kind the daemon recorded reaches the webview
+    /// as `authoringKind`, in the daemon's kebab-case spelling the dashboard's
+    /// kind filter matches on, and an agent with none carries no key at all.
+    #[test]
+    fn agent_mapping_surfaces_the_recorded_authoring_kind() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("authoringKind").is_none(), "{value}");
+
+        for kind in AuthoringKind::ALL {
+            let mut record = fixture_record();
+            record.authoring_kind = Some(kind);
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["authoringKind"], kind.as_str());
+        }
     }
 
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are
@@ -3519,13 +4194,17 @@ mod tests {
         );
     }
 
+    /// PRD #1487 M5: Replace daemon is `desktop_upgrade_daemon` on the local
+    /// deck now, so the action it used to be is gone — refused at decode
+    /// rather than quietly running the old stop-and-respawn path.
     #[test]
-    fn restart_daemon_action_has_no_force_field() {
-        let action: DesktopAction = serde_json::from_value(serde_json::json!({
-            "type": "restart_daemon"
-        }))
-        .unwrap();
-        assert!(matches!(action, DesktopAction::RestartDaemon));
+    fn restart_daemon_is_no_longer_an_action() {
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "restart_daemon"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4099,6 +4778,32 @@ mod tests {
                 "showAgentProfiles": true,
                 "showAgentDetails": false,
             })
+        );
+    }
+
+    /// PR #1623 review: a failed start rejects with its failure kind and its
+    /// technical detail beside the sentence, every string scrubbed; any other
+    /// rejection stays the bare string every `catch` already reads.
+    #[test]
+    fn a_failed_start_rejects_with_its_detail() {
+        use dot_agent_deck::daemon_start::{StartFailure, StartProblem};
+        let failed = DesktopStartDaemonError::Failed(DesktopStartFailure::new(&StartProblem {
+            failure: StartFailure::StartFailed,
+            message: "Could not start the daemon on this machine.".into(),
+            detail: Some("spawn: \u{7}No such file or directory".into()),
+        }));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            serde_json::json!({
+                "message": "Could not start the daemon on this machine.",
+                "failure": "start-failed",
+                "detail": "spawn: No such file or directory",
+            })
+        );
+        let plain = DesktopStartDaemonError::from("not observed".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!("not observed")
         );
     }
 }

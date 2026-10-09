@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import type { DeckActionResult, DeckDirectoryListing, DeckFleet, DeckRuntimeState, NewAgentOptions } from "../types";
 import { AgentOverview } from "./AgentOverview";
 import { DRAFT_RESTORED } from "./NewAgentDialog";
@@ -333,5 +333,47 @@ describe("the overview keeps a closed New agent form (issue 1247)", () => {
     await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("claude"));
     expect(screen.getByTestId("new-agent-name")).toHaveValue("");
     expect(screen.queryByTestId("new-agent-restored")).toBeNull();
+  });
+});
+
+describe("the New agent dialog lists only daemons that can take one (PR #1451 round 3, change 6)", () => {
+  const OLDER = "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.";
+  /** The four-deck fleet with its unreachable deck refused as older than this app instead. */
+  const fleetWithIncompatible = (): DeckFleet =>
+    createFixtureFleet("fleet").map((deck) =>
+      deck.connection.deckId === FIXTURE_UNREACHABLE_DAEMON_ID
+        ? { ...deck, connection: { ...deck.connection, status: "error" as const, daemonDetected: true, buildStampMismatchOnly: true, runningAgentCount: 2, message: OLDER } }
+        : deck,
+    );
+  const incompatibleNote = () => screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === FIXTURE_UNREACHABLE_DAEMON_ID)!;
+
+  /**
+   * Scenario: on a fleet with a connected local daemon, a connected remote
+   * one, a daemon refused as older than this app and one that has not
+   * reported, open New agent from the top bar. The dialog's daemon list holds
+   * only the two connected daemons, and none of the refused daemon's
+   * explanation or its buttons appear in the dialog. Behind it, and after it
+   * closes, the overview still shows that daemon with its full explanation and
+   * its buttons, unchanged.
+   */
+  it("hides the unusable daemons in the dialog and leaves the overview's explanation as it was", () => {
+    render(<AgentOverview runtime={runtime({ fleet: fleetWithIncompatible() })} onNavigate={vi.fn()} />);
+    const note = () => within(incompatibleNote()).getByTestId("overview-incompatible");
+    expect(note()).toHaveTextContent(OLDER);
+    const buttonsBefore = within(note()).getAllByRole("button").map((button) => button.textContent);
+    expect(buttonsBefore.length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    const flow = screen.getByTestId("new-agent-dialog");
+    const listed = within(screen.getByTestId("new-agent-deck-list")).getAllByRole("option").map((option) => option.getAttribute("data-deck-id"));
+    expect(listed).toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID]);
+    expect(listed).not.toContain(FIXTURE_PENDING_DAEMON_ID);
+    expect(flow).not.toHaveTextContent(/older than this app|Update the daemon|not reported yet|waiting for it to report/);
+    expect(within(flow).queryByRole("button", { name: /connect anyway|reconnect|open daemons/i })).toBeNull();
+    expect(note()).toHaveTextContent(OLDER);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    expect(note()).toHaveTextContent(OLDER);
+    expect(within(note()).getAllByRole("button").map((button) => button.textContent)).toEqual(buttonsBefore);
   });
 });

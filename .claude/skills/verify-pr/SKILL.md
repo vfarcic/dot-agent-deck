@@ -70,7 +70,7 @@ bash .claude/skills/verify-pr/setup.sh <pr-number>
 
 Creates `../dot-agent-deck-pr-<n>` from `refs/pull/<n>/head` (works for forks with no extra remote), then merges `origin/main` into it — CI tests the merge commit, so a PR that is green in isolation can still break `main`.
 
-`setup.sh` is a deliberate sibling of `/worktree-prd`'s `create.sh`, not a caller: that script starts *new* work, so it branches from `main` and names the branch from `prds/<n>-*.md`. Reviewing needs a branch pinned to the contributor's head commit. The conventions are identical on purpose — same `../<repo>-<suffix>` path scheme, same validate-then-create ordering, same `KEY=value` output (the grammar in `stream.sh`, which `setup.sh` sources too) — and `setup.sh` performs `/worktree-prd`'s Step 3 (copying the untracked `.claude/settings.local.json`) itself.
+`setup.sh` is a deliberate sibling of `/worktree-prd`'s `create.sh`, not a caller: that script starts *new* work, so it branches from `main` and names the branch from the PRD (its `prds/<n>-*.md` file, else its issue title). Reviewing needs a branch pinned to the contributor's head commit. The conventions are identical on purpose — same `../<repo>-<suffix>` path scheme, same validate-then-create ordering, same `KEY=value` output (the grammar in `stream.sh`, which `setup.sh` sources too) — and `setup.sh` performs `/worktree-prd`'s Step 3 (copying the untracked `.claude/settings.local.json`) itself.
 
 Read its output before continuing:
 

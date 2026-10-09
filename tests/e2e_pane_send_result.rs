@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 
@@ -30,6 +30,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[test]
 fn pane_input_004_history_only_send_reports_result_and_feedback() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_continue_session("history-codex", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -124,6 +125,7 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
         ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
     ] {
         let deck = TuiDeck::builder()
+            .impersonating_pane_signals()
             .with_continue_session(format!("stream-rejection-{input_kind}"), "cat")
             .launch_with_fixture("minimal");
         deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -204,6 +206,7 @@ payload = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "pane_id": pane,
     "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "token": os.environ.get("DOT_AGENT_DECK_PANE_CAPABILITY"),
     "live_target": {
         "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
         "writable": os.environ["WRITABLE"],
@@ -284,5 +287,196 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
     assert!(
         context.contains(MARKER),
         "the delivered context pointer must reference the generated context containing the role prompt"
+    );
+}
+
+/// Scenario: Launch a real dashboard with two panes — one whose program puts
+/// its terminal in raw mode and then never reads, one plain `cat` — and send the
+/// stuck pane a prompt far larger than its terminal will hold. The send must
+/// come back as possibly delivered rather than hang, its card must show the
+/// error, and a send to the other pane made while the stuck one is pending must
+/// still go straight through.
+#[cfg(target_os = "linux")]
+#[spec("prompt/pane-input/046")]
+#[test]
+fn prompt_pane_input_046_a_pane_that_stops_reading_does_not_hang_its_send_or_stall_the_deck() {
+    const SENTINEL: &str = "HEALTHY-PANE-SENTINEL-046";
+    const HEALTHY_PANE: &str = "healthy-046";
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_continue_session(
+            "wedged-046",
+            "sh -c 'stty raw; printf WEDGE-READY; exec sleep 600'",
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .any(|record| record.display_name.as_deref() == Some("wedged-046"))
+        }),
+        "precondition: the stuck pane was restored"
+    );
+    let wedged = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some("wedged-046"))
+        .expect("the stuck pane's daemon record");
+    // A session on the stuck pane, so its card shows a status rather than
+    // "No agent" — the error is reported as that status.
+    let wedged_pane = wedged
+        .pane_id_env
+        .clone()
+        .expect("the stuck pane's pane id");
+    let session = json!({
+        "session_id": "wedged-046-session",
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": "2026-10-03T12:00:00Z",
+        "pane_id": wedged_pane,
+        "agent_id": wedged.id,
+    });
+    common::write_hook_line(deck.hook_socket_path(), &session.to_string())
+        .expect("inject the stuck pane's SessionStart");
+    deck.wait_until_grid("the stuck pane's card names its agent", |grid| {
+        grid.contains("Claude")
+    });
+    // The second pane is started on the same daemon directly: it only has to
+    // take input, and the dashboard restores one session per launch.
+    let started_healthy = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::StartAgent {
+            command: Some("cat".to_string()),
+            cwd: None,
+            display_name: Some(HEALTHY_PANE.to_string()),
+            rows: 24,
+            cols: 80,
+            env: vec![(
+                dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                HEALTHY_PANE.to_string(),
+            )],
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
+        },
+    )
+    .expect("start the healthy pane");
+    let healthy_id = started_healthy
+        .id
+        .clone()
+        .unwrap_or_else(|| panic!("start-agent returned no id: {started_healthy:?}"));
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            String::from_utf8_lossy(&common::pane_snapshot_on(
+                deck.attach_socket_path(),
+                &wedged.id,
+            ))
+            .contains("WEDGE-READY")
+        }),
+        "precondition: the stuck pane's program never put its terminal in raw mode"
+    );
+    assert!(
+        !deck.snapshot_grid().contains("Error"),
+        "precondition: no card shows an error yet\n{}",
+        deck.snapshot_grid()
+    );
+
+    // A single line far larger than the terminal's input queue, so the write
+    // stops part-way with the pane not reading.
+    let flood = "x".repeat(200_000);
+    let socket = deck.attach_socket_path().to_path_buf();
+    let wedged_agent = wedged.id.clone();
+    let started = std::time::Instant::now();
+    let (stuck_tx, stuck_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build stuck-send runtime")
+            .block_on(DaemonClient::new(socket).write_and_submit_with_identity(
+                &wedged_pane,
+                &flood,
+                Some(&wedged_agent),
+                Some("wedged-046-session"),
+                Some("wedged-send-046"),
+            ));
+        let _ = stuck_tx.send((result, started.elapsed()));
+    });
+
+    // While that send is stuck on the wedged pane, the other pane still takes
+    // input at once. The stuck pane's terminal echoes what it receives (raw
+    // mode, echo left on), so its first bytes showing is the observable that
+    // the send has reached the PTY — and the send cannot finish until the
+    // queue behind them would take all 200 KB.
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            String::from_utf8_lossy(&common::pane_snapshot_on(
+                deck.attach_socket_path(),
+                &wedged.id,
+            ))
+            .contains(&"x".repeat(256))
+        }),
+        "precondition: the stuck send never reached the stuck pane's PTY"
+    );
+    let healthy_started = std::time::Instant::now();
+    let healthy_result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build healthy-send runtime")
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                DaemonClient::new(deck.attach_socket_path().to_path_buf())
+                    .write_and_submit_with_identity(
+                        HEALTHY_PANE,
+                        SENTINEL,
+                        Some(&healthy_id),
+                        None,
+                        Some("healthy-send-046"),
+                    ),
+            )
+            .await
+        })
+        .expect("the healthy pane's send did not come back within 10 s")
+        .expect("send to the healthy pane");
+    let healthy_took = healthy_started.elapsed();
+    assert_eq!(healthy_result, SendResult::Applied);
+    if let Ok(early) = stuck_rx.try_recv() {
+        panic!(
+            "precondition: the healthy send was made while the stuck one was still pending; it \
+             had already returned {early:?}"
+        );
+    }
+    assert!(
+        healthy_took < Duration::from_secs(8),
+        "the healthy pane's send waited {healthy_took:?} behind the stuck pane"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            String::from_utf8_lossy(&common::pane_snapshot_on(
+                deck.attach_socket_path(),
+                &healthy_id,
+            ))
+            .contains(SENTINEL)
+        }),
+        "the healthy pane never showed its input"
+    );
+
+    let (stuck_result, stuck_took) = stuck_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the send into the pane that stopped reading never came back");
+    assert_eq!(
+        stuck_result.expect("the stuck send returns a result, not a transport error"),
+        SendResult::Ambiguous,
+        "part of the prompt went to a pane that stopped reading, so it may have been delivered \
+         (it came back after {stuck_took:?})"
+    );
+    assert!(
+        deck.wait_for_grid_string_within("Error", Duration::from_secs(10)),
+        "the stuck pane's card never showed the error\n{}",
+        deck.snapshot_grid()
     );
 }

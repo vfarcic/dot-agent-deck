@@ -219,13 +219,26 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent("the hint shown when it cannot");
     expect(disclosure).toHaveTextContent("the model name and token limit");
     expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
+    // PRD #1260 and #1261: every locally decided case is named — the typing
+    // mode's phrases and everything said in it, and an answer to a choice.
+    expect(disclosure).toHaveTextContent("“type on” and “type off” said on their own");
+    expect(disclosure).toHaveTextContent("everything said while typing mode is on");
+    // PRD #1541: the prompt commands said on their own in an agent's pane are
+    // decided here too — outside typing mode they only ask for "typing on".
+    expect(disclosure).toHaveTextContent("in an agent’s pane, “interrupt”, “clear the prompt”, “scratch that” and the other prompt commands said on their own");
+    expect(disclosure).toHaveTextContent("while a numbered choice is on offer, an answer to it");
+    expect(disclosure).toHaveTextContent("Anything else said while a choice is on offer closes it and is sent as usual.");
     // PRD #1223, closing audit G2: the negations are about the app-observed
     // names only, and the words spoken are said to be always sent.
     // PRD #1223, closing audit H2: stated as FIELD provenance — the app adds
     // no such field — because a name is arbitrary text and can itself be a
     // path; and the words go with a command that REACHES the endpoint, since
     // the locally decided ones named above send nothing.
-    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments");
+    // Issue #1495: a directory's NAME goes, its path does not, and no prompt
+    // text goes at all — a task is matched on this machine (review on PR #1529).
+    expect(disclosure).not.toHaveTextContent("last prompt");
+    expect(disclosure).toHaveTextContent("the name of its working directory (with the name of the folder above it when two agents' directories share a name)");
+    expect(disclosure).toHaveTextContent("This app adds no field of its own for a full filesystem path, a daemon or agent id, prompt text or a tool's arguments");
     expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
     expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
     expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");

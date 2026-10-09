@@ -299,6 +299,13 @@ pub enum EventVerdict {
 /// nothing.
 pub fn classify_event(event: &AgentEvent) -> EventVerdict {
     match event.event_type {
+        // Issue #1493: a Codex pane's painted output, the pointer's own echo
+        // included — see `crate::state::worker_event_proves_delivery`.
+        _ if event.agent_type == crate::event::AgentType::Codex
+            && event.is_wrapper_output_classified() =>
+        {
+            EventVerdict::Ignore
+        }
         EventType::Thinking
         | EventType::ToolStart
         | EventType::ToolEnd
@@ -2093,6 +2100,15 @@ mod tests {
                 "{:?}",
                 e.event_type
             );
+            // Issue #1493: the same frame drawn by a Codex pane's wrapper.
+            let mut codex_output = e.clone();
+            codex_output.agent_type = AgentType::Codex;
+            codex_output.metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+            assert_eq!(classify_event(&codex_output), EventVerdict::Ignore);
+            assert!(!crate::state::worker_event_proves_delivery(&codex_output));
         }
     }
 

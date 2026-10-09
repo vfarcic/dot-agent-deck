@@ -1,6 +1,6 @@
 # Installation
 
-dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app connects to a daemon but does not start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
+dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app is a client of a daemon, and can start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
 
 After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ. If `dot-agent-deck docs` reports an unrecognized subcommand, the installed version predates it: read the documentation at [agent-deck.devopstoolkit.ai/llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt) instead, keeping in mind that the website follows the latest release rather than your installed version.
 
@@ -191,6 +191,8 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 
 The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
 
+The deck keeps one entry of its own per hook event. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`, or the desktop app's bundled copy and a CLI), the hooks call the first installed copy that registered them, and starting any other copy leaves them alone rather than adding a second set or switching them over. They move to another copy only when the one they call is deleted (the next copy to start then takes its place) or when you run `dot-agent-deck hooks install` from the copy you prefer. Your own hooks, and their order, are left alone either way. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
+
 To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
 
 ```bash
@@ -200,7 +202,7 @@ dot-agent-deck hooks install --agent codex
 dot-agent-deck hooks install --agent devin
 ```
 
-`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex. On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
+`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)). On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
 
 An agent that was already running when the hooks were installed may need a restart to load them. If a card stays on its first status while the agent works, see [Troubleshooting → Hooks](troubleshooting.md#hooks).
 
@@ -256,7 +258,7 @@ Launch it from the application menu or with `dot-agent-deck-desktop`. Remove it 
 
 ### How the desktop app gets a daemon
 
-The desktop app connects to a daemon and does not start one. With no daemon running, its Dashboard shows **Daemon disconnected** with a **Reconnect** button. (Starting a daemon from inside the app is one of the [features behind the `experimental` flag](desktop/index.md#features-behind-the-experimental-flag).) Start a daemon, then press **Reconnect**:
+With no daemon running, the desktop app's Dashboard shows **Daemon disconnected** with a **Start daemon** button: press it and confirm, and the app starts the daemon and connects ([Desktop app → Daemons → Start a daemon from the app](desktop/daemons.md#start-a-daemon-from-the-app)). You can also start a daemon yourself:
 
 - **Run the TUI**: `dot-agent-deck` starts a daemon if none is running. Both clients can be open at once.
 - **Run the daemon alone**: `dot-agent-deck daemon serve` runs it in the foreground of that terminal until `Ctrl+C`. On macOS without a CLI install: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
@@ -268,17 +270,19 @@ A daemon with no clients, no agents and no enabled [schedules](scheduled-tasks.m
 - Quitting the TUI with **Detach** leaves the daemon running under the same rule. Quitting it with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
 - Quitting the desktop app leaves agents running.
 
-The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon must already be running on its host; see [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
+The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon needs the deck installed on its host; the app can then start the daemon there. See [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
 
 ### Keep the app and the daemon on the same release
 
-When it connects, the app compares its protocol and its declared compatibility breaks with the daemon's:
+When it connects, the app checks whether it and the daemon can work together:
 
 | Situation | What the Dashboard shows | What to do |
 |---|---|---|
-| Same protocol, no compatibility break between the two builds | Connects normally | Nothing |
-| Same protocol, one side declares a compatibility break the other lacks | **Incompatible daemon**, naming the break and which side is behind, with **Connect anyway** | Upgrade the older side. **Connect anyway** connects for this session, but the app may misread some of what the daemon reports. |
-| Different protocol | **Incompatible daemon**, no Connect anyway | Upgrade the older side, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+| The two are compatible | Connects normally | Nothing |
+| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one; for a remote daemon older than the app, press **Upgrade** ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)). **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
+| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | For a remote daemon older than the app, press **Upgrade**. Otherwise update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+
+**Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
 `daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this.
 
@@ -326,7 +330,7 @@ dot-agent-deck daemon status
 
 ```text
 PANE	AGENT	ROLE	STATUS	TOOL	LABEL	CWD
-1	1	mode:review	Thinking	-	api	/home/you/src/api
+1	1	lead (orchestrator)	Thinking	-	api	/home/you/src/api
 2	2	-	Working	Bash	api	/home/you/src/api
 ```
 
@@ -336,7 +340,7 @@ The columns are tab-separated (`column -t -s $'\t'` aligns them). `-` means no v
 |---|---|
 | `PANE` | Pane id; a managed agent sees it as `DOT_AGENT_DECK_PANE_ID`. |
 | `AGENT` | The daemon's id for the agent. |
-| `ROLE` | `mode:<name>` for a mode pane, the role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `-` otherwise. |
+| `ROLE` | The role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `mode:<name>` for an agent still running from a workspace mode started by a release before 0.44.0, `-` otherwise. |
 | `STATUS` | `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error` or `Blocked`. See [Session statuses](session-management.md#session-statuses). |
 | `TOOL` | The name of the tool running now, without its arguments. |
 | `LABEL` | The pane's display name. |
@@ -356,7 +360,7 @@ dot-agent-deck daemon status --json
 {
   "schema_version": 2,
   "agents": [
-    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "mode:review", "status": "Thinking" },
+    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "lead (orchestrator)", "status": "Thinking" },
     { "agent_id": "2", "pane_id": "2", "label": "api", "cwd": "/home/you/src/api", "status": "Working", "active_tool": { "name": "Bash" } }
   ]
 }

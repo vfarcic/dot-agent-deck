@@ -12,13 +12,19 @@ pub mod codex_rollout_tail;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
+// PRD #1487: refuses agent-config writes outside an owned root in a test process.
+pub mod config_write_guard;
 pub mod connect;
 pub mod daemon;
 pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
+pub mod daemon_restart;
+// Issue #1490: why a deck is not connected, and starting its daemon.
+pub mod daemon_start;
 pub mod daemon_status;
 pub mod daemon_stop;
+pub mod daemon_upgrade;
 pub mod deck_list;
 pub mod delegate_retry;
 pub mod devin_hooks_manage;
@@ -37,8 +43,14 @@ pub mod embedded_docs;
 // read-only probe of the pre-#1121 endpoint spelling, and (issue #1211) the
 // daemon's best-effort alias bind of that same spelling.
 pub mod endpoint_resolve;
+// Issue #1516: an in-process stand-in for a few environment knobs, so a test can
+// change one while the deck's own tasks are reading it. Production never sets an
+// override; the environment variables stay the user-facing knobs.
+#[doc(hidden)]
+pub mod env_override;
 pub mod error;
 pub mod event;
+pub mod event_subscriber;
 pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
@@ -54,6 +66,8 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
+// Issue #1540: the deck's last New-agent-form command, owned by the daemon.
+pub mod last_command;
 pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
@@ -81,6 +95,7 @@ pub mod prompt_delivery;
 pub mod quota_block;
 pub mod quota_signals;
 pub mod remote;
+pub mod remote_daemon;
 pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
@@ -92,6 +107,9 @@ pub mod submit_echo;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;
+// Issue #1537: the DEC private-mode parser shared by the TUI's mouse-mode scan
+// and the daemon's output ring, which restores those modes on replay.
+pub(crate) mod terminal_modes;
 pub mod terminal_widget;
 // Issue #322: test-only, and never part of the shipped library. Unit tests in
 // this crate do not link `tests/common/`, so before this they allocated scratch

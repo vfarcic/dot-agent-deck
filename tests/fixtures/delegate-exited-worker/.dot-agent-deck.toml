@@ -1,0 +1,48 @@
+# Fixture for `orchestration/delegate/049` (issue #524) and
+# `orchestration/work-done/015` (issue #507).
+#
+# Workers that end ON THEIR OWN — no `StopAgent`, no pane close — when the
+# test creates their trigger file. `steady` and `fresh` first report
+# `work-done` from inside their own pane (so neither owes anything, and a later
+# delegate cannot be refused as busy for the wrong reason), then exit. The
+# trigger is removed before the report, so a `clear = true` replacement running
+# the same command waits for a NEW trigger instead of exiting at once.
+#
+# Every worker is `worker.py` (beside this file), which logs each line it reads
+# from its PTY to `<role>-received.log`. That log, not the pane's echo, is how
+# the tests see a task pointer arrive: a resize drops the pane's replay ring,
+# and the TUI resizes every role pane once it lays out the new tab (#1539).
+#
+# `steady` is `clear = false`: a delegate to it after the exit has no live
+# worker to reach, and must say so. `fresh` is `clear = true`: a delegate to it
+# after the exit respawns the role, so it must still be delivered — the half
+# that rules out simply refusing every dead pane.
+#
+# `quitter` (`clear = false`) is the #507 worker: given a task, it exits on its
+# trigger WITHOUT reporting, so the commission stays owed while its pane id is
+# free for the successor the test starts there.
+#
+# `$DAD_TEST_BIN` is the branch's own binary, passed in by the test so an
+# installed release on `PATH` cannot stand in for it.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "steady"
+command = "python3 -u worker.py steady steady-reported"
+clear = false
+
+[[orchestrations.roles]]
+name = "fresh"
+command = "python3 -u worker.py fresh fresh-reported"
+clear = true
+
+[[orchestrations.roles]]
+name = "quitter"
+command = "python3 -u worker.py quitter"
+clear = false

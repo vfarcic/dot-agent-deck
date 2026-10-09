@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Upstream PR #918 review fix round: PTY-attached L2 coverage for `pane
 //! restart <role>` — the coverage gap every existing `pane/restart/*` entry
@@ -174,7 +174,16 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         Duration::from_secs(30),
     );
 
-    deck.wait_until_quiescent();
+    // The successful restart response orders the delegate below, and coder's
+    // new generation listed by the daemon confirms it — a condition, not a
+    // quiet screen: a live TUI keeps emitting redraw bytes, so terminal silence
+    // is not a readiness signal.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            role_agent_id(&deck, CODER_ROLE).is_some()
+        }),
+        "the restart must publish coder's new generation"
+    );
 
     let delegate_output = run_delegate_cli(
         &deck,
@@ -247,14 +256,14 @@ fn session_start_hook(pane_id: &str, agent_id: &str, session_id: &str, prompt: &
     .to_string()
 }
 
-/// Scenario: Open the `pane-restart-live` orchestration, let `coder` crash and restart it with the real `pane restart` CLI, so the daemon has published two generations on coder's pane. The new generation reports a `SessionStart` whose prompt marks its card; then a late `SessionStart` from the REPLACED generation arrives, as a slow-booting old agent's hook can. The attached TUI must keep showing the live generation's card and never draw the replaced one's (issue #320).
+/// Scenario: Open the `pane-restart-late-start` orchestration, let `coder` exit on the test's go-ahead and restart it with the real `pane restart` CLI, so the daemon has published two generations on coder's pane. The new generation reports a `SessionStart` whose prompt marks its card; then a late `SessionStart` from the REPLACED generation arrives, as a slow-booting old agent's hook can. The attached TUI must keep showing the live generation's card and never draw the replaced one's (issue #320).
 #[spec("pane/restart/014")]
 #[test]
 fn restart_014_a_replaced_generations_late_start_cannot_take_the_card_back() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(160, 40)
-        .launch_with_fixture("pane-restart-live");
+        .launch_with_fixture("pane-restart-late-start");
     deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_absence("┌ New Agent");
@@ -281,8 +290,19 @@ fn restart_014_a_replaced_generations_late_start_cannot_take_the_card_back() {
         .cwd
         .clone()
         .expect("the orchestrator role must carry its cwd");
+    // The roles spawn concurrently, so coder may not be listed yet; and it
+    // stays listed only until it exits, which is why this fixture's coder
+    // waits for the test's go-ahead instead of exiting on a timer.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            role_agent_id(&deck, CODER_ROLE).is_some()
+        }),
+        "coder must have a daemon record before it exits"
+    );
     let (replaced, coder_pane) =
-        role_agent_id(&deck, CODER_ROLE).expect("coder must have a daemon record before it exits");
+        role_agent_id(&deck, CODER_ROLE).expect("coder is held alive until the go-ahead below");
+    std::fs::write(std::path::Path::new(&cwd).join("coder-may-exit"), b"")
+        .expect("let coder's first generation exit");
 
     std::fs::write(
         std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),

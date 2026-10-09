@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agentDomKey } from "../components/AgentOverview";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type VoiceResultDto, type VoiceStatusDto } from "./bridge";
 import type { DeckActionResult, DeckRuntimeState } from "../types";
 
 type RegistryEntry = {
@@ -55,6 +55,7 @@ vi.mock("../components/TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
+import { saysCommand } from "./voiceActions";
 
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
@@ -110,10 +111,47 @@ function expectOneRegistryDispatch(actionId?: string) {
   if (actionId) expect(registryDispatch).toHaveBeenCalledWith(actionId);
 }
 
+// Exercise the actual shell, voice panel and registry. Only the microphone
+// and remote intent answer are synthetic, as in VoiceControlPanel.test.tsx.
+function renderDashboardVoice(said: string, initial: "deck" | "overview" = "overview", outcome?: VoiceResultDto["outcome"]) {
+  let started = false;
+  let delivered = false;
+  const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({
+    state, capturedMs: 1240, maxMs: 30_000, capped: false, available: true, backend: "remote",
+  });
+  const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({
+    outcome: outcome ?? {
+      kind: "dispatch", transcript: said, action: "clear_dashboard_filter",
+      invoke: "clearDashboardFilter", params: [], sentence: "Showing all agents.",
+    }, resolveMs: null, backend: "stub",
+  }));
+  const snapshot = createFixtureSnapshot("connected");
+  snapshot.agents = snapshot.agents.map((agent, at) => ({ ...agent, displayName: `filter-voice-agent-${at + 1}`, agentType: at === 0 ? "codex" : "claude_code" }));
+  const deck = runtime({
+    snapshot,
+    resolveVoice,
+    voiceStatus: vi.fn(async () => {
+      if (started && !delivered) { delivered = true; return status("done"); }
+      return status(started ? "recording" : "idle");
+    }),
+    voiceStart: vi.fn(async () => { started = true; return status("recording"); }),
+    voiceStop: vi.fn(async () => ({ outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 })),
+    voiceCancel: vi.fn(async () => status("idle")),
+  });
+  render(createElement(DeckShell, { runtime: deck, initialView: { kind: initial } }));
+  return { deck, resolveVoice };
+}
+
+async function speakDashboardCommand(resolveVoice: ReturnType<typeof vi.fn>) {
+  fireEvent.click(screen.getByTestId("voice-trigger"));
+  await waitFor(() => expect(resolveVoice).toHaveBeenCalledTimes(1));
+}
+
 describe("VOICE_ACTIONS", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
     window.localStorage.clear();
+    window.sessionStorage.clear();
     registryDispatch.mockClear();
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
       matches: false,
@@ -148,6 +186,8 @@ describe("VOICE_ACTIONS", () => {
     const voiceActionIds = [
       "openAgent",
       "openOverview",
+      "filterDashboard",
+      "clearDashboardFilter",
       "openDeck",
       "switchDeck",
       // `closeAgentView` is deliberately NOT here any more: `close` names
@@ -160,12 +200,28 @@ describe("VOICE_ACTIONS", () => {
       "showVoiceCommands",
       "dictateToAgent",
       "submitAgentPrompt",
+      "interruptAgent",
+      "clearAgentPrompt",
+      "scratchLastDictation",
       // PRD #1223: the `open_new_agent` row.
       "openNewAgent",
       // PRD #1223: the directory browser's rows.
       "openDirectory",
       "goToParentDirectory",
       "useThisDirectory",
+      // PR #1451 round 3, change 5: the browser's Filter box.
+      "filterDirectories",
+      "clearDirectoryFilter",
+      // PR #1451 round 3, change 4: turning the page of a paged list.
+      "nextPage",
+      "previousPage",
+      // Issue #1492: scrolling the agent dashboard.
+      "scrollDown",
+      "scrollUp",
+      "scrollToTop",
+      "scrollToBottom",
+      // PR #1451 round 4, D8: the New agent form's Command field.
+      "setNewAgentCommand",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);
@@ -190,6 +246,101 @@ describe("VOICE_ACTIONS", () => {
       ).toBe(false);
     }
   });
+
+  /// Scenario: each clear phrase is heard while a text filter hides every agent except one. The actual voice dispatch restores the full dashboard and removes its active-filter controls.
+  it.each(["show everything", "show all agents", "clear the filter", "remove the filter", "reset"])(
+    "clears an active dashboard filter by voice: %s", async (said) => {
+      const { deck, resolveVoice } = renderDashboardVoice(said);
+      const wanted = deck.snapshot.agents[0];
+      fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: wanted.displayName } });
+      expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+      await speakDashboardCommand(resolveVoice);
+      await waitFor(() => expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(deck.snapshot.agents.length));
+      expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+      expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    },
+  );
+
+  /// Scenario: say show everything from the deck with no filter active. It opens the ordinary unfiltered dashboard just as the existing overview command does.
+  it("opens the dashboard from another screen when show everything has no active filter", async () => {
+    const { deck, resolveVoice } = renderDashboardVoice("show everything", "deck");
+    await speakDashboardCommand(resolveVoice);
+    await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(deck.snapshot.agents.length);
+  });
+
+  /// Scenario: say show the dashboard from Daemons using the existing overview voice row. The same synthetic microphone and actual dispatch path still open every agent, proving the new clear-command failures are not capture failures.
+  it("keeps the existing overview voice dispatch working without a filter", async () => {
+    const { deck, resolveVoice } = renderDashboardVoice("show the dashboard", "deck", {
+      kind: "dispatch", transcript: "show the dashboard", action: "open_overview", invoke: "openOverview", params: [], sentence: "Opening the agent dashboard.",
+    });
+    await speakDashboardCommand(resolveVoice);
+    await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(deck.snapshot.agents.length);
+  });
+
+  /// Scenario: activate a filter, visit the deck, then say show everything there. Returning by voice clears the window's previous filter as well as opening the dashboard.
+  it("clears a retained filter and opens the dashboard from another screen", async () => {
+    const { deck, resolveVoice } = renderDashboardVoice("show everything");
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: deck.snapshot.agents[0].displayName } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Daemons" }));
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+    await speakDashboardCommand(resolveVoice);
+    await waitFor(() => expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(deck.snapshot.agents.length));
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+  });
+
+  /// Scenario: activate a dashboard filter, visit the Daemons screen, then return to Dashboard within the same window session. The chosen facet and its visible row survive that navigation until explicitly cleared.
+  it("retains the dashboard filter across navigation within the window session", () => {
+    const { deck } = renderDashboardVoice("show everything");
+    const text = deck.snapshot.agents[0].displayName;
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: text } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Daemons" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue(text);
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Show all" })).toBeVisible();
+  });
+
+  /// Scenario: ask for Codex agents on the unfiltered dashboard. The resolved type facet reaches the same header filter as a click and hides every other type.
+  it("applies the voice type facet to the displayed dashboard", async () => {
+    const { deck, resolveVoice } = renderDashboardVoice("show Codex agents", "overview", {
+      kind: "dispatch", transcript: "show Codex agents", action: "filter_dashboard", invoke: "filterDashboard",
+      params: [{ name: "agent_type", kind: "agent_type_ref", spoken: "Codex", value: "codex", label: "Codex" }],
+      sentence: "Showing Codex agents.",
+    });
+    await speakDashboardCommand(resolveVoice);
+    await waitFor(() => expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1));
+    expect(screen.getByTestId(`overview-agent-${agentDomKey(deck.snapshot.agents[0])}`)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Show all" })).toBeVisible();
+  });
+
+  /// Scenario: filter away the earlier row, then say one with the actual voice panel listening. The first remaining row's pane opens through the locally resolved number instead of the first agent in the original fleet.
+  it("opens the filtered first row when its number is spoken", async () => {
+    const { deck } = renderDashboardVoice("one");
+    const wanted = deck.snapshot.agents[1];
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: wanted.displayName } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(screen.getByTestId(`terminal-${wanted.id}`)).toBeVisible());
+    expect(screen.queryByTestId(`terminal-${deck.snapshot.agents[0].id}`)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: inspect the three prompt-control entries that the typing-mode command rows invoke. Each declares its panel callable as a required capability. */
+  it.each(["interruptAgent", "clearAgentPrompt", "scratchLastDictation"])(
+    "declares the %s prompt-control callable in needs",
+    async (actionId) => {
+      const { VOICE_ACTIONS } = await vi.importActual<{
+        VOICE_ACTIONS: Record<string, RegistryEntry & { needs: string[] }>;
+      }>("./voiceActions");
+      expect(VOICE_ACTIONS).toHaveProperty(actionId);
+      expect(VOICE_ACTIONS[actionId].needs).toEqual([actionId]);
+      expect(typeof VOICE_ACTIONS[actionId].run).toBe("function");
+      expect(VOICE_ACTIONS[actionId].voice).toBe(true);
+    },
+  );
 
   /**
    * Scenario: choose a configured remote daemon in the header selector. The
@@ -640,5 +791,13 @@ describe("VOICE_ACTIONS", () => {
     expect(screen.queryByTestId("orchestration-editor")).not.toBeInTheDocument();
     expect(screen.getByTestId("toast")).toHaveTextContent("That project is no longer one this daemon knows");
     expectOneRegistryDispatch("openProjects");
+  });
+});
+
+describe("saysCommand (PR #1451 round 4, audit A1)", () => {
+  /** Scenario: a sentence that says "command" is about the Command field, whatever case or punctuation the transcriber used; "commands" and a word that merely contains it are not. */
+  it("reads the singular word command and nothing else", () => {
+    expect(["Set the command to devbox run agent.", "COMMAND: bash", "start it with the command npm test"].map(saysCommand)).toEqual([true, true, true]);
+    expect(["what commands can I say", "start it", "commander", ""].map(saysCommand)).toEqual([false, false, false, false]);
   });
 });

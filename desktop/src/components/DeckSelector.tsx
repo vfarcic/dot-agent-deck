@@ -60,7 +60,7 @@
  * M15; `docs/develop/glossary.md` has the canonical words). Identifiers keep
  * their `deck` spelling.
  */
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
 import { LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -75,6 +75,9 @@ import {
   UNKNOWN_DECK_LABEL,
 } from "../lib/endpoints";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
+import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
+import { VoiceNumber } from "./VoiceNumber";
 import type { ConnectionView } from "../types";
 
 /**
@@ -176,6 +179,23 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
   const selection = parseSelection(section?.selection ?? LOCAL_ENDPOINT_SELECTION);
   const current = choices.find((choice) => sameSelection(choice.selection, selection));
   const note = deckStateNote(connection);
+  /*
+    PR #1451 round 3, change 4 — while the menu is open its entries are a
+    numbered list, over whatever screen it opened on (the dialog layer), so
+    "two" switches to the second, as saying its name would. All daemons is
+    numbered like the rest (issue #1491): voice's `switch_deck` switches to it
+    by name, so its number dispatches the same switch with its `all` token.
+  */
+  const numberedChoices = useMemo(() => (open ? choices : undefined), [choices, open]);
+  const numberedEntries = useMemo(() => numberedChoices?.map((choice): VoiceNumberedEntryDto => ({
+    kind: "deck_switch",
+    value: choice.token,
+    label: choice.label,
+    names: choice.address ? [choice.address] : [],
+  })), [numberedChoices]);
+  const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "deck", entries: numberedEntries }], [numberedEntries]);
+  useNumberedList("dialog", numberedSections);
+  const numbersShown = useNumbersShown();
 
   /*
     Dismiss on a pointer-down anywhere else, exactly as `OverviewColumnPicker`
@@ -211,6 +231,15 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
       className="deck-selector"
       ref={root}
       onKeyDown={(event) => {
+        /* A digit picks the daemon showing it while the numbers show. */
+        const number = open && numbersShown ? numberKey(event.nativeEvent) : undefined;
+        const numbered = number === undefined ? undefined : numberedChoices?.[number - 1];
+        if (numbered) {
+          event.preventDefault();
+          event.stopPropagation();
+          choose(numbered.selection);
+          return;
+        }
         if (event.key !== "Escape") return;
         setOpen(false);
         event.stopPropagation();
@@ -261,7 +290,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
                   title={choice.address ? displayText(choice.address, DISPLAY_LIMITS.name) : undefined}
                   onClick={() => choose(choice.selection)}
                 >
-                  <span>{displayText(choice.label, DISPLAY_LIMITS.name)}</span>
+                  <span><VoiceNumber number={numbersShown && numberedChoices ? (numberedChoices.indexOf(choice) + 1 || undefined) : undefined} />{displayText(choice.label, DISPLAY_LIMITS.name)}</span>
                   {chosen && <Check size={12} aria-hidden="true" />}
                 </button>
               );

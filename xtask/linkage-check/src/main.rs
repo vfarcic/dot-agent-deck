@@ -68,6 +68,10 @@
 //!   behind by SIGKILLed test processes. Decides by whether the owning PID
 //!   in the `dad-tests-<pid>-*` name is still alive rather than by age
 //!   (issue #461). Dry-run unless `--apply`.
+//! - `affected-checks` — issue #1575: prints the checks a change needs,
+//!   from the merge-base with `origin/main` to the working tree (or the paths
+//!   given): CLAUDE.md rule 2's and rule 5's full gates for code or a build
+//!   input, and the tests that read them for text. See [`affected_checks`].
 //! - `list-tests` — PRD #77 Decision 31: emits a Markdown report of
 //!   every `#[spec]` test created or modified in this branch versus
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
@@ -82,6 +86,10 @@
 /// lives in the scripts, and their whole value is runtime behaviour, so a
 /// compile-time gate proves nothing about them (the same reason `clean_tmp`'s
 /// deletion-safety properties are tested here rather than trusted).
+/// Issue #1575: `cargo xtask affected-checks`, which says which of CLAUDE.md
+/// rule 2's and rule 5's gates a change needs — the full gates for code or a
+/// build input, the tests that read them for text.
+mod affected_checks;
 #[cfg(all(test, unix))]
 mod build_gate;
 mod clean_tmp;
@@ -140,6 +148,12 @@ mod issue_labeler_policy;
 #[cfg(test)]
 mod junit_strip;
 mod list_tests;
+/// Issue #1610: every project-local skill that runs `gh pr merge` without
+/// `--auto` names the overlap check `issue-queue` defines, and CLAUDE.md rule 8
+/// points a person merging by hand at it. Tests only — the rule is prose in
+/// repository files, which no compile step reads.
+#[cfg(test)]
+mod merge_overlap_check;
 /// Issue #831: printing a walked path the way this repository writes
 /// paths. Shared by `desktop_palette` and `list_tests`, which both build a
 /// repo-relative string out of a directory walk and print it next to
@@ -160,6 +174,12 @@ mod pin_lockstep;
 /// here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
+/// Issue #1591: where a PRD lives — its `prds/` file when one exists, else its
+/// issue body — is decided by `.claude/skills/prd-start/prd-source.sh`, and
+/// each PRD skill fork replaced its `dot-ai` mirror. Tests only, and Unix only:
+/// the scripts are driven under `bash` against offline `gh` and `git` stand-ins.
+#[cfg(all(test, unix))]
+mod prd_skills;
 /// Issue #1019 review: `scripts/reap-orphans.sh` SIGKILLs processes selected by
 /// parsing `/proc`, and every property that makes that safe — the never-kill
 /// list, the two-part MCP identification, the stat-field arithmetic past a comm
@@ -185,6 +205,12 @@ mod release_channel_vars;
 /// release has gone out wrong.
 #[cfg(test)]
 mod release_workflow_wiring;
+/// PR #1488: lock file maintenance automerges only through Renovate's own
+/// all-checks merge (`platformAutomerge: false`), because the jobs that reject
+/// a bad lock refresh are unrequired. Tests only — the config validator accepts
+/// either value, so nothing else notices the setting going away.
+#[cfg(test)]
+mod renovate_lock_file_maintenance;
 mod repo_state;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
@@ -208,6 +234,14 @@ mod site_image_refs;
 /// property exists purely at run time in repository files.
 #[cfg(test)]
 mod skill_frontmatter;
+/// `.claude/skills/tag-release/cleanup.sh`, the detector whose lists the
+/// tag-release skill deletes from once the user confirms. Which list a
+/// directory lands in — offered, held by a live process, labelled as holding
+/// unpushed commits — is a runtime decision in the script. Tests only, and Unix
+/// only: driven under `bash` against a sandbox repository, with the process
+/// assertions Linux-only because they read `/proc`.
+#[cfg(all(test, unix))]
+mod tag_release_cleanup;
 /// Issue #688: a `src/` unit test that spawns a hook emitter — a
 /// Wrapper-strategy `agent_type`, or a command naming an agent or the deck —
 /// pins that child's deck endpoints through `src/test_isolation.rs`. Like
@@ -589,8 +623,12 @@ fn check_self_contained(root: &Path) -> Vec<String> {
 /// harness, or `child_lifetime_bound::arm()` for the ones that deliberately do
 /// not (`tests/common/child_lifetime_bound.rs` is `#[path]`-includable on its
 /// own, because `tests/common/mod.rs` is ~420 KB of PTY harness and pulling it
-/// into a fast-tier crate to reach one `set_var` is a real compile cost). Either
-/// marker anywhere in the file clears it.
+/// into a fast-tier crate to reach one variable is a real compile cost). Either
+/// marker anywhere in the file clears it. Since issue #678 neither call writes
+/// anything — the cap is pinned by a constructor in
+/// `tests/common/child_lifetime_bound.rs` that runs before `main` — so what a
+/// marker really proves is that the file includes the module carrying that
+/// constructor, because neither call compiles without it.
 ///
 /// **The view both halves are matched over** is comment-stripped AND
 /// literal-blanked ([`blank_string_literal_contents`]), so prose about either
@@ -604,13 +642,14 @@ fn check_self_contained(root: &Path) -> Vec<String> {
 /// **Its false-negative surface, stated rather than hidden.** This is a line
 /// scan, not a parser, so it is a belt: the load-bearing protection is the fd
 /// fix in `src/wrap.rs`, which makes a stranded child die of its own hangup with
-/// no env var involved. Three things it cannot see. It checks *presence*, not
-/// *ordering*, so an `arm()` call placed after the spawn passes. It is
-/// file-granular, so one armed test clears a second unarmed one in the same
-/// file. And it keys on the module being included under its own name, so
-/// `#[path = "common/child_lifetime_bound.rs"] mod bound;` defeats the marker.
-/// All three are review-visible in a way the original gap was not, which is the
-/// bar this rule is aiming at.
+/// no env var involved. Two things it cannot see. It is file-granular, so one
+/// marked test clears a second unmarked one in the same file — harmless since
+/// issue #678, because the constructor arms the whole binary either way, and
+/// the reason it used to also miss an `arm()` placed *after* the spawn is gone
+/// for the same reason. And it keys on the module being included under its own
+/// name, so `#[path = "common/child_lifetime_bound.rs"] mod bound;` defeats the
+/// marker. Both are review-visible in a way the original gap was not, which is
+/// the bar this rule is aiming at.
 const UNARMED_SPAWN_RULE: &str = "agent spawn path with no lifetime bound armed — this file \
      builds an `AgentPtyRegistry` or runs a daemon in-process, so the agents it spawns inherit \
      THIS process's environment, and `dot-agent-deck wrap` leaves both its self-defence and \
@@ -1519,6 +1558,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("site")) {
         return xtask_site::run(&repo_root(), &args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("affected-checks")) {
+        return affected_checks::run(&repo_root(), &args[1..]);
     }
     // Accepted anywhere in the remaining args, because the `linkage-check`
     // subcommand name itself is optional: `cargo xtask --list-rules` and

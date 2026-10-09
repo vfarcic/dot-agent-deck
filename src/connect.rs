@@ -29,10 +29,15 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::build_version_handshake::KEEP_DAEMON_ENV;
 use crate::daemon_protocol::AttachResponse;
+use crate::daemon_upgrade::{
+    NotRestartedReason, RestartDecider, TtyDecider, UpgradeOutcome, client_is_newer,
+};
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
 };
+use crate::version::parse_version_output;
 
 /// Marker `kind` for entries the user added with `--type=kubernetes`. M2.4
 /// rejects these explicitly so the message clearly points the user at PRD #81
@@ -365,36 +370,6 @@ pub fn probe_timeout_secs() -> u64 {
         .clamp(1, PROBE_TIMEOUT_SECS_MAX)
 }
 
-/// Pull the version number out of `dot-agent-deck --version` output.
-///
-/// Stricter than `remote::parse_version_output` (which is happy with any
-/// second whitespace token) because the connect probe uses the parse to
-/// distinguish "remote really is dot-agent-deck" from "remote is some
-/// other binary at the same path." Requires:
-///
-/// 1. The first whitespace token to be exactly `dot-agent-deck`.
-/// 2. The second token to be at least one digit followed by a dot — a
-///    cheap-but-sufficient sanity check that catches "hello world" while
-///    accepting both `0.24.5` and `v0.24.5-rc.1`.
-fn parse_version_output(stdout: &str) -> Option<String> {
-    let mut parts = stdout.split_whitespace();
-    let prog = parts.next()?;
-    if prog != "dot-agent-deck" {
-        return None;
-    }
-    let version = parts.next()?;
-    let stripped = version.strip_prefix('v').unwrap_or(version);
-    let mut chars = stripped.chars();
-    let first = chars.next()?;
-    if !first.is_ascii_digit() {
-        return None;
-    }
-    if !stripped.contains('.') {
-        return None;
-    }
-    Some(version.to_string())
-}
-
 /// Maximum bytes the binary-version probe keeps from either stream.
 ///
 /// `dot-agent-deck --version` prints one short line, and the biggest thing ssh
@@ -448,77 +423,99 @@ pub fn probe_remote_version(
     // install_path because non-interactive ssh shells typically don't have
     // ~/.local/bin on PATH (same fix as ea8c748).
     let cmd = format!("{install_path} --version");
-    let result = executor.run_capped(target, &cmd, PROBE_VERSION_CAP);
-    match result {
-        Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        // A stream that reached its cap is a prefix, and `parse_version_output`
-        // reads only the FIRST two tokens — so a status-0 remote emitting
-        // exactly `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
-        // `dot-agent-deck <version>` pair would otherwise PASS on the strength
-        // of output we know we stopped reading (PRD #345 second audit).
-        // Refusing to trust a truncated handshake is strictly safer for
-        // `connect` too, not only for the doctor.
-        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+    match classify_version_probe(executor.run_capped(target, &cmd, PROBE_VERSION_CAP)) {
+        Ok(version) => Ok(version),
+        Err(VersionProbeFailure::Ssh(ssh_err)) => Err(map_probe_ssh_error(name, ssh_err)),
+        Err(VersionProbeFailure::Truncated) => Err(RemoteConnectError::ProbeOutputTruncated {
             name: name.to_string(),
             probe: "--version",
             cap: PROBE_VERSION_CAP,
         }),
-        Ok(capped) => {
-            let output = capped.output;
-            // Exit 127 (and the typical bash "command not found" message) is
-            // the canonical "binary missing" signal. We also treat any
-            // non-zero exit whose stderr mentions "not found" as missing —
-            // some shells use 126/127 inconsistently for permission vs
-            // missing.
-            if output.status == 127
-                || output.stderr.to_ascii_lowercase().contains("not found")
-                || output.stderr.to_ascii_lowercase().contains("no such file")
-            {
-                return Err(RemoteConnectError::RemoteBinaryMissing {
-                    name: name.to_string(),
-                    install_path: install_path.to_string(),
-                });
-            }
-            // Any other non-zero exit means the remote ran *something* and
-            // it failed; surface it as a host-unreachable-style error so the
-            // user sees the underlying message rather than a misleading
-            // "binary missing" hint.
-            if output.status != 0 {
-                // The remote wrote this. It reaches a terminal verbatim (and
-                // `remote doctor` quotes the first 200 characters of it into
-                // its report), so a malicious remote binary or shell startup
-                // file could otherwise smuggle CSI/OSC sequences that repaint
-                // the screen, retitle the terminal or forge a hyperlink —
-                // including over the diagnostic's own conclusions. Escape,
-                // don't strip: the user should be able to SEE that the remote
-                // sent something peculiar.
-                let detail = if output.stderr.trim().is_empty() {
-                    format!("ssh exited with status {}", output.status)
-                } else {
-                    crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
-                };
-                return Err(RemoteConnectError::HostUnreachable {
-                    name: name.to_string(),
-                    detail,
-                });
-            }
-            match parse_version_output(&output.stdout) {
-                // PRD #161 M1.2: no laptop↔remote comparison — just surface
-                // the remote version for the newer-only nudge decision.
-                Some(remote_version) => Ok(remote_version),
-                None => {
-                    // Status was 0 but stdout doesn't look like a version
-                    // line — e.g. `dot-agent-deck` was replaced with a stub
-                    // script. Treat as binary-missing because `remote
-                    // upgrade` is the right recovery path.
-                    Err(RemoteConnectError::RemoteBinaryMissing {
-                        name: name.to_string(),
-                        install_path: install_path.to_string(),
-                    })
-                }
-            }
-        }
+        Err(VersionProbeFailure::BinaryMissing) => Err(RemoteConnectError::RemoteBinaryMissing {
+            name: name.to_string(),
+            install_path: install_path.to_string(),
+        }),
+        // Any other non-zero exit means the remote ran *something* and it
+        // failed; surface it as a host-unreachable-style error so the user
+        // sees the underlying message rather than a misleading "binary
+        // missing" hint.
+        Err(VersionProbeFailure::Failed { detail }) => Err(RemoteConnectError::HostUnreachable {
+            name: name.to_string(),
+            detail,
+        }),
     }
+}
+
+/// Why the binary-version probe (`<install_path> --version` over ssh) produced
+/// no version: [`classify_version_probe`]'s classification, shared by
+/// [`probe_remote_version`] and the desktop's remote start
+/// ([`crate::daemon_start`], issue #1490) so the two cannot disagree about what
+/// a reply means.
+#[derive(Debug)]
+pub enum VersionProbeFailure {
+    /// ssh itself failed: unreachable, authentication, host key.
+    Ssh(SshError),
+    /// A stream reached its cap, so the reply is a prefix and was not parsed.
+    Truncated,
+    /// ssh succeeded and the remote shell found no deck binary at the path
+    /// (or something that does not print a deck version line).
+    BinaryMissing,
+    /// The remote ran something and it failed; `detail` is its stderr,
+    /// escaped for a terminal.
+    Failed { detail: String },
+}
+
+/// Whether a remote command's exit `status` and `stderr` say the binary it
+/// named is not there. Exit 127 (and the typical bash "command not found"
+/// message) is the canonical signal; any non-zero exit whose stderr mentions
+/// "not found" or "no such file" counts too, because some shells use 126/127
+/// inconsistently for permission vs missing.
+pub fn is_missing_binary(status: i32, stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    status == 127 || stderr.contains("not found") || stderr.contains("no such file")
+}
+
+/// Classify what one binary-version probe returned: the remote's version, or
+/// why there is none. See [`probe_remote_version`] for the failure modes.
+pub fn classify_version_probe(
+    result: Result<crate::remote::CappedOutput, SshError>,
+) -> Result<String, VersionProbeFailure> {
+    let capped = result.map_err(VersionProbeFailure::Ssh)?;
+    // A stream that reached its cap is a prefix, and `parse_version_output`
+    // reads only the FIRST two tokens — so a status-0 remote emitting exactly
+    // `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
+    // `dot-agent-deck <version>` pair would otherwise PASS on the strength of
+    // output we know we stopped reading (PRD #345 second audit). Refusing to
+    // trust a truncated handshake is strictly safer for `connect` too, not
+    // only for the doctor.
+    if capped.truncated {
+        return Err(VersionProbeFailure::Truncated);
+    }
+    let output = capped.output;
+    if is_missing_binary(output.status, &output.stderr) {
+        return Err(VersionProbeFailure::BinaryMissing);
+    }
+    if output.status != 0 {
+        // The remote wrote this. It reaches a terminal verbatim (and `remote
+        // doctor` quotes the first 200 characters of it into its report), so a
+        // malicious remote binary or shell startup file could otherwise smuggle
+        // CSI/OSC sequences that repaint the screen, retitle the terminal or
+        // forge a hyperlink — including over the diagnostic's own conclusions.
+        // Escape, don't strip: the user should be able to SEE that the remote
+        // sent something peculiar.
+        let detail = if output.stderr.trim().is_empty() {
+            format!("ssh exited with status {}", output.status)
+        } else {
+            crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
+        };
+        return Err(VersionProbeFailure::Failed { detail });
+    }
+    // PRD #161 M1.2: no laptop↔remote comparison — just surface the remote
+    // version for the newer-only nudge decision. Status 0 but stdout that does
+    // not look like a version line (e.g. `dot-agent-deck` replaced with a stub
+    // script) is binary-missing, because `remote upgrade` is the right
+    // recovery path.
+    parse_version_output(&output.stdout).ok_or(VersionProbeFailure::BinaryMissing)
 }
 
 /// Maximum bytes of stdout the protocol probe accepts before declaring the
@@ -799,7 +796,14 @@ fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
 /// - The user@host argument goes through `arg(...)` (no shell), so even a
 ///   hostile host string can't shell-inject locally. Same defense as
 ///   `remote::SystemSshExecutor::build_command`.
-pub fn build_connect_command(target: &SshTarget, install_path: &str) -> Command {
+/// - `target.jump` (the deck list's jump host) is ignored: connect routing
+///   through a jump host is not supported yet (PRD #1487 uses it only for
+///   `remote upgrade`).
+/// - `keep_daemon` (PRD #1487) adds [`KEEP_DAEMON_ENV`]`=1`: the user chose to
+///   keep the remote's current daemon when upgrading, so the remote TUI attaches
+///   to it without asking about a restart a second time. Only ever set after a
+///   successful install, so the remote binary always understands it.
+pub fn build_connect_command(target: &SshTarget, install_path: &str, keep_daemon: bool) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
     // ConnectTimeout caps only the pre-handshake phase. Once the session is up
@@ -828,8 +832,13 @@ pub fn build_connect_command(target: &SshTarget, install_path: &str) -> Command 
     // hard-code the install_path expansion to the remote shell — `~` will
     // be expanded by the remote shell, which is what we want (and what the
     // install pipeline relies on).
+    let keep = if keep_daemon {
+        format!(" {KEEP_DAEMON_ENV}=1")
+    } else {
+        String::new()
+    };
     cmd.arg(format!(
-        "env {VIA_DAEMON_ENV}=1 {install_path}",
+        "env {VIA_DAEMON_ENV}=1{keep} {install_path}",
         VIA_DAEMON_ENV = VIA_DAEMON_ENV,
         install_path = install_path,
     ));
@@ -842,7 +851,13 @@ pub fn build_connect_command(target: &SshTarget, install_path: &str) -> Command 
 pub trait ConnectSpawner {
     /// Spawn the connect command, inherit stdio, and block until the child
     /// exits. Return ssh's exit code (or `1` if the child died of a signal).
-    fn spawn(&self, target: &SshTarget, install_path: &str) -> Result<i32, std::io::Error>;
+    /// `keep_daemon` is [`build_connect_command`]'s.
+    fn spawn(
+        &self,
+        target: &SshTarget,
+        install_path: &str,
+        keep_daemon: bool,
+    ) -> Result<i32, std::io::Error>;
 }
 
 /// Production spawner: builds the ssh command via [`build_connect_command`]
@@ -863,8 +878,13 @@ impl Default for SystemConnectSpawner {
 }
 
 impl ConnectSpawner for SystemConnectSpawner {
-    fn spawn(&self, target: &SshTarget, install_path: &str) -> Result<i32, std::io::Error> {
-        let mut cmd = build_connect_command(target, install_path);
+    fn spawn(
+        &self,
+        target: &SshTarget,
+        install_path: &str,
+        keep_daemon: bool,
+    ) -> Result<i32, std::io::Error> {
+        let mut cmd = build_connect_command(target, install_path, keep_daemon);
         let status = cmd.status()?;
         Ok(exit_code_from_status(&status))
     }
@@ -905,42 +925,29 @@ impl ReconnectBackoff for SleepBackoff {
     }
 }
 
-/// PRD #161 M1.2: abstraction over running `remote upgrade` (binary swap only)
-/// from the connect nudge's `y` path. Modeled on the [`ConnectSpawner`] /
-/// [`ReconnectBackoff`] seams: production swaps the remote binary via
-/// [`crate::remote::upgrade`]; unit tests inject a fake that records the call
-/// and returns a scripted success/failure so the nudge's upgrade-then-connect
-/// and upgrade-failure-fallback branches are exercisable without ssh.
+/// Upgrade a remote from the connect nudge's `y` path: install the laptop's
+/// version and restart the remote daemon onto it, through
+/// [`crate::daemon_upgrade::upgrade_daemon`] — the same function `remote
+/// upgrade` and the desktop run (PRD #1487). Modeled on the [`ConnectSpawner`]
+/// / [`ReconnectBackoff`] seams so unit tests inject a fake that records the
+/// call and returns a scripted outcome.
 ///
-/// **Binary-swap-only by contract (D3):** the upgrader MUST NOT restart the
-/// remote daemon or kill agents. Any daemon restart is the Part-A handshake's
-/// job on the remote's own machine — the connect `y`-path only orchestrates
-/// the binary swap, then connects.
+/// The daemon applies its own live-agent policy: an idle daemon restarts
+/// without a question, and when agents or orchestration roles would stop the
+/// upgrader asks `decider` — on the terminal the nudge itself is using — before
+/// anything is stopped. Whatever the outcome, connect goes ahead (D4: never
+/// strand).
 pub trait RemoteUpgrader {
-    /// Upgrade remote `name` to `version` (the laptop's version). `Ok(())` on
-    /// success; `Err(msg)` carries a user-facing failure reason so the nudge
-    /// can print a clear fallback line before connecting to the existing
-    /// version (D4: never strand).
-    fn upgrade(&self, name: &str, version: &str) -> Result<(), String>;
+    /// Upgrade remote `name` to `version` (the laptop's version).
+    fn upgrade(&self, name: &str, version: &str, decider: &dyn RestartDecider) -> UpgradeOutcome;
 }
 
-/// PRD #161 FIX 3: ssh keepalive parameters for the remote-UPGRADE executor.
-/// Tuned to DETECT a dead/stalled connection within roughly
-/// `UPGRADE_SSH_ALIVE_INTERVAL * UPGRADE_SSH_ALIVE_COUNT_MAX` seconds (~2 min)
-/// of a truly dead link, WITHOUT a hard wallclock cap that would wrongly kill a
-/// slow-but-alive release download (which keeps answering keepalive probes at
-/// the ssh transport layer).
-const UPGRADE_SSH_CONNECT_TIMEOUT: u64 = 30;
-const UPGRADE_SSH_ALIVE_INTERVAL: u64 = 15;
-const UPGRADE_SSH_ALIVE_COUNT_MAX: u32 = 8;
-
-/// Production upgrader: runs the binary-swap-only [`crate::remote::upgrade`]
-/// flow against the registry at `remotes_path`. Uses a
-/// [`crate::remote::SystemSshExecutor::with_keepalive`] executor (NOT the
-/// wallclock-capped probe executor): a release download + install can
-/// legitimately run longer than the short version-probe timeout, so instead of
-/// a hard wallclock cap it relies on ssh keepalives to DETECT a dead/stalled
-/// connection while leaving a slow-but-alive download running (PRD #161 FIX 3).
+/// Production upgrader: [`crate::daemon_upgrade::upgrade_daemon`] with an
+/// [`crate::daemon_upgrade::SshInstaller`] and an
+/// [`crate::remote_daemon::SshDaemonPort`] for the registry row, both on the
+/// keepalive ssh executor (a release download can outlast the short probe
+/// timeout, so a dead link is detected by keepalives instead of a wallclock
+/// cap — PRD #161 FIX 3).
 pub struct SystemRemoteUpgrader {
     remotes_path: PathBuf,
 }
@@ -952,65 +959,73 @@ impl SystemRemoteUpgrader {
 }
 
 impl RemoteUpgrader for SystemRemoteUpgrader {
-    fn upgrade(&self, name: &str, version: &str) -> Result<(), String> {
-        let opts = crate::remote::UpgradeOptions {
-            name: name.to_string(),
-            version: version.to_string(),
-            no_install: false,
-            release_base: crate::remote::RELEASE_BASE.to_string(),
+    fn upgrade(&self, name: &str, version: &str, decider: &dyn RestartDecider) -> UpgradeOutcome {
+        use crate::daemon_upgrade::{
+            SshInstaller, UpgradePlan, UpgradeStage, upgrade_daemon, upgrade_ssh_executor,
         };
-        // PRD #161 FIX 3: keepalive-bearing executor (not the uncapped
-        // `new()`), so a dropped/stalled ssh connection during the upgrade is
-        // detected instead of hanging connect indefinitely — without a hard
-        // wallclock cap that would kill a slow-but-alive download.
-        let executor = crate::remote::SystemSshExecutor::with_keepalive(
-            UPGRADE_SSH_CONNECT_TIMEOUT,
-            UPGRADE_SSH_ALIVE_INTERVAL,
-            UPGRADE_SSH_ALIVE_COUNT_MAX,
+        let entry = match lookup_remote(name, &self.remotes_path) {
+            Ok(entry) => entry,
+            Err(e) => {
+                return UpgradeOutcome::Failed {
+                    stage: UpgradeStage::Installing,
+                    reason: e.to_string(),
+                    installed_version: None,
+                    old_daemon_gone: false,
+                };
+            }
+        };
+        let installer = SshInstaller::for_entry(
+            &entry,
+            self.remotes_path.clone(),
+            Box::new(std::io::stdout()),
         );
-        crate::remote::upgrade(&opts, &executor, &self.remotes_path)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let port = crate::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+        let plan = UpgradePlan {
+            version: version.to_string(),
+            successor: crate::daemon_protocol::RestartSuccessor::Installed,
+        };
+        upgrade_daemon(name, &plan, &installer, &port, decider, &mut |p| {
+            print_upgrade_progress(name, &p, &mut std::io::stdout())
+        })
     }
 }
 
-/// PRD #161 M1.2 (D3): is the laptop strictly newer than the remote? The
-/// connect nudge is **newer-only** — it never suggests a downgrade or a no-op
-/// same-version upgrade — so an equal or older laptop returns `false` and no
-/// prompt is shown. Both sides are parsed as semver (stripping the optional
-/// `v` prefix the install pipeline may carry); if either fails to parse we
-/// conservatively return `false`, so a malformed version string can never
-/// trigger a spurious upgrade prompt.
-fn laptop_is_newer(local: &str, remote: &str) -> bool {
-    let parse = |s: &str| semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok();
-    match (parse(local), parse(remote)) {
-        (Some(l), Some(r)) => l > r,
-        _ => false,
-    }
+/// One line per upgrade stage, shared by `connect` and `remote upgrade`.
+pub fn print_upgrade_progress(
+    name: &str,
+    progress: &crate::daemon_upgrade::UpgradeProgress,
+    out: &mut dyn Write,
+) {
+    use crate::daemon_upgrade::UpgradeStage;
+    let line = match progress.stage {
+        UpgradeStage::Installing => format!("Installing the new build on '{name}'..."),
+        UpgradeStage::Restarting => format!("Asking the daemon on '{name}' to restart..."),
+        UpgradeStage::Verifying => format!("Waiting for the new daemon on '{name}' to answer..."),
+    };
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
-/// PRD #161 M1.2 (D3/D4): the one-step, laptop-side, pre-handover upgrade
-/// nudge that replaces the deleted laptop↔remote enforcement.
+/// PRD #161 M1.2 (D3/D4), PRD #1487: the one-step, laptop-side, pre-handover
+/// upgrade nudge.
 ///
 /// Shown **only** when the laptop is strictly newer than the remote
-/// ([`laptop_is_newer`]) *and* stdin is a TTY (`is_tty`); otherwise this is a
+/// ([`client_is_newer`]) *and* stdin is a TTY (`is_tty`); otherwise this is a
 /// no-op and `connect` proceeds against the existing remote. The prompt
 /// defaults to **No** — empty / `Enter` / EOF / anything that isn't an
 /// explicit `y`/`yes`:
 ///
-/// - `y`/`yes` → run `remote upgrade` (binary swap only) via `upgrader`, then
-///   connect. If the upgrade fails, print a clear fallback line and connect to
-///   the **existing** version anyway (never strand — D4). The Part-A handshake
-///   then owns any daemon restart on attach.
+/// - `y`/`yes` → install and restart through `upgrader`, which may ask the
+///   restart question on this same terminal, then print the outcome and
+///   connect whatever it was (never strand — D4). A failed install says so and
+///   connects to the **existing** version.
 /// - `Enter` / `n` / EOF → connect as-is against the existing version.
 ///
 /// `agent_count` (from the `daemon hello` probe's `running_agents`) is folded
-/// into the prompt as "(N running agents)" when known, so the user sees the
-/// restart cost the upgrade incurs on attach. It is `None` on the current
-/// static-probe path; the note is simply omitted in that case.
+/// into the prompt as "(N running agents)" when known.
 ///
 /// Generic over `BufRead` / `Write` so tests inject fake I/O (same seam as
-/// [`pick_remote`]). Returns whether an upgrade ran and succeeded.
+/// [`pick_remote`]). Returns the upgrade's outcome when one ran.
 #[allow(clippy::too_many_arguments)]
 fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     upgrader: &dyn RemoteUpgrader,
@@ -1021,20 +1036,25 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     is_tty: bool,
     input: &mut R,
     output: &mut W,
-) -> Result<bool, RemoteConnectError> {
+) -> Result<Option<UpgradeOutcome>, RemoteConnectError> {
     // Newer-only: never suggest a downgrade or a same-version no-op.
-    if !laptop_is_newer(local_version, remote_version) {
-        return Ok(false);
+    if !client_is_newer(local_version, remote_version) {
+        return Ok(None);
     }
     // Non-TTY: no one to answer the prompt — connect as-is, no nudge.
     if !is_tty {
-        return Ok(false);
+        return Ok(None);
     }
 
     let agents_note = match agent_count {
         Some(n) if n > 0 => format!(" ({n} running agents)"),
         _ => String::new(),
     };
+    // Remote-reported: the display copy only (PRD #1487 audit A3).
+    let remote_version = &crate::untrusted_text::display_line(
+        remote_version,
+        crate::untrusted_text::REMOTE_NAME_MAX_BYTES,
+    );
     write!(
         output,
         "Remote '{name}' runs {remote_version}; you have {local_version}{agents_note}. Upgrade and connect? [y/N] "
@@ -1047,22 +1067,29 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     // Default N: empty input / bare Enter / EOF / anything but an explicit yes.
     let yes = n != 0 && (answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
     if !yes {
-        return Ok(false);
+        return Ok(None);
     }
 
-    // `y` → binary-swap upgrade to the laptop's version, then connect. A
-    // failure falls back to connecting the existing version with a clear
-    // message; the failure semantics are owned by `remote upgrade` (D3/D4).
-    match upgrader.upgrade(name, local_version) {
-        Ok(()) => Ok(true),
-        Err(msg) => {
-            writeln!(
-                output,
-                "warning: upgrade of remote '{name}' failed: {msg}\nConnecting to the existing {remote_version} install instead."
-            )?;
-            Ok(false)
-        }
+    // `y` → install and restart to the laptop's version, then connect whatever
+    // the outcome (D4).
+    let outcome = {
+        let decider = TtyDecider::new(&mut *input, &mut *output);
+        upgrader.upgrade(name, local_version, &decider)
+    };
+    let summary = outcome.summary(name);
+    match &outcome {
+        UpgradeOutcome::Failed {
+            installed_version: None,
+            ..
+        } => writeln!(
+            output,
+            "warning: {summary}\nConnecting to the existing {remote_version} install instead."
+        )?,
+        UpgradeOutcome::Failed { .. } => writeln!(output, "warning: {summary}")?,
+        _ => writeln!(output, "{summary}")?,
     }
+    output.flush()?;
+    Ok(Some(outcome))
 }
 
 /// PRD #148: best-effort restore of a sane local terminal after auto-reconnect
@@ -1443,7 +1470,12 @@ pub fn run_connect<R: BufRead, W: Write>(
     output: &mut W,
     is_tty: bool,
 ) -> Result<i32, RemoteConnectError> {
-    let target = entry.ssh_target();
+    // PRD #1487 gave `SshTarget` the deck list's jump host, for `remote
+    // upgrade`. Connect routing does not use it yet (`build_connect_command`
+    // ignores it), so the probes are kept on the same direct route as the
+    // session they precede.
+    let mut target = entry.ssh_target();
+    target.jump = None;
     let mut install_path = install_path.to_string();
 
     // 1-based count of connect attempts made (initial connect + reconnects).
@@ -1467,6 +1499,10 @@ pub fn run_connect<R: BufRead, W: Write>(
     // A transient SSH failure after discovery may retry the handshake. Keep
     // the verified candidate until the handshake succeeds and we record it.
     let mut discovered_binary = None;
+    // PRD #1487: the user upgraded but kept the remote's running daemon, so the
+    // remote TUI must attach to it without asking about a restart again. Kept
+    // for reconnects too: the choice was about this daemon, not this session.
+    let mut keep_daemon = false;
     loop {
         attempt += 1;
 
@@ -1610,7 +1646,7 @@ pub fn run_connect<R: BufRead, W: Write>(
         // connect to the upgraded remote (a failed upgrade falls back to the
         // existing version).
         if !session_established {
-            let upgraded = maybe_nudge_upgrade(
+            let outcome = maybe_nudge_upgrade(
                 upgrader,
                 &entry.name,
                 &remote_version,
@@ -1625,18 +1661,35 @@ pub fn run_connect<R: BufRead, W: Write>(
             // from the one this connect started with — an entry that recorded
             // no method, on a remote whose deck Homebrew installed. Connect to
             // the binary that was just upgraded, not to the one before it.
-            if upgraded && let Ok(updated) = lookup_remote(&entry.name, remotes_path) {
-                install_path = updated.remote_binary().to_string();
+            if let Some(outcome) = &outcome {
+                let installed = !matches!(
+                    outcome,
+                    UpgradeOutcome::Failed {
+                        installed_version: None,
+                        ..
+                    }
+                );
+                if installed && let Ok(updated) = lookup_remote(&entry.name, remotes_path) {
+                    install_path = updated.remote_binary().to_string();
+                }
+                keep_daemon = matches!(
+                    outcome,
+                    UpgradeOutcome::InstalledNotRestarted {
+                        reason: NotRestartedReason::KeptByUser { .. }
+                            | NotRestartedReason::NoOneToAsk { .. },
+                        ..
+                    }
+                );
             }
         }
 
         // Stage 2: hand the terminal over. This blocks until the user exits.
-        let exit_code = spawner.spawn(&target, &install_path).map_err(|source| {
-            RemoteConnectError::SpawnFailed {
+        let exit_code = spawner
+            .spawn(&target, &install_path, keep_daemon)
+            .map_err(|source| RemoteConnectError::SpawnFailed {
                 name: entry.name.clone(),
                 source,
-            }
-        })?;
+            })?;
         if !session_established {
             session_established = true;
             // Greptile P1 on PR #859: the probe retries that got this FIRST
@@ -1754,7 +1807,7 @@ mod tests {
     #[test]
     fn build_connect_command_has_t_flag_and_via_daemon_env() {
         let target = ssh_target("viktor@host.example.com", 22);
-        let cmd = build_connect_command(&target, "~/.local/bin/dot-agent-deck");
+        let cmd = build_connect_command(&target, "~/.local/bin/dot-agent-deck", false);
         let args = args_of(&cmd);
 
         // -t must be present (remote TUI requires a pty); install_path is
@@ -1810,6 +1863,22 @@ mod tests {
         );
     }
 
+    /// PRD #1487: a kept daemon is passed to the remote TUI as
+    /// `DOT_AGENT_DECK_KEEP_DAEMON=1`, inside the same `env` prefix.
+    #[test]
+    fn build_connect_command_carries_keep_daemon_only_when_asked() {
+        let target = ssh_target("h", 22);
+        let kept = build_connect_command(&target, REMOTE_INSTALL_PATH, true);
+        assert_eq!(
+            args_of(&kept).last().unwrap(),
+            &format!(
+                "env DOT_AGENT_DECK_VIA_DAEMON=1 DOT_AGENT_DECK_KEEP_DAEMON=1 {REMOTE_INSTALL_PATH}"
+            )
+        );
+        let plain = build_connect_command(&target, REMOTE_INSTALL_PATH, false);
+        assert!(!args_of(&plain).last().unwrap().contains("KEEP_DAEMON"));
+    }
+
     #[test]
     fn build_connect_command_passes_port_and_key() {
         let target = SshTarget {
@@ -1817,8 +1886,9 @@ mod tests {
             user: Some("u".to_string()),
             port: 2222,
             key: Some(std::path::PathBuf::from("/tmp/key id_rsa")),
+            jump: None,
         };
-        let cmd = build_connect_command(&target, "~/.local/bin/dot-agent-deck");
+        let cmd = build_connect_command(&target, "~/.local/bin/dot-agent-deck", false);
         let args = args_of(&cmd);
         // -p PORT must appear (custom port survives the round-trip).
         let p_pos = args.iter().position(|a| a == "-p").expect("missing -p");
@@ -1831,7 +1901,7 @@ mod tests {
     #[test]
     fn build_connect_command_omits_key_when_none() {
         let target = ssh_target("h", 22);
-        let cmd = build_connect_command(&target, REMOTE_INSTALL_PATH);
+        let cmd = build_connect_command(&target, REMOTE_INSTALL_PATH, false);
         let args = args_of(&cmd);
         assert!(
             !args.iter().any(|a| a == "-i"),
@@ -2279,6 +2349,7 @@ mod tests {
         codes: Vec<i32>,
         calls: Cell<usize>,
         install_paths: std::cell::RefCell<Vec<String>>,
+        keep_daemon: std::cell::RefCell<Vec<bool>>,
     }
 
     impl ScriptedSpawner {
@@ -2288,6 +2359,7 @@ mod tests {
                 codes,
                 calls: Cell::new(0),
                 install_paths: Default::default(),
+                keep_daemon: Default::default(),
             }
         }
         fn spawn_count(&self) -> usize {
@@ -2296,10 +2368,16 @@ mod tests {
     }
 
     impl ConnectSpawner for ScriptedSpawner {
-        fn spawn(&self, _target: &SshTarget, install_path: &str) -> Result<i32, std::io::Error> {
+        fn spawn(
+            &self,
+            _target: &SshTarget,
+            install_path: &str,
+            keep_daemon: bool,
+        ) -> Result<i32, std::io::Error> {
             self.install_paths
                 .borrow_mut()
                 .push(install_path.to_string());
+            self.keep_daemon.borrow_mut().push(keep_daemon);
             let n = self.calls.get();
             self.calls.set(n + 1);
             let code = self
@@ -2335,24 +2413,47 @@ mod tests {
     }
 
     /// Fake `RemoteUpgrader` that records each `upgrade` call (name + version)
-    /// and returns a scripted result. `fail` makes every call return `Err`, so
-    /// the nudge's upgrade-failure fallback can be exercised without ssh.
+    /// and returns a scripted outcome. `failing` returns an install failure,
+    /// so the nudge's fallback can be exercised without ssh. `asking` first
+    /// asks the decider it is handed, as the real one does when the daemon
+    /// names live work, and keeps or restarts by the answer.
     struct RecordingUpgrader {
         calls: std::cell::RefCell<Vec<(String, String)>>,
-        fail: bool,
+        outcome: UpgradeOutcome,
+        asking: bool,
+    }
+
+    fn restarted() -> UpgradeOutcome {
+        UpgradeOutcome::Restarted {
+            from_version: "0.31.0".into(),
+            to_version: "0.31.1".into(),
+            stopped: Default::default(),
+        }
     }
 
     impl RecordingUpgrader {
         fn new() -> Self {
             Self {
                 calls: std::cell::RefCell::new(Vec::new()),
-                fail: false,
+                outcome: restarted(),
+                asking: false,
             }
         }
         fn failing() -> Self {
             Self {
-                calls: std::cell::RefCell::new(Vec::new()),
-                fail: true,
+                outcome: UpgradeOutcome::Failed {
+                    stage: crate::daemon_upgrade::UpgradeStage::Installing,
+                    reason: "install failed: download 404".into(),
+                    installed_version: None,
+                    old_daemon_gone: false,
+                },
+                ..Self::new()
+            }
+        }
+        fn asking() -> Self {
+            Self {
+                asking: true,
+                ..Self::new()
             }
         }
         fn calls(&self) -> Vec<(String, String)> {
@@ -2361,14 +2462,34 @@ mod tests {
     }
 
     impl RemoteUpgrader for RecordingUpgrader {
-        fn upgrade(&self, name: &str, version: &str) -> Result<(), String> {
+        fn upgrade(
+            &self,
+            name: &str,
+            version: &str,
+            decider: &dyn RestartDecider,
+        ) -> UpgradeOutcome {
             self.calls
                 .borrow_mut()
                 .push((name.to_string(), version.to_string()));
-            if self.fail {
-                Err("install failed: download 404".to_string())
-            } else {
-                Ok(())
+            if !self.asking {
+                return self.outcome.clone();
+            }
+            let at_stake = crate::daemon_protocol::RestartStopSet {
+                agents: vec![crate::daemon_protocol::RestartAgent {
+                    id: "a1".into(),
+                    label: "worker".into(),
+                    pane_id: Some("p1".into()),
+                    cwd: None,
+                }],
+                roles: vec![],
+            };
+            match decider.decide(name, &at_stake, false) {
+                crate::daemon_upgrade::RestartChoice::RestartNow => restarted(),
+                _ => UpgradeOutcome::InstalledNotRestarted {
+                    from_version: Some("0.31.0".into()),
+                    installed_version: version.into(),
+                    reason: NotRestartedReason::KeptByUser { at_stake },
+                },
             }
         }
     }
@@ -2432,7 +2553,7 @@ mod tests {
     /// upgrader, so the reconnect/exit-code tests below stay focused on the
     /// PRD #148 state machine. PRD #161 M1.2 added the nudge seam; these tests
     /// don't exercise it (the probe reports the same version as the laptop, so
-    /// `laptop_is_newer` is false regardless).
+    /// `client_is_newer` is false regardless).
     fn run_connect_no_nudge(
         entry: &RemoteEntry,
         executor: &dyn SshExecutor,
@@ -3165,16 +3286,16 @@ mod tests {
         // The nudge is offered only when the laptop is strictly newer than the
         // remote; an equal or older laptop must NOT prompt (never suggest a
         // downgrade).
-        assert!(laptop_is_newer("0.31.1", "0.31.0"), "newer laptop -> nudge");
-        assert!(!laptop_is_newer("0.31.0", "0.31.0"), "equal -> no nudge");
+        assert!(client_is_newer("0.31.1", "0.31.0"), "newer laptop -> nudge");
+        assert!(!client_is_newer("0.31.0", "0.31.0"), "equal -> no nudge");
         assert!(
-            !laptop_is_newer("0.31.0", "0.31.1"),
+            !client_is_newer("0.31.0", "0.31.1"),
             "older laptop -> no nudge (never downgrade)"
         );
         // `v` prefix tolerated on either side.
-        assert!(laptop_is_newer("v0.32.0", "0.31.9"));
+        assert!(client_is_newer("v0.32.0", "0.31.9"));
         // Unparseable version is conservative: no nudge.
-        assert!(!laptop_is_newer("garbage", "0.31.0"));
+        assert!(!client_is_newer("garbage", "0.31.0"));
 
         // End-to-end through the prompt: an equal-version laptop on a TTY with
         // 'y' queued still writes NO prompt and runs no upgrade.
@@ -3375,7 +3496,12 @@ mod tests {
             registry: std::path::PathBuf,
         }
         impl RemoteUpgrader for RecordingBrewUpgrader {
-            fn upgrade(&self, name: &str, _version: &str) -> Result<(), String> {
+            fn upgrade(
+                &self,
+                name: &str,
+                _version: &str,
+                _decider: &dyn RestartDecider,
+            ) -> UpgradeOutcome {
                 let mut file = RemotesFile::load(&self.registry).unwrap();
                 let entry = file.remotes.iter_mut().find(|e| e.name == name).unwrap();
                 entry.install = Some(crate::remote::INSTALL_HOMEBREW.to_string());
@@ -3386,7 +3512,7 @@ mod tests {
                     .unwrap(),
                 );
                 file.save(&self.registry).unwrap();
-                Ok(())
+                restarted()
             }
         }
 
@@ -3418,6 +3544,77 @@ mod tests {
         assert_eq!(
             *spawner.install_paths.borrow(),
             vec!["/opt/homebrew/bin/dot-agent-deck".to_string()]
+        );
+    }
+
+    /// PRD #1487: the restart question is asked on the nudge's own terminal;
+    /// Enter keeps the daemon, and the session that follows tells the remote
+    /// TUI so it does not ask a second time. `r` restarts and passes nothing.
+    #[test]
+    fn run_connect_keep_answer_is_passed_to_the_remote_tui() {
+        for (answer, keep) in [("y\n\n", true), ("y\nr\n", false)] {
+            let entry = test_entry("prod");
+            let (_dir, path) = registry_with(&entry);
+            let executor = VersionExecutor::new("0.31.0");
+            let spawner = ScriptedSpawner::new(vec![0]);
+            let upgrader = RecordingUpgrader::asking();
+            let mut input: &[u8] = answer.as_bytes();
+            let mut output: Vec<u8> = Vec::new();
+            run_connect(
+                &entry,
+                &executor,
+                &spawner,
+                &RecordingBackoff::new(),
+                &upgrader,
+                &path,
+                "0.31.1",
+                REMOTE_INSTALL_PATH,
+                &mut input,
+                &mut output,
+                true,
+            )
+            .expect("connect whatever the outcome");
+            let text = String::from_utf8(output).unwrap();
+            assert_eq!(text.matches("Upgrade and connect? [y/N]").count(), 1);
+            assert_eq!(text.matches("Restart now?").count(), 1, "{text}");
+            assert!(text.contains("worker") && text.contains("p1"), "{text}");
+            assert_eq!(*spawner.keep_daemon.borrow(), vec![keep], "{text}");
+            if keep {
+                assert!(text.contains("not restarted"), "{text}");
+            } else {
+                assert!(text.contains("Restarted"), "{text}");
+            }
+        }
+    }
+
+    /// PRD #1487: a failed install keeps the existing daemon without the keep
+    /// flag — the remote binary was not replaced, so it may not know it.
+    #[test]
+    fn run_connect_after_a_failed_install_does_not_pass_keep() {
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+        run_connect(
+            &entry,
+            &VersionExecutor::new("0.31.0"),
+            &spawner,
+            &RecordingBackoff::new(),
+            &RecordingUpgrader::failing(),
+            &path,
+            "0.31.1",
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            true,
+        )
+        .expect("connect after a failed upgrade");
+        assert_eq!(*spawner.keep_daemon.borrow(), vec![false]);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("existing 0.31.0 install")
         );
     }
 }

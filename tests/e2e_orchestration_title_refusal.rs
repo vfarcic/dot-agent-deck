@@ -94,6 +94,8 @@ fn identity_010_a_title_taken_by_another_client_after_the_form_opened_is_refused
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .expect("reach the deck's attach socket");

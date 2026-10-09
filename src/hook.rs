@@ -166,7 +166,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let json = match serde_json::to_string(&event) {
+    // Issue #318: present this pane's hook capability token, so the daemon can
+    // tell this pane's own report from one naming it from outside.
+    let token = crate::hook_provenance::token_from_env();
+    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
@@ -789,10 +792,19 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
+    // OpenCode publishes the user interrupting a turn as a `session.error`
+    // named `MessageAbortedError` — its own TUI skips exactly that name rather
+    // than showing an error — so it is the turn ending, not a failure. That
+    // matters since an Error card stays Error through the `session.idle` that
+    // follows it (`AppState::apply_event`).
+    if input.event == "session.error" && input.error_name.as_deref() == Some("MessageAbortedError")
+    {
+        event_type = EventType::Idle;
+    }
     // Issue #714: a `session.error` whose structured fields name a provider
     // quota or credit refusal is a block; every other one stays `Error`. See
     // `crate::quota_signals::classify_opencode_error`.
-    if input.event == "session.error" {
+    if input.event == "session.error" && event_type == EventType::Error {
         let fields = crate::quota_signals::OpenCodeErrorFields {
             error_name: input.error_name,
             response_markers: input.response_markers,
@@ -827,6 +839,75 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         schema_version: None,
         live_target: None,
     })
+}
+
+/// The optional card detail `dot-agent-deck agent-event` carries beside its
+/// `--type` (issue #622). Each is what an extension already has in hand when it
+/// reports: the session's directory, the prompt it is about to run, the tool it
+/// is starting or finishing and a short description of that call.
+#[derive(Debug, Default, Clone)]
+pub struct AgentEventDetail {
+    pub cwd: Option<String>,
+    pub prompt: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_detail: Option<String>,
+    /// Issue #1567: the reporter declares that it reports every prompt the
+    /// agent submits (`--reports-prompts`), stamped on the event as
+    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`].
+    pub reports_prompts: bool,
+}
+
+/// Build the raw [`AgentEvent`] `dot-agent-deck agent-event` sends for a pane
+/// (PRD #201 M1.2; detail since issue #622).
+///
+/// The event is keyed on `<pane_id>-session` so repeated reports update one
+/// card, and typed [`AgentType::Pi`] — safe because `apply_event` only upgrades
+/// `None` to a concrete type and never overwrites a known one.
+///
+/// The detail is bounded the way the hook builders above bound theirs, because
+/// it arrives on argv from a producer rather than from the deck: a blank value
+/// is dropped rather than sent, the prompt goes through
+/// [`record_submitted_prompt`] exactly as a Claude or OpenCode prompt does, and
+/// the tool detail keeps only its first line, cut to the same 120 bytes as
+/// [`extract_tool_detail`]'s shell arms. The daemon scrubs both tool strings on
+/// ingest regardless.
+///
+/// [`AgentEventDetail::reports_prompts`] becomes the declaration marker on the
+/// event's metadata (issue #1567), on every `--type`: the deck reads it from
+/// whichever report it sees first, the session-start one included.
+pub fn build_agent_event_cli(
+    pane_id: String,
+    agent_id: Option<String>,
+    event_type: EventType,
+    detail: AgentEventDetail,
+) -> AgentEvent {
+    let non_blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let tool_detail = non_blank(detail.tool_detail)
+        .map(|d| truncate(d.lines().next().unwrap_or(&d), 120))
+        .filter(|d| !d.trim().is_empty());
+    let mut metadata = std::collections::HashMap::new();
+    if detail.reports_prompts {
+        metadata.insert(
+            crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
+            crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
+        );
+    }
+    AgentEvent {
+        session_id: format!("{pane_id}-session"),
+        agent_type: AgentType::Pi,
+        event_type,
+        tool_name: non_blank(detail.tool_name).map(|n| truncate(&n, 80)),
+        tool_detail,
+        cwd: non_blank(detail.cwd),
+        timestamp: Utc::now(),
+        user_prompt: non_blank(detail.prompt).map(|p| record_submitted_prompt(&p)),
+        metadata,
+        pane_id: Some(pane_id),
+        agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
 }
 
 /// The total-operation budget for a `delegate`'s reply — the same 5s
@@ -1752,6 +1833,138 @@ mod tests {
     #[test]
     fn map_unknown_returns_none() {
         assert_eq!(map_event_type("SomethingElse"), None);
+    }
+
+    /// Issue #622: the `agent-event` CLI's detail lands on the fields every
+    /// other producer fills, bounded the same way.
+    #[test]
+    fn agent_event_cli_carries_the_card_detail() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-7".into()),
+            EventType::ToolStart,
+            AgentEventDetail {
+                cwd: Some("/work/repo".into()),
+                prompt: None,
+                tool_name: Some("bash".into()),
+                tool_detail: Some("touch a.txt\necho second line".into()),
+                reports_prompts: false,
+            },
+        );
+        assert_eq!(event.session_id, "pane-7-session");
+        assert_eq!(event.agent_type, AgentType::Pi);
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.pane_id.as_deref(), Some("pane-7"));
+        assert_eq!(event.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(event.cwd.as_deref(), Some("/work/repo"));
+        assert_eq!(event.tool_name.as_deref(), Some("bash"));
+        assert_eq!(event.tool_detail.as_deref(), Some("touch a.txt"));
+        assert!(event.user_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_event_cli_prompt_is_recorded_like_any_producer_prompt() {
+        let long = "p".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 50);
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Thinking,
+            AgentEventDetail {
+                prompt: Some(long.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            event.user_prompt.as_deref(),
+            Some(record_submitted_prompt(&long).as_str())
+        );
+        assert!(event.user_prompt.unwrap().chars().count() < long.chars().count());
+    }
+
+    #[test]
+    fn agent_event_cli_drops_blank_detail_and_bounds_tool_text() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Idle,
+            AgentEventDetail {
+                cwd: Some("  ".into()),
+                prompt: Some("".into()),
+                tool_name: Some("\t".into()),
+                tool_detail: Some("\nsecond".into()),
+                reports_prompts: false,
+            },
+        );
+        assert!(event.cwd.is_none());
+        assert!(event.user_prompt.is_none());
+        assert!(event.tool_name.is_none());
+        assert!(event.tool_detail.is_none());
+
+        let long = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::ToolStart,
+            AgentEventDetail {
+                tool_name: Some("t".repeat(300)),
+                tool_detail: Some("d".repeat(300)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(long.tool_name, Some(truncate(&"t".repeat(300), 80)));
+        assert_eq!(long.tool_detail, Some(truncate(&"d".repeat(300), 120)));
+    }
+
+    /// Issue #1567: `--reports-prompts` becomes the declaration marker on any
+    /// report; without it the frame declares nothing, as every report from an
+    /// older extension. The marker the CLI stamps is not yet standing: only
+    /// once the daemon's hook-provenance gate attests the frame
+    /// (`ATTESTED_OWNER_METADATA_KEY`) does a Pi pane count as confirming.
+    #[test]
+    fn agent_event_cli_declares_prompt_reports_only_when_asked() {
+        for reports_prompts in [false, true] {
+            let mut event = build_agent_event_cli(
+                "pane-7".into(),
+                Some("agent-7".into()),
+                EventType::Idle,
+                AgentEventDetail {
+                    reports_prompts,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY)
+                    .map(String::as_str),
+                reports_prompts.then_some(crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE)
+            );
+            assert!(
+                !event.declares_prompt_reports() && !event.reports_submitted_prompt(),
+                "reports_prompts={reports_prompts}: an unattested frame declares nothing"
+            );
+            event.metadata.insert(
+                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+                "agent-7".to_string(),
+            );
+            assert_eq!(event.declares_prompt_reports(), reports_prompts);
+            assert_eq!(event.reports_submitted_prompt(), reports_prompts);
+        }
+    }
+
+    /// A lifecycle report with no detail is the frame it has always been.
+    #[test]
+    fn agent_event_cli_without_detail_keeps_the_legacy_frame() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Thinking,
+            AgentEventDetail::default(),
+        );
+        assert!(event.cwd.is_none());
+        assert!(event.user_prompt.is_none());
+        assert!(event.tool_name.is_none());
+        assert!(event.tool_detail.is_none());
+        assert!(event.metadata.is_empty());
     }
 
     #[test]
@@ -2897,6 +3110,29 @@ mod tests {
         assert_eq!(
             map_opencode_event_type("session.deleted", None),
             Some(EventType::SessionEnd)
+        );
+    }
+
+    /// OpenCode publishes an interrupted turn as a `session.error` named
+    /// `MessageAbortedError`; that is the turn ending, so it reads Idle, while
+    /// any other `session.error` stays Error.
+    #[test]
+    fn an_opencode_abort_is_idle_and_other_errors_stay_errors() {
+        let aborted: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"MessageAbortedError"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_opencode_event(aborted).unwrap().event_type,
+            EventType::Idle
+        );
+        let failed: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"UnknownError"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_opencode_event(failed).unwrap().event_type,
+            EventType::Error
         );
     }
 

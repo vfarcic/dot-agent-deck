@@ -128,12 +128,14 @@ dot-agent-deck schedule update --name morning-digest --shape single
 dot-agent-deck schedule update --name morning-digest --shape ""   # back to config-derived
 ```
 
-If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
+If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, more than one orchestration with roles uses that name, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
 
 ## Reuse one tab or open a new one per run
 
 - **`new_tab_per_fire = false` (default):** a run sends its prompt into the tab the previous run opened, if that tab's agent is still the one the schedule started. The agent receives the prompt in the same session, so it still has the previous run's conversation. If that tab was closed, its agent exited, or the daemon restarted since, the run opens a new tab.
 - **`new_tab_per_fire = true`:** every run opens a new tab, so you keep one tab per run.
+
+An orchestration a run starts is named after the orchestration and its working directory, for example `team · my-repo`. The TUI shows that name on the run's tab, and the desktop app as the title of the run's group on the Dashboard. If another run of the same orchestration is still running in that directory, started by this schedule or another one, the new run gets the next free number instead (`team · my-repo · 2`, then `· 3`), so you can tell the runs apart in both clients. The run is never skipped because of its name.
 
 When a run reuses a tab you are typing in, its prompt waits until you have not typed for 5 seconds. If you left unsent text in that pane (in either client), it also waits until you press Enter or clear the text with `Ctrl+U` or `Ctrl+C`, so it is not submitted together with your text; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft). Either way the prompt is sent at the latest 60 seconds after the run started. To change the 5 seconds, set `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` (milliseconds) in the environment the daemon starts with.
 
@@ -191,6 +193,7 @@ An issue that is still open after its pull request merged or closed has no open 
 - **Closing the TUI or the desktop app does not stop schedules**, and the daemon keeps running while at least one enabled schedule exists.
 - **Nothing runs while the daemon is stopped.** A run whose time passed while the daemon was stopped, or while the machine was asleep for more than a minute, is not made up later.
 - **Stopping the daemon stops the agents it runs**, including those schedules started. `dot-agent-deck daemon stop` may refuse while agents are running unless you pass `--force`. After a restart, the next run of each schedule opens a new tab.
+- **A run that comes due while the daemon is restarting** (for example during an upgrade) is not reported as failed. If the restart is called off, the run goes ahead; if it happens, the run is skipped and the schedule's next run happens on the new daemon. An issue-dispatch run leaves the issues it had not reached for that next run.
 - **Your schedules are kept.** A daemon loads the schedules file when it starts. The `schedule` subcommands do not start a daemon; start the TUI (`dot-agent-deck`), or run `dot-agent-deck daemon serve` to run one in the foreground.
 - **Time zone.** Cron times use the daemon's local time zone; there is no per-schedule time zone. On a daylight-saving change, a run inside the skipped hour does not happen and a run inside the repeated hour happens twice.
 - **One run at a time per schedule.** If a schedule comes due while its previous run is still starting its agent or waiting to deliver the prompt, the new run is skipped, and `run-now` prints `skipped <name>: previous run still active`.

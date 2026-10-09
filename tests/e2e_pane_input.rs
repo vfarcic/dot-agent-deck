@@ -148,6 +148,53 @@ const EDITING_KEYS: &[KeyCase] = &[
         typed: b"\x1f",
         received: b"\x1f",
     },
+    // Issue #1477: modified keys the deck used to send differently from the
+    // desktop, which sends what xterm.js encodes for them.
+    KeyCase {
+        name: "Ctrl+Shift+Backspace (kitty protocol)",
+        typed: b"\x1b[127;6u",
+        received: b"\x08",
+    },
+    KeyCase {
+        name: "Ctrl+Alt+Backspace (kitty protocol)",
+        typed: b"\x1b[127;7u",
+        received: b"\x1b\x08",
+    },
+    KeyCase {
+        name: "Shift+Delete",
+        typed: b"\x1b[3;2~",
+        received: b"\x1b[3;2~",
+    },
+    KeyCase {
+        name: "Ctrl+Home",
+        typed: b"\x1b[1;5H",
+        received: b"\x1b[1;5H",
+    },
+    KeyCase {
+        name: "Ctrl+End",
+        typed: b"\x1b[1;5F",
+        received: b"\x1b[1;5F",
+    },
+    KeyCase {
+        name: "Shift+Home",
+        typed: b"\x1b[1;2H",
+        received: b"\x1b[1;2H",
+    },
+    KeyCase {
+        name: "Shift+End",
+        typed: b"\x1b[1;2F",
+        received: b"\x1b[1;2F",
+    },
+    KeyCase {
+        name: "Alt+Home",
+        typed: b"\x1b[1;3H",
+        received: b"\x1b[1;3H",
+    },
+    KeyCase {
+        name: "Alt+End",
+        typed: b"\x1b[1;3F",
+        received: b"\x1b[1;3F",
+    },
     // What a macOS terminal sends for Option+Left/Right by default, and what
     // a terminal configured for macOS text editing (iTerm2's Natural Text
     // Editing preset, for one) sends for Cmd+Left, Cmd+Right, Cmd+Backspace and
@@ -205,7 +252,105 @@ const EDITING_KEYS: &[KeyCase] = &[
     },
 ];
 
+/// Issue #1477: what the cursor keys reach the pane as once its program has
+/// turned on application cursor mode (`ESC[?1h`): the SS3 form for an
+/// unmodified arrow, Home or End, as xterm.js sends them on the desktop, and
+/// the CSI form still for the same keys with a modifier. The terminal's own
+/// encoding of the key does not matter: crossterm decodes `ESC[A` and `ESC O A`
+/// alike.
+const APPLICATION_CURSOR_KEYS: &[KeyCase] = &[
+    KeyCase {
+        name: "Up, application cursor mode",
+        typed: b"\x1b[A",
+        received: b"\x1bOA",
+    },
+    KeyCase {
+        name: "Down, application cursor mode",
+        typed: b"\x1b[B",
+        received: b"\x1bOB",
+    },
+    KeyCase {
+        name: "Right, application cursor mode",
+        typed: b"\x1b[C",
+        received: b"\x1bOC",
+    },
+    KeyCase {
+        name: "Left, application cursor mode",
+        typed: b"\x1b[D",
+        received: b"\x1bOD",
+    },
+    KeyCase {
+        name: "Home, application cursor mode",
+        typed: b"\x1b[H",
+        received: b"\x1bOH",
+    },
+    KeyCase {
+        name: "End, application cursor mode",
+        typed: b"\x1b[F",
+        received: b"\x1bOF",
+    },
+    KeyCase {
+        name: "Up from a terminal that sends SS3 itself, application cursor mode",
+        typed: b"\x1bOA",
+        received: b"\x1bOA",
+    },
+    KeyCase {
+        name: "Shift+Up keeps its CSI form, application cursor mode",
+        typed: b"\x1b[1;2A",
+        received: b"\x1b[1;2A",
+    },
+    KeyCase {
+        name: "Ctrl+Left keeps its CSI form, application cursor mode",
+        typed: b"\x1b[1;5D",
+        received: b"\x1b[1;5D",
+    },
+    KeyCase {
+        name: "Alt/Option+Right keeps its CSI form, application cursor mode",
+        typed: b"\x1b[1;3C",
+        received: b"\x1b[1;3C",
+    },
+    KeyCase {
+        name: "Ctrl+End keeps its CSI form, application cursor mode",
+        typed: b"\x1b[1;5F",
+        received: b"\x1b[1;5F",
+    },
+    KeyCase {
+        name: "Delete is not a cursor key, application cursor mode",
+        typed: b"\x1b[3~",
+        received: b"\x1b[3~",
+    },
+];
+
+/// Issue #1477: once the program turns application cursor mode off again
+/// (`ESC[?1l`), the cursor keys are back to their ordinary form.
+const ORDINARY_CURSOR_KEYS_AGAIN: &[KeyCase] = &[
+    KeyCase {
+        name: "Up, application cursor mode off again",
+        typed: b"\x1b[A",
+        received: b"\x1b[A",
+    },
+    KeyCase {
+        name: "Left, application cursor mode off again",
+        typed: b"\x1b[D",
+        received: b"\x1b[D",
+    },
+    KeyCase {
+        name: "Home, application cursor mode off again",
+        typed: b"\x1b[H",
+        received: b"\x1b[H",
+    },
+    KeyCase {
+        name: "End, application cursor mode off again",
+        typed: b"\x1b[F",
+        received: b"\x1b[F",
+    },
+];
+
 const KEY_LOG: &str = "keys.log";
+/// Files the test creates to ask the recorder's pane to turn application
+/// cursor mode on, and then off.
+const APP_ON: &str = "application-cursor-on";
+const APP_OFF: &str = "application-cursor-off";
 
 fn render_bytes(bytes: &[u8]) -> String {
     bytes
@@ -219,55 +364,101 @@ fn render_bytes(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Scenario: Start the deck with one pane whose program records every byte it receives, then type each platform editing shortcut the way a terminal sends it — Ctrl+Backspace, Ctrl+Delete, Option+Delete, Option+Left/Right, Cmd+Left/Right/Backspace — plus Home, End, Ctrl+Left/Right, the modified Enters and a paste. Each must reach the pane as the bytes the desktop app sends for that shortcut, which every supported agent acts on, and none of them may be taken by the deck's own shortcuts.
+/// Scenario: Start the deck with one pane whose program records every byte it receives, then type each platform editing shortcut the way a terminal sends it — Ctrl+Backspace, Ctrl+Delete, Option+Delete, Option+Left/Right, Cmd+Left/Right/Backspace — plus Home, End, Ctrl+Left/Right, the modified Enters, a paste, and modified Backspace, Delete, Home and End. Each must reach the pane as the bytes the desktop app sends for that key, and none of them may be taken by the deck's own shortcuts. Then the pane's program turns on application cursor mode: the arrows, Home and End must arrive in the form the desktop sends in that mode, and in the ordinary form again once the program turns it off.
 #[spec("embed/key-forwarding/003")]
 #[test]
 fn key_forwarding_003_editing_shortcuts_reach_the_pane_as_the_desktop_sends_them() {
+    // The recorder runs in the foreground; a background loop beside it turns
+    // application cursor mode on, then off, when the test creates a file
+    // asking for it, and prints a marker each time so the test can tell the
+    // deck has seen the mode change.
     let deck = TuiDeck::builder()
         .with_continue_session(
             "key-recorder",
-            format!("sh -c 'stty raw -echo; printf KEYREC-READY; exec cat -u > {KEY_LOG}'"),
+            format!(
+                "sh -c 'stty raw -echo; \
+                 (while [ ! -e {APP_ON} ]; do sleep 0.05; done; printf \"\\033[?1hAPP-ON\"; \
+                 while [ ! -e {APP_OFF} ]; do sleep 0.05; done; printf \"\\033[?1lAPP-OFF\") & \
+                 printf KEYREC-READY; exec cat -u > {KEY_LOG}'"
+            ),
         )
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.wait_for_string("KEYREC-READY");
 
-    // One keypress per write, each followed by a separator the recorder
-    // receives as itself, so the log splits back into one entry per key.
-    for case in EDITING_KEYS {
-        deck.send_keys(case.typed);
-        deck.send_keys(b"|");
-    }
-    deck.send_keys(b"END");
-
     let log_path = deck.workdir().join(KEY_LOG);
-    let finished = common::wait_until(Duration::from_secs(10), || {
-        std::fs::read(&log_path).is_ok_and(|log| log.ends_with(b"END"))
-    });
-    let log = std::fs::read(&log_path).unwrap_or_default();
-    assert!(
-        finished,
-        "the recorder never received the closing marker\nlog: {}\nFinal grid:\n{}",
-        render_bytes(&log),
-        deck.snapshot_grid()
-    );
+    // One keypress per write, each followed by a separator the recorder
+    // receives as itself, so the log splits back into one entry per key. A
+    // phase ends with a marker of its own, and the next phase starts only once
+    // the recorder has it: every key of a phase was then encoded before the
+    // mode changed.
+    let type_phase = |cases: &[KeyCase], marker: &str| {
+        for case in cases {
+            deck.send_keys(case.typed);
+            deck.send_keys(b"|");
+        }
+        let tail = format!("{marker}|");
+        deck.send_keys(tail.as_bytes());
+        let arrived = common::wait_until(Duration::from_secs(10), || {
+            std::fs::read(&log_path).is_ok_and(|log| log.ends_with(tail.as_bytes()))
+        });
+        let log = std::fs::read(&log_path).unwrap_or_default();
+        assert!(
+            arrived,
+            "the recorder never received the {marker} marker\nlog: {}\nFinal grid:\n{}",
+            render_bytes(&log),
+            deck.snapshot_grid()
+        );
+    };
 
-    let received: Vec<&[u8]> = log.split(|b| *b == b'|').collect();
+    type_phase(EDITING_KEYS, "ORDINARY");
+    std::fs::write(deck.workdir().join(APP_ON), b"")
+        .expect("ask the pane for application cursor mode");
+    deck.wait_for_string("APP-ON");
+    type_phase(APPLICATION_CURSOR_KEYS, "APPLICATION");
+    std::fs::write(deck.workdir().join(APP_OFF), b"")
+        .expect("ask the pane to leave application cursor mode");
+    deck.wait_for_string("APP-OFF");
+    type_phase(ORDINARY_CURSOR_KEYS_AGAIN, "END");
+
+    let log = std::fs::read(&log_path).unwrap_or_default();
+    let expected: Vec<(&str, &[u8])> = EDITING_KEYS
+        .iter()
+        .map(|case| (case.name, case.received))
+        .chain([("the ORDINARY marker", &b"ORDINARY"[..])])
+        .chain(
+            APPLICATION_CURSOR_KEYS
+                .iter()
+                .map(|case| (case.name, case.received)),
+        )
+        .chain([("the APPLICATION marker", &b"APPLICATION"[..])])
+        .chain(
+            ORDINARY_CURSOR_KEYS_AGAIN
+                .iter()
+                .map(|case| (case.name, case.received)),
+        )
+        .chain([("the END marker", &b"END"[..])])
+        .collect();
+    // Every entry, the last marker included, ends with a separator.
+    let received: Vec<&[u8]> = log
+        .strip_suffix(b"|")
+        .unwrap_or(&log)
+        .split(|b| *b == b'|')
+        .collect();
     assert_eq!(
         received.len(),
-        EDITING_KEYS.len() + 1,
-        "one entry per key plus the closing marker\nlog: {}",
+        expected.len(),
+        "one entry per key plus the three markers\nlog: {}",
         render_bytes(&log)
     );
-    let wrong: Vec<String> = EDITING_KEYS
+    let wrong: Vec<String> = expected
         .iter()
         .zip(&received)
-        .filter(|(case, got)| case.received != **got)
-        .map(|(case, got)| {
+        .filter(|((_, want), got)| want != *got)
+        .map(|((name, want), got)| {
             format!(
-                "{}: expected {}, received {}",
-                case.name,
-                render_bytes(case.received),
+                "{name}: expected {}, received {}",
+                render_bytes(want),
                 render_bytes(got)
             )
         })
@@ -276,7 +467,7 @@ fn key_forwarding_003_editing_shortcuts_reach_the_pane_as_the_desktop_sends_them
         wrong.is_empty(),
         "{} of {} keys reached the pane as the wrong bytes:\n{}",
         wrong.len(),
-        EDITING_KEYS.len(),
+        expected.len() - 3,
         wrong.join("\n")
     );
     assert!(

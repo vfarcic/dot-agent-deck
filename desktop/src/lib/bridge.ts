@@ -1,20 +1,28 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
-import { actionErrorFrom, LaunchCleanupError } from "./actionError";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
+import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
+import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
+import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
+import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
+  AuthoringKind,
   AgentSession,
   AgentTarget,
   AgentStatus,
   AgentTab,
+  AgentTypeId,
+  DaemonAgentStatus,
   DaemonProjectListing,
   DaemonResolvedProject,
   DeckAction,
@@ -24,13 +32,28 @@ import type { HandoffEdge,
   DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
+  DisconnectedReason,
   EvidenceItem,
   NewAgentOptions,
   NewAgentOrchestrations,
+  PromptKeys,
   RuntimeMode,
   TerminalChunk,
   WorkflowStage,
 } from "../types";
+
+/**
+ * Exact DTO `desktop_start_daemon` resolves with (issue #1490). It rejects
+ * instead of resolving when the deck did not end up connected: with
+ * `{ message, failure, detail }` for a failed start (see `StartDaemonError`),
+ * and with the sentence to show otherwise.
+ */
+export interface StartDaemonResultDto {
+  outcome: "started" | "already-running";
+  /** The machine the daemon runs on: `"this machine"` or `user@host[:port]`. */
+  host: string;
+  snapshot: DesktopSnapshotDto;
+}
 
 /** Exact DTO returned by the Tauri `desktop_get_snapshot` command. */
 export interface DesktopSnapshotDto {
@@ -71,6 +94,8 @@ export interface DesktopSnapshotDto {
     /** Issue #1240: the deck honours the directory browser's listing options. */
     listingOptions?: boolean;
     error?: string;
+    /** The technical half of `error` — break names, protocol numbers, builds — for a disclosure, never the sentence. */
+    errorDetail?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
     clientBuildVersion: string;
@@ -83,6 +108,10 @@ export interface DesktopSnapshotDto {
      * as "an override exists", never as "something is wrong".
      */
     buildStampMismatchOnly?: boolean;
+    /** PRD #1487 D8 — whether to offer Upgrade, decided in Rust. Always emitted by the crate. */
+    upgradeOffer?: UpgradeOffer;
+    /** Issue #1490 — why the deck is not connected and which control to offer; present when `status` is `"disconnected"`. */
+    disconnectedReason?: DisconnectedReason;
   };
   agents: DesktopAgentDto[];
   /*
@@ -219,7 +248,7 @@ export interface DesktopAgentDto {
   cwd?: string;
   rows: number;
   cols: number;
-  agentType: "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+  agentType: AgentTypeId;
   /**
    * The binary the agent registry says this type runs — `claude`, `opencode`,
    * `pi`, `codex`, `devin` (PRD #745). `agentType` above is the wire IDENTITY
@@ -235,7 +264,7 @@ export interface DesktopAgentDto {
    * daemon's, resolved from the registry of the process that forked the agent.
    */
   cliName?: string;
-  status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+  status: DaemonAgentStatus;
   activeTool?: { name: string; detail?: string };
   toolCount: number;
   /**
@@ -280,12 +309,27 @@ export interface DesktopAgentDto {
    */
   spawnedAtMs?: number;
   /**
+   * Issue #1496: the authoring kind the daemon recorded for this agent when it
+   * accepted the start — a dispatcher, a schedule or a schedule-issues agent —
+   * whichever client started it. Absent for every other agent and from a
+   * daemon predating the field, whose authoring agents read as single agents.
+   */
+  authoringKind?: AuthoringKind;
+  /**
    * Issue #714: why the agent is `blocked` — present only beside
    * `status: "blocked"`. `detail` is the agent's own error message, scrubbed by
    * the crate and still agent-controlled text; `resetsAtMs` is when the
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
+   * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
+   * `map_prompt_keys`. Absent when the deck has none for the agent (Devin, an
+   * unrecognised type), predates the field, or sent a set the crate refused;
+   * the voice surface then refuses the command rather than guessing.
+   */
+  promptKeys?: PromptKeys;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -749,6 +793,23 @@ export interface VoiceDirectoriesDto {
   path: string;
   hasParent: boolean;
   entries: { name: string; path: string }[];
+  /**
+   * PR #1451 round 3, change 4 — present only while voice is on and the rows
+   * are split into pages: `entries` is then the page showing, and this names
+   * the page and the children on the others (`voice::VoicePaging`).
+   */
+  paging?: VoicePagingDto;
+}
+
+/**
+ * A list split into pages while voice is on, as declared to Rust
+ * (`voice::VoicePaging`): the page showing, and each item on another page by
+ * the name it shows and its page — so a name said for one is refused with its
+ * page, never chosen.
+ */
+export interface VoicePagingDto {
+  page: number;
+  elsewhere: { name: string; page: number }[];
 }
 
 /**
@@ -761,6 +822,18 @@ export interface VoiceDirectoriesDto {
 export interface VoiceDeckChoiceDto {
   deckId: string;
   reason?: string;
+}
+
+/**
+ * PRD #1260 — the agent the voice panel is in the dictation mode for, declared
+ * with each utterance while the mode is on and absent otherwise —
+ * `voice::VoiceDictationTarget`. Its presence is the whole signal: Rust then
+ * answers the utterance locally (the reserved phrases, or the words typed
+ * whole) and calls no Commands backend.
+ */
+export interface VoiceDictationTargetDto {
+  deckId: string;
+  agentId: string;
 }
 
 /**
@@ -786,6 +859,8 @@ export interface VoiceNewAgentDto {
      * than answered with the nearest chip that is.
      */
     withheldModes?: { id: string; label: string }[];
+    /** PR #1451 round 3, change 4 — the Mode row's pages while it pages; `modes` is then the page showing. */
+    modePaging?: VoicePagingDto;
   };
 }
 
@@ -839,6 +914,21 @@ export interface VoiceResolvedParamDto {
    * row before writing. Absent for the local deck, which has no remote address.
    */
   deckIdentity?: VoiceDeckIdentityDto;
+  /**
+   * PRD #1261 — on an offered candidate of a `param_ambiguous` outcome alone,
+   * every name the entry answers to, from the same per-kind list Rust's
+   * `voice::choice::answer` matches a spoken answer against
+   * (`ResolvedParam::names`). `answerChoiceLocally` reads these beside the
+   * label, never `value`. Rust omits it when empty.
+   */
+  names?: string[];
+  /**
+   * PR #1451 round 3, change 3 — on an `agent_ref` chosen by its number on
+   * the dashboard alone: the deck that agent is on, since those rows span
+   * every deck where a resolved agent is the selected deck's. Never sent by
+   * Rust.
+   */
+  deckId?: string;
 }
 
 /**
@@ -868,15 +958,20 @@ export interface VoiceDeckIdentityDto extends Pick<RemoteEndpointDto, RemoteAddr
  * field and would refuse every switch to that row.
  */
 function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
-  if (result.outcome.kind !== "dispatch") return result;
-  const params = result.outcome.params.map((param) => {
+  const keyed = (param: VoiceResolvedParamDto): VoiceResolvedParamDto => {
     const identity = param.deckIdentity;
     if (!identity) return param;
     const sent = identity as Partial<Record<RemoteAddressField, unknown>>;
     const deckIdentity = Object.fromEntries(REMOTE_ADDRESS_FIELDS.map((field) => [field, sent[field] ?? undefined])) as unknown as VoiceDeckIdentityDto;
     return { ...param, deckIdentity };
-  });
-  return { ...result, outcome: { ...result.outcome, params } };
+  };
+  /* PRD #1261 — a switch offered as a choice carries each candidate's
+     identity too, and the chosen one reaches the same guard. */
+  if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
+    return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
+  }
+  if (result.outcome.kind !== "dispatch") return result;
+  return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
 
 /**
@@ -891,14 +986,27 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
  * `params`.
  */
 export type VoiceOutcomeDto =
-  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string }
+  /*
+    PR #1451 round 3 — `thenSubmit` is set on a dictation dispatch made in
+    typing mode whose utterance ended with a separate send sentence ("… Send
+    it."): the panel types `params`' text and then presses Enter, once that
+    write has landed. Absent everywhere else.
+  */
+  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string; thenSubmit?: boolean }
   | { kind: "unavailable"; transcript: string; action: string; hint: string; sentence: string }
   | { kind: "no_match"; transcript: string; sentence: string }
   | { kind: "unknown_action"; transcript: string; action: string; sentence: string }
   | { kind: "action_ungrounded"; transcript: string; action: string; sentence: string }
   | { kind: "param_missing"; transcript: string; action: string; param: string; sentence: string }
   | { kind: "param_unresolved"; transcript: string; action: string; param: string; spoken: string; sentence: string }
-  | { kind: "param_ambiguous"; transcript: string; action: string; param: string; spoken: string; matches: string[]; sentence: string }
+  /*
+    PRD #1261 — `candidates` is the tie as something to choose from, in the
+    order offered, and `params`, `invoke` and `reports` are what a chosen one is
+    dispatched with and reported as. Empty `candidates` means no choice is
+    offered (a tie beyond `VOICE_CHOICE_MAX`), and the four are optional
+    because a fixture written before them carries none.
+  */
+  | { kind: "param_ambiguous"; transcript: string; action: string; invoke?: string; param: string; spoken: string; matches: string[]; candidates?: VoiceResolvedParamDto[]; params?: VoiceResolvedParamDto[]; reports?: string[]; sentence: string }
   | { kind: "resolution_failed"; transcript: string; detail: string; sentence: string }
   | { kind: "transcription_failed"; detail: string; sentence: string };
 
@@ -1432,7 +1540,6 @@ export type DesktopRunActionDto =
   | { type: "submit_text"; agentId: string; text: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "restart_daemon" }
   | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
@@ -1457,6 +1564,17 @@ interface PendingTerminalAttachment {
   stateEvents: DesktopTerminalStateDto[];
   session?: TerminalAttachResult;
   activated: boolean;
+}
+
+/**
+ * PRD #1541 — a terminal write whose precondition answered false when its
+ * turn came, so nothing was written (see {@link DeckBridge.sendTerminalInput}).
+ */
+export class TerminalInputCancelled extends Error {
+  constructor() {
+    super("Nothing was sent — the write was called off before it went out.");
+    this.name = "TerminalInputCancelled";
+  }
 }
 
 export interface DeckBridge {
@@ -1490,8 +1608,15 @@ export interface DeckBridge {
    * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
    * 2. The target is matched BY VALUE (see {@link AgentTarget}); an
    * unattached target rejects rather than writing anywhere.
+   *
+   * PRD #1541 — `precondition`, when given, is asked once, immediately before
+   * the write is handed to the daemon (after every earlier write to the same
+   * terminal has settled). Answering false writes nothing and rejects with
+   * {@link TerminalInputCancelled}; later input to that terminal is not held
+   * up by it. Voice's prompt commands use it so a key accepted for a turn,
+   * a typing mode or a prompt that has since changed is never sent late.
    */
-  sendTerminalInput(target: AgentTarget, data: string): Promise<void>;
+  sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void>;
   /** This pane's measured grid, for the agent named by the composite identity. */
   resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void>;
   /**
@@ -1628,9 +1753,12 @@ export interface DeckBridge {
    * section the Deck selector is rendering. `useDesktopSettings.save` applies
    * an edit at once and writes it behind, so this — not `desktop.toml` — is
    * the list "switch deck to …" has to resolve against, or a deck the selector
-   * already shows is refused until the write lands.
+   * already shows is refused until the write lands. `dictation` is the sixth
+   * (PRD #1260): the agent the panel is typing to while the dictation mode is
+   * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
+   * Commands backend entirely.
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -1649,6 +1777,27 @@ export interface DeckBridge {
    * call itself could not be made.
    */
   resolveVoice(utterance: string): Promise<VoiceResultDto>;
+  /**
+   * PRD #1261 — answer a pending numbered choice (`desktop_voice_choice`):
+   * `offered` is the list on screen, `action` the row it completes. Judged
+   * against the declaration {@link declareVoiceScreen} last stated, so the
+   * panel declares immediately before, exactly as it does for a resolve.
+   *
+   * **No Commands backend call**: the answer is a cancel phrase, an ordinal or
+   * a name among the offered entries, decided by `voice::choice::answer`, and
+   * a selected entry is re-checked against what the app observes now. What
+   * runs is the panel's to dispatch, through the same checks a resolved
+   * dispatch meets.
+   */
+  answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto>;
+  /**
+   * PR #1451 round 3, change 3 — answer a bare number said against the
+   * numbered list on screen (`desktop_voice_number`): `heard` is the list as
+   * it stood when the user began to speak, `generation` the list's generation
+   * on screen now. **No Commands backend call**: `voice::numbers::answer`
+   * decides it, and what runs is the panel's to dispatch.
+   */
+  answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
@@ -1774,6 +1923,19 @@ export interface DeckBridge {
    * Fixture mode answers all OFF unless `?experimental=1`.
    */
   desktopFeatures(): Promise<DesktopFeatures>;
+  /**
+   * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names (Upgrade on a
+   * remote deck, Replace daemon on the local one) through
+   * `desktop_upgrade_daemon`. `onEvent` hears this run's stages and its
+   * live-agent question; the promise resolves with the outcome.
+   */
+  upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome>;
+  /**
+   * Answer question `questionId` of the upgrade `upgradeId`
+   * (`desktop_upgrade_decide`). An answer to a question that has since been
+   * asked again is refused.
+   */
+  decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -1819,7 +1981,7 @@ function fixtureAcceptsPath(path: string): boolean {
 }
 
 /** The sentence the live crate's `newAgentReason` carries for a deck without `list-directories` (PRD #1223 U1), repeated by the fixture's older decks. */
-export const FIXTURE_NO_LISTING_REASON = "This daemon does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
+export const FIXTURE_NO_LISTING_REASON = "This daemon is too old to let this app browse its folders, so new agents cannot be started on it from here. Start them from a terminal on its machine, or update the daemon.";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
 /** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older and non-Unix decks (PRD #1223 M6). */
@@ -1860,7 +2022,8 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   unknown: "waiting",
 };
 
-function statusFromDaemon(status: string): AgentStatus {
+/** The status column a daemon status word is shown in. */
+export function statusFromDaemon(status: string): AgentStatus {
   return DAEMON_STATUS[status.toLowerCase()] ?? "waiting";
 }
 
@@ -1945,8 +2108,17 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     // — the load-bearing part — it means there is no local table left to fall
     // back to, which is the whole point of the issue.
     cli: agent.cliName,
+    // PRD #1541 — what the voice surface needs to press keys at this agent:
+    // its type (for naming it in a refusal), whether it is mid-turn (the
+    // interrupt guard), and the deck's own keys for it. Copied through; no
+    // local table fills an absent `promptKeys` (the #856 principle).
+    agentType: agent.agentType,
+    turn: agentTurn(agent.status),
+    promptKeys: agent.promptKeys,
     model: UNREPORTED,
     status,
+    // Issue #1496 — the word `status` merged, kept for the dashboard filter.
+    daemonStatus: agent.status,
     task: taskLine(agent),
     // Absent, not sentinel-encoded. The deck's own stand-in word is a legal
     // working directory (`src/agent_pty.rs` accepts any non-empty, bounded,
@@ -1969,6 +2141,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     lastUserPrompt: agent.lastUserPrompt,
     lastActivityMs: agent.lastActivityMs,
     spawnedAtMs: agent.spawnedAtMs,
+    authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
     rows: agent.rows,
     cols: agent.cols,
@@ -2002,15 +2175,22 @@ export function modeScopedKey(base: string): string {
  * for EVERY incompatible status, which is wrong for the far more common
  * build-stamp case and would have told a user to look at a protocol version
  * that matched (issue #801). It now says which of the two checks failed, using
- * the same flag the Connect anyway affordance is gated on.
+ * the same flag the Connect anyway affordance is gated on — in the user's terms
+ * (CLAUDE.md rule 21), with the numbers left to {@link fallbackConnectionDetail}.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
   if (connection.status === "connected") return "Daemon responding";
   if (connection.status !== "incompatible") return "Daemon unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return "This daemon and this app are different versions. The app has not connected, because it could misread some of what this daemon reports. Run the same version of both.";
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+  return "This daemon and this app are different versions and cannot work together. Run the same version of both.";
+}
+
+/** The technical half of {@link fallbackConnectionMessage}, for the Technical details disclosure. */
+function fallbackConnectionDetail(connection: DesktopSnapshotDto["connection"]): string | undefined {
+  if (connection.status !== "incompatible") return undefined;
+  return `Protocol: app ${connection.clientProtocolVersion}, daemon ${connection.serverProtocolVersion ?? "not reported"}. Builds: app ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion ?? "not reported"}.`;
 }
 
 /**
@@ -2183,6 +2363,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       deckId: dto.connection.deckId,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
+      // Paired with the message it explains: the crate's own detail with the
+      // crate's sentence, the synthesised one only with the synthesised sentence.
+      detail: dto.connection.error === undefined ? fallbackConnectionDetail(dto.connection) : dto.connection.errorDetail,
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
       runningAgentCount: dto.connection.runningAgentCount,
       buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,
@@ -2194,6 +2377,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
       listingOptions: dto.connection.listingOptions === true,
+      ...(dto.connection.upgradeOffer === undefined ? {} : { upgradeOffer: dto.connection.upgradeOffer }),
+      ...(dto.connection.disconnectedReason === undefined ? {} : { disconnectedReason: dto.connection.disconnectedReason }),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.
@@ -2221,7 +2406,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "upgrade", "upgrade-error"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2230,6 +2415,7 @@ class FixtureDeckBridge implements DeckBridge {
    * every scenario but `fleet`, which is the three-deck one.
    */
   private fleet: DeckFleet;
+  private readonly fixtureState: FixtureState;
   private fleetListeners = new Set<FleetListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
@@ -2253,6 +2439,11 @@ class FixtureDeckBridge implements DeckBridge {
   private nonUnixDecks: ReadonlySet<string> = new Set();
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
+  /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
+  private upgradesInFlight = new Set<string>();
+  private upgradeQuestions = new Map<string, { questionId: number; answer: (choice: UpgradeChoice) => void }>();
+  private upgradeCount = 0;
+  private upgradeQuestionCount = 0;
 
   /**
    * The selected deck, which is the only one every mutating fixture action
@@ -2271,6 +2462,7 @@ class FixtureDeckBridge implements DeckBridge {
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
     const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
+    this.fixtureState = state;
     this.fleet = createFixtureFleet(state);
     const older = new URLSearchParams(window.location.search).get("older");
     if (older === "1" || older === "all") this.olderDecks = "all";
@@ -2414,6 +2606,7 @@ class FixtureDeckBridge implements DeckBridge {
         cwd: action.cwd,
         rows: action.rows,
         cols: action.cols,
+        authoringKind: action.authoringKind,
       }),
     ];
     // PRD #1223 M4: the live crate's rule — recorded once the deck accepted the
@@ -2499,7 +2692,8 @@ class FixtureDeckBridge implements DeckBridge {
    * the selected deck's key is the same wrong-producer stamp issue #1116's open
    * item 1 describes, reproduced in the fixture.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
+    if (precondition && !precondition()) throw new TerminalInputCancelled();
     this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
@@ -2655,10 +2849,27 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private voiceScreen: VoiceScreen = "deck";
 
-  /* The preview's vocabulary has no directory rows, so a declared browser is
-     accepted and has nothing to feed. */
-  declareVoiceScreen(screen: VoiceScreen): void {
+  /** PRD #1260 — the dictation mode declared with that screen, if it is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
+
+  /** Whether a directory listing was declared with that screen (PR #1451 round 3, change 5). */
+  private voiceDirectoryListing = false;
+
+  /** Whether the New agent dialog's live form was declared with it (PR #1451 round 4, D8). */
+  private voiceNewAgentForm = false;
+
+  /** Whether the New agent dialog was declared open at all, which the scroll rows need closed (issue #1492). */
+  private voiceNewAgentDialog = false;
+
+  /* The preview's directory rows (the Filter box's two) and its Command row
+     need only to know a listing or a live form is showing; the rows
+     themselves feed nothing here. */
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
+    this.voiceDirectoryListing = directories !== undefined;
+    this.voiceNewAgentForm = newAgent?.form !== undefined;
+    this.voiceNewAgentDialog = newAgent !== undefined;
+    this.voiceDictation = dictation;
   }
 
   /**
@@ -2671,7 +2882,19 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm, this.voiceNewAgentDialog);
+  }
+
+  /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
+  async answerVoiceChoice(utterance: string, _action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    await Promise.resolve();
+    return answerChoiceLocally(utterance, offered);
+  }
+
+  /** PR #1451 round 3 — likewise for a spoken number, against the numbered list on screen. */
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    await Promise.resolve();
+    return answerNumberLocally(utterance, heard, generation);
   }
 
   /**
@@ -2682,9 +2905,9 @@ class FixtureDeckBridge implements DeckBridge {
    * run — which is fewer rows than a live build has, and saying so is the point
    * of a preview rather than a shortcoming of one.
    */
-  async voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]> {
+  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]> {
     await Promise.resolve();
-    return fixtureVoiceCommands(screen);
+    return fixtureVoiceCommands(screen, directories !== undefined, newAgent?.form !== undefined, newAgent !== undefined);
   }
 
   /**
@@ -2832,7 +3055,7 @@ class FixtureDeckBridge implements DeckBridge {
     if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
-    const directory = fixtureDirectoryTree(home).get(wanted);
+    const directory = (this.fixtureState === "voice-pages" ? voicePagesDirectory(wanted) : undefined) ?? fixtureDirectoryTree(home).get(wanted);
     if (!directory) throw new Error(FIXTURE_UNRESOLVED_REFUSAL);
     return {
       kind: "listing",
@@ -2851,6 +3074,75 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /** Issue #1198 — see {@link fixtureDesktopFeatures}. */
+  /**
+   * PRD #1487 M5 — the fixture's Upgrade and Replace daemon. A deck the preview
+   * plays as older (`upgradeOffer.kind === "offered"`) walks the same stages
+   * the live crate reports; one with agents on it asks the restart question
+   * and waits for {@link decideUpgrade}, the way the daemon's policy does. Keep
+   * leaves everything as it was; Restart now stops the agents and brings the
+   * deck up on this app's version.
+   */
+  async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {
+    const deck = this.fleet.find((candidate) => candidate.connection.deckId === deckId);
+    if (!deck) throw new Error(`that daemon is not one this app is observing: ${deckId}`);
+    if (this.upgradesInFlight.has(deckId)) throw new Error(UPGRADE_ALREADY_RUNNING);
+    this.upgradesInFlight.add(deckId);
+    const upgradeId = `fixture-upgrade-${++this.upgradeCount}`;
+    const offer = deck.connection.upgradeOffer;
+    const fromVersion = offer?.kind === "offered" ? offer.from : FIXTURE_DAEMON_VERSION;
+    const toVersion = offer?.kind === "offered" ? offer.to : FIXTURE_APP_VERSION;
+    const progress = (stage: UpgradeProgressEvent["progress"]["stage"]) => onEvent({ type: "progress", deckId, attemptId: upgradeId, upgradeId, progress: { stage } });
+    const pause = () => new Promise<void>((resolve) => window.setTimeout(resolve, FIXTURE_UPGRADE_STEP_MS));
+    try {
+      progress("installing");
+      await pause();
+      progress("restarting");
+      await pause();
+      const atStake: UpgradeStopSet = {
+        agents: deck.agents.map((agent) => ({ id: agent.id, label: agent.displayName || agent.role, ...(agent.paneId ? { paneId: agent.paneId } : {}), ...(agent.cwd ? { cwd: agent.cwd } : {}) })),
+        roles: [],
+      };
+      if (atStake.agents.length) {
+        const choice = await new Promise<UpgradeChoice>((resolve) => {
+          const questionId = ++this.upgradeQuestionCount;
+          this.upgradeQuestions.set(upgradeId, { questionId, answer: resolve });
+          onEvent({ type: "decision", deckId, attemptId: upgradeId, upgradeId, questionId, atStake, stale: false });
+        });
+        if (choice === "keep-current") {
+          return { outcome: "installed-not-restarted", fromVersion, installedVersion: toVersion, reason: { kind: "kept-by-user", atStake } };
+        }
+      }
+      progress("verifying");
+      await pause();
+      deck.agents = [];
+      deck.stages = [];
+      deck.connection = {
+        ...deck.connection,
+        status: "connected",
+        daemonDetected: true,
+        message: "Daemon responding",
+        detail: undefined,
+        buildStampMismatchOnly: false,
+        runningAgentCount: 0,
+        upgradeOffer: { kind: "current" },
+      };
+      deck.health = "healthy";
+      this.emitSnapshot();
+      return { outcome: "restarted", fromVersion, toVersion, stopped: atStake };
+    } finally {
+      this.upgradeQuestions.delete(upgradeId);
+      this.upgradesInFlight.delete(deckId);
+    }
+  }
+
+  async decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void> {
+    const waiting = this.upgradeQuestions.get(upgradeId);
+    if (!waiting) throw new Error("That upgrade is no longer waiting for an answer; it may have finished already.");
+    if (waiting.questionId !== questionId) throw new Error("That question was replaced by a newer one, because what a restart would stop changed. Answer the question shown now.");
+    this.upgradeQuestions.delete(upgradeId);
+    waiting.answer(choice);
+  }
+
   async desktopFeatures(): Promise<DesktopFeatures> {
     await Promise.resolve();
     return fixtureDesktopFeatures();
@@ -2886,7 +3178,7 @@ class FixtureDeckBridge implements DeckBridge {
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = fixtureProjectOrchestrations(home, path);
+    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
@@ -2907,6 +3199,16 @@ class FixtureDeckBridge implements DeckBridge {
  * nine (PRD #745 M7).
  */
 export const MAX_WARM_TERMINALS = 3;
+
+/**
+ * PRD #1487 M5 — a fresh id for one `desktop_upgrade_daemon` call, unique
+ * across page reloads (a run a previous page started may still be emitting).
+ * Letters, digits and `-` only, which is what the crate accepts.
+ */
+function newUpgradeAttemptId(): string {
+  const random = globalThis.crypto?.randomUUID?.();
+  return random ?? `attempt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
 
 /**
  * One installed terminal session, and the deck it was created against.
@@ -2943,9 +3245,12 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
+  /** PRD #1487 M5 — decks with an upgrade this bridge started still running. */
+  private upgradingDecks = new Set<string>();
   /**
-   * The tail of each terminal's input queue, by the same composite key as
-   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   * The tail of each terminal session's input queue, by the `sessionId` of the
+   * session the input was accepted for. See {@link sendTerminalInput} for why
+   * input is queued, and why per session rather than per agent.
    */
   private inputTails = new Map<string, Promise<void>>();
   /**
@@ -4008,7 +4313,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
@@ -4028,7 +4333,7 @@ export class TauriDeckBridge implements DeckBridge {
       } catch (cause) {
         throw actionErrorFrom(cause);
       }
-      if (action.type === "stop_daemon" || action.type === "restart_daemon") {
+      if (action.type === "stop_daemon") {
         this.sessions.clear();
         this.sessionKeys.clear();
         this.attached.clear();
@@ -4046,9 +4351,18 @@ export class TauriDeckBridge implements DeckBridge {
       return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
     }
     if (action.type === "start_daemon") {
-      const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
-      if (dto.connection.status !== "connected") {
-        throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
+      // Issue #1490: one command for every deck, local or remote. It resolves
+      // only once the deck is connected, and rejects with the sentence to show
+      // — for a failed start, with its technical detail beside it, rethrown as
+      // a `StartDaemonError`.
+      let result: StartDaemonResultDto;
+      try {
+        result = await invoke<StartDaemonResultDto>("desktop_start_daemon", { deckId: action.deckId ?? null });
+      } catch (cause) {
+        throw startDaemonErrorFrom(cause);
+      }
+      if (result?.snapshot?.connection?.status !== "connected") {
+        throw new Error(result?.snapshot?.connection?.error ?? "The daemon did not become connected.");
       }
       // PRD #745 M7: starting the daemon no longer attaches its whole fleet
       // either — this was the third eager call site, and the one reachable
@@ -4245,18 +4559,36 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDeckStep: VoiceDeckChoiceDto[] | undefined;
   /** PRD #1195 — the Deck selector's section as it was rendered. */
   private voiceEndpoints: EndpointSettingsDto | undefined;
+  /** PRD #1260 — the dictation mode's target, while the mode is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
     this.voiceDeckStep = deckStep;
     this.voiceEndpoints = endpoints;
+    this.voiceDictation = dictation;
+  }
+
+  async answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    const invoke = await this.getInvoke();
+    const answer = await invoke<VoiceChoiceAnswerDto>("desktop_voice_choice", { utterance, action, offered, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null });
+    /* Rust hands back the entry exactly as offered; the offered one is
+       returned, so its identity keeps the keys it was given on the way in. */
+    if (answer.kind !== "selected") return answer;
+    const candidate = offered.find((entry) => entry.value === answer.candidate.value);
+    return candidate ? { kind: "selected", candidate } : { kind: "refused" };
+  }
+
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null }));
   }
 
   /**
@@ -4318,22 +4650,36 @@ export class TauriDeckBridge implements DeckBridge {
    * waits and the pane reattaches, the chunk was typed into a terminal that no
    * longer exists, and it rejects as not attached rather than landing in the
    * replacement.
+   *
+   * PRD #1541 — the queue is the accepted SESSION's, not the agent's: a chunk
+   * waits only for earlier chunks accepted for the same session. A session
+   * whose last write never settles therefore holds back only the chunks typed
+   * into it — which reject as not attached once their turn comes — and never
+   * the session that replaced it. A re-attach that is handed the same
+   * `sessionId` back shares that session's queue, so its order is kept.
+   *
+   * PRD #1541 — a chunk with a `precondition` asks it when its turn comes,
+   * after the previous chunk settled and before `desktop_terminal_write` is
+   * invoked; a false answer rejects it with {@link TerminalInputCancelled} and
+   * writes nothing, and the chunks behind it go on as usual.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
     const key = agentKey(target.deckId, target.agentId);
     const accepted = this.sessions.get(key);
     const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
     if (!accepted) throw notAttached();
-    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const queue = accepted.result.sessionId;
+    const previous = this.inputTails.get(queue) ?? Promise.resolve();
     const write = previous.then(async () => {
       const invoke = await this.getInvoke();
       if (this.sessions.get(key) !== accepted) throw notAttached();
+      if (precondition && !precondition()) throw new TerminalInputCancelled();
       await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
     });
     const tail = write.catch(() => undefined);
-    this.inputTails.set(key, tail);
+    this.inputTails.set(queue, tail);
     void tail.then(() => {
-      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+      if (this.inputTails.get(queue) === tail) this.inputTails.delete(queue);
     });
     return write;
   }
@@ -4419,6 +4765,77 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {
+    // One upgrade per deck at a time from this app, reserved before anything
+    // is awaited: a second call while one runs registers no listener at all,
+    // so it cannot hear, show or answer the first run's question (PRD #1487,
+    // Qodo 4208054166). The crate refuses a second run too.
+    if (this.upgradingDecks.has(deckId)) throw new Error(UPGRADE_ALREADY_RUNNING);
+    this.upgradingDecks.add(deckId);
+    try {
+      const invoke = await this.getInvoke();
+      const { listen } = await import("@tauri-apps/api/event");
+      // Every event of this run carries the id chosen here, before the crate
+      // can emit anything, so the listeners hear this run and no other —
+      // another deck's, or one a reloaded page left running.
+      const attemptId = newUpgradeAttemptId();
+      // Settled rather than `Promise.all`, so a listener that did register is
+      // removed when the other one fails, instead of outliving the run (PRD
+      // #1487, Qodo #14).
+      const registered = await Promise.allSettled([
+        listen<UpgradeProgressEvent>("desktop://upgrade-progress", (event) => {
+          if (event.payload.attemptId === attemptId) onEvent({ type: "progress", ...event.payload });
+        }),
+        listen<UpgradeDecisionEvent>("desktop://upgrade-decision", (event) => {
+          if (event.payload.attemptId === attemptId) onEvent({ type: "decision", ...event.payload });
+        }),
+      ]);
+      const stops = registered.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+      const refused = registered.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (refused) {
+        stops.forEach((stop) => stop());
+        throw refused.reason;
+      }
+      try {
+        const outcome = await invoke<UpgradeOutcome>("desktop_upgrade_daemon", { deckId, attemptId });
+        // When the old daemon may be gone the crate ended this deck's terminal
+        // sessions with it; the bridge forgets them too, so the next declaration
+        // re-attaches against whatever answers now.
+        if (upgradeEndedDeckSessions(outcome)) this.forgetDeckSessions(deckId);
+        return outcome;
+      } finally {
+        stops.forEach((stop) => stop());
+      }
+    } finally {
+      this.upgradingDecks.delete(deckId);
+    }
+  }
+
+  async decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke("desktop_upgrade_decide", { upgradeId, questionId, choice });
+  }
+
+  /**
+   * Forget every terminal session on `deckId` after its daemon was replaced —
+   * the crate already detached them. Other decks' sessions are untouched, and
+   * `shown` is kept for the reason `stop_daemon` keeps it: re-declaring it
+   * re-attaches against the new daemon.
+   */
+  private forgetDeckSessions(deckId: string): void {
+    for (const [key, session] of Array.from(this.sessions.entries())) {
+      if (session.target.deckId !== deckId) continue;
+      this.sessions.delete(key);
+      this.sessionKeys.delete(session.result.sessionId);
+      this.attached.delete(key);
+      this.terminalChannels.delete(key);
+      this.warm.delete(key);
+    }
+    for (const [key, target] of Array.from(this.warm.entries())) {
+      if (target.deckId === deckId) this.warm.delete(key);
+    }
   }
 
   async desktopFeatures(): Promise<DesktopFeatures> {

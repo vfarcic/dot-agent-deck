@@ -340,14 +340,14 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
         EndpointTestState::ContractDiffers => info
             .and_then(|info| info.error.clone())
             .unwrap_or_else(|| {
-                format!("{deck} answered; a declared compatibility break sits between the two builds.")
+                format!("{deck} answered, but it is a different version from this app, so the app has not connected: it could misread some of what that daemon reports.")
             }),
         EndpointTestState::ProtocolRefused => info
             .and_then(|info| info.error.clone())
-            .unwrap_or_else(|| format!("{deck} speaks a different protocol version.")),
+            .unwrap_or_else(|| format!("{deck} answered, but it is a different version from this app and the two cannot work together.")),
         EndpointTestState::HandshakeRefused => info
             .and_then(|info| info.error.clone())
-            .unwrap_or_else(|| format!("{deck} refused the connection.")),
+            .unwrap_or_else(|| format!("{deck} turned this app away.")),
         EndpointTestState::DeckNotAnswering => format!(
             "The ssh connection to {deck} works, but nothing is listening on its daemon socket over there. Start Agent Deck on that machine, then test again."
         ),
@@ -394,6 +394,13 @@ fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo) {
     // `strip_control_and_bidi` removes rather than escapes, so scrubbing a
     // string that is already scrubbed — `deck` is — changes nothing.
     report.message = safe_display_text(message_for(report.state, &report.deck, Some(info)));
+    // The handshake's technical half — break names, protocol numbers, builds —
+    // goes where the panel already shows a transport failure's details, so the
+    // sentence above stays in the user's terms (CLAUDE.md rule 21). Scrubbed
+    // for the same reason as the message: it carries the peer's stamp.
+    if report.detail.is_none() {
+        report.detail = info.error_detail.clone().map(safe_display_text);
+    }
     report.server_protocol_version = info.server_protocol_version;
     report.daemon_build_version = info.daemon_build_version.as_deref().map(safe_display_text);
     report.running_agent_count = info.running_agent_count;
@@ -936,6 +943,15 @@ mod tests {
             report.daemon_build_version
         );
         assert!(
+            !report
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains('\u{202e}'),
+            "the details still carry the override: {:?}",
+            report.detail
+        );
+        assert!(
             report.daemon_build_version.as_deref() == Some("0.38.0-g5a56361drowssap"),
             "scrubbing must strip the control and keep the rest: {:?}",
             report.daemon_build_version
@@ -1022,8 +1038,10 @@ mod tests {
         assert!(state.is_ok());
     }
 
-    /// The wire disagreeing is the state no override reaches, and the report
-    /// carries both numbers so the sentence can name them.
+    /// The wire disagreeing is the state no override reaches. The report
+    /// carries both numbers, and they are shown under the result's details —
+    /// the sentence itself says which side is older in plain words, because a
+    /// user cannot act on a protocol number (CLAUDE.md rule 21).
     #[test]
     fn a_protocol_difference_is_named_and_carries_both_versions() {
         let mut response = hello_with_build(Some("0.39.0-gabc1234"));
@@ -1045,9 +1063,20 @@ mod tests {
         assert_eq!(report.client_protocol_version, PROTOCOL_VERSION);
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION + 1));
         assert!(
-            report.message.contains(&PROTOCOL_VERSION.to_string()),
-            "the sentence must name the version: {}",
+            report.message.contains("This app is older than the daemon"),
+            "the sentence names the older side: {}",
             report.message
+        );
+        assert!(
+            !report.message.chars().any(|c| c.is_ascii_digit()),
+            "no protocol number in the sentence: {}",
+            report.message
+        );
+        let detail = report.detail.expect("the numbers move to the details");
+        assert!(
+            detail.contains(&PROTOCOL_VERSION.to_string())
+                && detail.contains(&(PROTOCOL_VERSION + 1).to_string()),
+            "the details name both versions: {detail}"
         );
     }
 
@@ -1358,9 +1387,13 @@ mod tests {
         assert_eq!(report.client_protocol_version, PROTOCOL_VERSION);
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION + 1));
         assert!(
-            report.message.contains(&(PROTOCOL_VERSION + 1).to_string()),
-            "the sentence must name what the daemon reported: {}",
-            report.message
+            report
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&(PROTOCOL_VERSION + 1).to_string()),
+            "the details must name what the daemon reported: {:?}",
+            report.detail
         );
         let _ = std::fs::remove_dir_all(dir);
     }

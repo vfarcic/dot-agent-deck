@@ -17,16 +17,29 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+	AGENT_EVENT_TYPES,
 	AGENT_STATES,
 	buildAgentEventArgv,
+	DETAIL_EVENTS,
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
+	createReporter,
+	createSerialQueue,
 	DECK_BIN,
 	DECK_EXE_ENV,
+	DeckExecError,
+	DECLARE_PROMPT_REPORTS_FLAG,
 	execFailureMessage,
 	isAgentState,
+	isUnsupportedFlagFailure,
+	legacyAgentEventArgv,
+	MAX_PROMPT_CHARS,
+	piEventReport,
 	piEventToAgentState,
+	piToolDetail,
+	REPORT_LEVELS,
+	reportArgvAt,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
 	seedToDeliver,
@@ -113,10 +126,217 @@ describe("row 8: agent-event argv", () => {
 		assert.deepEqual(buildAgentEventArgv("finished"), ["agent-event", "--type", "finished"]);
 	});
 
-	test("throws a clear error on a non-canonical state, listing the allowed ones", () => {
-		assert.throws(() => buildAgentEventArgv("idle"), /unknown state "idle".*running, waiting, finished/s);
-		assert.throws(() => buildAgentEventArgv("Running"), /unknown state "Running"/);
-		assert.throws(() => buildAgentEventArgv(""), /unknown state ""/);
+	test("throws a clear error on a non-canonical type, listing the allowed ones", () => {
+		assert.throws(
+			() => buildAgentEventArgv("idle"),
+			/unknown type "idle".*running, waiting, finished, prompt, tool-start, tool-end/s,
+		);
+		assert.throws(() => buildAgentEventArgv("Running"), /unknown type "Running"/);
+		assert.throws(() => buildAgentEventArgv("tool_start"), /unknown type "tool_start"/);
+		assert.throws(() => buildAgentEventArgv(""), /unknown type ""/);
+	});
+
+	// Issue #622: the card detail rides the same verb as optional flags.
+	test("appends each supplied detail as its own flag, in a fixed order", () => {
+		assert.deepEqual(
+			buildAgentEventArgv("tool-start", {
+				cwd: "/work/repo",
+				toolName: "bash",
+				toolDetail: "touch x.txt",
+			}),
+			["agent-event", "--type", "tool-start", "--cwd=/work/repo", "--tool-name=bash", "--tool-detail=touch x.txt"],
+		);
+		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "fix it" }), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--cwd=/w",
+			"--prompt=fix it",
+		]);
+	});
+
+	test("a value starting with a dash stays inside its own flag", () => {
+		assert.deepEqual(buildAgentEventArgv("prompt", { prompt: "--help me" }), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--prompt=--help me",
+		]);
+		assert.deepEqual(buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "-rf build" }), [
+			"agent-event",
+			"--type",
+			"tool-start",
+			"--tool-name=bash",
+			"--tool-detail=-rf build",
+		]);
+	});
+
+	test("omits blank or missing details rather than sending empty flags", () => {
+		assert.deepEqual(buildAgentEventArgv("running", { cwd: "  ", prompt: "", toolName: undefined }), [
+			"agent-event",
+			"--type",
+			"running",
+		]);
+	});
+
+	test("a lifecycle report keeps its exact legacy argv when no detail is given", () => {
+		assert.deepEqual(buildAgentEventArgv("finished", {}), ["agent-event", "--type", "finished"]);
+	});
+
+	// Issue #1567: the declaration goes FIRST among the flags, so a CLI that
+	// predates it names it, and not `--cwd`, as the argument it does not know.
+	test("the prompt-report declaration is the first flag when asked for", () => {
+		assert.equal(DECLARE_PROMPT_REPORTS_FLAG, "--reports-prompts");
+		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "go" }, true), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--reports-prompts",
+			"--cwd=/w",
+			"--prompt=go",
+		]);
+		assert.deepEqual(buildAgentEventArgv("finished", {}, true), [
+			"agent-event",
+			"--type",
+			"finished",
+			"--reports-prompts",
+		]);
+	});
+});
+
+describe("issue #622: Pi tool detail", () => {
+	test("bash shows the first line of its command", () => {
+		assert.equal(piToolDetail("bash", { command: "touch a.txt\necho done", timeout: 5 }), "touch a.txt");
+	});
+
+	test("bash clips a long command to 120 characters", () => {
+		assert.equal(piToolDetail("bash", { command: "x".repeat(300) })?.length, 120);
+	});
+
+	test("file tools show their path, search tools their pattern", () => {
+		assert.equal(piToolDetail("read", { path: "src/a.rs", offset: 3 }), "src/a.rs");
+		assert.equal(piToolDetail("write", { content: "body first", path: "out.txt" }), "out.txt");
+		assert.equal(piToolDetail("edit", { path: "b.ts", edits: [] }), "b.ts");
+		assert.equal(piToolDetail("ls", { path: "docs" }), "docs");
+		assert.equal(piToolDetail("grep", { path: "src", pattern: "fn main" }), "fn main");
+		assert.equal(piToolDetail("find", { pattern: "*.md" }), "*.md");
+	});
+
+	test("an unknown tool falls back to its first string argument, clipped to 80", () => {
+		assert.equal(piToolDetail("delegate", { role: "coder", task: "t" }), "coder");
+		assert.equal(piToolDetail("custom", { n: 1, s: "y".repeat(200) })?.length, 80);
+	});
+
+	test("arguments that carry nothing to show yield no detail", () => {
+		assert.equal(piToolDetail("ls", {}), undefined);
+		assert.equal(piToolDetail("bash", null), undefined);
+		assert.equal(piToolDetail("bash", "touch x"), undefined);
+		assert.equal(piToolDetail("custom", { n: 1 }), undefined);
+	});
+
+	test("clipping never splits a surrogate pair", () => {
+		const detail = piToolDetail("bash", { command: "😀".repeat(200) }) as string;
+		assert.equal(Array.from(detail).length, 120);
+		assert.ok(!/[\uD800-\uDBFF]$/.test(detail));
+	});
+});
+
+describe("issue #622: Pi event → agent-event report", () => {
+	test("a lifecycle event reports its state plus the session cwd", () => {
+		assert.deepEqual(piEventReport("agent_start", {}, "/w"), { type: "running", detail: { cwd: "/w" } });
+		assert.deepEqual(piEventReport("session_start", {}, "/w"), { type: "finished", detail: { cwd: "/w" } });
+	});
+
+	test("before_agent_start reports the submitted prompt", () => {
+		assert.deepEqual(piEventReport("before_agent_start", { prompt: "list the files" }, "/w"), {
+			type: "prompt",
+			detail: { cwd: "/w", prompt: "list the files" },
+		});
+	});
+
+	test("a prompt is clipped before it reaches argv", () => {
+		const report = piEventReport("before_agent_start", { prompt: "p".repeat(MAX_PROMPT_CHARS + 50) }, "/w");
+		assert.equal(report?.detail.prompt?.length, MAX_PROMPT_CHARS);
+	});
+
+	// Issue #1567, measured on Pi 0.87.1: a prompt submitted while Pi is busy is
+	// queued as a steering or follow-up message and never reaches
+	// `before_agent_start`. Pi raises `input` for it with `streamingBehavior`.
+	test("input reports a prompt Pi queues because it is busy", () => {
+		for (const streamingBehavior of ["steer", "followUp"]) {
+			assert.deepEqual(
+				piEventReport("input", { text: "also do this", source: "interactive", streamingBehavior }, "/w"),
+				{ type: "prompt", detail: { cwd: "/w", prompt: "also do this" } },
+				streamingBehavior,
+			);
+		}
+		assert.equal(
+			piEventReport(
+				"input",
+				{ text: "p".repeat(MAX_PROMPT_CHARS + 50), source: "extension", streamingBehavior: "followUp" },
+				"/w",
+			)?.detail.prompt?.length,
+			MAX_PROMPT_CHARS,
+		);
+	});
+
+	test("input leaves an idle submission to before_agent_start, so it is reported once", () => {
+		assert.equal(piEventReport("input", { text: "go", source: "interactive" }, "/w"), null);
+		assert.equal(
+			piEventReport("input", { text: "go", source: "interactive", streamingBehavior: undefined }, "/w"),
+			null,
+		);
+	});
+
+	test("input with no usable text reports nothing", () => {
+		assert.equal(piEventReport("input", { text: "  ", streamingBehavior: "steer" }, "/w"), null);
+		assert.equal(piEventReport("input", { streamingBehavior: "steer" }, "/w"), null);
+		assert.equal(piEventReport("input", undefined, "/w"), null);
+	});
+
+	test("a blank or missing prompt reports nothing (agent_start still reports the turn)", () => {
+		assert.equal(piEventReport("before_agent_start", { prompt: "   " }, "/w"), null);
+		assert.equal(piEventReport("before_agent_start", {}, "/w"), null);
+		assert.equal(piEventReport("before_agent_start", undefined, "/w"), null);
+	});
+
+	test("tool_execution_start reports the tool and its detail", () => {
+		assert.deepEqual(
+			piEventReport("tool_execution_start", { toolCallId: "c1", toolName: "bash", args: { command: "ls -la" } }, "/w"),
+			{ type: "tool-start", detail: { cwd: "/w", toolName: "bash", toolDetail: "ls -la" } },
+		);
+	});
+
+	test("tool_execution_end reports the tool finishing, failed or not", () => {
+		assert.deepEqual(
+			piEventReport("tool_execution_end", { toolCallId: "c1", toolName: "bash", result: {}, isError: true }, "/w"),
+			{ type: "tool-end", detail: { cwd: "/w", toolName: "bash" } },
+		);
+	});
+
+	test("a missing cwd is simply left off", () => {
+		assert.deepEqual(piEventReport("agent_settled", {}, undefined), { type: "finished", detail: {} });
+	});
+
+	test("unsubscribed events report nothing", () => {
+		assert.equal(piEventReport("agent_end", {}, "/w"), null);
+		assert.equal(piEventReport("tool_execution_update", { toolName: "bash" }, "/w"), null);
+		assert.equal(piEventReport("tool_call", { toolName: "bash" }, "/w"), null);
+	});
+
+	test("every subscribed event yields a report whose argv the CLI accepts", () => {
+		const payloads: Record<string, unknown> = {
+			before_agent_start: { prompt: "go" },
+			input: { text: "go", source: "interactive", streamingBehavior: "steer" },
+			tool_execution_start: { toolName: "bash", args: { command: "ls" } },
+			tool_execution_end: { toolName: "bash" },
+		};
+		for (const event of [...STATUS_EVENTS, ...DETAIL_EVENTS]) {
+			const report = piEventReport(event, payloads[event] ?? {}, "/w");
+			assert.notEqual(report, null, `${event} should report`);
+			const argv = buildAgentEventArgv(report!.type, report!.detail);
+			assert.ok((AGENT_EVENT_TYPES as readonly string[]).includes(argv[2]));
+		}
 	});
 });
 
@@ -282,5 +502,178 @@ describe("row 9: Pi event → agent state mapping", () => {
 		assert.ok(isAgentState("running"));
 		assert.ok(!isAgentState("idle"));
 		assert.ok(!isAgentState("RUNNING"));
+	});
+});
+
+describe("issue #622: falling back for a CLI older than the extension", () => {
+	test("a lifecycle report with detail falls back to the bare argv every CLI accepts", () => {
+		assert.deepEqual(legacyAgentEventArgv({ type: "running", detail: { cwd: "/w" } }), [
+			"agent-event",
+			"--type",
+			"running",
+		]);
+	});
+
+	test("a lifecycle report that is already bare has nothing to fall back to", () => {
+		assert.equal(legacyAgentEventArgv({ type: "finished", detail: {} }), null);
+		assert.equal(legacyAgentEventArgv({ type: "finished", detail: { cwd: "  " } }), null);
+	});
+
+	test("a detail report has no older equivalent and is dropped", () => {
+		assert.equal(legacyAgentEventArgv({ type: "prompt", detail: { prompt: "p" } }), null);
+		assert.equal(legacyAgentEventArgv({ type: "tool-start", detail: { toolName: "bash" } }), null);
+		assert.equal(legacyAgentEventArgv({ type: "tool-end", detail: {} }), null);
+	});
+
+	test("only the CLI's own unknown-flag refusal marks it as older", () => {
+		// The released 0.45.1 CLI's exact refusal.
+		const refusal =
+			"error: unexpected argument '--cwd' found\n\nUsage: dot-agent-deck agent-event --type <TYPE>\n";
+		assert.ok(isUnsupportedFlagFailure({ code: 2, stderr: refusal }));
+		// Not a usage error, or not this one.
+		assert.ok(!isUnsupportedFlagFailure({ code: 1, stderr: "Failed to send agent-event to daemon socket." }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 1, stderr: refusal }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 2, stderr: "error: invalid value 'x' for '--type <TYPE>'" }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 2 }));
+		// The phrase appearing elsewhere (e.g. in a directory echoed back) is not a refusal.
+		assert.ok(
+			!isUnsupportedFlagFailure({
+				code: 1,
+				stderr: "Failed to send agent-event for /work/error: unexpected argument '--x'",
+			}),
+		);
+	});
+});
+
+describe("issue #1567: report levels for decks of every age", () => {
+	const prompt = { type: "prompt" as const, detail: { cwd: "/w", prompt: "go" } };
+	const lifecycle = { type: "running" as const, detail: { cwd: "/w" } };
+
+	test("each level sends what it names, and a detail report has no lifecycle form", () => {
+		assert.deepEqual([...REPORT_LEVELS], ["declared", "detail", "lifecycle"]);
+		assert.deepEqual(reportArgvAt(prompt, "declared"), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--reports-prompts",
+			"--cwd=/w",
+			"--prompt=go",
+		]);
+		assert.deepEqual(reportArgvAt(prompt, "detail"), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
+		assert.equal(reportArgvAt(prompt, "lifecycle"), null);
+		assert.deepEqual(reportArgvAt(lifecycle, "lifecycle"), ["agent-event", "--type", "running"]);
+	});
+
+	/**
+	 * A fake deck CLI that knows only `known` flags and refuses the first
+	 * other one exactly as clap does (exit 2, `error: unexpected argument …`).
+	 * `down` makes every call fail the way an unreachable daemon does.
+	 */
+	function fakeCli(known: string[], options: { down?: boolean } = {}) {
+		const calls: string[][] = [];
+		const run = async (argv: string[]) => {
+			calls.push(argv);
+			const unknown = argv.slice(3).find((arg) => !known.includes(arg.split("=")[0]));
+			if (unknown !== undefined) {
+				const flag = unknown.split("=")[0];
+				throw new DeckExecError("refused", { code: 2, stderr: `error: unexpected argument '${flag}' found\n` });
+			}
+			if (options.down) {
+				throw new DeckExecError("down", { code: 1, stderr: "Failed to send agent-event to daemon socket." });
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		};
+		return { calls, run };
+	}
+	const DETAIL_FLAGS = ["--cwd", "--prompt", "--tool-name", "--tool-detail"];
+
+	test("a current deck gets every report declared, first time", async () => {
+		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		await reporter.send(prompt);
+		assert.equal(reporter.level(), "declared");
+		assert.deepEqual(
+			cli.calls.map((argv) => argv.includes("--reports-prompts")),
+			[true, true],
+		);
+	});
+
+	test("a deck from #622 to #1567 keeps the detail and loses only the declaration", async () => {
+		const cli = fakeCli(DETAIL_FLAGS);
+		const reporter = createReporter(cli.run);
+		await reporter.send(prompt);
+		assert.equal(reporter.level(), "detail");
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
+		await reporter.send(lifecycle);
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "running", "--cwd=/w"]);
+		assert.equal(cli.calls.length, 3, "after the first refusal no report is spent on the declaration");
+	});
+
+	test("a deck from before #622 falls all the way to bare lifecycle reports", async () => {
+		const cli = fakeCli([]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "lifecycle");
+		assert.deepEqual(cli.calls, [
+			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "running", "--cwd=/w"],
+			["agent-event", "--type", "running"],
+		]);
+		await reporter.send(prompt);
+		assert.equal(cli.calls.length, 3, "a detail report has nothing to send to such a deck");
+	});
+
+	test("a transient failure keeps the level and retries a lifecycle report bare", async () => {
+		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS], { down: true });
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "declared");
+		assert.deepEqual(cli.calls, [
+			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "running"],
+		]);
+		await reporter.send(prompt);
+		assert.equal(cli.calls.length, 3, "a failed detail report is not retried");
+	});
+
+	test("a failure that is not a DeckExecError is treated as transient", async () => {
+		const calls: string[][] = [];
+		const reporter = createReporter(async (argv) => {
+			calls.push(argv);
+			throw new Error("spawn ENOENT");
+		});
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "declared");
+		assert.equal(calls.length, 2);
+	});
+});
+
+describe("issue #622: reports reach the deck in the order Pi emitted them", () => {
+	const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	test("a slow earlier report finishes before a fast later one starts", async () => {
+		const inOrder = createSerialQueue();
+		const log: string[] = [];
+		const first = inOrder(async () => {
+			log.push("agent_start:begin");
+			await delay(30); // e.g. a failed detailed report plus its bare retry
+			log.push("agent_start:end");
+		});
+		const second = inOrder(async () => {
+			log.push("agent_settled:begin");
+			log.push("agent_settled:end");
+		});
+		await Promise.all([first, second]);
+		assert.deepEqual(log, ["agent_start:begin", "agent_start:end", "agent_settled:begin", "agent_settled:end"]);
+	});
+
+	test("a failed report does not stop the ones after it", async () => {
+		const inOrder = createSerialQueue();
+		const failed = inOrder(async () => {
+			throw new Error("daemon down");
+		});
+		await assert.rejects(failed, /daemon down/);
+		assert.equal(await inOrder(async () => "next"), "next");
 	});
 });

@@ -232,7 +232,9 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
 /// carrying control bytes claims the canonical name the tab will actually show;
 /// and once every pane of the title-holding tab has exited, the title can be
 /// claimed again — even with an unrelated agent reusing the holder's pane id —
-/// rather than being unclaimable for the rest of the daemon's life.
+/// rather than being unclaimable for the rest of the daemon's life. The same
+/// goes for a run the daemon spawns itself, as a scheduled fire does: a client
+/// typing its title is refused while it runs, and admitted once it has exited.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/identity/008")]
 async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_exit() {
@@ -388,4 +390,111 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
     )
     .await
     .expect("a title whose every pane has exited must be claimable again");
+
+    // Issue #1339: the same holds for a run the daemon spawned ITSELF (a
+    // scheduled fire, `dispatch`, issue dispatch). It is admitted through the
+    // same check and holds its title while live — a client typing it is
+    // refused — and its admission claim is released once its roles are
+    // registered, so the title is free again once those roles exit rather
+    // than held by a claim nothing will ever end.
+    let spawned_dir = common::race_safe_tempdir();
+    let spawned_cwd = spawned_dir.path().to_string_lossy().into_owned();
+    let spawned_release = spawned_dir.path().join("release-roles");
+    let role_command = format!(
+        "sh -c 'while [ ! -e {} ]; do sleep 0.05; done'",
+        spawned_release.display()
+    );
+    tokio::fs::write(
+        spawned_dir.path().join(".dot-agent-deck.toml"),
+        format!(
+            "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{role_command}\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{role_command}\"\n"
+        ),
+    )
+    .await
+    .expect("write the spawned run's config");
+    let spawned = dot_agent_deck::spawn::spawn(
+        dot_agent_deck::spawn::SpawnRequest {
+            task_name: "scheduled-review".to_string(),
+            working_dir: spawned_cwd.clone(),
+            command: None,
+            prompt: "review".to_string(),
+            resolved_target: None,
+            compose_orchestrator_context: None,
+        },
+        &daemon.registry,
+        &QuietNotifier,
+        Some(&daemon.event_tx),
+        true,
+        Some(&daemon.state),
+    )
+    .await
+    .expect("the daemon's own spawn primitive must start the run");
+    let spawned_title = format!(
+        "{ORCHESTRATION} · {}",
+        spawned_dir
+            .path()
+            .file_name()
+            .expect("a tempdir has a basename")
+            .to_string_lossy()
+    );
+    let refused = start_role(
+        &client,
+        Role {
+            command: "cat",
+            pane_id: "after-spawn-orchestrator",
+            orchestration_id: "after-spawn-tab",
+            role_index: 0,
+            role_name: "orchestrator",
+            is_start_role: true,
+            display_title: Some(&spawned_title),
+            orchestration_cwd: &spawned_cwd,
+        },
+    )
+    .await;
+    assert_title_refusal(refused, &spawned_title);
+
+    tokio::fs::write(&spawned_release, b"")
+        .await
+        .expect("release the spawned run's stand-ins");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while spawned
+        .agents
+        .iter()
+        .any(|a| daemon.registry.has_live_pane(&a.pane_id))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the spawned run's stand-ins never exited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    start_role(
+        &client,
+        Role {
+            command: "cat",
+            pane_id: "after-spawn-orchestrator",
+            orchestration_id: "after-spawn-tab",
+            role_index: 0,
+            role_name: "orchestrator",
+            is_start_role: true,
+            display_title: Some(&spawned_title),
+            orchestration_cwd: &spawned_cwd,
+        },
+    )
+    .await
+    .expect(
+        "a daemon-spawned run's title must be free once its roles have exited — still refused \
+         here means the spawn's own admission claim was never released",
+    );
+}
+
+/// The spawn primitive reports failures through a notifier; nothing here is
+/// expected to fail, and the `expect` on its result says why if it does.
+struct QuietNotifier;
+impl dot_agent_deck::scheduler::Notifier for QuietNotifier {
+    fn notify(&self, event: dot_agent_deck::scheduler::NotifyEvent) {
+        eprintln!("[spawn notifier] {event:?}");
+    }
 }
