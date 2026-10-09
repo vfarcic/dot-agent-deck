@@ -4494,7 +4494,9 @@ impl ReadingSessions {
 
 /// The real [`voice::reading::TurnSummariser`]: the settings read per call
 /// (so a revoked opt-in stops the very next request), and the Commands
-/// connection they name with its key from the keychain.
+/// connection they name with its key from the keychain. The summariser runs
+/// `load` on a blocking thread, as [`voice_settings_now`] does, because reading
+/// runs on the shared async runtime and this is file I/O.
 fn settings_summariser() -> voice::reading::SettingsSummariser {
     voice::reading::SettingsSummariser::new(
         Arc::new(|| {

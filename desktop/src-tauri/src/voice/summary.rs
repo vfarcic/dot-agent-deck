@@ -142,7 +142,12 @@ pub enum SummaryFailure {
 
 /// Asked after the keychain read and immediately before a summary request:
 /// whether the settings as they are then still permit it (PR #1617's review).
-pub type RequestGate = Arc<dyn Fn() -> bool + Send + Sync>;
+/// A future, so the settings read behind it can run on a blocking thread
+/// rather than on the async worker sending the request.
+pub type RequestGate = Arc<dyn Fn() -> GateFuture + Send + Sync>;
+
+/// The answer a [`RequestGate`] gives.
+pub type GateFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 
 /// What reading mode speaks for one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,7 +637,9 @@ impl HttpSummaryTransport {
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
             .await
             .map_err(SummaryFailure::NotConfigured)?;
-        if self.gate.as_ref().is_some_and(|gate| !gate()) {
+        if let Some(gate) = self.gate.as_ref()
+            && !gate().await
+        {
             return Err(SummaryFailure::NotPermitted);
         }
         let Some(client) = self.client.as_ref() else {

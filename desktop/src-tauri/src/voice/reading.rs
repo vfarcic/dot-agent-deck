@@ -609,19 +609,40 @@ impl ReadingSentence {
 /// sent.
 pub type SummaryFuture<'a> = Pin<Box<dyn Future<Output = Option<Summary>> + Send + 'a>>;
 
+/// The future [`TurnSummariser::consented`] returns: whether reading's opt-in
+/// is on.
+pub type ConsentFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
 /// Summarises one turn, and says whether reading may go on. The real one is
 /// [`SettingsSummariser`] over the settings and the Commands connection; tests
 /// pass their own.
 pub trait TurnSummariser: Send + Sync {
     /// Whether reading's Settings opt-in is on now. Asked before every event.
-    fn consented(&self) -> bool;
+    /// A future, so the settings read behind it can run off the async worker.
+    fn consented(&self) -> ConsentFuture<'_>;
     /// Summarise one turn — or, with the opt-in off by the time the request
     /// would go out, send nothing and answer `None`.
     fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a>;
 }
 
-/// The settings document's voice section, read when asked.
+/// The settings document's voice section, read when asked. It is file I/O, so
+/// [`SettingsSummariser`] calls it only through [`load_off_runtime`].
 pub type LoadVoiceSettings = Arc<dyn Fn() -> VoiceSettings + Send + Sync>;
+
+/// `load`, run on a blocking thread rather than on the async worker that
+/// awaits it: reading's loop runs on the app's shared runtime, and reading the
+/// settings is file I/O (PR #1617's review, the same reason
+/// `voice_settings_now` reads them there).
+///
+/// `None` when the read did not finish — `load` panicked, or the runtime is
+/// shutting down. Every caller treats that as the opt-in being off, so a read
+/// that fails ends reading and sends nothing rather than reading on.
+async fn load_off_runtime(load: &LoadVoiceSettings) -> Option<VoiceSettings> {
+    let load = Arc::clone(load);
+    tauri::async_runtime::spawn_blocking(move || load())
+        .await
+        .ok()
+}
 
 /// A summary transport for the Commands connection the settings name, which
 /// asks the gate after its keychain read and sends nothing when it refuses.
@@ -630,7 +651,9 @@ pub type ConnectTransport =
 
 /// The real [`TurnSummariser`]: the settings read per call — so a changed
 /// connection applies to the next turn and a revoked opt-in stops the next
-/// request — and a transport to the Commands connection they name.
+/// request — and a transport to the Commands connection they name. Every read
+/// goes through [`load_off_runtime`], and one that does not finish counts as
+/// the opt-in being off.
 ///
 /// The transport reads the key and then asks again (PR #1617's review): the
 /// settings as they are then must still have the opt-in on and still name the
@@ -652,15 +675,19 @@ impl SettingsSummariser {
 }
 
 impl TurnSummariser for SettingsSummariser {
-    fn consented(&self) -> bool {
-        (self.load)().reading_permitted()
+    fn consented(&self) -> ConsentFuture<'_> {
+        Box::pin(async move {
+            load_off_runtime(&self.load)
+                .await
+                .is_some_and(|settings| settings.reading_permitted())
+        })
     }
 
     fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
         Box::pin(async move {
             // Immediately before the request: the opt-in may have been turned
             // off since this turn's event arrived.
-            let settings = (self.load)();
+            let settings = load_off_runtime(&self.load).await?;
             if !settings.reading_permitted() {
                 return None;
             }
@@ -668,15 +695,22 @@ impl TurnSummariser for SettingsSummariser {
                 let load = Arc::clone(&self.load);
                 let intent = settings.intent.clone();
                 Arc::new(move || {
-                    let now = load();
-                    now.reading_permitted() && now.intent.same_connection(&intent)
+                    let load = Arc::clone(&load);
+                    let intent = intent.clone();
+                    Box::pin(async move {
+                        load_off_runtime(&load).await.is_some_and(|now| {
+                            now.reading_permitted() && now.intent.same_connection(&intent)
+                        })
+                    })
                 })
             };
             let transport = (self.connect)(&settings.intent, gate);
             let summary =
                 super::summary::summarise_over(&settings.intent, transport.as_ref(), request).await;
             if summary.fallback == Some(SummaryFailure::NotPermitted)
-                && !(self.load)().reading_permitted()
+                && !load_off_runtime(&self.load)
+                    .await
+                    .is_some_and(|settings| settings.reading_permitted())
             {
                 return None;
             }
@@ -878,7 +912,7 @@ pub async fn read_turns(
         match next {
             Next::Event(None) => open = false,
             Next::Event(Some(event)) => {
-                if !summariser.consented() {
+                if !summariser.consented().await {
                     sink(ended_sentence());
                     return;
                 }
@@ -966,8 +1000,8 @@ mod tests {
     }
 
     impl TurnSummariser for Recording {
-        fn consented(&self) -> bool {
-            true
+        fn consented(&self) -> ConsentFuture<'_> {
+            Box::pin(std::future::ready(true))
         }
 
         fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
@@ -1729,8 +1763,8 @@ mod tests {
     }
 
     impl TurnSummariser for Slow {
-        fn consented(&self) -> bool {
-            true
+        fn consented(&self) -> ConsentFuture<'_> {
+            Box::pin(std::future::ready(true))
         }
 
         fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
@@ -1943,16 +1977,146 @@ mod tests {
             kind: TurnKind::Finished,
             reply: "a reply that must not leave yet",
         };
-        assert!(!summariser.consented());
+        assert!(!summariser.consented().await);
         assert_eq!(summariser.summarise(request).await, None);
         assert!(
             posts.0.lock().unwrap().is_empty(),
             "a request before the notice"
         );
         shown.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(summariser.consented());
+        assert!(summariser.consented().await);
         assert!(summariser.summarise(request).await.is_some());
         assert_eq!(posts.0.lock().unwrap().len(), 1);
+    }
+
+    /// A transport that asks its gate the way the real one does after the
+    /// keychain read, then answers as [`Posts`] does.
+    struct GateThenPosts {
+        gate: RequestGate,
+        posts: Posts,
+    }
+
+    impl SummaryTransport for GateThenPosts {
+        fn post(&self, body: serde_json::Value) -> super::super::summary::PostFuture<'_> {
+            Box::pin(async move {
+                if !(self.gate)().await {
+                    return Err(SummaryFailure::NotPermitted);
+                }
+                self.posts.post(body).await
+            })
+        }
+    }
+
+    /// Scenario (PR #1617's review, Qodo finding 16): reading is on and a
+    /// turn is summarised. Every settings read the summariser makes — the
+    /// opt-in check before an event, the one before the request, and the gate
+    /// after the keychain read — runs on a blocking thread, never on the async
+    /// worker that awaits it.
+    #[tokio::test]
+    async fn voice_reading_reads_the_settings_off_the_async_worker() {
+        let read_on = Arc::new(Mutex::new(Vec::new()));
+        let posts = Posts::default();
+        let summariser = {
+            let read_on = Arc::clone(&read_on);
+            let posts = posts.clone();
+            SettingsSummariser::new(
+                Arc::new(move || {
+                    read_on.lock().unwrap().push(std::thread::current().id());
+                    VoiceSettings {
+                        intent: IntentSettings::for_backend(
+                            crate::settings::IntentBackend::OpenaiCompatible,
+                        ),
+                        reading: ReadingConsent::On,
+                        reading_notice: ReadingNotice::Shown,
+                        ..VoiceSettings::default()
+                    }
+                }),
+                Box::new(move |_, gate| {
+                    Box::new(GateThenPosts {
+                        gate,
+                        posts: posts.clone(),
+                    })
+                }),
+            )
+        };
+        assert!(summariser.consented().await);
+        let summary = summariser
+            .summarise(TurnSummaryRequest {
+                agent: "tester",
+                kind: TurnKind::Finished,
+                reply: "all 42 tests pass",
+            })
+            .await
+            .expect("summarised");
+        assert_eq!(summary.fallback, None);
+        assert_eq!(posts.0.lock().unwrap().len(), 1);
+        let read_on = read_on.lock().unwrap();
+        assert_eq!(
+            read_on.len(),
+            3,
+            "the opt-in check, the pre-request read and the gate"
+        );
+        let worker = std::thread::current().id();
+        assert!(
+            read_on.iter().all(|thread| *thread != worker),
+            "a settings read ran on the async worker that awaited it"
+        );
+    }
+
+    /// Scenario (PR #1617's review, Qodo finding 16): reading is running and
+    /// the settings read fails — the blocking thread it runs on panics. That
+    /// counts as the opt-in being off: nothing is consented to, nothing is
+    /// sent, and a finished turn ends reading with the "Reading off." sentence
+    /// rather than being read.
+    #[tokio::test]
+    async fn voice_reading_a_failed_settings_read_fails_closed() {
+        let posts = Posts::default();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let summariser = {
+            let posts = posts.clone();
+            let connected = Arc::clone(&connected);
+            SettingsSummariser::new(
+                Arc::new(|| panic!("the settings could not be read")),
+                Box::new(move |_, _| {
+                    connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Box::new(posts.clone())
+                }),
+            )
+        };
+        assert!(!summariser.consented().await);
+        assert_eq!(
+            summariser
+                .summarise(TurnSummaryRequest {
+                    agent: "tester",
+                    kind: TurnKind::Finished,
+                    reply: "a reply that must not leave",
+                })
+                .await,
+            None
+        );
+
+        let (send, events) = mpsc::channel(8);
+        send.send(TurnEvent::Finished {
+            reply: "another reply that must not leave".to_string(),
+        })
+        .await
+        .unwrap();
+        let mut heard = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_turns("tester", events, &summariser, |sentence| {
+                heard.push(sentence);
+                true
+            }),
+        )
+        .await
+        .expect("reading ends when the settings cannot be read");
+        assert_eq!(heard, vec![ended_sentence()]);
+        assert!(posts.0.lock().unwrap().is_empty(), "a request was sent");
+        assert!(
+            !connected.load(std::sync::atomic::Ordering::SeqCst),
+            "a transport was built"
+        );
     }
 
     /// Scenario (audit A-B1): reading starts with the opt-in on and a
