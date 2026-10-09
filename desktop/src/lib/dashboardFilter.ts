@@ -319,10 +319,14 @@ export function currentDashboardFilter(): DashboardFilter {
   return cached.filter;
 }
 
-/** Replace the window session's filter, and tell every screen showing it. */
+/**
+ * Replace the window session's filter, and tell every screen showing it. The
+ * search text is kept as typed, so a leading space stays in the box even
+ * though the match is on the trimmed text and a blank one restricts nothing.
+ */
 export function setDashboardFilter(filter: DashboardFilter): void {
   const kept = { ...filter, text: capped(filter.text) };
-  const raw = dashboardFilterActive(kept) ? JSON.stringify(kept) : null;
+  const raw = dashboardFilterActive(kept) || kept.text ? JSON.stringify(kept) : null;
   memory = raw;
   try {
     if (raw === null) window.sessionStorage.removeItem(DASHBOARD_FILTER_STORAGE_KEY);

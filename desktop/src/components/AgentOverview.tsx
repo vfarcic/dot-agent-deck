@@ -2027,18 +2027,6 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
 }
 
 /**
- * The column picker: what the screen shows, chosen from what the daemon
- * reports and nothing else (PRD #745 M12).
- *
- * The options come from {@link ALL_OVERVIEW_COLUMNS}, whose ids are
- * `OverviewAgent` field names — so this list cannot offer `model`, `cost` or
- * `tokens` even by mistake, because those are not fields of `OverviewAgent` and
- * naming one would not compile. The picker inherits the screen's honesty
- * guarantee rather than restating it.
- *
- * It lives in the top bar, so choosing columns never leaves the overview.
- */
-/**
  * Issue #1496 — a daemon as the dashboard filter names it: by the name it was
  * given, where it has one, else as the dashboard's section heading names it.
  */
@@ -2141,6 +2129,18 @@ function DashboardFilterControls({ filter, daemons }: { filter: DashboardFilter;
   );
 }
 
+/**
+ * The column picker: what the screen shows, chosen from what the daemon
+ * reports and nothing else (PRD #745 M12).
+ *
+ * The options come from {@link ALL_OVERVIEW_COLUMNS}, whose ids are
+ * `OverviewAgent` field names — so this list cannot offer `model`, `cost` or
+ * `tokens` even by mistake, because those are not fields of `OverviewAgent` and
+ * naming one would not compile. The picker inherits the screen's honesty
+ * guarantee rather than restating it.
+ *
+ * It lives in the top bar, so choosing columns never leaves the overview.
+ */
 function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId[]; onChange: (columns: OverviewColumnId[]) => void }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);

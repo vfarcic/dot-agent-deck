@@ -3,6 +3,7 @@ import {
   clearDashboardFilter,
   currentDashboardFilter,
   DASHBOARD_FILTER_TEXT_MAX,
+  dashboardFilterActive,
   readStoredDashboardFilter,
   setDashboardFilter,
 } from "./dashboardFilter";
@@ -20,6 +21,18 @@ describe("dashboard filter storage", () => {
     expect(currentDashboardFilter().text).toBe("a".repeat(DASHBOARD_FILTER_TEXT_MAX));
     const raw = Array.from({ length: window.sessionStorage.length }, (_, at) => window.sessionStorage.getItem(window.sessionStorage.key(at) ?? "") ?? "").join("");
     expect(raw).not.toContain("a".repeat(DASHBOARD_FILTER_TEXT_MAX + 1));
+  });
+
+  /// Scenario: type a space into the empty filter box, then a word after it. The box keeps the space as typed rather than erasing it, while the filter still restricts nothing until a word follows, and matches on the trimmed word once one does.
+  it("keeps the search text as typed while it restricts nothing", () => {
+    setDashboardFilter({ ...clearDashboardFilter(), text: " " });
+    expect(currentDashboardFilter().text).toBe(" ");
+    expect(dashboardFilterActive(currentDashboardFilter())).toBe(false);
+    setDashboardFilter({ ...currentDashboardFilter(), text: " tester" });
+    expect(currentDashboardFilter().text).toBe(" tester");
+    expect(dashboardFilterActive(currentDashboardFilter())).toBe(true);
+    setDashboardFilter({ ...currentDashboardFilter(), text: "" });
+    expect(currentDashboardFilter()).toEqual(clearDashboardFilter());
   });
 
   /// Scenario: read back a stored filter whose text was written longer than the cap, by an older build or by hand. The text comes back cut to the cap and the other facets are kept.

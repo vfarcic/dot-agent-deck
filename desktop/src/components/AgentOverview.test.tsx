@@ -361,6 +361,19 @@ describe("dashboard filter controls", () => {
     expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
   });
 
+  /// Scenario: type a space into the empty filter box, then a name after it. The box keeps the space as typed, every agent stays shown with no Show all until a name follows, and the name then matches with the space ignored.
+  it("keeps a leading space typed into the empty filter box", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    const box = screen.getByRole("textbox", { name: "Filter agents" });
+    fireEvent.change(box, { target: { value: " " } });
+    expect(box).toHaveValue(" ");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    fireEvent.change(box, { target: { value: " Keep sentinel" } });
+    expect(box).toHaveValue(" Keep sentinel");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
   /// Scenario: filter a fleet in which one connected daemon has no agents at all. While the filter is active that daemon collapses to its "no matching agents" line like any other daemon the filter empties, instead of its first-run card; Show all brings the first-run card back.
   it("collapses a connected daemon with no agents while filtering", () => {
     const input = filterFleet();
