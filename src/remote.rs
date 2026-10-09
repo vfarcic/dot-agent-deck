@@ -516,6 +516,10 @@ pub struct SystemSshExecutor {
     /// capping a slow-but-alive transfer. `None` keeps the original behavior.
     /// Mutually exclusive with `wallclock_timeout` by construction.
     keepalive: Option<SshKeepalive>,
+    /// Issue #1490: force `StrictHostKeyChecking=yes`, so a session refuses a
+    /// host whose key is not already trusted instead of following a permissive
+    /// user `Host` block. See [`Self::requiring_known_host_key`].
+    require_known_host_key: bool,
     /// The ssh client to run: `ssh`, found on `PATH`. Only a unit test points
     /// it elsewhere, at a stand-in that misbehaves the way a hostile remote
     /// would, so the production executor's own bounds are what get exercised.
@@ -540,6 +544,7 @@ impl SystemSshExecutor {
             wallclock_timeout: None,
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
             program: "ssh".into(),
         }
     }
@@ -553,6 +558,7 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
             program: "ssh".into(),
         }
     }
@@ -572,6 +578,7 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: true,
             keepalive: None,
+            require_known_host_key: false,
             program: "ssh".into(),
         }
     }
@@ -593,8 +600,34 @@ impl SystemSshExecutor {
                 interval,
                 count_max,
             }),
+            require_known_host_key: false,
             program: "ssh".into(),
         }
+    }
+
+    /// Make every session of this executor an **observation** session — the
+    /// [`apply_observation_options`] flags, the one list of them — whatever
+    /// bounds it was built with. [`Self::for_observation`] is this over the
+    /// wallclock cap; issue #1490's desktop checks and start use it over the
+    /// keepalive bounds, because they run unattended against a deck the app
+    /// is not connected to and need to authenticate to the host, never to
+    /// delegate a credential to it.
+    pub fn observing(mut self) -> Self {
+        self.observation = true;
+        self
+    }
+
+    /// Force `StrictHostKeyChecking=yes` (issue #1490), the host-key policy the
+    /// desktop's tunnel forces ([`crate::remote_tunnel`]'s `forced_options`).
+    /// A session to a host whose key is not already trusted then fails with
+    /// [`SshError::HostKeyVerificationFailed`] instead of following a user
+    /// `Host` block's `accept-new` or `no` — so a desktop check or start
+    /// cannot silently accept a key the tunnel would then refuse. Not part of
+    /// [`apply_observation_options`], whose docs say why `remote doctor` must
+    /// still work against a host it has never connected to.
+    pub fn requiring_known_host_key(mut self) -> Self {
+        self.require_known_host_key = true;
+        self
     }
 
     /// The laptop-side wallclock deadline this executor arms on each ssh
@@ -624,6 +657,9 @@ impl SystemSshExecutor {
         // host yet will see an actionable error rather than the deck CLI
         // wedging.
         cmd.arg("-o").arg("BatchMode=yes");
+        if self.require_known_host_key {
+            cmd.arg("-o").arg("StrictHostKeyChecking=yes");
+        }
         if self.observation {
             apply_observation_options(&mut cmd);
         }
@@ -1670,6 +1706,11 @@ impl RemoteEntry {
             .as_ref()
             .map_or(REMOTE_INSTALL_PATH, RemoteBinaryPath::as_str)
     }
+
+    /// [`Self::remote_binary`] as the validated type a remote command takes.
+    pub fn deck_binary(&self) -> RemoteDeckBinary {
+        RemoteDeckBinary::recorded_or_default(self.binary.as_ref())
+    }
 }
 
 /// Where `remote add` installs the deck on a remote that has no Homebrew
@@ -1728,6 +1769,64 @@ impl TryFrom<String> for RemoteBinaryPath {
 impl From<RemoteBinaryPath> for String {
     fn from(path: RemoteBinaryPath) -> Self {
         path.0
+    }
+}
+
+/// The deck binary a remote command runs, as a type that can hold only a value
+/// safe to put **unquoted** at the start of a remote shell command (issue
+/// #1490): the default install or a validated [`RemoteBinaryPath`]. A raw
+/// string enters only through [`TryFrom<&str>`], which refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteDeckBinary {
+    /// [`REMOTE_INSTALL_PATH`], the `~/.local/bin` install. Its leading `~` is
+    /// deliberately left unquoted so the remote shell expands it to the remote
+    /// user's home; quoting it would name a directory literally called `~`.
+    DefaultInstall,
+    /// A recorded absolute path, such as a Homebrew install.
+    Path(RemoteBinaryPath),
+}
+
+impl RemoteDeckBinary {
+    /// The deck-list row's recorded binary, or the default install when it
+    /// records none.
+    pub fn recorded_or_default(recorded: Option<&RemoteBinaryPath>) -> Self {
+        recorded.map_or(Self::DefaultInstall, |path| Self::Path(path.clone()))
+    }
+
+    /// The binary as spelled for the remote shell, ready to interpolate
+    /// unquoted.
+    pub fn as_shell_word(&self) -> &str {
+        match self {
+            Self::DefaultInstall => REMOTE_INSTALL_PATH,
+            Self::Path(path) => path.as_str(),
+        }
+    }
+}
+
+impl From<RemoteBinaryPath> for RemoteDeckBinary {
+    fn from(path: RemoteBinaryPath) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl TryFrom<&str> for RemoteDeckBinary {
+    type Error = String;
+
+    /// [`REMOTE_INSTALL_PATH`] exactly, or an absolute path
+    /// [`RemoteBinaryPath`] accepts. Anything else — whitespace, a shell
+    /// metacharacter, a relative path, any other `~` spelling — is refused.
+    fn try_from(binary: &str) -> Result<Self, Self::Error> {
+        if binary == REMOTE_INSTALL_PATH {
+            Ok(Self::DefaultInstall)
+        } else {
+            RemoteBinaryPath::try_from(binary.to_string()).map(Self::Path)
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteDeckBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_shell_word())
     }
 }
 
@@ -3148,6 +3247,134 @@ mod tests {
                 .any(|a| a == "ClearAllForwardings=yes"),
             "only observation sessions clear forwardings"
         );
+    }
+
+    /// Issue #1490 audit A1: `observing()` over the keepalive bounds applies
+    /// the one observation list, and `requiring_known_host_key()` adds the
+    /// tunnel's host-key policy — neither is applied unless asked for.
+    #[test]
+    fn system_ssh_executor_observing_with_keepalive_requires_a_known_host_key() {
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+            jump: None,
+        };
+        let observing = SystemSshExecutor::with_keepalive(10, 15, 8)
+            .observing()
+            .requiring_known_host_key();
+        let args = args_of(&observing.build_command(&target, "echo hi"));
+        let mut observation_only = Command::new("ssh");
+        apply_observation_options(&mut observation_only);
+        for expected in args_of(&observation_only)
+            .iter()
+            .filter(|arg| *arg != "-o")
+            .map(String::as_str)
+            .chain([
+                "StrictHostKeyChecking=yes",
+                "BatchMode=yes",
+                "ConnectTimeout=10",
+                "ServerAliveInterval=15",
+                "ServerAliveCountMax=8",
+            ])
+        {
+            assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
+        }
+        // Keepalive-bounded, not wallclock-killed.
+        assert_eq!(observing.kill_deadline_secs(), None);
+
+        let plain =
+            args_of(&SystemSshExecutor::with_keepalive(10, 15, 8).build_command(&target, "x"));
+        assert!(
+            !plain
+                .iter()
+                .any(|a| a.starts_with("StrictHostKeyChecking") || a == "ForwardAgent=no"),
+            "an ordinary keepalive session honours the user's Host block: {plain:?}"
+        );
+    }
+
+    /// Issue #1490 audit A2: a raw string becomes a remote command's binary
+    /// only through `RemoteDeckBinary::try_from`, which accepts the default
+    /// install and a safe absolute path and refuses whitespace, every shell
+    /// metacharacter, relative paths and any other `~` spelling.
+    #[test]
+    fn remote_deck_binary_refuses_anything_a_shell_would_reinterpret() {
+        assert_eq!(
+            RemoteDeckBinary::try_from(REMOTE_INSTALL_PATH),
+            Ok(RemoteDeckBinary::DefaultInstall)
+        );
+        assert_eq!(
+            RemoteDeckBinary::DefaultInstall.as_shell_word(),
+            "~/.local/bin/dot-agent-deck",
+            "the default keeps its `~` for the remote shell to expand"
+        );
+        let homebrew = RemoteDeckBinary::try_from("/opt/homebrew/bin/dot-agent-deck").unwrap();
+        assert_eq!(homebrew.as_shell_word(), "/opt/homebrew/bin/dot-agent-deck");
+        for refused in [
+            "",
+            "/",
+            "dot-agent-deck",
+            "bin/dot-agent-deck",
+            "~/bin/dot-agent-deck",
+            "~other/.local/bin/dot-agent-deck",
+            "/opt/my bin/dot-agent-deck",
+            "/opt/bin/dot-agent-deck\t",
+            "/opt/bin/dot-agent-deck\n",
+            "/opt/bin/dot-agent-deck;rm -rf ~",
+            "/opt/bin/dot-agent-deck&&id",
+            "/opt/bin/dot-agent-deck|id",
+            "/opt/bin/$(id)",
+            "/opt/bin/`id`",
+            "/opt/bin/$HOME",
+            "/opt/bin/dot-agent-deck>x",
+            "/opt/bin/dot-agent-deck<x",
+            "/opt/bin/'dot-agent-deck'",
+            "/opt/bin/\"dot-agent-deck\"",
+            "/opt/bin/dot*",
+            "/opt/bin/dot?",
+            "/opt/bin/\\dot",
+            "/opt/bin/(dot)",
+            "/opt/bin/{dot}",
+            "/opt/bin/dot#x",
+            "/opt/bin/dot!x",
+        ] {
+            assert!(
+                RemoteDeckBinary::try_from(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+        let row = RemoteEntry {
+            binary: Some(
+                RemoteBinaryPath::try_from("/opt/homebrew/bin/dot-agent-deck".to_string()).unwrap(),
+            ),
+            ..entry_with_binary_none()
+        };
+        assert_eq!(row.deck_binary(), homebrew);
+        assert_eq!(
+            entry_with_binary_none().deck_binary(),
+            RemoteDeckBinary::DefaultInstall
+        );
+    }
+
+    fn entry_with_binary_none() -> RemoteEntry {
+        RemoteEntry {
+            name: "mac".to_string(),
+            kind: "ssh".to_string(),
+            host: "user@mac".to_string(),
+            port: 22,
+            key: None,
+            version: "0.1.0".to_string(),
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
+        }
     }
 
     #[test]

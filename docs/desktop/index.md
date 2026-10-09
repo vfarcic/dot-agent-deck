@@ -4,14 +4,14 @@ The desktop app is a graphical client of the same daemon the TUI talks to. The d
 
 The desktop app is an **alpha**. Its downloads are named `dot-agent-deck-desktop-alpha-*` and are not covered by the support expectations of the CLI. Builds exist for macOS on Apple Silicon (`.dmg`) and Linux amd64 (`.deb`) only. [Installation → Desktop app](../installation.md#desktop-app) says what to download and how to install it.
 
-## Before you start: the app needs a running daemon
+## Before you start: a daemon
 
-The desktop app connects to a daemon; it does not start one. Before you open it, start a daemon on this machine in either of these ways:
+The desktop app is a client of a daemon. When no daemon is running on this machine, the app can start one: open the app, and the Dashboard's **Local daemon** section says **Daemon disconnected** and `No daemon is running on this machine.` with a **Start daemon** button. Press it and confirm, and the section connects. You can also start a daemon yourself before you open the app:
 
 - Run the TUI, `dot-agent-deck`. It starts a daemon if none is running.
 - Run `dot-agent-deck daemon serve` in a terminal. It runs in the foreground, and exits on its own about 30 seconds after it last had a client, an agent or an enabled schedule, so open the app within that window. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve` keeps it up until you stop it.
 
-**Check it worked:** open the app. The Dashboard shows a section named **Local daemon**, and the **DAEMONS** counter at the top reads `1/1`. If the section says **Daemon disconnected** instead, no daemon is answering at the default address: start one, then press **Reconnect**. See [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there) for the other states.
+**Check it worked:** the Dashboard shows a section named **Local daemon** listing its agents (or **No agents are running yet**), and the **DAEMONS** counter at the top reads `1/1`. A section that says **Daemon disconnected** offers one button: **Start daemon** when no daemon is running there, or **Reconnect** when a daemon is running but the app is not connected to it. See [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there) for the other states.
 
 While the desktop app is connected it counts as a client, so the daemon stays up under it. [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon) has the details.
 
@@ -28,6 +28,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
+| Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
@@ -39,7 +40,7 @@ These are TUI-only:
 - The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
 - Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
-- Installing the deck on a remote machine and starting a daemon there (`dot-agent-deck remote add`, `dot-agent-deck connect`). The desktop app connects to a remote daemon that is already running, and can [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version once it does; see [Daemons](daemons.md).
+- Installing the deck on a remote machine (`dot-agent-deck remote add`). Once it is installed, the desktop app can [start a daemon there](daemons.md#start-a-daemon-from-the-app) and [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version.
 
 The desktop app has two things the TUI does not: one Dashboard over several daemons at once, and voice control.
 
@@ -47,7 +48,7 @@ The desktop app has two things the TUI does not: one Dashboard over several daem
 
 Some desktop surfaces are hidden unless the `experimental` flag is on, and these pages do not describe them. If you see one of these on someone else's screen and not on yours, that is why:
 
-- The **Daemons** entry in the rail and the Dashboard's **Open daemons** button, which lead to a multi-pane screen. The **Start daemon**, **Stop** and **Replace daemon** controls, renaming an agent, the command palette (`Ctrl+K` / `⌘K`), the shortcut sheet (`?`) and the output **Reader** are on that screen, so they are hidden with it.
+- The **Daemons** entry in the rail and the Dashboard's **Open daemons** button, which lead to a multi-pane screen. The **Stop** and **Replace daemon** controls, renaming an agent, the command palette (`Ctrl+K` / `⌘K`), the shortcut sheet (`?`) and the output **Reader** are on that screen, so they are hidden with it.
 - The **Projects**, **Prompts**, **Orchestrations** and **Agent Profiles** entries in the rail.
 
 **How the desktop app reads the flag.** From its own environment, once, when it starts: set `DOT_AGENT_DECK_EXPERIMENTAL=1` in the environment the app is launched from, or set `DOT_AGENT_DECK_FEATURES_CONFIG` to the path of a `.dot-agent-deck.toml` whose `[features]` table sets `experimental = true`. When both are set, `DOT_AGENT_DECK_EXPERIMENTAL` wins. Unlike the TUI and the daemon, the desktop app does not look for a `.dot-agent-deck.toml` in any directory, and it does not notice a change until it is restarted. An app launched from the macOS Dock or Finder, or from a Linux desktop menu, does not inherit variables exported in your shell profile; on Linux, start it from a terminal instead: `DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck-desktop`.

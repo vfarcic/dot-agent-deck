@@ -9,9 +9,10 @@
 //!
 //! Deliberately general: nothing here knows about upgrades. It is "run this
 //! deck's CLI on the remote against that machine's daemon and parse a JSON
-//! line", and issue #1490 adds `start_daemon()` beside [`SshDaemonPort::probe`]
-//! and [`SshDaemonPort::restart_installed`]. The upgrade flow adapts it to its
-//! own port trait in [`crate::daemon_upgrade`].
+//! line", and issue #1490 added [`SshDaemonPort::start_detached`] beside
+//! [`SshDaemonPort::probe`] and [`SshDaemonPort::restart_installed`]. The
+//! upgrade flow adapts it to its own port trait in [`crate::daemon_upgrade`],
+//! and the start flow uses it directly in [`crate::daemon_start`].
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -19,9 +20,12 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use crate::daemon_client::RemoteEndpoint;
 use crate::daemon_protocol::RestartStopSet;
 use crate::daemon_restart::{DaemonProbe, RemoteRestartReport, encode_stop_set_hex};
-use crate::remote::{RemoteEntry, SshError, SshExecutor, SshTarget};
+use crate::remote::{
+    RemoteBinaryPath, RemoteDeckBinary, RemoteEntry, SshError, SshExecutor, SshTarget,
+};
 
 /// Upper bound on what one plumbing command may print. A `Hello` reply with a
 /// full capability list and a running-agents summary is a few KiB; anything
@@ -70,6 +74,32 @@ const _: () = assert!(
 /// a plumbing subcommand exits with when asked to run it.
 const CLAP_USAGE_EXIT: i32 = 2;
 
+/// `daemon endpoint`'s exit status when something is at the endpoint and it
+/// failed a trust check (`ENDPOINT_UNTRUSTED` in `main.rs`).
+const ENDPOINT_UNTRUSTED_EXIT: i32 = 1;
+/// `daemon endpoint`'s exit status when nothing usable answered there
+/// (`ENDPOINT_UNDETERMINED` in `main.rs`).
+const ENDPOINT_UNDETERMINED_EXIT: i32 = 3;
+
+/// What [`SshDaemonPort::start_detached`] runs after the binary.
+const START_DETACHED_ARGS: &str = "daemon serve </dev/null >/dev/null 2>&1 &";
+
+/// What `daemon endpoint` said about the remote's endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointAnswer {
+    /// A trusted daemon answered a `Hello` there.
+    Live,
+    /// Nothing is at the endpoint, or a stale socket refused the connection:
+    /// no daemon is running there.
+    Nothing,
+    /// Something is at the endpoint and accepted the connection, but no
+    /// usable `Hello` came back: a daemon is there and the check could not
+    /// talk to it.
+    NoAnswer { stderr: String },
+    /// Something is at the endpoint and failed the trust check.
+    Refused { stderr: String },
+}
+
 /// Why a remote daemon operation produced no answer.
 #[derive(Debug, Error)]
 pub enum RemoteDaemonError {
@@ -91,14 +121,15 @@ pub enum RemoteDaemonError {
 
 /// A remote machine's daemon, reached through the deck binary installed there.
 ///
-/// `binary` is spelled for the remote shell (it may start with `~`), exactly as
-/// [`RemoteEntry::remote_binary`] returns it. It can be repointed after an
-/// install moved the deck (a Homebrew install replacing `~/.local/bin`), which
-/// is why it sits in a `RefCell`.
+/// `binary` is a [`RemoteDeckBinary`] — the default install or a validated
+/// absolute path — so every command can put it unquoted at the start of the
+/// remote shell command. It can be repointed after an install moved the deck (a
+/// Homebrew install replacing `~/.local/bin`), which is why it sits in a
+/// `RefCell`.
 pub struct SshDaemonPort<E: SshExecutor> {
     executor: E,
     target: SshTarget,
-    binary: RefCell<String>,
+    binary: RefCell<RemoteDeckBinary>,
     /// The daemon's attach socket on the remote, when the deck-list row names
     /// one (the desktop's "Daemon socket" field). Every command runs with it
     /// as `DOT_AGENT_DECK_ATTACH_SOCKET`, so the probe and the restart reach
@@ -109,11 +140,11 @@ pub struct SshDaemonPort<E: SshExecutor> {
 }
 
 impl<E: SshExecutor> SshDaemonPort<E> {
-    pub fn new(executor: E, target: SshTarget, binary: impl Into<String>) -> Self {
+    pub fn new(executor: E, target: SshTarget, binary: RemoteDeckBinary) -> Self {
         Self {
             executor,
             target,
-            binary: RefCell::new(binary.into()),
+            binary: RefCell::new(binary),
             socket: None,
             probe_deadline: REMOTE_PROBE_DEADLINE,
             restart_deadline: REMOTE_RESTART_DEADLINE,
@@ -138,18 +169,47 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// The port for a deck-list row: its ssh target (jump host included), its
     /// recorded binary, and its recorded daemon socket.
     pub fn for_entry(executor: E, entry: &RemoteEntry) -> Self {
-        Self::new(executor, entry.ssh_target(), entry.remote_binary())
+        Self::new(executor, entry.ssh_target(), entry.deck_binary())
             .with_socket(entry.socket.clone())
     }
 
+    /// The port for a deck the desktop knows by its [`RemoteEndpoint`]: its
+    /// ssh route (user, port, key and jump host), its daemon socket, and the
+    /// deck binary `binary` names — the deck-list row's recorded
+    /// [`RemoteEntry::binary`] when there is one, otherwise
+    /// [`RemoteDeckBinary::DefaultInstall`] (issue #1490).
+    pub fn for_endpoint(
+        executor: E,
+        endpoint: &RemoteEndpoint,
+        binary: Option<&RemoteBinaryPath>,
+    ) -> Self {
+        Self::new(
+            executor,
+            endpoint.ssh_target(),
+            RemoteDeckBinary::recorded_or_default(binary),
+        )
+        .with_socket(Some(endpoint.socket().to_string()))
+    }
+
+    /// The daemon socket every command names, when the deck sets one.
+    pub fn socket(&self) -> Option<&str> {
+        self.socket.as_deref()
+    }
+
     /// Run later commands through `binary` instead.
-    pub fn set_binary(&self, binary: impl Into<String>) {
-        *self.binary.borrow_mut() = binary.into();
+    pub fn set_binary(&self, binary: RemoteDeckBinary) {
+        *self.binary.borrow_mut() = binary;
     }
 
     /// The binary later commands run, as spelled for the remote shell.
     pub fn binary(&self) -> String {
-        self.binary.borrow().clone()
+        self.binary.borrow().as_shell_word().to_string()
+    }
+
+    /// The executor, for a test that asserts what was run.
+    #[cfg(test)]
+    pub(crate) fn executor_for_tests(&self) -> &E {
+        &self.executor
     }
 
     /// The ssh target every command goes to.
@@ -200,6 +260,127 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         self.run_json(&args, self.restart_deadline)
     }
 
+    /// `<binary> --version` on the remote, classified exactly as `connect`'s
+    /// binary-version probe classifies it
+    /// ([`crate::connect::classify_version_probe`]): the remote's version, or
+    /// unreachable / authentication / host key, no deck binary at the path, or
+    /// a failure the remote reported. Issue #1490's start runs it first, so a
+    /// missing install is named rather than lost to a detached start.
+    pub fn version(&self) -> Result<String, crate::connect::VersionProbeFailure> {
+        let command = format!("{} --version", self.binary.borrow().as_shell_word());
+        crate::connect::classify_version_probe(self.executor.run_capped_within(
+            &self.target,
+            &command,
+            crate::connect::PROBE_VERSION_CAP,
+            self.probe_deadline,
+        ))
+    }
+
+    /// `daemon endpoint` on the remote (issue #1174): the older, plain-text
+    /// way to ask whether a daemon answers at that machine's endpoint, kept
+    /// for a remote whose deck predates `daemon probe` (PRD #1487). See
+    /// [`EndpointAnswer`] for how its exit status reads.
+    pub fn endpoint(&self) -> Result<EndpointAnswer, RemoteDaemonError> {
+        let output = self.run_bounded("daemon endpoint", self.probe_deadline)?;
+        let stderr = crate::remote::scrub_remote_text(output.stderr.trim());
+        Ok(match output.status {
+            0 => EndpointAnswer::Live,
+            CLAP_USAGE_EXIT => return Err(RemoteDaemonError::Unsupported { stderr }),
+            ENDPOINT_UNTRUSTED_EXIT => EndpointAnswer::Refused { stderr },
+            ENDPOINT_UNDETERMINED_EXIT => {
+                let lower = stderr.to_ascii_lowercase();
+                if lower.contains("nothing at ") || lower.contains("connection refused") {
+                    EndpointAnswer::Nothing
+                } else {
+                    EndpointAnswer::NoAnswer { stderr }
+                }
+            }
+            status => return Err(RemoteDaemonError::Failed { status, stderr }),
+        })
+    }
+
+    /// Start `<binary> daemon serve` on the remote, detached, and return
+    /// without waiting for it (issue #1490).
+    ///
+    /// One non-interactive command: `nohup` so the session's hangup does not
+    /// reach the daemon, every stream redirected so ssh has no open channel to
+    /// wait on, and `&` so the remote shell exits at once. The daemon listens
+    /// at the port's socket, passed as `DOT_AGENT_DECK_ATTACH_SOCKET` like
+    /// every other command here, which is where `daemon serve` binds its
+    /// attach endpoint. Whether it came up is the caller's to check: a
+    /// detached start reports nothing about the process it started.
+    pub fn start_detached(&self) -> Result<(), RemoteDaemonError> {
+        let command = self.command_with("nohup ", START_DETACHED_ARGS);
+        let output = self.run_bounded_command(&command, self.probe_deadline)?;
+        if output.status != 0 {
+            return Err(RemoteDaemonError::Failed {
+                status: output.status,
+                stderr: crate::remote::scrub_remote_text(output.stderr.trim()),
+            });
+        }
+        Ok(())
+    }
+
+    /// `<binary> <args>`, with the configured socket in its environment.
+    ///
+    /// The binary is a [`RemoteDeckBinary`], which by construction is either a
+    /// validated absolute path or the `~/.local/bin` default, both free of
+    /// shell metacharacters, and is left unquoted so the remote shell expands
+    /// the default's `~`. The socket is whatever the deck list holds, so it is
+    /// quoted as one shell word.
+    fn command(&self, args: &str) -> String {
+        self.command_with("", args)
+    }
+
+    /// [`Self::command`] with `wrapper` (`"nohup "`) between the environment
+    /// and the binary.
+    fn command_with(&self, wrapper: &str, args: &str) -> String {
+        let env = self
+            .socket
+            .as_deref()
+            .map(|socket| {
+                format!(
+                    "env DOT_AGENT_DECK_ATTACH_SOCKET={} ",
+                    crate::remote::shell_word(socket)
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{env}{wrapper}{} {args}",
+            self.binary.borrow().as_shell_word()
+        )
+    }
+
+    /// Run `<binary> <args>` bounded by `deadline` and the reply cap, and hand
+    /// back what it printed. A stream that reached the cap is not a reply this
+    /// build wrote, whatever the exit status.
+    fn run_bounded(
+        &self,
+        args: &str,
+        deadline: Duration,
+    ) -> Result<crate::remote::SshOutput, RemoteDaemonError> {
+        self.run_bounded_command(&self.command(args), deadline)
+    }
+
+    fn run_bounded_command(
+        &self,
+        command: &str,
+        deadline: Duration,
+    ) -> Result<crate::remote::SshOutput, RemoteDaemonError> {
+        let capped = self.executor.run_capped_within(
+            &self.target,
+            command,
+            REMOTE_DAEMON_REPLY_CAP,
+            deadline,
+        )?;
+        if capped.truncated {
+            return Err(RemoteDaemonError::Malformed(format!(
+                "more than {REMOTE_DAEMON_REPLY_CAP} bytes"
+            )));
+        }
+        Ok(capped.output)
+    }
+
     /// Run `<binary> <args>` and parse the last non-empty stdout line as `T`.
     ///
     /// Bounded however the executor was built (audit A1): each stream is
@@ -212,36 +393,10 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         args: &str,
         deadline: Duration,
     ) -> Result<T, RemoteDaemonError> {
-        // The binary is a `RemoteBinaryPath` or the `~/.local/bin` constant,
-        // both free of shell metacharacters, and left unquoted so the remote
-        // shell expands `~` (see `RemoteEntry::remote_binary`). The socket is
-        // whatever the deck list holds, so it is quoted as one shell word.
-        let env = self
-            .socket
-            .as_deref()
-            .map(|socket| {
-                format!(
-                    "env DOT_AGENT_DECK_ATTACH_SOCKET={} ",
-                    crate::remote::shell_word(socket)
-                )
-            })
-            .unwrap_or_default();
-        let command = format!("{env}{} {args}", self.binary.borrow());
-        let capped = self.executor.run_capped_within(
-            &self.target,
-            &command,
-            REMOTE_DAEMON_REPLY_CAP,
-            deadline,
-        )?;
-        let output = capped.output;
         // A stream that reached the cap is not a reply this build wrote,
         // whatever the exit status — and a remote that kept writing past it
         // usually dies of the closed pipe, so its status says nothing useful.
-        if capped.truncated {
-            return Err(RemoteDaemonError::Malformed(format!(
-                "more than {REMOTE_DAEMON_REPLY_CAP} bytes"
-            )));
-        }
+        let output = self.run_bounded(args, deadline)?;
         // Remote-controlled text: scrubbed before it can reach a terminal.
         let stderr = crate::remote::scrub_remote_text(output.stderr.trim());
         if output.status == CLAP_USAGE_EXIT {
@@ -294,7 +449,7 @@ mod tests {
                 },
             },
             SshTarget::parse("u@h", 22, None),
-            "~/.local/bin/dot-agent-deck",
+            crate::remote::RemoteDeckBinary::DefaultInstall,
         )
     }
 
@@ -407,7 +562,7 @@ mod tests {
             unsupported: false,
         };
         let p = port(0, &serde_json::to_string(&report).unwrap(), "");
-        p.set_binary("/opt/homebrew/bin/dot-agent-deck");
+        p.set_binary(RemoteDeckBinary::try_from("/opt/homebrew/bin/dot-agent-deck").unwrap());
         let set = RestartStopSet {
             agents: vec![RestartAgent {
                 id: "a1".into(),
@@ -459,7 +614,7 @@ mod tests {
             SshDaemonPort::new(
                 crate::daemon_upgrade::upgrade_ssh_executor().with_program(&script),
                 SshTarget::parse("u@h", 22, None),
-                "~/.local/bin/dot-agent-deck",
+                crate::remote::RemoteDeckBinary::DefaultInstall,
             )
             .with_deadlines(DEADLINE, DEADLINE)
         }

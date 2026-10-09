@@ -92,7 +92,7 @@ A daemon section shows one of these instead of its agents:
 
 | Title | What it means | What to do |
 | --- | --- | --- |
-| **Daemon disconnected** | Nothing is answering at that daemon's address. | Start a daemon (see [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon)), then press **Reconnect**. For a remote daemon, see [Daemons → What a remote daemon must already have](daemons.md#what-a-remote-daemon-must-already-have). |
+| **Daemon disconnected** | The app is not connected to that daemon, and the sentence under the title says why: no daemon is running there, a daemon is running but the app is not connected to it, or the app cannot tell, for example because the host cannot be reached. | Press the one button the section offers: **Start daemon** when no daemon is running, which asks first and names the machine it starts on, or **Reconnect** otherwise. See [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app), which also lists what a failed start says. |
 | **Waiting for this daemon** | The app is still connecting to it. | Nothing: its agents appear when it answers. If it never does, press **Test connection** for it in [Settings → Daemons](daemons.md#test-connection). |
 | **Establishing control channel** | The app is reading the daemon's agent list. | Nothing. |
 | **Daemon not configured** | A remote daemon has no socket path yet. | Open [Settings → Daemons](daemons.md), choose it and press **Test connection**, which finds the path. |

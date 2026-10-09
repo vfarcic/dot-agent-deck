@@ -1,5 +1,5 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
@@ -9,7 +9,8 @@ import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 import { upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
-import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "../lib/connectionRemedy";
+import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
+import { StartDaemonError } from "../lib/actionError";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
@@ -1309,6 +1310,60 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     });
   };
 
+  /**
+   * Issue #1490 — Start daemon on THIS deck's card, local or remote. The
+   * request names the deck it was pressed on, never the selection, and a
+   * rejection lands on that deck's note in the crate's own sentence, with its
+   * technical detail behind a disclosure.
+   *
+   * One error PER DECK (PR #1623 review): a failed start on one deck must not
+   * replace another's, and only that deck's own connection, Reconnect or
+   * Start clears it.
+   */
+  const [startErrors, setStartErrors] = useState<ReadonlyMap<string, StartErrorView>>(() => new Map());
+  const setStartError = (deckId: string | undefined, error: StartErrorView | undefined) => {
+    setStartErrors((current) => {
+      const key = startErrorKey(deckId);
+      if (error === undefined && !current.has(key)) return current;
+      const next = new Map(current);
+      if (error === undefined) next.delete(key);
+      else next.set(key, error);
+      return next;
+    });
+  };
+  const connectedStartErrorKeys = fleet
+    .filter((deck) => deck.connection.status === "connected" && startErrors.has(startErrorKey(deck.connection.deckId)))
+    .map((deck) => startErrorKey(deck.connection.deckId))
+    .join("\n");
+  useEffect(() => {
+    if (connectedStartErrorKeys === "") return;
+    const connected = new Set(connectedStartErrorKeys.split("\n"));
+    setStartErrors((current) => new Map([...current].filter(([key]) => !connected.has(key))));
+  }, [connectedStartErrorKeys]);
+  const requestStartDaemon = (target: ConnectionView) => {
+    const reason = target.disconnectedReason;
+    if (mode !== "live" || reason?.action !== "start-daemon") return;
+    const deckId = target.deckId;
+    setConfirm({
+      ...startDaemonConfirmCopy(reason.host),
+      label: "Start daemon",
+      busyLabel: "Starting…",
+      action: async () => {
+        setStartError(deckId, undefined);
+        try {
+          // The crate resolves once the deck is connected and emits its
+          // snapshot, so the card turns into the connected deck on its own.
+          await runtime.runAction({ type: "start_daemon", ...(deckId === undefined ? {} : { deckId }) });
+        } catch (cause) {
+          setStartError(deckId, {
+            message: cause instanceof Error ? cause.message : String(cause),
+            ...(cause instanceof StartDaemonError && cause.detail !== undefined ? { detail: cause.detail } : {}),
+          });
+        }
+      },
+    });
+  };
+
   /*
     Named rather than returned directly, so the provider below can wrap it
     without re-indenting eighty lines of screen for one line of plumbing.
@@ -1389,8 +1444,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onOpenDeck={openDeck}
               onReconnect={() => {
                 setOverrideError(undefined);
+                setStartError(deck.snapshot.connection.deckId, undefined);
                 void runtime.reconnect();
               }}
+              onStartDaemon={mode === "live" && deck.snapshot.connection.disconnectedReason?.action === "start-daemon" ? () => requestStartDaemon(deck.snapshot.connection) : undefined}
+              startError={startErrors.get(startErrorKey(deck.snapshot.connection.deckId))}
               overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               /*
@@ -1480,13 +1538,28 @@ function decksUpTitle(up: number, total: number): string {
  * nothing" and "we cannot see what this deck runs" are different statements and
  * only the first is a number.
  */
-function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onUpgrade, onNewAgent }: {
+/** Issue #1490 — one deck's failed Start daemon: the crate's sentence, and its technical detail. */
+interface StartErrorView {
+  message: string;
+  detail?: string;
+}
+
+/** The key a deck's start error is kept under: its id, or `""` for a deck that has not reported one. */
+function startErrorKey(deckId: string | undefined): string {
+  return deckId ?? "";
+}
+
+function DeckGroup({ deck, now, columns, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
   /** How many decks are on screen — the note density, and nothing else. */
   fleetSize: number;
   overrideError?: string;
+  /** Issue #1490 — why the last Start daemon on this deck failed. */
+  startError?: StartErrorView;
+  /** Issue #1490 — Start daemon on this deck. Absent unless its reason offers it. */
+  onStartDaemon?: () => void;
   /** Absent while the deck is hidden (issue #1198), which removes this group's Open deck buttons. */
   onOpenDeck?: () => void;
   onReconnect: () => void;
@@ -1616,8 +1689,10 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           message={daemonMessage}
           compactNote={fleetSize > 1}
           overrideError={overrideError}
+          startError={startError}
           onOpenDeck={onOpenDeck}
           onReconnect={onReconnect}
+          onStartDaemon={onStartDaemon}
           onConnectAnyway={onConnectAnyway}
           onUpgrade={upgradeInNote ? onUpgrade : undefined}
           onNewAgent={onNewAgent}
@@ -1642,7 +1717,7 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onUpgrade, onNewAgent }: {
+function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   /** The one instant every relative cell on this screen is measured against. */
@@ -1659,9 +1734,13 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
    */
   compactNote?: boolean;
   overrideError?: string;
+  /** Issue #1490 — why the last Start daemon on this deck failed, in the crate's words, and its technical detail. */
+  startError?: StartErrorView;
   /** Absent while the deck is hidden (issue #1198): no Open deck button, and no sentence sending the user to it. */
   onOpenDeck?: () => void;
   onReconnect: () => void;
+  /** Issue #1490 — offered in place of Reconnect when the deck's reason says no daemon runs. */
+  onStartDaemon?: () => void;
   /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
   onConnectAnyway?: () => void;
   /** PRD #1487 — Upgrade, in the incompatible note. Absent unless offered. */
@@ -1724,15 +1803,36 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   }
 
   if (connection.status === "disconnected") {
+    /*
+      Issue #1490: ONE remedy, the one the deck's reason names — Start daemon
+      when no daemon runs there, Reconnect otherwise. A deck without a reason
+      (fixture data, an older snapshot) keeps Reconnect and the old hint.
+    */
+    const reason = connection.disconnectedReason;
+    const offersStart = reason?.action === "start-daemon" && onStartDaemon !== undefined;
     return (
       <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
-        <p>{message ?? DECK_STATE_FALLBACK.disconnected}</p>
-        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. {onOpenDeck ? "Start one from the Daemons screen, then reconnect." : "Start one, then reconnect."}</p>
+        <p>{reason ? displayText(reason.message, DISPLAY_LIMITS.message) : message ?? DECK_STATE_FALLBACK.disconnected}</p>
+        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale.{reason ? "" : onOpenDeck ? " Start one from the Daemons screen, then reconnect." : " Start one, then reconnect."}</p>
+        {/*
+          PR #1623 review: the reason's sentence is the headline, and the
+          connection's own error stays visible — on the card's header line
+          (`daemon-state`), so the disclosure carries the details beside it.
+        */}
+        <ConnectionDetail detail={reason ? disconnectedDetails(connection, { message: false }) : undefined} />
         {/* Issue #1472: a deck that stopped answering during Connect anyway lands here, and the reason must land with it. */}
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
+        {startError && (
+          <div role="alert" data-testid="overview-start-error">
+            <p className="overview-note-hint">{startError.message}</p>
+            <ConnectionDetail detail={startError.detail} />
+          </div>
+        )}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
-          <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
+          {offersStart
+            ? <button className="button primary" data-testid="start-daemon" onClick={onStartDaemon}><Play size={14} /> Start daemon</button>
+            : <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>}
         </div>
       </OverviewNote>
     );
