@@ -1120,6 +1120,20 @@ pub async fn handle_utterance_with_dictation(
             )
         };
         match step {
+            // Issue #1496 — "on all daemons" resolves to the Daemon selector's
+            // All daemons entry, which is every daemon and so no daemon facet:
+            // no agent's daemon is that id, and filtering by it would hide
+            // every one of them.
+            Ok(param)
+                if row.id == FILTER_DASHBOARD_ROW
+                    && param.kind == ParamKind::DeckRef
+                    && param.value == super::ALL_DECKS_ID =>
+            {
+                notes.push(format!(
+                    "{} is every daemon, so the dashboard is not filtered by daemon.",
+                    safe_message(&param.label)
+                ));
+            }
             // **An optional param that resolves is named in the report**
             // (PRD #1223), whether or not the user said it. A row's report may
             // not interpolate an optional param — it may have nothing to say —
@@ -5295,6 +5309,66 @@ mod tests {
                 "{said:?} must select {name} {value:?}, got {outcome:?}"
             );
         }
+    }
+
+    /// Scenario: ask for agents "on all daemons", which the model answers with
+    /// the Daemon selector's All daemons entry. That is every daemon, so it is
+    /// no daemon facet: beside another facet only that one filters, and alone
+    /// the filter is refused rather than collapsing every daemon.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_all_daemons_is_no_daemon_facet() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        });
+        let filter = |said: &'static str, answer: IntentAnswer| {
+            let decks = decks.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, answer);
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let outcome = filter(
+            "show the working agents on all daemons",
+            IntentAnswer::new("filter_dashboard")
+                .with_param("status", "working")
+                .with_param("daemon", "all daemons"),
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0].name, "status");
+        assert!(sentence.contains("not filtered by daemon"), "{sentence}");
+        let outcome = filter(
+            "show the agents on all daemons",
+            IntentAnswer::new("filter_dashboard").with_param("daemon", "all daemons"),
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, .. } if action == "filter_dashboard"),
+            "{outcome:?}"
+        );
     }
 
     /// Scenario: say any clear phrase from the dashboard, deck or agent pane.

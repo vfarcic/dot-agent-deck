@@ -232,6 +232,13 @@ export function buildDashboardFilterHeader(filter: DashboardFilter, visibleCount
   };
 }
 
+/**
+ * The key voice gives the Daemon selector's All daemons entry (`voice::ALL_DECKS_ID`
+ * in the desktop crate). It is every daemon, so as a dashboard daemon it is no
+ * daemon facet: no agent's daemon has that id.
+ */
+const VOICE_ALL_DAEMONS_ID = "all-daemons";
+
 /** The voice dispatch's facets, by the row's param names (`commands.toml`'s `filter_dashboard`). */
 export function dashboardFilterFromParams(params: readonly { name: string; value: string }[]): DashboardFilter {
   const value = (name: string) => params.find((param) => param.name === name)?.value;
@@ -244,7 +251,7 @@ export function dashboardFilterFromParams(params: readonly { name: string; value
     kinds: one("kind", DASHBOARD_KINDS),
     statuses: one("status", DASHBOARD_STATUSES),
     agentTypes: one("agent_type", DASHBOARD_AGENT_TYPES),
-    daemonIds: daemon ? [daemon] : [],
+    daemonIds: daemon && daemon !== VOICE_ALL_DAEMONS_ID ? [daemon] : [],
     text: value("text") ?? "",
   };
 }

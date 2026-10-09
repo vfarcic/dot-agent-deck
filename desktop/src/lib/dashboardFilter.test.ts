@@ -73,6 +73,14 @@ describe("dashboard filter", () => {
     expect(filterDashboardAgents(sameId, filter({ daemonIds: ["build-box"] }))).toEqual([sameId[1]]);
   });
 
+  /// Scenario: say "show the working agents on all daemons", which reaches the dashboard with `daemon` = the Daemon selector's All daemons id. That is every daemon, so no daemon facet is set and the working agents on every daemon stay.
+  it("reads a voice All daemons param as no daemon facet", () => {
+    const spoken = dashboardFilterFromParams([{ name: "status", value: "working" }, { name: "daemon", value: "all-daemons" }]);
+    expect(spoken.daemonIds).toEqual([]);
+    expect(ids(spoken)).toEqual(["dispatcher"]);
+    expect(dashboardFilterFromParams([{ name: "daemon", value: "build-box" }]).daemonIds).toEqual(["build-box"]);
+  });
+
   /// Scenario: type a case-insensitive, padded substring from each searchable fact. A role, orchestration, directory or prompt match keeps that agent even when its label does not contain the query.
   it.each([" TESTER ", "quality-checker", "RELEASE PIPELINE", "dashboard-project", "scroll sentinel"])(
     "searches the existing facts for %s", (text) => {
