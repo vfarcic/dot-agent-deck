@@ -3366,23 +3366,38 @@ const STATE_FILLER: [&str; 14] = [
 /// made of nothing but [`STATE_WORDS`] and [`STATE_FILLER`] is read this way,
 /// so a name or any other fact in it leaves the refusal standing.
 ///
-/// Every state word in it has to be one the user said — the model's answer
-/// is not the user's words, and a state it supplies for "kill it" reaches
-/// nobody. What it returns is every agent in that state; the caller holds
-/// them to the rest of the transcript ([`resolve_param`]).
+/// Every state in it has to be one the user said, in some word for it — the
+/// model's answer is not the user's words, and a state it supplies for "kill
+/// it" reaches nobody. The model may say it in another of the words, though:
+/// "stop the busy agent" answered as "the working agent" names the working
+/// agents, because "busy" covers working. A state word the model said counts
+/// only for the statuses the user's own state words cover, so its word never
+/// widens what the user said — "busy" for "working" reaches no thinking agent.
+/// What it returns is every agent in those states; the caller holds them to
+/// the rest of the transcript ([`resolve_param`]).
 fn agents_in_state<'a>(
     spoken: &str,
     transcript: &str,
     agents: &'a [DesktopAgent],
 ) -> Vec<&'a DesktopAgent> {
     let heard: BTreeSet<String> = word_sequence(transcript).into_iter().collect();
+    let said: BTreeSet<&str> = STATE_WORDS
+        .iter()
+        .filter(|(state, _)| heard.contains(*state))
+        .flat_map(|(_, named)| named.iter().copied())
+        .collect();
     let mut statuses: BTreeSet<&str> = BTreeSet::new();
     for word in &word_sequence(spoken) {
         if let Some((_, named)) = STATE_WORDS.iter().find(|(state, _)| state == word) {
-            if !heard.contains(word) {
+            let grounded: Vec<&str> = named
+                .iter()
+                .copied()
+                .filter(|status| said.contains(status))
+                .collect();
+            if grounded.is_empty() {
                 return Vec::new();
             }
-            statuses.extend(named.iter().copied());
+            statuses.extend(grounded);
         } else if !STATE_FILLER.contains(&word.as_str()) {
             return Vec::new();
         }
@@ -5448,6 +5463,54 @@ mod tests {
             matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
             "{outcome:?}"
         );
+    }
+
+    /// Scenario: the user says "stop the busy agent" and the model answers
+    /// with a different word for the same state, "the working agent". "Busy"
+    /// covers working, so the working agent is the one to stop. A state the
+    /// user did not say in any form is refused: "idle" for "busy", "busy" for
+    /// "working" reaching a thinking agent, or any state for "stop the agent".
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_is_grounded_on_the_status_the_user_said() {
+        let fleet = vec![
+            role_agent_in_state("1", "tester", "working"),
+            role_agent_in_state("2", "coder", "idle"),
+        ];
+        let stop = |said: &'static str, answered: &'static str, fleet: Vec<DesktopAgent>| async move {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("stop_agent").with_param("agent", answered),
+            );
+            run(&resolver, Screen::Overview, &fleet, said).await
+        };
+        let outcome = stop("stop the busy agent", "the working agent", fleet.clone()).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. } if action == "stop_agent" && params[0].value == "1"),
+            "{outcome:?}"
+        );
+        for (said, answered, fleet) in [
+            // The model invents a state the user never said in any alias.
+            ("stop the agent", "the idle agent", fleet.clone()),
+            ("stop the agent", "the working agent", fleet.clone()),
+            // A state word the user said, but for another status.
+            ("stop the busy agent", "the idle agent", fleet.clone()),
+            // "Busy" is wider than "working": the model's word may not widen
+            // what the user said to the thinking agent.
+            (
+                "stop the working agent",
+                "the busy agent",
+                vec![
+                    role_agent_in_state("1", "tester", "thinking"),
+                    role_agent_in_state("2", "coder", "idle"),
+                ],
+            ),
+        ] {
+            let outcome = stop(said, answered, fleet).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                "{said:?} answered {answered:?} must reach nobody: {outcome:?}"
+            );
+        }
     }
 
     /// A working Codex agent in `billing` and a blocked Claude Code agent in
