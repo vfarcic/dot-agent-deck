@@ -340,7 +340,13 @@ heard_as_whole_while.new_agent_dialog = [
 # heard a refusal instead of "Nothing to close". The fixture
 # `close-the-agent-on-the-overview` measured 9/10 at the round's start and 5/10
 # once the round's page and filter rows were in the table; the description now
-# says the dashboard case outright, and it measured 20/20 after.
+# says the dashboard case outright, and it measured 20/20 after. PRD #1497's
+# reading rows pulled it back to `stop_agent`: 25 of 45 runs against
+# `gpt-5-mini`, and 7 of 10 with those three rows taken out. This description
+# now says a close is this row even with nothing open, picked anyway rather than
+# a stop, and `stop_agent`'s that "close" stops nothing on any screen although
+# its button is labelled Close: 30 of 30 after, with every `stop-*` fixture 5 of
+# 5 and `start-new-agent-dialog-closed` 15 of 20 against 9 of 20 (2026-10-09).
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
@@ -353,7 +359,8 @@ agent, back to dashboard (the label of an open agent pane's button), or back to 
 overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
 keeps running — on the agent dashboard too, where nothing may be open over the screen and the app
-then says there is nothing to close. Closing the New agent dialog this way keeps what was entered
+then says there is nothing to close. A request to close is THIS one even when nothing is open over
+the screen: pick it anyway rather than a row that stops something, and the app says so. Closing the New agent dialog this way keeps what was entered
 in it for the next time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
 and stopping something are both possible readings, closing the view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
 callable — a callable `open_deck` means the Daemons screen itself is what "back" leads to, and that one
@@ -1676,7 +1683,8 @@ shut it down, end that agent, terminate the one that is stuck. Set `agent` the w
 does. It never stops anything by itself: the app shows the same confirmation the row's button shows
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
-"close the tester" close the VIEW (`close`) and stop nothing — and "start" is its opposite: "start
+"close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
+open to close, although this row's button is labelled Close — and "start" is its opposite: "start
 it" is never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
