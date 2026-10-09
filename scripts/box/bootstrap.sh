@@ -25,8 +25,10 @@
 # --use-vals is for a box whose operator can read the secrets .env.vals.yaml
 # points at: it makes every devbox shell, and every agent the deck starts, run
 # that file through `vals`, which fails without access. It sticks: a re-run
-# without the flag keeps it while the marked block it wrote is in ~/.bashrc, and
-# deleting that block turns it off.
+# without the flag keeps it while the marked block it wrote is in ~/.bashrc. To
+# turn it off, delete that block and re-run. Either way a deck daemon that is
+# already running keeps the environment it started with, so its agents see the
+# change only once it is restarted.
 
 set -euo pipefail
 
@@ -187,6 +189,8 @@ EOF
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
 if [ "$USE_VALS_FLAG" = 1 ]; then
   systemctl --user set-environment USE_VALS=true || echo "  warning: could not set USE_VALS in the running systemd --user manager (applies at next login)"
+else
+  systemctl --user unset-environment USE_VALS || true
 fi
 # shellcheck source=/dev/null
 eval "$(sed -n '/# >>> dad-box PATH/,/# <<< dad-box PATH/p' "$HOME/.bashrc")"
@@ -270,6 +274,9 @@ check pi       '[ -s ~/.pi/agent/auth.json ]'                 'pi   (then /login
 check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow its login prompt)'
 check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
 [ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
+if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it restarts."
+fi
 if ! id -nG | tr ' ' '\n' | grep -qx docker; then
   echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."
 fi
