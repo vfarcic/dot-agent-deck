@@ -252,7 +252,7 @@ While the New agent dialog shows a directory listing, "filter" is about its dire
 invoke      = "filterDashboard"
 screens     = ["deck", "overview"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "the agent dashboard can be filtered once the agent's pane is closed"
+unavailable_hint = "the agent dashboard can be filtered once the agent's pane and the New agent dialog are closed"
 report      = "Filtering the agent dashboard."
 asks_to     = "filter the agent dashboard"
 try_saying  = "show only the dispatchers"
