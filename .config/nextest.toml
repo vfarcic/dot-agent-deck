@@ -194,6 +194,19 @@ fail-fast = false
 [profile.default.junit]
 path = "junit.xml"
 
+# `orchestration/delegate/012` compares a 650 ms stand-in readiness window
+# against a 1000 ms buffer, with a strict 500–900 ms measurement precondition.
+# A contended fast run observed 2.895 s with 88% I/O starvation; the same
+# test passed alone in 3.360 s. Reserve this run's pool
+# for the measurement and run it before the nested-compile tests (priority 25),
+# rather than widening its timing band or retrying a failed assertion. Keep it
+# below the live dispatch reservation (priority 50). Other processes can still
+# starve the host, so the original assertions remain the evidence.
+[[profile.default.overrides]]
+filter = 'test(delegate_012_slow_agent_toggle_proves_delivery_and_submission)'
+threads-required = "num-test-threads"
+priority = 40
+
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent
 # delegate -> work -> work-done chains through them, so its honest wall clock

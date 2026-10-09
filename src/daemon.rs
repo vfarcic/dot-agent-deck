@@ -5531,14 +5531,15 @@ mod hook_ingestion_tests {
                 .count()
         }
 
-        /// [`Self::notices`], polled until at least one has landed and the
-        /// count has stopped moving.
+        /// [`Self::notices`], polled until both the terminal echo and `cat`
+        /// output have landed and the count has stopped moving. A quiet gap
+        /// after just the echo does not mean the stand-in has read its input.
         async fn settled_notices(&self) -> usize {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut last = self.notices().await;
             loop {
                 let now = self.notices().await;
-                if now > 0 && now == last {
+                if now >= 2 && now == last {
                     return now;
                 }
                 assert!(
@@ -5749,10 +5750,9 @@ mod hook_ingestion_tests {
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (review): a notice task waiting on a stalled orchestrator
-    /// writer is cancelled when its delegation is superseded, so repeated
-    /// delegations to a blocked worker leave at most one notice queued on that
-    /// writer, and releasing it delivers only the current delegation's notice.
+    /// Scenario: hold an orchestrator's writer and repeatedly supersede a
+    /// delegation to a blocked worker. Release the writer and wait for the
+    /// terminal echo and stand-in output, proving only the current notice lands.
     #[tokio::test]
     async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
         let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;

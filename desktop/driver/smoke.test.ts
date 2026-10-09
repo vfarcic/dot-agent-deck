@@ -188,19 +188,17 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
     const input = await openShellPane(deck);
     await deck.traceTerminals();
     const [agent] = await deck.daemonAgents();
-    // The grid the pane fits, once the daemon has applied it: off the agent's
-    // spawn size, 80x24, which every pane in this window is larger than, and
-    // then still. The settle alone is not enough. The pane's own size has
-    // reached the daemon 1.9-2.0s after the attach, measured on a runner and
-    // locally, so a settle can finish at the spawn size and the control below
-    // would then see that late resize rather than none (PR #1505's first three
-    // CI runs).
-    await waitFor("the daemon to apply the pane's own size", async () => {
+    // A local fit can leave 80x24 before the attach reply restores that spawn
+    // size, so leaving it once is not evidence the daemon applied the pane's size.
+    // Read the daemon through a non-sizing observer and require xterm to agree
+    // after settling; return that same checked grid as the baseline.
+    const own = await waitFor("the daemon and settled pane to agree on the pane's own size", async () => {
+      await deck.gridSettled();
+      const applied = await deck.appliedGrid(agent.agent_id);
       const [grid] = await deck.grids();
-      return grid !== undefined && !(grid[0] === 80 && grid[1] === 24);
+      return grid !== undefined && !(applied[0] === 80 && applied[1] === 24)
+        && grid[0] === applied[0] && grid[1] === applied[1] ? grid : false;
     });
-    await deck.gridSettled();
-    const [own] = await deck.grids();
 
     // The control: the same gesture when coming to the front resizes nothing,
     // because the window is the only client and already the one sized for.
