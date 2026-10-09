@@ -833,8 +833,8 @@ fn install_impl_in(
         let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), &own_command)
             .to_string();
         expected["hooks"][0]["command"] = Value::String(command.clone());
-        // Another install's rule is left exactly as that install wrote it,
-        // `matcher` included (PRD #1487).
+        // Another install's rule keeps its `matcher` and its place (PRD #1487);
+        // only its command is rebuilt, around the same executable (PRD #1497).
         let keeps_other = matches!(kept_here, Some(KeptDeckEntry::Other { .. }));
 
         // ONE deck rule per hook type (PRD #1487), shared with the Codex and

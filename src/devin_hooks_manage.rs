@@ -341,10 +341,13 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
     // delete a live hook belonging to a user or to a newer sibling install.
     // That is issue #730's own defect one door along.
     //
-    // The consequence, stated rather than left to be discovered: nothing cleans
-    // a FOREIGN install's retired-event rule during install. That is the same
-    // tradeoff already accepted for the installed events, and `uninstall_impl`
-    // still clears every deck-signature command wide.
+    // The consequence, stated rather than left to be discovered: a FOREIGN
+    // install's retired-event hook is left in place by install, with the two
+    // exceptions the Codex writer applies (PRD #1497 audit F4,
+    // `remediate_retired_deck_handlers`): one whose executable has no safe
+    // spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper
+    // is rebuilt into the current form in place. `uninstall_impl` still clears
+    // every deck-signature command wide.
     //
     // An event key left empty IS dropped by this INSTALL sweep, while Codex's
     // install sweep leaves it. (Both adapters' `uninstall` drop emptied keys;
@@ -359,6 +362,13 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
             strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            crate::agent_hook_config::remediate_retired_deck_handlers(
+                arr,
+                command_is_deck_owned,
+                deck_command_executable,
+                |exe| crate::agent_hook_config::build_command(exe, HOOK_COMMAND_SUFFIX, HOOK_SHELL),
+                crate::agent_hook_config::EmptiedRule::Drop,
+            );
             if arr.is_empty() {
                 hooks.remove(&key);
             }

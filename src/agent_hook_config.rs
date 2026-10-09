@@ -1205,6 +1205,136 @@ pub(crate) fn strip_deck_commands(
     removed
 }
 
+/// What [`remediate_retired_deck_handlers`] does with a rule its removal
+/// leaves with no handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmptiedRule {
+    /// Keep an emptied rule unless it is the last one, so every rule after it
+    /// keeps its index. Codex keys a trust grant by a rule's index (issue #1034)
+    /// and accepts an empty rule, which holds no index of its own.
+    KeepInterior,
+    /// Drop it. Devin keys nothing by position.
+    Drop,
+}
+
+/// Under an event key the deck no longer installs, deal with the deck hooks a
+/// sibling left there that this build must not leave runnable (PRD #1497 audit
+/// F4), and return how many handlers it changed.
+///
+/// The retired-key sweep otherwise keeps issue #730's policy: another install's
+/// hook under such a key is left alone, because the agent may still run that
+/// event and the deck has nothing to put in its place. Codex 0.149.0 runs
+/// `SessionEnd`, which the deck no longer installs. So a deck hook (any command
+/// `is_deck` recognises: the current form, the legacy override wrapper, or a
+/// historical spelling) is no longer left as it is in two cases, whatever its
+/// executable's liveness:
+///
+/// - **Its executable fails [`ensure_hook_path_is_shell_safe`]**: the handler
+///   is removed. There is no safe spelling of that path to rebuild it with.
+/// - **It is in [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]'s form** around a safe
+///   executable: its `command` is rebuilt with `command_for_exe` (the adapter's
+///   own command for that executable) where it sits, every other key on the
+///   handler and its rule's `matcher` kept. That wrapper ran a relative
+///   [`crate::platform::paths::DOT_AGENT_DECK_BIN`] from `$PATH` or the working
+///   directory.
+///
+/// Every other handler is left exactly as it was, a safe sibling deck hook
+/// included, and so is every handler `is_deck` does not recognise.
+///
+/// **Positions.** A rebuild moves nothing. A removal shifts only what follows
+/// the removed handler inside its own rule; a rule the removal empties is kept
+/// or dropped as `emptied` says, so under [`EmptiedRule::KeepInterior`] no
+/// later rule moves. A legacy flat `{"command": …}` rule is handled the same
+/// way, through its `command` key.
+///
+/// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
+pub(crate) fn remediate_retired_deck_handlers(
+    rules: &mut Vec<Value>,
+    is_deck: impl Fn(&str) -> bool,
+    executable_of: impl Fn(&str) -> Option<String>,
+    command_for_exe: impl Fn(&str) -> String,
+    emptied: EmptiedRule,
+) -> usize {
+    enum Fix {
+        Keep,
+        Remove,
+        Rebuild(String),
+    }
+    let fix = |command: Option<&Value>| -> Fix {
+        let Some(command) = command.and_then(Value::as_str).filter(|c| is_deck(c)) else {
+            return Fix::Keep;
+        };
+        let Some(exe) = executable_of(command) else {
+            return Fix::Keep;
+        };
+        if ensure_hook_path_is_shell_safe(&exe).is_err() {
+            Fix::Remove
+        } else if command.starts_with(crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX) {
+            Fix::Rebuild(command_for_exe(&exe))
+        } else {
+            Fix::Keep
+        }
+    };
+
+    let mut changed = 0usize;
+    let mut emptied_at = vec![false; rules.len()];
+    for (rule_idx, rule) in rules.iter_mut().enumerate() {
+        let had_a_handler = rule_retains_a_handler(rule);
+        if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
+            handlers.retain_mut(|handler| match fix(handler.get("command")) {
+                Fix::Keep => true,
+                Fix::Remove => {
+                    changed += 1;
+                    false
+                }
+                Fix::Rebuild(command) => {
+                    if let Some(object) = handler.as_object_mut() {
+                        object.insert("command".into(), Value::String(command));
+                        changed += 1;
+                    }
+                    true
+                }
+            });
+        }
+        let flat = fix(rule.get("command"));
+        if let Some(object) = rule.as_object_mut() {
+            match flat {
+                Fix::Keep => {}
+                Fix::Remove => {
+                    object.remove("command");
+                    changed += 1;
+                }
+                Fix::Rebuild(command) => {
+                    object.insert("command".into(), Value::String(command));
+                    changed += 1;
+                }
+            }
+        }
+        emptied_at[rule_idx] = had_a_handler && !rule_retains_a_handler(rule);
+    }
+
+    match emptied {
+        EmptiedRule::Drop => {
+            let mut idx = 0;
+            rules.retain(|_| {
+                let keep = !emptied_at[idx];
+                idx += 1;
+                keep
+            });
+        }
+        EmptiedRule::KeepInterior => {
+            while rules
+                .len()
+                .checked_sub(1)
+                .is_some_and(|last| emptied_at[last])
+            {
+                rules.pop();
+            }
+        }
+    }
+    changed
+}
+
 /// Whether `exe` — the unquoted executable of a command that already has the
 /// deck's hook-command shape — is a deck INSTALL the installing binary may
 /// replace: the same binary ([`executables_match`]), or any executable sharing
@@ -1363,9 +1493,9 @@ pub(crate) enum KeptDeckEntry {
     /// The installing binary's own: the ordinary refresh writes the same
     /// command, so there is nothing to keep apart from it.
     ThisBinary,
-    /// Another install's: written back verbatim, so it stays byte for byte,
-    /// unless it carried the legacy override wrapper, which is rebuilt around
-    /// the same executable (see [`auto_install_kept_entry`]).
+    /// Another install's: its executable, and the command the deck writes for
+    /// that executable, rebuilt rather than copied (see
+    /// [`auto_install_kept_entry`]).
     Other { command: String, exe: String },
 }
 
@@ -1402,12 +1532,12 @@ impl KeptDeckEntry {
 /// deck's hook command can name safely ([`ensure_hook_path_is_shell_safe`]),
 /// or `None` when no deck entry there is.
 ///
-/// The caller writes another install's command back instead of its own, so
-/// [`consolidate_deck_handlers_in_place`] keeps that entry where it sits and
+/// The caller writes another install's command (rebuilt, below) instead of its
+/// own, so [`consolidate_deck_handlers_in_place`] keeps that entry where it sits and
 /// still consolidates the other deck copies down to it. A dead or build-output
 /// entry ahead of it is overwritten in place with the kept command.
 ///
-/// Two checks apply to another install's entry before it is kept, because
+/// Two rules apply to another install's entry before it is kept, because
 /// keeping it also copies its command into every event array that has no deck
 /// entry of its own (PRD #1497 audit F1):
 ///
@@ -1416,16 +1546,22 @@ impl KeptDeckEntry {
 ///   install does write: the next safe live sibling's, else the installing
 ///   binary's own, which the caller has already checked. An older deck may have
 ///   written it, and fish reads `\` inside its single quotes as an escape.
-/// - **A sibling written in [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]'s form is
-///   rebuilt**, through `command_for_exe` (the adapter's own command for an
-///   executable), around the same executable. That wrapper ran a relative
-///   [`crate::platform::paths::DOT_AGENT_DECK_BIN`] from `$PATH` or the working
-///   directory. The rebuilt command replaces the old one where it sits, so the
-///   entry's position and its rule's `matcher` are kept.
+/// - **A kept sibling's command is never copied byte for byte.** It is rebuilt
+///   through `command_for_exe`, the adapter's own command for an executable,
+///   around the executable it names. The executable is recovered by suffix and
+///   unquoted without shell semantics, so the original text can be a historical
+///   unquoted spelling that a shell splits differently: an unquoted
+///   `/opt/a; printf X >&2; #/dot-agent-deck` names a live file at that literal
+///   path, and a shell running the original runs `printf X`. The rebuilt
+///   command quotes the path, so it names that file and nothing else. The same
+///   rebuild replaces [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]'s form, which ran a
+///   relative [`crate::platform::paths::DOT_AGENT_DECK_BIN`] from `$PATH` or the
+///   working directory. The rebuilt command replaces the old one where it sits,
+///   so the entry's position and its rule's `matcher` are kept.
 ///
-/// Every other form of another install's command is written back byte for
-/// byte, so two installs that each resolve to themselves do not rewrite the
-/// agent's config on every start.
+/// A sibling already in the current form rebuilds to the same bytes, so two
+/// installs that each resolve to themselves still do not rewrite the agent's
+/// config on every start.
 ///
 /// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
 pub(crate) fn auto_install_kept_entry(
@@ -1435,7 +1571,7 @@ pub(crate) fn auto_install_kept_entry(
     executable_of: impl Fn(&str) -> Option<String>,
     command_for_exe: impl Fn(&str) -> String,
 ) -> Option<KeptDeckEntry> {
-    let (command, exe) = rules
+    let exe = rules
         .iter()
         .filter_map(|rule| rule.get("hooks").and_then(Value::as_array))
         .flatten()
@@ -1445,17 +1581,14 @@ pub(crate) fn auto_install_kept_entry(
             executable_of(command)
                 .filter(|exe| auto_install_keeps(exe))
                 .filter(|exe| ensure_hook_path_is_shell_safe(exe).is_ok())
-                .map(|exe| (command.to_string(), exe))
         })?;
     Some(if executables_match(&exe, binary_path) {
         KeptDeckEntry::ThisBinary
-    } else if command.starts_with(crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX) {
+    } else {
         KeptDeckEntry::Other {
             command: command_for_exe(&exe),
             exe,
         }
-    } else {
-        KeptDeckEntry::Other { command, exe }
     })
 }
 
@@ -2600,6 +2733,249 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run `command` the way an agent's POSIX shell would, in `cwd`, with no
+    /// `DOT_AGENT_DECK_BIN` set, and wait for it.
+    #[cfg(unix)]
+    fn run_in_shell(command: &str, cwd: &Path) {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run /bin/sh");
+    }
+
+    /// Scenario: another live install of dot-agent-deck sits at a path holding
+    /// shell syntax but no backslash, and its hook command names that path in a
+    /// historical spelling a shell splits differently: unquoted around a `;`,
+    /// or double-quoted around a `$( )`. The command is in one event only,
+    /// after a user rule and under a custom matcher, and running it as written
+    /// creates a marker file. For Claude Code, Codex and Devin, an automatic
+    /// install rebuilds the entry where it sits into the current, quoted
+    /// command for that same executable, copies that rebuilt command into
+    /// every missing event, and leaves the original spelling nowhere; running
+    /// every command left in the config creates no marker (PRD #1497 audit F1
+    /// residual).
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_install_rebuilds_a_kept_sibling_spelled_unsafely() {
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let semicolon = live_deck_binary(&fixture.path().join("a; touch PWNED; #").join("bin"));
+        let substitution = live_deck_binary(&fixture.path().join("$(touch PWNED)").join("bin"));
+        let installing = live_deck_binary(&fixture.path().join("installing/bin"));
+        for (case_idx, (case, sibling, spell)) in [
+            (
+                "unquoted ;",
+                &semicolon,
+                (|exe: &str| exe.to_string()) as fn(&str) -> String,
+            ),
+            ("double-quoted $( )", &substitution, |exe: &str| {
+                format!("\"{exe}\"")
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ensure_hook_path_is_shell_safe(sibling).expect("no backslash in the fixture path");
+            for agent in ["claude-code", "codex", "devin"] {
+                let home = fixture.path().join(format!("{agent}-{case_idx}"));
+                std::fs::create_dir_all(&home).unwrap();
+                let original = format!("{} hook --agent {agent}", spell(sibling));
+
+                // The fixture is a real injection: the original runs the marker.
+                let control = home.join("control");
+                std::fs::create_dir_all(&control).unwrap();
+                run_in_shell(&original, &control);
+                assert!(
+                    control.join("PWNED").exists(),
+                    "{agent}/{case}: the fixture must inject when run as written"
+                );
+
+                let (event, missing) = seed_one_deck_rule(agent, &home, &original);
+                let named = auto_install_config(agent, &home, &installing);
+
+                let rebuilt = current_deck_command(agent, sibling);
+                let root: Value =
+                    serde_json::from_slice(&std::fs::read(home.join(config_name(agent))).unwrap())
+                        .unwrap();
+                let rules = root["hooks"][&event].as_array().expect("event kept");
+                assert_eq!(rules.len(), 2, "{agent}/{case}: {rules:#?}");
+                assert_eq!(rules[0]["hooks"][0]["command"], "echo user-hook");
+                assert_eq!(
+                    rules[1]["hooks"][0]["command"],
+                    rebuilt.as_str(),
+                    "{agent}/{case}: rebuilt around the same executable, in place"
+                );
+                assert_eq!(rules[1]["matcher"], "custom-matcher", "{agent}/{case}");
+                let commands = commands_by_event(agent, &home);
+                assert!(
+                    commands
+                        .iter()
+                        .all(|(_, command)| !command.contains(&original)),
+                    "{agent}/{case}: the original spelling must not survive: {commands:#?}"
+                );
+                for event in &missing {
+                    let deck: Vec<&str> = commands
+                        .iter()
+                        .filter(|(e, _)| e == event)
+                        .map(|(_, command)| command.as_str())
+                        .collect();
+                    assert_eq!(
+                        deck,
+                        [rebuilt.as_str()],
+                        "{agent}/{case}/{event}: a missing event gets the rebuilt command"
+                    );
+                }
+                if agent == "codex" {
+                    // The trust write grants `expected_hook_command` of every
+                    // binary the install named, so the rebuilt command is the
+                    // one it trusts.
+                    assert_eq!(
+                        crate::codex_hooks_manage::expected_hook_command(
+                            named.as_deref().expect("codex names a binary")
+                        ),
+                        rebuilt,
+                        "{case}: the trust write is about the rebuilt command"
+                    );
+                }
+
+                let run = home.join("run");
+                std::fs::create_dir_all(&run).unwrap();
+                for (_, command) in &commands {
+                    run_in_shell(command, &run);
+                }
+                assert!(
+                    !run.join("PWNED").exists(),
+                    "{agent}/{case}: a command left in the config injected: {commands:#?}"
+                );
+            }
+        }
+    }
+
+    /// The event key each shell-hook adapter with a retired-key sweep does not
+    /// install: Codex runs `SessionEnd` although the deck no longer writes it.
+    #[cfg(unix)]
+    fn retired_event(agent: &str) -> &'static str {
+        match agent {
+            "codex" => "SessionEnd",
+            "devin" => "Notification",
+            _ => panic!("no retired-key sweep for {agent}"),
+        }
+    }
+
+    /// Scenario: under an event the deck no longer installs, a sibling left
+    /// deck hooks naming a live install at a path holding a backslash (one
+    /// beside a user hook, one alone in an interior rule), a deck hook in the
+    /// legacy override wrapper around a safe live install (under a custom
+    /// matcher and with a timeout), and a current-form deck hook for another
+    /// safe live install beside a user hook. For Codex and Devin, under both
+    /// the explicit and the automatic install, the unsafe hooks are removed,
+    /// the legacy one is rebuilt into the current form in place with its
+    /// matcher and timeout, and the safe deck hook and both user hooks are
+    /// untouched. Codex keeps the emptied interior rule so no later rule
+    /// moves; Devin drops it (PRD #1497 audit F4).
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_key_sweep_removes_unsafe_and_rebuilds_legacy_deck_hooks() {
+        let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let unsafe_sibling = live_deck_binary(&fixture.path().join("back\\slash").join("bin"));
+        let legacy_sibling = live_deck_binary(&fixture.path().join("legacy/bin"));
+        let safe_sibling = live_deck_binary(&fixture.path().join("safe/bin"));
+        let installing = live_deck_binary(&fixture.path().join("installing/bin"));
+        for agent in ["codex", "devin"] {
+            for automatic in [false, true] {
+                let home = fixture.path().join(format!("{agent}-{automatic}"));
+                std::fs::create_dir_all(&home).unwrap();
+                let retired = retired_event(agent);
+                let unsafe_command = current_deck_command(agent, &unsafe_sibling);
+                let safe_command = current_deck_command(agent, &safe_sibling);
+                let user = |command: &str| json!({ "type": "command", "command": command });
+                let seeded = json!({ "hooks": { retired: [
+                    { "hooks": [ user("echo user-a"), user(&unsafe_command) ] },
+                    { "hooks": [ user(&unsafe_command) ] },
+                    {
+                        "matcher": "custom-matcher",
+                        "hooks": [ {
+                            "type": "command",
+                            "command": format!("{legacy}{legacy_sibling} hook --agent {agent}"),
+                            "timeout": 7
+                        } ]
+                    },
+                    { "hooks": [ user(&safe_command), user("echo user-b") ] }
+                ] } });
+                let config = home.join(config_name(agent));
+                std::fs::write(&config, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+
+                if automatic {
+                    auto_install_config(agent, &home, &installing);
+                } else {
+                    install_config(agent, &home, &installing).expect("explicit install");
+                }
+
+                let root: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+                let rebuilt = json!({
+                    "matcher": "custom-matcher",
+                    "hooks": [ {
+                        "type": "command",
+                        "command": current_deck_command(agent, &legacy_sibling),
+                        "timeout": 7
+                    } ]
+                });
+                let mut expected = vec![json!({ "hooks": [ user("echo user-a") ] })];
+                if agent == "codex" {
+                    expected.push(json!({ "hooks": [] }));
+                }
+                expected.push(rebuilt);
+                expected.push(json!({ "hooks": [ user(&safe_command), user("echo user-b") ] }));
+                assert_eq!(
+                    root["hooks"][retired],
+                    Value::Array(expected),
+                    "{agent}, automatic={automatic}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a legacy flat `{"command": …}` deck rule under a retired key
+    /// is handled through its `command` key: an unsafe one loses it and the
+    /// emptied trailing rule goes, and a legacy-wrapper one is rebuilt in place
+    /// (PRD #1497 audit F4).
+    #[test]
+    fn a_retired_key_flat_deck_rule_is_removed_or_rebuilt() {
+        let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
+        let suffix = "hook --agent codex";
+        let mut rules = vec![
+            json!({ "matcher": "m", "command": format!("{legacy}/opt/deck/dot-agent-deck {suffix}") }),
+            json!({ "command": format!("/opt/back\\slash/dot-agent-deck {suffix}") }),
+        ];
+        let changed = remediate_retired_deck_handlers(
+            &mut rules,
+            |command| command_executable(command, suffix).is_some(),
+            |command| {
+                command_executable(command, suffix).map(|exe| unquote_if_needed(exe).into_owned())
+            },
+            |exe| format!("{exe} {suffix}"),
+            EmptiedRule::KeepInterior,
+        );
+        if cfg!(windows) {
+            // A backslash is the Windows separator, not refused there.
+            assert_eq!(changed, 1);
+            return;
+        }
+        assert_eq!(changed, 2);
+        assert_eq!(
+            rules,
+            vec![
+                json!({ "matcher": "m", "command": format!("/opt/deck/dot-agent-deck {suffix}") })
+            ]
+        );
     }
 
     /// Tester H1, at each installer: a refused install writes nothing, so the

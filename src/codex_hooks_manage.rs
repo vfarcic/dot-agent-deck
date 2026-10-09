@@ -363,7 +363,7 @@ fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path
 ///
 /// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
 /// install is kept rather than replaced (PRD #1487 —
-/// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
+/// [`crate::agent_hook_config::auto_install_kept_entry`]), and an event with
 /// no such entry gets the first kept install's command rather than this
 /// binary's. Returns every binary the installed events now name — the first
 /// kept install's first, then any other an event kept for itself — which is
@@ -403,10 +403,24 @@ fn install_impl(
     // along. (`Notification` and `TurnStart` were dropped as unknown in the same
     // probe, so the class is real but not every name is in it.)
     //
-    // The consequence, stated rather than left to be discovered: nothing cleans
-    // a FOREIGN install's retired-event rule during install. That is the same
-    // tradeoff already accepted for the installed events, and `uninstall_from`
-    // still clears every deck-signature command wide.
+    // The consequence, stated rather than left to be discovered: a FOREIGN
+    // install's retired-event hook is left in place by install, with two
+    // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`): one
+    // whose executable has no safe spelling is removed, and one in the legacy
+    // `DOT_AGENT_DECK_BIN` wrapper is rebuilt into the current form in place.
+    // Codex runs `SessionEnd`, so leaving either would leave it runnable.
+    // `uninstall_from` still clears every deck-signature command wide.
+    //
+    // Trust, for those two: a removal leaves the removed handler's trust record
+    // behind, and since Codex pins a grant to the hash of command, `matcher`
+    // and `async`, that record authorises nothing but the removed command. A
+    // handler that followed it in the same rule moves up one index and is held
+    // for review, as any re-keyed grant is (issue #1034); an emptied rule is
+    // kept unless it is the last, so no later rule moves. A rebuild moves
+    // nothing, but changes the command and so its hash: the trust write grants
+    // the rebuilt command only when it names a binary the install named (this
+    // binary, or a sibling an automatic install kept), exactly as for any
+    // command the install writes, and Codex otherwise holds it for review.
     //
     // An event key left empty is NOT dropped by this INSTALL sweep, while
     // Devin's install sweep does drop it. (Both adapters' `uninstall` drop
@@ -422,6 +436,13 @@ fn install_impl(
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
             strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            crate::agent_hook_config::remediate_retired_deck_handlers(
+                arr,
+                command_is_deck_owned,
+                deck_command_executable,
+                expected_hook_command,
+                crate::agent_hook_config::EmptiedRule::KeepInterior,
+            );
         }
     }
 
