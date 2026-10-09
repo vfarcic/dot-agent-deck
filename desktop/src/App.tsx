@@ -1380,9 +1380,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const helpOpen = overlays.open.shortcuts ?? false;
   // voice-registry-exempt: the shortcut sheet is a `ShellOverlay` and not a `DeckOverlay` — no registry entry opens it; `?` and the rail's bottom button do
   const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
-  /* Issue #1234: a sentence only. The roles a failed launch could not confirm
+  /* Issue #1234: a sentence, with a failure's technical detail beside it, and
+     nothing else. The roles a failed launch could not confirm
      are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
-  const [notice, setNotice] = useState<string>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  const [noticeState, setNoticeState] = useState<{ message: string; detail?: string }>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  /* PR #1623 review: a failure's technical detail rides beside its sentence
+     rather than inside it, so the sentence stays equal to the one `runAction`
+     recorded as `runtime.error` and `dismissToast` can match the two. */
+  const notice = noticeState?.message;
+  const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
@@ -1887,15 +1893,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         } catch (cause) {
           // PR #1623 review: a failed start's technical detail — the spawn
           // error, what ssh printed — is said with its sentence, not dropped.
+          // It travels as the notice's detail rather than appended to its
+          // sentence, so the sentence still equals the one `runAction` recorded
+          // and `dismissToast` takes both. `runtime.error` is shared, so nothing
+          // here clears it: a newer failure recorded there before this catch
+          // ran says something else and must survive (PR #1623 review).
           const message = cause instanceof Error ? cause.message : String(cause);
-          const reported = cause instanceof StartDaemonError && cause.detail !== undefined ? `${message} (${cause.detail})` : message;
-          // `runAction` recorded the sentence alone as `runtime.error`, so once
-          // the detail is added the two no longer read alike and `dismissToast`
-          // would leave the error behind — the toast would come straight back.
-          // The notice is the full report of that same failure, so the shorter
-          // copy goes now (PR #1623 review).
-          if (reported !== message) runtime.clearError();
-          setNotice(reported);
+          setNotice(message, cause instanceof StartDaemonError ? cause.detail : undefined);
         }
       },
     });
@@ -2269,7 +2273,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
     </div>
   );
 }
@@ -2295,7 +2299,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -2317,7 +2321,7 @@ function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: s
         <div className="toast" data-testid="toast" role="status">
           <AlertTriangle size={15} />
           <div className="toast-body">
-            <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+            <span>{displayText(message, DISPLAY_LIMITS.message)}{detail ? ` (${displayText(detail, DISPLAY_LIMITS.detail)})` : null}</span>
           </div>
           <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
         </div>

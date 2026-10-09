@@ -2738,6 +2738,46 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: a start fails with technical detail, but before its rejection
+   * reaches the handler a different failure — a reconnect, another action — is
+   * recorded in the runtime's one error slot. The toast reports the start; once
+   * the user dismisses it, the newer failure is still there and takes its place
+   * instead of having been wiped by the start's handler (PR #1623 review: it
+   * cleared the shared error unconditionally to keep its own toast closed).
+   */
+  function DeckWithOvertakenStart({ failure, newer }: { failure: Error; newer: string }) {
+    const base = useMemo(() => runtime({ mode: "live", snapshot: disconnectedLive() }), []);
+    const [error, setError] = useState<string | undefined>();
+    const runAction = useCallback(async () => {
+      setError(failure.message);
+      setError(newer);
+      throw failure;
+    }, [failure, newer]);
+    return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined), runAction }} />;
+  }
+
+  it("keeps a newer error recorded while a start failed instead of clearing it", async () => {
+    const { StartDaemonError } = await import("./lib/actionError");
+    const sentence = "Could not start the daemon on this machine.";
+    const detail = "spawn: No such file or directory";
+    const newer = "daemon returned error: reconnect-failed";
+    render(<DeckWithOvertakenStart failure={new StartDaemonError(sentence, "start-failed", detail)} newer={newer} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    expect(await screen.findByText(`${sentence} (${detail})`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    expect(await screen.findByText(newer)).toBeInTheDocument();
+    expect(screen.queryByText(`${sentence} (${detail})`)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(newer)).not.toBeInTheDocument());
+  });
+
+  /**
    * The other half of the same click: the daemon's own notices still clear, and
    * they clear through `setNotice` rather than through the runtime — so a
    * runtime that never errored is not asked to do anything on its behalf.
