@@ -1543,14 +1543,26 @@ heard_as    = ["daemon", "deck", "demon"]
 # mentions and still refuses any other "confirm" in this row.
 #
 # **"Launch the agent" is this row before a directory is chosen too** (issue
-# #1496). Adding the dashboard filter's two rows took "just launch the agent
-# immediately", with the dialog open and no form yet, from 60/60 on `main` to
-# 32/40: the model answered `none`. Naming "launch the agent" put it at 44/45.
-# A sentence saying the row answers while the form is incomplete did as well,
-# but with it a bare "stop" on the agent screen went to `interrupt_agent` 14
-# times in 20 (ending "so a start request is never `none`") or 12 in 50
-# (without that ending), against 9 in 70 on `main` — so it was not kept, and
-# `interrupt_agent`'s description now names `stop_agent` for those words.
+# #1496). "Just launch the agent immediately", with the dialog open and no form
+# yet, went from 60/60 on `main` to 32/40 on this branch: the model answered
+# `none`. Naming "launch the agent" put it at 44/45. A sentence saying the row
+# answers while the form is incomplete did as well, but with it a bare "stop"
+# on the agent screen went to `interrupt_agent` 14 times in 20 (ending "so a
+# start request is never `none`") or 12 in 50 (without that ending), against 9
+# in 70 on `main` — so it was not kept, and `interrupt_agent`'s description now
+# names `stop_agent` for those words.
+#
+# **The cause was the re-wrap, not the two new rows.** The first "launch the
+# agent" edit re-flowed every line after it, and these descriptions reach the
+# model with their line breaks. Replaying the captured request against the
+# model, all variants interleaved, `none` came back 21/180 with that re-wrap,
+# 12/120 with the dashboard filter's two rows removed instead, 3/180 with this
+# row's `main` text, 4/180 on `main`, and 2/180 with "launch the agent" added
+# inside `main`'s line and nothing re-flowed — the text below, which is why its
+# one long line stays long. No neighbour moved under it: 12 replays each over
+# the open-new-agent, start, stop, close, choose-deck, name, discard, directory
+# and dashboard-filter fixtures, and 60 each on the no-confirm start and the
+# bare stops.
 [[commands]]
 id          = "start_new_agent"
 description = """Start what the New agent dialog's form describes — the voice form of its Start
@@ -1558,11 +1570,11 @@ button, and it starts at once. The button reads "Create agent", or "Activate orc
 an orchestration is chosen in Mode, and either label said aloud means THIS one. Use for create
 agent, activate orchestration, activate the orchestration, activate it, start agent, start
 orchestration, start the orchestration, start the run, start it, start the agent, start the new
-agent, go ahead and start it, launch it, launch the agent, launch the orchestration, create it, spin it
-up now, or run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the
-user is looking at, so "activate orchestration" starts the orchestration already chosen and is
-never `choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request
-to start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
+agent, go ahead and start it, launch it, launch the agent, launch the orchestration, create it, spin it up now, or
+run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the user is
+looking at, so "activate orchestration" starts the orchestration already chosen and is never
+`choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to
+start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
 incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
 for — "start it right now", "just launch it, don't ask me", "skip the confirmation" — since it
 starts at once: a start has no confirmation and no second step for it to skip. A bare "go ahead"
