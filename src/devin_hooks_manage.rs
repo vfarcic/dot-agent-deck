@@ -344,8 +344,9 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
     // The consequence, stated rather than left to be discovered: a FOREIGN
     // install's retired-event hook is left in place by install, with the two
     // exceptions the Codex writer applies (PRD #1497 audit F4,
-    // `remediate_retired_deck_handlers`): one whose executable has no safe
-    // spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper,
+    // `remediate_retired_deck_handlers`), and like it only to a command naming
+    // a deck install (this binary, or an executable sharing its basename;
+    // audit A1): one whose executable has no safe spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper,
     // or one whose executable needs quoting and is not spelled as the current
     // command for it, is rebuilt into the current form in place. `uninstall_impl` still clears
     // every deck-signature command wide.
@@ -367,6 +368,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
                 arr,
                 command_is_deck_owned,
                 deck_command_executable,
+                binary_path,
                 HOOK_COMMAND_SUFFIX,
                 HOOK_SHELL,
                 crate::agent_hook_config::EmptiedRule::Drop,

@@ -1243,10 +1243,15 @@ pub(crate) enum EmptiedRule {
 /// The retired-key sweep otherwise keeps issue #730's policy: another install's
 /// hook under such a key is left alone, because the agent may still run that
 /// event and the deck has nothing to put in its place. Codex 0.149.0 runs
-/// `SessionEnd`, which the deck no longer installs. So a deck hook (any command
-/// `is_deck` recognises: the current form, the legacy override wrapper, or a
-/// historical spelling) is no longer left as it is in two cases, whatever its
-/// executable's liveness:
+/// `SessionEnd`, which the deck no longer installs. So a deck hook is no
+/// longer left as it is in the cases below, whatever its executable's
+/// liveness. A deck hook here is a command `is_deck` recognises (the current
+/// form, the legacy override wrapper, or a historical spelling) whose
+/// executable is also a deck install by [`is_replaceable_deck_install`]
+/// against `binary_path`: the same binary, or one sharing its basename. The
+/// command suffix alone is not enough (PRD #1497 audit A1): a user's own
+/// `audit-hook` that happens to end in `hook --agent codex` is not the deck's,
+/// and is never removed or rebuilt here, whatever its path holds.
 ///
 /// - **Its executable fails [`ensure_hook_path_is_shell_safe`]**: the handler
 ///   is removed. There is no safe spelling of that path to rebuild it with.
@@ -1263,9 +1268,9 @@ pub(crate) enum EmptiedRule {
 ///   executable whose path holds no such byte cannot be split that way.
 ///
 /// Every other handler is left exactly as it was, and so is every handler
-/// `is_deck` does not recognise: that includes a deck hook already in the
-/// current form, and one spelled another way around a path that needs no
-/// quoting.
+/// that is not a deck hook by the test above: that includes a deck hook
+/// already in the current form, one spelled another way around a path that
+/// needs no quoting, and any command naming a differently named executable.
 ///
 /// **Positions.** A rebuild moves nothing. A removal shifts only what follows
 /// the removed handler inside its own rule; a rule the removal empties is kept
@@ -1278,6 +1283,7 @@ pub(crate) fn remediate_retired_deck_handlers(
     rules: &mut Vec<Value>,
     is_deck: impl Fn(&str) -> bool,
     executable_of: impl Fn(&str) -> Option<String>,
+    binary_path: &str,
     suffix: &str,
     shell: HookShell,
     emptied: EmptiedRule,
@@ -1291,7 +1297,9 @@ pub(crate) fn remediate_retired_deck_handlers(
         let Some(command) = command.and_then(Value::as_str).filter(|c| is_deck(c)) else {
             return Fix::Keep;
         };
-        let Some(exe) = executable_of(command) else {
+        let Some(exe) =
+            executable_of(command).filter(|exe| is_replaceable_deck_install(exe, binary_path))
+        else {
             return Fix::Keep;
         };
         if ensure_hook_path_is_shell_safe(&exe).is_err() {
@@ -2977,7 +2985,8 @@ mod tests {
     /// Scenario: a legacy flat `{"command": …}` deck rule under a retired key
     /// is handled through its `command` key: an unsafe one loses it and the
     /// emptied trailing rule goes, and a legacy-wrapper one is rebuilt in place
-    /// (PRD #1497 audit F4).
+    /// (PRD #1497 audit F4), while flat rules naming a user's differently named
+    /// executable in the same two shapes are left as they were (audit A1).
     #[test]
     fn a_retired_key_flat_deck_rule_is_removed_or_rebuilt() {
         let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
@@ -2986,12 +2995,20 @@ mod tests {
             json!({ "matcher": "m", "command": format!("{legacy}/opt/deck/dot-agent-deck {suffix}") }),
             json!({ "command": format!("/opt/back\\slash/dot-agent-deck {suffix}") }),
         ];
+        // A user's own executable carrying the deck's verb is not the deck's
+        // (audit A1): neither its backslash path nor its wrapper is touched.
+        let user = vec![
+            json!({ "command": format!("/opt/audit\\tools/audit-hook {suffix}") }),
+            json!({ "command": format!("{legacy}/opt/user/audit-hook {suffix}") }),
+        ];
+        rules.splice(0..0, user.iter().cloned());
         let changed = remediate_retired_deck_handlers(
             &mut rules,
             |command| command_executable(command, suffix).is_some(),
             |command| {
                 command_executable(command, suffix).map(|exe| unquote_if_needed(exe).into_owned())
             },
+            "/usr/local/bin/dot-agent-deck",
             suffix,
             HookShell::Native,
             EmptiedRule::KeepInterior,
@@ -3002,13 +3019,98 @@ mod tests {
             return;
         }
         assert_eq!(changed, 2);
-        assert_eq!(
-            rules,
-            vec![json!({
-                "matcher": "m",
-                "command": build_command("/opt/deck/dot-agent-deck", suffix, HookShell::Native)
-            })]
-        );
+        let mut expected = user;
+        expected.push(json!({
+            "matcher": "m",
+            "command": build_command("/opt/deck/dot-agent-deck", suffix, HookShell::Native)
+        }));
+        assert_eq!(rules, expected);
+    }
+
+    /// Scenario: under an event the deck no longer installs, a user's own
+    /// executable named `audit-hook` (not the deck) has handlers whose commands
+    /// end in the deck's `hook --agent <agent>` verb: one at a path holding a
+    /// backslash, one unquoted around a `;`, and one in the legacy override
+    /// wrapper, each as a nested handler and as a legacy flat `{"command": …}`
+    /// rule, beside a genuine sibling deck hook at a backslash path and one in
+    /// the legacy wrapper. For Codex and Devin, under both the explicit and
+    /// the automatic install, every `audit-hook` entry is left byte for byte,
+    /// while the sibling deck hooks are still removed and rebuilt (PRD #1497
+    /// audit A1).
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_key_sweep_leaves_a_differently_named_user_executable_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let user_binary = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let binary = dir.join("audit-hook");
+            crate::test_isolation::write_script(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            binary.to_str().expect("utf-8 fixture path").to_string()
+        };
+        let user_backslash = user_binary(&fixture.path().join("audit\\tools"));
+        let user_semicolon = user_binary(&fixture.path().join("a; true; #").join("bin"));
+        let user_plain = user_binary(&fixture.path().join("user/bin"));
+        let unsafe_sibling = live_deck_binary(&fixture.path().join("back\\slash").join("bin"));
+        let legacy_sibling = live_deck_binary(&fixture.path().join("legacy/bin"));
+        let installing = live_deck_binary(&fixture.path().join("installing/bin"));
+        for agent in ["codex", "devin"] {
+            for automatic in [false, true] {
+                let home = fixture.path().join(format!("{agent}-{automatic}"));
+                std::fs::create_dir_all(&home).unwrap();
+                let retired = retired_event(agent);
+                let user_commands = [
+                    current_deck_command(agent, &user_backslash),
+                    format!("{user_semicolon} hook --agent {agent}"),
+                    format!("{legacy}{user_plain} hook --agent {agent}"),
+                ];
+                for command in &user_commands {
+                    assert!(
+                        crate::agent_hook_config::command_executable(
+                            command,
+                            &format!("hook --agent {agent}")
+                        )
+                        .is_some(),
+                        "{agent}: the fixture must carry the deck's command shape: {command}"
+                    );
+                }
+                let handler = |command: &str| json!({ "type": "command", "command": command });
+                let nested: Vec<Value> = user_commands.iter().map(|c| handler(c)).collect();
+                let mut first = nested.clone();
+                first.push(handler(&current_deck_command(agent, &unsafe_sibling)));
+                let flat: Vec<Value> = user_commands
+                    .iter()
+                    .map(|c| json!({ "command": c }))
+                    .collect();
+                let legacy_rule = |command: String| json!({ "hooks": [ handler(&command) ] });
+                let mut seeded_rules = vec![json!({ "hooks": first })];
+                seeded_rules.extend(flat.iter().cloned());
+                seeded_rules.push(legacy_rule(format!(
+                    "{legacy}{legacy_sibling} hook --agent {agent}"
+                )));
+                let seeded = json!({ "hooks": { retired: seeded_rules } });
+                let config = home.join(config_name(agent));
+                std::fs::write(&config, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+
+                if automatic {
+                    auto_install_config(agent, &home, &installing);
+                } else {
+                    install_config(agent, &home, &installing).expect("explicit install");
+                }
+
+                let root: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+                let mut expected = vec![json!({ "hooks": nested })];
+                expected.extend(flat.iter().cloned());
+                expected.push(legacy_rule(current_deck_command(agent, &legacy_sibling)));
+                assert_eq!(
+                    root["hooks"][retired],
+                    Value::Array(expected),
+                    "{agent}, automatic={automatic}"
+                );
+            }
+        }
     }
 
     /// Scenario: under an event the deck no longer installs, a sibling left

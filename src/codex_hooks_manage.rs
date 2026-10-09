@@ -405,8 +405,11 @@ fn install_impl(
     //
     // The consequence, stated rather than left to be discovered: a FOREIGN
     // install's retired-event hook is left in place by install, with two
-    // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`): one
-    // whose executable has no safe spelling is removed, and one in the legacy
+    // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`),
+    // which apply only to a command naming a deck install (this binary, or an
+    // executable sharing its basename; audit A1): a user's own executable
+    // that merely ends in the deck's verb is never touched. One whose
+    // executable has no safe spelling is removed, and one in the legacy
     // `DOT_AGENT_DECK_BIN` wrapper, or one whose executable needs quoting and
     // is not spelled as the current command for it, is rebuilt into the
     // current form in place. Codex runs `SessionEnd`, so leaving either would
@@ -442,6 +445,7 @@ fn install_impl(
                 arr,
                 command_is_deck_owned,
                 deck_command_executable,
+                binary_path,
                 HOOK_COMMAND_SUFFIX,
                 HOOK_SHELL,
                 crate::agent_hook_config::EmptiedRule::KeepInterior,
