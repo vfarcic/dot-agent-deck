@@ -2217,6 +2217,7 @@ mod tests {
                                 prompt_keys: None,
                                 crashed: None,
                                 orchestrator_context_path: None,
+                                authoring_kind: None,
                             }]);
                             r.orchestration_roles = Some(vec![OrchestrationRoleRecord {
                                 pane_id: "7".into(),

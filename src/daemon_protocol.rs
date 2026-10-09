@@ -1694,6 +1694,21 @@ pub enum AttachRequest {
         /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        /// Issue #1496: this start is an AUTHORING agent whose seed the CLIENT
+        /// delivers itself — the TUI's `schedule` / `schedule: issues` /
+        /// `dispatcher` options, which type their own seed once the agent is
+        /// ready. The daemon composes and delivers nothing for it; it only
+        /// records the kind once it has accepted the start, as it does for
+        /// `authoring_kind`, so [`crate::agent_pty::AgentRecord::authoring_kind`]
+        /// answers for an authoring agent whichever client started it. Refused,
+        /// with nothing started, when it is combined with `authoring_kind`.
+        ///
+        /// Not gated on a capability: an older daemon drops the key and starts
+        /// the agent unchanged, which records no kind — what every daemon did
+        /// before this field. No `PROTOCOL_VERSION` bump: an additive optional
+        /// field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seeded_kind: Option<crate::authoring_seeds::AuthoringKind>,
         /// Issue #1540: this start was submitted from a **New agent form** (the
         /// TUI's `Ctrl+n`, the desktop's New agent dialog), plain or authoring,
         /// so once the daemon has ACCEPTED it — the spawn succeeded — `command`
@@ -4670,6 +4685,7 @@ async fn handle_connection(
                     // PRD #1223 M7: an orchestration role is not an authoring
                     // agent, and `start-prepared-agent` has no such field.
                     authoring_kind: None,
+                    client_seeded_kind: None,
                     // Issue #1540: a role start is not a form start, so it
                     // never records the deck's last command.
                     remember_command: false,
@@ -4871,6 +4887,7 @@ async fn handle_connection(
             agent_type,
             seed,
             authoring_kind,
+            client_seeded_kind,
             remember_command,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
@@ -5201,6 +5218,18 @@ async fn handle_connection(
             .then(|| command.clone())
             .flatten();
 
+            // Issue #1496: one start names one kind, whoever delivers its seed.
+            if authoring_kind.is_some() && client_seeded_kind.is_some() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(
+                        "start-agent: authoring_kind and client_seeded_kind are mutually \
+                         exclusive; nothing was started",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             // PRD #1223 M7: an authoring start's seed is composed — and its
             // preconditions checked — before anything spawns, so a refusal
             // starts nothing. See `AttachRequest::StartAgent::authoring_kind`.
@@ -5325,6 +5354,12 @@ async fn handle_connection(
             drop(prepared_dir);
             match spawned {
                 Ok(id) => {
+                    // Issue #1496: the start is accepted, so the record says
+                    // what kind of authoring agent it is — before the seed
+                    // delivery below, which can wait on the agent's readiness.
+                    if let Some(kind) = authoring_kind.or(client_seeded_kind) {
+                        let _ = registry.set_authoring_kind(&id, kind);
+                    }
                     // PRD #1223 M7: deliver the authoring seed through the path
                     // this agent already has, never a new one (#528). A Pi pane
                     // takes PRD #201's native seed — the branch just below, which
@@ -9287,6 +9322,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -9324,6 +9360,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         };
         let v: serde_json::Value =
@@ -9366,6 +9403,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -9408,6 +9446,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -9465,6 +9504,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -9488,6 +9528,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -9663,6 +9704,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -10026,6 +10068,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
@@ -10856,6 +10899,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind,
+            client_seeded_kind: None,
             remember_command: false,
         };
         let plain = serde_json::to_value(start(None)).unwrap();

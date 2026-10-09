@@ -118,6 +118,7 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
             agent_type: Some(AgentType::ClaudeCode),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )

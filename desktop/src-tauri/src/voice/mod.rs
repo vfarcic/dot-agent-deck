@@ -631,6 +631,7 @@ pub mod test_support {
             last_activity_ms: None,
             spawned_at_ms: None,
             blocked: None,
+            authoring_kind: None,
             tab: DesktopTab::Dashboard,
         }
     }

@@ -256,6 +256,7 @@ impl InstalledDaemon {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         });
         assert!(response.ok, "stand-in spawn failed: {:?}", response.error);
