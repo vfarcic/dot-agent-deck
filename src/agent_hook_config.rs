@@ -123,8 +123,28 @@ fn build_command_for(
     };
     format!(
         "{} {suffix}",
-        crate::platform::paths::native_shell_command_word(binary_path, windows_dialect)
+        overridable_command_word(
+            &crate::platform::paths::native_shell_command_word(binary_path, windows_dialect),
+            windows_dialect,
+        )
     )
+}
+
+/// What a POSIX-dialect hook command opens with — see
+/// [`crate::platform::paths::HOOK_BIN_OVERRIDE_PREFIX`], which documents the
+/// form.
+pub(crate) const BIN_OVERRIDE_PREFIX: &str = crate::platform::paths::HOOK_BIN_OVERRIDE_PREFIX;
+
+/// `quoted_exe` (already quoted for the dialect) as the command word of a hook
+/// command that honours [`crate::platform::paths::DOT_AGENT_DECK_BIN`]: wrapped in
+/// [`BIN_OVERRIDE_PREFIX`] for a POSIX shell, unchanged for `cmd.exe`, which
+/// has no such expansion and runs the installed executable as before.
+pub(crate) fn overridable_command_word(quoted_exe: &str, windows_dialect: bool) -> String {
+    if windows_dialect {
+        quoted_exe.to_string()
+    } else {
+        format!("{BIN_OVERRIDE_PREFIX}{quoted_exe}")
+    }
 }
 
 /// Atomically publish `bytes` to `dest` by writing a temp file in `dir` — which
@@ -782,6 +802,12 @@ fn temp_path(dir: &Path, name: &str) -> PathBuf {
 pub(crate) fn command_executable<'a>(command: &'a str, suffix: &str) -> Option<&'a str> {
     let exe = command.trim_end().strip_suffix(suffix)?;
     let exe = exe.strip_suffix(' ')?;
+    // PRD #1497: the override wrapper is the deck's own, and the installed
+    // executable is what follows it — both forms name the same install.
+    if exe == BIN_OVERRIDE_PREFIX.trim_end() {
+        return None;
+    }
+    let exe = exe.strip_prefix(BIN_OVERRIDE_PREFIX).unwrap_or(exe);
     if exe.is_empty() { None } else { Some(exe) }
 }
 
@@ -2196,7 +2222,7 @@ mod tests {
                 HookShell::Native,
                 false
             ),
-            "/abs/dot-agent-deck hook --agent codex"
+            format!("{BIN_OVERRIDE_PREFIX}/abs/dot-agent-deck hook --agent codex")
         );
         assert_eq!(
             build_command_for(
@@ -2205,8 +2231,139 @@ mod tests {
                 HookShell::Posix,
                 false
             ),
-            "'/with space/dot-agent-deck' hook --agent devin"
+            format!("{BIN_OVERRIDE_PREFIX}'/with space/dot-agent-deck' hook --agent devin")
         );
+    }
+
+    /// PRD #1497: the wrapper reads the one variable the docs, the OpenCode
+    /// plugin and the Pi extension name, with the installed path as its
+    /// fallback.
+    #[test]
+    fn bin_override_prefix_reads_dot_agent_deck_bin_with_the_installed_fallback() {
+        let var = crate::platform::paths::DOT_AGENT_DECK_BIN;
+        assert!(
+            BIN_OVERRIDE_PREFIX.contains(&format!("\"${{{var}:-$0}}\"")),
+            "{BIN_OVERRIDE_PREFIX}"
+        );
+        assert!(BIN_OVERRIDE_PREFIX.starts_with("/bin/sh -c 'exec "));
+        assert!(BIN_OVERRIDE_PREFIX.ends_with("\"$@\"' "));
+        assert_eq!(
+            overridable_command_word("'/a b/dot-agent-deck'", true),
+            "'/a b/dot-agent-deck'",
+            "cmd.exe has no such expansion, so a Windows-dialect word is left alone"
+        );
+    }
+
+    /// PRD #1497: both forms name the same install, so the parse from the
+    /// right recovers the installed executable from the override form — which
+    /// is what lets a re-install migrate an old entry in place and an
+    /// uninstall remove either.
+    #[test]
+    fn command_executable_recovers_the_installed_path_from_either_form() {
+        for exe in ["/abs/dot-agent-deck", "'/with space/dot-agent-deck'"] {
+            let plain = format!("{exe} {CODEX}");
+            let overridden = format!("{BIN_OVERRIDE_PREFIX}{exe} {CODEX}");
+            assert_eq!(command_executable(&plain, CODEX), Some(exe));
+            assert_eq!(command_executable(&overridden, CODEX), Some(exe));
+        }
+        assert_eq!(
+            command_executable(&format!("{BIN_OVERRIDE_PREFIX}{CODEX}"), CODEX),
+            None,
+            "the wrapper with no installed executable after it is not a command the deck writes"
+        );
+    }
+
+    /// PRD #1497, run rather than read: the written command runs the
+    /// `DOT_AGENT_DECK_BIN` binary when that is set and non-empty and the
+    /// installed one otherwise, with the hook's arguments and stdin intact,
+    /// under every outer shell an agent here hands the command to that this
+    /// machine has — `sh -c` (Claude Code, per its hooks reference) and
+    /// `$SHELL -lc` (Codex),
+    /// where `$SHELL` may be bash, zsh or fish. fish is the reason for the
+    /// `/bin/sh -c` wrapper: it rejects a bare `${VAR:-default}`. A shell that
+    /// is not installed is skipped and named.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_command_runs_the_override_else_the_installed_binary() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spaced = dir.path().join("my deck");
+        std::fs::create_dir(&spaced).expect("mkdir");
+        let write_stub = |name: &str| {
+            let path = spaced.join(name);
+            crate::test_isolation::write_script(
+                &path,
+                format!("#!/bin/sh\nprintf '%s|%s|' {name} \"$*\" > \"$OUT\"\ncat >> \"$OUT\"\n"),
+            )
+            .expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            path
+        };
+        let installed = write_stub("installed");
+        let built = write_stub("built");
+        let out = dir.path().join("out");
+        let command = build_command_for(
+            installed.to_str().expect("utf-8"),
+            DEVIN,
+            HookShell::Posix,
+            false,
+        );
+
+        let mut ran_any = false;
+        for shell in ["sh", "bash", "zsh", "fish"] {
+            let run = |bin: Option<&str>| {
+                let _ = std::fs::remove_file(&out);
+                let mut cmd = Command::new(shell);
+                cmd.arg("-c")
+                    .arg(&command)
+                    .env("OUT", &out)
+                    .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+                if let Some(bin) = bin {
+                    cmd.env(crate::platform::paths::DOT_AGENT_DECK_BIN, bin);
+                }
+                let mut child = cmd.spawn().ok()?;
+                use std::io::Write as _;
+                child
+                    .stdin
+                    .take()
+                    .expect("stdin")
+                    .write_all(b"{\"payload\":1}")
+                    .expect("write stdin");
+                let output = child.wait_with_output().expect("wait");
+                assert!(
+                    output.status.success(),
+                    "{shell} -c {command:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Some(std::fs::read_to_string(&out).expect("the stub wrote its record"))
+            };
+            let Some(unset) = run(None) else {
+                eprintln!("SKIP: {shell} is not installed here");
+                continue;
+            };
+            ran_any = true;
+            assert_eq!(
+                unset, "installed|hook --agent devin|{\"payload\":1}",
+                "{shell}, unset"
+            );
+            assert_eq!(
+                run(Some("")).expect("ran"),
+                "installed|hook --agent devin|{\"payload\":1}",
+                "{shell}, set but empty"
+            );
+            assert_eq!(
+                run(Some(built.to_str().expect("utf-8"))).expect("ran"),
+                "built|hook --agent devin|{\"payload\":1}",
+                "{shell}, set to a path with a space in it"
+            );
+        }
+        assert!(ran_any, "no shell at all could be spawned");
     }
 
     /// Issue #734. The command written into a Windows Codex user's `hooks.json`
@@ -2300,7 +2457,9 @@ mod tests {
                 HookShell::Posix,
                 true
             ),
-            "'/Applications/My Deck/dot-agent-deck' hook --agent devin",
+            format!(
+                "{BIN_OVERRIDE_PREFIX}'/Applications/My Deck/dot-agent-deck' hook --agent devin"
+            ),
             "on a Windows host a POSIX writer still single-quotes"
         );
 

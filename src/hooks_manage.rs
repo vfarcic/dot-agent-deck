@@ -598,9 +598,14 @@ const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// `{ "hooks": [{"type": "command", "command": "..."}] }`
 /// For Notification, adds a matcher for permission_prompt.
 fn make_rule(binary_path: &str, hook_type: &str) -> Value {
+    // PRD #1497: through the `DOT_AGENT_DECK_BIN` override wherever the hook
+    // runs in a POSIX shell (`sh -c`, per Claude Code's hooks reference).
     let command = format!(
         "{} {HOOK_COMMAND_SUFFIX}",
-        shell_quote_if_needed(binary_path)
+        crate::agent_hook_config::overridable_command_word(
+            &shell_quote_if_needed(binary_path),
+            cfg!(windows),
+        )
     );
     let command_obj = json!({
         "type": "command",
@@ -1606,7 +1611,13 @@ mod tests {
         );
         assert_eq!(
             commands[0],
-            format!("{} {HOOK_COMMAND_SUFFIX}", b.display())
+            format!(
+                "{} {HOOK_COMMAND_SUFFIX}",
+                crate::agent_hook_config::overridable_command_word(
+                    &shell_quote_if_needed(b.to_str().unwrap()),
+                    cfg!(windows)
+                )
+            )
         );
     }
 

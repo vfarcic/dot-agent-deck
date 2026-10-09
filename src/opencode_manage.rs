@@ -197,9 +197,18 @@ const ancestryLookups = new Map();
 let unsettledAncestryLookups = 0;
 let disposalGeneration = 0;
 
+// PRD #1497: DOT_AGENT_DECK_BIN, when set and non-empty, names the binary to
+// report through instead of BINARY_PATH (the `task run-all` sandbox sets it to
+// the build under test). Read per event, like the shell `${{VAR:-default}}` the
+// deck's other hook commands use.
+const hookBinary = () => {{
+  const override = process.env.DOT_AGENT_DECK_BIN;
+  return typeof override === "string" && override !== "" ? override : BINARY_PATH;
+}};
+
 const sendEvent = (payload) => {{
   try {{
-    execFileSync(BINARY_PATH, ["hook", "--agent", "opencode"], {{
+    execFileSync(hookBinary(), ["hook", "--agent", "opencode"], {{
       input: JSON.stringify(payload),
       timeout: 5000,
       stdio: ["pipe", "ignore", "ignore"],
@@ -2155,6 +2164,95 @@ pub(crate) mod tests {
             durable.to_str(),
             "issue #536: a bare BINARY_PATH survived because the cwd held a file \
              of that name"
+        );
+    }
+
+    /// PRD #1497: the plugin reports through the binary `DOT_AGENT_DECK_BIN`
+    /// names when that is set and non-empty, and through its pinned
+    /// `BINARY_PATH` otherwise. Loaded under Node with two recorder scripts,
+    /// one pinned and one named by the variable; each run sends one event and
+    /// exactly one recorder receives it.
+    #[cfg(unix)]
+    #[test]
+    fn plugin_reports_through_dot_agent_deck_bin_when_it_is_set() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = |name: &str| {
+            let script = dir.path().join(name);
+            let out = dir.path().join(format!("{name}.jsonl"));
+            crate::test_isolation::write_script(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                    out.display(),
+                    out.display()
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script, out)
+        };
+        let (pinned, pinned_out) = recorder("pinned");
+        let (built, built_out) = recorder("built");
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&pinned.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{}";
+const hooks = await plugin({{ directory: "/work" }});
+await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: "boom" }} }} }});
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let lines = |path: &Path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        };
+        let run = |bin: Option<&str>| {
+            let mut cmd = std::process::Command::new("node");
+            cmd.arg(&driver)
+                .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN);
+            if let Some(bin) = bin {
+                cmd.env(crate::platform::paths::DOT_AGENT_DECK_BIN, bin);
+            }
+            assert!(
+                cmd.status().expect("run node").success(),
+                "the plugin driver failed"
+            );
+        };
+
+        // One run sends the error and whatever the plugin reports on its own
+        // around it (its shutdown handler), so count one run's events first.
+        run(None);
+        let per_run = lines(&pinned_out);
+        assert!(per_run > 0, "the plugin reported nothing");
+        assert_eq!(lines(&built_out), 0, "unset: only the pinned binary");
+        run(Some(""));
+        assert_eq!(
+            (lines(&pinned_out), lines(&built_out)),
+            (2 * per_run, 0),
+            "empty: the pinned binary"
+        );
+        run(Some(&built.to_string_lossy()));
+        assert_eq!(
+            (lines(&pinned_out), lines(&built_out)),
+            (2 * per_run, per_run),
+            "set: only the named binary"
         );
     }
 

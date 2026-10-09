@@ -103,7 +103,16 @@ fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
     let mut all = Vec::new();
     collect_commands(&doc, &mut all);
     all.retain(|command| command.trim_end().ends_with(suffix));
-    all
+    // The `DOT_AGENT_DECK_BIN` wrapper (PRD #1497) is stripped: what these
+    // tests pin is the installed path that follows it.
+    all.into_iter()
+        .map(|command| {
+            command
+                .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+                .map(str::to_string)
+                .unwrap_or(command)
+        })
+        .collect()
 }
 
 /// The value of `const BINARY_PATH = "…";` in the generated OpenCode plugin.
@@ -444,6 +453,14 @@ fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
     write_executable(&durable_path, STUB_BODY);
     let durable = durable_path.to_str().expect("durable path is UTF-8");
     let ours = format!("{durable} {CODEX_SUFFIX}");
+    // What the install refreshes `ours` to: the same install behind the
+    // `DOT_AGENT_DECK_BIN` wrapper (PRD #1497). `ours` is seeded in the plain
+    // form an older release wrote, so the refresh in place is also the
+    // migration.
+    let ours_now = format!(
+        "{}{ours}",
+        dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX
+    );
 
     // A SECOND, genuinely different install: absolute, present, executable, and
     // not under `target/`. It must be consolidated on an installed event.
@@ -503,7 +520,7 @@ fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
     // `SessionStart` rule can only have been written by this launch.
     let wrote = event_rules(&doc, "SessionStart")
         .iter()
-        .any(|rule| commands_in(rule).contains(&ours));
+        .any(|rule| commands_in(rule).contains(&ours_now));
     if !wrote {
         problems.push(format!(
             "~/.codex/hooks.json: no `SessionStart` rule names the durable binary `{durable}`, \
@@ -558,9 +575,10 @@ fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
                 // user's handler still follows it at `…:0:1`. Under a RETIRED
                 // event there is nothing to refresh it with — the sweep's job is
                 // removal — so the old expectation stands unchanged there.
-                let deck_handler_index = handlers
-                    .iter()
-                    .position(|h| h.get("command").and_then(Value::as_str) == Some(ours.as_str()));
+                let deck_handler_index = handlers.iter().position(|h| {
+                    let command = h.get("command").and_then(Value::as_str);
+                    command == Some(ours.as_str()) || command == Some(ours_now.as_str())
+                });
                 let sibling_index = handlers.iter().position(|h| h == &sibling);
                 if event == "PreToolUse" {
                     if deck_handler_index != Some(0) {

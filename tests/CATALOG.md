@@ -2457,6 +2457,27 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the Codex and Devin installers, which share the backup helper (`agent_hook_config::backup_malformed`, unit-covered there); the `.bak` the deck writes when the name is free (`hook_rule_identification_017`); the startup install's logged form of the same refusal.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/011 — Hook commands run the binary `DOT_AGENT_DECK_BIN` names when it is set, and the install otherwise (PRD #1497).
+- **Layer:** as `hooks/install/007` (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`), then each written command run through `/bin/sh -c`, the way Claude Code runs a hook on Linux and macOS.
+- **Agent:** none (recording stubs stand in for the install at `$HOME/.local/bin/dot-agent-deck` and for a build at a path with a space in it).
+- **Asserts:** every deck command is the installed path behind `platform::paths::HOOK_BIN_OVERRIDE_PREFIX`; run with `DOT_AGENT_DECK_BIN` unset it executes the install, and with it set it executes the binary it names, each with `hook --agent claude-code` and the hook payload on stdin intact. This is what lets `task run-all`'s agents report through the build under test while every other session keeps the installed release.
+- **Does not assert:** the Codex and Devin writers (`*_hooks_manage`'s `install_migrates_the_plain_form_and_uninstall_removes_both_forms`), the outer shells other than `sh` (`agent_hook_config`'s `the_override_command_runs_the_override_else_the_installed_binary` runs bash, zsh and fish where installed), the OpenCode plugin and Pi extension (their own unit tests), or a real Claude Code firing the hook.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/012 — A re-install over the plain hook command an older release wrote migrates it in place, without a duplicate (PRD #1497).
+- **Layer:** as `hooks/install/007`.
+- **Agent:** none (a stub install at `$HOME/.local/bin/dot-agent-deck`).
+- **Asserts:** with `settings.json` seeded with the plain `<install> hook --agent claude-code` under three hook types and a user hook beside them, `hooks install` leaves every hook type with exactly one deck command, in the override form, the user hook untouched and no plain entry left; a second install leaves the file byte for byte as it was.
+- **Does not assert:** what an older release does with the override form (measured by hand against 0.45.0 for `docs/develop/local-run.md`, not automated); the unattended startup install's keep rule for another live install (`hooks/install/006`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/013 — An uninstall removes the deck's hook commands in both the plain and the override form (PRD #1497).
+- **Layer:** as `hooks/install/007`, running `hooks uninstall --agent claude-code`.
+- **Agent:** none.
+- **Asserts:** with one plain and one override-form deck command and a user hook seeded, the uninstall leaves only the user hook.
+- **Does not assert:** the Codex and Devin uninstallers (their `install_migrates_the_plain_form_and_uninstall_removes_both_forms` units).
+- **Platform coverage:** mac+linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start

@@ -2383,9 +2383,76 @@ mod tests {
                 .unwrap_or_else(|| panic!("event {event} present"));
             assert_eq!(arr.len(), 1, "one deck rule per event ({event})");
             let cmd = arr[0]["hooks"][0]["command"].as_str().expect("command str");
-            assert_eq!(cmd, "/abs/dot-agent-deck hook --agent codex");
+            assert_eq!(
+                cmd,
+                format!(
+                    "{} hook --agent codex",
+                    crate::agent_hook_config::overridable_command_word(
+                        "/abs/dot-agent-deck",
+                        cfg!(windows)
+                    )
+                )
+            );
             assert_eq!(arr[0]["hooks"][0]["type"].as_str(), Some("command"));
         }
+    }
+
+    /// PRD #1497: a `hooks.json` holding the plain `<path> hook --agent codex`
+    /// command an older release wrote is migrated in place to the
+    /// `DOT_AGENT_DECK_BIN` form, one deck entry per event and the user's hook
+    /// kept; an uninstall over a file holding both forms removes both.
+    #[cfg(unix)]
+    #[test]
+    fn install_migrates_the_plain_form_and_uninstall_removes_both_forms() {
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        let binary = "/abs/dot-agent-deck";
+        let plain = format!("{binary} {HOOK_COMMAND_SUFFIX}");
+        let overridden = format!(
+            "{}{binary} {HOOK_COMMAND_SUFFIX}",
+            crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+        );
+        let user = "/usr/local/bin/audit.sh";
+        std::fs::write(
+            dir.path().join("hooks.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": plain }] },
+                    { "hooks": [{ "type": "command", "command": user }] }
+                ]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(dir.path(), binary).expect("install");
+        let root = read_back(dir.path());
+        for &event in CODEX_HOOK_EVENTS {
+            let commands = commands_for(&root, event);
+            let deck: Vec<_> = commands
+                .iter()
+                .filter(|c| c.ends_with(HOOK_COMMAND_SUFFIX))
+                .collect();
+            assert_eq!(deck, vec![&overridden], "{event}: {commands:?}");
+        }
+        assert!(commands_for(&root, "Stop").contains(&user.to_string()));
+
+        // A file holding both forms, as a 0.45.1 start can leave one.
+        std::fs::write(
+            dir.path().join("hooks.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": {
+                "Stop": [{ "hooks": [
+                    { "type": "command", "command": overridden },
+                    { "type": "command", "command": user }
+                ] }],
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": plain }] }]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        uninstall_from(dir.path()).expect("uninstall");
+        let root = read_back(dir.path());
+        assert_eq!(commands_for(&root, "Stop"), vec![user.to_string()]);
+        assert!(commands_for(&root, "SessionStart").is_empty());
     }
 
     /// Write a real, executable file at `path` (creating its directory) and

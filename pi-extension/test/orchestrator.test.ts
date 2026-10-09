@@ -29,6 +29,7 @@ import {
 	createSerialQueue,
 	createTurnReplyTracker,
 	DECK_BIN,
+	DECK_BIN_OVERRIDE_ENV,
 	DECK_EXE_ENV,
 	DeckExecError,
 	DECLARE_PROMPT_REPORTS_FLAG,
@@ -367,6 +368,24 @@ describe("issue #1385: which deck binary the extension shells", () => {
 		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }), DECK_BIN);
 		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }), DECK_BIN);
 		assert.equal(DECK_BIN, "dot-agent-deck");
+	});
+
+	test("PRD #1497: the operator's DOT_AGENT_DECK_BIN wins over the deck's own path", () => {
+		assert.equal(DECK_BIN_OVERRIDE_ENV, "DOT_AGENT_DECK_BIN");
+		assert.equal(
+			resolveDeckBin({
+				DOT_AGENT_DECK_BIN: "/src/target/debug/dot-agent-deck",
+				DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck",
+			}),
+			"/src/target/debug/dot-agent-deck",
+		);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/my build/dot-agent-deck" }), "/my build/dot-agent-deck");
+		// Empty or blank is unset, so the deck's own path (or the bare name) is used.
+		assert.equal(
+			resolveDeckBin({ DOT_AGENT_DECK_BIN: "", DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck" }),
+			"/opt/homebrew/bin/dot-agent-deck",
+		);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "  " }), DECK_BIN);
 	});
 
 	test("failure messages name the binary actually shelled", () => {

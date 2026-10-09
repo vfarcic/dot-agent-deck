@@ -121,7 +121,7 @@ Hooks are how an agent tells the deck what it is doing: prompts, tool use, waiti
 | Devin | `devin` is on the `PATH` | a `"hooks"` object in `$XDG_CONFIG_HOME/devin/config.json` (when `XDG_CONFIG_HOME` is an absolute path), else `~/.config/devin/config.json` |
 | Pi | `pi` is on the `PATH` | no hooks; the daemon writes the deck's Pi extension to `$PI_CODING_AGENT_DIR/extensions/dot-agent-deck` (default `~/.pi/agent/extensions/dot-agent-deck`) when it starts. `dot-agent-deck orchestrator setup` does the same on demand |
 
-Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. For Claude Code, an install also removes the deck's entries from hook types it no longer installs, such as `StopFailure` after Claude Code is downgraded below 2.1.78. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
+Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. On macOS and Linux it is written as `/bin/sh -c 'exec "${DOT_AGENT_DECK_BIN:-$0}" "$@"' <path to dot-agent-deck> hook --agent <agent>`, so an agent started with `DOT_AGENT_DECK_BIN` set reports through the binary that variable names, and every other agent runs the installed path exactly as before (see [Environment variables](configuration.md#paths-and-endpoints)). The OpenCode plugin and the Pi extension honour the same variable. An entry an earlier release wrote for the same binary is rewritten to this form, in place, the next time this release installs hooks. On Windows the command stays `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. For Claude Code, an install also removes the deck's entries from hook types it no longer installs, such as `StopFailure` after Claude Code is downgraded below 2.1.78. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
 
 On Windows, `$HOME` is usually unset, so Codex hooks are installed only when `CODEX_HOME` is set.
 
@@ -129,17 +129,17 @@ The install runs when the daemon **starts**. After you install an agent, or upgr
 
 ### Checking that hooks are installed
 
-Each command prints the hook commands the deck wrote. Every line should name an installed `dot-agent-deck` binary (for example `~/.local/bin/dot-agent-deck` or the one `command -v dot-agent-deck` prints), not a `target/debug` or `target/release` directory and not a file that no longer exists:
+Each command prints the binary every deck hook names, followed by its `hook --agent` arguments (the `DOT_AGENT_DECK_BIN` wrapper in front of it is left out). Every line should name an installed `dot-agent-deck` binary (for example `~/.local/bin/dot-agent-deck` or the one `command -v dot-agent-deck` prints), not a `target/debug` or `target/release` directory and not a file that no longer exists:
 
 ```bash
 # Claude Code
-grep -o '[^"]*hook --agent claude-code' ~/.claude/settings.json | sort -u
+grep -oE "('[^']*'|[^\"' ]+) hook --agent claude-code" ~/.claude/settings.json | sort -u
 
 # Codex
-grep -o '[^"]*hook --agent codex' "${CODEX_HOME:-$HOME/.codex}/hooks.json" | sort -u
+grep -oE "('[^']*'|[^\"' ]+) hook --agent codex" "${CODEX_HOME:-$HOME/.codex}/hooks.json" | sort -u
 
 # Devin
-grep -o '[^"]*hook --agent devin' "${XDG_CONFIG_HOME:-$HOME/.config}/devin/config.json" | sort -u
+grep -oE "('[^']*'|[^\"' ]+) hook --agent devin" "${XDG_CONFIG_HOME:-$HOME/.config}/devin/config.json" | sort -u
 
 # OpenCode (prints the pinned binary from each plugin file that exists)
 grep -h 'const BINARY_PATH' "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugin/dot-agent-deck.js" ~/.opencode/plugin/dot-agent-deck.js 2>/dev/null

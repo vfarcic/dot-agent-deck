@@ -29,16 +29,31 @@ export const DECK_BIN = "dot-agent-deck";
 export const DECK_EXE_ENV = "DOT_AGENT_DECK_EXE";
 
 /**
- * The CLI the extension shells: the deck's own absolute path from
- * {@link DECK_EXE_ENV} when the deck set one, otherwise the bare
+ * The operator's override, honoured by every hook command and bundled plugin
+ * the deck ships (`platform::paths::DOT_AGENT_DECK_BIN` on the Rust side, PRD
+ * #1497). The deck never sets it; the `task run-all` sandbox exports it so an
+ * agent there reports through the build under test. MUST stay in sync with
+ * that constant.
+ */
+export const DECK_BIN_OVERRIDE_ENV = "DOT_AGENT_DECK_BIN";
+
+/**
+ * The CLI the extension shells: the operator's override from
+ * {@link DECK_BIN_OVERRIDE_ENV} when one is set, else the deck's own absolute
+ * path from {@link DECK_EXE_ENV} when the deck set one, otherwise the bare
  * {@link DECK_BIN} — so an older deck that sets nothing keeps working exactly
  * as before. The value is used verbatim (argv exec, no shell), so a path with
  * spaces needs no quoting. `env` is a parameter rather than `process.env` so
  * this module stays import- and global-free and unit-testable.
  */
 export function resolveDeckBin(env: Readonly<Record<string, string | undefined>>): string {
-	const exe = env[DECK_EXE_ENV];
-	return typeof exe === "string" && exe.trim().length > 0 ? exe : DECK_BIN;
+	for (const name of [DECK_BIN_OVERRIDE_ENV, DECK_EXE_ENV]) {
+		const value = env[name];
+		if (typeof value === "string" && value.trim().length > 0) {
+			return value;
+		}
+	}
+	return DECK_BIN;
 }
 
 /**

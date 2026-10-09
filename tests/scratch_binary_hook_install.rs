@@ -187,7 +187,16 @@ fn deck_commands(path: &Path) -> Vec<String> {
     let mut out = Vec::new();
     commands_in(&doc, &mut out);
     out.retain(|command| command.trim_end().ends_with(CLAUDE_SUFFIX));
-    out
+    // The `DOT_AGENT_DECK_BIN` wrapper (PRD #1497) is stripped: what these
+    // tests pin is the installed path that follows it.
+    out.into_iter()
+        .map(|command| {
+            command
+                .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+                .map(str::to_string)
+                .unwrap_or(command)
+        })
+        .collect()
 }
 
 fn combined(out: &std::process::Output) -> String {
@@ -333,5 +342,264 @@ fn install_010_a_refused_install_exits_non_zero_and_leaves_a_users_backup_alone(
     assert!(
         !report.contains("preserved at"),
         "the message claims a backup the deck did not make:\n{report}"
+    );
+}
+
+// --- PRD #1497: hook commands honour `DOT_AGENT_DECK_BIN` ----------------------
+
+/// Every `"command"` string in the settings file, unfiltered and unstripped.
+fn raw_commands(path: &Path) -> Vec<String> {
+    let body =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let doc: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("parse {} as JSON: {e}\n{body}", path.display()));
+    let mut out = Vec::new();
+    commands_in(&doc, &mut out);
+    out
+}
+
+/// The command `hooks install` writes for `exe`: the installed path behind the
+/// `DOT_AGENT_DECK_BIN` wrapper.
+fn override_form(exe: &Path) -> String {
+    format!(
+        "{}{} {CLAUDE_SUFFIX}",
+        dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX,
+        exe.display()
+    )
+}
+
+/// The plain command every release before PRD #1497 wrote.
+fn plain_form(exe: &Path) -> String {
+    format!("{} {CLAUDE_SUFFIX}", exe.display())
+}
+
+/// A settings document holding the given commands under the given hook types,
+/// each in a rule of its own, plus one user hook under `PreToolUse`.
+fn seeded_settings(entries: &[(&str, String)]) -> serde_json::Value {
+    let mut hooks = serde_json::Map::new();
+    hooks.insert(
+        "PreToolUse".into(),
+        serde_json::json!([{ "hooks": [{ "type": "command", "command": USER_HOOK }] }]),
+    );
+    for (hook_type, command) in entries {
+        let rules = hooks
+            .entry(hook_type.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        rules
+            .as_array_mut()
+            .expect("rules are an array")
+            .push(serde_json::json!({ "hooks": [{ "type": "command", "command": command }] }));
+    }
+    serde_json::json!({ "model": "opus", "hooks": hooks })
+}
+
+const USER_HOOK: &str = "/usr/local/bin/my-audit.sh --before-tool";
+
+/// A recording stub at `path`: writes its name, its arguments and its stdin to
+/// `$OUT`, so a test can tell which binary a hook command ran and with what.
+fn write_recording_stub(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("stub name");
+    std::fs::create_dir_all(path.parent().expect("stub dir")).expect("create stub dir");
+    // Written by a `/bin/cat` child, as `test_isolation::write_script` does in
+    // the crate (private to it): this process never holds a write descriptor
+    // on a file it then executes, so a fork elsewhere cannot leave one open
+    // and turn the exec into ETXTBSY.
+    let mut cat = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/cat > \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn /bin/cat");
+    {
+        use std::io::Write as _;
+        cat.stdin
+            .take()
+            .expect("cat stdin")
+            .write_all(
+                format!("#!/bin/sh\nprintf '%s|%s|' '{name}' \"$*\" > \"$OUT\"\ncat >> \"$OUT\"\n")
+                    .as_bytes(),
+            )
+            .expect("write stub");
+    }
+    assert!(cat.wait().expect("wait for cat").success());
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+}
+
+/// Run `command` the way Claude Code runs a hook on Linux and macOS (`sh -c`,
+/// per its hooks reference), with a hook payload on stdin and
+/// `DOT_AGENT_DECK_BIN` set to `bin` or unset, and return what the stub that
+/// ran recorded.
+fn run_hook_command(command: &str, bin: Option<&Path>, out: &Path) -> String {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(out);
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(command)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("OUT", out)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(bin) = bin {
+        cmd.env(dot_agent_deck::platform::paths::DOT_AGENT_DECK_BIN, bin);
+    }
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(br#"{"hook_event_name":"Stop"}"#)
+        .expect("write the hook payload");
+    let output = child.wait_with_output().expect("wait for the hook command");
+    assert!(
+        output.status.success(),
+        "the hook command failed: {command}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(out).expect("the stub recorded its run")
+}
+
+/// Scenario: Seed an install at `$HOME/.local/bin` and run `hooks install
+/// --agent claude-code` from a scratch copy. Every deck command must name the
+/// install behind the `DOT_AGENT_DECK_BIN` wrapper, and running one through
+/// `sh -c` must run the install when the variable is unset and the binary it
+/// names when it is set, with the hook's arguments and stdin intact (PRD
+/// #1497).
+#[spec("hooks/install/011")]
+#[test]
+fn install_011_hook_commands_run_dot_agent_deck_bin_when_it_is_set() {
+    let fixture = Fixture::new();
+    let installed = fixture.seed_install();
+    write_recording_stub(&installed);
+    let built = fixture.path().join("my build").join("built-deck");
+    write_recording_stub(&built);
+    let scratch = fixture.scratch_deck();
+
+    let out = fixture.run(&scratch, &["hooks", "install", "--agent", "claude-code"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let commands = raw_commands(&fixture.settings());
+    let deck: Vec<_> = commands
+        .iter()
+        .filter(|c| c.ends_with(CLAUDE_SUFFIX))
+        .collect();
+    assert!(
+        !deck.is_empty(),
+        "no deck command was written: {commands:?}"
+    );
+    for command in &deck {
+        assert_eq!(*command, &override_form(&installed));
+    }
+
+    let record = fixture.path().join("ran");
+    let payload = r#"{"hook_event_name":"Stop"}"#;
+    assert_eq!(
+        run_hook_command(deck[0], None, &record),
+        format!("{}|hook --agent claude-code|{payload}", durable_file_name()),
+        "unset, the hook must run the installed deck exactly as before"
+    );
+    assert_eq!(
+        run_hook_command(deck[0], Some(&built), &record),
+        format!("built-deck|hook --agent claude-code|{payload}"),
+        "set, the hook must run the binary DOT_AGENT_DECK_BIN names"
+    );
+}
+
+/// Scenario: Seed `settings.json` with the plain `<install> hook --agent
+/// claude-code` commands an older release wrote, beside a user hook, and run
+/// `hooks install --agent claude-code`. Each hook type must end with exactly
+/// one deck command, now in the override form, the user hook untouched, and a
+/// second install must leave the file byte for byte as it was (PRD #1497).
+#[spec("hooks/install/012")]
+#[test]
+fn install_012_reinstall_migrates_the_plain_form_in_place_without_duplicating() {
+    let fixture = Fixture::new();
+    let installed = fixture.seed_install();
+    let scratch = fixture.scratch_deck();
+    let settings = fixture.settings();
+    let old = plain_form(&installed);
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&seeded_settings(&[
+            ("PreToolUse", old.clone()),
+            ("Stop", old.clone()),
+            ("SessionStart", old.clone()),
+        ]))
+        .expect("serialize"),
+    )
+    .expect("seed settings.json");
+
+    let out = fixture.run(&scratch, &["hooks", "install", "--agent", "claude-code"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("parse");
+    for (hook_type, rules) in doc["hooks"].as_object().expect("hooks object") {
+        let mut commands = Vec::new();
+        commands_in(rules, &mut commands);
+        let deck: Vec<_> = commands
+            .iter()
+            .filter(|c| c.ends_with(CLAUDE_SUFFIX))
+            .collect();
+        assert_eq!(
+            deck,
+            vec![&override_form(&installed)],
+            "{hook_type} must hold exactly one deck command, migrated: {commands:?}"
+        );
+    }
+    assert!(
+        raw_commands(&settings).contains(&USER_HOOK.to_string()),
+        "the user's own hook must survive the migration"
+    );
+    assert!(
+        !raw_commands(&settings).contains(&old),
+        "no plain-form entry may be left beside the migrated one"
+    );
+
+    let after_first = std::fs::read(&settings).expect("read");
+    let out = fixture.run(&scratch, &["hooks", "install", "--agent", "claude-code"]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_eq!(
+        std::fs::read(&settings).expect("read"),
+        after_first,
+        "a second install over the migrated form must change nothing"
+    );
+}
+
+/// Scenario: Seed `settings.json` with one deck command in the plain form, one
+/// in the override form and a user hook, and run `hooks uninstall --agent
+/// claude-code`. Both deck commands must be gone and the user hook kept (PRD
+/// #1497).
+#[spec("hooks/install/013")]
+#[test]
+fn install_013_uninstall_removes_both_the_plain_and_the_override_form() {
+    let fixture = Fixture::new();
+    let installed = fixture.seed_install();
+    let scratch = fixture.scratch_deck();
+    let settings = fixture.settings();
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&seeded_settings(&[
+            ("Stop", plain_form(&installed)),
+            ("SessionStart", override_form(&installed)),
+        ]))
+        .expect("serialize"),
+    )
+    .expect("seed settings.json");
+
+    let out = fixture.run(&scratch, &["hooks", "uninstall", "--agent", "claude-code"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let commands = raw_commands(&settings);
+    assert_eq!(
+        commands,
+        vec![USER_HOOK.to_string()],
+        "only the user's hook may remain after an uninstall"
     );
 }

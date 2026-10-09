@@ -1017,6 +1017,48 @@ pub fn executable_path() -> Option<String> {
 /// absent, so an older deck that does not set it still works.
 pub const DOT_AGENT_DECK_EXE: &str = "DOT_AGENT_DECK_EXE";
 
+/// The environment variable the deck's hook commands and bundled plugins honour
+/// in place of the executable they name (PRD #1497): set and non-empty, an
+/// agent's hooks run that binary; unset or empty, they run the installed one
+/// exactly as before. The sandbox behind `task run-all`
+/// (`scripts/sandbox-run.sh`) exports it, so an agent there reports through
+/// the build under test while sessions outside it keep the installed release.
+///
+/// Unlike [`DOT_AGENT_DECK_EXE`], the deck never sets it: it is an operator's
+/// override, read by [`HOOK_BIN_OVERRIDE_PREFIX`] in the Claude
+/// Code, Codex and Devin hook commands, by the OpenCode plugin and by the Pi
+/// extension.
+pub const DOT_AGENT_DECK_BIN: &str = "DOT_AGENT_DECK_BIN";
+
+/// What a POSIX-dialect hook command the deck writes opens with (PRD #1497),
+/// honouring [`DOT_AGENT_DECK_BIN`]: it goes ahead of the shell-quoted
+/// installed executable, which becomes the inner shell's `$0`, so the whole
+/// command reads `<this><installed> hook --agent <agent>`.
+///
+/// A `/bin/sh -c` wrapper rather than a bare `${DOT_AGENT_DECK_BIN:-…}` word,
+/// for two reasons:
+///
+/// - **The outer shell is not always POSIX.** Codex runs a hook through
+///   `$SHELL -lc` (`agent_hook_config::HookShell::Native`), and fish rejects
+///   `${…}`, so a bare expansion would stop every deck hook for a Codex user
+///   whose login shell is fish. sh, bash, zsh and fish all read the
+///   single-quoted script literally and pass the arguments through, so only
+///   `/bin/sh` expands it. Absolute, so `$PATH` does not choose the
+///   interpreter (the issue #536 exposure).
+/// - **The command still ends in `<installed> hook --agent <agent>`,** so the
+///   parse from the right (`agent_hook_config::command_executable`) recovers
+///   the installed path. A deck that predates this form reads the entry the
+///   same way, and for an unquoted installed path (no spaces) the last path
+///   component is the deck's own name while the whole token names no file, so
+///   such a deck treats it as a dead pin of its own and rewrites it to its
+///   plain command instead of adding a second entry beside it — measured for
+///   the Claude Code installer of 0.45.0, which 0.45.1 left unchanged.
+///
+/// `exec` keeps the hook payload on the same stdin and makes the hook's exit
+/// status the binary's own.
+pub const HOOK_BIN_OVERRIDE_PREFIX: &str =
+    "/bin/sh -c 'exec \"${DOT_AGENT_DECK_BIN:-$0}\" \"$@\"' ";
+
 /// Whether `path` can be interpolated into the generated **text** — not just
 /// the shell — without changing the text around it. Shell quoting makes any
 /// byte safe for the shell, but the word is also embedded in Markdown code
