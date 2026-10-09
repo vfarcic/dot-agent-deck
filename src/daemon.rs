@@ -5531,9 +5531,10 @@ mod hook_ingestion_tests {
                 .count()
         }
 
-        /// [`Self::notices`], polled until both the terminal echo and `cat`
-        /// output have landed and the count has stopped moving. A quiet gap
-        /// after just the echo does not mean the stand-in has read its input.
+        /// [`Self::notices`], polled until at least two occurrences (one
+        /// notice's echo and output) have landed and the count has stopped
+        /// moving. A quiet gap after just the echo does not mean the stand-in
+        /// has read its input.
         async fn settled_notices(&self) -> usize {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut last = self.notices().await;
@@ -5752,7 +5753,8 @@ mod hook_ingestion_tests {
 
     /// Scenario: hold an orchestrator's writer and repeatedly supersede a
     /// delegation to a blocked worker. Release the writer and wait for the
-    /// terminal echo and stand-in output, proving only the current notice lands.
+    /// terminal echo and stand-in output, proving only the current notice lands
+    /// (issue #714, review).
     #[tokio::test]
     async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
         let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;

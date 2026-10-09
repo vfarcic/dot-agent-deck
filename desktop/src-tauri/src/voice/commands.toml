@@ -343,8 +343,9 @@ heard_as_whole_while.new_agent_dialog = [
 # says the dashboard case outright, and it measured 20/20 after. PRD #1497's
 # reading rows pulled it back to `stop_agent`: 25 of 45 runs against
 # `gpt-5-mini`, and 7 of 10 with those three rows taken out. This description
-# now says a close is this row even with nothing open, picked anyway rather than
-# a stop, and `stop_agent`'s that "close" stops nothing on any screen although
+# now says a close of an agent or its view is this row even with nothing open,
+# picked anyway rather than a stop (a named orchestration or run stays
+# `close_orchestration`), and `stop_agent`'s that "close" stops nothing on any screen although
 # its button is labelled Close: 30 of 30 after, with every `stop-*` fixture 5 of
 # 5 and `start-new-agent-dialog-closed` 15 of 20 against 9 of 20 (2026-10-09).
 [[commands]]
@@ -359,8 +360,9 @@ agent, back to dashboard (the label of an open agent pane's button), or back to 
 overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
 keeps running — on the agent dashboard too, where nothing may be open over the screen and the app
-then says there is nothing to close. A request to close is THIS one even when nothing is open over
-the screen: pick it anyway rather than a row that stops something, and the app says so. Closing the New agent dialog this way keeps what was entered
+then says there is nothing to close. A request to close an agent or its view is THIS one even when
+nothing is open over the screen: pick it anyway rather than a row that stops something, and the app
+says so. A request that names an orchestration or a run is NOT this one: it is `close_orchestration`. Closing the New agent dialog this way keeps what was entered
 in it for the next time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
 and stopping something are both possible readings, closing the view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
 callable — a callable `open_deck` means the Daemons screen itself is what "back" leads to, and that one

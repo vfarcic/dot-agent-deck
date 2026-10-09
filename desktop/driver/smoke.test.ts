@@ -189,7 +189,8 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
     await deck.traceTerminals();
     const [agent] = await deck.daemonAgents();
     // A local fit can leave 80x24 before the attach reply restores that spawn
-    // size, so leaving it once is not evidence the daemon applied the pane's size.
+    // size, so leaving it once is not evidence the daemon applied the pane's size
+    // (that size has landed 1.9-2.0s after the attach, per PR #1505's CI runs).
     // Read the daemon through a non-sizing observer and require xterm to agree
     // after settling; return that same checked grid as the baseline.
     const own = await waitFor("the daemon and settled pane to agree on the pane's own size", async () => {

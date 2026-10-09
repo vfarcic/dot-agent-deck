@@ -24610,7 +24610,8 @@ mod spawn_tests {
 
     /// Scenario: start a ready shell sink with terminal echo disabled and submit
     /// a notice, which waits out the echo bound. Submit three more notices and
-    /// check that they bypass that bound and reach the sink in order.
+    /// check that they bypass that bound and reach the sink in order (issue
+    /// #1383, audit).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_that_did_not_echo_skips_the_gate_on_its_next_submit() {
