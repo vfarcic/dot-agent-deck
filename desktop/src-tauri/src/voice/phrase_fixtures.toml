@@ -699,10 +699,15 @@ outcome = "unavailable"
 # G1), so these are the command said on its own in words the local list does
 # not hold — "send it" wrapped in an edge "okay" / "please". They replaced
 # "okay that's the whole prompt, send it off", which a sentence containing
-# "send" now cannot ground. A bare "go ahead" on the agent screen is NOT here:
-# measured 2026-09-22, the default model answers it with `close` (four runs of
-# four), which grounding refuses — so it submits nothing by voice today, a gap
-# that predates G1 and is reported rather than pinned red.
+# "send" now cannot ground.
+#
+# A bare "go ahead" on the agent screen DOES submit, and not through the model:
+# measured 2026-09-22, the default model answered it with `close` (four runs of
+# four), which grounding refused, so nothing was sent. Since issue #1246 the
+# local fast path answers the row's whole utterances itself wherever the row
+# is callable, so `submit-go-ahead` pins the whole pipeline's answer. Over the
+# New agent form the same words still reach the model and start the agent
+# (`start-new-agent-go-ahead`, below).
 
 [[fixtures]]
 name = "submit-politely"
@@ -717,6 +722,23 @@ utterance = "okay, send it please"
 screen = "overview"
 action = "submit_prompt"
 outcome = "unavailable"
+
+[[fixtures]]
+name = "submit-go-ahead"
+utterance = "go ahead"
+screen = "agent"
+action = "submit_prompt"
+outcome = "dispatch"
+
+# Issue #1246: "go ahead" inside a longer sentence is not a submit — the fast
+# path compares the whole utterance — and what is left is the model's answer
+# to the rest of it, which asks to close the agent's view.
+[[fixtures]]
+name = "go-ahead-and-close-it-is-not-a-submit"
+utterance = "go ahead and close it"
+screen = "agent"
+action = "close"
+outcome = "dispatch"
 
 # A submit word used in passing is a request to TYPE something (G1): "end" is
 # the agent's word to write, not the user's instruction to press Enter.

@@ -52,7 +52,7 @@ A stale checkout does not fail loudly. It reports every recently-added symbol as
 
 ## Step 0b — Bring the base up to date, because every unit is cut from it
 
-**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit inherits, and no flag anywhere overrides it. Step 0's fetch fixes what you *verify against* and does nothing at all about what the units are *built on*.
+**`dispatch` has no base or branch option.** It resolves the caller's **`HEAD`** to a commit once, then runs `git worktree add <dir> -b agent/dispatch-<name> <that sha>` **in the caller's own working directory** — `resolve_dispatch_base` and `create_dispatch_worktree` in `src/dispatch.rs`, feeding `create_worktree_from` in `src/issue_dispatch_run.rs` — and reports that same sha in its `cut from <branch> at <sha>` reply. So whatever `HEAD` is at dispatch time is the base every unit inherits, and no flag anywhere overrides it. Step 0's fetch fixes what you *verify against* and does nothing at all about what the units are *built on*.
 
 **That matters more for a PRD than for an issue.** An issue unit is a handful of commits and a short PR. A PRD unit runs the whole lifecycle — plan, implement, gate, PR — and will rebase or merge before it finishes anyway; what it cannot do is get back the hours it spent planning tests and reading `src/` against a base that was already wrong. The cost is not a conflict at the end, it is the work done before the conflict.
 

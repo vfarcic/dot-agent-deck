@@ -2427,6 +2427,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** other agents' environment overrides (covered by the shared config-writer unit tests), races replacing symlinks during a write, or a real agent trust dialog.
 - **Platform coverage:** mac+linux.
 
+##### hooks/containment/004 — An outside-root config symlink pointing into the owned root is refused, not renamed over (issue #1614).
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** with `CODEX_HOME` outside the owned root and its `hooks.json` a symlink to a file inside the root, the automatic install leaves the symlink in place (same inode, same target), leaves the target's bytes, inode and mtime unchanged, and creates no temporary file, backup or lock sidecar beside it.
+- **Does not assert:** the other writers (the rule lives in the shared guard, unit-covered in `config_write_guard`'s `mod tests`), races replacing symlinks during a write, or a real agent trust dialog.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install (continued)
 
 ##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
@@ -2694,6 +2701,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** with the daemon committed and blocked re-verifying the replaced build, a first SIGTERM is logged as arriving after the commit and not acted on; a second SIGTERM ends the process with status 143; no successor PID is recorded.
 - **Does not assert:** what happens to a successor that was already spawned when the signal arrived (it runs on its own); Windows' Ctrl-C delivery.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/009 — `restart-installed --confirm-stdin` reads a confirmation too large for the command line (issue #1619).
+- **Layer:** L2 (lane 1, a real headless daemon and the real installed CLI with its confirmation piped to stdin).
+- **Agent:** three synthetic cat stand-ins, including two orchestration roles.
+- **Asserts:** a 600-agent confirmation whose hex form exceeds 128 KiB is read whole from stdin and answered as stale with the real three disclosed, leaving the daemon, agents and role map untouched; the disclosed set sent the same way is accepted and the daemon is replaced.
+- **Does not assert:** the laptop side choosing stdin over `--confirm-hex` or the ssh transport (`remote_daemon` unit tests own those); a remote whose ssh client drops stdin.
 - **Platform coverage:** linux+mac.
 
 
