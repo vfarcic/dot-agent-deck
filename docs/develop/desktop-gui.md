@@ -2201,3 +2201,44 @@ One automated test takes [the New agent flow](#the-new-agent-flow) through the r
 8. **An older deck.** Point a remote row at a deck from a release before PRD #1223 and confirm its group header offers no **New agent**, and that the deck field lists it disabled with the reason that it does not advertise `list-directories` — clicking it does nothing. Point one at a release after PRD #1223 but before issue #1240 and confirm it browses without **Show hidden** or **link** rows, and that its truncation hint does not offer a deck search. On a non-Unix deck, confirm the `Orch:` chips are withheld with their reason and a plain start still works.
 
 Record which decks you ran it against, and their versions, in the PR.
+
+## The in-app pull request browser ([PRD #1401](https://github.com/vfarcic/dot-agent-deck/issues/1401))
+
+An agent whose record carries a pull request (`SessionSnapshot.pull_request`, resolved by the daemon) shows a badge on its tile and on its agent screen. Clicking it, or saying "open the PR" on the agent's screen, opens GitHub's own page for it inside the app. The code is `desktop/src-tauri/src/pr_browser.rs` (Rust) and `desktop/src/components/PullRequestBrowser.tsx` with `desktop/src/lib/prBrowser.ts` (the app's side).
+
+### How the page is drawn
+
+The page is a **child webview of the main window** (`Window::add_child`), which is why `tauri` is built with its `unstable` feature. That feature also makes the main webview a child of its window, sized to fill it, which is how Tauri runs every webview in a window that has more than one. React draws the toolbar (Back, Open in browser, Close) and an empty frame below it; the frame's rectangle and the size of the page it sits in, both in CSS pixels, are sent to Rust on open and whenever they change, and Rust places the page in proportion to the main webview's real size (`pr_browser::Bounds::onto`). Proportion rather than "CSS pixels times the zoom" because WebKitGTK also scales CSS pixels by the screen's DPI over 96: under Xvfb's default 100 DPI a page sized from the zoom alone came out 4% short of its frame. A native webview draws above everything the main webview renders, so the page is hidden while any of the app's own modal dialogs is open over it (`[aria-modal="true"]` other than the agent's pane) and shown again when it closes.
+
+On Linux, Tauri cannot place a second webview by itself: `tauri-runtime-wry` packs every webview of a window into the window's vertical `GtkBox`, and wry's `set_bounds` moves only a webview whose parent is a `GtkFixed`, so the page would take half the window. `pr_browser::overlay` therefore moves the main webview into a `GtkOverlay` when a pull request opens, moves the page's webview from the box into that overlay and places it from `get-child-position`, and puts the main webview back in the box when the page closes, so the app's widget tree is the stock one whenever no pull request is open. macOS and Windows use Tauri's own `set_bounds`. This was checked by eye under Xvfb (a real GitHub page drawn exactly in the frame, under the toolbar, and the app restored after closing it); in that environment, which has only software GL, the terminals' WebGL renderer sometimes drew nothing, with or without a pull request ever opened, so a blank terminal there is not evidence about this feature.
+
+### The page cannot call the app
+
+Decision 4 of the PRD, held three ways, each pinned by a test in `pr_browser.rs`:
+
+- `capabilities/default.json` is scoped to the main **webview** by label (`"webviews": ["main"]`), not to the main window the page is a child of, and no capability is `remote`. `capability_files_grant_nothing_to_the_pr_webview` reads every capability file. A capability scoped to `windows: ["main"]` would grant every core and plugin permission to the page as well, whenever it held a local origin.
+- Every app command checks that its caller is the main webview (`ensure_main_webview`); `every_app_command_refuses_a_webview_other_than_main` scans `lib.rs` for a `#[tauri::command]` without it.
+- The navigation policy (`pr_browser::classify`) keeps the page on `https` GitHub hosts and refuses `tauri:`, `ipc:`, `file:`, `javascript:` and every other scheme, so the page never holds the app's own (local) origin — the one origin Tauri does not check an app command against its ACL for.
+
+`the_pr_webview_cannot_invoke_commands` drives Tauri's own IPC with `tauri::test::mock_builder`: from the page's webview, an app command and core and plugin commands are refused at a GitHub origin, and a core command is refused at the app's own origin too, while the same requests from the main webview are answered. It does not run on Windows, for the reason the `test` feature's entry in `desktop/src-tauri/Cargo.toml` gives.
+
+The one page → app signal is a navigation to `https://close.dot-agent-deck.invalid/`, which an initialization script makes when the page did not use an `Escape` itself (focus not in an input, no menu or dialog open, `defaultPrevented` false once every listener has run). The navigation hook cancels it, closes the page and emits `pr-browser://closed` to the main webview; it carries no data and invokes no command.
+
+### Links, and which hosts stay in the app
+
+`github.com` and its subdomains, `githubusercontent.com`, `githubassets.com`, and the sign-in captcha (`octocaptcha.com`, `arkoselabs.com`) stay in the page, matched exactly or as a subdomain, never by suffix alone (`github.com.evil.example` is not GitHub). Any other `http(s)` address is cancelled and handed to the system browser (`open::that_detached`); a link that asks for a new window loads in the page if it is GitHub and goes to the system browser otherwise. A sign-in that leaves GitHub — an organisation's SAML identity provider, or signing in with Google or Apple — therefore opens in the system browser and cannot finish inside the app. On macOS and Linux the hook also sees navigations of frames inside the page, so a frame from a host not listed here would be opened in the system browser; GitHub's pull request pages frame only the hosts above.
+
+### The profile
+
+`pr_browser::profile` puts the page's cookies and storage in `<app data dir>/pr-browser` on Linux and Windows and in the fixed data store `dad-pr-browser-1` on macOS 14 and later, never `incognito`, so a sign-in survives a restart (`the_profile_is_persistent_and_the_same_on_every_launch`). On macOS before 14 a webview cannot have a store of its own and the page shares the app's default store; Settings → GitHub → **Sign out of GitHub** is refused there, because clearing that store would also erase the app's own saved state. Elsewhere sign-out clears the page's webview if one is open, or opens the profile in a hidden window only to clear it. Deleting the directory instead was rejected: on Linux Tauri keeps a profile's web context for the life of the app, so its cookies would survive in memory and be written back.
+
+### Checking it by hand
+
+No automated test reaches the native webview's placement, the real sign-in or the system browser hand-off. On each platform, with an agent whose branch has a pull request:
+
+1. Click the badge on the agent's screen. The page fills the frame under the toolbar and nothing else; resize the window and zoom (`Cmd/Ctrl` `+`/`-`) and it follows the frame.
+2. Sign in to GitHub, quit and relaunch, and open the pull request again: still signed in.
+3. Click a link to a site off GitHub: it opens in the system browser and the page stays where it was. **Back** steps the page back; **Open in browser** opens the page on screen in the system browser and closes it in the app.
+4. Press `Escape` with focus in the page and nothing open in it: the page closes back to the agent's screen. Open a menu or start a comment in the page first, and `Escape` closes that instead.
+5. With voice on and the page open, say "what can I say": the page hides under the list of commands and comes back when the list closes. "scroll down", "scroll to the top", "open it in the browser" and "close" act on the page.
+6. Close the page, then Settings → GitHub → **Sign out of GitHub**, and open the pull request again: signed out.

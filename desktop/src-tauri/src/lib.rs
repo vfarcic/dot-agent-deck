@@ -20,6 +20,8 @@ mod local_deck;
 // settings struct, so the next feature that needs to store an endpoint uses
 // these rather than inventing a second answer.
 mod model_service;
+/// PRD #1401: the in-app pull request browser.
+mod pr_browser;
 // PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
 // Not voice-specific, so it is a module of its own rather than one under
 // `voice`: the rule it serves is #803's and any later feature needing a
@@ -6082,6 +6084,78 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
     }
 }
 
+/// PRD #1401 — open the in-app pull request browser on `url` over `bounds`
+/// (the agent screen's frame, in the window's logical pixels), or move the open
+/// one there. Only a github.com pull request URL is accepted.
+#[tauri::command]
+async fn desktop_pr_browser_open(
+    webview: Webview,
+    url: String,
+    bounds: pr_browser::Bounds,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::open(webview.app_handle(), &url, bounds).await
+}
+
+/// PRD #1401 — the frame moved: put the open browser over it again.
+#[tauri::command]
+async fn desktop_pr_browser_bounds(
+    webview: Webview,
+    bounds: pr_browser::Bounds,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::set_bounds(webview.app_handle(), bounds)
+}
+
+/// PRD #1401 — hide the open browser while one of the app's dialogs is over
+/// it, and show it again after.
+#[tauri::command]
+async fn desktop_pr_browser_visible(webview: Webview, visible: bool) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::set_visible(webview.app_handle(), visible)
+}
+
+/// PRD #1401 — the toolbar's Back.
+#[tauri::command]
+async fn desktop_pr_browser_back(webview: Webview) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::back(webview.app_handle())
+}
+
+/// PRD #1401 — a spoken scroll, applied to the page from the app.
+#[tauri::command]
+async fn desktop_pr_browser_scroll(
+    webview: Webview,
+    scroll: pr_browser::Scroll,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::scroll(webview.app_handle(), scroll)
+}
+
+/// PRD #1401 — Open in browser: the page on screen in the system browser,
+/// then close the in-app one.
+#[tauri::command]
+async fn desktop_pr_browser_open_external(webview: Webview) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::open_external(webview.app_handle())
+}
+
+/// PRD #1401 — close the browser: the toolbar's Close, `Escape` in the app
+/// and voice's "close".
+#[tauri::command]
+async fn desktop_pr_browser_close(webview: Webview) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::close(webview.app_handle());
+    Ok(())
+}
+
+/// PRD #1401 — Settings → Sign out of GitHub: clear the browser's profile.
+#[tauri::command]
+async fn desktop_pr_browser_sign_out(webview: Webview) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    pr_browser::sign_out(webview.app_handle()).await
+}
+
 /// PRD #802's audit blocker: release the microphone — and, since the sleep
 /// work, the machine with it.
 ///
@@ -6259,6 +6333,14 @@ pub fn run() {
             {
                 release_microphone(&voice);
             }
+            // PRD #1401: the document that owned the pull request browser's
+            // toolbar is gone, so the browser goes with it rather than staying
+            // drawn over a page that no longer knows it is there.
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Started
+            {
+                pr_browser::close(webview.app_handle());
+            }
         });
     // PRD #802's audit blocker, teardown trigger 3: the web content PROCESS
     // died. The chain is broken here rather than continued because this hook
@@ -6321,6 +6403,14 @@ pub fn run() {
             desktop_voice_commands,
             desktop_voice_speech_plan,
             desktop_voice_speech_audio,
+            desktop_pr_browser_open,
+            desktop_pr_browser_bounds,
+            desktop_pr_browser_visible,
+            desktop_pr_browser_back,
+            desktop_pr_browser_scroll,
+            desktop_pr_browser_open_external,
+            desktop_pr_browser_close,
+            desktop_pr_browser_sign_out,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

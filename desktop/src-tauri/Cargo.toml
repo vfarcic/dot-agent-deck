@@ -16,7 +16,19 @@ tauri-build = { version = "2", features = [] }
 dot-agent-deck = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+# PRD #1401: `unstable` is what exposes `Window::add_child`, the child webview
+# the in-app pull request browser is drawn in (`pr_browser.rs`). It adds no
+# crate; what it changes is that the main webview, too, is created as a child
+# of its window (sized to fill it), which is the mode Tauri's multiwebview
+# support runs every webview in.
+tauri = { version = "2", features = ["unstable"] }
+# PRD #1401: "Open in browser" and every link that leaves GitHub hand the URL to
+# the operating system's default browser. NOT a new dependency in any sense
+# that costs anything: the root package declares `open = "5"` for the TUI's own
+# browser hand-off, this crate already links the root package, and the lockfile
+# carries one `open`. Chosen over `tauri-plugin-opener` because a plugin is a
+# set of commands the page could be granted; this is a function only Rust calls.
+open = "5"
 # PRD #803: the desktop app's own settings document is TOML, a sibling of
 # the TUI's config.toml. Same version pin as the root package.
 #
@@ -326,6 +338,12 @@ tauri = { version = "2", features = ["test"] }
 # for them.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
+# PRD #1401: the Linux half of the PR browser's placement (`pr_browser.rs`'s
+# `overlay`). Tauri packs a window's webviews into one `GtkBox`, so the PR
+# webview is moved into a `GtkOverlay` over the main one. NOT a new dependency:
+# `tauri`, `tao` and `wry` all build on this `gtk` on Linux and the lockfile
+# carries one 0.18. Declared for the discipline the `zbus` entry states.
+gtk = "0.18"
 
 # PRD #802's sleep work: the Windows half of `voice/wake.rs` —
 # `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, which is the
