@@ -1926,7 +1926,17 @@ fn main() -> ExitCode {
                 // first so the capture result is recorded; `run_daemon_serve_cli`
                 // therefore no longer initializes it.
                 init_logging_from_env();
+                // PRD #1258: time the pre-bind work, so a lazy-spawn that timed
+                // out says in the daemon's log whether the login-shell capture or
+                // the installers below took the time — the gap before the first
+                // line is process start-up itself.
+                let pre_bind_started = std::time::Instant::now();
+                tracing::info!("daemon serve: starting pre-bind work");
                 dot_agent_deck::login_shell::apply_login_shell_path();
+                tracing::info!(
+                    elapsed_ms = pre_bind_started.elapsed().as_millis() as u64,
+                    "daemon serve: login-shell PATH step done"
+                );
                 // PRD #201: materialize the bundled Pi orchestrator extension ONCE
                 // at daemon startup — parity with claude/opencode installing their
                 // hooks/plugin at startup. This covers both the lazy-spawned daemon
@@ -1967,6 +1977,10 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                tracing::info!(
+                    elapsed_ms = pre_bind_started.elapsed().as_millis() as u64,
+                    "daemon serve: pre-bind work done, starting the server"
+                );
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),

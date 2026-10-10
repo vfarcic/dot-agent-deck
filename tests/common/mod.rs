@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::daemon_attach::{DAEMON_START_POLL_TIMEOUT, DAEMON_START_TIMEOUT_ENV};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Decision 21: tunable harness constant for `wait_until_quiescent`.
@@ -239,6 +240,26 @@ pub const DAEMON_TASK_START_BASE: Duration = Duration::from_secs(8);
 #[allow(dead_code)]
 pub fn daemon_task_start_budget() -> Duration {
     load_scaled(DAEMON_TASK_START_BASE)
+}
+
+/// PRD #1258: the most [`daemon_start_timeout_for_launch`] hands the deck. It
+/// sits under [`WAIT_TIMEOUT`], the fixed ceiling on the first wait every
+/// launching test makes, so a daemon that never binds still has its deck print
+/// `daemon failed to start within …` onto the screen before that wait expires;
+/// a bound past it would trade that message for an empty grid and buy nothing,
+/// because the test's wait has already given up.
+pub(crate) const DAEMON_START_HARNESS_CEILING: Duration =
+    WAIT_TIMEOUT.saturating_sub(Duration::from_secs(5));
+
+/// PRD #1258: the lazy-spawn start bound a launched deck is given through
+/// [`DAEMON_START_TIMEOUT_ENV`] — the binary's own default
+/// ([`DAEMON_START_POLL_TIMEOUT`], 15 s) widened by [`load_scaled`], up to
+/// [`DAEMON_START_HARNESS_CEILING`]. Measured cause: `dashboard/host-metrics/004`
+/// went red on a starved box (io stalled ~70% of the window) with the deck's
+/// fixed 15 s expiring while its debug daemon was still starting. Only an `e2e`
+/// build of the deck reads the variable, and it never goes below the default.
+pub fn daemon_start_timeout_for_launch() -> Duration {
+    load_scaled(DAEMON_START_POLL_TIMEOUT).min(DAEMON_START_HARNESS_CEILING)
 }
 
 /// Issue #709: how long after a child stops being live its output is still
@@ -640,6 +661,12 @@ pub struct TuiDeck {
     /// [`TuiDeck::dump_recordings`] a failing test deleted the one line that says
     /// why. `None` when a test's `with_env` removed the state-dir pin.
     daemon_log_path: Option<PathBuf>,
+    /// The deck's tracing log (`DOT_AGENT_DECK_LOG`), which the TUI and its
+    /// lazy-spawned daemon both append to (PRD #1258). The harness points it at
+    /// `deck.log` in the test's own temp root so a red says where the time went;
+    /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
+    /// value that is not an absolute path (`1`, a relative name).
+    deck_log_path: Option<PathBuf>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1190,6 +1217,24 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
+        // PRD #1258: the deck's lazy-spawn start bound, load-scaled (see
+        // `daemon_start_timeout_for_launch`), and a tracing log for the deck and
+        // its daemon in the test's own temp root. The log sits in `work`, not in
+        // the state dir: the daemon creates that directory, and the TUI opens the
+        // log before any daemon exists — a missing parent would fail the open and
+        // print a warning into the very PTY the test reads. Both are layered
+        // under `with_env`, so a test that sets its own log keeps it.
+        final_env.insert(
+            DAEMON_START_TIMEOUT_ENV.into(),
+            daemon_start_timeout_for_launch().as_millis().to_string(),
+        );
+        final_env.insert(
+            "DOT_AGENT_DECK_LOG".into(),
+            work.join("deck.log")
+                .to_str()
+                .expect("deck log path is UTF-8")
+                .to_string(),
+        );
         // PRD #1487: `env_clear` above drops the test runner's own signal, so
         // pin the agent-config containment contract explicitly — every config
         // writer in the deck, its daemon and their children refuses a
@@ -1231,6 +1276,10 @@ impl TuiDeck {
         let daemon_log_path = final_env
             .get("DOT_AGENT_DECK_STATE_DIR")
             .map(|dir| PathBuf::from(dir).join("daemon.log"));
+        let deck_log_path = final_env
+            .get("DOT_AGENT_DECK_LOG")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1343,6 +1392,7 @@ impl TuiDeck {
             record_on_success,
             recording_redactions,
             daemon_log_path,
+            deck_log_path,
         })
     }
 
@@ -2517,16 +2567,21 @@ const DAEMON_LOG_TAIL_LINES: usize = 40;
 /// front of whoever reads a red `e2e-deterministic` run. Bounded, because a
 /// chatty daemon must not bury the assertion that failed.
 fn eprint_daemon_log_tail(redacted: &[u8], where_the_rest_is: &str) {
+    eprint_log_tail("daemon.log", redacted, where_the_rest_is);
+}
+
+/// [`eprint_daemon_log_tail`] for any dumped log, labelled `name`.
+fn eprint_log_tail(name: &str, redacted: &[u8], where_the_rest_is: &str) {
     let text = String::from_utf8_lossy(redacted);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(DAEMON_LOG_TAIL_LINES);
     eprintln!(
-        "[tui-harness] daemon.log (last {} of {} lines; {where_the_rest_is}):",
+        "[tui-harness] {name} (last {} of {} lines; {where_the_rest_is}):",
         lines.len() - start,
         lines.len(),
     );
     for line in &lines[start..] {
-        eprintln!("[daemon.log] {line}");
+        eprintln!("[{name}] {line}");
     }
 }
 
@@ -2658,6 +2713,30 @@ impl TuiDeck {
                     if outcome == RecordingOutcome::Failed {
                         let copy = dir.join("daemon.log");
                         eprint_daemon_log_tail(
+                            &redacted,
+                            &format!("full copy at {}", copy.display()),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // deck.log — PRD #1258. The TUI's and the daemon's tracing log, which
+        // `daemon.log` (stdout and stderr only) does not carry: it is where the
+        // daemon's pre-bind timing lands, so a start that timed out says whether
+        // the login-shell capture or the installers took the time. Redacted like
+        // the rest; its tail goes to stderr on a failure for the same reason.
+        if let Some(src) = self.deck_log_path.as_deref() {
+            match std::fs::read(src) {
+                Ok(bytes) => {
+                    let redacted = redact_known_credentials_bytes(&bytes, &redactions);
+                    atomic_write(&dir.join("deck.log"), &redacted)?;
+                    if outcome == RecordingOutcome::Failed {
+                        let copy = dir.join("deck.log");
+                        eprint_log_tail(
+                            "deck.log",
                             &redacted,
                             &format!("full copy at {}", copy.display()),
                         );
@@ -4627,13 +4706,14 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// will publish the cast, so removing it before the cast means a discard that
 /// panics partway has already made whatever survives unpublishable. The dump
 /// writes it LAST for the mirror-image reason.
-const RECORDING_ARTIFACTS: [&str; 6] = [
+const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
     "daemon.log",
+    "deck.log",
 ];
 
 /// Schema version of the `provenance.json` sidecar (issue #808).

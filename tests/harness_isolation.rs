@@ -452,13 +452,14 @@ mod live_deck_fallback {
 /// The artifacts the harness dumps — the set the discard has to clear. Mirrors
 /// `RECORDING_ARTIFACTS` in `tests/common/mod.rs`; the guard below proves the two
 /// lists and the dump itself still agree.
-const RECORDING_ARTIFACTS: [&str; 6] = [
+const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
     "daemon.log",
+    "deck.log",
 ];
 
 fn adapter_build_script() -> String {
