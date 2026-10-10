@@ -73,7 +73,7 @@ pub async fn run(
         if !confirmed(plan, args, &mut answers, out) {
             continue;
         }
-        match execute::execute(host, plan, source, options).await {
+        match execute::execute(host, plan, source, &options.staging_root).await {
             Ok(outcome) => {
                 for line in outcome.lines() {
                     let _ = writeln!(out, "{line}");
@@ -81,6 +81,9 @@ pub async fn run(
             }
             Err(e) => {
                 let _ = writeln!(out, "{e}");
+                for line in plan::render_lines(&e.fallback()) {
+                    let _ = writeln!(out, "{line}");
+                }
                 ok = false;
             }
         }
@@ -124,7 +127,8 @@ fn confirmed(
 }
 
 /// The subcommand as `main` runs it: the real machine, this build's release
-/// source, a terminal client's options, and stdin when it is a terminal.
+/// source, a terminal client's options (which ask `gh` whether provenance can
+/// be checked, before any plan is printed), and stdin when it is a terminal.
 pub fn main(args: Args) -> std::process::ExitCode {
     use std::io::IsTerminal;
 
@@ -140,7 +144,7 @@ pub fn main(args: Args) -> std::process::ExitCode {
     };
     let host = super::SystemHost::default();
     let source = ReleaseSource::from_build();
-    let options = PlanOptions::terminal();
+    let options = PlanOptions::terminal(&host);
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let answers = if std::io::stdin().is_terminal() {
@@ -179,6 +183,9 @@ mod tests {
             &PlanOptions {
                 staging_root: PathBuf::from("/stage"),
                 can_prompt_for_privilege: false,
+                provenance: crate::self_upgrade::ProvenanceCheck::Unavailable {
+                    reason: crate::self_upgrade::verify::GH_NOT_INSTALLED.into(),
+                },
             },
         )
     }

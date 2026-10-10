@@ -16,7 +16,8 @@
 //!    CLI, the CLI from the desktop app), which gets its own detection and its
 //!    own plan.
 //! 4. [`verify`] — the release checksum manifest, build provenance through
-//!    `gh attestation verify`, and the new binary's `--version`.
+//!    `gh attestation verify`, the new binary's `--version`, and the re-hash
+//!    right before a staged file is installed.
 //! 5. [`execute`] — downloading the release assets and carrying a confirmed
 //!    plan out.
 //!
@@ -26,7 +27,9 @@
 //!
 //! Every subprocess and every filesystem question goes through [`Host`], so a
 //! test fakes the machine instead of needing one; [`SystemHost`] is the real
-//! one.
+//! one. The staged downloads themselves are real files in a private directory
+//! [`execute`] creates per upgrade. `docs/develop/self-upgrade.md` describes
+//! the design and the trust boundary.
 
 pub mod cli;
 pub mod detect;
@@ -41,8 +44,9 @@ use std::path::{Path, PathBuf};
 pub use detect::{CopyKind, HomebrewFormula, InstallMethod, Installation, Platform, SourceReason};
 pub use discover::OtherCopy;
 pub use execute::{Outcome, ReleaseSource};
+pub use plan::PlanLine;
 pub use plan::{PlanAction, PlanOptions, UpgradePlan};
-pub use verify::Provenance;
+pub use verify::{Provenance, ProvenanceCheck};
 
 /// The CLI binary's file name, inside every install and every release asset
 /// name.
@@ -233,6 +237,41 @@ pub enum UpgradeError {
     )]
     ProvenanceFailed { manifest: String, detail: String },
     #[error(
+        "The upgrade plan said build provenance would be checked, but it cannot be now: {reason}. Nothing was changed."
+    )]
+    ProvenanceUnavailable { reason: String },
+    #[error(
+        "{path} changed after it was checked (expected {expected}, got {actual}), so it was not installed. Nothing was changed."
+    )]
+    StagedChanged {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "WARNING: {target} was installed, but it is NOT the verified build (expected {expected}, got {actual}). It was not run. Do not use it: reinstall dot-agent-deck from {release}."
+    )]
+    InstalledMismatch {
+        target: String,
+        expected: String,
+        actual: String,
+        release: String,
+    },
+    #[error(
+        "The download folder {root} is not safe to use: {why}. Nothing was changed. Remove it or make it private to you, then try again."
+    )]
+    StagingUnsafe { root: String, why: String },
+    /// The privilege prompt (`pkexec`) did not install a file that was
+    /// downloaded and checked. `install` is the command that installs the
+    /// staged file instead, when one can be shown safely.
+    #[error("`{command}` failed: {detail}")]
+    PrivilegeFailed {
+        command: String,
+        detail: String,
+        install: Option<String>,
+        version: String,
+    },
+    #[error(
         "The downloaded binary reports {actual} instead of dot-agent-deck {expected}. Nothing was changed."
     )]
     VersionMismatch { expected: String, actual: String },
@@ -244,6 +283,30 @@ pub enum UpgradeError {
     Io(String),
     #[error("This install is not upgraded from here: {0}")]
     NotActionable(String),
+}
+
+impl UpgradeError {
+    /// What the user can do instead, shown after the error itself: for a
+    /// failed privilege prompt, the command that installs the file that was
+    /// already downloaded and checked, or how to upgrade manually when that
+    /// command cannot be shown safely.
+    pub fn fallback(&self) -> Vec<PlanLine> {
+        match self {
+            Self::PrivilegeFailed {
+                install: Some(command),
+                ..
+            } => vec![
+                PlanLine::Text(plan::PROMPT_FAILED.to_string()),
+                PlanLine::Command(command.clone()),
+            ],
+            Self::PrivilegeFailed {
+                install: None,
+                version,
+                ..
+            } => vec![PlanLine::Text(plan::manual_upgrade_line(version))],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl From<std::io::Error> for UpgradeError {

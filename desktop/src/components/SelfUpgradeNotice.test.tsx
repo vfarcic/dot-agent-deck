@@ -15,7 +15,8 @@ const plan = (action: SelfUpgradePlan["action"], headline: string): SelfUpgradeP
   action,
   actionable: action === "swap-app",
   confirmQuestion: null,
-  lines: [{ text: headline, command: false }],
+  provenance: { checked: true, reason: null },
+  lines: [{ text: headline, command: null }],
 });
 
 const NEWER: SelfUpgradeCheck = { latest: "0.47.0", updateAvailable: true, notice: HEADLINE, app: plan("swap-app", HEADLINE), cli: null, recheckAfterSecs: 21600 };

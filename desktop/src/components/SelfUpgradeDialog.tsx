@@ -49,7 +49,7 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
     setRunning(plan.copy);
     api.run(plan.copy).then(
       (result) => setResults((current) => ({ ...current, [plan.copy]: result })),
-      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: false }] } })),
+      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
     ).finally(() => {
       setDone((current) => [...current, plan.copy]);
       setRunning(undefined);
@@ -134,14 +134,25 @@ function PlanSection({ plan, result, running, copyText }: { plan: SelfUpgradePla
 function Lines({ lines, copyText, testId }: { lines: SelfUpgradeLine[]; copyText: (text: string) => Promise<void>; testId?: string }) {
   return (
     <div className="self-upgrade-lines" data-testid={testId}>
-      {lines.map((line, index) => line.command
-        ? (
-          <div className="self-upgrade-command" key={index}>
-            <code>{displayText(line.text, DISPLAY_LIMITS.detail)}</code>
-            <button type="button" aria-label="Copy command" title="Copy command" data-testid="self-upgrade-copy" onClick={() => void copyText(sanitizeText(line.text)).catch(() => undefined)}><Copy size={12} /></button>
-          </div>
-        )
+      {lines.map((line, index) => line.command !== null
+        ? <CommandLine key={index} command={line.command} copyText={copyText} />
         : <p key={index}>{displayText(line.text, DISPLAY_LIMITS.detail)}</p>)}
+    </div>
+  );
+}
+
+/**
+ * A command for the user to run. Copy writes it exactly as the crate built it,
+ * and is offered only when the display sanitiser would leave it unchanged, so
+ * the copied text is always the text shown — whole, never shortened. A command
+ * the sanitiser would change is shown sanitised and is not copyable.
+ */
+function CommandLine({ command, copyText }: { command: string; copyText: (text: string) => Promise<void> }) {
+  const copyable = sanitizeText(command) === command;
+  return (
+    <div className="self-upgrade-command" data-testid="self-upgrade-command" data-copyable={copyable}>
+      <code>{copyable ? command : displayText(command, DISPLAY_LIMITS.detail)}</code>
+      {copyable && <button type="button" aria-label="Copy command" title="Copy command" data-testid="self-upgrade-copy" onClick={() => void copyText(command).catch(() => undefined)}><Copy size={12} /></button>}
     </div>
   );
 }

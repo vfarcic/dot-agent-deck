@@ -15,10 +15,23 @@
 /** Which copy a plan or a result is about. */
 export type SelfCopy = "app" | "cli";
 
-/** One line of a plan or a result; `command` lines are for the user to run. */
+/**
+ * One line of a plan or a result. `text` is the display copy (sanitised and
+ * possibly shortened by the bridge). `command`, on a line that is a command
+ * for the user to run, is that command exactly as the crate built it, never
+ * shortened: it is what Copy writes, and Copy is offered only when it is
+ * unchanged by the display sanitiser.
+ */
 export interface SelfUpgradeLine {
   text: string;
-  command: boolean;
+  command: string | null;
+}
+
+/** Whether build provenance will be checked for a plan, said before Upgrade. */
+export interface SelfUpgradeProvenance {
+  checked: boolean;
+  /** Why not, when it will not be. */
+  reason: string | null;
 }
 
 /** The crate's `PlanAction`, kebab-case. */
@@ -45,6 +58,7 @@ export interface SelfUpgradePlan {
   actionable: boolean;
   /** The question the Upgrade button answers; null when there is nothing to confirm. */
   confirmQuestion: string | null;
+  provenance: SelfUpgradeProvenance;
   lines: SelfUpgradeLine[];
 }
 

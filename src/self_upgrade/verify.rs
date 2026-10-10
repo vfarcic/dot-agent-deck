@@ -1,12 +1,15 @@
 //! Checking a downloaded release asset before anything is replaced.
 //!
 //! In order: the checksum manifest's build provenance (`gh attestation verify`,
-//! when `gh` is installed and logged in), the asset's SHA-256 against that
-//! manifest (mandatory: a missing entry or a mismatch aborts), and for a CLI
-//! binary its own `--version`.
+//! when the plan said `gh` is installed and logged in), the asset's SHA-256
+//! against that manifest (mandatory: a missing entry or a mismatch aborts),
+//! for a CLI binary its own `--version`, and the same SHA-256 again right
+//! before the file is handed to whatever installs it ([`rehash`]).
+//! `docs/develop/self-upgrade.md` has the whole chain and what it does not
+//! cover.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -54,17 +57,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Check `bytes` (the downloaded `asset`) against `manifest`.
+/// Check `bytes` (the downloaded `asset`) against `manifest`, returning the
+/// verified SHA-256 for the later re-checks ([`rehash`]).
 pub fn verify_checksum(
     manifest: &str,
     manifest_name: &str,
     asset: &str,
     bytes: &[u8],
-) -> Result<(), UpgradeError> {
+) -> Result<String, UpgradeError> {
     let expected = manifest_entry(manifest, manifest_name, asset)?;
     let actual = sha256_hex(bytes);
     if actual == expected {
-        Ok(())
+        Ok(expected)
     } else {
         Err(UpgradeError::ChecksumMismatch {
             asset: asset.to_string(),
@@ -75,11 +79,128 @@ pub fn verify_checksum(
     }
 }
 
+/// The SHA-256 of the file at `path`, read without following a symlink in
+/// its last component.
+pub fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = super::execute::open_no_follow(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// The staged file at `path` must still hash to `expected`, the digest
+/// verified against the manifest. Called immediately before the file is
+/// handed to something that installs it (`pkexec`, `apt-get`, `hdiutil`, a
+/// rename), so a file swapped after the check is refused rather than
+/// installed. It narrows the window to the hand-off; it does not close it
+/// (`docs/develop/self-upgrade.md`).
+pub fn rehash(path: &Path, expected: &str) -> Result<(), UpgradeError> {
+    let actual = file_sha256(path).map_err(|e| UpgradeError::StagedChanged {
+        path: path.display().to_string(),
+        expected: expected.to_string(),
+        actual: format!("unreadable: {e}"),
+    })?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(UpgradeError::StagedChanged {
+            path: path.display().to_string(),
+            expected: expected.to_string(),
+            actual,
+        })
+    }
+}
+
+/// Why build provenance will not be checked when `gh` is missing.
+pub const GH_NOT_INSTALLED: &str = "the GitHub CLI (`gh`) is not installed";
+/// Why, when `gh auth status` reports no usable login.
+pub const GH_LOGGED_OUT: &str =
+    "the GitHub CLI (`gh`) is not logged in, or its token is invalid (run `gh auth login`)";
+
+/// Whether build provenance CAN be checked on this machine, decided before
+/// the user confirms so the plan says which it will be
+/// ([`super::plan::PlanOptions::provenance`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvenanceCheck {
+    /// `gh` at this path is installed and logged in.
+    Available { gh: PathBuf },
+    /// It cannot be checked, and why, in words for the user.
+    Unavailable { reason: String },
+}
+
+impl ProvenanceCheck {
+    /// Look `gh` up on `host` and ask it whether it is logged in.
+    pub fn detect(host: &dyn Host) -> Self {
+        Self::with_gh(host, host.find_program("gh").as_deref())
+    }
+
+    /// Ask `gh` (when there is one) whether it is logged in. A known logged-out
+    /// state and an unexpected failure (`gh` cannot be spawned, `gh auth
+    /// status` failing for another reason, such as no network) each get their
+    /// own reason.
+    pub fn with_gh(host: &dyn Host, gh: Option<&Path>) -> Self {
+        let Some(gh) = gh else {
+            return Self::Unavailable {
+                reason: GH_NOT_INSTALLED.to_string(),
+            };
+        };
+        let output = match host.run(gh, &[OsStr::new("auth"), OsStr::new("status")]) {
+            Ok(output) => output,
+            Err(e) => {
+                return Self::Unavailable {
+                    reason: format!(
+                        "the GitHub CLI (`gh`) at {} could not be run: {e}",
+                        gh.display()
+                    ),
+                };
+            }
+        };
+        if output.success {
+            return Self::Available {
+                gh: gh.to_path_buf(),
+            };
+        }
+        let said = format!("{}\n{}", output.stderr, output.stdout);
+        let lower = said.to_ascii_lowercase();
+        if lower.contains("not logged in") || lower.contains("is invalid") {
+            return Self::Unavailable {
+                reason: GH_LOGGED_OUT.to_string(),
+            };
+        }
+        // gh marks the failing account's line with `X`; the first line is often
+        // just the host name.
+        let lines = said.lines().map(str::trim).filter(|line| !line.is_empty());
+        let detail = lines
+            .clone()
+            .find_map(|line| line.strip_prefix("X "))
+            .or_else(|| lines.clone().next())
+            .map(str::trim)
+            .map_or_else(
+                || match output.code {
+                    Some(code) => format!("exit {code}"),
+                    None => "killed by a signal".to_string(),
+                },
+                str::to_string,
+            );
+        Self::Unavailable {
+            reason: format!("`gh auth status` failed: {detail}"),
+        }
+    }
+
+    pub fn will_check(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
 /// Whether build provenance was checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
     Verified,
-    /// Not checked, and why — reported to the user, not fatal.
+    /// Not checked, and why: the plan said so before the user confirmed.
     Skipped {
         reason: String,
     },
@@ -94,63 +215,104 @@ impl Provenance {
     }
 }
 
-/// Verify that `manifest` (a file on disk) was produced by this repository's
-/// release workflow. No `gh`, or a `gh` that is not logged in (it cannot reach
-/// the attestation API then), is reported as skipped; a verification that runs
-/// and fails aborts.
+/// Verify that `manifest_bytes`, written once to `manifest_path` for `gh` to
+/// read, were produced by this repository's release workflow for the tag
+/// `v<version>`.
+///
+/// The plan already said whether this would happen: [`ProvenanceCheck::
+/// Unavailable`] is reported as skipped. [`ProvenanceCheck::Available`] is a
+/// promise, so a `gh` that has since disappeared or logged out aborts rather
+/// than downgrading silently, and so does a verification that runs and fails.
+///
+/// `gh` reads the file, while the checksums are parsed from the bytes in
+/// memory. What ties the two together is the digest: the attestation `gh`
+/// verified must name the SHA-256 of `manifest_bytes` as a subject, so a file
+/// swapped under `gh` cannot vouch for different bytes.
 pub fn verify_provenance(
     host: &dyn Host,
-    gh: Option<&Path>,
-    manifest: &Path,
+    check: &ProvenanceCheck,
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+    version: &str,
 ) -> Result<Provenance, UpgradeError> {
-    let Some(gh) = gh else {
-        return Ok(Provenance::Skipped {
-            reason: "the GitHub CLI (`gh`) is not installed".to_string(),
-        });
+    let manifest_name = manifest_path.file_name().map_or_else(
+        || manifest_path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let gh = match check {
+        ProvenanceCheck::Unavailable { reason } => {
+            return Ok(Provenance::Skipped {
+                reason: reason.clone(),
+            });
+        }
+        ProvenanceCheck::Available { gh } => gh,
     };
-    let logged_in = host
-        .run(gh, &[OsStr::new("auth"), OsStr::new("status")])
-        .is_ok_and(|out| out.success);
-    if !logged_in {
-        return Ok(Provenance::Skipped {
-            reason: "the GitHub CLI (`gh`) is not logged in (run `gh auth login`)".to_string(),
-        });
+    if let ProvenanceCheck::Unavailable { reason } = ProvenanceCheck::with_gh(host, Some(gh)) {
+        return Err(UpgradeError::ProvenanceUnavailable { reason });
     }
+    let failed = |detail: String| UpgradeError::ProvenanceFailed {
+        manifest: manifest_name.clone(),
+        detail,
+    };
     let repo = crate::repo_identity::SLUG;
     let signer = format!("{repo}/.github/workflows/release.yml");
+    let source_ref = format!(
+        "refs/tags/v{}",
+        version.strip_prefix('v').unwrap_or(version)
+    );
     let output = host
         .run(
             gh,
             &[
                 OsStr::new("attestation"),
                 OsStr::new("verify"),
-                manifest.as_os_str(),
+                manifest_path.as_os_str(),
                 OsStr::new("--repo"),
                 OsStr::new(repo),
                 OsStr::new("--signer-workflow"),
                 OsStr::new(&signer),
+                OsStr::new("--source-ref"),
+                OsStr::new(&source_ref),
+                OsStr::new("--format"),
+                OsStr::new("json"),
             ],
         )
-        .map_err(|e| UpgradeError::ProvenanceFailed {
-            manifest: manifest.display().to_string(),
-            detail: e.to_string(),
-        })?;
-    if output.success {
-        Ok(Provenance::Verified)
-    } else {
+        .map_err(|e| failed(e.to_string()))?;
+    if !output.success {
         let detail = [output.stderr.trim(), output.stdout.trim()]
             .into_iter()
             .find(|text| !text.is_empty())
             .unwrap_or("it exited without saying why")
             .to_string();
-        Err(UpgradeError::ProvenanceFailed {
-            manifest: manifest.file_name().map_or_else(
-                || manifest.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
-            detail,
-        })
+        return Err(failed(detail));
     }
+    let digest = sha256_hex(manifest_bytes);
+    if attested_digests(&output.stdout).contains(&digest) {
+        Ok(Provenance::Verified)
+    } else {
+        Err(failed(format!(
+            "the attestation it verified does not cover the downloaded {manifest_name} (sha256 {digest})"
+        )))
+    }
+}
+
+/// Every subject SHA-256 in `gh attestation verify --format json` output.
+fn attested_digests(json: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(results)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .filter_map(|result| {
+            result
+                .pointer("/verificationResult/statement/subject")
+                .and_then(serde_json::Value::as_array)
+        })
+        .flatten()
+        .filter_map(|subject| subject.pointer("/digest/sha256")?.as_str())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// The binary at `path` must answer `--version` as dot-agent-deck `expected`.
@@ -192,12 +354,12 @@ mod tests {
         let bytes = b"the new binary";
         assert_eq!(
             verify_checksum(&manifest_for(bytes), "checksums.txt", ASSET, bytes),
-            Ok(())
+            Ok(sha256_hex(bytes))
         );
         let binary_mode = format!("{} *{ASSET}\n", sha256_hex(bytes).to_uppercase());
         assert_eq!(
             verify_checksum(&binary_mode, "checksums.txt", ASSET, bytes),
-            Ok(())
+            Ok(sha256_hex(bytes))
         );
     }
 
@@ -243,55 +405,272 @@ mod tests {
         ));
     }
 
+    const GH: &str = "/usr/bin/gh";
+    const MANIFEST: &[u8] = b"the manifest bytes\n";
+
+    fn verify_line(version: &str) -> String {
+        format!(
+            "{GH} attestation verify /s/checksums.txt --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml --source-ref refs/tags/v{version} --format json"
+        )
+    }
+
+    /// `gh attestation verify --format json` output whose attestation names
+    /// `digests` as subjects.
+    fn attestation_json(digests: &[String]) -> String {
+        let subjects: Vec<_> = digests
+            .iter()
+            .map(|d| serde_json::json!({"name": "checksums.txt", "digest": {"sha256": d}}))
+            .collect();
+        serde_json::json!([{"verificationResult": {"statement": {"subject": subjects}}}])
+            .to_string()
+    }
+
+    fn available() -> ProvenanceCheck {
+        ProvenanceCheck::Available {
+            gh: PathBuf::from(GH),
+        }
+    }
+
     #[test]
-    fn verify_005_provenance_skipped_without_gh() {
+    fn verify_005_provenance_unavailable_without_gh() {
         let host = FakeHost::new();
-        let result = verify_provenance(&host, None, Path::new("/s/checksums.txt")).unwrap();
-        assert!(matches!(result, Provenance::Skipped { .. }));
+        let check = ProvenanceCheck::detect(&host);
+        assert_eq!(
+            check,
+            ProvenanceCheck::Unavailable {
+                reason: GH_NOT_INSTALLED.into()
+            }
+        );
+        let result = verify_provenance(
+            &host,
+            &check,
+            Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.46.0",
+        )
+        .unwrap();
         assert!(result.message().contains("not installed"));
         assert!(host.ran().is_empty());
     }
 
     #[test]
-    fn verify_006_provenance_skipped_when_gh_logged_out() {
-        let host = FakeHost::new()
-            .exe("/usr/bin/gh")
-            .answer("/usr/bin/gh auth status", fail("not logged in"));
-        let result = verify_provenance(
-            &host,
-            Some(Path::new("/usr/bin/gh")),
-            Path::new("/s/checksums.txt"),
+    fn verify_006_logged_out_and_unexpected_failures_have_their_own_reasons() {
+        let logged_out = FakeHost::new().exe(GH).on_path("/usr/bin").answer(
+            "/usr/bin/gh auth status",
+            fail("You are not logged into any GitHub hosts. To log in, run: gh auth login"),
         );
-        assert!(matches!(result, Ok(Provenance::Skipped { .. })));
+        assert_eq!(
+            ProvenanceCheck::detect(&logged_out),
+            ProvenanceCheck::Unavailable {
+                reason: GH_LOGGED_OUT.into()
+            }
+        );
+
+        let invalid = FakeHost::new().exe(GH).on_path("/usr/bin").answer(
+            "/usr/bin/gh auth status",
+            fail("github.com\n  X Failed to log in to github.com using token (GITHUB_TOKEN)\n  - The token in GITHUB_TOKEN is invalid.\n"),
+        );
+        assert_eq!(
+            ProvenanceCheck::detect(&invalid),
+            ProvenanceCheck::Unavailable {
+                reason: GH_LOGGED_OUT.into()
+            }
+        );
+
+        let offline = FakeHost::new().exe(GH).on_path("/usr/bin").answer(
+            "/usr/bin/gh auth status",
+            fail("github.com\n  X Timeout trying to log in to github.com account u (keyring)\n"),
+        );
+        let ProvenanceCheck::Unavailable { reason } = ProvenanceCheck::detect(&offline) else {
+            panic!("an offline gh cannot check provenance");
+        };
+        assert_eq!(
+            reason,
+            "`gh auth status` failed: Timeout trying to log in to github.com account u (keyring)"
+        );
+
+        // On PATH by name, but not runnable: the spawn itself fails.
+        let unrunnable = FakeHost::new()
+            .on_path("/usr/bin")
+            .link(GH, "/usr/bin/gh-real");
+        let mut unrunnable = unrunnable;
+        unrunnable
+            .executables
+            .insert(PathBuf::from("/usr/bin/gh-real"));
+        let ProvenanceCheck::Unavailable { reason } = ProvenanceCheck::detect(&unrunnable) else {
+            panic!("a gh that cannot be spawned cannot check provenance");
+        };
+        assert!(reason.contains("could not be run"), "{reason}");
+
+        let logged_in = FakeHost::new()
+            .exe(GH)
+            .on_path("/usr/bin")
+            .answer("/usr/bin/gh auth status", ok(""));
+        assert_eq!(ProvenanceCheck::detect(&logged_in), available());
+        assert!(available().will_check());
     }
 
     #[test]
     fn verify_007_provenance_verified_and_failed() {
-        let verify = "/usr/bin/gh attestation verify /s/checksums.txt --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml";
+        let good = attestation_json(&[sha256_hex(b"other"), sha256_hex(MANIFEST)]);
         let host = FakeHost::new()
-            .exe("/usr/bin/gh")
+            .exe(GH)
             .answer("/usr/bin/gh auth status", ok(""))
-            .answer(verify, ok("Verification succeeded!"));
+            .answer(&verify_line("0.46.0"), ok(&good));
         assert_eq!(
             verify_provenance(
                 &host,
-                Some(Path::new("/usr/bin/gh")),
-                Path::new("/s/checksums.txt")
+                &available(),
+                Path::new("/s/checksums.txt"),
+                MANIFEST,
+                "v0.46.0"
             ),
             Ok(Provenance::Verified)
         );
 
         let host = FakeHost::new()
-            .exe("/usr/bin/gh")
+            .exe(GH)
             .answer("/usr/bin/gh auth status", ok(""))
-            .answer(verify, fail("no attestations found"));
+            .answer(&verify_line("0.46.0"), fail("no attestations found"));
         let err = verify_provenance(
             &host,
-            Some(Path::new("/usr/bin/gh")),
+            &available(),
             Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.46.0",
         )
         .unwrap_err();
         assert!(err.to_string().contains("no attestations found"), "{err}");
+    }
+
+    #[test]
+    fn verify_009_attestation_is_tied_to_the_release_tag() {
+        // `--source-ref refs/tags/v<version>`: gh refuses an attestation made
+        // for another tag, and that refusal aborts.
+        let host = FakeHost::new()
+            .exe(GH)
+            .answer("/usr/bin/gh auth status", ok(""))
+            .answer(
+                &verify_line("0.47.0"),
+                fail("Error: expected SourceRepositoryRef to be refs/tags/v0.47.0, got refs/tags/v0.46.0"),
+            );
+        let err = verify_provenance(
+            &host,
+            &available(),
+            Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.47.0",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::ProvenanceFailed { .. }),
+            "{err:?}"
+        );
+        assert!(host.ran().contains(&verify_line("0.47.0")));
+    }
+
+    #[test]
+    fn verify_010_attestation_must_cover_the_bytes_in_memory() {
+        // gh verified SOME file, but not the bytes whose checksums are used.
+        let elsewhere = attestation_json(&[sha256_hex(b"a swapped manifest")]);
+        let host = FakeHost::new()
+            .exe(GH)
+            .answer("/usr/bin/gh auth status", ok(""))
+            .answer(&verify_line("0.46.0"), ok(&elsewhere));
+        let err = verify_provenance(
+            &host,
+            &available(),
+            Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.46.0",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not cover"), "{err}");
+
+        let garbage = FakeHost::new()
+            .exe(GH)
+            .answer("/usr/bin/gh auth status", ok(""))
+            .answer(&verify_line("0.46.0"), ok("Verification succeeded!"));
+        assert!(
+            verify_provenance(
+                &garbage,
+                &available(),
+                Path::new("/s/checksums.txt"),
+                MANIFEST,
+                "0.46.0",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_011_a_promised_check_that_cannot_run_aborts() {
+        // The plan said provenance would be checked; by execution gh is logged
+        // out. That aborts instead of silently skipping.
+        let host = FakeHost::new().exe(GH).answer(
+            "/usr/bin/gh auth status",
+            fail("You are not logged into any GitHub hosts."),
+        );
+        let err = verify_provenance(
+            &host,
+            &available(),
+            Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.46.0",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            UpgradeError::ProvenanceUnavailable {
+                reason: GH_LOGGED_OUT.into()
+            }
+        );
+        assert!(err.to_string().contains("Nothing was changed"), "{err}");
+        assert!(!host.ran().iter().any(|line| line.contains("attestation")));
+
+        // And a plan that said it would not be checked skips with its reason.
+        let skipped = verify_provenance(
+            &FakeHost::new(),
+            &ProvenanceCheck::Unavailable {
+                reason: GH_LOGGED_OUT.into(),
+            },
+            Path::new("/s/checksums.txt"),
+            MANIFEST,
+            "0.46.0",
+        )
+        .unwrap();
+        assert_eq!(
+            skipped,
+            Provenance::Skipped {
+                reason: GH_LOGGED_OUT.into()
+            }
+        );
+    }
+
+    #[test]
+    fn verify_012_rehash_refuses_a_file_swapped_after_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("dot-agent-deck-linux-amd64");
+        std::fs::write(&staged, b"verified build").unwrap();
+        let digest = sha256_hex(b"verified build");
+        assert_eq!(rehash(&staged, &digest), Ok(()));
+
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, b"something else").unwrap();
+        let err = rehash(&staged, &digest).unwrap_err();
+        assert!(matches!(err, UpgradeError::StagedChanged { .. }), "{err:?}");
+        assert!(err.to_string().contains("was not installed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_013_rehash_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, b"verified build").unwrap();
+        let link = dir.path().join("staged");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(rehash(&link, &sha256_hex(b"verified build")).is_err());
     }
 
     #[test]

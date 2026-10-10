@@ -4,12 +4,19 @@
 //! it hands on is bytes that already passed [`super::verify`], and the
 //! replacing half ([`atomic_replace`], [`swap_app`], …) is synchronous and runs
 //! every subprocess through a [`Host`] by absolute path.
+//!
+//! Every upgrade stages its files in a directory of its own ([`Staging`]):
+//! created fresh, with an unpredictable name and mode `0700`, inside a staging
+//! root that must be a real directory the user owns and nobody else can write
+//! to ([`prepare_staging_root`]). Each staged file is created new, never
+//! following a symlink ([`write_new_file`]), and hashed again right before it
+//! is handed to whatever installs it ([`verify::rehash`]).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::plan::{PlanAction, PlanOptions, UpgradePlan};
-use super::verify::{self, Provenance};
+use super::plan::{self, PlanAction, PlanLine, UpgradePlan};
+use super::verify::{self, Provenance, ProvenanceCheck};
 use super::{
     CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, UpgradeError, run_checked,
 };
@@ -114,18 +121,24 @@ async fn fetch(url: &str) -> Result<Vec<u8>, UpgradeError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Downloaded {
     pub bytes: Vec<u8>,
+    /// Its SHA-256, as the checksum manifest lists it.
+    pub sha256: String,
     pub provenance: Provenance,
 }
 
 /// Download `asset` of release `version` and its checksum manifest, verify the
-/// manifest's provenance (when `gh` can) and the asset's checksum. The manifest
-/// is kept in `staging_dir` for `gh` to read.
+/// manifest's provenance (as `provenance` says the plan promised) and the
+/// asset's checksum.
+///
+/// The manifest is written once, as a new file in the private `staging_dir`,
+/// for `gh` to read; the checksums are parsed from the same bytes in memory,
+/// and [`verify::verify_provenance`] ties the two together by digest.
 pub async fn download_verified(
     host: &dyn Host,
     source: &ReleaseSource,
     version: &str,
     asset: &str,
-    gh: Option<&Path>,
+    provenance: &ProvenanceCheck,
     staging_dir: &Path,
 ) -> Result<Downloaded, UpgradeError> {
     let manifest_name = if asset.starts_with("dot-agent-deck-desktop-") {
@@ -133,15 +146,19 @@ pub async fn download_verified(
     } else {
         CLI_MANIFEST
     };
-    create_private_dir(staging_dir)?;
     let manifest = fetch(&source.asset_url(version, manifest_name)).await?;
     let manifest_path = staging_dir.join(manifest_name);
-    std::fs::write(&manifest_path, &manifest)?;
-    let provenance = verify::verify_provenance(host, gh, &manifest_path)?;
+    write_new_file(&manifest_path, &manifest, 0o600)?;
+    let provenance =
+        verify::verify_provenance(host, provenance, &manifest_path, &manifest, version)?;
     let manifest = String::from_utf8_lossy(&manifest);
     let bytes = fetch(&source.asset_url(version, asset)).await?;
-    verify::verify_checksum(&manifest, manifest_name, asset, &bytes)?;
-    Ok(Downloaded { bytes, provenance })
+    let sha256 = verify::verify_checksum(&manifest, manifest_name, asset, &bytes)?;
+    Ok(Downloaded {
+        bytes,
+        sha256,
+        provenance,
+    })
 }
 
 /// What an upgrade did.
@@ -159,9 +176,12 @@ pub enum Outcome {
         reported: Option<String>,
     },
     /// The verified file is at `path`; the user runs `command` to install it.
+    /// `command` is `None` when it could not be shown safely
+    /// ([`plan::install_binary_command`]).
     Staged {
         path: PathBuf,
-        command: String,
+        command: Option<String>,
+        version: String,
         provenance: Provenance,
     },
     /// The package or binary was installed behind a privilege prompt.
@@ -178,61 +198,82 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// What to tell the user, in the same words in every client.
+    /// What to tell the user, as a terminal prints it ([`Self::items`]).
     pub fn lines(&self) -> Vec<String> {
+        plan::render_lines(&self.items())
+    }
+
+    /// What to tell the user, line by line, in the same words in every client.
+    pub fn items(&self) -> Vec<PlanLine> {
+        let text = PlanLine::Text;
         match self {
             Self::Replaced {
                 path,
                 version,
                 provenance,
             } => vec![
-                format!("Upgraded {} to v{version}.", path.display()),
-                provenance.message(),
+                text(format!("Upgraded {} to v{version}.", path.display())),
+                text(provenance.message()),
             ],
-            Self::BrewUpgraded { formula, reported } => vec![match reported {
+            Self::BrewUpgraded { formula, reported } => vec![text(match reported {
                 Some(version) => {
                     format!("`brew upgrade {formula}` finished; it now reports v{version}.")
                 }
                 None => format!("`brew upgrade {formula}` finished."),
-            }],
+            })],
             Self::Staged {
                 command,
+                version,
                 provenance,
                 ..
-            } => vec![
-                "Downloaded and checked. Install it with:".to_string(),
-                format!("  {command}"),
-                provenance.message(),
-            ],
+            } => {
+                let mut lines = match command {
+                    Some(command) => vec![
+                        text("Downloaded and checked. Install it with:".to_string()),
+                        PlanLine::Command(command.clone()),
+                    ],
+                    None => vec![
+                        text("Downloaded and checked.".to_string()),
+                        text(plan::manual_upgrade_line(version)),
+                    ],
+                };
+                lines.push(text(provenance.message()));
+                lines
+            }
             Self::Installed {
                 version,
                 provenance,
-            } => vec![format!("Installed v{version}."), provenance.message()],
+            } => vec![
+                text(format!("Installed v{version}.")),
+                text(provenance.message()),
+            ],
             Self::AppReplaced {
                 app,
                 version,
                 provenance,
             } => vec![
-                format!(
+                text(format!(
                     "Replaced {} with v{version}. Quit and reopen Agent Deck to run it.",
                     app.display()
-                ),
-                provenance.message(),
+                )),
+                text(provenance.message()),
             ],
         }
     }
 }
 
 /// Carry out `plan`. The caller has shown it and the user confirmed.
+/// `staging_root` is where this upgrade creates its private staging
+/// directory ([`super::plan::PlanOptions::staging_root`]).
 pub async fn execute(
     host: &dyn Host,
     plan: &UpgradePlan,
     source: &ReleaseSource,
-    options: &PlanOptions,
+    staging_root: &Path,
 ) -> Result<Outcome, UpgradeError> {
     let version = plan.latest.as_str();
-    let staging_dir = options.staging_root.join(format!("v{version}"));
-    let gh = plan.installation.tools.gh.as_deref();
+    let platform = plan.installation.platform;
+    let provenance = &plan.provenance;
     match &plan.action {
         PlanAction::UpToDate
         | PlanAction::NotifyOnly
@@ -254,12 +295,12 @@ pub async fn execute(
             })
         }
         PlanAction::ReplaceBinary { target, asset } => {
+            let staging = Staging::create(staging_root, version)?;
             let downloaded =
-                download_verified(host, source, version, asset, gh, &staging_dir).await?;
-            atomic_replace(target, &downloaded.bytes, |candidate| {
+                download_verified(host, source, version, asset, provenance, staging.dir()).await?;
+            atomic_replace(target, &downloaded.bytes, &downloaded.sha256, |candidate| {
                 verify::verify_binary_version(host, candidate, version)
             })?;
-            let _ = std::fs::remove_dir_all(&staging_dir);
             Ok(Outcome::Replaced {
                 path: target.clone(),
                 version: version.to_string(),
@@ -269,64 +310,75 @@ pub async fn execute(
         PlanAction::StagedInstall {
             target,
             asset,
-            staged,
-            command,
             pkexec,
         } => {
+            let mut staging = Staging::create(staging_root, version)?;
             let downloaded =
-                download_verified(host, source, version, asset, gh, &staging_dir).await?;
-            write_staged(staged, &downloaded.bytes, 0o755)?;
-            verify::verify_binary_version(host, staged, version)?;
+                download_verified(host, source, version, asset, provenance, staging.dir()).await?;
+            let staged = staging.dir().join(asset);
+            write_new_file(&staged, &downloaded.bytes, 0o755)?;
+            verify::verify_binary_version(host, &staged, version)?;
+            let command =
+                plan::install_binary_command(platform, &staged, target, &downloaded.sha256);
             match pkexec {
                 Some(pkexec) => {
-                    run_checked(
+                    install_binary_privileged(
                         host,
                         pkexec,
-                        &[
-                            OsStr::new("/usr/bin/install"),
-                            OsStr::new("-m"),
-                            OsStr::new("0755"),
-                            staged.as_os_str(),
-                            target.as_os_str(),
-                        ],
-                    )?;
-                    verify::verify_binary_version(host, target, version)?;
-                    let _ = std::fs::remove_dir_all(&staging_dir);
+                        &staged,
+                        target,
+                        &downloaded.sha256,
+                        version,
+                        command,
+                    )
+                    .inspect_err(|e| staging.keep_after(e))?;
                     Ok(Outcome::Installed {
                         version: version.to_string(),
                         provenance: downloaded.provenance,
                     })
                 }
-                None => Ok(Outcome::Staged {
-                    path: staged.clone(),
-                    command: command.clone(),
-                    provenance: downloaded.provenance,
-                }),
+                None => {
+                    if command.is_some() {
+                        staging.keep();
+                    }
+                    Ok(Outcome::Staged {
+                        path: staged,
+                        command,
+                        version: version.to_string(),
+                        provenance: downloaded.provenance,
+                    })
+                }
             }
         }
-        PlanAction::InstallDeb {
-            asset,
-            staged,
-            command,
-            pkexec,
-        } => {
+        PlanAction::InstallDeb { asset, pkexec } => {
+            let mut staging = Staging::create(staging_root, version)?;
             let downloaded =
-                download_verified(host, source, version, asset, gh, &staging_dir).await?;
-            write_staged(staged, &downloaded.bytes, 0o644)?;
+                download_verified(host, source, version, asset, provenance, staging.dir()).await?;
+            let staged = staging.dir().join(asset);
+            write_new_file(&staged, &downloaded.bytes, 0o644)?;
+            let command = plan::install_deb_command(&staged, &downloaded.sha256);
             match pkexec {
                 Some(pkexec) => {
-                    install_deb(host, pkexec, staged)?;
-                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    verify::rehash(&staged, &downloaded.sha256)?;
+                    install_deb(host, pkexec, &staged)
+                        .map_err(|e| privilege_failed(e, command, version))
+                        .inspect_err(|e| staging.keep_after(e))?;
                     Ok(Outcome::Installed {
                         version: version.to_string(),
                         provenance: downloaded.provenance,
                     })
                 }
-                None => Ok(Outcome::Staged {
-                    path: staged.clone(),
-                    command: command.clone(),
-                    provenance: downloaded.provenance,
-                }),
+                None => {
+                    if command.is_some() {
+                        staging.keep();
+                    }
+                    Ok(Outcome::Staged {
+                        path: staged,
+                        command,
+                        version: version.to_string(),
+                        provenance: downloaded.provenance,
+                    })
+                }
             }
         }
         PlanAction::SwapApp {
@@ -334,12 +386,13 @@ pub async fn execute(
             asset,
             team_id,
         } => {
+            let staging = Staging::create(staging_root, version)?;
             let downloaded =
-                download_verified(host, source, version, asset, gh, &staging_dir).await?;
-            let dmg = staging_dir.join(asset);
-            write_staged(&dmg, &downloaded.bytes, 0o644)?;
-            swap_app(host, &dmg, app, team_id, version, &staging_dir)?;
-            let _ = std::fs::remove_dir_all(&staging_dir);
+                download_verified(host, source, version, asset, provenance, staging.dir()).await?;
+            let dmg = staging.dir().join(asset);
+            write_new_file(&dmg, &downloaded.bytes, 0o644)?;
+            verify::rehash(&dmg, &downloaded.sha256)?;
+            swap_app(host, &dmg, app, team_id, version, staging.dir())?;
             Ok(Outcome::AppReplaced {
                 app: app.clone(),
                 version: version.to_string(),
@@ -349,7 +402,183 @@ pub async fn execute(
     }
 }
 
-fn create_private_dir(dir: &Path) -> Result<(), UpgradeError> {
+/// The release page a user reinstalls from.
+fn release_page(version: &str) -> String {
+    format!("{}/releases/tag/v{version}", crate::repo_identity::URL)
+}
+
+/// A failed privilege prompt, carrying the command that installs the verified
+/// file instead. Any other error passes through.
+fn privilege_failed(error: UpgradeError, install: Option<String>, version: &str) -> UpgradeError {
+    match error {
+        UpgradeError::CommandFailed { command, detail } => UpgradeError::PrivilegeFailed {
+            command,
+            detail,
+            install,
+            version: version.to_string(),
+        },
+        other => other,
+    }
+}
+
+/// Install the verified binary at `staged` over `target` behind `pkexec`.
+///
+/// `staged` is hashed again right before `pkexec` gets it. Once installed,
+/// `target` (root-owned now, so no longer the user's to change) is hashed
+/// against the verified digest BEFORE it is run for its `--version`: a
+/// mismatch means what root installed is not the verified build, which is
+/// reported as such and never executed. `fallback` is the command the user
+/// runs when the prompt itself fails.
+pub fn install_binary_privileged(
+    host: &dyn Host,
+    pkexec: &Path,
+    staged: &Path,
+    target: &Path,
+    sha256: &str,
+    version: &str,
+    fallback: Option<String>,
+) -> Result<(), UpgradeError> {
+    verify::rehash(staged, sha256)?;
+    run_checked(
+        host,
+        pkexec,
+        &[
+            OsStr::new("/usr/bin/install"),
+            OsStr::new("-m"),
+            OsStr::new("0755"),
+            staged.as_os_str(),
+            target.as_os_str(),
+        ],
+    )
+    .map_err(|e| privilege_failed(e, fallback, version))?;
+    let actual = verify::file_sha256(target).unwrap_or_else(|e| format!("unreadable: {e}"));
+    if actual != sha256 {
+        return Err(UpgradeError::InstalledMismatch {
+            target: target.display().to_string(),
+            expected: sha256.to_string(),
+            actual,
+            release: release_page(version),
+        });
+    }
+    verify::verify_binary_version(host, target, version)
+}
+
+/// The private directory one upgrade stages its files in. Removed when
+/// dropped, unless kept for a command the user still has to run.
+pub struct Staging {
+    dir: PathBuf,
+    keep: bool,
+}
+
+impl Staging {
+    /// Create a fresh staging directory for release `version` under `root`:
+    /// `v<version>-<random>`, mode `0700`, created exclusively, so two
+    /// upgrades never share one and nobody can prepare it in advance. `root`
+    /// must pass [`prepare_staging_root`].
+    pub fn create(root: &Path, version: &str) -> Result<Self, UpgradeError> {
+        prepare_staging_root(root)?;
+        for _ in 0..16 {
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes)
+                .map_err(|e| UpgradeError::Io(format!("OS randomness is unavailable: {e}")))?;
+            let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = root.join(format!("v{version}-{suffix}"));
+            match create_dir_private(&dir) {
+                Ok(()) => return Ok(Self { dir, keep: false }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(UpgradeError::Io(format!(
+            "Cannot create a staging directory in {}.",
+            root.display()
+        )))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Leave the directory in place: the user still installs from it.
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+
+    /// Keep the directory when `error` hands the user a command that installs
+    /// from it (a failed privilege prompt).
+    fn keep_after(&mut self, error: &UpgradeError) {
+        if matches!(
+            error,
+            UpgradeError::PrivilegeFailed {
+                install: Some(_),
+                ..
+            }
+        ) {
+            self.keep();
+        }
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Make sure `root` can hold private staging directories: create it (mode
+/// `0700`) when missing, then refuse it unless it is a real directory — not a
+/// symlink — owned by the current user and not writable by group or others.
+/// Anything else lets another user prepare or replace what is staged in it.
+pub fn prepare_staging_root(root: &Path) -> Result<(), UpgradeError> {
+    let unsafe_root = |why: &str| UpgradeError::StagingUnsafe {
+        root: root.display().to_string(),
+        why: why.to_string(),
+    };
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match create_dir_private(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let meta = std::fs::symlink_metadata(root)?;
+    if meta.file_type().is_symlink() {
+        return Err(unsafe_root("it is a symbolic link"));
+    }
+    if !meta.is_dir() {
+        return Err(unsafe_root("it is not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return Err(unsafe_root("it belongs to another user"));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(unsafe_root("other users can write to it"));
+        }
+    }
+    Ok(())
+}
+
+/// Create the one directory `dir` (not its parents), private to the user.
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(dir)
+}
+
+/// Create `dir` and any missing parents, private to the user.
+fn create_private_dir_all(dir: &Path) -> Result<(), UpgradeError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -363,20 +592,34 @@ fn create_private_dir(dir: &Path) -> Result<(), UpgradeError> {
     Ok(())
 }
 
-/// Write `bytes` to `path` (replacing what is there) with `mode`.
-fn write_staged(path: &Path, bytes: &[u8], mode: u32) -> Result<(), UpgradeError> {
-    if let Some(dir) = path.parent() {
-        create_private_dir(dir)?;
+/// Write `bytes` to a NEW file at `path` with `mode`. It fails rather than
+/// write through anything already there, a symlink included (`O_EXCL`, and
+/// `O_NOFOLLOW` on Unix).
+pub fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), UpgradeError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode).custom_flags(libc::O_NOFOLLOW);
     }
-    let _ = std::fs::remove_file(path);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut file = options.open(path)?;
     std::io::Write::write_all(&mut file, bytes)?;
     set_mode(&file, mode)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Open `path` for reading without following a symlink in its last component.
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 #[cfg(unix)]
@@ -392,11 +635,13 @@ fn set_mode(_file: &std::fs::File, _mode: u32) -> std::io::Result<()> {
 
 /// Replace `target` with `bytes` atomically: write a temporary file in the
 /// same directory, fsync it, run `check` on it (the new binary's `--version`),
-/// and only then rename it over `target` and fsync the directory. On any
-/// failure the temporary file is removed and `target` is left as it was.
+/// hash it again against `sha256`, and only then rename it over `target` and
+/// fsync the directory. On any failure the temporary file is removed and
+/// `target` is left as it was.
 pub fn atomic_replace(
     target: &Path,
     bytes: &[u8],
+    sha256: &str,
     check: impl FnOnce(&Path) -> Result<(), UpgradeError>,
 ) -> Result<(), UpgradeError> {
     let dir = target
@@ -406,9 +651,11 @@ pub fn atomic_replace(
         .file_name()
         .map_or_else(|| CLI_BINARY.into(), |n| n.to_string_lossy().into_owned());
     let temp = dir.join(format!(".{name}.upgrade-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
     let result = (|| {
-        write_staged(&temp, bytes, 0o755)?;
+        write_new_file(&temp, bytes, 0o755)?;
         check(&temp)?;
+        verify::rehash(&temp, sha256)?;
         std::fs::rename(&temp, target)?;
         #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
@@ -496,7 +743,7 @@ pub fn swap_app(
     work_dir: &Path,
 ) -> Result<(), UpgradeError> {
     let mount = work_dir.join("mount");
-    create_private_dir(&mount)?;
+    create_private_dir_all(&mount)?;
     run_checked(
         host,
         Path::new(HDIUTIL),
@@ -580,7 +827,7 @@ mod tests {
         let target = dir.path().join("dot-agent-deck");
         std::fs::write(&target, b"old").unwrap();
         let mut checked = None;
-        atomic_replace(&target, b"new", |candidate| {
+        atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |candidate| {
             assert_eq!(std::fs::read(candidate).unwrap(), b"new");
             assert_eq!(
                 candidate.parent(),
@@ -607,7 +854,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dot-agent-deck");
         std::fs::write(&target, b"old").unwrap();
-        let err = atomic_replace(&target, b"new", |_| {
+        let err = atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |_| {
             Err(UpgradeError::VersionMismatch {
                 expected: "0.46.0".into(),
                 actual: "v0.45.0".into(),
@@ -803,12 +1050,337 @@ mod tests {
     fn execute_008_outcome_lines() {
         let outcome = Outcome::Staged {
             path: PathBuf::from("/s/x"),
-            command: "sudo install -m 0755 /s/x /usr/local/bin/dot-agent-deck".into(),
+            command: Some("sudo install -m 0755 /s/x /usr/local/bin/dot-agent-deck".into()),
+            version: "0.46.0".into(),
             provenance: Provenance::Verified,
         };
         assert_eq!(
             outcome.lines()[1],
             "  sudo install -m 0755 /s/x /usr/local/bin/dot-agent-deck"
+        );
+        assert_eq!(
+            outcome.items()[1],
+            PlanLine::Command("sudo install -m 0755 /s/x /usr/local/bin/dot-agent-deck".into())
+        );
+
+        // No command could be shown safely: the manual route, and no command.
+        let unshowable = Outcome::Staged {
+            path: PathBuf::from("/s/x"),
+            command: None,
+            version: "0.46.0".into(),
+            provenance: Provenance::Verified,
+        };
+        let items = unshowable.items();
+        assert!(
+            !items
+                .iter()
+                .any(|line| matches!(line, PlanLine::Command(_)))
+        );
+        assert_eq!(
+            items[1],
+            PlanLine::Text(plan::manual_upgrade_line("0.46.0"))
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn execute_009_staging_is_a_fresh_private_directory_per_upgrade() {
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("upgrade");
+        let first = Staging::create(&root, "0.46.0").unwrap();
+        let second = Staging::create(&root, "0.46.0").unwrap();
+        assert_ne!(
+            first.dir(),
+            second.dir(),
+            "two stagings of one release collide"
+        );
+        for staging in [&first, &second] {
+            assert_eq!(staging.dir().parent(), Some(root.as_path()));
+            let name = staging
+                .dir()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                name.starts_with("v0.46.0-") && name.len() > "v0.46.0-".len() + 8,
+                "{name}"
+            );
+            #[cfg(unix)]
+            assert_eq!(mode_of(staging.dir()), 0o700);
+        }
+        #[cfg(unix)]
+        assert_eq!(mode_of(&root), 0o700);
+
+        let (one, two) = (first.dir().to_path_buf(), second.dir().to_path_buf());
+        let mut kept = second;
+        kept.keep();
+        drop(first);
+        drop(kept);
+        assert!(!one.exists(), "a staging directory is removed when done");
+        assert!(two.exists(), "a kept one stays for the user's command");
+    }
+
+    #[test]
+    fn execute_010_concurrent_stagings_do_not_collide() {
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("upgrade");
+        let dirs: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.clone();
+                    scope.spawn(move || {
+                        let mut staging = Staging::create(&root, "0.46.0").unwrap();
+                        staging.keep();
+                        write_new_file(&staging.dir().join(CLI_MANIFEST), b"m", 0o600).unwrap();
+                        staging.dir().to_path_buf()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let unique: std::collections::HashSet<_> = dirs.iter().collect();
+        assert_eq!(unique.len(), dirs.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_011_a_permissive_staging_root_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().join("upgrade");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = Staging::create(&root, "0.46.0").err().unwrap();
+        assert!(matches!(err, UpgradeError::StagingUnsafe { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("other users can write to it"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was staged"
+        );
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(
+            Staging::create(&root, "0.46.0").is_err(),
+            "group-writable too"
+        );
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            Staging::create(&root, "0.46.0").is_ok(),
+            "readable by others is fine"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_012_a_symlinked_staging_root_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let elsewhere = state.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let root = state.path().join("upgrade");
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let err = Staging::create(&root, "0.46.0").err().unwrap();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        let file_root = state.path().join("a-file");
+        std::fs::write(&file_root, b"").unwrap();
+        let err = Staging::create(&file_root, "0.46.0").err().unwrap();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_013_a_planted_manifest_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let manifest = dir.path().join(CLI_MANIFEST);
+        std::os::unix::fs::symlink(&victim, &manifest).unwrap();
+        assert!(write_new_file(&manifest, b"attacker-chosen", 0o600).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        let fresh = dir.path().join("fresh");
+        write_new_file(&fresh, b"x", 0o600).unwrap();
+        assert_eq!(mode_of(&fresh), 0o600);
+        assert!(
+            write_new_file(&fresh, b"y", 0o600).is_err(),
+            "never overwrites"
+        );
+    }
+
+    #[test]
+    fn execute_014_atomic_replace_refuses_a_temp_swapped_after_its_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dot-agent-deck");
+        std::fs::write(&target, b"old").unwrap();
+        let err = atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |candidate| {
+            // Another process swaps the checked file before the rename.
+            std::fs::remove_file(candidate).unwrap();
+            std::fs::write(candidate, b"evil").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, UpgradeError::StagedChanged { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    const PKEXEC: &str = "/usr/bin/pkexec";
+
+    /// A staged binary and the target it is installed over, in a temp dir.
+    fn staged_install(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, bytes).unwrap();
+        let target = dir.path().join("dot-agent-deck");
+        std::fs::write(&target, b"old").unwrap();
+        (dir, staged, target, verify::sha256_hex(bytes))
+    }
+
+    /// `pkexec /usr/bin/install -m 0755 <from> <to>` writes `installed` to
+    /// `<to>` (the verified bytes for an honest install).
+    fn installing(installed: Option<&'static [u8]>) -> FakeHost {
+        FakeHost::new().exe(PKEXEC).handle(PKEXEC, move |args| {
+            let to = PathBuf::from(&args[4]);
+            match installed {
+                Some(bytes) => std::fs::write(&to, bytes).unwrap(),
+                None => {
+                    std::fs::copy(&args[3], &to).unwrap();
+                }
+            }
+            ok("")
+        })
+    }
+
+    #[test]
+    fn execute_015_privileged_install_checks_and_then_runs_the_target() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = installing(None).answer(
+            &format!("{} --version", target.display()),
+            ok("dot-agent-deck 0.46.0\n"),
+        );
+        install_binary_privileged(
+            &host,
+            Path::new(PKEXEC),
+            &staged,
+            &target,
+            &sha,
+            "0.46.0",
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified build");
+        assert!(host.ran().last().unwrap().ends_with("--version"));
+    }
+
+    #[test]
+    fn execute_016_a_file_swapped_after_verification_is_refused_at_the_rehash() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, b"swapped in later").unwrap();
+        let host = installing(None);
+        let err = install_binary_privileged(
+            &host,
+            Path::new(PKEXEC),
+            &staged,
+            &target,
+            &sha,
+            "0.46.0",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpgradeError::StagedChanged { .. }), "{err:?}");
+        assert!(host.ran().is_empty(), "pkexec never ran: {:?}", host.ran());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    #[test]
+    fn execute_017_an_installed_target_that_does_not_match_is_reported_and_not_run() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        // What lands at the target is not what was verified (swapped between
+        // the re-hash and `install` reading it).
+        let host = installing(Some(b"not the verified build")).answer(
+            &format!("{} --version", target.display()),
+            ok("dot-agent-deck 0.46.0\n"),
+        );
+        let err = install_binary_privileged(
+            &host,
+            Path::new(PKEXEC),
+            &staged,
+            &target,
+            &sha,
+            "0.46.0",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::InstalledMismatch { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("NOT the verified build"), "{message}");
+        assert!(message.contains("reinstall"), "{message}");
+        assert!(message.contains("/releases/tag/v0.46.0"), "{message}");
+        assert!(
+            !host.ran().iter().any(|line| line.ends_with("--version")),
+            "the mismatched target was executed: {:?}",
+            host.ran()
+        );
+    }
+
+    #[test]
+    fn execute_018_a_failed_prompt_hands_over_the_install_command() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new()
+            .exe(PKEXEC)
+            .handle(PKEXEC, |_| fail("Request dismissed"));
+        let command = plan::install_binary_command(None, &staged, &target, &sha);
+        let err = install_binary_privileged(
+            &host,
+            Path::new(PKEXEC),
+            &staged,
+            &target,
+            &sha,
+            "0.46.0",
+            command.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::PrivilegeFailed { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Request dismissed"), "{err}");
+        assert_eq!(
+            err.fallback(),
+            vec![
+                PlanLine::Text(plan::PROMPT_FAILED.into()),
+                PlanLine::Command(command.unwrap()),
+            ]
+        );
+        let unshowable = UpgradeError::PrivilegeFailed {
+            command: "pkexec".into(),
+            detail: "dismissed".into(),
+            install: None,
+            version: "0.46.0".into(),
+        };
+        assert_eq!(
+            unshowable.fallback(),
+            vec![PlanLine::Text(plan::manual_upgrade_line("0.46.0"))]
         );
     }
 }

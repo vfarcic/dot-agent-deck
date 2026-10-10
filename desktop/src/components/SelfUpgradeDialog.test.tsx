@@ -15,9 +15,10 @@ const APP_SWAP: SelfUpgradePlan = {
   action: "swap-app",
   actionable: true,
   confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?",
+  provenance: { checked: true, reason: null },
   lines: [
-    { text: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)", command: false },
-    { text: "Agent Deck at /Applications/Agent Deck.app. Upgrading downloads `dot-agent-deck-desktop-alpha-macos-arm64.dmg` from release v0.47.0, checks its checksum, signature and notarization, and replaces the app. Agent Deck then restarts to run v0.47.0.", command: false },
+    { text: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)", command: null },
+    { text: "Agent Deck at /Applications/Agent Deck.app. Upgrading downloads `dot-agent-deck-desktop-alpha-macos-arm64.dmg` from release v0.47.0, checks its checksum, signature and notarization, and replaces the app. Agent Deck then restarts to run v0.47.0.", command: null },
   ],
 };
 
@@ -26,9 +27,9 @@ const APP_DEB: SelfUpgradePlan = {
   action: "install-deb",
   lines: [
     APP_SWAP.lines[0],
-    { text: "Installed from the Agent Deck `.deb` (package `agent-deck`).", command: false },
-    { text: "Upgrading downloads `dot-agent-deck-desktop-alpha-linux-amd64.deb` from release v0.47.0, checks it, and asks for your password to install it. Without the prompt, install it with:", command: false },
-    { text: "sudo apt install /home/u/.local/state/dot-agent-deck/upgrade/v0.47.0/dot-agent-deck-desktop-alpha-linux-amd64.deb", command: true },
+    { text: "Installed from the Agent Deck `.deb` (package `agent-deck`).", command: null },
+    { text: "Upgrading downloads `dot-agent-deck-desktop-alpha-linux-amd64.deb` from release v0.47.0, checks it, and asks for your password to install it. If the prompt does not install it, the command to install it is shown then.", command: null },
+    { text: "Its checksum is checked against the release's checksum file, and that file's build provenance with `gh attestation verify`.", command: null },
   ],
 };
 
@@ -39,8 +40,8 @@ const APP_NOT_WRITABLE: SelfUpgradePlan = {
   confirmQuestion: null,
   lines: [
     APP_SWAP.lines[0],
-    { text: "/Applications is not writable by you, so Agent Deck cannot be replaced from here.", command: false },
-    { text: "Download https://github.com/vfarcic/dot-agent-deck/releases/download/v0.47.0/dot-agent-deck-desktop-alpha-macos-arm64.dmg, open it, and drag Agent Deck.app into /Applications, replacing the old one.", command: false },
+    { text: "/Applications is not writable by you, so Agent Deck cannot be replaced from here.", command: null },
+    { text: "Download https://github.com/vfarcic/dot-agent-deck/releases/download/v0.47.0/dot-agent-deck-desktop-alpha-macos-arm64.dmg, open it, and drag Agent Deck.app into /Applications, replacing the old one.", command: null },
   ],
 };
 
@@ -53,9 +54,10 @@ const CLI_BREW: SelfUpgradePlan = {
   action: "brew-upgrade",
   actionable: true,
   confirmQuestion: "Upgrade dot-agent-deck to v0.47.0?",
+  provenance: { checked: false, reason: "the GitHub CLI (`gh`) is not installed" },
   lines: [
-    { text: "dot-agent-deck: update available: v0.47.0 (current: v0.46.0)", command: false },
-    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the tap's latest release.", command: false },
+    { text: "dot-agent-deck: update available: v0.47.0 (current: v0.46.0)", command: null },
+    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the tap's latest release.", command: null },
   ],
 };
 
@@ -66,7 +68,7 @@ const CLI_NIX: SelfUpgradePlan = {
   confirmQuestion: null,
   lines: [
     CLI_BREW.lines[0],
-    { text: "Installed with Nix (/nix/store/abc/bin/dot-agent-deck), so it is not changed from here. Update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`.", command: false },
+    { text: "Installed with Nix (/nix/store/abc/bin/dot-agent-deck), so it is not changed from here. Update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`.", command: null },
   ],
 };
 
@@ -77,8 +79,8 @@ const CLI_SHOW_COMMAND: SelfUpgradePlan = {
   confirmQuestion: null,
   lines: [
     CLI_BREW.lines[0],
-    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck), but `brew` was not found. Upgrade it with:", command: false },
-    { text: "brew upgrade dot-agent-deck", command: true },
+    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck), but `brew` was not found. Upgrade it with:", command: null },
+    { text: "brew upgrade dot-agent-deck", command: "brew upgrade dot-agent-deck" },
   ],
 };
 
@@ -86,13 +88,28 @@ function checkOf(app: SelfUpgradePlan, cli: SelfUpgradePlan | null = null): Self
   return { latest: "0.47.0", updateAvailable: true, notice: app.headline, app, cli, recheckAfterSecs: 21600 };
 }
 
+const INSTALL_DEB = "echo '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /stage/v0.47.0-1f2e/x.deb' | sha256sum -c - && sudo apt install /stage/v0.47.0-1f2e/x.deb";
+
+/** A staged CLI install the bridge reported, with `command` as the crate built it. */
+function stagedResult(command: string, text = command): SelfUpgradeResult {
+  return {
+    copy: "cli",
+    ok: true,
+    relaunch: false,
+    lines: [
+      { text: "Downloaded and checked. Install it with:", command: null },
+      { text, command },
+    ],
+  };
+}
+
 const SWAPPED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
   relaunch: true,
   lines: [
-    { text: "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it.", command: false },
-    { text: "Build provenance verified with `gh attestation verify`.", command: false },
+    { text: "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it.", command: null },
+    { text: "Build provenance verified with `gh attestation verify`.", command: null },
   ],
 };
 
@@ -100,14 +117,14 @@ const DEB_INSTALLED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
   relaunch: false,
-  lines: [{ text: "Installed v0.47.0.", command: false }],
+  lines: [{ text: "Installed v0.47.0.", command: null }],
 };
 
 const BREWED: SelfUpgradeResult = {
   copy: "cli",
   ok: true,
   relaunch: false,
-  lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.47.0.", command: false }],
+  lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.47.0.", command: null }],
 };
 
 /** An api whose runs are resolved from the test, one copy at a time. */
@@ -237,15 +254,15 @@ describe("SelfUpgradeDialog", () => {
       ok: false,
       relaunch: false,
       lines: [
-        { text: "`/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb` failed: Request dismissed", command: false },
-        { text: "It was downloaded and checked, but not installed. Install it with:", command: false },
-        { text: "sudo apt install /stage/x.deb", command: true },
+        { text: "`/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb` failed: Request dismissed", command: null },
+        { text: "It was downloaded and checked, but not installed. Install it with:", command: null },
+        { text: INSTALL_DEB, command: INSTALL_DEB },
       ],
     });
     const result = screen.getByTestId("self-upgrade-result-app");
     expect(result).toHaveAttribute("data-ok", "false");
     expect(result).toHaveTextContent("Request dismissed");
-    expect(within(result).getByText("sudo apt install /stage/x.deb").tagName).toBe("CODE");
+    expect(within(result).getByTestId("self-upgrade-command").querySelector("code")?.textContent).toBe(INSTALL_DEB);
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
   });
 
@@ -260,5 +277,36 @@ describe("SelfUpgradeDialog", () => {
     await fail("app", new Error("An upgrade is already running."));
     expect(screen.getByTestId("self-upgrade-result-app")).toHaveTextContent("An upgrade is already running.");
     expect(screen.getByTestId("self-upgrade-done")).toBeInTheDocument();
+  });
+
+  /** Scenario: A staged install's command is longer than the display limit; the dialog shows it whole and Copy puts exactly that command, unshortened, on the clipboard. */
+  it("self_upgrade_dialog_009 shows and copies a long command whole", async () => {
+    const { api, finish } = controlledApi();
+    const copyText = vi.fn(async () => undefined);
+    const staged = `/home/u/${"segment-".repeat(120)}/dot-agent-deck-linux-amd64`;
+    const command = `echo '${"a".repeat(64)}  ${staged}' | sha256sum -c - && sudo install -m 0755 ${staged} /usr/local/bin/dot-agent-deck`;
+    expect(command.length).toBeGreaterThan(2048);
+    render(<SelfUpgradeDialog check={checkOf(APP_NOT_WRITABLE, CLI_BREW)} api={api} onClose={vi.fn()} copyText={copyText} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    // The bridge's display copy is shortened; the command is not.
+    await finish(stagedResult(command, `${command.slice(0, 2048)}`));
+    const result = screen.getByTestId("self-upgrade-result-cli");
+    expect(within(result).getByTestId("self-upgrade-command").querySelector("code")?.textContent).toBe(command);
+    fireEvent.click(within(result).getByTestId("self-upgrade-copy"));
+    expect(copyText).toHaveBeenCalledWith(command);
+  });
+
+  /** Scenario: A command carrying a character the dialog's sanitiser would remove (a bidi override) is shown sanitised and offers no Copy, so nothing different from what is shown can be copied. */
+  it("self_upgrade_dialog_010 offers Copy only for an unaltered command", async () => {
+    const { api, finish } = controlledApi();
+    const copyText = vi.fn(async () => undefined);
+    render(<SelfUpgradeDialog check={checkOf(APP_NOT_WRITABLE, CLI_BREW)} api={api} onClose={vi.fn()} copyText={copyText} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await finish(stagedResult("sudo install /stage/\u202Ex /usr/local/bin/dot-agent-deck"));
+    const command = within(screen.getByTestId("self-upgrade-result-cli")).getByTestId("self-upgrade-command");
+    expect(command).toHaveAttribute("data-copyable", "false");
+    expect(within(command).queryByTestId("self-upgrade-copy")).not.toBeInTheDocument();
+    expect(command).toHaveTextContent("sudo install /stage/x /usr/local/bin/dot-agent-deck");
+    expect(copyText).not.toHaveBeenCalled();
   });
 });

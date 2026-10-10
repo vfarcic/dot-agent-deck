@@ -195,6 +195,9 @@ mod tests {
         PlanOptions {
             staging_root: PathBuf::from("/stage"),
             can_prompt_for_privilege: false,
+            provenance: crate::self_upgrade::ProvenanceCheck::Unavailable {
+                reason: crate::self_upgrade::verify::GH_NOT_INSTALLED.into(),
+            },
         }
     }
 
@@ -272,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_006_tui_finds_deb_desktop_and_gets_its_command() {
+    fn discover_006_tui_finds_deb_desktop_and_plans_its_install() {
         let host = FakeHost::new()
             .exe("/usr/bin/dpkg-query")
             .on_path("/usr/bin")
@@ -292,9 +295,8 @@ mod tests {
         assert_eq!(found.method, InstallMethod::DesktopDeb);
         let plan = plan(&found, "0.46.0", &options());
         assert!(
-            plan.text().contains(
-                "sudo apt install /stage/v0.46.0/dot-agent-deck-desktop-alpha-linux-amd64.deb"
-            ),
+            plan.text()
+                .contains("from release v0.46.0 and checks it. The command to install it"),
             "{}",
             plan.text()
         );

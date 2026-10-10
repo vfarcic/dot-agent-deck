@@ -8,7 +8,7 @@ const CHECK: SelfUpgradeCheck = {
   latest: "0.47.0",
   updateAvailable: true,
   notice: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)",
-  app: { copy: "app", label: "Agent Deck (desktop app)", headline: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)", current: "0.46.0", latest: "0.47.0", action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?", lines: [] },
+  app: { copy: "app", label: "Agent Deck (desktop app)", headline: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)", current: "0.46.0", latest: "0.47.0", action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?", provenance: { checked: true, reason: null }, lines: [] },
   cli: null,
   recheckAfterSecs: 3600,
 };

@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dot_agent_deck::self_upgrade::{
-    CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanOptions, ReleaseSource,
-    SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError, UpgradePlan, detect, discover, execute,
-    plan,
+    CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
+    ProvenanceCheck, ReleaseSource, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError, UpgradePlan,
+    detect, discover, execute, plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
@@ -46,13 +46,24 @@ pub(crate) enum SelfCopy {
     Cli,
 }
 
-/// One line of a plan or a result. `command` marks a line that is a command
-/// for the user to run, which the dialog renders as code with a Copy button.
+/// One line of a plan or a result. `text` is for display only and may be
+/// shortened. `command`, on a line that is a command for the user to run, is
+/// that command exactly as the core built it, never shortened or rewritten:
+/// it is what Copy writes, and the dialog offers Copy only when its own
+/// display sanitizer would leave it unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LineDto {
     pub text: String,
-    pub command: bool,
+    pub command: Option<String>,
+}
+
+/// Whether build provenance will be checked for a plan, and when not, why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProvenanceDto {
+    pub checked: bool,
+    pub reason: Option<String>,
 }
 
 /// [`UpgradePlan`] for the webview.
@@ -71,6 +82,9 @@ pub(crate) struct PlanDto {
     /// The question the Upgrade button answers; `None` when there is nothing
     /// to confirm.
     pub confirm_question: Option<String>,
+    /// Whether build provenance will be checked, decided before the user
+    /// confirms (the lines say the same in words).
+    pub provenance: ProvenanceDto,
     pub lines: Vec<LineDto>,
 }
 
@@ -206,11 +220,13 @@ impl SelfUpgradeState {
 }
 
 /// The options this client plans with: staging where the terminal client
-/// stages, and a privilege prompt, which a desktop app can raise.
-pub(crate) fn options() -> PlanOptions {
+/// stages, a privilege prompt, which a desktop app can raise, and provenance
+/// as `gh` on the login-shell `PATH` allows.
+pub(crate) fn options(provenance: ProvenanceCheck) -> PlanOptions {
     PlanOptions {
+        staging_root: PlanOptions::default_staging_root(),
         can_prompt_for_privilege: true,
-        ..PlanOptions::terminal()
+        provenance,
     }
 }
 
@@ -246,22 +262,40 @@ fn action_name(action: &PlanAction) -> &'static str {
     }
 }
 
-/// The core's lines for the webview. The core indents a command the user runs
-/// by two spaces on a line of its own; that is what marks it here.
-fn line_dtos(lines: Vec<String>) -> Vec<LineDto> {
-    lines
+/// The core's lines for the webview. A command keeps its exact text in
+/// `command`; only the display copy goes through [`safe_message`], which
+/// drops control characters and caps the length. The core builds no command
+/// with a control or formatting character in it; one that somehow has one is
+/// shown as prose and never offered for copying.
+fn line_dtos(items: Vec<PlanLine>) -> Vec<LineDto> {
+    items
         .into_iter()
-        .map(|line| match line.strip_prefix("  ") {
-            Some(command) => LineDto {
-                text: safe_message(command.trim()),
-                command: true,
+        .map(|item| match item {
+            PlanLine::Text(text) => LineDto {
+                text: safe_message(text),
+                command: None,
             },
-            None => LineDto {
-                text: safe_message(line),
-                command: false,
+            PlanLine::Command(command) => LineDto {
+                text: safe_message(&command),
+                command: (dot_agent_deck::untrusted_text::strip_control_and_bidi(&command, false)
+                    == command)
+                    .then_some(command),
             },
         })
         .collect()
+}
+
+fn provenance_dto(check: &ProvenanceCheck) -> ProvenanceDto {
+    match check {
+        ProvenanceCheck::Available { .. } => ProvenanceDto {
+            checked: true,
+            reason: None,
+        },
+        ProvenanceCheck::Unavailable { reason } => ProvenanceDto {
+            checked: false,
+            reason: Some(safe_message(reason)),
+        },
+    }
 }
 
 pub(crate) fn plan_dto(copy: SelfCopy, plan: &UpgradePlan) -> PlanDto {
@@ -274,7 +308,8 @@ pub(crate) fn plan_dto(copy: SelfCopy, plan: &UpgradePlan) -> PlanDto {
         action: action_name(&plan.action),
         actionable: plan.is_actionable(),
         confirm_question: plan.confirm_question().map(safe_message),
-        lines: line_dtos(plan.lines()),
+        provenance: provenance_dto(&plan.provenance),
+        lines: line_dtos(plan.items()),
     }
 }
 
@@ -298,41 +333,19 @@ pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
     RunDto {
         copy,
         ok: true,
-        lines: line_dtos(outcome.lines()),
+        lines: line_dtos(outcome.items()),
         relaunch: matches!(outcome, Outcome::AppReplaced { .. }),
     }
 }
 
-/// The wording when the privilege prompt did not install a file that was
-/// downloaded and checked.
-pub(crate) const PROMPT_FAILED: &str =
-    "It was downloaded and checked, but not installed. Install it with:";
-
-/// A failed upgrade for the webview. When the failure was the privilege prompt
-/// itself — dismissed, refused, or `pkexec` failing — the verified file is
-/// still staged, so the exact command to install it follows the error.
-pub(crate) fn failure_dto(copy: SelfCopy, plan: &UpgradePlan, error: &UpgradeError) -> RunDto {
-    let mut lines = vec![error.to_string()];
-    let fallback = match &plan.action {
-        PlanAction::StagedInstall {
-            command,
-            pkexec: Some(pkexec),
-            ..
-        }
-        | PlanAction::InstallDeb {
-            command,
-            pkexec: Some(pkexec),
-            ..
-        } => Some((command, pkexec)),
-        _ => None,
-    };
-    if let (Some((command, pkexec)), UpgradeError::CommandFailed { command: ran, .. }) =
-        (fallback, error)
-        && ran.split(' ').next() == Some(pkexec.to_string_lossy().as_ref())
-    {
-        lines.push(PROMPT_FAILED.to_string());
-        lines.push(format!("  {command}"));
-    }
+/// A failed upgrade for the webview: the error, then what the core says to do
+/// instead. When the failure was the privilege prompt itself — dismissed,
+/// refused, or `pkexec` failing — the verified file is still staged, and the
+/// core hands over the exact command that installs it
+/// ([`UpgradeError::fallback`]).
+pub(crate) fn failure_dto(copy: SelfCopy, error: &UpgradeError) -> RunDto {
+    let mut lines = vec![PlanLine::Text(error.to_string())];
+    lines.extend(error.fallback());
     RunDto {
         copy,
         ok: false,
@@ -360,7 +373,8 @@ pub(crate) async fn desktop_self_upgrade_check(
         let path = state.login_path();
         let host = SystemHost { path: path.clone() };
         let running = detect::running(&host, CopyKind::Desktop).map_err(|e| e.to_string())?;
-        let checked = check_plans(&host, &running, &latest, &options(), path.as_deref());
+        let options = options(ProvenanceCheck::detect(&host));
+        let checked = check_plans(&host, &running, &latest, &options, path.as_deref());
         state.store(checked.clone());
         Ok::<_, String>(checked)
     })
@@ -394,7 +408,7 @@ pub(crate) async fn desktop_self_upgrade_run(
             &host,
             &run_plan,
             &ReleaseSource::from_build(),
-            &options(),
+            &PlanOptions::default_staging_root(),
         ))
     })
     .await
@@ -406,7 +420,7 @@ pub(crate) async fn desktop_self_upgrade_run(
             }
             outcome_dto(copy, &outcome)
         }
-        Err(error) => failure_dto(copy, &plan, &error),
+        Err(error) => failure_dto(copy, &error),
     })
 }
 
@@ -573,6 +587,9 @@ mod tests {
         PlanOptions {
             staging_root: PathBuf::from("/home/u/.local/state/dot-agent-deck/upgrade"),
             can_prompt_for_privilege: true,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "the GitHub CLI (`gh`) is not installed".into(),
+            },
         }
     }
 
@@ -645,8 +662,7 @@ mod tests {
     fn commands(lines: &[LineDto]) -> Vec<String> {
         lines
             .iter()
-            .filter(|line| line.command)
-            .map(|line| line.text.clone())
+            .filter_map(|line| line.command.clone())
             .collect()
     }
 
@@ -662,12 +678,9 @@ mod tests {
         );
         let text = texts(&dto.app.lines).join("\n");
         assert!(text.contains("asks for your password"), "{text}");
-        assert_eq!(
-            commands(&dto.app.lines),
-            vec![
-                "sudo apt install /home/u/.local/state/dot-agent-deck/upgrade/v0.47.0/dot-agent-deck-desktop-alpha-linux-amd64.deb"
-            ]
-        );
+        // The staged path is only known once the download is verified, so the
+        // plan names no command yet.
+        assert!(commands(&dto.app.lines).is_empty());
         // The `.deb`'s bundled CLI upgrades with the package: not a second copy.
         assert_eq!(dto.cli, None);
     }
@@ -678,9 +691,11 @@ mod tests {
         assert_eq!(dto.app.action, "install-deb");
         let text = texts(&dto.app.lines).join("\n");
         assert!(!text.contains("asks for your password"), "{text}");
-        assert!(text.contains("Then install it with:"), "{text}");
-        assert_eq!(commands(&dto.app.lines).len(), 1);
-        assert!(commands(&dto.app.lines)[0].starts_with("sudo apt install "));
+        assert!(
+            text.contains("is shown once the download is verified"),
+            "{text}"
+        );
+        assert!(commands(&dto.app.lines).is_empty());
     }
 
     #[test]
@@ -809,12 +824,7 @@ mod tests {
         assert!(cli.actionable);
         let text = texts(&cli.lines).join("\n");
         assert!(text.contains("asks for your password"), "{text}");
-        assert_eq!(
-            commands(&cli.lines),
-            vec![
-                "sudo install -m 0755 /home/u/.local/state/dot-agent-deck/upgrade/v0.47.0/dot-agent-deck-linux-amd64 /usr/local/bin/dot-agent-deck"
-            ]
-        );
+        assert!(commands(&cli.lines).is_empty());
     }
 
     #[test]
@@ -828,8 +838,10 @@ mod tests {
         assert_eq!(cli.action, "staged-install");
         let text = texts(&cli.lines).join("\n");
         assert!(!text.contains("asks for your password"), "{text}");
-        assert!(text.contains("Then install it with:"), "{text}");
-        assert!(commands(&cli.lines)[0].starts_with("sudo install -m 0755 "));
+        assert!(
+            text.contains("is shown once the download is verified"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -931,7 +943,8 @@ mod tests {
             },
             Outcome::Staged {
                 path: PathBuf::from("/stage/x.deb"),
-                command: "sudo apt install /stage/x.deb".into(),
+                command: Some("sudo apt install /stage/x.deb".into()),
+                version: LATEST.into(),
                 provenance: provenance(),
             },
         ];
@@ -947,40 +960,30 @@ mod tests {
         );
     }
 
-    fn deb_plan_with_pkexec() -> UpgradePlan {
-        let host = deb_machine().exe("/usr/bin/pkexec");
-        let running = running(&host, DEB_APP, Platform::LinuxAmd64, CURRENT);
-        plan::plan(&running, LATEST, &test_options())
-    }
-
     #[test]
     fn self_upgrade_017_a_dismissed_password_prompt_shows_the_command() {
-        let plan = deb_plan_with_pkexec();
-        let dismissed = UpgradeError::CommandFailed {
-            command: "/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb".into(),
+        let install = "echo 'abc  /stage/v0.47.0-1f/x.deb' | sha256sum -c - && sudo apt install /stage/v0.47.0-1f/x.deb";
+        let dismissed = UpgradeError::PrivilegeFailed {
+            command: "/usr/bin/pkexec /usr/bin/apt-get install -y /stage/v0.47.0-1f/x.deb".into(),
             detail: "Error executing command as another user: Request dismissed".into(),
+            install: Some(install.into()),
+            version: LATEST.into(),
         };
-        let dto = failure_dto(SelfCopy::App, &plan, &dismissed);
+        let dto = failure_dto(SelfCopy::App, &dismissed);
         assert!(!dto.ok);
         assert!(!dto.relaunch);
         assert!(dto.lines[0].text.contains("Request dismissed"));
-        assert_eq!(dto.lines[1].text, PROMPT_FAILED);
-        assert_eq!(
-            commands(&dto.lines),
-            vec![
-                "sudo apt install /home/u/.local/state/dot-agent-deck/upgrade/v0.47.0/dot-agent-deck-desktop-alpha-linux-amd64.deb"
-            ]
-        );
+        assert_eq!(dto.lines[1].text, plan::PROMPT_FAILED);
+        assert_eq!(commands(&dto.lines), vec![install]);
     }
 
     #[test]
     fn self_upgrade_018_a_failure_before_the_prompt_offers_no_command() {
-        let plan = deb_plan_with_pkexec();
         let download = UpgradeError::Download {
             url: "https://example.invalid/x.deb".into(),
             detail: "timed out".into(),
         };
-        let dto = failure_dto(SelfCopy::App, &plan, &download);
+        let dto = failure_dto(SelfCopy::App, &download);
         assert!(!dto.ok);
         assert_eq!(dto.lines.len(), 1);
         assert!(commands(&dto.lines).is_empty());
@@ -995,7 +998,12 @@ mod tests {
         assert_eq!(json["app"]["copy"], "app");
         assert_eq!(json["app"]["action"], "install-deb");
         assert!(json["app"]["confirmQuestion"].is_string());
-        assert_eq!(json["app"]["lines"][0]["command"], false);
+        assert!(json["app"]["lines"][0]["command"].is_null());
+        assert_eq!(json["app"]["provenance"]["checked"], false);
+        assert_eq!(
+            json["app"]["provenance"]["reason"],
+            "the GitHub CLI (`gh`) is not installed"
+        );
         assert!(json["cli"].is_null());
         let copy: SelfCopy = serde_json::from_str("\"cli\"").unwrap();
         assert_eq!(copy, SelfCopy::Cli);
@@ -1047,6 +1055,125 @@ mod tests {
 
     #[test]
     fn self_upgrade_023_the_app_plans_with_a_privilege_prompt() {
-        assert!(options().can_prompt_for_privilege);
+        let gh = ProvenanceCheck::Available {
+            gh: PathBuf::from("/usr/bin/gh"),
+        };
+        let options = options(gh.clone());
+        assert!(options.can_prompt_for_privilege);
+        assert_eq!(options.provenance, gh);
+    }
+
+    #[test]
+    fn self_upgrade_024_a_long_command_reaches_the_webview_whole() {
+        // Longer than `safe_message`'s cap: the display copy may be shortened,
+        // the command Copy writes never is.
+        let staged = format!(
+            "/home/u/{}/dot-agent-deck-linux-amd64",
+            "segment-".repeat(120)
+        );
+        let command = plan::install_binary_command(
+            Some(Platform::LinuxAmd64),
+            Path::new(&staged),
+            Path::new("/usr/local/bin/dot-agent-deck"),
+            &"a".repeat(64),
+        )
+        .expect("a long but clean path still gets a command");
+        assert!(command.chars().count() > 2048);
+        let dto = outcome_dto(
+            SelfCopy::Cli,
+            &Outcome::Staged {
+                path: PathBuf::from(&staged),
+                command: Some(command.clone()),
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        );
+        assert_eq!(commands(&dto.lines), vec![command.clone()]);
+        assert!(command.ends_with(" /usr/local/bin/dot-agent-deck"));
+    }
+
+    #[test]
+    fn self_upgrade_025_a_command_with_hidden_characters_is_never_copyable() {
+        let dto = outcome_dto(
+            SelfCopy::Cli,
+            &Outcome::Staged {
+                path: PathBuf::from("/stage/x"),
+                command: Some("sudo install /stage/\u{202E}x /usr/local/bin/x".into()),
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        );
+        assert!(commands(&dto.lines).is_empty());
+        // And the core shows no command for such a path in the first place:
+        // the manual route instead.
+        assert_eq!(
+            plan::install_binary_command(
+                Some(Platform::LinuxAmd64),
+                Path::new("/stage/\u{202E}x"),
+                Path::new("/usr/local/bin/dot-agent-deck"),
+                &"a".repeat(64),
+            ),
+            None
+        );
+        let manual = outcome_dto(
+            SelfCopy::Cli,
+            &Outcome::Staged {
+                path: PathBuf::from("/stage/x"),
+                command: None,
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        );
+        assert!(commands(&manual.lines).is_empty());
+        assert!(
+            texts(&manual.lines)
+                .join("\n")
+                .contains("Upgrade manually from"),
+            "{manual:?}"
+        );
+    }
+
+    #[test]
+    fn self_upgrade_026_the_plan_says_whether_provenance_will_be_checked() {
+        let host = deb_machine();
+        let path = host.login_path();
+        let running = running(&host, DEB_APP, Platform::LinuxAmd64, CURRENT);
+        let logged_out = PlanOptions {
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "the GitHub CLI (`gh`) is not logged in, or its token is invalid (run `gh auth login`)".into(),
+            },
+            ..test_options()
+        };
+        let dto = check_dto(&check_plans(
+            &host,
+            &running,
+            LATEST,
+            &logged_out,
+            Some(&path),
+        ));
+        assert!(!dto.app.provenance.checked);
+        assert!(texts(&dto.app.lines).join("\n").contains(
+            "Build provenance will NOT be checked: the GitHub CLI (`gh`) is not logged in"
+        ),);
+        let available = PlanOptions {
+            provenance: ProvenanceCheck::Available {
+                gh: PathBuf::from("/usr/bin/gh"),
+            },
+            ..test_options()
+        };
+        let dto = check_dto(&check_plans(
+            &host,
+            &running,
+            LATEST,
+            &available,
+            Some(&path),
+        ));
+        assert_eq!(
+            dto.app.provenance,
+            ProvenanceDto {
+                checked: true,
+                reason: None
+            }
+        );
     }
 }
