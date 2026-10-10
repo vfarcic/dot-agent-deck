@@ -163,6 +163,30 @@ pub struct SystemHost {
     pub path: Option<std::ffi::OsString>,
 }
 
+impl SystemHost {
+    /// [`Host::run_within`], also ended early once `cancelled` answers true:
+    /// the command is then stopped as one past its bound is, and the error
+    /// says it was cancelled ([`std::io::ErrorKind::Interrupted`]) and
+    /// whether it was stopped ([`unfinished_stopped`]). `cancelled` is asked
+    /// every few milliseconds while the command runs, so it must be cheap.
+    /// For a client that forwards its own interruption to the command (the
+    /// CLI's Ctrl+C, [`cli`]); nothing here touches a signal disposition.
+    pub fn run_within_cancellable(
+        &self,
+        program: &Path,
+        args: &[&OsStr],
+        timeout: std::time::Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> std::io::Result<CommandOutput> {
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        if let Some(path) = &self.path {
+            command.env("PATH", path);
+        }
+        run_bounded(&mut command, timeout, cancelled, &stop_child)
+    }
+}
+
 impl Host for SystemHost {
     fn run_within(
         &self,
@@ -172,10 +196,7 @@ impl Host for SystemHost {
     ) -> std::io::Result<CommandOutput> {
         let mut command = std::process::Command::new(program);
         command.args(args);
-        if let Some(path) = &self.path {
-            command.env("PATH", path);
-        }
-        run_bounded(&mut command, timeout, &stop_child)
+        self.run_within_cancellable(program, args, timeout, &|| false)
     }
 
     fn find_program(&self, name: &str) -> Option<PathBuf> {
@@ -260,12 +281,17 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const READ_POLL_MS: i32 = 50;
 
 /// Run `command` (stdin closed, stdout and stderr captured) for at most
-/// `timeout`.
+/// `timeout`, or until `cancelled` answers true.
 ///
-/// On Unix the command runs in a process group of its own, and one still
-/// running at the bound is stopped by `SIGKILL` to that group alone, so what
-/// it started dies with it; a descendant that moved to another group or
-/// session escapes it. The error says how long the command was given and
+/// On Unix the command runs in a session of its own (`setsid`), so it has no
+/// controlling terminal: one that opens `/dev/tty` fails at once with
+/// `ENXIO` instead of being stopped by `SIGTTIN` as a background job of the
+/// user's terminal, and the terminal's `^C` does not reach it (the CLI
+/// forwards its own as cancellation, [`cli`]). The session's id is its
+/// process group's, and one still running at the bound, or when cancelled,
+/// is stopped by `SIGKILL` to that group alone, so what it started dies with
+/// it; a descendant that moved to another group or session escapes it. The
+/// error says how long the command was given, or that it was cancelled, and
 /// whether it was stopped (`stop` returning whether it exited): a command
 /// `pkexec` started runs as root, which this user cannot signal, so it may
 /// still be running, and a thread waits for it so it does not stay a zombie.
@@ -288,6 +314,7 @@ const READ_POLL_MS: i32 = 50;
 fn run_bounded(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
+    cancelled: &dyn Fn() -> bool,
     stop: &dyn Fn(&mut std::process::Child) -> bool,
 ) -> std::io::Result<CommandOutput> {
     use std::process::Stdio;
@@ -298,7 +325,18 @@ fn run_bounded(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // SAFETY: the closure runs in the forked child before `exec`, and
+        // calls only setsid(2), which is async-signal-safe and allocates
+        // nothing. A forked child is never a process group leader, so it
+        // cannot fail with EPERM; any failure aborts the spawn.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -328,7 +366,8 @@ fn run_bounded(
         if let Some(status) = exited {
             break status;
         }
-        if now >= deadline {
+        let was_cancelled = cancelled();
+        if was_cancelled || now >= deadline {
             let stopped = stop(&mut child);
             if stopped {
                 let _ = child.wait();
@@ -336,7 +375,11 @@ fn run_bounded(
                 reap_later(child);
             }
             finish(readers);
-            return Err(timed_out(timeout, stopped));
+            return Err(if was_cancelled {
+                cancelled_error(stopped)
+            } else {
+                timed_out(timeout, stopped)
+            });
         }
         std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
     };
@@ -470,7 +513,8 @@ fn reap_later(mut child: std::process::Child) {
 
 /// A command that did not run to its end under the runner's watch, as the
 /// error [`Host::run_within`] returns: it outlived its bound
-/// ([`std::io::ErrorKind::TimedOut`]), or its exit could not be read
+/// ([`std::io::ErrorKind::TimedOut`]), it was cancelled
+/// ([`std::io::ErrorKind::Interrupted`]), or its exit could not be read
 /// ([`ownership_lost`]). The message is for the user; `stopped` is whether
 /// the command is known to have stopped, which [`unfinished_stopped`] reads
 /// back.
@@ -505,6 +549,21 @@ pub fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error 
     )
 }
 
+/// A command ended early because the client cancelled it, in words for the
+/// user. `stopped` is whether it was stopped; one that was not may still be
+/// running.
+pub fn cancelled_error(stopped: bool) -> std::io::Error {
+    let message = if stopped {
+        "it was cancelled and stopped".to_string()
+    } else {
+        "it was cancelled and could not be stopped, so it may still be running".to_string()
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        Unfinished { stopped, message },
+    )
+}
+
 /// A command whose wait failed with `error`: it may have been reaped by
 /// something else, so its pid is no longer known to be its own and it is not
 /// signalled. Whether it finished is not known.
@@ -515,8 +574,8 @@ fn ownership_lost(error: &std::io::Error) -> std::io::Error {
     })
 }
 
-/// For an error [`timed_out`] made, or one from a command whose exit could
-/// not be read, whether the command is known to have stopped; `None` for any
+/// For an error [`timed_out`] or [`cancelled_error`] made, or one from a
+/// command whose exit could not be read, whether the command is known to have stopped; `None` for any
 /// other error.
 pub fn unfinished_stopped(error: &std::io::Error) -> Option<bool> {
     error
@@ -967,7 +1026,8 @@ mod tests {
         let mut command = std::process::Command::new(SH);
         command.args(["-c", &script]);
         let refuse = |_: &mut std::process::Child| false;
-        let err = run_bounded(&mut command, Duration::from_millis(300), &refuse).unwrap_err();
+        let err =
+            run_bounded(&mut command, Duration::from_millis(300), &|| false, &refuse).unwrap_err();
         assert_eq!(
             err.to_string(),
             "it did not finish within 300 milliseconds and could not be stopped, so it may still be running"
@@ -1016,6 +1076,148 @@ mod tests {
         std::env::var_os(REEXEC_CHILD).is_some()
     }
 
+    /// Run the test at `path` again as [`reexec`] does, but as the leader of
+    /// a session of its own whose controlling terminal is a fresh PTY, so it
+    /// stands where the CLI stands on a user's terminal: the terminal's
+    /// foreground process group.
+    fn reexec_on_a_terminal(path: &str) {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::Read;
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open a PTY");
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let mut command = CommandBuilder::new(exe);
+        command.args(["--exact", path, "--nocapture", "--test-threads=1"]);
+        command.env(REEXEC_CHILD, "1");
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("re-exec this test binary on the PTY");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("PTY reader");
+        let output = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut buffer = [0u8; 4096];
+            // The read fails (EIO) once the child's side is closed.
+            while let Ok(n) = reader.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..n]);
+            }
+            String::from_utf8_lossy(&output).into_owned()
+        });
+        let status = child.wait().expect("wait for the re-exec'd test");
+        drop(pair.master);
+        let output = output.join().unwrap_or_default();
+        assert!(
+            status.success() && output.contains("1 passed"),
+            "the re-exec'd test failed or did not run\n--- terminal ---\n{output}"
+        );
+    }
+
+    /// Scenario: run from a process whose controlling terminal is a PTY, as
+    /// the CLI runs on a user's terminal, a command opens `/dev/tty` and
+    /// reads from it. It has no controlling terminal, so the open fails at
+    /// once and the command exits with an error, well inside its 10 s bound,
+    /// rather than being stopped by `SIGTTIN` as a background job and looking
+    /// hung until the bound.
+    #[test]
+    fn host_008_a_command_that_opens_the_terminal_fails_at_once() {
+        if !is_reexec_child() {
+            reexec_on_a_terminal(
+                "self_upgrade::tests::host_008_a_command_that_opens_the_terminal_fails_at_once",
+            );
+            return;
+        }
+        assert!(
+            std::fs::File::open("/dev/tty").is_ok(),
+            "the re-exec'd half must have a controlling terminal, or this proves nothing"
+        );
+        let started = Instant::now();
+        let result = SystemHost::default().run_within(
+            Path::new(SH),
+            &[OsStr::new("-c"), OsStr::new("read line < /dev/tty")],
+            Duration::from_secs(10),
+        );
+        let elapsed = started.elapsed();
+        let output = result.expect("the command ends on its own, inside its bound");
+        assert!(!output.success, "{output:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// Scenario: a command that started a descendant and then waits on it is
+    /// run through the cancellable path with a 60 s bound, and the client
+    /// cancels it once both are running. The call returns "cancelled" within
+    /// `STOP_GRACE` of the cancellation, and the command, its descendant and
+    /// its whole process group are gone.
+    #[test]
+    fn host_009_a_cancelled_command_is_stopped_with_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let command_pid = dir.path().join("command.pid");
+        let descendant_pid = dir.path().join("descendant.pid");
+        let script = format!(
+            "sleep 60 & echo $! > '{}'; echo $$ > '{}'; wait",
+            descendant_pid.display(),
+            command_pid.display()
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let canceller = {
+            let (cancel, fired_at) = (cancel.clone(), fired_at.clone());
+            let (command_pid, descendant_pid) = (command_pid.clone(), descendant_pid.clone());
+            std::thread::spawn(move || {
+                let (command, descendant) = (pid_in(&command_pid), pid_in(&descendant_pid));
+                *fired_at.lock().unwrap() = Some(Instant::now());
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                (command, descendant)
+            })
+        };
+        let flag = cancel.clone();
+        let result = SystemHost::default().run_within_cancellable(
+            Path::new(SH),
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            Duration::from_secs(60),
+            &move || flag.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let returned_at = Instant::now();
+        let (command, descendant) = canceller.join().unwrap();
+        let descendant_died = eventually(|| exited(descendant));
+        if !descendant_died {
+            // SAFETY: the pid was just read from the descendant itself.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err:?}");
+        assert_eq!(err.to_string(), "it was cancelled and stopped");
+        assert_eq!(unfinished_stopped(&err), Some(true));
+        let fired_at = fired_at.lock().unwrap().expect("the cancellation fired");
+        assert!(
+            returned_at.duration_since(fired_at) < STOP_GRACE,
+            "{:?}",
+            returned_at.duration_since(fired_at)
+        );
+        assert!(reaped(command), "the cancelled command was not reaped");
+        assert!(
+            descendant_died,
+            "the descendant outlived its cancelled command"
+        );
+        // SAFETY: signal 0 to the command's group checks only that the group
+        // exists; nothing is sent.
+        let group_left = unsafe { libc::kill(-command, 0) } == 0;
+        assert!(
+            !group_left,
+            "something in the command's group is still running"
+        );
+    }
+
     /// Scenario: something else in the process reaps the command first, as
     /// the kernel does for every child under an inherited `SIGCHLD=SIG_IGN`,
     /// so the runner's own wait fails. The call returns an error and sends no
@@ -1038,7 +1240,7 @@ mod tests {
         };
         let mut command = std::process::Command::new(SH);
         command.args(["-c", "exit 0"]);
-        let err = run_bounded(&mut command, Duration::from_secs(10), &stop).unwrap_err();
+        let err = run_bounded(&mut command, Duration::from_secs(10), &|| false, &stop).unwrap_err();
         assert!(
             !signalled.load(std::sync::atomic::Ordering::SeqCst),
             "a child the runner did not reap itself was signalled: {err}"
