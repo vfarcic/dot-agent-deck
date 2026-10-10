@@ -616,7 +616,7 @@ fn run_privileged(host: &dyn Host, pkexec: &Path, args: &[&OsStr]) -> Result<(),
                 })
             }
         }
-        Err(error) => match super::timed_out_stopped(&error) {
+        Err(error) => match super::unfinished_stopped(&error) {
             Some(stopped) => Err(Privileged::Unfinished {
                 command,
                 detail: error.to_string(),

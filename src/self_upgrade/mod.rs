@@ -277,6 +277,14 @@ const READ_POLL_MS: i32 = 50;
 /// they wait for data with `poll` and look at a stop flag between waits, and
 /// once they stop the read ends are closed, so a descendant still writing
 /// gets `EPIPE`. Elsewhere a reader stops at the end of its stream only.
+///
+/// Signalling the command's pid and group is safe only while this runner has
+/// not reaped it, because until then the pid cannot be reissued. That rests
+/// on an assumption: nothing else in the process reaps these children (no
+/// `waitpid(-1)` elsewhere, no inherited `SIGCHLD=SIG_IGN`, under which the
+/// kernel reaps them itself). Where a wait fails anyway, ownership is taken
+/// to be lost: no signal is sent, and the error says the command may still
+/// be running ([`unfinished_stopped`] reads `Some(false)`).
 fn run_bounded(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -312,12 +320,9 @@ fn run_bounded(
         let exited = match child.try_wait() {
             Ok(exited) => exited,
             Err(e) => {
-                let stopped = stop(&mut child);
-                if !stopped {
-                    reap_later(child);
-                }
+                // Not ours to signal any more: see the ownership note above.
                 finish(readers);
-                return Err(e);
+                return Err(ownership_lost(&e));
             }
         };
         if let Some(status) = exited {
@@ -431,7 +436,9 @@ fn stop_child(child: &mut std::process::Child) -> bool {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: kill(2) with a negative pid signals the process group
         // `run_bounded` gave the command, whose id is the command's pid. The
-        // command is not reaped yet, so that id cannot have been reused for
+        // command is not reaped yet (`run_bounded` calls this only before
+        // its own first successful wait, and nothing else reaps it — the
+        // assumption it documents), so that id cannot have been reused for
         // somebody else's group. A failure (EPERM for a group of root's,
         // ESRCH for one already gone) leaves the exit check below to decide.
         unsafe {
@@ -461,22 +468,25 @@ fn reap_later(mut child: std::process::Child) {
         });
 }
 
-/// A command that outlived its bound, as the error [`Host::run_within`]
-/// returns ([`std::io::ErrorKind::TimedOut`]): the message for the user, and
-/// whether the command was stopped, which [`timed_out_stopped`] reads back.
+/// A command that did not run to its end under the runner's watch, as the
+/// error [`Host::run_within`] returns: it outlived its bound
+/// ([`std::io::ErrorKind::TimedOut`]), or its exit could not be read
+/// ([`ownership_lost`]). The message is for the user; `stopped` is whether
+/// the command is known to have stopped, which [`unfinished_stopped`] reads
+/// back.
 #[derive(Debug)]
-struct TimedOut {
+struct Unfinished {
     stopped: bool,
     message: String,
 }
 
-impl std::fmt::Display for TimedOut {
+impl std::fmt::Display for Unfinished {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for TimedOut {}
+impl std::error::Error for Unfinished {}
 
 /// A command that outlived `timeout`, in words for the user. `stopped` is
 /// whether it was stopped; one that was not may still be running.
@@ -489,16 +499,30 @@ pub fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error 
             "it did not finish within {within} and could not be stopped, so it may still be running"
         )
     };
-    std::io::Error::new(std::io::ErrorKind::TimedOut, TimedOut { stopped, message })
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        Unfinished { stopped, message },
+    )
 }
 
-/// For an error [`timed_out`] made, whether the command was stopped; `None`
-/// for any other error.
-pub fn timed_out_stopped(error: &std::io::Error) -> Option<bool> {
+/// A command whose wait failed with `error`: it may have been reaped by
+/// something else, so its pid is no longer known to be its own and it is not
+/// signalled. Whether it finished is not known.
+fn ownership_lost(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::other(Unfinished {
+        stopped: false,
+        message: format!("its exit could not be read ({error}), so it may still be running"),
+    })
+}
+
+/// For an error [`timed_out`] made, or one from a command whose exit could
+/// not be read, whether the command is known to have stopped; `None` for any
+/// other error.
+pub fn unfinished_stopped(error: &std::io::Error) -> Option<bool> {
     error
         .get_ref()
-        .and_then(|inner| inner.downcast_ref::<TimedOut>())
-        .map(|timed_out| timed_out.stopped)
+        .and_then(|inner| inner.downcast_ref::<Unfinished>())
+        .map(|unfinished| unfinished.stopped)
 }
 
 /// `duration` in the largest whole unit that fits: "15 minutes", "60
@@ -953,6 +977,76 @@ mod tests {
         assert!(
             eventually(|| reaped(child)),
             "the child that could not be stopped was never reaped"
+        );
+    }
+
+    /// Marks a process as the re-exec'd half of a test: the test runs its
+    /// child body instead of re-executing itself again.
+    const REEXEC_CHILD: &str = "DOT_AGENT_DECK_SELF_UPGRADE_REEXEC_CHILD";
+
+    /// Run the test at `path` (as libtest names it) again in a process of its
+    /// own, marked with [`REEXEC_CHILD`], and return its output once it
+    /// exits. For a test that changes something process-wide, or needs a
+    /// process with a controlling terminal of its own.
+    fn reexec(path: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", path, "--nocapture", "--test-threads=1"])
+            .env(REEXEC_CHILD, "1")
+            .output()
+            .expect("re-exec this test binary");
+        assert_child_passed(
+            &output.status,
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        );
+        output
+    }
+
+    /// That the re-exec'd half exited 0 having run exactly one test: a filter
+    /// that matched nothing exits 0 too.
+    fn assert_child_passed(status: &std::process::ExitStatus, stdout: &str, stderr: &str) {
+        assert!(
+            status.success() && stdout.contains("1 passed"),
+            "the re-exec'd test failed or did not run\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    fn is_reexec_child() -> bool {
+        std::env::var_os(REEXEC_CHILD).is_some()
+    }
+
+    /// Scenario: something else in the process reaps the command first, as
+    /// the kernel does for every child under an inherited `SIGCHLD=SIG_IGN`,
+    /// so the runner's own wait fails. The call returns an error and sends no
+    /// signal: the pid may already be somebody else's.
+    #[test]
+    fn host_007_a_child_reaped_elsewhere_is_never_signalled() {
+        if !is_reexec_child() {
+            reexec("self_upgrade::tests::host_007_a_child_reaped_elsewhere_is_never_signalled");
+            return;
+        }
+        // SAFETY: this process is the re-exec'd half running this one test
+        // on one thread, so the disposition changes nothing else.
+        unsafe {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        }
+        let signalled = std::sync::atomic::AtomicBool::new(false);
+        let stop = |_: &mut std::process::Child| {
+            signalled.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+        let mut command = std::process::Command::new(SH);
+        command.args(["-c", "exit 0"]);
+        let err = run_bounded(&mut command, Duration::from_secs(10), &stop).unwrap_err();
+        assert!(
+            !signalled.load(std::sync::atomic::Ordering::SeqCst),
+            "a child the runner did not reap itself was signalled: {err}"
+        );
+        assert_eq!(unfinished_stopped(&err), Some(false), "{err:?}");
+        assert!(
+            err.to_string().ends_with("so it may still be running"),
+            "{err}"
         );
     }
 }
