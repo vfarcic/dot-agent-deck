@@ -170,7 +170,7 @@ pub enum HostMetricsReportDto {
 }
 
 /// PRD #1258 M4: the camelCase form of
-/// [`dot_agent_deck::host_metrics::HostMetrics`]. Every reading the daemon
+/// [`dot_agent_deck::daemon_protocol::HostMetrics`]. Every reading the daemon
 /// could not take is absent here too, so the webview shows `unknown` rather
 /// than a zero.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -221,11 +221,11 @@ impl HostMetricsReportDto {
                     disks: metrics
                         .disks
                         .iter()
-                        .take(dot_agent_deck::host_metrics::MAX_DISK_ROLES)
+                        .take(dot_agent_deck::daemon_protocol::MAX_DISK_ROLES)
                         .map(|disk| DiskUsageDto {
                             role: dot_agent_deck::prompt_delivery::truncate_on_char_boundary(
                                 &disk.role,
-                                dot_agent_deck::host_metrics::MAX_ROLE_BYTES,
+                                dot_agent_deck::daemon_protocol::MAX_ROLE_BYTES,
                             ),
                             free_bytes: disk.free_bytes,
                             total_bytes: disk.total_bytes,
@@ -2916,7 +2916,7 @@ mod tests {
     #[test]
     fn host_metrics_dto_keeps_absence_and_ages_a_held_answer() {
         use dot_agent_deck::daemon_client::HostMetricsReport;
-        let metrics: dot_agent_deck::host_metrics::HostMetrics =
+        let metrics: dot_agent_deck::daemon_protocol::HostMetrics =
             serde_json::from_value(serde_json::json!({
                 "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20},
                           {"role": "temp_root"}],
@@ -2959,7 +2959,7 @@ mod tests {
     #[test]
     fn host_metrics_dto_bounds_a_hostile_report() {
         use dot_agent_deck::daemon_client::HostMetricsReport;
-        use dot_agent_deck::host_metrics::{
+        use dot_agent_deck::daemon_protocol::{
             DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES,
         };
         let mut disks = vec![DiskUsage {

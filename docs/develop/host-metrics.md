@@ -6,13 +6,15 @@ PRD #1258 M1–M4. The daemon reports the machine it runs on (disk per watched r
 
 `src/host_metrics.rs` owns it. It is also the only place in the tree that reads the load average: `machine_load_per_cpu` used to exist twice, in `src/test_budget.rs` and in `tests/common/mod.rs`, and issue #1245 had to teach each copy macOS separately. Both now call this module (M2). A new caller should import from here rather than reading `/proc/loadavg` itself.
 
+The reply's wire shape (`HostMetrics`, `DiskUsage`, the three `ROLE_*` names) and the client's size bounds (`MAX_DISK_ROLES`, `MAX_ROLE_BYTES`, `HostMetrics::within_reply_bounds`) live in `src/daemon_protocol.rs`, not here. Linkage-check rule 12 (`xtask/linkage-check/src/desktop_project_boundary.rs`) allows the desktop crate to name `daemon_protocol` and `daemon_client` but not `host_metrics`, which reads `/proc` and calls `statvfs`; keeping the types with the protocol lets the desktop decode and bound the reply without the boundary being widened to the sampler.
+
 One sample (`sample_host`) is:
 
 - a `statvfs` per watched role: `f_bavail × f_frsize` as free (what an unprivileged build can actually use) and `f_blocks × f_frsize` as total;
 - the one-minute load average (`/proc/loadavg` on Linux, `getloadavg(3)` on macOS) divided by `available_parallelism()`, plus that core count;
 - memory from `/proc/meminfo` on Linux: `MemTotal − MemAvailable` as used, `MemAvailable` as available.
 
-**Every reading degrades on its own.** A field the host cannot read is `None` on the wire (`#[serde(default, skip_serializing_if = "Option::is_none")]`), never `0`, so a client can tell "idle" or "full" from "unknown". Both clients render `None` as `unknown`. `host_metrics_004_unreadable_memory_is_absent_not_zero` pins this for memory.
+**Every reading degrades on its own.** A field the host cannot read is `None` on the wire (`#[serde(default, skip_serializing_if = "Option::is_none")]`), never `0`, so a client can tell "idle" or "full" from "unknown". Both clients render `None` as `unknown`. `protocol_host_metrics_004_unreadable_memory_is_absent_not_zero` pins this for memory.
 
 **macOS memory is absent, deliberately.** The Mach host-statistics calls (`host_statistics64`) are marked deprecated in the `libc` crate in favour of the `mach2` crate, which this project does not depend on. Adding a dependency for one informational figure was not worth it, so a macOS deck reports memory as `unknown`. Disk and load work there.
 
@@ -62,7 +64,7 @@ Measured for M1 in a debug build on the 16-core dev box at load average ~25–29
 
 ## The same words in both clients
 
-The overlay and the desktop panel use the same title, subtitle, row labels, role labels and formats (rule 22). `tests/fixtures/host-metrics-copy.json` holds them once: samples in the daemon's wire shape with the label/value rows each must render as, plus the not-available sentences. The TUI's `host_metrics_overlay_008_words_match_the_shared_copy` (`tests/render_host_metrics_copy.rs`) renders the overlay for each sample, and the desktop's `HostMetricsPanel.copy.test.tsx` renders the panel, so a word changed in one client alone fails the other's test, the pattern `tests/fixtures/editing-shortcuts.json` set for PR #1429.
+The overlay and the desktop panel use the same title, subtitle, row labels, role labels and formats (rule 22). `tests/fixtures/host-metrics-copy.json` holds them once: samples in the daemon's wire shape with the label/value rows each must render as, plus the not-available sentences. The TUI's `dashboard_host_metrics_008_words_match_the_shared_copy` (`tests/render_host_metrics_copy.rs`) renders the overlay for each sample, and the desktop's `HostMetricsPanel.copy.test.tsx` renders the panel, so a word changed in one client alone fails the other's test, the pattern `tests/fixtures/editing-shortcuts.json` set for PR #1429.
 
 ## How each client refreshes
 

@@ -19909,9 +19909,9 @@ const HOST_METRICS_LABEL_WIDTH: usize = 18;
 /// daemon chose it and its figures have to stay on the row (audit A2).
 fn host_metrics_role_label(role: &str) -> String {
     match role {
-        crate::host_metrics::ROLE_WORKING_ROOT => "Working root".to_string(),
-        crate::host_metrics::ROLE_WORKTREE_PARENT => "Worktree parent".to_string(),
-        crate::host_metrics::ROLE_TEMP_ROOT => "Temp root".to_string(),
+        crate::daemon_protocol::ROLE_WORKING_ROOT => "Working root".to_string(),
+        crate::daemon_protocol::ROLE_WORKTREE_PARENT => "Worktree parent".to_string(),
+        crate::daemon_protocol::ROLE_TEMP_ROOT => "Temp root".to_string(),
         other => crate::untrusted_text::display_line(other, HOST_METRICS_LABEL_WIDTH),
     }
 }
@@ -19965,7 +19965,7 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
             for disk in metrics
                 .disks
                 .iter()
-                .take(crate::host_metrics::MAX_DISK_ROLES)
+                .take(crate::daemon_protocol::MAX_DISK_ROLES)
             {
                 lines.push(row(
                     &host_metrics_role_label(&disk.role),

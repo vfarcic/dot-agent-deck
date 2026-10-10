@@ -66,7 +66,7 @@ fn assert_line_has(rendered: &str, label: &str, values: &[&str]) {
 /// Scenario: Render the dashboard, press the default `m` host-metrics key, and then press Escape through the production key handlers. The host overlay must appear over the dashboard and disappear again without opening another dialog.
 #[spec("dashboard/host-metrics/001")]
 #[test]
-fn host_metrics_001_default_key_opens_and_escape_closes() {
+fn dashboard_host_metrics_001_default_key_opens_and_escape_closes() {
     let frames = render_host_metrics_key_sequence_to_buffers(
         &KeybindingConfig::default(),
         &sample(),
@@ -95,7 +95,7 @@ fn host_metrics_001_default_key_opens_and_escape_closes() {
 /// Scenario: Render a fixed daemon sample into a TestBackend and snapshot the host title, three disk roles, load per core, core count, memory and sample age. An unreadable disk field and a second sample with unreadable load, cores, memory and disks must show explicit unknown markers rather than invented zero readings.
 #[spec("dashboard/host-metrics/002")]
 #[test]
-fn host_metrics_002_overlay_content_and_unknown_fields() {
+fn dashboard_host_metrics_002_overlay_content_and_unknown_fields() {
     let rendered = text(&render_host_metrics_overlay_to_buffer(&sample(), 100, 32));
     assert!(rendered.contains("Host of this deck"), "{rendered}");
     assert_line_has(
@@ -162,7 +162,7 @@ fn host_metrics_002_overlay_content_and_unknown_fields() {
 /// Scenario: Open the overlay with a daemon result that lacks the host-metrics capability. It must say “not available from this deck” under the host title and must not fill the metric rows with zero readings.
 #[spec("dashboard/host-metrics/003")]
 #[test]
-fn host_metrics_003_old_deck_is_explicitly_unavailable() {
+fn dashboard_host_metrics_003_old_deck_is_explicitly_unavailable() {
     let rendered = text(&render_host_metrics_overlay_to_buffer(
         &HostMetricsReport::NotAvailable,
         100,

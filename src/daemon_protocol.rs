@@ -873,6 +873,85 @@ pub const CAP_TURN_REPLIES: &str = "turn-replies";
 /// deck", exactly as it does against a daemon that predates the verb.
 pub const CAP_HOST_METRICS: &str = "host-metrics";
 
+// PRD #1258: the host-metrics reply's wire shape and the bounds a client holds
+// it to. They live with the protocol rather than with the daemon's sampler in
+// `crate::host_metrics`, so a client names the reply without reaching into
+// the module that reads `/proc` and calls `statvfs` (PRD #819, linkage-check
+// rule 12).
+
+/// The role of the filesystem holding the deck's working root.
+pub const ROLE_WORKING_ROOT: &str = "working_root";
+/// The role of the filesystem holding the working root's parent, where sibling
+/// worktrees (`../<repo>-dispatch-*`) land.
+pub const ROLE_WORKTREE_PARENT: &str = "worktree_parent";
+/// The role of the filesystem holding the e2e harness's temp root.
+pub const ROLE_TEMP_ROOT: &str = "temp_root";
+
+/// One watched role's filesystem. Either figure is absent when it could not be
+/// read; neither is ever reported as zero in its place.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskUsage {
+    /// One of [`ROLE_WORKING_ROOT`], [`ROLE_WORKTREE_PARENT`],
+    /// [`ROLE_TEMP_ROOT`]. A string rather than an enum so a client meeting a
+    /// role a newer daemon added still decodes the reply.
+    pub role: String,
+    /// Bytes available to an unprivileged writer (`f_bavail`), which is what a
+    /// build can actually use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+}
+
+/// The daemon's answer to `host-metrics`: its own host, as of `sampled_at_ms`.
+///
+/// Every reading degrades on its own: a field this host cannot read is absent,
+/// not zero. Memory is Linux-only today (`/proc/meminfo`); macOS reports it
+/// absent rather than reaching for the Mach host-statistics calls, which the
+/// `libc` crate marks deprecated in favour of a crate this project does not
+/// depend on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostMetrics {
+    #[serde(default)]
+    pub disks: Vec<DiskUsage>,
+    /// [`crate::host_metrics::machine_load_per_cpu`]: the 1-minute load
+    /// average over the CPUs this process may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_per_cpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    /// `MemTotal - MemAvailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// Wall-clock epoch milliseconds the sample was taken at. Equal across
+    /// replies served from one cached sample.
+    pub sampled_at_ms: u64,
+    /// How old the sample was when this reply was written, in milliseconds.
+    pub sample_age_ms: u64,
+}
+
+/// The most disk roles a client accepts in one reply. The daemon names three;
+/// the headroom lets a newer daemon add roles without an older client refusing
+/// the reply, while a hostile or broken one cannot make a client allocate and
+/// render an unbounded list (PRD #1258 audit A2).
+pub const MAX_DISK_ROLES: usize = 16;
+
+/// The longest role name, in bytes, a client accepts. The daemon's are under
+/// twenty; a role is an identifier, not text.
+pub const MAX_ROLE_BYTES: usize = 64;
+
+impl HostMetrics {
+    /// Whether a reply is within [`MAX_DISK_ROLES`] and [`MAX_ROLE_BYTES`]. The
+    /// client refuses one that is not, rather than handing its renderers work
+    /// whose size the peer chose.
+    pub fn within_reply_bounds(&self) -> bool {
+        self.disks.len() <= MAX_DISK_ROLES
+            && self.disks.iter().all(|d| d.role.len() <= MAX_ROLE_BYTES)
+    }
+}
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -2562,7 +2641,7 @@ pub enum AttachRequest {
     /// three watched roles, load per CPU, CPU count and memory, with the
     /// sample's age. **Read-only.** The reply rides back on
     /// [`AttachResponse::host_metrics`]; the shape is
-    /// [`crate::host_metrics::HostMetrics`], which names roles and never a
+    /// [`HostMetrics`], which names roles and never a
     /// path.
     ///
     /// Answered from the daemon's [`crate::host_metrics::HostMetricsCache`],
@@ -3217,7 +3296,7 @@ pub struct AttachResponse {
     /// other response, and on a refusal. Additive + optional, and the request
     /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_metrics: Option<crate::host_metrics::HostMetrics>,
+    pub host_metrics: Option<HostMetrics>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -7735,7 +7814,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[spec("protocol/host-metrics/004")]
     #[test]
-    fn host_metrics_004_unreadable_memory_is_absent_not_zero() {
+    fn protocol_host_metrics_004_unreadable_memory_is_absent_not_zero() {
         let root = tempfile::tempdir().unwrap();
         // Reading a directory fails even for a root test process, unlike chmod(0).
         assert_eq!(

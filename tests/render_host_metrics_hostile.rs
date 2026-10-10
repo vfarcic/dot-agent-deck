@@ -5,7 +5,7 @@
 //! so these prove the renderer's defence in depth on its own.
 
 use dot_agent_deck::daemon_client::HostMetricsReport;
-use dot_agent_deck::host_metrics::{DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES};
+use dot_agent_deck::daemon_protocol::{DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES};
 use dot_agent_deck::ui::render_host_metrics_overlay_to_buffer;
 use ratatui::buffer::Buffer;
 use spec::spec;
@@ -64,7 +64,7 @@ fn assert_no_control_or_bidi(buffer: &Buffer) {
 /// control character or bidi override.
 #[spec("dashboard/host-metrics/005")]
 #[test]
-fn host_metrics_overlay_005_control_characters_in_a_role_are_scrubbed() {
+fn dashboard_host_metrics_005_control_characters_in_a_role_are_scrubbed() {
     let buffer = render_host_metrics_overlay_to_buffer(
         &report(["\u{1b}[2Jro\nle\u{202e}x".to_string()]),
         80,
@@ -86,7 +86,7 @@ fn host_metrics_overlay_005_control_characters_in_a_role_are_scrubbed() {
 /// role bound of rows.
 #[spec("dashboard/host-metrics/006")]
 #[test]
-fn host_metrics_overlay_006_an_oversized_role_count_renders_bounded() {
+fn dashboard_host_metrics_006_an_oversized_role_count_renders_bounded() {
     let buffer = render_host_metrics_overlay_to_buffer(
         &report((0..65_525).map(|i| format!("role{i}"))),
         80,
@@ -109,7 +109,7 @@ fn host_metrics_overlay_006_an_oversized_role_count_renders_bounded() {
 /// trailing ellipsis, and its disk figures stay on the same row.
 #[spec("dashboard/host-metrics/007")]
 #[test]
-fn host_metrics_overlay_007_an_oversized_role_name_is_clamped() {
+fn dashboard_host_metrics_007_an_oversized_role_name_is_clamped() {
     let buffer = render_host_metrics_overlay_to_buffer(&report(["r".repeat(100 * 1024)]), 200, 24);
     let rendered = text(&buffer);
     let row = rendered

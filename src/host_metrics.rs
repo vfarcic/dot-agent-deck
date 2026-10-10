@@ -16,6 +16,13 @@
 //! sampled **on demand** — there is no timer — and reused for
 //! [`HOST_METRICS_MAX_AGE`]. Each reply states the sample's age. The reply names
 //! roles, never paths, so a client learns nothing about the host's layout.
+//! The reply's shape, [`HostMetrics`], and the bounds a client holds it to
+//! live in [`crate::daemon_protocol`], so a client names the reply without
+//! reaching into this module.
+
+use crate::daemon_protocol::{
+    DiskUsage, HostMetrics, ROLE_TEMP_ROOT, ROLE_WORKING_ROOT, ROLE_WORKTREE_PARENT,
+};
 
 /// The 1-minute load average, or `None` where this platform does not publish
 /// one cheaply.
@@ -78,59 +85,6 @@ pub fn machine_load_per_cpu() -> Option<f64> {
 /// the age, so a client never has to guess how stale a cache hit is.
 pub const HOST_METRICS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The role of the filesystem holding the deck's working root.
-pub const ROLE_WORKING_ROOT: &str = "working_root";
-/// The role of the filesystem holding the working root's parent, where sibling
-/// worktrees (`../<repo>-dispatch-*`) land.
-pub const ROLE_WORKTREE_PARENT: &str = "worktree_parent";
-/// The role of the filesystem holding the e2e harness's temp root.
-pub const ROLE_TEMP_ROOT: &str = "temp_root";
-
-/// One watched role's filesystem. Either figure is absent when it could not be
-/// read; neither is ever reported as zero in its place.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DiskUsage {
-    /// One of [`ROLE_WORKING_ROOT`], [`ROLE_WORKTREE_PARENT`],
-    /// [`ROLE_TEMP_ROOT`]. A string rather than an enum so a client meeting a
-    /// role a newer daemon added still decodes the reply.
-    pub role: String,
-    /// Bytes available to an unprivileged writer (`f_bavail`), which is what a
-    /// build can actually use.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub free_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_bytes: Option<u64>,
-}
-
-/// The daemon's answer to `host-metrics`: its own host, as of `sampled_at_ms`.
-///
-/// Every reading degrades on its own: a field this host cannot read is absent,
-/// not zero. Memory is Linux-only today (`/proc/meminfo`); macOS reports it
-/// absent rather than reaching for the Mach host-statistics calls, which the
-/// `libc` crate marks deprecated in favour of a crate this project does not
-/// depend on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct HostMetrics {
-    #[serde(default)]
-    pub disks: Vec<DiskUsage>,
-    /// [`machine_load_per_cpu`]: the 1-minute load average over the CPUs this
-    /// process may use.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_per_cpu: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_count: Option<u32>,
-    /// `MemTotal - MemAvailable`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_used_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_available_bytes: Option<u64>,
-    /// Wall-clock epoch milliseconds the sample was taken at. Equal across
-    /// replies served from one cached sample.
-    pub sampled_at_ms: u64,
-    /// How old the sample was when this reply was written, in milliseconds.
-    pub sample_age_ms: u64,
-}
-
 /// The longest a request waits for a sample being taken before it answers
 /// without one.
 ///
@@ -139,26 +93,6 @@ pub struct HostMetrics {
 /// running. One second sits under the desktop's two-second reply timeout, so a
 /// request that gives up here still reaches its client as an answer.
 pub const HOST_METRICS_SAMPLE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The most disk roles a client accepts in one reply. The daemon names three;
-/// the headroom lets a newer daemon add roles without an older client refusing
-/// the reply, while a hostile or broken one cannot make a client allocate and
-/// render an unbounded list (PRD #1258 audit A2).
-pub const MAX_DISK_ROLES: usize = 16;
-
-/// The longest role name, in bytes, a client accepts. The daemon's are under
-/// twenty; a role is an identifier, not text.
-pub const MAX_ROLE_BYTES: usize = 64;
-
-impl HostMetrics {
-    /// Whether a reply is within [`MAX_DISK_ROLES`] and [`MAX_ROLE_BYTES`]. The
-    /// client refuses one that is not, rather than handing its renderers work
-    /// whose size the peer chose.
-    pub fn within_reply_bounds(&self) -> bool {
-        self.disks.len() <= MAX_DISK_ROLES
-            && self.disks.iter().all(|d| d.role.len() <= MAX_ROLE_BYTES)
-    }
-}
 
 /// A sample being taken: resolves to the sample, or `None` if taking it failed.
 type SampleFuture =
@@ -371,8 +305,10 @@ pub fn sample_host() -> HostMetrics {
 /// as JSON in `DOT_AGENT_DECK_E2E_HOST_SAMPLE` replaces this host's, so the
 /// `host-metrics` capture shows the same figures on every machine. Gated on
 /// the feature rather than only on the variable, for the reason
-/// `effective_current_exe` is (`src/platform/paths.rs`): a release build has
-/// no way to be told to report a host it is not on.
+/// `effective_current_exe` is (`src/platform/paths.rs`): a build without the
+/// `e2e` feature — which is what a normally shipped release is — has no way to
+/// be told to report a host it is not on. The release profile is not the gate:
+/// `cargo build --release --features e2e` includes this seam.
 #[cfg(feature = "e2e")]
 fn e2e_fixed_sample() -> Option<HostMetrics> {
     serde_json::from_str(&std::env::var("DOT_AGENT_DECK_E2E_HOST_SAMPLE").ok()?).ok()
@@ -598,7 +534,7 @@ mod single_flight_tests {
     /// hit starts none.
     #[spec("protocol/host-metrics/005")]
     #[tokio::test(start_paused = true)]
-    async fn host_metrics_proto_005_stuck_sample_spawns_one_job_and_requests_return() {
+    async fn protocol_host_metrics_005_stuck_sample_spawns_one_job_and_requests_return() {
         let (cache, mut started, gate) = stalled_cache();
 
         // Cold and stuck: one sample, and every request answers within the wait.
@@ -669,12 +605,154 @@ mod single_flight_tests {
         );
     }
 
+    /// One scripted sampler start: what the cache's next refresh does.
+    type Script = Box<dyn FnOnce() -> SampleFuture + Send>;
+
+    /// A cache that runs the queued scripts in order, one per sampler start,
+    /// reporting each start on the returned channel. Its wait is an hour, so a
+    /// request that returns at all was released by the refresh ending, not by
+    /// giving up.
+    fn scripted_cache() -> (
+        Arc<HostMetricsCache>,
+        mpsc::UnboundedReceiver<()>,
+        Arc<Mutex<std::collections::VecDeque<Script>>>,
+    ) {
+        let (started_tx, started_rx) = mpsc::unbounded_channel();
+        let scripts: Arc<Mutex<std::collections::VecDeque<Script>>> = Arc::default();
+        let queue = Arc::clone(&scripts);
+        let sampler: Sampler = Arc::new(move || -> SampleFuture {
+            started_tx.send(()).unwrap();
+            let next = queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a sampler start the test did not script");
+            next()
+        });
+        let cache = HostMetricsCache::with_sampler(sampler, std::time::Duration::from_secs(3600));
+        (Arc::new(cache), started_rx, scripts)
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+    }
+
+    /// Bounds a hang in a broken build; no assertion is made about how long a
+    /// release takes.
+    async fn released<T>(handle: tokio::task::JoinHandle<T>, who: &str) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .unwrap_or_else(|_| panic!("{who} was never released"))
+            .unwrap_or_else(|e| panic!("{who} failed: {e}"))
+    }
+
+    /// The next sampler start, or a panic naming it: a marker left set means no
+    /// start ever comes, and the test should fail rather than hang.
+    async fn next_start(started: &mut mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), started.recv())
+            .await
+            .expect("the in-flight marker was left set: no refresh started")
+            .expect("the sampler is alive");
+    }
+
+    /// Scenario: A refresh whose sample panics, one whose task is dropped with
+    /// the runtime it ran on, and one whose sampler panics before returning a
+    /// sample each release every request waiting on it at once and leave the
+    /// cache free to start the next refresh, which then answers with a real
+    /// sample.
+    #[spec("protocol/host-metrics/010")]
+    #[test]
+    fn protocol_host_metrics_010_a_refresh_that_panics_or_is_dropped_releases_waiters() {
+        let (cache, mut started, scripts) = scripted_cache();
+        let script = |s: Script| scripts.lock().unwrap().push_back(s);
+
+        // 1. The sample panics on the refresh task. On a current-thread runtime
+        // each spawned request runs to its wait before the test resumes, so
+        // both are waiting on the refresh when the panic fires.
+        let (fire, trigger) = oneshot::channel::<()>();
+        script(Box::new(move || {
+            Box::pin(async move {
+                let _ = trigger.await;
+                panic!("the sample panicked");
+            })
+        }));
+        let rt = current_thread();
+        rt.block_on(async {
+            let initiator = tokio::spawn({
+                let cache = Arc::clone(&cache);
+                async move { cache.read().await }
+            });
+            next_start(&mut started).await;
+            let joiner = tokio::spawn({
+                let cache = Arc::clone(&cache);
+                async move { cache.read().await }
+            });
+            tokio::task::yield_now().await;
+            fire.send(()).unwrap();
+            assert_eq!(released(initiator, "the initiator").await, None);
+            assert_eq!(released(joiner, "the joiner").await, None);
+            assert_eq!(starts(&mut started), 0, "the joiner started no refresh");
+        });
+
+        // 2. The refresh task is dropped: it lives on a runtime that shuts
+        // down while a request on another runtime waits on it.
+        script(Box::new(|| Box::pin(std::future::pending())));
+        let doomed = current_thread();
+        doomed.block_on(async {
+            tokio::spawn({
+                let cache = Arc::clone(&cache);
+                async move { cache.read().await }
+            });
+            next_start(&mut started).await;
+        });
+        rt.block_on(async {
+            let joiner = tokio::spawn({
+                let cache = Arc::clone(&cache);
+                async move { cache.read().await }
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(starts(&mut started), 0, "the joiner joined the refresh");
+            doomed.shutdown_background();
+            assert_eq!(released(joiner, "the joiner").await, None);
+        });
+
+        // 3. The sampler itself panics, inside the request that started it.
+        script(Box::new(|| panic!("the sampler panicked")));
+        rt.block_on(async {
+            let initiator = tokio::spawn({
+                let cache = Arc::clone(&cache);
+                async move { cache.read().await }
+            });
+            let failed = tokio::time::timeout(std::time::Duration::from_secs(30), initiator)
+                .await
+                .expect("the request that panicked ended");
+            assert!(failed.is_err_and(|e| e.is_panic()));
+            assert_eq!(starts(&mut started), 1);
+        });
+
+        // Each failure left the marker clear: the next request starts a
+        // refresh and gets its sample.
+        script(Box::new(|| Box::pin(async { Some(sample(7)) })));
+        rt.block_on(async {
+            let fresh = cache.read().await.expect("the next refresh answered");
+            assert_eq!(fresh.sampled_at_ms, 7);
+            assert_eq!(
+                starts(&mut started),
+                1,
+                "the next request started one refresh"
+            );
+        });
+    }
+
     /// Scenario: A statvfs result with a zero fragment size yields neither a
     /// free nor a total figure, rather than a zero free figure beside an
     /// unknown total; ordinary figures multiply out.
     #[spec("protocol/host-metrics/006")]
     #[test]
-    fn host_metrics_proto_006_zero_fragment_size_leaves_free_absent() {
+    fn protocol_host_metrics_006_zero_fragment_size_leaves_free_absent() {
         assert_eq!(disk_figures(0, 10, 20), (None, None));
         assert_eq!(disk_figures(4096, 0, 20), (Some(0), Some(20 * 4096)));
         assert_eq!(

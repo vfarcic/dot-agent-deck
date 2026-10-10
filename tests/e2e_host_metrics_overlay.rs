@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic PTY coverage of the attached deck's real host sampler. No real
 //! agent is started, and this test is deliberately not a demo-reel clip.
@@ -11,7 +11,7 @@ use spec::spec;
 /// Scenario: Launch the real TUI with its lazily spawned daemon and no agents, then press `m` on the dashboard. The overlay must show real disk numbers, a host title and sample age; Escape must restore the empty dashboard.
 #[spec("dashboard/host-metrics/004")]
 #[test]
-fn host_metrics_004_real_daemon_overlay_opens_and_closes() {
+fn dashboard_host_metrics_004_real_daemon_overlay_opens_and_closes() {
     let deck = TuiDeck::launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     deck.send_keys(b"m");

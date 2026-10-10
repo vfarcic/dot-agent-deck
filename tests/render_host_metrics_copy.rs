@@ -40,7 +40,7 @@ fn text(value: &serde_json::Value) -> &str {
 /// shows the fixture's not-available sentences.
 #[spec("dashboard/host-metrics/008")]
 #[test]
-fn host_metrics_overlay_008_words_match_the_shared_copy() {
+fn dashboard_host_metrics_008_words_match_the_shared_copy() {
     let shared = shared();
     for case in shared["samples"].as_array().expect("samples") {
         let sample = serde_json::from_value(case["sample"].clone()).expect("a daemon sample");

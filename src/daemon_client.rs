@@ -1327,7 +1327,7 @@ pub enum FocusReport {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostMetricsReport {
     /// The daemon advertises `host-metrics` and answered with its host's sample.
-    Available(crate::host_metrics::HostMetrics),
+    Available(crate::daemon_protocol::HostMetrics),
     /// The daemon does not advertise `host-metrics`, so nothing was sent.
     NotAvailable,
 }
@@ -2646,8 +2646,8 @@ impl DaemonClient {
     /// The numbers describe the **daemon's** host: for a remote deck, the
     /// remote machine.
     ///
-    /// A reply with more than [`crate::host_metrics::MAX_DISK_ROLES`] roles, or
-    /// a role longer than [`crate::host_metrics::MAX_ROLE_BYTES`], is
+    /// A reply with more than [`crate::daemon_protocol::MAX_DISK_ROLES`] roles, or
+    /// a role longer than [`crate::daemon_protocol::MAX_ROLE_BYTES`], is
     /// [`ClientError::Malformed`]. Role text is passed through otherwise: the
     /// renderers scrub it for display.
     pub async fn host_metrics(&self) -> Result<HostMetricsReport, ClientError> {
@@ -4498,7 +4498,7 @@ mod tests {
     #[cfg(unix)]
     #[spec("protocol/host-metrics/003")]
     #[tokio::test]
-    async fn host_metrics_003_missing_capability_sends_no_frame() {
+    async fn protocol_host_metrics_003_missing_capability_sends_no_frame() {
         for advertised in [
             None,
             Some(vec![crate::daemon_protocol::CAP_FOCUS_GAINED.to_string()]),
@@ -4642,8 +4642,8 @@ mod tests {
     #[cfg(unix)]
     #[spec("protocol/host-metrics/007")]
     #[tokio::test]
-    async fn host_metrics_proto_007_too_many_roles_is_malformed() {
-        let max = crate::host_metrics::MAX_DISK_ROLES;
+    async fn protocol_host_metrics_007_too_many_roles_is_malformed() {
+        let max = crate::daemon_protocol::MAX_DISK_ROLES;
         match host_metrics_reply_with(roles(max + 1, "x")).await {
             Err(ClientError::Malformed(message)) => {
                 assert!(!message.contains(&(max + 1).to_string()), "{message}")
@@ -4662,8 +4662,8 @@ mod tests {
     #[cfg(unix)]
     #[spec("protocol/host-metrics/008")]
     #[tokio::test]
-    async fn host_metrics_proto_008_oversized_role_is_malformed() {
-        let max = crate::host_metrics::MAX_ROLE_BYTES;
+    async fn protocol_host_metrics_008_oversized_role_is_malformed() {
+        let max = crate::daemon_protocol::MAX_ROLE_BYTES;
         // Multi-byte characters, so the bound is checked in bytes, not chars.
         let over = "é".repeat(max / 2 + 1);
         assert!(over.len() > max && over.chars().count() <= max);
@@ -4685,7 +4685,7 @@ mod tests {
     #[cfg(unix)]
     #[spec("protocol/host-metrics/009")]
     #[tokio::test]
-    async fn host_metrics_proto_009_control_characters_reach_the_renderer_unchanged() {
+    async fn protocol_host_metrics_009_control_characters_reach_the_renderer_unchanged() {
         let hostile = "\u{1b}[2Jro\nle\u{202e}x";
         match host_metrics_reply_with(roles(1, hostile)).await {
             Ok(HostMetricsReport::Available(metrics)) => {

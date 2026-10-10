@@ -1239,6 +1239,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the TUI's scrub (covered by `dashboard/host-metrics/005`).
 - **Platform coverage:** mac+linux.
 
+##### protocol/host-metrics/010 — A refresh that panics or is dropped releases its waiters and the next refresh starts.
+- **Layer:** unit (the daemon's `HostMetricsCache` with a scripted sampler on current-thread Tokio runtimes, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a sample that panics on the refresh task, a refresh task dropped when its runtime shuts down, and a sampler that panics inside the request that started it each clear the in-flight marker; every request waiting on the refresh returns without a sample, released by the refresh ending rather than by the bounded wait (set to an hour here); a request that joined the refresh started none; the next request starts exactly one refresh and answers with its sample (PRD #1258 audit A1 follow-up).
+- **Does not assert:** the production sampler's `spawn_blocking` (whose panic surfaces as a failed sample, not a panic); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
 #### protocol/live-target
 
 ##### protocol/live-target/001 — `AgentEvent.live_target` preserves every target-kind and writability value while remaining optional for legacy events (PRD #20 M3).

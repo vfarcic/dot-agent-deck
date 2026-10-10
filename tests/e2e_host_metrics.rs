@@ -88,7 +88,7 @@ fn assert_no_absolute_paths(value: &serde_json::Value) {
 /// CPU and memory readings where supported, and sample age without host paths.
 #[spec("protocol/host-metrics/001")]
 #[tokio::test]
-async fn host_metrics_001_socket_reports_host_numbers_without_paths() {
+async fn protocol_host_metrics_001_socket_reports_host_numbers_without_paths() {
     let server = server();
     let (hello, _) = request(
         &server,
@@ -156,7 +156,7 @@ async fn host_metrics_001_socket_reports_host_numbers_without_paths() {
 /// age increases, and a request after the freshness bound obtains a fresh sample.
 #[spec("protocol/host-metrics/002")]
 #[tokio::test(start_paused = true)]
-async fn host_metrics_002_socket_reuses_sample_until_max_age() {
+async fn protocol_host_metrics_002_socket_reuses_sample_until_max_age() {
     let server = server();
     // Prevent paused Tokio time from auto-advancing while Unix I/O is pending.
     let clock_guard = tokio::spawn(async {

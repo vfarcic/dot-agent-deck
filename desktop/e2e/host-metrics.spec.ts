@@ -130,7 +130,7 @@ test("each connected deck shows its own host utilisation and sample age", async 
     await expect(metrics).toContainText(new RegExp(`Memory available[^\\n]*${memory}(?:\\.0+)? GiB`));
     await expect(metrics).toContainText(new RegExp(`Sample age[^\\n]*${age} ms`));
   }
-  await expect(localCard.getByTestId("daemon-identity")).toContainText("This machine");
+  await expect(localCard.getByTestId("daemon-identity")).toContainText("Local daemon");
   await expect(remoteCard.getByTestId("daemon-identity")).toContainText("build@remote-host");
   const updated = available(true);
   if (updated.status !== "available") throw new Error("available fixture");
