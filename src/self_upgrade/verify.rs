@@ -453,6 +453,8 @@ mod tests {
         assert!(host.ran().is_empty());
     }
 
+    // Unix `PATH` layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn verify_006_logged_out_and_unexpected_failures_have_their_own_reasons() {
         let logged_out = FakeHost::new().exe(GH).on_path("/usr/bin").answer(

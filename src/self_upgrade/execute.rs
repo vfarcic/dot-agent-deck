@@ -1409,6 +1409,9 @@ mod tests {
         );
     }
 
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn execute_018_a_failed_prompt_hands_over_the_install_command() {
         let (_dir, staged, target, sha) = staged_install(b"verified build");
@@ -1450,6 +1453,9 @@ mod tests {
         );
     }
 
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn execute_019_a_failed_prompt_is_recognised_whatever_the_pkexec_path() {
         // The prompt's failure is recognised by the error's variant, not by

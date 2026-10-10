@@ -1460,4 +1460,43 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn plan_027_a_platform_with_no_release_assets_is_only_told() {
+        // Native Windows (#164), or any OS/arch pair with no release assets:
+        // `Platform::current()` is `None`, so nothing is downloaded or
+        // replaced, whatever the copy's folder allows.
+        let exe = r"C:\Users\u\bin\dot-agent-deck.exe";
+        for copy in [CopyKind::Cli, CopyKind::Desktop] {
+            for method in [
+                InstallMethod::DownloadedWritable {
+                    binary: PathBuf::from(exe),
+                },
+                InstallMethod::DownloadedNonWritable {
+                    binary: PathBuf::from(exe),
+                },
+            ] {
+                let mut found = cli(exe, method);
+                found.copy = copy;
+                found.platform = None;
+                found.tools.pkexec = Some(PathBuf::from("/usr/bin/pkexec"));
+                let plan = plan(
+                    &found,
+                    &"0.46.0".into(),
+                    &PlanOptions {
+                        can_prompt_for_privilege: true,
+                        ..options()
+                    },
+                );
+                assert_eq!(plan.action, PlanAction::NotifyOnly, "{found:?}");
+                assert!(!plan.is_actionable());
+                assert!(
+                    plan.text()
+                        .contains("No release v0.46.0 build exists for this platform"),
+                    "{}",
+                    plan.text()
+                );
+            }
+        }
+    }
 }

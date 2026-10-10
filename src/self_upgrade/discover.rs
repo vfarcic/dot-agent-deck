@@ -156,7 +156,9 @@ fn answering_copy(
     ))
 }
 
-#[cfg(test)]
+// Every test here models a Unix install layout: native Windows is
+// unsupported (#164).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::self_upgrade::detect::{HomebrewFormula, InstallMethod, Tools};

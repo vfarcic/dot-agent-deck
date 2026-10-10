@@ -704,6 +704,8 @@ mod tests {
 
     // ── The impure wrapper, against a fake host ──
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn inspect_001_bundled_cli_in_deb_is_the_desktop_copy() {
         let host = FakeHost::new()

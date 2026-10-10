@@ -701,6 +701,8 @@ mod tests {
             .collect()
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_001_deb_app_with_pkexec_installs_behind_the_prompt() {
         let host = deb_machine().exe("/usr/bin/pkexec");
@@ -720,6 +722,8 @@ mod tests {
         assert_eq!(dto.cli, None);
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_002_deb_app_without_pkexec_shows_the_apt_command() {
         let dto = check(&deb_machine(), DEB_APP, Platform::LinuxAmd64);
@@ -808,6 +812,8 @@ mod tests {
         assert_eq!(dto.latest, "0.47.0");
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_008_homebrew_cli_beside_the_app_is_brew_upgraded() {
         let keg = "/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck";
@@ -832,6 +838,8 @@ mod tests {
         );
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_009_writable_local_bin_cli_is_replaced_in_place() {
         let host = deb_machine()
@@ -846,6 +854,8 @@ mod tests {
         assert!(commands(&cli.lines).is_empty());
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_010_unwritable_cli_on_linux_raises_the_password_prompt() {
         let host = deb_machine()
@@ -862,6 +872,8 @@ mod tests {
         assert!(commands(&cli.lines).is_empty());
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_011_unwritable_cli_on_macos_shows_the_command() {
         let host = dmg_machine(true, Some("ABCDE12345"))
@@ -879,6 +891,8 @@ mod tests {
         );
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_012_nix_cli_is_notify_only() {
         let store = "/nix/store/abc-dot-agent-deck-0.46.0/bin/dot-agent-deck";
@@ -895,6 +909,8 @@ mod tests {
         assert!(texts(&cli.lines).join("\n").contains("Installed with Nix"));
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_013_source_built_cli_is_notify_only() {
         let built = "/home/u/code/dot-agent-deck/target/release/dot-agent-deck";
@@ -916,6 +932,8 @@ mod tests {
         assert_eq!(dto.cli, None);
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_015_cli_behind_an_up_to_date_app_is_still_noticed() {
         let host = deb_machine()
@@ -1024,6 +1042,8 @@ mod tests {
         assert!(commands(&dto.lines).is_empty());
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_019_dto_is_camel_case_for_the_webview() {
         let host = deb_machine().exe("/usr/bin/pkexec");
@@ -1044,6 +1064,8 @@ mod tests {
         assert_eq!(copy, SelfCopy::Cli);
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_020_upgrade_carries_out_only_a_checked_actionable_plan() {
         let state = SelfUpgradeState::default();
@@ -1212,6 +1234,8 @@ mod tests {
         );
     }
 
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn self_upgrade_027_a_beta_formula_cli_is_offered_only_a_prerelease_and_told_to_switch() {
         const SWITCH: &str =
