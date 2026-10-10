@@ -52,6 +52,8 @@ The app checks for a newer release when it starts and every 6 hours while it run
 - an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
 - a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
 
+Once the app has upgraded itself, it still runs the old version until it restarts, so it does not offer that upgrade again. When nothing else is behind, the banner and the rail button say `Agent Deck v<new> is installed. Relaunch to run it.`, the banner's button reads **Relaunch…**, and the dialog they open shows the upgrade's result with a **Relaunch** button.
+
 Nothing appears while both copies are current, or while the app cannot reach GitHub. The TUI checks on the same schedule and shows the same notice at the right end of its footer; pressing `u` there opens its own upgrade dialog, with the same plans and the same one-copy-at-a-time questions as this one ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plan too.
 
 ### The upgrade dialog
@@ -61,7 +63,7 @@ The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**. I
 ![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: one section for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, one for the dot-agent-deck CLI installed with Homebrew, and below them the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
 
 1. The dialog asks about one copy at a time, the app first, for example `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. **Cancel** has the focus, as in the TUI, so `Enter` alone never upgrades anything. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead.
-2. While a copy upgrades, its section says **Upgrading…** and the dialog cannot be closed.
+2. While a copy upgrades, its section says **Upgrading…** and the dialog cannot be closed. The dialog keeps the plan it opened with: a check that finishes while it is open does not change it, and **Upgrade** carries out exactly the plan shown.
 3. The result appears under that copy's section, then the dialog asks about the next copy, if any.
 4. When nothing is left to ask, **Close** closes the dialog, and the app checks again.
 
@@ -73,9 +75,10 @@ A copy that cannot be upgraded from the app, such as a CLI installed with Nix or
 | --- | --- | --- |
 | The app, from a `.dmg` in a folder you can write | `Replaced <path> with v<new>. Quit and reopen Agent Deck to run it.`, and a **Relaunch** button | Press **Relaunch** to restart the app on the new version, or quit and reopen it later. Your agents keep running, as when you quit the app. |
 | The app, from a `.dmg` in a folder you cannot write, or an unsigned app | Why it cannot be replaced, and `Download <link>, open it, and drag Agent Deck.app into <folder>, replacing the old one.` | Do that, then reopen the app. |
-| The app, from the `.deb` | Your system's password prompt, then `Installed v<new>.` | Quit and reopen the app to run the new version. There is no **Relaunch** for the `.deb`. |
+| The app, from the `.deb` | Your system's password prompt, then `Installed v<new>.`, and a **Relaunch** button | Press **Relaunch** to restart the app on the new version, or quit and reopen it later. |
 | The app, from the `.deb`, when you dismiss the password prompt or it fails | `` `pkexec …` failed: … ``, then `It was downloaded and checked, but not installed. Install it with:` and a `sudo apt install …` command | Run the command in a terminal, then quit and reopen the app. If the system has no graphical password prompt, the dialog shows the command straight away. |
 | The CLI, from Homebrew | `` `brew upgrade dot-agent-deck` finished; it now reports v<new>. `` | Nothing. |
+| The CLI, from Homebrew, before the formula carries the new release | `` `brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v<old>, not v<new>: Homebrew does not offer v<new> yet. Try again later. `` | Nothing was upgraded, and the CLI stays on offer. Try again later. |
 | The CLI, a downloaded binary | `Upgraded <path> to v<new>.`, or, in a directory you cannot write, the password prompt on Linux and then `Installed v<new>.` | Nothing. Where the password prompt is dismissed, fails or is not available, run the command the dialog shows. |
 
 If **Relaunch** fails, the dialog shows why under its buttons; quit the app and open it again yourself. For any other failure, the copy's section shows the error and says whether anything changed; [Installation → When an upgrade fails](../installation.md#when-an-upgrade-fails) lists the messages and what to do.

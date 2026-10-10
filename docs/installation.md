@@ -299,15 +299,21 @@ The daemon owns the agents. Quitting the TUI with **Detach** leaves them running
 Both clients tell you when a newer release exists:
 
 - **TUI**: it checks when it starts and every 6 hours while it runs. When this machine's CLI or desktop app is behind, the right end of the footer shows a notice such as `dot-agent-deck: update available: v0.47.0 (current: v0.46.0) · u to upgrade`. Press `u` in command mode, or click the notice, to open the upgrade dialog ([Upgrade from the TUI](#upgrade-from-the-tui)). `dot-agent-deck upgrade` in another terminal works too.
-- **Desktop app**: it checks when it starts and every 6 hours while it runs. When this machine's app or CLI is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner with the same text and an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays.
+- **Desktop app**: it checks when it starts and every 6 hours while it runs. When this machine's app or CLI is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner with the same text and an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays. Once the app has upgraded itself and nothing else is behind, the notice says `Agent Deck v<new> is installed. Relaunch to run it.` until the app restarts, and the dialog it opens offers **Relaunch**.
 
 Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and both clients try again later.
 
-### Upgrade from the TUI
-
-Press `u` in command mode, or click the update notice in the footer, to open a dialog titled **Upgrade to v<new>**. The key can be remapped as `open_upgrade` ([Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings)). It shows the same plan as `dot-agent-deck upgrade`: one section for the CLI you are running and, when the desktop app is installed on this machine, one for the app. Each says which version you have, how that copy was installed, what upgrading it does, and whether the download's build provenance will be checked.
+**TUI:**
 
 ![The Upgrade to v0.47.0 dialog over the TUI's dashboard, with the footer's notice dot-agent-deck: update available: v0.47.0 (current: v0.46.0) · u to upgrade at the right end of the command bar: one section for the CLI, a downloaded binary at /home/dev/.local/bin/dot-agent-deck, saying what upgrading downloads and checks and that build provenance will not be checked because the GitHub CLI is not logged in, then the question Upgrade dot-agent-deck to v0.47.0? with Cancel selected above Upgrade](/img/self-upgrade-tui.png)
+
+**Desktop:**
+
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: one section for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, one for the dot-agent-deck CLI installed with Homebrew, and below them the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+
+### Upgrade from the TUI
+
+Press `u` in command mode, or click the update notice in the footer, to open a dialog titled **Upgrade to v<new>**. The key can be remapped as `open_upgrade` ([Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings)). It shows the same plan as `dot-agent-deck upgrade`: one section for the CLI you are running and, when the desktop app is installed on this machine, one for the app. Each says which version you have, how that copy was installed, what upgrading it does, and whether the download's build provenance will be checked. The dialog keeps the plan it opened with, and **Upgrade** carries out exactly that plan, even if a newer check finishes while the dialog is open.
 
 1. The dialog asks about one copy at a time, the CLI first, for example `Upgrade dot-agent-deck to v0.47.0?`. **Cancel** is selected; press `Down` (or `j`) to select **Upgrade**, then `Enter`. Nothing changes until you choose **Upgrade**: `Enter` on **Cancel**, or `Esc`, closes the dialog having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead. If the plan does not fit in your terminal, `↑ more` or `↓ more` marks the text above or below; scroll it with `PageUp` / `PageDown` or the mouse wheel. **Upgrade** works only once you have scrolled through the whole of that copy's plan, including any command and the line about build provenance; until then, `Enter` on **Upgrade** scrolls on, and the hint at the bottom says `PageDown to read the whole plan`. In a terminal too small to show any of the plan, the dialog says how many columns and rows it needs and offers only **Close**; make the terminal larger and the plan appears.
 2. While a copy upgrades, its section says **Upgrading…**, and the TUI keeps running; `Esc` does not close the dialog until the upgrade finishes.
@@ -334,7 +340,7 @@ Each copy is upgraded the way it was installed. The same plan is shown by `dot-a
 
 | Copy | Installed with | What upgrading does |
 | --- | --- | --- |
-| CLI | [Homebrew](#homebrew-macos--linux) | Runs `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta` for the beta formula; see [Beta and stable](#beta-and-stable)). If `brew` cannot be found, it shows the command to run instead. |
+| CLI | [Homebrew](#homebrew-macos--linux) | Runs `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta` for the beta formula; see [Beta and stable](#beta-and-stable)), then checks that the CLI now reports the new version. If the `brew` of the Homebrew installation the CLI came from cannot be found, it shows the command to run instead. |
 | CLI | [A downloaded binary](#download-binary) in a directory you can write, such as `~/.local/bin` | Downloads the new binary, checks it, and replaces the file in place. |
 | CLI | A downloaded binary in a directory you cannot write, such as `/usr/local/bin` | Downloads the new binary and checks it, then shows the command that installs it, which starts with `sudo`. The desktop app on Linux asks for your password instead and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the same command. |
 | CLI | [Nix](#nix) | Changes nothing. It says to update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`. |
@@ -342,7 +348,7 @@ Each copy is upgraded the way it was installed. The same plan is shown by `dot-a
 | CLI | Another system package | Changes nothing. It says to upgrade that package with your package manager. |
 | Desktop app | The `.dmg`, in `/Applications` or another folder you can write | Downloads the new `.dmg`, checks it, including its signature and notarization, replaces the app, and offers **Relaunch**. |
 | Desktop app | The `.dmg`, in a folder you cannot write, or an unsigned app | Changes nothing. It gives the download link and says to drag **Agent Deck** into that folder, replacing the old one. |
-| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` and the TUI always show that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
+| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, then offers **Relaunch**, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` and the TUI always show that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
 
 Where no desktop app exists for the platform (Linux arm64, macOS Intel, WSL), only the CLI is upgraded, and nothing is reported as missing. Inside WSL, the CLI is upgraded the same way as on Linux.
 
@@ -359,7 +365,7 @@ A copy counts as installed only when it runs and reports its version. Where the 
 
 ### Beta and stable
 
-A CLI installed from the `dot-agent-deck-beta` formula, or any copy running a pre-release version (such as `0.47.0-beta.1`), follows pre-releases: it is offered the newest pre-release, and a stable release once that is newer than every pre-release. Every other copy follows stable releases only. The CLI and the desktop app on one machine follow the channel of the copy you upgrade from.
+A CLI installed from the `dot-agent-deck-beta` formula, or any copy running a pre-release version (such as `0.47.0-beta.1`), follows pre-releases: it is offered the newest pre-release, and a stable release once that is newer than every pre-release. Every other copy follows stable releases only. Each copy on the machine follows its own channel, whichever client you upgrade from: a CLI from the stable formula next to a pre-release desktop app is offered the newest stable release, and a pre-release app next to a stable CLI the newest pre-release.
 
 The beta formula only ever receives pre-releases, so `brew upgrade dot-agent-deck-beta` cannot install a stable release. When a stable release is newer than what the beta formula offers, the plan says so and shows the switch to the stable formula:
 
@@ -379,6 +385,10 @@ The error is printed in place of the result, and says whether anything changed. 
 | `The build provenance of … could not be verified, so nothing was changed.` | `gh attestation verify` refused the release's checksum file. Do not install the release by hand; [report it](https://github.com/vfarcic/dot-agent-deck/issues). |
 | `The upgrade plan said build provenance would be checked, but it cannot be now: …` | `gh` was removed or logged out between the plan and the upgrade. Log in with `gh auth login` and run the upgrade again. |
 | `` `pkexec …` failed: … `` followed by `It was downloaded and checked, but not installed. Install it with:` | The password prompt was dismissed or failed. Run the command shown. |
+| `` `brew upgrade …` finished, but dot-agent-deck still reports v<old>, not v<new>: Homebrew does not offer v<new> yet. Try again later. `` | The release is out on GitHub, but the Homebrew formula has not been updated to it yet. Nothing was upgraded; the copy stays on offer. Try again later. |
+| `` `…` failed: it did not finish within … and was stopped `` | A command the upgrade ran stopped answering, and the deck stopped it. Try again; if it keeps happening, run the command shown in a terminal to see where it hangs. When the message says it `could not be stopped, so it may still be running`, the command was started behind the password prompt; wait for it to finish before trying again. |
+| `Warning: the release's disk image is still attached at …` | The Mac app was upgraded (or the upgrade stopped), but the downloaded disk image could not be detached. Run the `hdiutil detach -force …` command shown. |
+| `The upgrade plan this dialog shows is no longer current, so nothing was changed.` | The desktop app's dialog stayed open across several newer checks. Close it and open it again to see the current plan. |
 | `The download folder … is not safe to use: …` | The folder the deck downloads into is not private to you (it is a link, belongs to another user, or others can write to it). Remove it or make it private to you, then try again. |
 | `WARNING: … was installed, but it is NOT the verified build …` | The installed file is not the one that was checked. Do not run it; reinstall from the release page the message names. |
 
