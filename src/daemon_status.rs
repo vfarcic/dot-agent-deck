@@ -256,6 +256,7 @@ mod tests {
             last_activity_ms: None,
             blocked: None,
             hook_generation: None,
+            pull_request: None,
         }
     }
 

@@ -941,6 +941,14 @@ pub struct SessionSnapshot {
     /// ignores the key, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_generation: Option<HookGeneration>,
+    /// PRD #1401: the pull request this session's work produced, when the
+    /// daemon knows of one ([`SessionState::pull_request`]). Additive optional,
+    /// the `last_activity_ms` precedent: an older daemon omits the key and a
+    /// newer client reads its absence as no PR, an older client ignores it, so
+    /// no `PROTOCOL_VERSION` bump. The enums inside tolerate values a newer
+    /// daemon may add, so an unknown one never fails the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request::PullRequestInfo>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1060,6 +1068,10 @@ pub struct SessionState {
     /// (trust left by an earlier install) still outranks output. Process-local,
     /// like [`Self::prompt_reports_unavailable`].
     pub output_set_status: bool,
+    /// PRD #1401: the pull request this session's work produced, when the
+    /// daemon knows of one. Carried to clients by
+    /// [`SessionSnapshot::pull_request`].
+    pub pull_request: Option<crate::pull_request::PullRequestInfo>,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -1135,6 +1147,7 @@ impl SessionState {
             subagent_wait: self.subagent_wait.clone(),
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
+            pull_request: self.pull_request.clone(),
         }
     }
 
@@ -11647,6 +11660,7 @@ impl AppState {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pull_request: None,
             },
         );
         session_id
@@ -16122,6 +16136,7 @@ impl AppState {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pull_request: None,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -24498,6 +24513,7 @@ while True:
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pull_request: None,
             },
         );
 
@@ -26300,6 +26316,7 @@ while True:
                 resets_at_ms: Some(9_000),
             }),
             hook_generation: None,
+            pull_request: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -26365,6 +26382,7 @@ while True:
                 resets_at_ms,
             }),
             hook_generation: None,
+            pull_request: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

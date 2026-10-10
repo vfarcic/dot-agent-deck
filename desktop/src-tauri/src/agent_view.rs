@@ -654,6 +654,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            pull_request: None,
         });
 
         let mut view = AgentView::default();
@@ -697,6 +698,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            pull_request: None,
         });
 
         let mut view = AgentView::default();
@@ -737,6 +739,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            pull_request: None,
         });
 
         let mut view = AgentView::default();

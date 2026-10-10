@@ -332,6 +332,12 @@ export interface DesktopAgentDto {
    */
   promptKeys?: PromptKeys;
   /**
+   * PRD #1401 — the pull request this agent's work produced, copied through
+   * from `SessionSnapshot.pull_request`. Absent when the daemon knows of no PR
+   * or predates the field.
+   */
+  pullRequest?: PullRequestInfoDto;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -339,6 +345,21 @@ export interface DesktopAgentDto {
    */
   tab: AgentTab;
 }
+
+/**
+ * PRD #1401 — the daemon's `pull_request::PullRequestInfo`. `"unknown"` is what
+ * a value from a newer daemon that this build does not know arrives as.
+ */
+export interface PullRequestInfoDto {
+  number: number;
+  url: string;
+  state: PullRequestState;
+  review?: PullRequestReview;
+}
+
+export type PullRequestState = "open" | "draft" | "merged" | "closed" | "unknown";
+
+export type PullRequestReview = "approved" | "changes_requested" | "review_required" | "unknown";
 
 /** Result returned after the ordered Tauri output channel is registered. */
 export interface TerminalAttachResult {

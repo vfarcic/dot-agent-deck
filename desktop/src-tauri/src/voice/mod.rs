@@ -655,6 +655,7 @@ pub mod test_support {
             blocked: None,
             authoring_kind: None,
             tab: DesktopTab::Dashboard,
+            pull_request: None,
         }
     }
 
