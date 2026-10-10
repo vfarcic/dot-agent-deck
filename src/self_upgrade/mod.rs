@@ -48,6 +48,14 @@ pub use verify::Provenance;
 /// name.
 pub const CLI_BINARY: &str = "dot-agent-deck";
 
+/// How often a running client asks again whether a newer release exists, after
+/// the check it makes at start. The desktop app uses it; one value so both
+/// clients notice a release equally soon (CLAUDE.md rule 22). Six hours keeps a
+/// client that runs for days current while staying far inside GitHub's
+/// unauthenticated limit of 60 API requests an hour.
+pub const UPDATE_RECHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
 /// The command a client shows where it cannot carry an upgrade out itself.
 pub const UPGRADE_COMMAND: &str = "dot-agent-deck upgrade";
 

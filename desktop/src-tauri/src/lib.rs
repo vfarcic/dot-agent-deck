@@ -30,6 +30,9 @@ mod secrets;
 // nothing to a normal build.
 #[cfg(test)]
 mod selection_capture;
+// Issue #1635: noticing a newer release and upgrading this machine's copies
+// (the app and the CLI beside it) on the root crate's shared core.
+mod self_upgrade;
 mod settings;
 mod terminal;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
@@ -6163,6 +6166,8 @@ pub fn run() {
         .manage(VoiceState::default())
         // PRD #1487 M5: the running upgrades and the restart questions they wait on.
         .manage(upgrade::UpgradeState::default())
+        // Issue #1635: the plans last shown and the one upgrade of this app's own copies.
+        .manage(self_upgrade::SelfUpgradeState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -6306,6 +6311,9 @@ pub fn run() {
             desktop_run_action,
             desktop_upgrade_daemon,
             desktop_upgrade_decide,
+            self_upgrade::desktop_self_upgrade_check,
+            self_upgrade::desktop_self_upgrade_run,
+            self_upgrade::desktop_self_upgrade_relaunch,
             desktop_secret_status,
             desktop_store_secret,
             desktop_forget_secret,
