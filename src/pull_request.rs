@@ -31,25 +31,35 @@
 //!
 //! A change is set on the daemon's own sessions and broadcast as an
 //! [`EventType::PullRequest`] carrying the value under
-//! [`PULL_REQUEST_METADATA_KEY`], both under one `AppState` write lock, so a
-//! `ListAgents` reply can never be older than a report a client already
-//! applied. Clients apply it in [`crate::state::AppState::apply_event`] (the TUI
-//! and the desktop's fold both run that), and hydration copies the snapshot
-//! field. An older client decodes the event type as `Unknown`, a no-op, which is
-//! why no `PROTOCOL_VERSION` bump is needed.
+//! [`PULL_REQUEST_METADATA_KEY`], both under one `AppState` write lock. That
+//! orders the daemon's state against its broadcast, not a client's `ListAgents`
+//! reply against its event stream: a reply built before a report can reach a
+//! client after the report did. Clients apply the event in
+//! [`crate::state::AppState::apply_event`] (the TUI and the desktop's fold both
+//! run that), and hydration copies the snapshot field.
+//!
+//! An older client decodes the event type as `Unknown`. That is not a no-op
+//! there: the event is still journalled on the card and still runs the
+//! client's admission and cwd reconciliation. What keeps it harmless is that
+//! the classifiers that matter stay neutral — `Unknown` changes no status and
+//! is neither delivery proof nor retry evidence — and that the event names no
+//! agent type and no prompt and is stamped at the session's own last activity,
+//! so it moves no activity clock. That is why no `PROTOCOL_VERSION` bump is
+//! needed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::{AgentEvent, BroadcastMsg, EventType, PULL_REQUEST_METADATA_KEY};
 use crate::git_env::git_at;
 use crate::state::{SessionState, SharedState};
+use crate::untrusted_text::escape_control_and_bidi;
 
 /// A pull request linked to an agent session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -131,6 +141,18 @@ const MAX_KICK_DEBOUNCE: Duration = Duration::from_secs(10);
 /// How long one `gh` may run before it counts as a failure.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one `git` probe may run before the directory counts as having no
+/// key. A repository on a stalled filesystem, or one whose config is a FIFO,
+/// costs this much and a killed child, never a stuck one.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most `git` probes and `gh` queries the monitor runs at once, across
+/// every directory and key. Further jobs wait for a permit.
+const MAX_CONCURRENT_JOBS: usize = 4;
+
+/// How much of `gh`'s stderr a failure keeps.
+const MAX_LOGGED_STDERR_CHARS: usize = 300;
+
 /// The interval from [`DOT_AGENT_DECK_PR_REFRESH_SECS_ENV`]'s value.
 pub fn refresh_interval_from(value: Option<&str>) -> Duration {
     value
@@ -159,8 +181,21 @@ pub(crate) fn is_default_branch(branch: &str, default: Option<&str>) -> bool {
     }
 }
 
-fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = git_at(cwd).args(args).output().ok()?;
+/// One line of `git <args>` run in `cwd`, or `None` when it fails, prints
+/// nothing or outlives [`GIT_TIMEOUT`]. The child is `git_at`'s command (the
+/// ambient git location switched off), run async and killed when the future is
+/// dropped — so a timed-out probe, or one whose job is aborted, leaves no git
+/// behind.
+async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::from(git_at(cwd));
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -170,11 +205,11 @@ fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
 
 /// The key `cwd`'s PR is looked up by, or `None` when it gets no badge: not a
 /// git repository, a detached `HEAD`, the remote's default branch, or an
-/// `origin` that is missing or not on GitHub. Blocking (it runs `git`); the
-/// monitor calls it on a blocking thread.
-pub(crate) fn branch_key(cwd: &Path) -> Option<PrKey> {
+/// `origin` that is missing or not on GitHub. Each `git` it runs is bounded by
+/// [`GIT_TIMEOUT`] and killed when the future is dropped.
+pub(crate) async fn branch_key(cwd: &Path) -> Option<PrKey> {
     // `symbolic-ref` fails on a detached HEAD and outside a repository alike.
-    let branch = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
     let default = git_line(
         cwd,
         &[
@@ -183,14 +218,16 @@ pub(crate) fn branch_key(cwd: &Path) -> Option<PrKey> {
             "--short",
             "refs/remotes/origin/HEAD",
         ],
-    );
+    )
+    .await;
     let default = default
         .as_deref()
         .map(|d| d.strip_prefix("origin/").unwrap_or(d));
     if is_default_branch(&branch, default) {
         return None;
     }
-    let slug = crate::worktree_reclaim::derive_repo_slug(cwd)?;
+    let origin = git_line(cwd, &["remote", "get-url", "origin"]).await?;
+    let slug = crate::worktree_reclaim::parse_github_owner_repo(&origin)?;
     Some(PrKey { slug, branch })
 }
 
@@ -265,11 +302,18 @@ async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, S
         .map_err(|_| format!("gh pr list timed out after {}s", GH_TIMEOUT.as_secs()))?
         .map_err(|e| format!("gh unavailable: {e}"))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stderr: String = stderr.trim().chars().take(300).collect();
-        return Err(format!("gh pr list failed ({}): {stderr}", out.status));
+        return Err(gh_failure(&out.status, &out.stderr));
     }
     parse_pr_list(&String::from_utf8_lossy(&out.stdout), &key.branch)
+}
+
+/// The error a failed `gh` reports. Its stderr is quoted into a log line, so
+/// control characters, line breaks and bidi marks are escaped first, and the
+/// result is capped at [`MAX_LOGGED_STDERR_CHARS`].
+fn gh_failure(status: &impl std::fmt::Display, stderr: &[u8]) -> String {
+    let stderr = escape_control_and_bidi(String::from_utf8_lossy(stderr).trim());
+    let stderr: String = stderr.chars().take(MAX_LOGGED_STDERR_CHARS).collect();
+    format!("gh pr list failed ({status}): {stderr}")
 }
 
 /// What the monitor knows about one key.
@@ -375,18 +419,118 @@ fn is_refresh_trigger(event_type: &EventType) -> bool {
 struct CwdEntry {
     key: Option<PrKey>,
     resolved_at: Option<Instant>,
-    resolving: bool,
     kicked: bool,
 }
 
-enum Finished {
-    Resolved(PathBuf, Option<PrKey>),
-    Fetched(PrKey, Result<Option<PullRequestInfo>, String>),
+/// Whether a directory's branch needs re-reading at `now`: never read, once an
+/// interval, or after a turn end once the same debounce as a lookup's passed —
+/// so a stream of Idle reports cannot drive `git` at its completion rate.
+fn resolve_due(
+    resolved_at: Option<Instant>,
+    kicked: bool,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    let Some(at) = resolved_at else {
+        return true;
+    };
+    let age = now.saturating_duration_since(at);
+    age >= interval || (kicked && age >= interval.min(MAX_KICK_DEBOUNCE))
+}
+
+/// The monitor's background jobs of one kind (`git` probes per directory, `gh`
+/// queries per key): at most one per id, all owned here and aborted when the
+/// pool is dropped — the monitor stopping drops it — or when [`Self::retain`]
+/// drops their id. Aborting a job drops its future, which kills its child
+/// (`kill_on_drop`). Every job runs only while holding a permit from a
+/// semaphore shared by every pool, which bounds how many run at once.
+pub(crate) struct JobPool<K, T> {
+    jobs: tokio::task::JoinSet<(K, u64, T)>,
+    running: HashMap<K, (u64, tokio::task::AbortHandle)>,
+    next_id: u64,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl<K, T> JobPool<K, T>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+    T: Send + 'static,
+{
+    pub(crate) fn new(permits: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            jobs: tokio::task::JoinSet::new(),
+            running: HashMap::new(),
+            next_id: 0,
+            permits,
+        }
+    }
+
+    pub(crate) fn is_running(&self, id: &K) -> bool {
+        self.running.contains_key(id)
+    }
+
+    /// Jobs started and neither finished nor cancelled, waiting for a permit
+    /// or running.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Start `job` for `id`, cancelling one already running for it.
+    pub(crate) fn spawn<F>(&mut self, id: K, job: F)
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        self.cancel(&id);
+        let generation = self.next_id;
+        self.next_id += 1;
+        let permits = self.permits.clone();
+        let task_id = id.clone();
+        let handle = self.jobs.spawn(async move {
+            // The semaphore is never closed, so this only waits.
+            let _permit = permits.acquire_owned().await;
+            (task_id, generation, job.await)
+        });
+        self.running.insert(id, (generation, handle));
+    }
+
+    pub(crate) fn cancel(&mut self, id: &K) {
+        if let Some((_, handle)) = self.running.remove(id) {
+            handle.abort();
+        }
+    }
+
+    /// Cancel every job whose id `keep` rejects.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.running.retain(|id, (_, handle)| {
+            let kept = keep(id);
+            if !kept {
+                handle.abort();
+            }
+            kept
+        });
+    }
+
+    /// The next job to finish, skipping cancelled and superseded ones. `None`
+    /// once no job is left.
+    pub(crate) async fn next(&mut self) -> Option<(K, T)> {
+        while let Some(joined) = self.jobs.join_next().await {
+            let Ok((id, generation, value)) = joined else {
+                continue;
+            };
+            if self.running.get(&id).is_some_and(|(g, _)| *g == generation) {
+                self.running.remove(&id);
+                return Some((id, value));
+            }
+        }
+        None
+    }
 }
 
 /// PRD #1401: the daemon's background task that resolves every live
 /// session's pull request and reports changes — see the module docs. Runs
-/// until aborted (`run_daemon_with`'s cleanup) or the broadcast closes.
+/// until aborted (`run_daemon_with`'s cleanup) or the broadcast closes; either
+/// way its jobs, and the children they run, go with it.
 pub async fn run_pull_request_monitor(
     registry: Arc<AgentPtyRegistry>,
     state: SharedState,
@@ -394,7 +538,10 @@ pub async fn run_pull_request_monitor(
     interval: Duration,
 ) {
     let mut events = event_tx.subscribe();
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Finished>();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
+    let mut probes: JobPool<PathBuf, Option<PrKey>> = JobPool::new(permits.clone());
+    let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, String>> =
+        JobPool::new(permits);
     let tick = interval.min(Duration::from_secs(5));
     let mut cwds: HashMap<PathBuf, CwdEntry> = HashMap::new();
     let mut keys: HashMap<PrKey, KeyEntry> = HashMap::new();
@@ -414,39 +561,39 @@ pub async fn run_pull_request_monitor(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            Some(done) = done_rx.recv() => match done {
-                Finished::Resolved(cwd, key) => {
-                    let entry = cwds.entry(cwd).or_default();
+            Some((cwd, key)) = probes.next() => {
+                // A directory dropped meanwhile had its job cancelled, so a
+                // result always has its entry.
+                if let Some(entry) = cwds.get_mut(&cwd) {
                     entry.key = key;
                     entry.resolved_at = Some(Instant::now());
-                    entry.resolving = false;
                 }
-                Finished::Fetched(key, result) => {
-                    let entry = keys.entry(key.clone()).or_default();
-                    entry.in_flight = false;
-                    entry.fetched_at = Some(Instant::now());
-                    match result {
-                        Ok(value) => {
-                            entry.value = Some(value);
-                            entry.failed = false;
-                            entry.failure_logged = false;
-                        }
-                        Err(error) => {
-                            entry.failed = true;
-                            if !entry.failure_logged {
-                                entry.failure_logged = true;
-                                warn!(
-                                    repo = %key.slug,
-                                    branch = %key.branch,
-                                    error = %error,
-                                    "pull request lookup failed; the agent's card shows no \
-                                     pull request until a later lookup succeeds"
-                                );
-                            }
+            }
+            Some((key, result)) = lookups.next() => {
+                let entry = keys.entry(key.clone()).or_default();
+                entry.in_flight = false;
+                entry.fetched_at = Some(Instant::now());
+                match result {
+                    Ok(value) => {
+                        entry.value = Some(value);
+                        entry.failed = false;
+                        entry.failure_logged = false;
+                    }
+                    Err(error) => {
+                        entry.failed = true;
+                        if !entry.failure_logged {
+                            entry.failure_logged = true;
+                            warn!(
+                                repo = %escape_control_and_bidi(&key.slug),
+                                branch = %escape_control_and_bidi(&key.branch),
+                                error = %escape_control_and_bidi(&error),
+                                "pull request lookup failed; the agent's card shows no \
+                                 pull request until a later lookup succeeds"
+                            );
                         }
                     }
                 }
-            },
+            }
         }
         let now = Instant::now();
 
@@ -490,52 +637,51 @@ pub async fn run_pull_request_monitor(
         }
         kicked_sessions.clear();
 
-        // Re-read each directory's branch: new, kicked, or once an interval.
+        // Only directories some session still works in are tracked; a probe
+        // for one no session references any more is cancelled with it.
         let live_cwds: HashSet<&PathBuf> =
             sessions.iter().filter_map(|(_, c)| c.as_ref()).collect();
-        cwds.retain(|cwd, entry| entry.resolving || live_cwds.contains(cwd));
+        cwds.retain(|cwd, _| live_cwds.contains(cwd));
+        probes.retain(|cwd| live_cwds.contains(cwd));
+
+        // Re-read each directory's branch: new, once an interval, or after a
+        // turn end once the debounce passed.
         for (cwd, entry) in cwds.iter_mut() {
-            let due = entry
-                .resolved_at
-                .is_none_or(|at| entry.kicked || now.saturating_duration_since(at) >= interval);
-            if entry.resolving || !due {
+            if probes.is_running(cwd)
+                || !resolve_due(entry.resolved_at, entry.kicked, now, interval)
+            {
                 continue;
             }
-            entry.resolving = true;
             entry.kicked = false;
-            let cwd = cwd.clone();
-            let done_tx = done_tx.clone();
-            tokio::spawn(async move {
-                let probe = cwd.clone();
-                let key = tokio::task::spawn_blocking(move || branch_key(&probe))
-                    .await
-                    .ok()
-                    .flatten();
-                let _ = done_tx.send(Finished::Resolved(cwd, key));
-            });
+            let probe = cwd.clone();
+            probes.spawn(cwd.clone(), async move { branch_key(&probe).await });
         }
 
-        // Look up each key in use that is due.
+        // Look up each key in use that is due; a lookup for a key no
+        // directory uses any more is cancelled.
         let mut key_cwd: HashMap<PrKey, PathBuf> = HashMap::new();
         for (cwd, entry) in &cwds {
             if let Some(key) = &entry.key {
                 key_cwd.entry(key.clone()).or_insert_with(|| cwd.clone());
             }
         }
-        keys.retain(|key, entry| entry.in_flight || key_cwd.contains_key(key));
+        keys.retain(|key, _| key_cwd.contains_key(key));
+        lookups.retain(|key| key_cwd.contains_key(key));
         for (key, cwd) in &key_cwd {
             let entry = keys.entry(key.clone()).or_default();
+            entry.in_flight = lookups.is_running(key);
             if !fetch_due(entry, now, interval) {
                 continue;
             }
             entry.in_flight = true;
             entry.kicked = false;
-            debug!(repo = %key.slug, branch = %key.branch, "looking up the branch's pull request");
-            let (key, cwd, done_tx) = (key.clone(), cwd.clone(), done_tx.clone());
-            tokio::spawn(async move {
-                let result = query_gh(cwd, key.clone()).await;
-                let _ = done_tx.send(Finished::Fetched(key, result));
-            });
+            debug!(
+                repo = %escape_control_and_bidi(&key.slug),
+                branch = %escape_control_and_bidi(&key.branch),
+                "looking up the branch's pull request"
+            );
+            let (job_key, cwd) = (key.clone(), cwd.clone());
+            lookups.spawn(key.clone(), async move { query_gh(cwd, job_key).await });
         }
 
         // What each session should show now. A session whose directory or key
@@ -925,8 +1071,8 @@ mod tests {
     /// `branch_key` against real repositories: a feature branch with a GitHub
     /// origin has a key; the default branch, a detached HEAD, a non-GitHub
     /// origin and a directory outside git have none.
-    #[test]
-    fn branch_key_reads_the_branch_the_default_and_the_origin() {
+    #[tokio::test]
+    async fn branch_key_reads_the_branch_the_default_and_the_origin() {
         let sandbox = tempfile::tempdir().unwrap();
         let repo = sandbox.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -950,23 +1096,197 @@ mod tests {
             "refs/remotes/origin/HEAD",
             "refs/remotes/origin/main",
         ]);
-        assert_eq!(branch_key(&repo), None, "the default branch");
+        assert_eq!(branch_key(&repo).await, None, "the default branch");
         git(&["checkout", "-q", "-b", "feat/x"]);
         assert_eq!(
-            branch_key(&repo),
+            branch_key(&repo).await,
             Some(PrKey {
                 slug: "o/r".into(),
                 branch: "feat/x".into()
             })
         );
         git(&["remote", "set-url", "origin", "https://gitlab.com/o/r.git"]);
-        assert_eq!(branch_key(&repo), None, "a non-GitHub origin");
+        assert_eq!(branch_key(&repo).await, None, "a non-GitHub origin");
         git(&["remote", "set-url", "origin", "https://github.com/o/r.git"]);
         git(&["checkout", "-q", "--detach"]);
-        assert_eq!(branch_key(&repo), None, "a detached HEAD");
+        assert_eq!(branch_key(&repo).await, None, "a detached HEAD");
         let outside = sandbox.path().join("plain");
         std::fs::create_dir(&outside).unwrap();
-        assert_eq!(branch_key(&outside), None, "outside git");
+        assert_eq!(branch_key(&outside).await, None, "outside git");
+    }
+
+    #[test]
+    fn a_branch_is_re_read_every_interval_and_a_turn_end_only_after_the_debounce() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        assert!(resolve_due(None, false, at, interval), "never read");
+        assert!(!resolve_due(
+            Some(at),
+            false,
+            at + Duration::from_secs(59),
+            interval
+        ));
+        assert!(resolve_due(Some(at), false, at + interval, interval));
+        // A burst of Idle reports right after a probe does not re-probe.
+        assert!(!resolve_due(Some(at), true, at, interval));
+        assert!(!resolve_due(
+            Some(at),
+            true,
+            at + Duration::from_secs(9),
+            interval
+        ));
+        assert!(resolve_due(
+            Some(at),
+            true,
+            at + MAX_KICK_DEBOUNCE,
+            interval
+        ));
+    }
+
+    /// Wait (bounded) until `done` holds, yielding to the runtime between
+    /// checks.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Two pools sharing one semaphore run at most its permit count of jobs
+    /// at once, however many are queued, and every job still finishes.
+    #[tokio::test]
+    async fn the_job_pools_share_one_concurrency_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut probes: JobPool<u32, u32> = JobPool::new(permits.clone());
+        let mut lookups: JobPool<u32, u32> = JobPool::new(permits);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let job = |id: u32| {
+            let (gate, active, peak) = (gate.clone(), active.clone(), peak.clone());
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let _ = gate.acquire().await.map(|p| p.forget());
+                active.fetch_sub(1, Ordering::SeqCst);
+                id
+            }
+        };
+        for id in 0..5 {
+            probes.spawn(id, job(id));
+        }
+        for id in 0..3 {
+            lookups.spawn(id, job(id));
+        }
+        eventually("two jobs running", || active.load(Ordering::SeqCst) == 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(active.load(Ordering::SeqCst), 2, "only two may run");
+        assert_eq!((probes.len(), lookups.len()), (5, 3));
+        gate.add_permits(100);
+        let mut finished = 0;
+        while probes.next().await.is_some() {
+            finished += 1;
+        }
+        while lookups.next().await.is_some() {
+            finished += 1;
+        }
+        assert_eq!(finished, 8);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!((probes.len(), lookups.len()), (0, 0));
+    }
+
+    /// A job whose id is retained away, or whose pool is dropped (the monitor
+    /// stopping), has its future dropped; a superseded job's result is never
+    /// reported.
+    #[tokio::test]
+    async fn cancelled_superseded_and_dropped_jobs_go_away() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut pool: JobPool<u32, ()> =
+            JobPool::new(Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS)));
+        for id in 0..6 {
+            let guard = Guard(dropped.clone());
+            pool.spawn(id, async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+        }
+        pool.retain(|id| id % 2 == 0);
+        assert_eq!(pool.len(), 3);
+        assert!(!pool.is_running(&1) && pool.is_running(&2));
+        eventually("the three cancelled jobs dropped", || {
+            dropped.load(Ordering::SeqCst) == 3
+        })
+        .await;
+        drop(pool);
+        eventually("every job dropped with the pool", || {
+            dropped.load(Ordering::SeqCst) == 6
+        })
+        .await;
+
+        let mut pool: JobPool<u32, &str> =
+            JobPool::new(Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS)));
+        pool.spawn(1, async { "old" });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pool.spawn(1, async { "new" });
+        assert_eq!(pool.next().await, Some((1, "new")));
+        assert_eq!(pool.next().await, None);
+    }
+
+    /// Dropping the pool kills the child a running job started — the
+    /// `kill_on_drop` a stuck `git` relies on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_the_pool_kills_a_running_jobs_child() {
+        let mut pool: JobPool<u32, ()> =
+            JobPool::new(Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS)));
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        pool.spawn(1, async move {
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("1000")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sleep");
+            let _ = pid_tx.send(child.id().expect("pid"));
+            let _ = child.wait().await;
+        });
+        let pid = pid_rx.await.expect("the job started its child");
+        drop(pool);
+        let stat = format!("/proc/{pid}/stat");
+        eventually("the child killed", || {
+            // Gone, or a zombie waiting for tokio's reaper: either way dead.
+            match std::fs::read_to_string(&stat) {
+                Err(_) => true,
+                Ok(s) => s
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn gh_stderr_is_escaped_and_capped_before_it_is_logged() {
+        let hostile = "HTTP 401\n2026-10-10T00:00:00Z WARN forged line\x1b[2J\u{202e}gnp.exe";
+        let msg = gh_failure(&"exit status: 1", hostile.as_bytes());
+        assert!(!msg.chars().any(|c| c.is_control()), "{msg}");
+        assert!(
+            !msg.chars().any(crate::untrusted_text::is_bidi_format_char),
+            "{msg}"
+        );
+        assert!(msg.contains("HTTP 401\\n2026"), "{msg}");
+        let long = "y".repeat(10_000);
+        let msg = gh_failure(&"exit status: 1", long.as_bytes());
+        assert_eq!(msg.matches('y').count(), MAX_LOGGED_STDERR_CHARS);
     }
 
     fn sample_session() -> SessionState {

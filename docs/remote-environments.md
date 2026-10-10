@@ -337,7 +337,7 @@ ssh deck@198.51.100.10 '~/.local/bin/dot-agent-deck hooks install --agent openco
 
 ## Pull requests on the remote
 
-An agent's [pull request badge](session-management.md#pull-request-badge) is looked up with GitHub's `gh` command on the host, in the agent's working directory there, so `gh` has to be installed and signed in on the host (`ssh <host> gh auth status`), not only on your laptop. Opening it differs between the clients. The desktop app opens the page inside the app on your laptop. `o` in the TUI runs where the TUI runs, which with `connect` is the host, so it opens a browser on the host, and on a host with no desktop session no browser opens; open the pull request from the desktop app or on github.com instead. See [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+An agent's [pull request badge](session-management.md#pull-request-badge) is looked up with GitHub's `gh` command on the host, in the agent's working directory there, so `gh` has to be installed and signed in on the host (`ssh <host> gh auth status`), not only on your laptop. Opening it differs between the clients. The desktop app opens the page inside the app on your laptop. `o` in the TUI runs where the TUI runs, which with `connect` is the host, so it opens a browser on the host. On a host with no desktop session, or when no browser can be started there, the status line shows the pull request's address instead, so you can copy it and open it on your laptop, or open the pull request from the desktop app. See [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
 
 ## Getting files to the remote
 

@@ -8402,46 +8402,6 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
-/// PRD #1401: open a pull request `url` in the system browser without blocking
-/// the render loop — `$BROWSER` when it is set (the first entry of a
-/// `:`-separated list, `%s` replaced by the URL or the URL appended), the
-/// platform opener otherwise. Only a `https://github.com/` URL is opened: the
-/// daemon only ever reports one, and this is the one place a URL from the wire
-/// reaches a process spawn.
-fn open_in_system_browser(url: &str) -> Result<(), String> {
-    if !url.starts_with("https://github.com/") || url.chars().any(char::is_control) {
-        return Err("not a GitHub pull request URL".to_string());
-    }
-    let browser = std::env::var("BROWSER").unwrap_or_default();
-    let command = browser.split(':').next().unwrap_or("").trim();
-    if command.is_empty() {
-        return open::that_detached(url).map_err(|e| e.to_string());
-    }
-    let mut words = command.split_whitespace();
-    let program = words.next().unwrap_or(command);
-    let mut args: Vec<String> = words.map(str::to_string).collect();
-    if args.iter().any(|arg| arg.contains("%s")) {
-        for arg in &mut args {
-            *arg = arg.replace("%s", url);
-        }
-    } else {
-        args.push(url.to_string());
-    }
-    let mut child = std::process::Command::new(program)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{program}: {e}"))?;
-    // Reaped off the render thread, so a browser that stays in the foreground
-    // neither blocks the deck nor lingers as a zombie.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
 /// Open the project repository in the user's browser and build the status
 /// message for whichever way that went.
 ///
@@ -11803,18 +11763,13 @@ fn dispatch_action(
                 .and_then(|session| session.pull_request.as_ref())
                 .map(|pr| pr.url.clone());
             match url {
-                Some(url) => match open_in_system_browser(&url) {
-                    Ok(()) => {
-                        ui.status_message =
-                            Some((format!("Opened {url}"), std::time::Instant::now()));
-                    }
-                    Err(e) => {
-                        ui.status_message = Some((
-                            format!("Could not open the pull request: {e}"),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                },
+                Some(url) => {
+                    let message = crate::system_browser::open_pull_request(
+                        &url,
+                        &crate::system_browser::BrowserEnv::from_process(),
+                    );
+                    ui.status_message = Some((message, std::time::Instant::now()));
+                }
                 None => {
                     ui.status_message = Some((
                         "This agent has no pull request.".to_string(),

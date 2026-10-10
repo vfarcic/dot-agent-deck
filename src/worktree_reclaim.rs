@@ -350,7 +350,7 @@ pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
 /// `owner/name` slug. Returns `None` for anything else, including a
 /// non-GitHub host, a URL with no path, or a path with more than two
 /// segments — fail closed rather than guess.
-fn parse_github_owner_repo(url: &str) -> Option<String> {
+pub(crate) fn parse_github_owner_repo(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))

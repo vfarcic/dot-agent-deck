@@ -106,6 +106,8 @@ pub mod scheduler;
 pub mod spawn;
 pub mod state;
 pub mod submit_echo;
+// PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
+pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;

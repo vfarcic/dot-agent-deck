@@ -10392,11 +10392,13 @@ fn overlay_snapshot_onto_kept_card(
     snap: &SessionSnapshot,
     observed: Option<DateTime<Utc>>,
 ) {
-    // PRD #1401: the pull request is the daemon's alone and not ordered by
-    // activity — its report moves no `last_activity` — so the reply wins
-    // whatever its stamp. Every report broadcast before the reply was built was
-    // applied to the state the reply was built from (one write lock covers both),
-    // so the reply is never the older of the two.
+    // PRD #1401: the pull request is the daemon's alone and its report moves
+    // no `last_activity`, so the activity clock below cannot order it and the
+    // reply's value is taken whatever its stamp. The daemon sets a session's
+    // value and broadcasts its report under one write lock, which orders the
+    // daemon's own state, not this client's two streams: a reply built before
+    // a report can still be applied after that report's event arrived, and the
+    // card then shows the older value until the next report or reply.
     session.pull_request = snap.pull_request.clone();
     if let Some(observed) = observed
         && observed > session.last_activity
