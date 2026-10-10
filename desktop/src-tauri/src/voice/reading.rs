@@ -1477,7 +1477,8 @@ mod tests {
 
     /// Scenario: Claude's permission hook announces a prompt, then its delayed
     /// notification describes that same pending prompt six seconds later.
-    /// Reading speaks it once; a Claude with only the notification still speaks.
+    /// Reading speaks each prompt once even with two hooks before two notices;
+    /// a Claude with only the notification still speaks.
     #[tokio::test(start_paused = true)]
     async fn question_desktop_015_a_permission_hook_and_its_notification_are_announced_once() {
         let notice_only = question_reading_script(vec![(delayed_permission_notice(), SHORT)]).await;
@@ -1501,6 +1502,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["The tester is asking for permission: Bash: touch x."],
             "the delayed permission_prompt must not announce the same pending prompt again"
+        );
+
+        let mut second = held_permission_prompt("q2");
+        second.tool_detail = Some("touch y".into());
+        let sentences = question_reading_script(vec![
+            (held_permission_prompt("q1"), Duration::from_secs(6)),
+            (second, Duration::from_secs(6)),
+            (delayed_permission_notice(), Duration::from_secs(6)),
+            (delayed_permission_notice(), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "The tester is asking for permission: Bash: touch x.",
+                "The tester is asking for permission: Bash: touch y."
+            ],
+            "two announced prompts owe two notices; neither delayed notice may speak"
+        );
+    }
+
+    /// Scenario: A hook prompt receives no notification before the agent
+    /// moves on. A later notification-only prompt must still be announced,
+    /// whether the earlier prompt was answered or work simply resumed.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_missing_notice_does_not_silence_the_next_prompt() {
+        let mut answered = status("a", EventType::Thinking);
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+        );
+        let boundaries = [
+            ("PermissionAnswered", vec![answered]),
+            (
+                "ToolEnd then Idle",
+                vec![
+                    status("a", EventType::ToolEnd),
+                    status("a", EventType::Idle),
+                ],
+            ),
+            ("ToolStart", vec![status("a", EventType::ToolStart)]),
+            ("Thinking", vec![status("a", EventType::Thinking)]),
+            ("Idle", vec![status("a", EventType::Idle)]),
+        ];
+        let mut failures = Vec::new();
+        for (label, boundary) in boundaries {
+            let mut script = vec![(held_permission_prompt("q1"), Duration::from_secs(6))];
+            script.extend(
+                boundary
+                    .into_iter()
+                    .map(|event| (event, Duration::from_secs(6))),
+            );
+            let mut notice = delayed_permission_notice();
+            notice.user_prompt = Some("new Q2".into());
+            script.push((notice, SHORT));
+            let sentences = question_reading_script(script).await;
+            let spoken = sentences
+                .iter()
+                .filter(|s| s["kind"] == "permission")
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            if spoken
+                != [
+                    "The tester is asking for permission: Bash: touch x.",
+                    "The tester is asking for permission: new Q2.",
+                ]
+            {
+                failures.push(format!("after {label}: {spoken:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "missing Q1 notice must not swallow Q2 at turn boundaries: {failures:#?}"
         );
     }
 

@@ -132,24 +132,79 @@ fn pick(question_index: u32, options: &[u32]) -> Selection {
 
 /// Scenario: The model fills Colour with the spoken free text, but also picks
 /// Sizes' textless free-text option using words already cited for Colour.
-/// Grounding drops the borrowed selection and keeps the correct Colour answer.
-#[test]
-fn question_desktop_007_grounding_drops_a_textless_selection_borrowing_another_questions_words() {
-    let correct = ModelAnswer::answer(0, &[4])
+/// The final form keeps Colour and leaves Sizes unanswered, even when Sizes
+/// had an earlier answer, so the answer cannot arm a countdown.
+#[tokio::test]
+async fn question_desktop_007_grounding_drops_a_textless_selection_borrowing_another_questions_words()
+ {
+    let question = map_pending_question(&form_question());
+    let said = "type my own colour: a hamster named Bob";
+    let correct = ModelAnswer::answer(0, &[3])
         .with_text("a hamster named Bob")
         .citing("type my own colour: a hamster named Bob");
     for borrowed in [
         "a hamster named Bob",
         "type my own colour: a hamster named Bob",
     ] {
-        let mut answer = correct.clone().and(1, &[4]).citing(borrowed);
-        ground("type my own colour: a hamster named Bob", &mut answer)
-            .expect("the correct half stands rather than refusing the whole answer");
-        assert_eq!(
-            answer.selections, correct.selections,
-            "Sizes must keep waiting when its textless selection borrows Colour's evidence"
-        );
+        let answer = correct.clone().and(1, &[3]).citing(borrowed);
+        let resolver = StubResolver::new().answering_question(said, answer);
+        for previous in [vec![], vec![pick(1, &[2])]] {
+            let verdict = say(&resolver, &question, &previous, said).await;
+            match verdict {
+                QuestionVerdict::Answered {
+                    form,
+                    complete,
+                    always,
+                    ..
+                } => {
+                    assert!(
+                        !complete,
+                        "a dropped Sizes selection must not leave an earlier answer sendable: {form:?}"
+                    );
+                    assert!(always.is_none());
+                    assert_eq!(form.len(), 1, "Sizes must be unanswered: {form:?}");
+                    assert_eq!(form[0].question_index, 0);
+                    assert_eq!(form[0].option_indices, [3]);
+                    assert_eq!(form[0].text.as_deref(), Some("a hamster named Bob"));
+                    assert!(
+                        check_form("tester", &question, "q-form", &form, false).is_err(),
+                        "the incomplete form cannot be sent"
+                    );
+                }
+                other => panic!("Colour should be filled while Sizes waits: {other:?}"),
+            }
+        }
     }
+}
+
+/// Scenario: A model supplies Colour's spoken free text and an invalid
+/// textless selection borrowing those words. Validation must refuse the
+/// entire answer rather than dropping the invalid selection and arming it.
+#[tokio::test]
+async fn question_desktop_007_borrowed_invalid_selections_are_still_refused() {
+    let question = map_pending_question(&form_question());
+    let said = "type my own colour: a hamster named Bob";
+    let mut failures = Vec::new();
+    for (at, index) in [(99, 3), (1, 99)] {
+        let answer = ModelAnswer::answer(0, &[3])
+            .with_text("a hamster named Bob")
+            .citing(said)
+            .and(at, &[index])
+            .citing("a hamster named Bob");
+        let expected = validate("tester", &question, &answer.selections)
+            .expect_err("the original model answer is invalid");
+        let resolver = StubResolver::new().answering_question(said, answer);
+        let verdict = say(&resolver, &question, &[pick(1, &[2])], said).await;
+        if verdict != (QuestionVerdict::Refused { sentence: expected }) {
+            failures.push(format!(
+                "invalid question {at} / option {index} became {verdict:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "invalid selections must still refuse after grounding: {failures:#?}"
+    );
 }
 
 /// Scenario: Colour's free text and Sizes' textless selection each cite their

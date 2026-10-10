@@ -2711,11 +2711,18 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * Reading switch the settings document starts with; `notice` whether its
    * one-time notice was shown.
    */
-  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, question }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; question?: PendingQuestionDto } = {}) {
+  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, holdStart, question }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; holdStart?: Promise<void>; question?: PendingQuestionDto } = {}) {
     const finished: string[] = [];
     const spoken = synth(silent, finished);
     const steps: Parameters<typeof sequencedVoice>[0] = [];
     const voice = sequencedVoice(steps);
+    if (holdStart) {
+      const start = voice.voiceStart.getMockImplementation()!;
+      voice.voiceStart.mockImplementationOnce(async () => {
+        await holdStart;
+        return start();
+      });
+    }
     const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
     const deck = runtime(resolveVoice, voice);
     if (typing) {
@@ -2978,8 +2985,8 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
   });
 
-  /** Scenario: with Voice and Reading on, hold a transcription open while the open agent's held permission prompt is read aloud and finishes. When recording resumes with that audio in its kept buffer, the app's own "yes, go ahead" must not resolve the question, open a confirmation, start a countdown or send an answer. The same words in a later quiet recording still start the answer countdown. */
-  it("question/desktop/017: speech finished during transcription still overlaps the kept recording", async () => {
+  /** Scenario: with Voice and Reading on, hold transcription or fresh microphone startup open while the agent's held permission prompt is read aloud and finishes. The app's own "yes, go ahead" in that recording must not resolve the question, open a confirmation, start a countdown or send an answer. The same words in a later quiet recording still start the answer countdown. */
+  it.each(["transcription", "microphone startup"])("question/desktop/017: speech finished during %s still overlaps the recording", async (during) => {
     const question: PendingQuestionDto = {
       id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
       tool: { name: "Bash", detail: "touch x" },
@@ -2988,7 +2995,9 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
         { index: 3, label: "No", role: "deny", answerable: true },
       ] }],
     };
-    const h = await mount({ reading: "on", notice: "shown", openPane: true, silent: false, question });
+    let release: () => void = () => undefined;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const h = await mount({ reading: "on", notice: "shown", openPane: true, silent: false, question, holdStart: during === "microphone startup" ? pending : undefined });
     const resolveVoiceQuestion = vi.fn(async (): Promise<QuestionResultDto> => ({
       verdict: { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary: "Allow once — touch x" },
       resolveMs: 1, backend: "stub",
@@ -2997,17 +3006,20 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     Object.assign(h.deck, { resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer: vi.fn(async () => undefined) });
     h.deck.resolveVoice.mockImplementation(async (said) => result({ kind: "no_match", transcript: said, sentence: "Heard while the app was speaking — nothing dispatched." }));
 
-    let releaseTranscription: () => void = () => undefined;
-    const pending = new Promise<void>((resolve) => { releaseTranscription = resolve; });
-    const stop = h.voice.voiceStop.getMockImplementation()!;
-    h.voice.voiceStop.mockImplementationOnce(async () => {
-      const captured = await stop();
-      await pending;
-      return captured;
-    });
-    h.steps.push({ outcome: SILENT });
-    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
-    expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
+    if (during === "transcription") {
+      const stop = h.voice.voiceStop.getMockImplementation()!;
+      h.voice.voiceStop.mockImplementationOnce(async () => {
+        const captured = await stop();
+        await pending;
+        return captured;
+      });
+      h.steps.push({ outcome: SILENT });
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+      expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
+    } else {
+      expect(h.voice.voiceStop).not.toHaveBeenCalled();
+      expect(screen.getByText("Opening the microphone…")).toBeInTheDocument();
+    }
     expect(h.voice.voiceStart).toHaveBeenCalledTimes(1);
 
     const prompt = "Permission needed: say yes, go ahead to allow Bash.";
@@ -3015,15 +3027,15 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await h.drain();
     expect(h.spoken).toEqual([prompt]);
     expect(h.finished).toEqual([prompt]);
-    // The speech ended while the previous transcription was still pending.
+    // The speech ended before the pending capture operation completed.
     expect(h.voice.voiceStart).toHaveBeenCalledTimes(1);
     expect(resolveVoiceQuestion).not.toHaveBeenCalled();
-    await act(async () => { releaseTranscription(); });
+    await act(async () => { release(); });
     await flush();
-    expect(h.voice.voiceStart).toHaveBeenCalledTimes(2);
+    expect(h.voice.voiceStart).toHaveBeenCalledTimes(during === "transcription" ? 2 : 1);
 
     await h.say("yes, go ahead");
-    expect(resolveVoiceQuestion, "Reading's finished speech is still in the kept recording and must not answer the question").not.toHaveBeenCalled();
+    expect(resolveVoiceQuestion, "Reading's finished speech is still in the recording and must not answer the question").not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog", { name: "Always allow?" })).toBeNull();
     expect(screen.queryByTestId("voice-question")).toBeNull();
     expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });

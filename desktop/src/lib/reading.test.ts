@@ -508,8 +508,7 @@ describe("DeckReader with speech in flight", () => {
     expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["Tester: allow Bash?", "Tester: stopped with an error.", "Coder: allow edits?", "Tester: last summary."]);
 
     // This is the wire control message required from the Rust reading pipeline.
-    // The cast keeps this RED test executable before the DTO gains that kind.
-    h.sinks.get("tester")!(JSON.parse('{"kind":"permission_answered","text":"","bare":""}') as ReadingSentenceDto);
+    h.sinks.get("tester")!({ kind: "permission_answered", text: "", bare: "" });
     expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["Tester: stopped with an error.", "Coder: allow edits?", "Tester: last summary."]);
     h.provider.finish();
     await flush();
