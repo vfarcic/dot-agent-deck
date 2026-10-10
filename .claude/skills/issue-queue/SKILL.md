@@ -47,7 +47,7 @@ git grep -n "fn shell_foreground_busy_snapshot" origin/main -- src/agent_pty.rs
 
 ### Then bring the checkout up to date, because every unit is cut from it
 
-**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The fetch above fixes what you *verify against* and does nothing whatever about what the units are *built on*.
+**`dispatch` has no base or branch option.** It resolves the caller's **`HEAD`** to a commit once, then runs `git worktree add <dir> -b agent/dispatch-<name> <that sha>` **in the caller's own working directory** — `resolve_dispatch_base` and `create_dispatch_worktree` in `src/dispatch.rs`, feeding `create_worktree_from` in `src/issue_dispatch_run.rs` — and reports that same sha in its `cut from <branch> at <sha>` reply. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The fetch above fixes what you *verify against* and does nothing whatever about what the units are *built on*.
 
 **So bring the base up to date when it is safe to, rather than reporting it stale.** The fetch has already happened, so reading the state costs nothing. Two of the three are new; the third is the same distance read as above, wanted this time for its *left* number as well:
 
