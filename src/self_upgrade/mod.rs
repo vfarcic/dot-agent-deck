@@ -173,6 +173,20 @@ pub trait Host: Send + Sync {
     fn cancelled(&self) -> bool {
         false
     }
+    /// Flush `dir`'s entries to disk, so a rename in it survives a power
+    /// loss ([`execute::atomic_replace`]). Nothing to do off Unix.
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        sync_dir_on_disk(dir)
+    }
+}
+
+/// [`Host::sync_dir`] on the machine this process runs on.
+pub(crate) fn sync_dir_on_disk(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// [`Host`] for the machine this process runs on.
@@ -1385,6 +1399,8 @@ pub(crate) mod test_host {
         /// What [`Host::cancelled`] answers. Shared, so a handler can cancel
         /// the upgrade while it runs.
         pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// When set, [`Host::sync_dir`] fails instead of syncing.
+        pub dir_sync_fails: bool,
     }
 
     pub fn ok(stdout: &str) -> CommandOutput {
@@ -1562,6 +1578,12 @@ pub(crate) mod test_host {
         }
         fn cancelled(&self) -> bool {
             self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            if self.dir_sync_fails {
+                return Err(std::io::Error::other("the folder could not be synced"));
+            }
+            sync_dir_on_disk(dir)
         }
     }
 }

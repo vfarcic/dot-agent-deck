@@ -236,14 +236,21 @@ pub async fn download_verified(
     })
 }
 
+/// What [`Outcome::Replaced`] adds when the binary's folder could not be
+/// synced to disk after the rename that installed it.
+pub const UNSYNCED_WARNING: &str = "Warning: upgraded, but the folder could not be synced to disk; a power loss now could undo the upgrade.";
+
 /// What an upgrade did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The binary at `path` now runs `version`.
+    /// The binary at `path` now runs `version`. `synced` is false when its
+    /// folder could not be synced to disk after the rename that installed it
+    /// ([`atomic_replace`]): still an upgrade, with a warning.
     Replaced {
         path: PathBuf,
         version: String,
         provenance: Provenance,
+        synced: bool,
     },
     /// `brew upgrade` ran and the Homebrew binary now reports `reported`,
     /// the offered release.
@@ -336,10 +343,15 @@ impl Outcome {
                 path,
                 version,
                 provenance,
-            } => vec![
-                text(format!("Upgraded {} to v{version}.", path.display())),
-                text(provenance.message()),
-            ],
+                synced,
+            } => {
+                let mut lines = vec![text(format!("Upgraded {} to v{version}.", path.display()))];
+                if !synced {
+                    lines.push(text(UNSYNCED_WARNING.to_string()));
+                }
+                lines.push(text(provenance.message()));
+                lines
+            }
             Self::BrewUpgraded { formula, reported } => vec![text(match reported {
                 Some(version) => {
                     format!("`brew upgrade {formula}` finished; it now reports v{version}.")
@@ -465,7 +477,7 @@ pub async fn execute(
             let staging = Staging::create(staging_root, version)?;
             let downloaded =
                 download_verified(host, source, version, asset, provenance, staging.dir()).await?;
-            atomic_replace(
+            let synced = atomic_replace(
                 host,
                 target,
                 &downloaded.bytes,
@@ -476,6 +488,7 @@ pub async fn execute(
                 path: target.clone(),
                 version: version.to_string(),
                 provenance: downloaded.provenance,
+                synced,
             })
         }
         PlanAction::StagedInstall {
@@ -998,9 +1011,13 @@ fn set_mode(_file: &std::fs::File, _mode: u32) -> std::io::Result<()> {
 /// Replace `target` with `bytes` atomically: write a temporary file in the
 /// same directory, fsync it, run `check` on it (the new binary's `--version`),
 /// hash it again against `sha256`, and only then rename it over `target` and
-/// fsync the directory. On any failure, a cancellation through `host` seen
-/// just before the rename included ([`UpgradeError::Cancelled`]), the
-/// temporary file is removed and `target` is left as it was.
+/// fsync the directory ([`Host::sync_dir`]). The rename is the commit point.
+/// On any failure before it, a cancellation through `host` seen just before
+/// the rename included ([`UpgradeError::Cancelled`]), the temporary file is
+/// removed and `target` is left as it was. Once the rename succeeded the
+/// upgrade has happened: a directory fsync that fails after it is no error,
+/// and the answer is `Ok(false)` instead of `Ok(true)`, the rename installed
+/// but not known to be on disk ([`Outcome::Replaced`]'s `synced`).
 ///
 /// The replaced binary's mode is not preserved: the new file is always
 /// written `0o755`, whatever `target`'s mode was.
@@ -1010,7 +1027,7 @@ pub fn atomic_replace(
     bytes: &[u8],
     sha256: &str,
     check: impl FnOnce(&Path) -> Result<(), UpgradeError>,
-) -> Result<(), UpgradeError> {
+) -> Result<bool, UpgradeError> {
     let dir = target
         .parent()
         .ok_or_else(|| UpgradeError::Io(format!("{} has no directory", target.display())))?;
@@ -1029,14 +1046,13 @@ pub fn atomic_replace(
             return Err(UpgradeError::Cancelled);
         }
         std::fs::rename(&temp, target)?;
-        #[cfg(unix)]
-        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
-    if result.is_err() {
+    if let Err(error) = result {
         let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
-    result
+    Ok(host.sync_dir(dir).is_ok())
 }
 
 /// Install the verified `.deb` at `deb` (hashing to `sha256`) behind
@@ -1628,6 +1644,8 @@ mod tests {
         assert!(outcome.upgraded());
     }
 
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn execute_024_a_failed_swap_that_leaves_the_image_attached_says_so() {
         let root = tempfile::tempdir().unwrap();
@@ -1889,6 +1907,46 @@ mod tests {
                 .any(|line| line.starts_with(&format!("{HDIUTIL} detach"))),
             "the image was not detached: ran {ran:?}"
         );
+    }
+
+    /// Scenario: the new binary is renamed over the old one, and then the
+    /// folder it sits in cannot be synced to disk. The rename already
+    /// installed it, so the upgrade succeeds: the target is the new binary,
+    /// no temporary file is left, and the outcome warns that a power loss
+    /// now could undo it.
+    #[test]
+    fn execute_037_a_folder_sync_that_fails_after_the_rename_is_still_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dot-agent-deck");
+        std::fs::write(&target, b"old").unwrap();
+        let host = FakeHost {
+            dir_sync_fails: true,
+            ..FakeHost::new()
+        };
+        let result = atomic_replace(&host, &target, b"new", &verify::sha256_hex(b"new"), |_| {
+            Ok(())
+        });
+        assert!(matches!(result, Ok(false)), "{result:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let outcome = Outcome::Replaced {
+            path: target.clone(),
+            version: "0.46.0".into(),
+            provenance: Provenance::Verified,
+            synced: false,
+        };
+        assert!(outcome.upgraded());
+        assert_eq!(
+            outcome.lines()[..2],
+            [
+                format!("Upgraded {} to v0.46.0.", target.display()),
+                UNSYNCED_WARNING.to_string(),
+            ]
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["dot-agent-deck"], "no temporary file is left");
     }
 
     #[test]

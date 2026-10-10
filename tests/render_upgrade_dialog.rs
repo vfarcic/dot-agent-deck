@@ -405,6 +405,7 @@ fn upgrade_dialog_005_one_copy_at_a_time_and_cancel_skips_after_a_run() {
         path: PathBuf::from(CLI_EXE),
         version: LATEST.into(),
         provenance: skipped(),
+        synced: true,
     };
     let result = RunResult::from_outcome(&cli, &outcome, true);
     assert!(result.ok);
@@ -668,6 +669,7 @@ fn upgrade_dialog_008_upgrade_waits_until_the_whole_plan_was_on_screen() {
         path: PathBuf::from(CLI_EXE),
         version: LATEST.into(),
         provenance: skipped(),
+        synced: true,
     };
     dialog.finish(0, RunResult::from_outcome(&cli, &outcome, true));
     assert_eq!(dialog.phase(), Phase::Confirm(1));
@@ -696,6 +698,7 @@ fn upgrade_dialog_009_an_installed_copy_is_not_offered_again_until_restart() {
         path: PathBuf::from(CLI_EXE),
         version: LATEST.into(),
         provenance: skipped(),
+        synced: true,
     };
     let restart = replaced_outcome
         .tui_restart_line(LATEST)

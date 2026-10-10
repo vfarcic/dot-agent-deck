@@ -45852,6 +45852,7 @@ mod upgrade_dialog_tests {
             provenance: Provenance::Skipped {
                 reason: "no gh".into(),
             },
+            synced: true,
         };
         let restart = outcome.tui_restart_line("0.47.0").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();

@@ -1235,6 +1235,7 @@ mod tests {
                 path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
                 version: LATEST.into(),
                 provenance: provenance(),
+                synced: true,
             },
             Outcome::BrewUpgraded {
                 formula: "dot-agent-deck",
