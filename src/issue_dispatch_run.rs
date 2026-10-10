@@ -1511,6 +1511,40 @@ pub async fn create_worktree(
     reuse_existing_branch: bool,
     creator: Creator,
 ) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        worktree_dir,
+        branch,
+        reuse_existing_branch,
+        creator,
+        None,
+    )
+    .await
+}
+
+/// [`create_worktree`] with an explicit start-point for a branch it creates.
+///
+/// Issue #1643: with no start-point, `git worktree add -b` resolves the
+/// checkout's `HEAD` itself, at the moment it runs. A caller that has already
+/// read `HEAD` and reported it — `dispatch`'s `cut from <branch> at <sha>` —
+/// then names one commit while git may cut the branch from another, if `HEAD`
+/// moved in between. Passing the sha it read makes the reported base the
+/// branch's base by construction.
+///
+/// `start_point` applies only when this call CREATES the branch (`-b`). A
+/// branch that already exists is attached as it stands, and its own history is
+/// its base; that covers `reuse_existing_branch` and a retry after a scan
+/// short-read, whose branch our own earlier attempt created from the same
+/// start-point. `None` is exactly [`create_worktree`]. This stays the only
+/// `git worktree add` in `src/`.
+pub async fn create_worktree_from(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
+    start_point: Option<&str>,
+) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
@@ -1568,7 +1602,9 @@ pub async fn create_worktree(
         let result = if branch_exists {
             run_git_status(&["-C", &clone, "worktree", "add", &wt, branch]).await
         } else {
-            run_git_status(&["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+            let mut args: Vec<&str> = vec!["-C", &clone, "worktree", "add", &wt, "-b", branch];
+            args.extend(start_point);
+            run_git_status(&args).await
         };
         match result {
             Err(e) if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) => {
