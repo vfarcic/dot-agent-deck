@@ -323,7 +323,8 @@ pub fn verbatim_slice<'a>(transcript: &'a str, quoted: &str) -> Option<&'a str> 
 /// the same words both keep them.
 /// The caller still validates it with the rest ([`judge`]), so dropping can
 /// never make an invalid answer acceptable, and leaves its question
-/// unanswered, clearing any earlier answer to it.
+/// unanswered, clearing any earlier answer to it and any other selection this
+/// answer makes for it.
 pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<Vec<ModelSelection>, String> {
     if answer.kind != ModelKind::Answer {
         return Ok(Vec::new());
@@ -550,7 +551,8 @@ fn fast_path(question: &DesktopPendingQuestion, words: &[String]) -> Option<Mode
 /// question's words. They are validated with the rest first — an invalid one
 /// refuses the answer exactly as if nothing had been dropped — and then leave
 /// their questions unanswered: an earlier answer to such a question is
-/// cleared from `form`, so a drop can never make the form more sendable.
+/// cleared from `form`, and so is any kept selection for it in this answer, so
+/// a drop can never make the form more sendable.
 fn judge(
     agent: &str,
     question: &DesktopPendingQuestion,
@@ -572,16 +574,18 @@ fn judge(
             match validate(agent, question, &answer.selections) {
                 Ok(selections) => {
                     // Validated above, so each index fits a question.
+                    let was_dropped =
+                        |at: u32| dropped.iter().any(|d| d.question_index == i64::from(at));
                     let cleared: Vec<Selection> = form
                         .iter()
-                        .filter(|old| {
-                            !dropped
-                                .iter()
-                                .any(|d| d.question_index == i64::from(old.question_index))
-                        })
+                        .filter(|old| !was_dropped(old.question_index))
                         .cloned()
                         .collect();
-                    answered(agent, question, merge(&cleared, selections))
+                    let kept: Vec<Selection> = selections
+                        .into_iter()
+                        .filter(|new| !was_dropped(new.question_index))
+                        .collect();
+                    answered(agent, question, merge(&cleared, kept))
                 }
                 Err(sentence) => QuestionVerdict::Refused { sentence },
             }
