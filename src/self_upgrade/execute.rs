@@ -232,6 +232,12 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// STUB (issue #1635): what the TUI adds after upgrading the copy it runs
+    /// from.
+    pub fn tui_restart_line(&self, _version: &str) -> Option<PlanLine> {
+        None
+    }
+
     /// What to tell the user, as a terminal prints it ([`Self::items`]).
     pub fn lines(&self) -> Vec<String> {
         plan::render_lines(&self.items())

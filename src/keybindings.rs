@@ -92,6 +92,8 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    /// Issue #1635: open the upgrade dialog the footer's update badge names.
+    OpenUpgrade,
     ScrollPaneUp,
     ScrollPaneDown,
 }
@@ -332,6 +334,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_scheduled_tasks",
         default: "s",
         description: "Schedules manager",
+    },
+    // Issue #1635: open the upgrade dialog. STUB: unbound until implemented.
+    ActionSpec {
+        action: Action::OpenUpgrade,
+        section: Section::Dashboard,
+        name: "open_upgrade",
+        default: "",
+        description: "Upgrade",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back

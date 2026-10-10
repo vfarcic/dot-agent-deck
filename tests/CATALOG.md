@@ -5145,6 +5145,98 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH, independently compiled releases, real-agent work or desktop UI.
 - **Platform coverage:** linux+mac.
 
+### Upgrading this machine's copies (issue #1635)
+
+#### upgrade/upgrade-dialog
+
+##### upgrade/upgrade-dialog/001 — The TUI's upgrade dialog shows both copies' plans in the core's words and asks about this TUI's copy first, defaulting to Cancel.
+- **Layer:** L1 (`upgrade_dialog::UpgradeDialog` + ratatui `TestBackend` + `insta`), plans built by `self_upgrade::plan::plan` from faked installs.
+- **Agent:** none.
+- **Asserts:** every line of the in-place CLI plan and of the desktop `.deb` plan appears; the provenance line says it will NOT be checked; the question is `Upgrade dot-agent-deck to v<new>?` with `> Cancel` selected; the desktop app is not asked about yet.
+- **Does not assert:** the spawned binary's badge and key (`upgrade/tui-upgrade/001`), executing an upgrade.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/002 — A Nix copy is notify-only: the dialog offers only Close and never starts an upgrade.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the core's Nix text including `nix profile upgrade`; `> Close` and no Cancel or question; `y` and choosing Upgrade do nothing; Enter closes.
+- **Does not assert:** the other notify-only installs (source builds, system packages), which share the same path through `UpgradePlan::is_actionable`.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/003 — A show-command plan (Homebrew without `brew`) shows the command and offers only Close.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the core's lines with `brew upgrade dot-agent-deck`; `> Close` and no Cancel; Escape closes.
+- **Does not assert:** copying the command (the TUI has no copy button; the terminal's own selection copies it).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/004 — A CLI in a folder the user cannot write is downloaded and checked on confirm, then the core's install command is shown.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** choosing Upgrade yields `Run(0)`; while running the dialog says `Upgrading…` and neither Escape nor Enter dismisses it; after the core's `Staged` outcome every outcome line and the whole command appear, with `> Close`.
+- **Does not assert:** the download itself (`upgrade/cli-upgrade/002`), the command's shell quoting (core unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/005 — One copy at a time: Cancel closes before anything ran and skips a copy after; a successful upgrade of this TUI's copy says to restart it.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** Escape, Enter on the default Cancel and clicking Cancel close with nothing run; Down/Up move between Cancel and Upgrade; after the core's `Replaced` outcome the result carries its lines and `Outcome::tui_restart_line`, the desktop app is offered next defaulting to Cancel, and Cancel then skips to Close; an upgrade of the other copy carries no restart line; a failure shows the core's error first.
+- **Does not assert:** the off-render-thread execution (`upgrade/tui-upgrade/001` drives it through the real binary).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/006 — The badge reads like the desktop app's notice and names the rebindable `u` key; the TUI re-checks on the shared interval.
+- **Layer:** L1 (pure `UpgradeCheck::notice`, `badge_text`, keybinding config, help overlay `TestBackend`).
+- **Agent:** none.
+- **Asserts:** the notice is the headline of the first copy that is behind (this TUI's first, the desktop app's when only it is behind, none when all are current); the badge contains it and `u to upgrade`; `open_upgrade` defaults to `u`, rebinds through `keybindings.toml` with no warning, and is listed in the help overlay; `recheck_interval()` is `UPDATE_RECHECK_INTERVAL`.
+- **Does not assert:** the badge drawn in the live footer (`upgrade/tui-upgrade/001`).
+- **Platform coverage:** mac+linux+windows.
+
+#### upgrade/tui-upgrade
+
+##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test, `e2e`-only seams for the running version, the running executable's path and the release URLs).
+- **Agent:** none.
+- **Asserts:** the footer shows `update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
+- **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
+- **Platform coverage:** linux.
+
+##### upgrade/tui-upgrade/002 — A copy installed with Nix is told what to do and offered no confirmation.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server, a faked `/nix/store` path).
+- **Agent:** none.
+- **Asserts:** `u` opens the dialog with `Installed with Nix` and `> Close`, no question and no Cancel; Enter closes it.
+- **Does not assert:** that the TUI runs from a real Nix store.
+- **Platform coverage:** linux.
+
+##### upgrade/tui-upgrade/003 — The TUI notices a release published while it runs.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server whose newest release changes mid-test, the `e2e`-only re-check interval seam at 1 s).
+- **Agent:** none.
+- **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one, the badge appears within 30 s without a restart.
+- **Does not assert:** the production 6-hour interval (`upgrade/upgrade-dialog/006` pins the constant).
+- **Platform coverage:** linux.
+
+#### upgrade/cli-upgrade
+
+##### upgrade/cli-upgrade/001 — `upgrade --check` prints the plan and changes nothing.
+- **Layer:** L2 (lane 1, real `dot-agent-deck upgrade` subprocess, fake release server, `e2e`-only seams).
+- **Agent:** none.
+- **Asserts:** exit 0; the headline, `Downloaded binary at <path>.` and `Build provenance will NOT be checked`; the file is unchanged.
+- **Does not assert:** the confirmation prompt on a terminal (`self_upgrade::cli` unit tests).
+- **Platform coverage:** linux.
+
+##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release.
+- **Layer:** L2 (lane 1, real subprocess, fake release server).
+- **Agent:** none.
+- **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte.
+- **Does not assert:** provenance verification, the non-writable `sudo` path.
+- **Platform coverage:** linux.
+
+##### upgrade/cli-upgrade/003 — A checksum mismatch aborts and leaves the old binary.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a wrong checksum).
+- **Agent:** none.
+- **Asserts:** non-zero exit, `<asset> does not match checksums.txt` and `Nothing was changed.`, and the file is unchanged.
+- **Does not assert:** a missing manifest entry or an ambiguous one (core unit tests).
+- **Platform coverage:** linux.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor

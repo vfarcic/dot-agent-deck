@@ -21656,6 +21656,19 @@ pub fn render_stop_confirm_to_buffer(
     })
 }
 
+/// Issue #1635 (L1 `upgrade/dialog/*`): render the upgrade dialog into a
+/// standalone Buffer through the SAME [`crate::upgrade_dialog::render`] the
+/// live modal draws.
+pub fn render_upgrade_dialog_to_buffer(
+    dialog: &crate::upgrade_dialog::UpgradeDialog,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        crate::upgrade_dialog::render(frame, dialog);
+    })
+}
+
 /// L1 test seam: render `render_star_prompt` into a standalone Buffer.
 /// See `render_stats_bar_to_buffer` for the rationale.
 #[doc(hidden)]
