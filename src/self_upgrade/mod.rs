@@ -48,6 +48,8 @@ pub use plan::PlanLine;
 pub use plan::{PlanAction, PlanOptions, UpgradePlan};
 pub use verify::{Provenance, ProvenanceCheck};
 
+pub use crate::version::ReleaseChannel;
+
 /// The CLI binary's file name, inside every install and every release asset
 /// name.
 pub const CLI_BINARY: &str = "dot-agent-deck";
@@ -366,6 +368,21 @@ pub fn reported_version(host: &dyn Host, binary: &Path) -> Option<String> {
     }
     let version = crate::version::parse_version_output(&output.stdout)?;
     Some(version.strip_prefix('v').unwrap_or(&version).to_string())
+}
+
+/// The release channel `installation` follows: `Prerelease` for the
+/// `dot-agent-deck-beta` Homebrew formula, which only ever receives
+/// prereleases, or for any copy whose own version is a prerelease; `Stable`
+/// otherwise. A client looks the newest release up on its running copy's
+/// channel and plans the other copy on the machine against that same release.
+pub fn release_channel(installation: &Installation) -> ReleaseChannel {
+    match installation.method {
+        InstallMethod::Homebrew {
+            formula: HomebrewFormula::Beta,
+            ..
+        } => ReleaseChannel::Prerelease,
+        _ => ReleaseChannel::of_version(&installation.version),
+    }
 }
 
 /// Whether `latest` is a newer release than `current` (both with or without a

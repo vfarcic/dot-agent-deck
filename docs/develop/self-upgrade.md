@@ -28,6 +28,12 @@ Every subprocess and filesystem question the detection and planning steps ask go
 5. on macOS, inside a `.app` bundle → the desktop `.dmg` install (swapped in place when its folder is writable and the running app is signed; otherwise the user downloads the new image);
 6. otherwise a downloaded binary, replaced in place when its directory is writable, and staged for a privileged install when it is not.
 
+## The release channel
+
+`release_channel` (`src/self_upgrade/mod.rs`) puts a copy on one of two channels, `ReleaseChannel` in `src/version.rs`. A copy installed from the `dot-agent-deck-beta` Homebrew formula, or whose own version is a SemVer prerelease (`0.47.0-beta.1`), is on the prerelease channel; every other copy is on the stable channel. The stable channel asks GitHub's `releases/latest`, which never names a prerelease, and refuses an answer that is a draft or a prerelease anyway. The prerelease channel asks the `releases` list endpoint and takes the highest SemVer among the releases that are not drafts, so a beta is offered the next beta, and a stable release once it is higher than every beta. A client looks the release up once, on its running copy's channel, and plans the other copy on the machine against the same release, so the CLI and the desktop app on one machine follow one channel. The TUI's startup notice uses the same lookup, choosing the channel from its own version. Under the `e2e` feature, `DOT_AGENT_DECK_TEST_RELEASES_API_URL` and `DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL` replace the two endpoints for an L2 test.
+
+The beta formula only ever receives prereleases (`release.yml`'s "Detect channel" step), so once a stable release is the highest version, `brew upgrade dot-agent-deck-beta` cannot reach it: the plan still offers it, and the formula stays where it is. Moving to the stable formula is the user's step (`docs/installation.md` says the two conflict).
+
 ## The verification chain
 
 For every plan that downloads something, in order:
@@ -45,7 +51,7 @@ A command the user runs themselves (`sudo install …`, `sudo apt install …`) 
 
 ### Why `--source-ref` is safe to require
 
-Checked on 2026-10-10 against the published attestations: `checksums.txt` and `checksums-desktop-alpha.txt` of v0.46.0, v0.45.1, v0.45.0, v0.44.0 and v0.43.0 all verify with `--source-ref refs/tags/v<version>`, and v0.46.0's manifest checked against `refs/tags/v0.45.1` fails with `expected SourceRepositoryRef to be refs/tags/v0.45.1, got refs/tags/v0.46.0`. Releases are cut by pushing a `v*` tag (`tag-release.yml`), so the attestation's source ref is the tag. `release.yml` also has a `workflow_dispatch` trigger; a release cut that way would be attested with the dispatching branch as its source ref, and an upgrade to it fails provenance and changes nothing, which is the intended failure direction. Among the last 100 `release.yml` runs (listed with `gh run list --workflow release.yml`), one dispatched run succeeded, on 2026-04-27, months before self-upgrade existed. An upgrade only ever targets the latest release.
+Checked on 2026-10-10 against the published attestations: `checksums.txt` and `checksums-desktop-alpha.txt` of v0.46.0, v0.45.1, v0.45.0, v0.44.0 and v0.43.0 all verify with `--source-ref refs/tags/v<version>`, and v0.46.0's manifest checked against `refs/tags/v0.45.1` fails with `expected SourceRepositoryRef to be refs/tags/v0.45.1, got refs/tags/v0.46.0`. Releases are cut by pushing a `v*` tag (`tag-release.yml`), so the attestation's source ref is the tag. `release.yml` also has a `workflow_dispatch` trigger; a release cut that way would be attested with the dispatching branch as its source ref, and an upgrade to it fails provenance and changes nothing, which is the intended failure direction. Among the last 100 `release.yml` runs (listed with `gh run list --workflow release.yml`), one dispatched run succeeded, on 2026-04-27, months before self-upgrade existed. An upgrade only ever targets the newest release on the running copy's channel (next section).
 
 ## The residual same-user race
 

@@ -1072,4 +1072,72 @@ mod tests {
             plan.text()
         );
     }
+
+    #[test]
+    fn plan_020_a_beta_copy_follows_the_prerelease_channel_and_is_offered_a_newer_beta() {
+        use crate::self_upgrade::{ReleaseChannel, release_channel};
+        let mut brew_beta = cli(
+            "/home/linuxbrew/.linuxbrew/Cellar/x/0.47.0-beta.1/bin/dot-agent-deck",
+            InstallMethod::Homebrew {
+                formula: HomebrewFormula::Beta,
+                prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+            },
+        );
+        brew_beta.version = "0.47.0-beta.1".into();
+        brew_beta.tools.brew = Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"));
+        assert_eq!(release_channel(&brew_beta), ReleaseChannel::Prerelease);
+        let plan_beta = plan(&brew_beta, "v0.47.0-beta.2", &options());
+        assert_eq!(plan_beta.latest, "0.47.0-beta.2");
+        assert!(
+            matches!(
+                plan_beta.action,
+                PlanAction::BrewUpgrade {
+                    formula: HomebrewFormula::Beta,
+                    ..
+                }
+            ),
+            "{:?}",
+            plan_beta.action
+        );
+
+        // A downloaded prerelease is on the same channel by its version alone.
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let mut downloaded = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        downloaded.version = "0.47.0-beta.1".into();
+        assert_eq!(release_channel(&downloaded), ReleaseChannel::Prerelease);
+        assert!(matches!(
+            plan(&downloaded, "0.47.0-beta.2", &options()).action,
+            PlanAction::ReplaceBinary { .. }
+        ));
+        // Even the beta formula pinned to a stable-looking version follows
+        // the formula's channel.
+        brew_beta.version = "0.46.0".into();
+        assert_eq!(release_channel(&brew_beta), ReleaseChannel::Prerelease);
+    }
+
+    #[test]
+    fn plan_021_a_stable_copy_follows_the_stable_channel() {
+        use crate::self_upgrade::{ReleaseChannel, release_channel};
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let downloaded = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        assert_eq!(release_channel(&downloaded), ReleaseChannel::Stable);
+        let brew_stable = cli(
+            "/home/linuxbrew/.linuxbrew/Cellar/x/0.45.0/bin/dot-agent-deck",
+            InstallMethod::Homebrew {
+                formula: HomebrewFormula::Stable,
+                prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+            },
+        );
+        assert_eq!(release_channel(&brew_stable), ReleaseChannel::Stable);
+    }
 }

@@ -2,9 +2,40 @@ use serde::Deserialize;
 
 use crate::repo_identity;
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+/// Which releases a copy is offered.
+///
+/// `Stable` copies are offered only stable releases: GitHub's
+/// `releases/latest`, which never names a prerelease or a draft. `Prerelease`
+/// copies — the `dot-agent-deck-beta` Homebrew formula, or any build whose own
+/// version is a SemVer prerelease — are offered the highest version among every
+/// published release, prereleases included, so a beta sees the next beta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseChannel {
+    Stable,
+    Prerelease,
+}
+
+impl ReleaseChannel {
+    /// The channel a copy reporting `version` (with or without a leading `v`)
+    /// follows on its version alone: `Prerelease` when it carries a SemVer
+    /// prerelease suffix (`0.47.0-beta.1`), `Stable` otherwise, unparseable
+    /// included.
+    pub fn of_version(version: &str) -> Self {
+        let version = version.strip_prefix('v').unwrap_or(version);
+        match semver::Version::parse(version) {
+            Ok(parsed) if !parsed.pre.is_empty() => Self::Prerelease,
+            _ => Self::Stable,
+        }
+    }
 }
 
 pub(crate) fn current_version() -> semver::Version {
@@ -12,11 +43,7 @@ pub(crate) fn current_version() -> semver::Version {
 }
 
 pub(crate) fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
-    let stripped = latest_tag
-        .strip_prefix('v')
-        .or_else(|| latest_tag.strip_prefix('V'))
-        .unwrap_or(latest_tag);
-    let latest = semver::Version::parse(stripped).ok()?;
+    let latest = parse_tag(latest_tag)?;
     if latest > *current {
         Some(latest.to_string())
     } else {
@@ -24,15 +51,41 @@ pub(crate) fn should_notify(current: &semver::Version, latest_tag: &str) -> Opti
     }
 }
 
-async fn fetch_latest_version() -> Option<String> {
-    fetch_latest_tag(repo_identity::RELEASES_API_URL).await.ok()
+fn parse_tag(tag: &str) -> Option<semver::Version> {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    semver::Version::parse(stripped).ok()
 }
 
-/// The `tag_name` of the release `api_url` answers with (a GitHub
-/// `releases/latest` endpoint), or why it could not be read. Shared by the
-/// startup nudge, which ignores the error, and `dot-agent-deck upgrade`
+async fn fetch_latest_version(channel: ReleaseChannel) -> Option<String> {
+    fetch_release_tag(
+        channel,
+        repo_identity::RELEASES_API_URL,
+        repo_identity::RELEASES_LIST_API_URL,
+    )
+    .await
+    .ok()
+}
+
+/// The tag of the newest release on `channel`, or why it could not be read:
+/// `latest_url` (a GitHub `releases/latest` endpoint) answers for `Stable`,
+/// `list_url` (a GitHub `releases` list endpoint) for `Prerelease`. Shared by
+/// the startup nudge, which ignores the error, and `dot-agent-deck upgrade`
 /// (`crate::self_upgrade`), which reports it.
-pub(crate) async fn fetch_latest_tag(api_url: &str) -> Result<String, String> {
+pub(crate) async fn fetch_release_tag(
+    channel: ReleaseChannel,
+    latest_url: &str,
+    list_url: &str,
+) -> Result<String, String> {
+    match channel {
+        ReleaseChannel::Stable => stable_tag(get_json(latest_url).await?),
+        ReleaseChannel::Prerelease => newest_tag(&get_json::<Vec<GitHubRelease>>(list_url).await?),
+    }
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(api_url: &str) -> Result<T, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -51,8 +104,30 @@ pub(crate) async fn fetch_latest_tag(api_url: &str) -> Result<String, String> {
         return Err(format!("{api_url} answered {}", resp.status()));
     }
 
-    let release: GitHubRelease = resp.json().await.map_err(|e| e.to_string())?;
+    resp.json().await.map_err(|e| e.to_string())
+}
+
+/// `release`'s tag when it is a stable release. `releases/latest` never
+/// answers with a prerelease or a draft; this holds the stable channel to that
+/// in our own code rather than only in GitHub's.
+fn stable_tag(release: GitHubRelease) -> Result<String, String> {
+    let is_prerelease = parse_tag(&release.tag_name).is_some_and(|v| !v.pre.is_empty());
+    if release.draft || release.prerelease || is_prerelease {
+        return Err(format!("`{}` is not a stable release", release.tag_name));
+    }
     Ok(release.tag_name)
+}
+
+/// The tag with the highest version among `releases`, prereleases included and
+/// drafts skipped. A tag that is not a version is ignored.
+fn newest_tag(releases: &[GitHubRelease]) -> Result<String, String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
+        .ok_or_else(|| "no published release names a version".to_string())
 }
 
 /// Returns the latest version string if a newer release exists, `None` otherwise.
@@ -70,7 +145,7 @@ pub async fn check_for_update() -> Option<String> {
         return None;
     }
     let current = current_version();
-    let tag = fetch_latest_version().await?;
+    let tag = fetch_latest_version(ReleaseChannel::of_version(&current.to_string())).await?;
     should_notify(&current, &tag)
 }
 
@@ -139,6 +214,67 @@ mod tests {
         let current = semver::Version::new(0, 1, 0);
         assert_eq!(should_notify(&current, "v0.2.0"), Some("0.2.0".into()));
         assert_eq!(should_notify(&current, "V0.2.0"), Some("0.2.0".into()));
+    }
+
+    fn release(tag: &str, draft: bool, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.into(),
+            draft,
+            prerelease,
+        }
+    }
+
+    /// The shape of GitHub's `releases` list: newest first, with a draft, a
+    /// newer prerelease than any stable, and the stable line below it.
+    fn release_list() -> Vec<GitHubRelease> {
+        serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.48.0-beta.1", "draft": true, "prerelease": true},
+                {"tag_name": "v0.47.0-beta.2", "draft": false, "prerelease": true},
+                {"tag_name": "v0.47.0-beta.10", "draft": false, "prerelease": true},
+                {"tag_name": "nightly", "draft": false, "prerelease": true},
+                {"tag_name": "v0.46.0", "draft": false, "prerelease": false},
+                {"tag_name": "v0.45.0", "draft": false, "prerelease": false}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_channel_of_version() {
+        assert_eq!(
+            ReleaseChannel::of_version("0.47.0-beta.1"),
+            ReleaseChannel::Prerelease
+        );
+        assert_eq!(
+            ReleaseChannel::of_version("v0.25.0-alpha.0"),
+            ReleaseChannel::Prerelease
+        );
+        assert_eq!(ReleaseChannel::of_version("0.46.0"), ReleaseChannel::Stable);
+        assert_eq!(
+            ReleaseChannel::of_version("garbage"),
+            ReleaseChannel::Stable
+        );
+    }
+
+    #[test]
+    fn test_newest_tag_includes_prereleases_by_semver_and_skips_drafts() {
+        assert_eq!(newest_tag(&release_list()).unwrap(), "v0.47.0-beta.10");
+        let mut list = release_list();
+        list.push(release("v0.47.0", false, false));
+        assert_eq!(newest_tag(&list).unwrap(), "v0.47.0", "a newer stable wins");
+        assert!(newest_tag(&[release("v0.49.0", true, false)]).is_err());
+    }
+
+    #[test]
+    fn test_stable_channel_is_never_offered_a_prerelease() {
+        assert_eq!(
+            stable_tag(release("v0.46.0", false, false)).unwrap(),
+            "v0.46.0"
+        );
+        assert!(stable_tag(release("v0.47.0-beta.2", false, false)).is_err());
+        assert!(stable_tag(release("v0.47.0", false, true)).is_err());
+        assert!(stable_tag(release("v0.47.0", true, false)).is_err());
     }
 
     #[test]

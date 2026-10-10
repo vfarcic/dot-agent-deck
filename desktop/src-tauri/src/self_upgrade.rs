@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dot_agent_deck::self_upgrade::{
     CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
     ProvenanceCheck, ReleaseSource, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError, UpgradePlan,
-    detect, discover, execute, plan,
+    detect, discover, execute, plan, release_channel,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
@@ -231,8 +231,9 @@ pub(crate) fn options(provenance: ProvenanceCheck) -> PlanOptions {
 }
 
 /// Plan the running app and, when one is installed, the CLI beside it, each
-/// through its own install method. `path` is the `PATH` the CLI is looked for
-/// on.
+/// through its own install method, both against `latest`: the newest release
+/// on the app's channel ([`release_channel`]). `path` is the `PATH` the CLI is
+/// looked for on.
 pub(crate) fn check_plans(
     host: &dyn Host,
     running: &Installation,
@@ -364,23 +365,32 @@ pub(crate) async fn desktop_self_upgrade_check(
     state: State<'_, SelfUpgradeState>,
 ) -> Result<CheckDto, String> {
     crate::ensure_main_webview(&webview)?;
-    let latest = ReleaseSource::from_build()
-        .latest_version()
-        .await
-        .map_err(|e| safe_message(e.to_string()))?;
     let state = state.inner().clone();
-    let checked = tauri::async_runtime::spawn_blocking(move || {
-        let path = state.login_path();
+    let detect_state = state.clone();
+    let (path, running) = tauri::async_runtime::spawn_blocking(move || {
+        let path = detect_state.login_path();
         let host = SystemHost { path: path.clone() };
         let running = detect::running(&host, CopyKind::Desktop).map_err(|e| e.to_string())?;
-        let options = options(ProvenanceCheck::detect(&host));
-        let checked = check_plans(&host, &running, &latest, &options, path.as_deref());
-        state.store(checked.clone());
-        Ok::<_, String>(checked)
+        Ok::<_, String>((path, running))
     })
     .await
     .map_err(|e| safe_message(e.to_string()))?
     .map_err(safe_message)?;
+    // The CLI beside the app is planned against the same release, so both
+    // copies follow the app's channel.
+    let latest = ReleaseSource::from_build()
+        .latest_version(release_channel(&running))
+        .await
+        .map_err(|e| safe_message(e.to_string()))?;
+    let checked = tauri::async_runtime::spawn_blocking(move || {
+        let host = SystemHost { path: path.clone() };
+        let options = options(ProvenanceCheck::detect(&host));
+        let checked = check_plans(&host, &running, &latest, &options, path.as_deref());
+        state.store(checked.clone());
+        checked
+    })
+    .await
+    .map_err(|e| safe_message(e.to_string()))?;
     Ok(check_dto(&checked))
 }
 

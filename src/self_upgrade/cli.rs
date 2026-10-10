@@ -44,7 +44,10 @@ pub async fn run(
             return false;
         }
     };
-    let latest = match source.latest_version().await {
+    let latest = match source
+        .latest_version(super::release_channel(&running))
+        .await
+    {
         Ok(latest) => latest,
         Err(e) => {
             let _ = writeln!(out, "{e}");

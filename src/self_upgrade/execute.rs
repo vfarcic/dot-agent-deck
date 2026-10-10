@@ -20,6 +20,7 @@ use super::verify::{self, Provenance, ProvenanceCheck};
 use super::{
     CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, UpgradeError, run_checked,
 };
+use crate::version::ReleaseChannel;
 
 /// The largest asset accepted (the desktop disk image is the largest, at tens
 /// of megabytes).
@@ -28,8 +29,11 @@ const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 /// Where releases are looked up and downloaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseSource {
-    /// A GitHub `releases/latest` API endpoint.
+    /// A GitHub `releases/latest` API endpoint: the stable channel's lookup.
     pub api_url: String,
+    /// A GitHub `releases` list API endpoint: the prerelease channel's lookup
+    /// ([`ReleaseChannel`]).
+    pub list_url: String,
     /// The base release assets hang off: `<base>/v<version>/<asset>`.
     pub download_base: String,
 }
@@ -37,7 +41,8 @@ pub struct ReleaseSource {
 impl ReleaseSource {
     /// This build's repository ([`crate::repo_identity`]).
     ///
-    /// Under the `e2e` feature only, `DOT_AGENT_DECK_TEST_RELEASES_API_URL` and
+    /// Under the `e2e` feature only, `DOT_AGENT_DECK_TEST_RELEASES_API_URL`,
+    /// `DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL` and
     /// `DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE` replace them, so an L2 test
     /// can point the real binary at a fake release server. A download URL a
     /// shipped binary reads from its environment would be a way to make it
@@ -48,12 +53,16 @@ impl ReleaseSource {
         #[allow(unused_mut)]
         let mut source = Self {
             api_url: crate::repo_identity::RELEASES_API_URL.to_string(),
+            list_url: crate::repo_identity::RELEASES_LIST_API_URL.to_string(),
             download_base: crate::repo_identity::RELEASE_DOWNLOAD_BASE.to_string(),
         };
         #[cfg(feature = "e2e")]
         {
             if let Ok(url) = std::env::var("DOT_AGENT_DECK_TEST_RELEASES_API_URL") {
                 source.api_url = url;
+            }
+            if let Ok(url) = std::env::var("DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL") {
+                source.list_url = url;
             }
             if let Ok(base) = std::env::var("DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE") {
                 source.download_base = base;
@@ -62,9 +71,12 @@ impl ReleaseSource {
         source
     }
 
-    /// The latest release's version, without a leading `v`.
-    pub async fn latest_version(&self) -> Result<String, UpgradeError> {
-        let tag = crate::version::fetch_latest_tag(&self.api_url)
+    /// The newest release's version on `channel`, without a leading `v`. A
+    /// client looks it up on the running copy's channel
+    /// ([`super::release_channel`]) and plans the other copy on the machine
+    /// against the same release, so the two follow one channel.
+    pub async fn latest_version(&self, channel: ReleaseChannel) -> Result<String, UpgradeError> {
+        let tag = crate::version::fetch_release_tag(channel, &self.api_url, &self.list_url)
             .await
             .map_err(UpgradeError::ReleaseLookup)?;
         let version = tag.strip_prefix('v').unwrap_or(&tag);
@@ -638,6 +650,9 @@ fn set_mode(_file: &std::fs::File, _mode: u32) -> std::io::Result<()> {
 /// hash it again against `sha256`, and only then rename it over `target` and
 /// fsync the directory. On any failure the temporary file is removed and
 /// `target` is left as it was.
+///
+/// The replaced binary's mode is not preserved: the new file is always
+/// written `0o755`, whatever `target`'s mode was.
 pub fn atomic_replace(
     target: &Path,
     bytes: &[u8],
@@ -792,6 +807,13 @@ fn swap_from_mount(
     let incoming = parent.join(format!(".{DESKTOP_APP_BUNDLE}.upgrade-{pid}"));
     let outgoing = parent.join(format!(".{DESKTOP_APP_BUNDLE}.old-{pid}"));
     let _ = std::fs::remove_dir_all(&incoming);
+    // The copy is checked with `assess = false` on purpose. The image is
+    // attached read-only, so what `ditto` copies is the bundle Gatekeeper just
+    // assessed on the mounted side, byte for byte; the copy is still checked
+    // again for a valid deep signature and the running app's Team ID, which
+    // is what would catch a copy that came out different. So the Gatekeeper
+    // assessment belongs on the mounted side: do not drop it there, and do not
+    // "fix" this call to assess again.
     let copied = run_checked(
         host,
         Path::new(DITTO),
@@ -1034,6 +1056,7 @@ mod tests {
     fn execute_007_release_source_urls() {
         let source = ReleaseSource {
             api_url: "http://127.0.0.1:1/latest".into(),
+            list_url: "http://127.0.0.1:1/releases".into(),
             download_base: "http://127.0.0.1:1/download/".into(),
         };
         assert_eq!(
@@ -1043,6 +1066,10 @@ mod tests {
         let production = ReleaseSource::from_build();
         if !cfg!(feature = "e2e") {
             assert_eq!(production.api_url, crate::repo_identity::RELEASES_API_URL);
+            assert_eq!(
+                production.list_url,
+                crate::repo_identity::RELEASES_LIST_API_URL
+            );
         }
     }
 
@@ -1381,6 +1408,40 @@ mod tests {
         assert_eq!(
             unshowable.fallback(),
             vec![PlanLine::Text(plan::manual_upgrade_line("0.46.0"))]
+        );
+    }
+
+    #[test]
+    fn execute_019_a_failed_prompt_is_recognised_whatever_the_pkexec_path() {
+        // The prompt's failure is recognised by the error's variant, not by
+        // parsing the command line it shows, so a pkexec path that the shown
+        // command quotes still hands over the install command.
+        const QUOTED_PKEXEC: &str = "/opt/my tools/pkexec";
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new()
+            .exe(QUOTED_PKEXEC)
+            .handle(QUOTED_PKEXEC, |_| fail("Request dismissed"));
+        let command = plan::install_binary_command(None, &staged, &target, &sha);
+        let err = install_binary_privileged(
+            &host,
+            Path::new(QUOTED_PKEXEC),
+            &staged,
+            &target,
+            &sha,
+            "0.46.0",
+            command.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("'/opt/my tools/pkexec'"),
+            "the shown command quotes the path: {err}"
+        );
+        assert_eq!(
+            err.fallback(),
+            vec![
+                PlanLine::Text(plan::PROMPT_FAILED.into()),
+                PlanLine::Command(command.unwrap()),
+            ]
         );
     }
 }
