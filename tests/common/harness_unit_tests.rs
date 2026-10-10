@@ -5614,3 +5614,51 @@ fn process_running_reads_a_live_child_as_running_and_a_reaped_one_as_gone() {
         "a reaped child (pid {pid}) must read as gone"
     );
 }
+
+/// Issue #656: the Codex test model follows the host's auth mode, so the most
+/// common login (ChatGPT) gets a model it can reach instead of skipping.
+#[test]
+fn codex_default_model_follows_the_auth_mode() {
+    assert_eq!(
+        codex_default_model_for(Some("chatgpt")),
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT
+    );
+    assert_eq!(
+        codex_default_model_for(Some("ChatGPT")),
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT
+    );
+    for other in [Some("apikey"), Some("api_key"), Some(""), None] {
+        assert_eq!(
+            codex_default_model_for(other),
+            CODEX_TEST_MODEL_API_KEY_DEFAULT,
+            "auth_mode {other:?} must take the API-key default"
+        );
+    }
+    assert_ne!(
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT, CODEX_TEST_MODEL_API_KEY_DEFAULT,
+        "the two auth modes reach different model families"
+    );
+}
+
+/// Issue #656: a refused model is told apart from an auth, network or quota
+/// failure, because only the refusal turns the skip into a failure. The two
+/// refusal texts are the measured ones (lowercased, as the probe passes them).
+#[test]
+fn codex_probe_refusal_matches_only_a_refused_model() {
+    let chatgpt = r#"error: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"the 'gpt-5.1-codex-mini' model is not supported when using codex with a chatgpt account."}}"#;
+    let api_key = "unexpected status 404 not found: model not found";
+    assert!(codex_probe_refused_model(chatgpt));
+    assert!(codex_probe_refused_model(api_key));
+    for not_a_refusal in [
+        "unexpected status 401 unauthorized",
+        "error: not logged in",
+        "stream error: connection reset by peer",
+        "you've hit your usage limit",
+        "",
+    ] {
+        assert!(
+            !codex_probe_refused_model(not_a_refusal),
+            "{not_a_refusal:?} must stay a skip, not a refused model"
+        );
+    }
+}

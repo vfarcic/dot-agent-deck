@@ -101,6 +101,19 @@ async fn codex_worker_001_inner() {
                         .expect("Codex test HOME is UTF-8")
                         .to_string(),
                 ),
+                // This in-process spawn inherits the test's environment, so an
+                // ambient `CODEX_HOME` would otherwise outrank the HOME above:
+                // the worker would run on credentials the preflight never
+                // probed, and its wrapper would install the deck's hooks into
+                // that real home instead of this one (review of #1653).
+                (
+                    "CODEX_HOME".to_string(),
+                    codex_home
+                        .join(".codex")
+                        .to_str()
+                        .expect("Codex test CODEX_HOME is UTF-8")
+                        .to_string(),
+                ),
             ],
             ..SpawnOptions::default()
         })
