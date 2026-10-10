@@ -363,6 +363,55 @@ pub async fn remove_worktree(
     clone_dir: &Path,
     policy: RemovalPolicy,
 ) -> Option<KeptWorktree> {
+    remove_worktree_outcome(worktree_dir, clone_dir, policy)
+        .await
+        .kept(worktree_dir)
+}
+
+/// PRD #1589 D6: what [`remove_worktree_outcome`] did, with the three ways a
+/// tree ends up kept told apart — [`KeptWorktree`] folds a failed status probe
+/// and a failed removal into one `confirmed_dirty: false`, which is enough for
+/// a warning and not for the `close` verb's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeRemoval {
+    /// Removed; the clone and the branch are kept.
+    Removed,
+    /// Kept: `git status --porcelain` reported uncommitted work.
+    KeptDirty,
+    /// Kept: the status probe failed, so dirtiness is unknown.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+}
+
+impl WorktreeRemoval {
+    /// The issue #717 report of this outcome: `None` when the tree was
+    /// removed.
+    pub fn kept(self, worktree_dir: &Path) -> Option<KeptWorktree> {
+        let path = worktree_dir.to_string_lossy().into_owned();
+        match self {
+            WorktreeRemoval::Removed => None,
+            WorktreeRemoval::KeptDirty => Some(KeptWorktree {
+                path,
+                confirmed_dirty: true,
+            }),
+            WorktreeRemoval::KeptCouldNotCheck | WorktreeRemoval::RemoveFailed => {
+                Some(KeptWorktree {
+                    path,
+                    confirmed_dirty: false,
+                })
+            }
+        }
+    }
+}
+
+/// [`remove_worktree`], answering with the typed [`WorktreeRemoval`]. The one
+/// implementation: [`remove_worktree`] is this outcome mapped to its report.
+pub async fn remove_worktree_outcome(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> WorktreeRemoval {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
         match worktree_is_dirty(worktree_dir).await {
@@ -371,10 +420,7 @@ pub async fn remove_worktree(
                     worktree = %worktree_dir.display(),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: true,
-                });
+                return WorktreeRemoval::KeptDirty;
             }
             Ok(false) => {}
             Err(e) => {
@@ -383,10 +429,7 @@ pub async fn remove_worktree(
                     error = %e,
                     "dispatch: could not check worktree status; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: false,
-                });
+                return WorktreeRemoval::KeptCouldNotCheck;
             }
         }
     }
@@ -403,7 +446,7 @@ pub async fn remove_worktree(
                 worktree = %worktree_dir.display(),
                 "issue-dispatch: removed worktree on tab close (clone preserved)"
             );
-            None
+            WorktreeRemoval::Removed
         }
         // A FAILED removal leaves the directory on disk too, so the user is
         // told about it for the same reason a deliberate keep is: something
@@ -416,10 +459,7 @@ pub async fn remove_worktree(
                 error = %e,
                 "issue-dispatch: worktree cleanup on close failed"
             );
-            Some(KeptWorktree {
-                path: worktree_dir.to_string_lossy().into_owned(),
-                confirmed_dirty: false,
-            })
+            WorktreeRemoval::RemoveFailed
         }
     }
 }

@@ -470,7 +470,7 @@ fn orchestration_role_line(role: &OrchestrationRoleRecord) -> String {
 /// `cwd` are what say *whose work* was running; `cwd` in particular is the only
 /// field here that distinguishes two panes of different dispatched units when
 /// neither holds an orchestration role.
-fn teardown_agent_line(agent: &AgentRecord) -> String {
+pub(crate) fn teardown_agent_line(agent: &AgentRecord) -> String {
     let dash = |v: Option<&str>| v.filter(|s| !s.is_empty()).unwrap_or("-").to_string();
     format!(
         "{} pane={} label={} cwd={}",

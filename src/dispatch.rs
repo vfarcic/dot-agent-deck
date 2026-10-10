@@ -362,7 +362,7 @@ fn names_a_relative_path(command: &str) -> bool {
     })
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
         .replace("..", "_")
         .replace('\0', "")
@@ -901,49 +901,50 @@ pub async fn handle_dispatch(
 
     let notifier = StderrNotifier;
 
-    match spawn(
-        req,
-        &ctx.registry,
-        &notifier,
-        Some(&ctx.event_tx),
-        false,
-        ctx.state.as_ref(),
-    )
-    .await
-    {
+    // PRD #1589 D5: a dispatch with a caller is a unit the `close` verb can
+    // later be authorized against, so it is recorded — inside the spawn, before
+    // its task is delivered (see `spawn_dispatched_unit`). A dispatch with no
+    // caller (an internal caller with nobody to report to) records nothing.
+    let spawned = match ctx.caller.as_ref() {
+        Some(caller) => {
+            crate::spawn::spawn_dispatched_unit(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+                crate::dispatched_units::UnitOrigin {
+                    name: name.to_string(),
+                    worktree: paths.worktree_dir.clone(),
+                    branch: paths.branch.clone(),
+                    clone_dir: clone_dir.clone(),
+                    dispatcher: crate::dispatched_units::Dispatcher {
+                        pane_id: caller.pane_id.clone(),
+                        agent_id: caller.agent_id.clone(),
+                    },
+                },
+                caller.clone(),
+            )
+            .await
+        }
+        None => {
+            spawn(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+            )
+            .await
+        }
+    };
+    match spawned {
         Ok(handle) => {
-            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
-            // the single agent's pane, or the orchestration's start role — which is
-            // the pane a `work-done --done` will arrive under. Registered here, at
-            // the first moment that pane id exists, rather than by the daemon after
-            // this call returns: every instant between the spawn and the
-            // registration is an instant in which a completion resolves to nothing.
-            if let Some(caller) = ctx.caller.clone() {
-                tracing::debug!(
-                    unit_pane_id = %handle.delivery_pane_id,
-                    unit_agent_id = %handle.delivery_agent_id,
-                    caller_pane_id = %caller.pane_id,
-                    // PRD #220 Phase 2 review (finding A4), missed here and caught
-                    // by PR #1081's review (Greptile finding 3): the unit name is
-                    // producer-supplied and rode into this field raw, where a bare
-                    // LF forges a log line, a CR overwrites the one being written
-                    // and a bidi override reorders whatever renders it.
-                    unit = %crate::config_validation::escape_field_for_log(
-                        &caller.unit_name,
-                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-                    ),
-                    "dispatch: retained the caller for this unit's completion report"
-                );
-                // Bound to the unit's AGENT as well as its pane: a pane id is a
-                // recycled handle, and a predecessor's late EOF would otherwise
-                // evict this route out from under the agent that now holds the
-                // pane (PR #1081 review, Greptile finding 1).
-                ctx.registry.register_dispatch_return(
-                    &handle.delivery_pane_id,
-                    &handle.delivery_agent_id,
-                    caller,
-                );
-            }
+            // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
+            // unit's completion report inside the spawn, before the task was
+            // delivered — see `crate::spawn::spawn_dispatched_unit`.
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: true,

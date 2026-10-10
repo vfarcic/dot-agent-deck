@@ -62,6 +62,20 @@ pub enum ClientError {
     Unanswered(String),
 }
 
+/// PRD #1589: why [`DaemonClient::close_agents`] could not get a report.
+#[derive(Debug, thiserror::Error)]
+pub enum CloseAgentsError {
+    /// The daemon does not advertise the capability. Nothing was sent.
+    #[error("the running daemon{} is too old for `close`", .daemon_version.as_deref().map(|v| format!(" ({v})")).unwrap_or_default())]
+    TooOld { daemon_version: Option<String> },
+    /// No daemon answered at the attach endpoint.
+    #[error("no daemon is reachable: {0}")]
+    Unreachable(io::Error),
+    /// The exchange itself failed after connecting.
+    #[error("{0}")]
+    Client(ClientError),
+}
+
 /// PRD #1487: what [`DaemonClient::restart_daemon`] asks for. Mirrors the
 /// fields of [`crate::daemon_protocol::AttachRequest::RestartDaemon`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2812,6 +2826,86 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// PRD #1589 — send [`AttachRequest::CloseAgents`] and return the daemon's
+    /// report. Refusals are in the report, not an error.
+    ///
+    /// **A daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_CLOSE_AGENTS`] is a HARD error
+    /// ([`CloseAgentsError::TooOld`]), with nothing written.** That is
+    /// deliberately unlike [`Self::focus_gained_while`], which answers
+    /// [`FocusReport::Withheld`] and lets its caller carry on silently: a focus
+    /// claim nobody records costs nothing, while a person who typed `close` and
+    /// got no error would believe the agents were closed. Do not "fix" this
+    /// into the silent form.
+    ///
+    /// **Connect-only.** It never lazy-spawns, restarts or replaces a daemon —
+    /// closing agents on a daemon this call just started would close nothing —
+    /// and never falls back to `StopAgent`, which an older daemon would accept
+    /// WITHOUT the authority checks and refusals this verb exists for.
+    ///
+    /// The capability is read from a `Hello` exchanged on this call rather
+    /// than [`Self::capabilities`]' cache, so the version the error names is
+    /// the one that answered.
+    pub async fn close_agents(
+        &self,
+        selector: crate::daemon_protocol::CloseSelector,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<crate::daemon_protocol::CloseReport, CloseAgentsError> {
+        let (mut rd, mut wr) = self
+            .connect()
+            .await
+            .map_err(CloseAgentsError::Unreachable)?;
+        let hello = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await
+        .map_err(CloseAgentsError::Client)?;
+        if !hello.ok {
+            return Err(CloseAgentsError::Client(ClientError::Server(
+                hello
+                    .error
+                    .unwrap_or_else(|| "handshake failed before close".into()),
+            )));
+        }
+        if !DaemonCapabilities::from_hello(&hello)
+            .supports(crate::daemon_protocol::CAP_CLOSE_AGENTS)
+        {
+            return Err(CloseAgentsError::TooOld {
+                daemon_version: hello.daemon_version.or(hello.build_version),
+            });
+        }
+        let (mut rd, mut wr) = self
+            .connect()
+            .await
+            .map_err(CloseAgentsError::Unreachable)?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::CloseAgents {
+                selector,
+                caller,
+                force,
+                dry_run,
+            },
+        )
+        .await
+        .map_err(CloseAgentsError::Client)?;
+        match resp.close_report {
+            Some(report) => Ok(report),
+            None => Err(CloseAgentsError::Client(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "the daemon answered close with no report".into()),
+            ))),
+        }
+    }
+
     pub async fn stop_agent(&self, id: &str) -> Result<(), ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
@@ -4527,6 +4621,124 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(dir);
+    }
+
+    /// PRD #1589 — `close` against a daemon that does not advertise
+    /// `close-agents` is a HARD error naming the daemon's version, and the
+    /// request never reaches the socket: unlike `focus-gained`'s silent
+    /// withhold, a person who typed `close` must be told nothing was closed.
+    /// Against both older shapes: no capabilities at all, and a set without
+    /// `close-agents`.
+    #[cfg(unix)]
+    #[test]
+    fn close_agents_is_refused_hard_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            close_agents_withheld_inner(None).await;
+            close_agents_withheld_inner(Some(&[
+                CAP_LIST_PROJECTS,
+                crate::daemon_protocol::CAP_STOP_DAEMON,
+                crate::daemon_protocol::CAP_FOCUS_GAINED,
+            ]))
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn close_agents_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        daemon_version: Some("0.40.2".to_string()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_other_requests.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::err("malformed request: unknown variant `close-agents`")
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        let err = client
+            .close_agents(
+                crate::daemon_protocol::CloseSelector::Units(
+                    crate::daemon_protocol::UnitSelector {
+                        names: vec!["issue-1".to_string()],
+                    },
+                ),
+                None,
+                false,
+                false,
+            )
+            .await
+            .expect_err("an older daemon must be a hard error, not a silent withhold");
+        match &err {
+            CloseAgentsError::TooOld { daemon_version } => {
+                assert_eq!(daemon_version.as_deref(), Some("0.40.2"));
+            }
+            other => panic!("advertised {advertised:?}: expected TooOld, got {other:?}"),
+        }
+        assert!(err.to_string().contains("too old"), "{err}");
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: nothing but the handshake may be written"
+        );
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// PRD #1589 — `close` is connect-only: with no daemon at the endpoint it
+    /// answers `Unreachable` and spawns nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_agents_against_no_daemon_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(dir.path().join("nobody.sock"));
+        let err = client
+            .close_agents(
+                crate::daemon_protocol::CloseSelector::AllUnits,
+                None,
+                false,
+                true,
+            )
+            .await
+            .expect_err("no daemon");
+        assert!(matches!(err, CloseAgentsError::Unreachable(_)), "{err:?}");
+        assert!(
+            !dir.path().join("nobody.sock").exists(),
+            "close must not lazy-spawn a daemon"
+        );
     }
 
     /// PRD #1223 — both new-agent queries withhold against the two older daemons

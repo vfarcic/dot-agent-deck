@@ -4325,6 +4325,13 @@ impl AppState {
             .map(|session| session.status.clone())
     }
 
+    /// PRD #1589: [`Self::pane_status`] for the `close` verb's busy check —
+    /// the status the card for `pane_id` shows. `None` when the pane has no
+    /// session, which the check treats as uncertainty rather than idle.
+    pub fn pane_status_of(&self, pane_id: &str) -> Option<SessionStatus> {
+        self.pane_status(pane_id)
+    }
+
     /// Issue #447: [`Self::apply_event`], plus the one daemon-side consumer of
     /// a worker's `WaitingForInput`: open or close that worker's waiting
     /// episode, whose debounced notice tells the orchestrator that delegated to

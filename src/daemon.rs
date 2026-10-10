@@ -859,6 +859,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // spawns is handed that path explicitly instead of re-resolving it from
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
+    // PRD #1589 D8: and which attach endpoint, so an agent's `close` (and every
+    // other attach-socket call it makes) reaches THIS daemon. The configured
+    // primary path as given, or `None` for a hook-only daemon — whose children
+    // are then pointed nowhere rather than at the default endpoint.
+    pty_registry.set_attach_socket(daemon.attach_socket_path.clone());
     let state = daemon.state;
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
@@ -3331,6 +3336,89 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// PRD #1589 D5: mark a dispatched unit complete from a `work-done --done`,
+/// gated on the generation the hook gate ATTESTED for this report.
+///
+/// Threaded from the `WorkDone` arm rather than resolved inside
+/// `prepare_dispatch_completion`, because that seam sees only the signal and
+/// the registry: looking the pane's occupant up there would launder a
+/// predecessor's late report into its successor, and reading the retained
+/// return's own agent id would compare the record to itself (auditor B2). Only
+/// an attested sender that is the unit's authorized terminal generation, and
+/// still speaks for its pane, marks it; a missing token admitted under
+/// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, an unattested pane, a superseded
+/// generation and a worker role of an orchestration never do. The return
+/// route's delivery is unchanged and runs whatever this decides. Returns the
+/// unit id it marked, if any.
+pub(crate) fn mark_dispatched_unit_completion(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    signal: &crate::event::WorkDoneSignal,
+    provenance: &crate::hook_provenance::Provenance,
+) -> Option<String> {
+    if !signal.done {
+        return None;
+    }
+    let crate::hook_provenance::Provenance::Attested { agent_id } = provenance else {
+        return None;
+    };
+    if registry.generation_ownership(Some(&signal.pane_id), Some(agent_id))
+        != crate::state::Ownership::Owned
+    {
+        return None;
+    }
+    let marked = registry.dispatched_units().mark_completed(
+        &signal.pane_id,
+        agent_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    if let Some(unit_id) = marked.as_deref() {
+        info!(
+            unit_id = %unit_id,
+            pane_id = %signal.pane_id,
+            agent_id = %agent_id,
+            "dispatch: unit reported done; it may now be closed without --force"
+        );
+    }
+    marked
+}
+
+/// PRD #1589 D2: the `(agent id, cwd)` a `dispatch` is recorded and run under,
+/// resolved as ONE pair from one record.
+///
+/// For an attested sender the pair comes from the attested generation's OWN
+/// record, and only while that generation still holds the pane it claims. The
+/// earlier lookup found "whatever live record names this pane" after the gate,
+/// so a retained predecessor token could attest A while the lookup found its
+/// successor B, pairing the dispatch with B's identity and cwd (auditor B1).
+/// Now A is refused outright, and B is never paired with A's claim.
+///
+/// The token-less compatibility path is unchanged: a pane never issued a token,
+/// or a message admitted under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, still
+/// resolves by pane, because there is no attested generation to bind to.
+pub(crate) fn resolve_dispatch_caller(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    pane_id: &str,
+    provenance: &crate::hook_provenance::Provenance,
+) -> Option<(String, String)> {
+    match provenance {
+        crate::hook_provenance::Provenance::Attested { agent_id } => {
+            if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
+                return None;
+            }
+            let record = registry.agent_record_any(agent_id)?;
+            if record.pane_id_env.as_deref() != Some(pane_id) {
+                return None;
+            }
+            record.cwd.map(|cwd| (record.id, cwd))
+        }
+        _ => registry
+            .agent_records()
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|r| r.cwd.map(|cwd| (r.id, cwd))),
+    }
+}
+
 /// Issue #617 (finding 3): deliver a dispatch result back to the agent that
 /// asked for it, bound to the registry agent id captured from the caller's
 /// `AgentRecord` *before* the dispatch ran.
@@ -4243,13 +4331,16 @@ async fn run_hook_loop_with_idle_timeout(
                                     // consistent pair; two lookups could straddle a
                                     // hand-over and pair one agent's cwd with another's
                                     // identity.
-                                    let caller = {
-                                        let records = pty_registry.agent_records();
-                                        records
-                                            .iter()
-                                            .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
-                                            .and_then(|r| r.cwd.clone().map(|cwd| (r.id.clone(), cwd)))
-                                    };
+                                    //
+                                    // PRD #1589 D2: and for an attested sender the
+                                    // pair is the attested generation's own, while
+                                    // it still holds the pane — see
+                                    // `resolve_dispatch_caller`.
+                                    let caller = resolve_dispatch_caller(
+                                        &pty_registry,
+                                        &signal.pane_id,
+                                        &provenance,
+                                    );
                                     let (caller_agent_id, cwd) = match caller {
                                         Some(c) => c,
                                         None => {
@@ -4373,6 +4464,15 @@ async fn run_hook_loop_with_idle_timeout(
                                     // only the PTY write moves, into the recipient
                                     // pane's queue, behind every report already
                                     // queued for that pane.
+                                    // PRD #1589 D5: the completion mark `close`
+                                    // reads, bound to the attested sender. Before
+                                    // the return route's own handling, which is
+                                    // unchanged.
+                                    mark_dispatched_unit_completion(
+                                        &pty_registry,
+                                        &signal,
+                                        &provenance,
+                                    );
                                     let delivery = state
                                         .read()
                                         .await
@@ -4813,6 +4913,176 @@ mod orphan_watchdog_tests {
         // which is WHY the watchdog must be left OFF for detached production /
         // TuiDeck daemons — only the harness's non-detached daemons enable it.
         assert!(should_exit_orphaned(1, 1));
+    }
+}
+
+/// PRD #1589: the two hook-socket seams the `close` verb depends on — the
+/// completion mark bound to the attested sender, and the `dispatch` caller
+/// resolved as one attested pair.
+#[cfg(all(test, unix))]
+mod close_verb_seam_tests {
+    use super::*;
+    use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::hook_provenance::{Provenance, Refusal};
+
+    fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: &str, command: &str) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
+                cwd: Some(cwd),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn")
+    }
+
+    fn wait_exited(registry: &AgentPtyRegistry, agent: &str) {
+        for _ in 0..400 {
+            if !registry.agent_is_live(agent) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the child never exited");
+    }
+
+    fn done(pane: &str, done: bool) -> crate::event::WorkDoneSignal {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane,
+            "task": "finished",
+            "done": done,
+            "timestamp": chrono::Utc::now(),
+        }))
+        .expect("a work-done signal")
+    }
+
+    fn unit(registry: &AgentPtyRegistry, pane: &str, agent: &str) -> String {
+        registry
+            .dispatched_units()
+            .register(crate::dispatched_units::NewUnit {
+                name: format!("unit-{pane}"),
+                worktree: std::path::PathBuf::from("/wt"),
+                branch: "b".to_string(),
+                clone_dir: std::path::PathBuf::from("/repo"),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "disp-agent".to_string(),
+                },
+                kind: crate::dispatched_units::UnitKind::Single {
+                    pane_id: pane.to_string(),
+                    agent_id: agent.to_string(),
+                },
+                dispatched_at_ms: 1,
+            })
+    }
+
+    fn completed(registry: &AgentPtyRegistry, id: &str) -> bool {
+        registry
+            .dispatched_units()
+            .get(id)
+            .is_some_and(|u| u.completed_at_ms.is_some())
+    }
+
+    /// Scenario: a dispatched unit's `work-done --done` marks it complete only
+    /// when the hook gate attested the report to the unit's own terminal
+    /// generation. A token-less report admitted under the `warn` escape hatch,
+    /// an unattested pane, another generation's token, a non-terminal report,
+    /// and a superseded generation's late `--done` mark nothing.
+    #[test]
+    fn completion_is_marked_only_by_the_attested_current_terminal_generation() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, "unit-pane", "/tmp", "sleep 30");
+        let id = unit(&registry, "unit-pane", &agent);
+        let signal = done("unit-pane", true);
+        for provenance in [
+            Provenance::Unattested,
+            Provenance::Refused(Refusal::Missing),
+            Provenance::Attested {
+                agent_id: "someone-else".to_string(),
+            },
+        ] {
+            assert_eq!(
+                mark_dispatched_unit_completion(&registry, &signal, &provenance),
+                None,
+                "{provenance:?}"
+            );
+        }
+        let attested = Provenance::Attested {
+            agent_id: agent.clone(),
+        };
+        assert_eq!(
+            mark_dispatched_unit_completion(&registry, &done("unit-pane", false), &attested),
+            None,
+            "progress without --done is not completion"
+        );
+        assert!(!completed(&registry, &id));
+        assert_eq!(
+            mark_dispatched_unit_completion(&registry, &signal, &attested),
+            Some(id.clone())
+        );
+        assert!(completed(&registry, &id));
+
+        // A generation whose pane was handed over cannot mark its unit late.
+        let old = spawn(&registry, "recycled", "/tmp", "/usr/bin/true");
+        let old_unit = unit(&registry, "recycled", &old);
+        wait_exited(&registry, &old);
+        let _new = spawn(&registry, "recycled", "/tmp", "sleep 30");
+        assert_eq!(
+            mark_dispatched_unit_completion(
+                &registry,
+                &done("recycled", true),
+                &Provenance::Attested { agent_id: old },
+            ),
+            None
+        );
+        assert!(!completed(&registry, &old_unit));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: a dispatcher A exits and B takes its pane in another
+    /// directory. A `dispatch` attested to A is refused rather than paired
+    /// with B's identity and cwd; one attested to B runs as B, in B's cwd; and
+    /// the token-less compatibility path still resolves by pane.
+    #[test]
+    fn a_dispatch_runs_as_the_attested_generation_with_its_own_cwd() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = spawn(
+            &registry,
+            "disp",
+            &a_dir.path().to_string_lossy(),
+            "/usr/bin/true",
+        );
+        wait_exited(&registry, &a);
+        let b = spawn(
+            &registry,
+            "disp",
+            &b_dir.path().to_string_lossy(),
+            "sleep 30",
+        );
+        let b_cwd = b_dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_dispatch_caller(&registry, "disp", &Provenance::Attested { agent_id: a }),
+            None,
+            "a superseded generation must not dispatch as its successor"
+        );
+        assert_eq!(
+            resolve_dispatch_caller(
+                &registry,
+                "disp",
+                &Provenance::Attested {
+                    agent_id: b.clone()
+                }
+            ),
+            Some((b.clone(), b_cwd.clone()))
+        );
+        assert_eq!(
+            resolve_dispatch_caller(&registry, "disp", &Provenance::Unattested),
+            Some((b, b_cwd)),
+            "the token-less compatibility path is unchanged"
+        );
+        registry.shutdown_all();
     }
 }
 

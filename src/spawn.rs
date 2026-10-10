@@ -225,6 +225,12 @@ pub struct SpawnHandle {
     /// is what the dispatch return edge's eviction gate depends on (PR #1081
     /// review, Greptile finding 1).
     pub delivery_agent_id: String,
+    /// PRD #1589: the per-instance token every role of an orchestration spawn
+    /// carries, minted with it. `None` for a single agent.
+    pub orchestration_id: Option<String>,
+    /// PRD #1589: the dispatched-unit record this spawn registered, when it was
+    /// started through [`spawn_dispatched_unit`]. `None` otherwise.
+    pub unit_id: Option<String>,
     /// PRD #120 cleanup seam. `None` until a caller registers one via
     /// [`SpawnHandle::on_tab_closed`].
     pub on_tab_closed: Option<TabClosedCallback>,
@@ -587,6 +593,110 @@ pub async fn spawn(
     detach_delivery: bool,
     state: Option<&crate::state::SharedState>,
 ) -> Result<SpawnHandle, SpawnError> {
+    spawn_with_unit(
+        req,
+        registry,
+        notifier,
+        event_tx,
+        detach_delivery,
+        state,
+        None,
+    )
+    .await
+}
+
+/// PRD #1589 D5: [`spawn`] for a dispatched unit — the same spawn, which also
+/// records the unit in the registry's
+/// [`crate::dispatched_units::DispatchedUnits`], and retains `return_to` as the
+/// recipient of its completion report (PRD #220's return edge), once every pane
+/// it opens exists and BEFORE the task is delivered.
+///
+/// Both used to be impossible to register in time: the return route was
+/// registered by `handle_dispatch` after `spawn` returned, and `spawn` returns
+/// only after the delivery wait, so a unit that reported `work-done --done`
+/// the moment it started found no route and its report was dropped as "from
+/// unknown pane" (auditor S3, reproduced by `dispatch/close-verb`'s stand-in
+/// units). A spawn that fails registers neither, because the registration
+/// comes after the last step that can fail.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_dispatched_unit(
+    req: SpawnRequest,
+    registry: &Arc<AgentPtyRegistry>,
+    notifier: &dyn Notifier,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    detach_delivery: bool,
+    state: Option<&crate::state::SharedState>,
+    unit: crate::dispatched_units::UnitOrigin,
+    return_to: crate::dispatch_return::DispatchCaller,
+) -> Result<SpawnHandle, SpawnError> {
+    spawn_with_unit(
+        req,
+        registry,
+        notifier,
+        event_tx,
+        detach_delivery,
+        state,
+        Some((unit, return_to)),
+    )
+    .await
+}
+
+/// [`spawn_dispatched_unit`]'s registration, at the one point both spawn
+/// shapes call it: the unit's identities exist, its task is not yet delivered.
+fn register_dispatched_unit(
+    registry: &AgentPtyRegistry,
+    unit: Option<(
+        crate::dispatched_units::UnitOrigin,
+        crate::dispatch_return::DispatchCaller,
+    )>,
+    kind: crate::dispatched_units::UnitKind,
+) -> Option<String> {
+    let (origin, caller) = unit?;
+    let (unit_pane_id, unit_agent_id) = {
+        let (pane, agent) = kind.terminal();
+        (pane.to_string(), agent.to_string())
+    };
+    let id = registry
+        .dispatched_units()
+        .register(origin.into_unit(kind, chrono::Utc::now().timestamp_millis()));
+    tracing::debug!(
+        unit_id = %id,
+        unit_pane_id = %unit_pane_id,
+        unit_agent_id = %unit_agent_id,
+        caller_pane_id = %caller.pane_id,
+        // PRD #220 Phase 2 review (finding A4), missed here and caught by PR
+        // #1081's review (Greptile finding 3): the unit name is producer-supplied
+        // and rode into this field raw, where a bare LF forges a log line, a CR
+        // overwrites the one being written and a bidi override reorders whatever
+        // renders it.
+        unit = %crate::config_validation::escape_field_for_log(
+            &caller.unit_name,
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+        ),
+        "dispatch: recorded the unit and retained the caller for its completion report"
+    );
+    // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane — the
+    // single agent's pane, or the orchestration's start role — which is the pane
+    // a `work-done --done` will arrive under. Bound to the unit's AGENT as well
+    // as its pane: a pane id is a recycled handle, and a predecessor's late EOF
+    // would otherwise evict this route out from under the agent that now holds
+    // the pane (PR #1081 review, Greptile finding 1).
+    registry.register_dispatch_return(&unit_pane_id, &unit_agent_id, caller);
+    Some(id)
+}
+
+async fn spawn_with_unit(
+    req: SpawnRequest,
+    registry: &Arc<AgentPtyRegistry>,
+    notifier: &dyn Notifier,
+    event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    detach_delivery: bool,
+    state: Option<&crate::state::SharedState>,
+    unit: Option<(
+        crate::dispatched_units::UnitOrigin,
+        crate::dispatch_return::DispatchCaller,
+    )>,
+) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -721,6 +831,15 @@ pub async fn spawn(
                     &id,
                 );
             }
+            // PRD #1589 D5: the unit's record, before its task is delivered.
+            let unit_id = register_dispatched_unit(
+                registry,
+                unit,
+                crate::dispatched_units::UnitKind::Single {
+                    pane_id: pane_id.clone(),
+                    agent_id: id.clone(),
+                },
+            );
             run_delivery(
                 registry,
                 pane_id.clone(),
@@ -740,6 +859,8 @@ pub async fn spawn(
                 }],
                 delivery_pane_id: pane_id,
                 delivery_agent_id: id,
+                orchestration_id: None,
+                unit_id,
                 on_tab_closed: None,
             })
         }
@@ -1131,6 +1252,19 @@ pub async fn spawn(
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
             let delivery_agent_id = agents[orch_idx].id.clone();
+            // PRD #1589 D5: the unit's record, before the orchestrator's task is
+            // delivered. Its terminal generation is the orchestrator the task
+            // goes to, which is the only generation whose `--done` completes it.
+            let unit_id = register_dispatched_unit(
+                registry,
+                unit,
+                crate::dispatched_units::UnitKind::Orchestration {
+                    orchestration_id: orchestration_id.clone(),
+                    name: name.clone(),
+                    terminal_pane_id: delivery_pane_id.clone(),
+                    terminal_agent_id: delivery_agent_id.clone(),
+                },
+            );
             run_delivery(
                 registry,
                 delivery_pane_id.clone(),
@@ -1146,6 +1280,8 @@ pub async fn spawn(
                 agents,
                 delivery_pane_id,
                 delivery_agent_id,
+                orchestration_id: Some(orchestration_id),
+                unit_id,
                 on_tab_closed: None,
             })
         }
