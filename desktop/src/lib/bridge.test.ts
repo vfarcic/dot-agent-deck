@@ -434,6 +434,19 @@ describe("TauriDeckBridge", () => {
    * reported cwd leads, exactly as before. With none, the last known daemon cwd
    * carries; with neither, the header says so rather than inventing a path.
    */
+  /** Scenario (PRD #1258 M4): a connected deck's host answer is mapped through, kept across a snapshot that carries none, and dropped when the deck stops being connected. */
+  it("keeps a connected deck's last host answer and drops it once the deck disconnects", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const hostMetrics = { status: "available" as const, metrics: { disks: [{ role: "working_root", freeBytes: 1, totalBytes: 2 }], sampledAtMs: 1, sampleAgeMs: 5 } };
+    const first = mapDesktopSnapshot({ ...structuredClone(snapshot), hostMetrics });
+    expect(first.hostMetrics).toEqual(hostMetrics);
+    const kept = mapDesktopSnapshot(structuredClone(snapshot), first);
+    expect(kept.hostMetrics).toEqual(hostMetrics);
+    const disconnected = structuredClone(snapshot);
+    disconnected.connection.status = "disconnected";
+    expect(mapDesktopSnapshot(disconnected, first).hostMetrics).toBeUndefined();
+  });
+
   it("falls back through daemon-sourced cwds only, and says so when there are none", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const empty = structuredClone(snapshot);

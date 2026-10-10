@@ -10,6 +10,7 @@ import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 import { upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
+import { HostMetricsPanel } from "./HostMetricsPanel";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
@@ -1760,6 +1761,9 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${deckName(connection)}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
+
+      {/* PRD #1258 M4: this deck's host, from its own daemon — beside its agents, so a fleet shows every host at once. */}
+      {deck.connected && deck.snapshot.hostMetrics && <HostMetricsPanel report={deck.snapshot.hostMetrics} />}
 
       <div className="daemon-group-body">
         <DaemonBody

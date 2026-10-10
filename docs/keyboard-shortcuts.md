@@ -92,6 +92,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `r` | Rename the selected agent |
 | `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
+| `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input** |
 | `?` | Toggle the help overlay |
 
@@ -183,6 +184,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed just before it appeared is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
+| **Host of this deck** | `m` | `Esc`, `q` or `m` closes it |
 
 ## Customizing Keybindings
 
@@ -255,6 +257,7 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `open_scheduled_tasks` | `s` | Open the Schedules manager |
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
+| `host_metrics` | `m` | Open the Host of this deck overlay |
 
 Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 

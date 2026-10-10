@@ -89,6 +89,28 @@ Minimal is used only when there are more cards than fit at Compact. Each card is
 
 An agent you start yourself, outside the deck, still gets a card when its hooks report to the deck. Such a card is removed when that agent's session ends, rather than being left behind as an empty card. The deck keeps up to 256 of these cards at a time: when another arrives beyond that, the one that has been quiet the longest is removed, and it comes back the next time that agent starts a session. Cards of agents the running daemon started never count toward that limit and are never removed to make room. An agent that kept running across a daemon restart was started by the previous daemon, so in a TUI you open after the restart it counts as one of these cards. A TUI that stayed open through the restart keeps the card it already had for that agent instead: the card keeps updating, does not count toward the limit and is never removed to make room, and when the agent's session ends the card stays and shows Idle, still marked orphaned if the agent belonged to an orchestration, rather than disappearing. A TUI older than the daemon leaves an empty card for the pane where one of these cards is removed.
 
+## Check the machine a deck runs on
+
+Before you start more agents on a deck, you can check how much room its machine has left. Both clients show the same figures for the machine the deck's daemon runs on. For a remote deck that is the remote machine, not the one you are sitting at.
+
+- **TUI:** in command mode, press `m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
+- **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a **Host of this deck** panel under its header. With several daemons shown, you see every machine at once. The panel refreshes at least every five seconds, and whenever the dashboard re-reads that daemon.
+
+What it shows:
+
+| Row | What it means |
+|---|---|
+| **Working root** | Free and total space on the disk holding the directory the deck's daemon was started in |
+| **Worktree parent** | Free and total space on the disk holding that directory's parent, where sibling worktrees (for example `../<repo>-dispatch-*`) are created |
+| **Temp root** | Free and total space on the disk holding the deck's test scratch directory |
+| **Load per core** | The machine's one-minute load average divided by its CPU cores, and the core count. Around `1.00` or more means the machine is fully busy. |
+| **Memory used** / **Memory available** | The machine's memory in use and still available |
+| **Sample age** | How old the figures are, in milliseconds |
+
+A figure the machine cannot report reads `unknown`, never `0`. Memory is `unknown` for a deck on macOS.
+
+When a deck's daemon is from a release before this feature, or runs on Windows, the overlay and the panel say **Host metrics are not available from this deck** instead of showing figures. Upgrade that daemon to see them (for a remote daemon in the desktop app, see [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)).
+
 ## Resuming Sessions
 
 *This section is about the TUI. The desktop app keeps no workspace of its own: it shows the agents the daemon has, and closing it leaves them running.*

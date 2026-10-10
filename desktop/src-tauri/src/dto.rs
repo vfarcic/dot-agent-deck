@@ -143,6 +143,99 @@ pub struct DesktopSnapshot {
     /// A property of the applied document, like [`Self::fleet`], so every
     /// deck's snapshot carries the same value.
     pub all_decks: bool,
+    /// PRD #1258 M4: this deck's host — disk per watched role, load per core,
+    /// memory and the sample's age — as its daemon reports it through
+    /// [`dot_agent_deck::daemon_client::DaemonClient::host_metrics`]. The
+    /// desktop measures nothing itself: for a remote deck these are the remote
+    /// machine's numbers.
+    ///
+    /// Absent when nothing was asked (a deck that is not connected) or the
+    /// request failed; the webview then keeps the last answer it had for a
+    /// connected deck. A daemon that does not report host metrics is
+    /// [`HostMetricsReportDto::NotAvailable`], never absent and never zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_metrics: Option<HostMetricsReportDto>,
+}
+
+/// PRD #1258 M4: a deck's host sample as the webview reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum HostMetricsReportDto {
+    /// The daemon does not advertise `host-metrics` (an older build, or one on
+    /// a platform it cannot sample), so it was never asked.
+    NotAvailable,
+    Available {
+        metrics: HostMetricsDto,
+    },
+}
+
+/// PRD #1258 M4: the camelCase form of
+/// [`dot_agent_deck::host_metrics::HostMetrics`]. Every reading the daemon
+/// could not take is absent here too, so the webview shows `unknown` rather
+/// than a zero.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostMetricsDto {
+    pub disks: Vec<DiskUsageDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_per_cpu: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    pub sampled_at_ms: u64,
+    /// How old the sample is as this snapshot leaves the bridge: the age the
+    /// daemon reported plus the time the bridge has held the answer since.
+    pub sample_age_ms: u64,
+}
+
+/// PRD #1258 M4: one watched role's filesystem, named by role, never by path.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageDto {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+}
+
+impl HostMetricsReportDto {
+    /// Map the daemon's answer, adding `held` — how long the bridge has kept
+    /// it — to the sample's age so a cached answer does not claim to be as
+    /// fresh as when it arrived.
+    pub(crate) fn from_report(
+        report: &dot_agent_deck::daemon_client::HostMetricsReport,
+        held: std::time::Duration,
+    ) -> Self {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        match report {
+            HostMetricsReport::NotAvailable => Self::NotAvailable,
+            HostMetricsReport::Available(metrics) => Self::Available {
+                metrics: HostMetricsDto {
+                    disks: metrics
+                        .disks
+                        .iter()
+                        .map(|disk| DiskUsageDto {
+                            role: disk.role.clone(),
+                            free_bytes: disk.free_bytes,
+                            total_bytes: disk.total_bytes,
+                        })
+                        .collect(),
+                    load_per_cpu: metrics.load_per_cpu.filter(|load| load.is_finite()),
+                    cpu_count: metrics.cpu_count,
+                    memory_used_bytes: metrics.memory_used_bytes,
+                    memory_available_bytes: metrics.memory_available_bytes,
+                    sampled_at_ms: metrics.sampled_at_ms,
+                    sample_age_ms: metrics
+                        .sample_age_ms
+                        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX)),
+                },
+            },
+        }
+    }
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -2588,6 +2681,8 @@ pub(crate) fn disconnected_snapshot(
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
         all_decks: all_decks_applied(),
+        // Nothing answered, so nothing was asked.
+        host_metrics: None,
     }
 }
 
@@ -2806,6 +2901,50 @@ pub(crate) fn ensure_desktop_orchestration_platform_supported(
 
 #[cfg(test)]
 mod tests {
+
+    /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
+    /// the camelCase `hostMetrics` shape, with absent readings omitted rather
+    /// than zeroed and the time the bridge held the answer added to its age;
+    /// an incapable daemon is `not-available`.
+    #[test]
+    fn host_metrics_dto_keeps_absence_and_ages_a_held_answer() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        let metrics: dot_agent_deck::host_metrics::HostMetrics =
+            serde_json::from_value(serde_json::json!({
+                "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20},
+                          {"role": "temp_root"}],
+                "cpu_count": 8,
+                "sampled_at_ms": 1_700_000_000_000_u64,
+                "sample_age_ms": 1500
+            }))
+            .unwrap();
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(metrics),
+            std::time::Duration::from_millis(250),
+        );
+        assert_eq!(
+            serde_json::to_value(&dto).unwrap(),
+            serde_json::json!({
+                "status": "available",
+                "metrics": {
+                    "disks": [{"role": "working_root", "freeBytes": 10, "totalBytes": 20},
+                              {"role": "temp_root"}],
+                    "cpuCount": 8,
+                    "sampledAtMs": 1_700_000_000_000_u64,
+                    "sampleAgeMs": 1750
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HostMetricsReportDto::from_report(
+                &HostMetricsReport::NotAvailable,
+                std::time::Duration::ZERO
+            ))
+            .unwrap(),
+            serde_json::json!({"status": "not-available"})
+        );
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------

@@ -545,9 +545,41 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay.
 - **Does not assert:** dynamic content (none today).
 - **Platform coverage:** mac+linux+windows.
+
+#### dashboard/host-metrics
+
+The attached deck's host measurements, supplied by the daemon. Desktop browser coverage of several decks is in `desktop/e2e/host-metrics.spec.ts`; the catalog IDs below name the Rust harness tests.
+
+##### dashboard/host-metrics/001 — The default `m` key opens the host overlay and Escape restores the dashboard.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** TestBackend frames through the production key handlers show the host title and disk roles only while the overlay is open; Escape returns the initial dashboard frame.
+- **Does not assert:** daemon transport or real host values (covered by `dashboard/host-metrics/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/002 — A fixed host sample renders all roles and unknown fields explicitly.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** an `insta` overlay snapshot names the deck's host and shows per-role free/total disk, load per core and core count, memory used/available, and sample age; independently absent fields show unknown, including both the load and core count.
+- **Does not assert:** the sampler's operating-system reads or cache expiry (covered by `protocol/host-metrics/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/003 — An older deck explicitly reports unavailable metrics.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** the overlay says `not available from this deck` beneath `Host of this deck`, without fabricated zero readings.
+- **Does not assert:** capability withholding on the wire (covered by `protocol/host-metrics/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/004 — The real TUI displays its daemon's host measurements and closes on Escape.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric sample-age row after `m`; Escape removes the overlay and restores the empty dashboard.
+- **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
+- **Platform coverage:** mac+linux.
 
 #### dashboard/config-gen
 
@@ -3236,6 +3268,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** `[global] close_pane = "Ctrl+x"` parses without warnings, the custom chord requests close in command mode, and the same chord remains ordinary `0x18` PTY input in PaneInput.
 - **Does not assert:** filesystem loading of `keybindings.toml` (covered by `keybindings/remap/001`); arbitrary per-mode config syntax (out of scope).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/remap/004 — A dashboard `host_metrics` remap opens the overlay on the configured key.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** a TOML `host_metrics = "F2"` remap produces no warnings; TestBackend frames stay on the dashboard after the old `m`, show the overlay after F2, and return to the dashboard after Escape; help names F2 on its host row.
+- **Does not assert:** loading the keybindings file from disk (covered by `keybindings/remap/001` and `/002`).
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/safety
