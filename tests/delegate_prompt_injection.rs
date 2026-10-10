@@ -1782,7 +1782,10 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         &daemon.registry,
         &new_agent_id,
         WRAPPED_READY_BANNER.as_bytes(),
-        Duration::from_secs(10),
+        // PRD #1258: a boot through the built deck binary's wrapper, so a
+        // ceiling on something that must HAPPEN — load-scaled. Flat 10 s went
+        // red at io full 81%.
+        common::load_scaled(Duration::from_secs(10)),
     )
     .await;
     assert!(
@@ -2100,7 +2103,10 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         &daemon.registry,
         &new_agent_id,
         banner.as_bytes(),
-        Duration::from_secs(10),
+        // PRD #1258: a boot through the built deck binary's wrapper, so a
+        // ceiling on something that must HAPPEN — load-scaled. Flat 10 s went
+        // red at io full 81%.
+        common::load_scaled(Duration::from_secs(10)),
     )
     .await;
     assert!(
@@ -4021,12 +4027,30 @@ fn write_generation_sentinel_worker(path: &std::path::Path, generation_marker: &
 #[test]
 #[cfg(unix)]
 fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
+    // PRD #1258: generation A's window is the time the supersede has to land
+    // in, so it is a ceiling on something that must HAPPEN and is load-scaled.
+    // At a flat 500 ms an I/O stall between A's pointer and B's respawn let A's
+    // window run out while A still owned the pane, and the notice it then
+    // legitimately sent read as #687. B's readiness buffer is measured from
+    // A's window, so A's deadline still falls while B waits for its payload —
+    // the gap the #687 regression left A's watch armed across.
+    let generation_a_window = common::load_scaled(Duration::from_millis(2000));
+    let generation_a_window_ms = generation_a_window.as_millis().to_string();
+    let generation_b_buffer =
+        generation_a_window + common::load_scaled(Duration::from_millis(2000));
+    let generation_b_buffer_ms = generation_b_buffer.as_millis().to_string();
+    // How long after A's deadline the #687 notice is given to reach the
+    // orchestrator's pane. A negative window, so not load-scaled.
+    let generation_a_expiry_slack = Duration::from_millis(800);
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
-        (DELEGATE_NO_EVENT_WINDOW_ENV, "500"),
+        (
+            DELEGATE_NO_EVENT_WINDOW_ENV,
+            generation_a_window_ms.as_str(),
+        ),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -4134,6 +4158,9 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 Duration::from_secs(2),
             )
             .await;
+            // A's watch is armed before its pointer is written, so its deadline
+            // is no later than this plus its window.
+            let generation_a_delivered_at = Instant::now();
             assert!(
                 snapshot_contains(&generation_a_delivered, POINTER),
                 "generation A did not receive its payload, so its silence watch was not \
@@ -4143,8 +4170,13 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
 
             // Issue #1516: through `env_override`, because generation A's tasks
             // are still alive on this runtime's workers.
-            let _buffer =
-                env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1400"));
+            let _buffer = env_override::override_for_tests(
+                DELEGATE_READINESS_BUFFER_ENV,
+                Some(generation_b_buffer_ms.as_str()),
+            );
+            // B's own window stays short: its notice is the positive half below.
+            let _window =
+                env_override::override_for_tests(DELEGATE_NO_EVENT_WINDOW_ENV, Some("500"));
             state
                 .handle_delegate(
                     DelegateSignal {
@@ -4162,6 +4194,13 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 .await;
             let generation_b =
                 wait_for_replacement_agent(&registry, WORKER_PANE, &generation_a).await;
+            let supersede_observed_after = generation_a_delivered_at.elapsed();
+            assert!(
+                supersede_observed_after < generation_a_window,
+                "precondition failed: generation B replaced A {supersede_observed_after:?} after \
+                 A's pointer landed, which is not inside A's {generation_a_window:?} window, so \
+                 a notice from A would be legitimate rather than issue #687"
+            );
             event_tx
                 .send(BroadcastMsg::Event(session_start_event(
                     AgentType::None,
@@ -4189,17 +4228,22 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 String::from_utf8_lossy(&generation_b_pane)
             );
 
+            // Wait out A's deadline rather than a span counted from here, so
+            // however long the steps above took, the check below runs after A's
+            // window has elapsed.
+            let generation_a_deadline =
+                generation_a_delivered_at + generation_a_window + generation_a_expiry_slack;
             let during_b_readiness = wait_for_silence_notice(
                 &registry,
                 &orchestrator_agent_id,
-                Duration::from_millis(800),
+                generation_a_deadline.saturating_duration_since(Instant::now()),
             )
             .await;
             let generation_b_still_waiting = registry.snapshot(&generation_b).unwrap_or_default();
             assert!(
                 !snapshot_contains(&generation_b_still_waiting, POINTER),
-                "generation B's payload arrived before A's 500 ms window expired, so the \
-                 supersession race was not reproduced; snapshot = {:?}",
+                "generation B's payload arrived before A's {generation_a_window:?} window \
+                 expired, so the supersession race was not reproduced; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_b_still_waiting)
             );
             assert!(
@@ -4218,7 +4262,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 &registry,
                 &generation_b,
                 POINTER,
-                Duration::from_secs(2),
+                generation_b_buffer + common::load_scaled(Duration::from_secs(2)),
             )
             .await;
             assert!(
@@ -4230,7 +4274,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 &registry,
                 &orchestrator_agent_id,
                 LIVE_GENERATION_B_SENTINEL.as_bytes(),
-                Duration::from_secs(2),
+                common::load_scaled(Duration::from_secs(3)),
             )
             .await;
             let notice_count = String::from_utf8_lossy(&generation_b_notice)
