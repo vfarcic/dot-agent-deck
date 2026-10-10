@@ -1629,6 +1629,9 @@ pub struct AppState {
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
     pub upgrade_check: Option<std::sync::Arc<crate::upgrade_dialog::UpgradeCheck>>,
+    /// Issue #1635: the id of the check `upgrade_check` holds, so a check that
+    /// started earlier never replaces it ([`crate::upgrade_dialog::publish`]).
+    pub upgrade_check_id: u64,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no

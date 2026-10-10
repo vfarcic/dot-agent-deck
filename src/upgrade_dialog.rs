@@ -19,6 +19,7 @@
 //! plain state machine the TUI feeds keys and results into.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -136,16 +137,44 @@ pub async fn check() -> Result<UpgradeCheck, UpgradeError> {
     Ok(UpgradeCheck { plans })
 }
 
+/// Hands out check ids, in the order checks start.
+static LAST_CHECK_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Check again and, when the check could be made, publish it in `state` for
 /// the badge and the dialog. A check that could not be made keeps what the
-/// last one found.
+/// last one found. The periodic check and the one a closed dialog asks for can
+/// run at once; the one that started later wins, whichever finishes last.
 pub async fn refresh(state: &SharedState) {
     if !checks_enabled() {
         return;
     }
+    let id = LAST_CHECK_ID.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(found) = check().await {
-        state.write().await.upgrade_check = Some(Arc::new(found));
+        let mut state = state.write().await;
+        let state = &mut *state;
+        publish(
+            &mut state.upgrade_check,
+            &mut state.upgrade_check_id,
+            id,
+            found,
+        );
     }
+}
+
+/// Put check `id`'s result `found` in `slot`, unless the check already there
+/// (`published`) started later. Returns whether it was put there.
+pub fn publish(
+    slot: &mut Option<Arc<UpgradeCheck>>,
+    published: &mut u64,
+    id: u64,
+    found: UpgradeCheck,
+) -> bool {
+    if id <= *published {
+        return false;
+    }
+    *published = id;
+    *slot = Some(Arc::new(found));
+    true
 }
 
 /// Check at start, then every [`recheck_interval`] for as long as the TUI
@@ -1068,6 +1097,38 @@ mod tests {
         let result = RunResult::from_outcome(&plan, &reached, true);
         assert!(result.ok);
         assert!(result.tui_restart.is_some());
+    }
+
+    #[test]
+    fn an_older_check_finishing_later_never_replaces_a_newer_one() {
+        use crate::self_upgrade::detect::{InstallMethod, Installation, Tools};
+        use crate::self_upgrade::{PlanOptions, ProvenanceCheck};
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: "/home/u/.local/bin/dot-agent-deck".into(),
+            version: "0.46.0".into(),
+            platform: None,
+            method: InstallMethod::Nix,
+            tools: Tools::default(),
+        };
+        let options = PlanOptions {
+            staging_root: "/stage".into(),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable { reason: "x".into() },
+        };
+        let check = |latest: &str| UpgradeCheck {
+            plans: vec![plan::plan(&installation, &latest.into(), &options)],
+        };
+        let latest =
+            |slot: &Option<Arc<UpgradeCheck>>| slot.as_ref().unwrap().plans[0].latest.clone();
+        let (mut slot, mut published) = (None, 0);
+        // The re-check a closed dialog asked for (id 2) finishes first; the
+        // periodic check that started before it (id 1) finishes after.
+        assert!(publish(&mut slot, &mut published, 2, check("0.48.0")));
+        assert!(!publish(&mut slot, &mut published, 1, check("0.47.0")));
+        assert_eq!((published, latest(&slot)), (2, "0.48.0".to_string()));
+        assert!(publish(&mut slot, &mut published, 3, check("0.49.0")));
+        assert_eq!((published, latest(&slot)), (3, "0.49.0".to_string()));
     }
 
     #[test]
