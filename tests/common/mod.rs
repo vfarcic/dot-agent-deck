@@ -11491,7 +11491,11 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // PRD #1258: both waits are load-scaled. A fixed 5s attach wait went red for
+    // `agent_event_007`/`008` in a fast-tier pass at a 1-min load of 143 on 16
+    // CPUs (cpu PSI 98%), and both passed once the box recovered.
+    let bind_budget = load_scaled(Duration::from_secs(5));
+    let deadline = tokio::time::Instant::now() + bind_budget;
     let mut ready = false;
     while tokio::time::Instant::now() < deadline {
         if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
@@ -11502,7 +11506,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket was not accepting connections within 5s"
+        "in-process daemon hook socket was not accepting connections within {bind_budget:?}"
     );
 
     // Issue #954: and the ATTACH socket too, because this function hands one
@@ -11522,7 +11526,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // harness-sized version of that bug being written next. `daemon_status.rs`
     // had already hand-rolled this wait for its own calls; the other consumer,
     // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
-    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let attach_deadline = tokio::time::Instant::now() + bind_budget;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < attach_deadline {
         if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
@@ -11533,7 +11537,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         attach_ready,
-        "in-process daemon attach socket {} was not accepting connections within 5s",
+        "in-process daemon attach socket {} was not accepting connections within {bind_budget:?}",
         attach_path.display()
     );
 
