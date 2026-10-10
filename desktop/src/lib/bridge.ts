@@ -348,7 +348,7 @@ export interface DesktopAgentDto {
 }
 
 /**
- * PRD #1401 — the daemon's `pull_request::PullRequestInfo`. `"unknown"` is what
+ * PRD #1401 — the daemon's `pull_request_info::PullRequestInfo`. `"unknown"` is what
  * a value from a newer daemon that this build does not know arrives as.
  */
 export interface PullRequestInfoDto {

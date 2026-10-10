@@ -507,7 +507,9 @@ mod tests {
     /// fetch falling due and no change to the status.
     #[test]
     fn a_pull_request_report_is_served_from_the_fold_and_costs_no_fetch() {
-        use dot_agent_deck::pull_request::{PullRequestInfo, PullRequestReview, PullRequestState};
+        use dot_agent_deck::pull_request_info::{
+            PullRequestInfo, PullRequestReview, PullRequestState,
+        };
         let now = Instant::now();
         let mut view = AgentView::default();
         view.install(listing(vec![record("7", "pane-7")]), now);

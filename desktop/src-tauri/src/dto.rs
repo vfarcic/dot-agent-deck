@@ -577,7 +577,7 @@ pub struct DesktopAgent {
     /// Absent when the record carries no `live` snapshot, the daemon knows of
     /// no PR, or the daemon predates the field.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pull_request: Option<dot_agent_deck::pull_request::PullRequestInfo>,
+    pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
 }
 

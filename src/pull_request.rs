@@ -61,47 +61,10 @@ use crate::git_env::git_at;
 use crate::state::{SessionState, SharedState};
 use crate::untrusted_text::escape_control_and_bidi;
 
-/// A pull request linked to an agent session.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PullRequestInfo {
-    /// The PR number on its forge (e.g. `1401`).
-    pub number: u64,
-    /// The PR's web URL.
-    pub url: String,
-    /// Where the PR is in its lifecycle.
-    pub state: PullRequestState,
-    /// The review decision, when the forge reports one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<PullRequestReview>,
-}
-
-/// A pull request's lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PullRequestState {
-    Open,
-    Draft,
-    Merged,
-    Closed,
-    /// A state this build does not know, sent by a newer daemon. Never
-    /// produced by this build; it only exists so deserialization succeeds.
-    #[serde(other)]
-    Unknown,
-}
-
-/// A pull request's review decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PullRequestReview {
-    Approved,
-    ChangesRequested,
-    ReviewRequired,
-    /// A review decision this build does not know, sent by a newer daemon.
-    /// Never produced by this build; it only exists so deserialization
-    /// succeeds.
-    #[serde(other)]
-    Unknown,
-}
+// The wire types live in their own I/O-free module so the desktop crate can
+// name them without reaching this resolver. Re-exported so code that names
+// them through this module, as the e2e tests do, still resolves.
+pub use crate::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
 
 /// The `--json` fields the badge needs from `gh pr list`.
 pub(crate) const GH_PR_FIELDS: &str = "number,state,isDraft,reviewDecision,url,headRefName";

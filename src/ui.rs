@@ -8563,8 +8563,10 @@ fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
 /// PRD #1401: the glyph a card's pull request badge shows for `state`, and
 /// its colour — GitHub's own colour roles (green open, grey draft, purple
 /// merged, red closed) in the palette's terms.
-fn pull_request_state_glyph(state: crate::pull_request::PullRequestState) -> (&'static str, Color) {
-    use crate::pull_request::PullRequestState;
+fn pull_request_state_glyph(
+    state: crate::pull_request_info::PullRequestState,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestState;
     match state {
         PullRequestState::Open => ("⊙", palette::STATUS_WORKING),
         PullRequestState::Draft => ("◌", palette::STATUS_IDLE),
@@ -8577,9 +8579,9 @@ fn pull_request_state_glyph(state: crate::pull_request::PullRequestState) -> (&'
 /// PRD #1401: the glyph a card's pull request badge shows for `review`, and
 /// its colour.
 fn pull_request_review_glyph(
-    review: crate::pull_request::PullRequestReview,
+    review: crate::pull_request_info::PullRequestReview,
 ) -> (&'static str, Color) {
-    use crate::pull_request::PullRequestReview;
+    use crate::pull_request_info::PullRequestReview;
     match review {
         PullRequestReview::Approved => ("✓", palette::STATUS_WORKING),
         PullRequestReview::ChangesRequested => ("✗", palette::STATUS_ERROR),
@@ -8591,7 +8593,9 @@ fn pull_request_review_glyph(
 /// PRD #1401: a card's pull request badge in its forms, widest first —
 /// `#<n>` with the state and review glyphs, then without the review glyph,
 /// then the number alone. A PR with no review decision has no first form.
-fn pull_request_badge_forms(pr: &crate::pull_request::PullRequestInfo) -> Vec<Vec<Span<'static>>> {
+fn pull_request_badge_forms(
+    pr: &crate::pull_request_info::PullRequestInfo,
+) -> Vec<Vec<Span<'static>>> {
     let number = Span::styled(
         format!("#{}", pr.number),
         text_primary().add_modifier(Modifier::BOLD),
@@ -8631,7 +8635,7 @@ fn pull_request_badge_forms(pr: &crate::pull_request::PullRequestInfo) -> Vec<Ve
 #[doc(hidden)]
 pub fn card_bottom_border_labels(
     usable_width: u16,
-    pull_request: Option<&crate::pull_request::PullRequestInfo>,
+    pull_request: Option<&crate::pull_request_info::PullRequestInfo>,
     last: &str,
     tools: usize,
 ) -> (Option<Vec<Span<'static>>>, Option<String>) {

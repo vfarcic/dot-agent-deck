@@ -208,6 +208,17 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "features",
     "platform",
     "prompt_delivery",
+    // PRD #1401, argued rather than added quietly. The desktop names
+    // `PullRequestInfo` here — the type `SessionSnapshot.pull_request` carries,
+    // which `dto::DesktopAgent` copies through to the webview as is — so the
+    // pull request badge has one shape on both clients. The module is the
+    // value's shape and nothing else, split out of `pull_request` for exactly
+    // this rule: `pull_request` is the daemon's resolver, which runs `git` and
+    // `gh` against each session's working directory, and stays off this list.
+    // Checked against this rule's lines: three serde types, no function, no
+    // I/O, no project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "pull_request_info",
     // PRD #1497, argued rather than added quietly. Reading mode names ONE item
     // here, `NOTIFICATION_TYPE_METADATA_KEY`: it tells a Claude-shaped
     // permission prompt from the other `WaitingForInput` notifications on the

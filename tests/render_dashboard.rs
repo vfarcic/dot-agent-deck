@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
-use dot_agent_deck::pull_request::{PullRequestInfo, PullRequestReview, PullRequestState};
+use dot_agent_deck::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
 use dot_agent_deck::state::{
     ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
     SessionState, SessionStatus,

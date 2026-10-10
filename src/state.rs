@@ -948,7 +948,7 @@ pub struct SessionSnapshot {
     /// no `PROTOCOL_VERSION` bump. The enums inside tolerate values a newer
     /// daemon may add, so an unknown one never fails the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pull_request: Option<crate::pull_request::PullRequestInfo>,
+    pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1071,7 +1071,7 @@ pub struct SessionState {
     /// PRD #1401: the pull request this session's work produced, when the
     /// daemon knows of one. Carried to clients by
     /// [`SessionSnapshot::pull_request`].
-    pub pull_request: Option<crate::pull_request::PullRequestInfo>,
+    pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -11539,7 +11539,7 @@ impl AppState {
     fn apply_pull_request_report(
         &mut self,
         event: &AgentEvent,
-        pull_request: Option<crate::pull_request::PullRequestInfo>,
+        pull_request: Option<crate::pull_request_info::PullRequestInfo>,
     ) {
         for (id, session) in self.sessions.iter_mut() {
             let same_card = *id == event.session_id
@@ -11561,7 +11561,7 @@ impl AppState {
     /// (`None`: no badge). Sessions it does not name are left as they are.
     pub fn set_pull_requests(
         &mut self,
-        want: &HashMap<String, Option<crate::pull_request::PullRequestInfo>>,
+        want: &HashMap<String, Option<crate::pull_request_info::PullRequestInfo>>,
     ) -> Vec<AgentEvent> {
         let mut changed = Vec::new();
         for (id, session) in self.sessions.iter_mut() {

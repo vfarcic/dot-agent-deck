@@ -556,7 +556,7 @@ pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 
 /// `AgentEvent.metadata` key carrying the JSON of the
-/// [`crate::pull_request::PullRequestInfo`] an [`EventType::PullRequest`]
+/// [`crate::pull_request_info::PullRequestInfo`] an [`EventType::PullRequest`]
 /// reports (PRD #1401). Absent on that event means "no pull request".
 ///
 /// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the hook
@@ -1218,7 +1218,7 @@ impl AgentEvent {
     /// `Some(None)` when it reports none, `None` when this is not such an
     /// event. A value that does not decode reads as "none": the badge is
     /// dropped rather than left showing something the daemon no longer says.
-    pub fn pull_request_report(&self) -> Option<Option<crate::pull_request::PullRequestInfo>> {
+    pub fn pull_request_report(&self) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
         if self.event_type != EventType::PullRequest {
             return None;
         }
