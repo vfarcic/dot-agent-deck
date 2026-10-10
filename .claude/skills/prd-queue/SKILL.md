@@ -52,44 +52,13 @@ A stale checkout does not fail loudly. It reports every recently-added symbol as
 
 ## Step 0b — Bring the base up to date, because every unit is cut from it
 
-**`dispatch` has no base or branch option.** It resolves the caller's **`HEAD`** to a commit once, then runs `git worktree add <dir> -b agent/dispatch-<name> <that sha>` **in the caller's own working directory** — `resolve_dispatch_base` and `create_dispatch_worktree` in `src/dispatch.rs`, feeding `create_worktree_from` in `src/issue_dispatch_run.rs` — and reports that same sha in its `cut from <branch> at <sha>` reply. So whatever `HEAD` is at dispatch time is the base every unit inherits, and no flag anywhere overrides it. Step 0's fetch fixes what you *verify against* and does nothing at all about what the units are *built on*.
+**Apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill here, before anything is dispatched.** It is where the base step for every dispatch in this repo is defined: that `dispatch` cuts every unit from `HEAD` and takes no base option, the three reads, the fast-forward under its preconditions, the four ways it refuses and what to say for each, resolving it before the first dispatch and never between two, reading the `cut from <branch> at <sha>` clause after each dispatch, and reporting the base as a distance from `origin/main`. Step 0's fetch is the fetch it starts with; do not fetch again. This step used to carry its own copy, and issue #1638 replaced it with this pointer so the copies could not drift.
 
-**That matters more for a PRD than for an issue.** An issue unit is a handful of commits and a short PR. A PRD unit runs the whole lifecycle — plan, implement, gate, PR — and will rebase or merge before it finishes anyway; what it cannot do is get back the hours it spent planning tests and reading `src/` against a base that was already wrong. The cost is not a conflict at the end, it is the work done before the conflict.
+**That matters more for a PRD than for an issue.** An issue unit is a handful of commits and a short PR. A PRD unit runs the whole lifecycle — plan, implement, gate, PR — and will rebase or merge before it finishes anyway; what it cannot do is get back the hours it spent planning tests and reading `src/` against a base that was already wrong. The cost is not a conflict at the end, it is the work done before the conflict. Both incidents `dispatch-base` records were PRD batches: the desktop PRDs #740 and #745 cut from a `main` with no `desktop/` directory (2026-08-30), and #1631, #1401 and #1258 cut from a feature branch (2026-10-10).
 
-**So bring the base up to date when it is safe to, rather than reporting it stale.** Step 0 already fetched, so reading the state costs nothing. Two of the three are new; the third is the same distance read as step 0's, wanted this time for its *left* number as well:
+**Do not stop the queue over a refusal.** Nothing in selection depends on the checkout — step 0 verifying against `origin/main` is exactly what makes that true — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 5), where they are already weighing what the batch costs. The three answers `dispatch-base` lists are the runner's to choose between, not yours.
 
-```bash
-git rev-parse --abbrev-ref HEAD                        # the branch every unit is cut from
-git status --porcelain --untracked-files=no            # ANY output means tracked changes
-git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 behind
-```
-
-**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt, no question — an up-to-date base is the default here, and the runner is told what happened rather than asked to authorise it:
-
-```bash
-git merge --ff-only origin/main
-```
-
-**This reverses what this step used to say, so read why before restoring it.** Until issue #760 it surfaced the staleness and asked, on the ground that *the runner may have local work, and this skill has no business moving their branch*. That hazard is real and it is kept — it is precisely what the three preconditions test for. What was wrong was the scope: the old rule asked in every case because it distinguished none of them, and distinguishing them is three commands that cost nothing after a fetch you were already doing. Together the preconditions are the statement **there is no local work here to move** — no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
-
-**Asking was measured, and it was not enough. 2026-08-30, on this queue's own workload.** Two orchestrations were dispatched for the desktop PRDs #740 and #745 from a local `main` at `820ba40`, six commits behind `origin/main` at `83d9bf3`. One of those six was `daf94f0`, the commit that introduces `desktop/` in the first place — so both units were cut from a tree with **no `desktop/` directory at all**, which is the entire subject of both PRDs. Neither could have done anything; both were stopped and re-dispatched after a pull, with not one original commit between them. **A unit cannot discover this about itself.** It sees a valid checkout, finds the code its PRD describes missing, and reasonably concludes that the *PRD* is stale rather than that its base is — which for a long-lived PRD document is an entirely plausible conclusion, and is the failure mode this step exists to prevent.
-
-**`git merge --ff-only origin/main`, never `git pull`, and the difference is not stylistic.** Step 0's fetch already put the ref in the repository, so the merge is purely local: no second network round trip, and nothing for a `pull.rebase` setting to reinterpret into a rebase of the runner's branch. It is also the second of two independent guards — the preconditions decide and `--ff-only` enforces, so if the two ever disagree the merge fails loudly instead of writing a merge commit onto `main`.
-
-**When the base cannot be brought up to date, do not touch the checkout.** Three of the four cases below are precondition failures — the case the old rule was written for, unchanged — and the fourth is the merge itself refusing. Say which one it was, in these terms:
-
-- **Tracked changes present** — name the files. They are invisible to the units either way: a unit's copy is made from the last commit ([`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md)), so uncommitted work never reaches one. Committing or stashing is therefore the same fix in both directions, and it is the runner's to make rather than yours. **Untracked files are deliberately not a blocker** — `--untracked-files=no` is load-bearing above. A fast-forward that would clobber one fails cleanly by itself, and counting them as dirtiness would refuse on nearly every real checkout, reinstating "never update" by another route.
-- **`HEAD` is not `main`** — every unit is cut from *that* branch and carries its unmerged work into every PR the batch produces. Name the branch and its distance from `origin/main`. This is the sharper failure of the three, because nothing about it looks wrong: a feature branch dispatches exactly as smoothly as `main` does.
-- **`HEAD` is ahead of `origin/main`** — there is nothing to fast-forward *to*, and the commits that put it ahead are inherited by every unit's branch and turn up in every unit's PR. Report the count; pushing or moving is the runner's call.
-- **The merge command itself fails despite every precondition passing** — a fast-forward that would clobber a file `origin/main` newly tracks is the concrete case. Treat that failure exactly like the three above: report the git error and do not proceed to dispatch. **Decide on the exit status, never on the output** — git prints `Updating <old>..<new>` *after* `Aborting`, so a refusal ends in a line that reads exactly like a successful fast-forward. `--ff-only` never partially applies, so the checkout is unchanged and there is nothing to undo.
-
-`git log --oneline HEAD..origin/main` names the commits behind the count, which is what makes a refusal actionable rather than a number.
-
-**Do not stop the queue over a refusal.** Nothing in selection depends on the checkout — step 0 verifying against `origin/main` is exactly what makes that true — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 5), where they are already weighing what the batch costs. Three answers are legitimate and all three are the runner's: dispatch anyway onto the older base, clear the blocker and dispatch after it, or defer the batch. Take their answer rather than picking one, and never clear the blocker on their behalf — committing, stashing or switching branch is precisely the local work this step refuses to touch.
-
-**Resolve it before the first dispatch, never between two.** If the runner clears the blocker, re-read `HEAD` and dispatch. Updating mid-batch splits one batch across two bases, and the units already started keep the old one.
-
-**Then report the base as a distance from `origin/main`, not as a branch name** (step 9). "cut from `main`" reads identically whether `main` is level with the remote or six commits behind it, which is exactly how the 2026-08-30 batch looked fine right up until the units did not.
+**Then report the base as a distance from `origin/main`, not as a branch name** (step 9), as `dispatch-base` says.
 
 ## Step 1 — Resolve identity at runtime
 
