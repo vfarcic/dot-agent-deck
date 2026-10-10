@@ -338,9 +338,9 @@ fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error {
 fn describe_duration(duration: std::time::Duration) -> String {
     let plural = |n: u128, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
     let ms = duration.as_millis();
-    if ms % 60_000 == 0 && ms > 0 {
+    if ms.is_multiple_of(60_000) && ms > 0 {
         plural(ms / 60_000, "minute")
-    } else if ms % 1000 == 0 && ms > 0 {
+    } else if ms.is_multiple_of(1000) && ms > 0 {
         plural(ms / 1000, "second")
     } else {
         plural(ms, "millisecond")
