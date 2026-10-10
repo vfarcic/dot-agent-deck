@@ -11,7 +11,8 @@
 //! that copy; a copy that cannot be upgraded from here shows what to do and
 //! offers only Close. Both start each question on Cancel, so Enter alone
 //! never upgrades anything. A plan too long for the terminal scrolls, and
-//! Upgrade waits until all of it has been on screen.
+//! Upgrade waits until all of it has been on screen. A terminal too small to
+//! show any of the plan gets a request for a larger one and only Close.
 //!
 //! Nothing here touches the network or a subprocess on the render thread:
 //! [`check`] and the upgrade itself run on tokio tasks, and the dialog is a
@@ -332,6 +333,9 @@ pub struct UpgradeDialog {
     /// Per copy, what of its section has been on screen while it was asked
     /// about. Upgrade waits until all of it has.
     seen: Vec<Option<Seen>>,
+    /// Whether the last draw found the terminal too small to show the plan
+    /// and asked for a larger one instead. While it is, only Close is offered.
+    too_small: bool,
 }
 
 impl UpgradeDialog {
@@ -350,6 +354,7 @@ impl UpgradeDialog {
             page: 0,
             anchor: None,
             seen: vec![None; n],
+            too_small: false,
         };
         dialog.step(None);
         dialog
@@ -413,8 +418,12 @@ impl UpgradeDialog {
     }
 
     /// Scroll the body by `rows`, up when negative, within what the last draw
-    /// laid out.
+    /// laid out. While the terminal is too small to show the plan there is
+    /// nothing to scroll.
     pub fn scroll_by(&mut self, rows: isize) {
+        if self.too_small {
+            return;
+        }
         self.anchor = None;
         self.scroll = self.scroll.saturating_add_signed(rows).min(self.max_scroll);
     }
@@ -447,11 +456,19 @@ impl UpgradeDialog {
     pub fn selected(&self) -> UpgradeChoice {
         match self.phase() {
             Phase::Done => UpgradeChoice::Close,
+            Phase::Confirm(_) if self.too_small => UpgradeChoice::Close,
             _ => self.selected,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        if self.too_small {
+            return match (self.phase(), key.code) {
+                (Phase::Running(_), _) => Effect::None,
+                (_, KeyCode::Enter | KeyCode::Esc) => Effect::Close,
+                _ => Effect::None,
+            };
+        }
         match key.code {
             KeyCode::PageDown => {
                 self.scroll_by(self.page_rows());
@@ -494,9 +511,14 @@ impl UpgradeDialog {
 
     /// Press `choice`, by key or by click. Upgrade waits until the whole of
     /// the copy's plan has been on screen: until then it scrolls on instead.
+    /// In a terminal too small to show the plan, only Close does anything.
     pub fn choose(&mut self, choice: UpgradeChoice) -> Effect {
         match self.phase() {
             Phase::Running(_) => Effect::None,
+            _ if self.too_small => match choice {
+                UpgradeChoice::Upgrade => Effect::None,
+                UpgradeChoice::Cancel | UpgradeChoice::Close => Effect::Close,
+            },
             Phase::Confirm(i) => match choice {
                 UpgradeChoice::Upgrade if !self.section_seen(i) => {
                     self.scroll_by(self.page_rows());
@@ -597,6 +619,16 @@ struct Layout {
 /// (a provenance line) fits on one row.
 const MAX_WIDTH: u16 = 160;
 
+/// The narrowest the plan's text is drawn: wide enough for the widest row the
+/// dialog never wraps (a hint, a button), which also leaves a command its
+/// two-column indent and room for any character.
+const MIN_TEXT_WIDTH: u16 = 60;
+
+/// The narrowest terminal the dialog shows a plan in: [`MIN_TEXT_WIDTH`], the
+/// dialog's border and padding, and the margin either side of it. Narrower,
+/// it asks for a larger terminal instead.
+pub const MIN_COLUMNS: u16 = MIN_TEXT_WIDTH + 8;
+
 fn plain() -> Style {
     Style::default().fg(Color::Reset)
 }
@@ -669,6 +701,83 @@ fn push_line(out: &mut Vec<Line<'static>>, line: &PlanLine, width: usize, style:
     }
 }
 
+/// The hints on the dialog's last row, one per step. They are never wrapped,
+/// so [`MIN_TEXT_WIDTH`] is at least as wide as the widest.
+const HINT_READ: &str = "PageDown to read the whole plan · ↑/↓ choose · Esc closes";
+const HINT_CONFIRM_SCROLL: &str = "↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc closes";
+const HINT_CONFIRM: &str = "↑/↓ choose · Enter confirms · Esc closes";
+const HINT_RUNNING: &str = "Upgrading… wait for it to finish.";
+const HINT_DONE_SCROLL: &str = "PgUp/PgDn scroll · Enter or Esc closes";
+const HINT_DONE: &str = "Enter or Esc closes";
+
+/// The buttons for `phase`, each with its label. They are never wrapped
+/// either.
+fn buttons(phase: Phase, ran_any: bool) -> Vec<(UpgradeChoice, String)> {
+    match phase {
+        Phase::Confirm(_) => {
+            let cancel = if ran_any {
+                "skip this copy"
+            } else {
+                "close, changing nothing"
+            };
+            vec![
+                (UpgradeChoice::Cancel, format!("Cancel   — {cancel}")),
+                (
+                    UpgradeChoice::Upgrade,
+                    "Upgrade  — upgrade it now".to_string(),
+                ),
+            ]
+        }
+        Phase::Running(_) => Vec::new(),
+        Phase::Done => vec![(UpgradeChoice::Close, "Close".to_string())],
+    }
+}
+
+/// The question, a blank row and the buttons, always kept in view, laid out
+/// for `width` columns. The first row is where the "more below" marker goes;
+/// the hint, the last row, is added once the view is placed. Returns the
+/// rows, the buttons and the row of the first button.
+fn footer_rows(
+    dialog: &UpgradeDialog,
+    phase: Phase,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<(UpgradeChoice, String)>, usize) {
+    let mut footer: Vec<Line<'static>> = vec![Line::from("")];
+    if let Phase::Confirm(i) = phase {
+        let question = dialog.plans[i].confirm_question().unwrap_or_default();
+        let question = crate::untrusted_text::strip_control_and_bidi(&question, false);
+        for row in wrap(&question, width) {
+            footer.push(Line::styled(row, bold()));
+        }
+        footer.push(Line::from(""));
+    }
+    let buttons = buttons(phase, dialog.ran_any());
+    let first_button_row = footer.len();
+    let selected = dialog.selected();
+    for (choice, label) in &buttons {
+        let (cursor, style) = if *choice == selected {
+            (">", selected_style())
+        } else {
+            (" ", plain())
+        };
+        footer.push(Line::styled(format!("{cursor} {label}"), style));
+    }
+    footer.push(Line::from(""));
+    (footer, buttons, first_button_row)
+}
+
+/// Where the text goes in a popup at `popup`: inside `block`'s border, with
+/// one column of padding on each side.
+fn text_rect(block: &Block, popup: Rect) -> Rect {
+    let inner = block.inner(popup);
+    Rect::new(
+        inner.x.saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    )
+}
+
 /// Draw `dialog` centred over the frame. Returns each button's row, for the
 /// mouse.
 ///
@@ -676,12 +785,47 @@ fn push_line(out: &mut Vec<Line<'static>>, line: &PlanLine, width: usize, style:
 /// there is more, PageUp and PageDown (or the mouse wheel) move through it,
 /// and the question and the buttons stay in view. Nothing is cut off. Drawing
 /// records what reached the screen, which is what lets Upgrade be chosen.
+///
+/// The plan is laid out for the text area it is drawn into. When that area is
+/// narrower than [`MIN_TEXT_WIDTH`] or has no row left for the plan, the
+/// dialog asks for a larger terminal instead ([`render_too_small`]), and
+/// nothing counts as seen.
 pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoice, Rect)> {
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(MAX_WIDTH);
-    // Inside the border, one column of padding on each side.
-    let text_width = usize::from(width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(2);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let title = crate::untrusted_text::strip_control_and_bidi(dialog.latest(), false);
+    let block = Block::default()
+        .title(format!(" Upgrade to v{title} "))
+        .title_style(selected_style())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    // The text area of the tallest popup the frame allows. A shorter plan
+    // draws a shorter popup, as wide.
+    let most = text_rect(&block, Rect::new(x, area.y, width, max_height));
+    let text_width = usize::from(most.width);
     let phase = dialog.phase();
+
+    let (mut footer, buttons, first_button_row) = footer_rows(dialog, phase, text_width);
+    // The "more above" row, the footer and its hint leave the body the rest.
+    let room = usize::from(most.height).saturating_sub(1 + footer.len() + 1);
+    if most.width < MIN_TEXT_WIDTH || room == 0 {
+        dialog.too_small = true;
+        // The footer as it would be at the narrowest width that shows a plan,
+        // when this one is narrower, so the size asked for is enough.
+        let rows = if most.width < MIN_TEXT_WIDTH {
+            footer_rows(dialog, phase, usize::from(MIN_TEXT_WIDTH))
+                .0
+                .len()
+        } else {
+            footer.len()
+        };
+        // One body row, the marker row and the hint, the border, the margin.
+        let needed = u16::try_from(rows + 1 + 2 + 2 + 2).unwrap_or(u16::MAX);
+        return render_too_small(frame, phase, &title, needed);
+    }
+    dialog.too_small = false;
 
     let mut body: Vec<Line<'static>> = Vec::new();
     let mut layout = Layout {
@@ -717,64 +861,16 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
     }
     layout.rows = body.len();
 
-    // The question and the buttons, always kept in view. The first row is
-    // where the "more below" marker goes.
-    let mut footer: Vec<Line<'static>> = vec![Line::from("")];
-    let mut buttons: Vec<(UpgradeChoice, String)> = Vec::new();
-    match phase {
-        Phase::Confirm(i) => {
-            let question = dialog.plans[i].confirm_question().unwrap_or_default();
-            let question = crate::untrusted_text::strip_control_and_bidi(&question, false);
-            for row in wrap(&question, text_width) {
-                footer.push(Line::styled(row, bold()));
-            }
-            footer.push(Line::from(""));
-            let cancel = if dialog.ran_any() {
-                "skip this copy"
-            } else {
-                "close, changing nothing"
-            };
-            buttons.push((UpgradeChoice::Cancel, format!("Cancel   — {cancel}")));
-            buttons.push((
-                UpgradeChoice::Upgrade,
-                "Upgrade  — upgrade it now".to_string(),
-            ));
-        }
-        Phase::Running(_) => {}
-        Phase::Done => buttons.push((UpgradeChoice::Close, "Close".to_string())),
-    }
-    let first_button_row = footer.len();
-    let selected = dialog.selected();
-    for (choice, label) in &buttons {
-        let (cursor, style) = if *choice == selected {
-            (">", selected_style())
-        } else {
-            (" ", plain())
-        };
-        footer.push(Line::styled(format!("{cursor} {label}"), style));
-    }
-    footer.push(Line::from(""));
-    // The hint, the last row, is added once the view is placed.
-
-    // Borders and the "more above" row around the body, which gets what the
-    // footer and its hint leave.
-    let chrome = 3usize;
-    let max_height = usize::from(area.height.saturating_sub(2));
-    let room = max_height.saturating_sub(chrome + footer.len() + 1);
     dialog.place(&layout, room, text_width);
     let scroll = dialog.scroll;
     let scrolls = dialog.max_scroll > 0;
     let hint = match phase {
-        Phase::Confirm(i) if !dialog.section_seen(i) => {
-            "PageDown to read the whole plan · ↑/↓ choose · Esc closes"
-        }
-        Phase::Confirm(_) if scrolls => {
-            "↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc closes"
-        }
-        Phase::Confirm(_) => "↑/↓ choose · Enter confirms · Esc closes",
-        Phase::Running(_) => "Upgrading… wait for it to finish.",
-        Phase::Done if scrolls => "PgUp/PgDn scroll · Enter or Esc closes",
-        Phase::Done => "Enter or Esc closes",
+        Phase::Confirm(i) if !dialog.section_seen(i) => HINT_READ,
+        Phase::Confirm(_) if scrolls => HINT_CONFIRM_SCROLL,
+        Phase::Confirm(_) => HINT_CONFIRM,
+        Phase::Running(_) => HINT_RUNNING,
+        Phase::Done if scrolls => HINT_DONE_SCROLL,
+        Phase::Done => HINT_DONE,
     };
     footer.push(Line::styled(hint, plain().add_modifier(Modifier::DIM)));
     let marker = |text: &'static str| Line::styled(text, Style::default().fg(Color::Yellow));
@@ -793,26 +889,13 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
     text.extend(footer);
     let height = u16::try_from(text.len() + 2)
         .unwrap_or(u16::MAX)
-        .min(area.height);
+        .min(max_height);
 
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    let title = crate::untrusted_text::strip_control_and_bidi(dialog.latest(), false);
-    let block = Block::default()
-        .title(format!(" Upgrade to v{title} "))
-        .title_style(selected_style())
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(popup);
+    let padded = text_rect(&block, popup);
     frame.render_widget(block, popup);
-    let padded = Rect::new(
-        inner.x.saturating_add(1),
-        inner.y,
-        inner.width.saturating_sub(2),
-        inner.height,
-    );
     frame.render_widget(Paragraph::new(text), padded);
 
     // Rows of the buttons: the marker row, the body, then the footer.
@@ -832,6 +915,75 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
         .collect()
 }
 
+/// Push `text` wrapped to `width` onto `out`.
+fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for row in wrap(text, width) {
+        out.push(Line::styled(row, style));
+    }
+}
+
+/// The dialog in a terminal too small to show the plan: what size it needs
+/// (`rows` tall, [`MIN_COLUMNS`] wide), and Close. While an upgrade runs there
+/// is nothing to close, as in the full dialog. Drawn over the whole frame,
+/// wrapped to it.
+fn render_too_small(
+    frame: &mut Frame,
+    phase: Phase,
+    title: &str,
+    rows: u16,
+) -> Vec<(UpgradeChoice, Rect)> {
+    let area = frame.area();
+    let width = usize::from(area.width);
+    let mut text: Vec<Line<'static>> = Vec::new();
+    push_wrapped(
+        &mut text,
+        &format!("Upgrade to v{title}"),
+        width,
+        selected_style(),
+    );
+    text.push(Line::from(""));
+    push_wrapped(
+        &mut text,
+        "The terminal is too small to show the upgrade plan.",
+        width,
+        plain(),
+    );
+    push_wrapped(
+        &mut text,
+        &format!("Make it at least {MIN_COLUMNS} columns wide and {rows} rows tall."),
+        width,
+        plain(),
+    );
+    text.push(Line::from(""));
+    let dim = plain().add_modifier(Modifier::DIM);
+    let close_row = match phase {
+        Phase::Running(_) => {
+            push_wrapped(&mut text, HINT_RUNNING, width, dim);
+            None
+        }
+        Phase::Confirm(_) | Phase::Done => {
+            let row = text.len();
+            push_wrapped(&mut text, "> Close", width, selected_style());
+            text.push(Line::from(""));
+            push_wrapped(&mut text, HINT_DONE, width, dim);
+            Some(row)
+        }
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(text), area);
+    close_row
+        .and_then(|row| u16::try_from(row).ok())
+        .filter(|&row| row < area.height)
+        .map(|row| {
+            (
+                UpgradeChoice::Close,
+                Rect::new(area.x, area.y + row, area.width, 1),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,5 +996,30 @@ mod tests {
         assert_eq!(wrap("a bcdefgh", 4), vec!["a", "bcde", "fgh"]);
         // Two spaces are kept, and never broken at.
         assert_eq!(wrap("x 'ab  cd' y", 9), vec!["x", "'ab  cd'", "y"]);
+    }
+
+    #[test]
+    fn rows_never_wrapped_fit_the_narrowest_text_width() {
+        let min = usize::from(MIN_TEXT_WIDTH);
+        let hints = [
+            HINT_READ,
+            HINT_CONFIRM_SCROLL,
+            HINT_CONFIRM,
+            HINT_RUNNING,
+            HINT_DONE_SCROLL,
+            HINT_DONE,
+        ];
+        for hint in hints {
+            assert!(hint.width() <= min, "{hint:?}");
+        }
+        for phase in [Phase::Confirm(0), Phase::Running(0), Phase::Done] {
+            for ran_any in [false, true] {
+                for (_, label) in buttons(phase, ran_any) {
+                    assert!(format!("> {label}").width() <= min, "{label:?}");
+                }
+            }
+        }
+        // A command's indent leaves room for a character two columns wide.
+        assert!(min >= 2 + 2);
     }
 }

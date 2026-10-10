@@ -5233,6 +5233,27 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the desktop app's sanitiser (its own vitest suite).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/011 — A terminal too narrow to show the plan gets a request for a larger one, and never an upgrade.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 8×60).
+- **Agent:** none.
+- **Asserts:** the dialog says the terminal is too small and asks for `upgrade_dialog::MIN_COLUMNS` columns and 13 rows, offering only `> Close`; fifty PageDowns, Down, choosing Upgrade and Enter never yield `Run`; Enter and Escape close; drawn larger again, the plan has still to be read before Upgrade runs.
+- **Does not assert:** a mouse click on Close (the same `choose` the keys reach).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/012 — At the narrowest width that shows a plan, no character of an indented command is cut off.
+- **Layer:** L1 (dialog state machine + `TestBackend` at `MIN_COLUMNS`×24), a staged outcome with a long install command.
+- **Agent:** none.
+- **Asserts:** paging through the result reaches every character of the core's install command; one column narrower the dialog asks for a larger terminal, 10 rows tall for a finished dialog.
+- **Does not assert:** characters two columns wide (the unit test `rows_never_wrapped_fit_the_narrowest_text_width` pins the room the minimum leaves).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/013 — A terminal too short for any row of the plan gets a request for a larger one, and never an upgrade.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 120×12 and 120×13).
+- **Agent:** none.
+- **Asserts:** at 12 rows the dialog asks for 13 and offers only `> Close`; PageDown and choosing Upgrade never yield `Run`; Enter closes; at 13 rows the plan is shown with `↓ more`.
+- **Does not assert:** a terminal resized while an upgrade runs (that state shows the same request with no Close, as the running dialog has none).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.

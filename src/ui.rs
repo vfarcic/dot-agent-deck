@@ -8472,6 +8472,9 @@ fn open_upgrade_dialog(ui: &mut UiState) {
             .map_or_else(String::new, |plan| plan.headline()),
         (None, None) => "No newer release has been found.".to_string(),
     };
+    // A version from the release check reaches the bar, so it is filtered as
+    // the dialog's lines are.
+    let message = crate::untrusted_text::strip_control_and_bidi(&message, false);
     ui.status_message = Some((message, std::time::Instant::now()));
 }
 
@@ -45886,6 +45889,37 @@ mod upgrade_dialog_tests {
         frame_sync(&mut ui, &state);
         ui.status_message = None;
         badge_columns(&draw_bar(&mut ui, 160), &offer);
+    }
+
+    /// Scenario: Every copy is current, but the version the running copy reports carries a terminal escape, a BEL and a bidi override. Pressing the upgrade key puts the core's "up to date" line in the status bar without any of them, and the bar as drawn shows none of them either.
+    #[test]
+    fn upgrade_dialog_up_to_date_status_line_drops_control_and_bidi() {
+        let hostile = "0.47.0\u{1b}]0;owned\u{7}\u{202e}";
+        let mut current = cli_plan("0.47.0");
+        current.installation.version = hostile.into();
+        current.action = crate::self_upgrade::PlanAction::UpToDate;
+        assert!(
+            current.headline().contains('\u{1b}'),
+            "the core passes the version through; the client filters it"
+        );
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![current],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "nothing is offered");
+        let bad = |c: char| c.is_control() || c == '\u{202e}';
+        let (status, _) = ui.status_message.clone().expect("the key answers");
+        assert!(!status.chars().any(bad), "{status:?}");
+        assert!(
+            status.contains("is up to date (v0.47.0]0;owned)."),
+            "{status}"
+        );
+
+        let bar = draw_bar(&mut ui, 160);
+        let shown: String = (0..160).map(|x| bar[(x, 0)].symbol()).collect();
+        assert!(!shown.chars().any(bad), "{shown:?}");
     }
 
     /// Scenario: Draw the dashboard's button bar with the update badge over its right end, at several widths. No cell of the badge is dimmed by the disabled buttons it covers, and a click on any of its cells opens the upgrade dialog rather than pressing a button underneath.

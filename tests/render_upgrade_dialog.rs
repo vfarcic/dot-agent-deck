@@ -819,3 +819,112 @@ fn upgrade_dialog_010_escapes_in_a_version_never_reach_the_terminal() {
     );
     assert!(flat_text.contains("Upgrade to v0.47.0]0;owned"), "{screen}");
 }
+
+/// Whether `text` is the dialog's "make the terminal larger" state, asking
+/// for `columns`×`rows`.
+fn is_resize_state(text: &str, columns: u16, rows: u16) -> bool {
+    let flat_text = flat(text);
+    flat_text.contains("The terminal is too small to show the upgrade plan.")
+        && flat_text.contains(&format!(
+            "Make it at least {columns} columns wide and {rows} rows tall."
+        ))
+        && flat_text.contains("> Close")
+        && !flat_text.contains("Upgrade  —")
+}
+
+/// Scenario: Open the dialog on this TUI's CLI in a terminal 8 columns wide and 60 rows tall, too narrow for any of the plan to be read. The dialog says the terminal is too small and what size it needs, and offers only Close; paging through it, selecting Upgrade, pressing Enter and clicking Upgrade never start an upgrade, and Enter or Esc closes it.
+#[spec("upgrade/upgrade-dialog/011")]
+#[test]
+fn upgrade_dialog_011_a_too_narrow_terminal_shows_the_resize_state_and_never_upgrades() {
+    use dot_agent_deck::upgrade_dialog::MIN_COLUMNS;
+    const W: u16 = 8;
+    const H: u16 = 60;
+    let mut dialog = UpgradeDialog::new(vec![writable_cli()]);
+    let first = render_at(&mut dialog, W, H);
+    assert!(is_resize_state(&first, MIN_COLUMNS, 13), "{first}");
+    assert_eq!(dialog.selected(), UpgradeChoice::Close);
+
+    for _ in 0..50 {
+        dialog.handle_key(key(KeyCode::PageDown));
+        render_at(&mut dialog, W, H);
+    }
+    dialog.handle_key(key(KeyCode::Down));
+    assert_eq!(dialog.choose(UpgradeChoice::Upgrade), Effect::None);
+    assert_eq!(dialog.phase(), Phase::Confirm(0));
+    let mut again = dialog.clone();
+    assert_eq!(again.handle_key(key(KeyCode::Enter)), Effect::Close);
+    assert_eq!(dialog.handle_key(key(KeyCode::Esc)), Effect::Close);
+
+    // Larger again, the plan has still to be read before Upgrade runs.
+    let mut wide = dialog.clone();
+    render_at(&mut wide, 120, 40);
+    let text = render_at(&mut wide, 120, 40);
+    assert!(!flat(&text).contains("too small"), "{text}");
+    wide.handle_key(key(KeyCode::Down));
+    assert_eq!(wide.selected(), UpgradeChoice::Upgrade);
+    assert_eq!(wide.handle_key(key(KeyCode::Enter)), Effect::Run(0));
+}
+
+/// Scenario: Upgrade a CLI in a folder the user cannot write in a terminal exactly as narrow as the dialog allows, and finish with the core's "staged" outcome. Paging through the result reaches every character of the indented install command. One column narrower, the dialog shows the resize state instead.
+#[spec("upgrade/upgrade-dialog/012")]
+#[test]
+fn upgrade_dialog_012_the_narrowest_allowed_width_cuts_no_command_character() {
+    use dot_agent_deck::upgrade_dialog::MIN_COLUMNS;
+    const H: u16 = 24;
+    let staged_file = PathBuf::from(format!(
+        "/home/u/.local/state/dot-agent-deck/upgrade/{}/dot-agent-deck-linux-amd64",
+        "d".repeat(150)
+    ));
+    let command = plan::install_binary_command(
+        Some(Platform::LinuxAmd64),
+        &staged_file,
+        Path::new("/usr/local/bin/dot-agent-deck"),
+        &"a".repeat(64),
+    )
+    .expect("a path under the limit is shown as a command");
+    let staged = non_writable_cli();
+    let outcome = Outcome::Staged {
+        path: staged_file,
+        command: Some(command.clone()),
+        version: LATEST.into(),
+        provenance: skipped(),
+    };
+    let mut dialog = UpgradeDialog::new(vec![staged.clone()]);
+    dialog.finish(0, RunResult::from_outcome(&staged, &outcome, true));
+
+    let narrower = render_at(&mut dialog.clone(), MIN_COLUMNS - 1, H);
+    assert!(is_resize_state(&narrower, MIN_COLUMNS, 10), "{narrower}");
+
+    let first = render_at(&mut dialog, MIN_COLUMNS, H);
+    assert!(!flat(&first).contains("too small"), "{first}");
+    let (body, _, _) = page_through(&mut dialog, MIN_COLUMNS, H, "> Close");
+    let squeezed = |text: &str| text.replace(' ', "");
+    assert!(
+        squeezed(&body.join("")).contains(&squeezed(&command)),
+        "every character of the command is reachable\n{}",
+        body.join("\n")
+    );
+}
+
+/// Scenario: Open the dialog on this TUI's CLI in a terminal wide enough but too short to show even one row of the plan beside the question and the buttons. The dialog says the terminal is too small and how many rows it needs, offers only Close, and choosing Upgrade or pressing Enter never starts an upgrade.
+#[spec("upgrade/upgrade-dialog/013")]
+#[test]
+fn upgrade_dialog_013_a_too_short_terminal_shows_the_resize_state() {
+    use dot_agent_deck::upgrade_dialog::MIN_COLUMNS;
+    let mut dialog = UpgradeDialog::new(vec![writable_cli()]);
+    let text = render_at(&mut dialog, 120, 12);
+    assert!(is_resize_state(&text, MIN_COLUMNS, 13), "{text}");
+    dialog.handle_key(key(KeyCode::Down));
+    for _ in 0..20 {
+        dialog.handle_key(key(KeyCode::PageDown));
+        render_at(&mut dialog, 120, 12);
+        assert_eq!(dialog.choose(UpgradeChoice::Upgrade), Effect::None);
+    }
+    assert_eq!(dialog.handle_key(key(KeyCode::Enter)), Effect::Close);
+
+    // One row taller is enough.
+    let mut taller = UpgradeDialog::new(vec![writable_cli()]);
+    let text = render_at(&mut taller, 120, 13);
+    assert!(!flat(&text).contains("too small"), "{text}");
+    assert!(text.contains("↓ more"), "{text}");
+}
