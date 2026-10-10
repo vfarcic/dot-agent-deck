@@ -336,7 +336,7 @@ impl SelfUpgradeState {
     /// runs as root, and the core only reaps it.
     pub(crate) fn mark_unfinished(&self, copy: SelfCopy, error: &UpgradeError) {
         if let UpgradeError::InstallUnfinished(unfinished) = error
-            && unfinished.may_still_be_running
+            && unfinished.may_still_be_running.is_some()
         {
             let mut copies = lock(&self.inner.unfinished);
             if !copies.contains(&copy) {
@@ -1730,7 +1730,8 @@ mod tests {
             dot_agent_deck::self_upgrade::UnfinishedInstall {
                 command: "/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb".into(),
                 detail: "it did not finish within 15 minutes and could not be stopped, so it may still be running".into(),
-                may_still_be_running,
+                may_still_be_running: may_still_be_running
+                    .then_some(dot_agent_deck::self_upgrade::Interruption::TimedOut),
                 target: dot_agent_deck::self_upgrade::InstallTarget::Package,
                 found: dot_agent_deck::self_upgrade::Found::NotChecked,
                 install: None,

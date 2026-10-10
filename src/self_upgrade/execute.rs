@@ -583,11 +583,12 @@ enum Privileged {
     /// was installed.
     Prompt { command: String, detail: String },
     /// It started and did not complete: it failed once past the prompt, or
-    /// outlived its bound, and was stopped unless it `may_still_be_running`.
+    /// outlived its bound, and was stopped unless it `may_still_be_running`
+    /// (`Some`, saying why it was not seen to finish).
     Unfinished {
         command: String,
         detail: String,
-        may_still_be_running: bool,
+        may_still_be_running: Option<plan::Interruption>,
     },
 }
 
@@ -613,15 +614,15 @@ fn run_privileged(host: &dyn Host, pkexec: &Path, args: &[&OsStr]) -> Result<(),
                 Err(Privileged::Unfinished {
                     command,
                     detail,
-                    may_still_be_running: false,
+                    may_still_be_running: None,
                 })
             }
         }
-        Err(error) => match super::unfinished_stopped(&error) {
-            Some(stopped) => Err(Privileged::Unfinished {
+        Err(error) => match super::unfinished(&error) {
+            Some(unfinished) => Err(Privileged::Unfinished {
                 command,
+                may_still_be_running: (!unfinished.stopped).then_some(unfinished.why),
                 detail: error.to_string(),
-                may_still_be_running: !stopped,
             }),
             None => Err(Privileged::Prompt {
                 command,
@@ -655,7 +656,7 @@ fn privileged_error(
             detail,
             may_still_be_running,
         } => {
-            let found = if may_still_be_running {
+            let found = if may_still_be_running.is_some() {
                 plan::Found::NotChecked
             } else {
                 found()
@@ -857,7 +858,7 @@ impl Staging {
         let keep = match error {
             UpgradeError::PrivilegeFailed { install, .. } => install.is_some(),
             UpgradeError::InstallUnfinished(unfinished) => {
-                unfinished.install.is_some() || unfinished.may_still_be_running
+                unfinished.install.is_some() || unfinished.may_still_be_running.is_some()
             }
             _ => false,
         };
@@ -2426,7 +2427,7 @@ mod tests {
         let (err, command) = privileged(&host, &staged, &target, &sha);
         let command = command.unwrap();
         let found = unfinished(&err);
-        assert!(!found.may_still_be_running);
+        assert_eq!(found.may_still_be_running, None);
         assert_eq!(found.found, plan::Found::Neither);
         assert_eq!(found.install.as_ref(), Some(&command));
         assert!(err.to_string().contains("No space left on device"), "{err}");
@@ -2484,7 +2485,10 @@ mod tests {
         });
         let (err, _) = privileged(&host, &staged, &target, &sha);
         let found = unfinished(&err);
-        assert!(found.may_still_be_running);
+        assert_eq!(
+            found.may_still_be_running,
+            Some(plan::Interruption::TimedOut)
+        );
         assert_eq!(found.found, plan::Found::NotChecked);
         assert_eq!(found.install, None);
         assert!(
@@ -2531,6 +2535,62 @@ mod tests {
             ]
         );
         assert_eq!(host.ran().len(), 1, "nothing else ran: {:?}", host.ran());
+    }
+
+    /// Scenario: the privileged install is cancelled and cannot be stopped,
+    /// or its exit cannot be read. Either way it may still be running, and
+    /// the result says which happened rather than that it ran out of time;
+    /// nothing is checked and no install command is offered. A cancelled
+    /// install that was stopped is no longer running.
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_033_an_install_that_may_still_be_running_says_why() {
+        type MakeError = fn() -> std::io::Error;
+        let cases: [(MakeError, plan::Interruption); 2] = [
+            (
+                || crate::self_upgrade::cancelled_error(false),
+                plan::Interruption::Cancelled,
+            ),
+            (
+                || crate::self_upgrade::ownership_lost(&std::io::Error::other("ECHILD")),
+                plan::Interruption::ExitUnread,
+            ),
+        ];
+        for (error, why) in cases {
+            let (_dir, staged, target, sha) = staged_install(b"verified build");
+            let host = FakeHost::new()
+                .exe(PKEXEC)
+                .handle_io(PKEXEC, move |_| Err(error()));
+            let (err, _) = privileged(&host, &staged, &target, &sha);
+            let found = unfinished(&err);
+            assert_eq!(found.may_still_be_running, Some(why));
+            assert_eq!(found.found, plan::Found::NotChecked);
+            assert_eq!(found.install, None);
+            let lines = err.fallback();
+            assert_eq!(
+                lines,
+                plan::install_unfinished_lines(
+                    &plan::InstallTarget::Binary(target.clone()),
+                    &plan::Found::NotChecked,
+                    Some(why),
+                    None,
+                    "0.46.0",
+                )
+            );
+            assert!(
+                !format!("{lines:?}").contains("in time"),
+                "{why:?}: {lines:?}"
+            );
+        }
+
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new()
+            .exe(PKEXEC)
+            .handle_io(PKEXEC, |_| Err(crate::self_upgrade::cancelled_error(true)));
+        let (err, _) = privileged(&host, &staged, &target, &sha);
+        assert_eq!(unfinished(&err).may_still_be_running, None);
     }
 
     /// Scenario: the privileged install outlives its bound and is stopped.

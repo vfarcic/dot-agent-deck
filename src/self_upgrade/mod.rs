@@ -45,7 +45,9 @@ pub use detect::{CopyKind, HomebrewFormula, InstallMethod, Installation, Platfor
 pub use discover::OtherCopy;
 pub use execute::{Outcome, ReleaseSource};
 pub use plan::PlanLine;
-pub use plan::{Found, InstallTarget, PlanAction, PlanOptions, Releases, UpgradePlan};
+pub use plan::{
+    Found, InstallTarget, Interruption, PlanAction, PlanOptions, Releases, UpgradePlan,
+};
 pub use verify::{Provenance, ProvenanceCheck};
 
 pub use crate::version::ReleaseChannel;
@@ -517,9 +519,10 @@ fn reap_later(mut child: std::process::Child) {
 /// ([`std::io::ErrorKind::Interrupted`]), or its exit could not be read
 /// ([`ownership_lost`]). The message is for the user; `stopped` is whether
 /// the command is known to have stopped, which [`unfinished_stopped`] reads
-/// back.
+/// back, and `why` which of the three it was.
 #[derive(Debug)]
 struct Unfinished {
+    why: plan::Interruption,
     stopped: bool,
     message: String,
 }
@@ -545,7 +548,11 @@ pub fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error 
     };
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        Unfinished { stopped, message },
+        Unfinished {
+            why: plan::Interruption::TimedOut,
+            stopped,
+            message,
+        },
     )
 }
 
@@ -560,7 +567,11 @@ pub fn cancelled_error(stopped: bool) -> std::io::Error {
     };
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
-        Unfinished { stopped, message },
+        Unfinished {
+            why: plan::Interruption::Cancelled,
+            stopped,
+            message,
+        },
     )
 }
 
@@ -569,19 +580,23 @@ pub fn cancelled_error(stopped: bool) -> std::io::Error {
 /// signalled. Whether it finished is not known.
 fn ownership_lost(error: &std::io::Error) -> std::io::Error {
     std::io::Error::other(Unfinished {
+        why: plan::Interruption::ExitUnread,
         stopped: false,
         message: format!("its exit could not be read ({error}), so it may still be running"),
     })
 }
 
 /// For an error [`timed_out`] or [`cancelled_error`] made, or one from a
-/// command whose exit could not be read, whether the command is known to have stopped; `None` for any
-/// other error.
+/// command whose exit could not be read, whether the command is known to
+/// have stopped; `None` for any other error.
 pub fn unfinished_stopped(error: &std::io::Error) -> Option<bool> {
+    unfinished(error).map(|unfinished| unfinished.stopped)
+}
+
+fn unfinished(error: &std::io::Error) -> Option<&Unfinished> {
     error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<Unfinished>())
-        .map(|unfinished| unfinished.stopped)
 }
 
 /// `duration` in the largest whole unit that fits: "15 minutes", "60
@@ -690,14 +705,14 @@ pub enum UpgradeError {
 /// past the prompt, or did not finish within its bound. Whether the new
 /// version is installed is not known from that alone, so `found` is what was
 /// found at `target` afterwards — not looked at while the install
-/// `may_still_be_running`. `install` is the command that installs the
+/// `may_still_be_running` (`Some`, saying why it was not seen to finish). `install` is the command that installs the
 /// verified file again, offered only when `found` shows the target is not the
 /// new version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnfinishedInstall {
     pub command: String,
     pub detail: String,
-    pub may_still_be_running: bool,
+    pub may_still_be_running: Option<plan::Interruption>,
     pub target: plan::InstallTarget,
     pub found: plan::Found,
     pub install: Option<String>,

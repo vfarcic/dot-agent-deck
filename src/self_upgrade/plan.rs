@@ -484,6 +484,17 @@ pub enum InstallTarget {
     Package,
 }
 
+/// Why a command did not run to its end under the runner's watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interruption {
+    /// It outlived its bound.
+    TimedOut,
+    /// The client cancelled it.
+    Cancelled,
+    /// Its exit could not be read.
+    ExitUnread,
+}
+
 /// What was found at an install's target once the install stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
@@ -526,24 +537,34 @@ pub fn installed_version_command(target: &InstallTarget) -> String {
 /// What a client shows after a privileged install that did not complete
 /// ([`super::UpgradeError::InstallUnfinished`]), after the error itself.
 ///
-/// While it `may_still_be_running`, root may still be writing the target, so
-/// no install command is offered: a second install would race the first. The
-/// user waits, then checks. Once it stopped, what was `found` at the target
+/// While it `may_still_be_running` (`Some`, saying why it was not seen to
+/// finish), root may still be writing the target, so no install command is
+/// offered: a second install would race the first. The user waits, then
+/// checks. Once it stopped, what was `found` at the target
 /// is reported, and `install` is offered only when the target is known not to
 /// be the new version.
 pub fn install_unfinished_lines(
     target: &InstallTarget,
     found: &Found,
-    may_still_be_running: bool,
+    may_still_be_running: Option<Interruption>,
     install: Option<&str>,
     version: &str,
 ) -> Vec<PlanLine> {
     let text = |line: String| PlanLine::Text(line);
     let check = PlanLine::Command(installed_version_command(target));
-    if may_still_be_running {
+    if let Some(why) = may_still_be_running {
+        let why = match why {
+            Interruption::TimedOut => "The install did not finish in time and may still be running",
+            Interruption::Cancelled => {
+                "The install was cancelled but could not be stopped and may still be running"
+            }
+            Interruption::ExitUnread => {
+                "The install's exit could not be read and it may still be running"
+            }
+        };
         return vec![
             text(format!(
-                "The install did not finish in time and may still be running, so whether v{version} was installed is not known. Do not start it again: wait a few minutes for it to finish, then check which version is installed with:"
+                "{why}, so whether v{version} was installed is not known. Do not start it again: wait a few minutes for it to finish, then check which version is installed with:"
             )),
             check,
         ];
@@ -1767,6 +1788,52 @@ mod tests {
             }
         );
         assert!(!plan.is_actionable());
+    }
+
+    /// Scenario: a privileged install was not seen to finish and could not
+    /// be stopped. The words say why — it outlived its bound, it was
+    /// cancelled, or its exit could not be read — and only the first says "in
+    /// time"; each offers no install command, only the check.
+    #[test]
+    fn plan_031_an_install_that_may_still_be_running_says_why() {
+        for (why, opening) in [
+            (
+                Interruption::TimedOut,
+                "The install did not finish in time and may still be running",
+            ),
+            (
+                Interruption::Cancelled,
+                "The install was cancelled but could not be stopped and may still be running",
+            ),
+            (
+                Interruption::ExitUnread,
+                "The install's exit could not be read and it may still be running",
+            ),
+        ] {
+            let lines = install_unfinished_lines(
+                &InstallTarget::Package,
+                &Found::NotChecked,
+                Some(why),
+                Some("pkexec apt-get install -y /stage/x.deb"),
+                "0.46.0",
+            );
+            assert_eq!(
+                lines,
+                vec![
+                    PlanLine::Text(format!(
+                        "{opening}, so whether v0.46.0 was installed is not known. Do not start it again: wait a few minutes for it to finish, then check which version is installed with:"
+                    )),
+                    PlanLine::Command(format!("dpkg -s {DESKTOP_DEB_PACKAGE}")),
+                ],
+                "{why:?}"
+            );
+            let said = format!("{lines:?}");
+            assert_eq!(
+                said.contains("in time"),
+                why == Interruption::TimedOut,
+                "{why:?}: {said}"
+            );
+        }
     }
 
     #[test]
