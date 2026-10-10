@@ -3337,6 +3337,41 @@ pub struct RunningAgent {
     /// agent. Per record, so a respawn — a new record with a new prompt —
     /// starts without one.
     pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    /// Issue #1650: when this registry forked the agent and when the agent's
+    /// own readiness signal arrived — what a `clear = false` delegate reads to
+    /// tell a worker that is still starting from one that is up. Per record,
+    /// so a respawn starts booting again.
+    pub boot: AgentBoot,
+}
+
+/// Issue #1650: an agent's boot, as the delegate path's `clear = false` gate
+/// reads it ([`AgentPtyRegistry::agent_boot`]).
+///
+/// A `clear = true` delegate respawns its worker and waits for that worker's
+/// readiness signal on the event bus it subscribed before the spawn. A
+/// `clear = false` delegate spawns nothing, so a worker the orchestration (or a
+/// `pane restart`) started a moment earlier may still be booting, and any
+/// readiness signal it sent already went past. This record is where that
+/// signal is kept, so the gate can tell "booting" from "ready a while ago".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentBoot {
+    /// When this registry forked the agent. `None` for a record it did not
+    /// fork, which the gate treats as long since started.
+    pub spawned: Option<tokio::time::Instant>,
+    /// The first readiness signal the agent's own hooks or wrapper sent,
+    /// recorded by the daemon as the event arrived. `None` until then.
+    pub ready: Option<BootReadiness>,
+}
+
+/// Issue #1650: the readiness signal an agent sent while booting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootReadiness {
+    /// When it arrived.
+    pub at: tokio::time::Instant,
+    /// Whether it was the wrapper's observation of the child taking raw input
+    /// ([`crate::event::AgentEvent::is_wrapper_interface_ready_session_start`]),
+    /// which the gate prices with the interface buffer.
+    pub interface: bool,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -10915,6 +10950,12 @@ impl AgentPtyRegistry {
             // Issue #1496: set after the spawn, by the `StartAgent` handler
             // that accepted an authoring start.
             authoring_kind: None,
+            // Issue #1650: booting from now; its readiness is recorded when
+            // it arrives.
+            boot: AgentBoot {
+                spawned: Some(tokio::time::Instant::now()),
+                ready: None,
+            },
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -12871,6 +12912,9 @@ impl AgentPtyRegistry {
             // Issue #1496: dropped — the fresh child is started with the
             // respawn's prompt, not the authoring seed the kind names.
             authoring_kind: _,
+            // Issue #1650: dropped — the replacement boots afresh, and
+            // `spawn_agent` stamps its own record.
+            boot: _,
             // The replacement gets a writer, and a PTY thread, of its own.
             pty_progress: _,
         } = removed;
@@ -13970,6 +14014,43 @@ impl AgentPtyRegistry {
     /// Called by the daemon under its `AppState` write lock, the same lock
     /// [`Self::quota_note_work_event`] is called under, so a work event and a
     /// block are applied to the latch in the order they are applied to the card.
+    /// Issue #1650: record `agent_id`'s first readiness signal, if it is the
+    /// live agent on `pane_id`. Later signals are ignored: the gate asks when
+    /// the agent first became ready, not when it last announced itself.
+    pub fn note_boot_readiness(&self, pane_id: &str, agent_id: &str, interface: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.pane_id_env.as_deref() == Some(pane_id)
+            && agent.boot.ready.is_none()
+        {
+            agent.boot.ready = Some(BootReadiness {
+                at: tokio::time::Instant::now(),
+                interface,
+            });
+        }
+    }
+
+    /// Issue #1650 test seam: make `agent_id` read as long since started, so a
+    /// `clear = false` delegate to it does not wait for a boot that a stand-in
+    /// fixture never announces. For tests about what happens after the write.
+    #[cfg(test)]
+    pub(crate) fn mark_started_long_ago_for_test(&self, agent_id: &str) {
+        if let Some(agent) = self.inner.lock().unwrap().agents.get_mut(agent_id) {
+            agent.boot.spawned = None;
+        }
+    }
+
+    /// Issue #1650: `agent_id`'s boot record, or `None` for an agent this
+    /// registry does not hold.
+    pub fn agent_boot(&self, agent_id: &str) -> Option<AgentBoot> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.boot)
+    }
+
     pub fn note_quota_block(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
         let epoch = QUOTA_BLOCK_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         self.with_owner_quota_latch(pane_id, agent_id, |latch| *latch = Some(epoch))
@@ -15200,6 +15281,7 @@ impl AgentPtyRegistry {
                 crashed: None,
                 quota_block: None,
                 authoring_kind: None,
+                boot: AgentBoot::default(),
             },
         );
         id

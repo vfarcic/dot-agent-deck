@@ -2034,6 +2034,19 @@ async fn ingest_event_unless(
         } else if crate::quota_block::is_work_evidence(&event) {
             registry.quota_note_work_event(pane_id, generation);
         }
+        // Issue #1650: remember when a booting agent first announced it is
+        // ready, so a `clear = false` delegate that arrives later can tell a
+        // worker still starting from one that is up. Only for the generation
+        // the event names, like the quota latch above.
+        if let Some(agent_id) = event.agent_id.as_deref()
+            && crate::state::session_start_opens_boot_gate(&event)
+        {
+            registry.note_boot_readiness(
+                pane_id,
+                agent_id,
+                event.is_wrapper_interface_ready_session_start(),
+            );
+        }
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
