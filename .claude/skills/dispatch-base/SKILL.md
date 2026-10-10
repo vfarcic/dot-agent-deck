@@ -87,7 +87,7 @@ git rev-list --left-right --count <sha>...origin/main  # "0  0" is origin/main i
 **When the clause is missing, read the commit the unit's branch was created at from its first reflog entry**, which later commits in the unit do not change. Take the branch from the worktree the success line names rather than from the name you passed: `dispatch` sanitizes the name before it builds the branch, so `fix auth` becomes `agent/dispatch-fix-auth`. Read it right after the dispatch, before the unit has had time to switch branch:
 
 ```bash
-branch=$(git -C <dir> rev-parse --abbrev-ref HEAD)              # <dir> from the success line
+branch=$(git -C "<dir>" rev-parse --abbrev-ref HEAD)            # <dir> from the success line, quoted
 git reflog show --format='%h %gs' "$branch" | tail -1          # "<sha> branch: Created from <...>"
 ```
 
