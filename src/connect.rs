@@ -971,6 +971,7 @@ impl RemoteUpgrader for SystemRemoteUpgrader {
                     reason: e.to_string(),
                     installed_version: None,
                     old_daemon_gone: false,
+                    installed_binary: None,
                 };
             }
         };
@@ -1662,15 +1663,29 @@ pub fn run_connect<R: BufRead, W: Write>(
             // no method, on a remote whose deck Homebrew installed. Connect to
             // the binary that was just upgraded, not to the one before it.
             if let Some(outcome) = &outcome {
-                let installed = !matches!(
-                    outcome,
+                match outcome {
                     UpgradeOutcome::Failed {
                         installed_version: None,
                         ..
+                    } => {}
+                    // Issue #1604: a step after the install (the hooks, the
+                    // deck list) failed, so the deck list may still name the
+                    // binary from before — on a remote with a legacy
+                    // ~/.local/bin copy beside the Homebrew install that was
+                    // just upgraded, that is the old copy. Run the binary the
+                    // install chose. Validated like a recorded one, since it
+                    // reaches the remote shell unquoted.
+                    UpgradeOutcome::Failed {
+                        installed_binary: Some(binary),
+                        ..
+                    } if crate::remote::RemoteDeckBinary::try_from(binary.as_str()).is_ok() => {
+                        install_path = binary.clone();
                     }
-                );
-                if installed && let Ok(updated) = lookup_remote(&entry.name, remotes_path) {
-                    install_path = updated.remote_binary().to_string();
+                    _ => {
+                        if let Ok(updated) = lookup_remote(&entry.name, remotes_path) {
+                            install_path = updated.remote_binary().to_string();
+                        }
+                    }
                 }
                 keep_daemon = matches!(
                     outcome,
@@ -2446,6 +2461,7 @@ mod tests {
                     reason: "install failed: download 404".into(),
                     installed_version: None,
                     old_daemon_gone: false,
+                    installed_binary: None,
                 },
                 ..Self::new()
             }
@@ -3544,6 +3560,209 @@ mod tests {
         assert_eq!(
             *spawner.install_paths.borrow(),
             vec!["/opt/homebrew/bin/dot-agent-deck".to_string()]
+        );
+    }
+
+    /// Scenario: a remote has both a legacy `~/.local/bin` copy and a Homebrew
+    /// install, and its deck-list row recorded neither. The user accepts
+    /// connect's upgrade nudge; `brew upgrade` lands the new build, and then
+    /// reinstalling the hooks fails, or recording the result in the deck list
+    /// does. The session that follows runs the Homebrew binary just upgraded,
+    /// not the old local copy the unrecorded row still names, and the nudge
+    /// still says the install is incomplete (issue #1604).
+    #[cfg(unix)]
+    #[test]
+    fn run_connect_after_a_partial_upgrade_runs_the_binary_the_install_chose() {
+        use crate::daemon_client::{GatedQuery, RestartDaemonRequest};
+        use crate::daemon_upgrade::{
+            DaemonPort, PortError, SshInstaller, UpgradePlan, upgrade_daemon,
+        };
+        use crate::remote::homebrew_remote_tests::{BrewAt, Fixture, Remote, SandboxShell};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Fails {
+            Hooks,
+            DeckList,
+        }
+
+        /// The sandboxed remote, with the step after the install failing.
+        struct FailsAfterInstall {
+            inner: SandboxShell,
+            fails: Fails,
+            registry: std::path::PathBuf,
+        }
+        impl SshExecutor for FailsAfterInstall {
+            fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if command.contains("hooks install") {
+                    match self.fails {
+                        Fails::Hooks => {
+                            return Ok(SshOutput {
+                                status: 3,
+                                stdout: String::new(),
+                                stderr: "settings.json is not writable".into(),
+                            });
+                        }
+                        // Another client moves the row while the upgrade
+                        // runs, so recording the result over it is refused.
+                        Fails::DeckList => {
+                            let mut file = RemotesFile::load(&self.registry).unwrap();
+                            file.remotes[0].port = 2222;
+                            file.save(&self.registry).unwrap();
+                        }
+                    }
+                }
+                self.inner.run(target, command)
+            }
+        }
+
+        /// An install that fails never reaches the daemon.
+        struct Unreached;
+        impl DaemonPort for Unreached {
+            fn probe(&self) -> Result<Option<AttachResponse>, PortError> {
+                panic!("a failed install must not probe the daemon")
+            }
+            fn restart(
+                &self,
+                _req: &RestartDaemonRequest,
+            ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, PortError>
+            {
+                panic!("a failed install must not restart the daemon")
+            }
+        }
+
+        struct SandboxUpgrader<'a> {
+            remote: &'a Remote,
+            fails: Fails,
+        }
+        impl RemoteUpgrader for SandboxUpgrader<'_> {
+            fn upgrade(
+                &self,
+                name: &str,
+                version: &str,
+                decider: &dyn RestartDecider,
+            ) -> UpgradeOutcome {
+                let installer = SshInstaller {
+                    entry: self.remote.entry(),
+                    remotes_path: self.remote.registry.clone(),
+                    executor: FailsAfterInstall {
+                        inner: self.remote.shell(BrewAt::PrefixOnly),
+                        fails: self.fails,
+                        registry: self.remote.registry.clone(),
+                    },
+                    no_install: false,
+                    release_base: "https://example.test/releases/download".into(),
+                    out: std::cell::RefCell::new(Box::new(std::io::sink())),
+                };
+                let plan = UpgradePlan {
+                    version: version.to_string(),
+                    successor: crate::daemon_protocol::RestartSuccessor::Installed,
+                };
+                upgrade_daemon(name, &plan, &installer, &Unreached, decider, &mut |_| {})
+            }
+        }
+
+        for fails in [Fails::Hooks, Fails::DeckList] {
+            let remote = Remote::new(Fixture {
+                brew: Some("0.40.0"),
+                local_bin: Some("0.40.0"),
+                tap: "0.43.0",
+                brew_upgrade_fails: false,
+            });
+            remote.register_legacy_entry("0.40.0");
+            let entry = remote.entry();
+            let spawner = ScriptedSpawner::new(vec![0]);
+            let mut input: &[u8] = b"y\n";
+            let mut output: Vec<u8> = Vec::new();
+
+            run_connect(
+                &entry,
+                &VersionExecutor::new("0.40.0"),
+                &spawner,
+                &RecordingBackoff::new(),
+                &SandboxUpgrader {
+                    remote: &remote,
+                    fails,
+                },
+                &remote.registry,
+                "0.43.0",
+                entry.remote_binary(),
+                &mut input,
+                &mut output,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{fails:?}: connect after the upgrade: {e}"));
+
+            let brew = remote.brew_binary().display().to_string();
+            assert_eq!(
+                remote.version_of(&remote.brew_binary()),
+                "dot-agent-deck 0.43.0",
+                "{fails:?}: Homebrew upgraded its copy"
+            );
+            assert_eq!(
+                remote.version_of(&remote.local_bin_copy()),
+                "dot-agent-deck 0.40.0",
+                "{fails:?}: the legacy copy is still there, still old"
+            );
+            assert_eq!(
+                remote.entry().remote_binary(),
+                REMOTE_INSTALL_PATH,
+                "{fails:?}: the deck list never recorded the Homebrew binary"
+            );
+            assert_eq!(
+                *spawner.install_paths.borrow(),
+                vec![brew],
+                "{fails:?}: the session must run the binary that was just upgraded"
+            );
+            let out = String::from_utf8(output).unwrap();
+            assert!(
+                out.contains(
+                    "0.43.0 is installed, but the upgrade stopped before restarting the daemon"
+                ) && out.contains("Run `dot-agent-deck remote upgrade mac` again to finish."),
+                "{fails:?}: the incomplete install is still reported: {out}"
+            );
+        }
+    }
+
+    /// Issue #1604: a partial-failure outcome whose binary would not be safe
+    /// to put on the remote command line is not run; connect falls back to
+    /// the deck list's row, as it did before the outcome carried a binary.
+    #[test]
+    fn run_connect_after_a_partial_upgrade_ignores_an_unsafe_installed_binary() {
+        struct UnsafeBinary;
+        impl RemoteUpgrader for UnsafeBinary {
+            fn upgrade(&self, _: &str, _: &str, _: &dyn RestartDecider) -> UpgradeOutcome {
+                UpgradeOutcome::Failed {
+                    stage: crate::daemon_upgrade::UpgradeStage::Installing,
+                    reason: "hooks failed".into(),
+                    installed_version: Some("0.31.1".into()),
+                    old_daemon_gone: false,
+                    installed_binary: Some("/opt/x; rm -rf ~".into()),
+                }
+            }
+        }
+
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let mut input: &[u8] = b"y\n";
+        run_connect(
+            &entry,
+            &VersionExecutor::new("0.31.0"),
+            &spawner,
+            &RecordingBackoff::new(),
+            &UnsafeBinary,
+            &path,
+            "0.31.1",
+            entry.remote_binary(),
+            &mut input,
+            &mut Vec::new(),
+            true,
+        )
+        .expect("connect after the partial upgrade");
+
+        assert_eq!(
+            *spawner.install_paths.borrow(),
+            vec![REMOTE_INSTALL_PATH.to_string()]
         );
     }
 

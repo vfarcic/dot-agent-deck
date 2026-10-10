@@ -5173,6 +5173,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH, independently compiled releases, real-agent work or desktop UI.
 - **Platform coverage:** linux+mac.
 
+##### remote/connect/004 — A partial upgrade connects to the Homebrew binary it upgraded, not the legacy copy.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, sandboxed SSH, a Homebrew stand-in and real daemon).
+- **Agent:** none.
+- **Asserts:** on a remote with both a legacy ~/.local/bin copy and a Homebrew install and a deck-list row that recorded neither, y at Upgrade and connect lets `brew upgrade` land the new build while its hook install fails; the incomplete-upgrade report and its remedy are shown, the dashboard renders, Homebrew's copy is the new build and the legacy copy the old one, and every session command connect hands the terminal to runs the Homebrew binary (issue #1604).
+- **Does not assert:** a failed deck-list write (covered by the connect unit test), real SSH or Homebrew, independently compiled releases or real-agent work.
+- **Platform coverage:** linux+mac.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor

@@ -5810,6 +5810,7 @@ async fn desktop_upgrade_daemon(
                             reason,
                             installed_version: None,
                             old_daemon_gone: false,
+                            installed_binary: None,
                         };
                     }
                 };
