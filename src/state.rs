@@ -6753,7 +6753,8 @@ pub(crate) fn session_start_opens_boot_gate(event: &AgentEvent) -> bool {
 }
 
 /// Issue #1650: how many successive owners of one worker pane a `clear = false`
-/// delegate gates ([`await_worker_boot`]) before it writes regardless.
+/// delegate gates ([`await_worker_boot`]). A pane that has changed hands again
+/// after the last of them is not written to.
 const MAX_BOOT_GATE_OWNERS: usize = 3;
 
 /// Issue #1650: hold a `clear = false` delegate's pointer until the worker it
@@ -6876,21 +6877,18 @@ pub(crate) async fn await_worker_boot(
                      window; typing the task pointer after the ordinary buffer"
                 );
             }
-            // The respawn path's pricing of the same outcome: the interface
-            // buffer for a wrapper host's raw-input fact, the ordinary one
-            // otherwise, re-priced when the strong fact lands during a buffer
-            // the weak "output settled" fact (or the timeout) started.
+            // The respawn path's pricing of the same outcome, exactly: the
+            // interface buffer for a wrapper host's raw-input fact, the ordinary
+            // one otherwise, re-priced when the strong fact lands during a buffer
+            // the weak "output settled" fact started (`weak_fact_buffer_reprice`;
+            // a timeout is not re-priced, there or here).
             let wrapper_host = registry.agent_spawned_as_wrapper_host(worker_agent_id);
             let buffer = if wait.observed_interface && wrapper_host {
                 wrapper_interface_readiness_buffer()
             } else {
                 delegate_readiness_buffer()
             };
-            let reprice = if wait.ready {
-                weak_fact_buffer_reprice(&wait, wrapper_host)
-            } else {
-                wrapper_host.then(wrapper_interface_readiness_buffer)
-            };
+            let reprice = weak_fact_buffer_reprice(&wait, wrapper_host);
             tokio::select! {
                 biased;
                 _ = &mut exited => {}
@@ -9884,8 +9882,8 @@ async fn dispatch_one_owned(
     //
     // The pane can change hands during the wait (a `pane restart`, or a worker
     // that exited and was replaced), and the write below goes to whoever holds
-    // it then, so a new owner is gated too. Bounded: a pane replaced over and
-    // over is written to after the last wait, as before this gate existed.
+    // it then, so a new owner is gated too, up to `MAX_BOOT_GATE_OWNERS`; a
+    // pane still changing hands after that is not written to at all.
     if expected_worker_agent_id.is_none() {
         let mut gated: Option<String> = None;
         for _ in 0..MAX_BOOT_GATE_OWNERS {
@@ -9895,10 +9893,15 @@ async fn dispatch_one_owned(
             if gated.as_deref() == Some(worker_agent_id.as_str()) {
                 break;
             }
-            let worker_agent_type = role_config
-                .as_ref()
-                .and_then(|role| role.resolved_agent_type())
-                .or_else(|| registry.pre_write_believed_agent_type(&worker_agent_id));
+            // The worker's own launch identity first: a role edited since it
+            // was spawned does not change which agent is booting in the pane.
+            let worker_agent_type = registry
+                .pre_write_believed_agent_type(&worker_agent_id)
+                .or_else(|| {
+                    role_config
+                        .as_ref()
+                        .and_then(|role| role.resolved_agent_type())
+                });
             await_worker_boot(
                 &registry,
                 &event_tx,
@@ -9909,6 +9912,22 @@ async fn dispatch_one_owned(
             )
             .await;
             gated = Some(worker_agent_id);
+        }
+        // A pane that changed hands again during the last wait is written to
+        // only by the owner that was gated: binding the write to it makes the
+        // guarded send refuse rather than type into a worker nobody waited
+        // for, and the refusal is reported like any other (Qodo, PR #1659).
+        if let Some(gated) = gated
+            && registry.pane_current_agent_id(&pane_id).as_deref() != Some(gated.as_str())
+        {
+            warn!(
+                role = %target_role,
+                pane_id = %pane_id,
+                gated_agent_id = %gated,
+                "delegate: the worker pane changed hands again while the deck waited for its \
+                 worker to start; not typing the task pointer into a worker it did not wait for"
+            );
+            expected_worker_agent_id = Some(gated);
         }
     }
     // PRD #249 review (finding B1): on every path that did NOT respawn
