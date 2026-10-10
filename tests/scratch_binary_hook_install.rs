@@ -83,6 +83,83 @@ impl Fixture {
         fixture
     }
 
+    fn installed_home() -> Self {
+        // Real OS temp directories are deliberately ineligible for takeover.
+        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(base).expect("create Cargo test directory");
+        let fixture = Self {
+            dir: tempfile::Builder::new()
+                .prefix("hook-takeover-")
+                .tempdir_in(base)
+                .expect("durable test HOME"),
+        };
+        std::fs::create_dir_all(fixture.home().join(".claude")).unwrap();
+        std::fs::create_dir_all(fixture.path().join("emptybin")).unwrap();
+        fixture
+    }
+
+    fn copy_deck_to(&self, path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        if std::fs::hard_link(built, path).is_err() {
+            std::fs::copy(built, path).expect("copy real binary");
+        }
+    }
+
+    fn versioned_pin(&self, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let pin = self.path().join("opt/old/dot-agent-deck");
+        std::fs::create_dir_all(pin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pin,
+            format!("#!/bin/sh\nprintf 'dot-agent-deck {version}\\n'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pin
+    }
+
+    fn automatic_install(&self, deck: &Path, path: &Path) -> String {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let socket = self.path().join("attach.sock");
+        let mut daemon = Daemon(
+            Command::new(deck)
+                .args(["daemon", "serve"])
+                .current_dir(self.path())
+                .env_clear()
+                .env("HOME", self.home())
+                .env("PATH", path)
+                .env("DOT_AGENT_DECK_SOCKET", self.path().join("hook.sock"))
+                .env("DOT_AGENT_DECK_ATTACH_SOCKET", &socket)
+                .env("DOT_AGENT_DECK_STATE_DIR", self.path().join("state"))
+                .env("DOT_AGENT_DECK_LOG", self.path().join("deck.log"))
+                .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "30")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("automatic install via daemon serve"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !socket.exists() && Instant::now() < deadline {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited before install"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = std::fs::read_to_string(self.path().join("deck.log")).unwrap_or_default();
+        assert!(socket.exists(), "daemon never bound attach socket:\n{log}");
+        log
+    }
+
     fn path(&self) -> &Path {
         self.dir.path()
     }
@@ -205,6 +282,102 @@ fn combined(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// The user's matcher and handler retain their original slots, and every
+/// installed event has exactly one deck handler.
+fn assert_automatic_pin(fixture: &Fixture, expected: &Path) {
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.settings()).unwrap()).unwrap();
+    let rule = &doc["hooks"]["PreToolUse"][0];
+    assert_eq!(rule["matcher"], "Bash", "matcher changed: {doc:#}");
+    assert_eq!(
+        rule["hooks"][1]["command"], USER_HOOK,
+        "user slot changed: {doc:#}"
+    );
+    assert!(
+        rule["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(expected.to_str().unwrap())
+    );
+    for (event, rules) in doc["hooks"].as_object().unwrap() {
+        let mut commands = Vec::new();
+        commands_in(rules, &mut commands);
+        commands.retain(|c| c.ends_with(CLAUDE_SUFFIX));
+        assert_eq!(
+            commands.len(),
+            1,
+            "{event} must have one deck handler: {doc:#}"
+        );
+        assert!(
+            commands[0].contains(expected.to_str().unwrap()),
+            "wrong pin: {doc:#}"
+        );
+    }
+}
+
+fn seed_shared_rule(fixture: &Fixture, pin: &Path) {
+    let rule = serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [
+            {"type": "command", "command": plain_form(pin)},
+            {"type": "command", "command": USER_HOOK}
+        ]
+    });
+    let doc = serde_json::json!({"hooks": {"PreToolUse": [rule,
+        {"hooks": [{"type": "command", "command": plain_form(pin)}]}]}});
+    std::fs::write(fixture.settings(), doc.to_string()).unwrap();
+}
+
+/// Scenario: Start a real installed copy with Claude hooks pinned to an older
+/// stub, then repeat with a newer stub. Automatic startup switches only the
+/// older pin in place, keeping one deck handler, the user's handler and matcher.
+#[spec("hooks/install/015")]
+#[test]
+fn install_015_a_newer_installed_copy_takes_over_in_place() {
+    for (version, takes_over) in [("0.0.1", true), ("999.0.0", false)] {
+        let fixture = Fixture::installed_home();
+        let installed = fixture.home().join(".local/bin/dot-agent-deck");
+        fixture.copy_deck_to(&installed);
+        let pin = fixture.versioned_pin(version);
+        seed_shared_rule(&fixture, &pin);
+        fixture.automatic_install(&installed, &fixture.path().join("emptybin"));
+        assert_automatic_pin(&fixture, if takes_over { &installed } else { &pin });
+    }
+}
+
+/// Scenario: Start a newer real binary from a temporary directory on PATH with
+/// Claude hooks pinned to an older durable stub. Automatic startup keeps the
+/// old pin and preserves the user's shared rule instead of pinning the scratch copy.
+#[spec("hooks/install/016")]
+#[test]
+fn install_016_a_temporary_path_copy_does_not_take_over() {
+    let fixture = Fixture::new();
+    let scratch = fixture.scratch_deck();
+    let pin = fixture.versioned_pin("0.0.1");
+    seed_shared_rule(&fixture, &pin);
+    fixture.automatic_install(&scratch, scratch.parent().unwrap());
+    assert_automatic_pin(&fixture, &pin);
+}
+
+/// Scenario: Start the only deck from an AppTranslocation bundle-shaped path
+/// with no installed fallback. Automatic startup writes no Claude settings and
+/// tells the user to move Agent Deck to /Applications.
+#[spec("hooks/install/017")]
+#[test]
+fn install_017_a_translocated_copy_does_not_install_hooks() {
+    let fixture = Fixture::new();
+    let deck = fixture
+        .path()
+        .join("AppTranslocation/uuid/d/Agent Deck.app/Contents/MacOS/dot-agent-deck");
+    fixture.copy_deck_to(&deck);
+    let log = fixture.automatic_install(&deck, &fixture.path().join("emptybin"));
+    assert!(
+        !fixture.settings().exists(),
+        "translocated binary wrote settings"
+    );
+    assert!(log.contains("/Applications"), "missing move remedy:\n{log}");
 }
 
 /// Scenario: Hard-link the freshly built deck to a scratch path outside

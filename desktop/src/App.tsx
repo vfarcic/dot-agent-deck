@@ -49,6 +49,7 @@ import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
+import { HookBinaryNotices } from "./components/HookBinaryNotice";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
@@ -2182,6 +2183,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
             {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
+
+        {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. Not the banner above — the connection is fine. */}
+        {!allDecks && <HookBinaryNotices notices={snapshot.connection.hookBinaryNotices} />}
 
         {allDecks && (
           <section className="workspace-section" aria-label="Select a daemon">

@@ -232,6 +232,40 @@ export interface ConnectionView {
    * absent otherwise, and in fixture scenarios that do not play one.
    */
   disconnectedReason?: DisconnectedReason;
+  /**
+   * Issue #1637 — agents whose hooks on this deck run an older
+   * `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+   * each with the daemon's own remedy so this app and the TUI say the same
+   * thing. Absent when there is nothing to show.
+   */
+  hookBinaryNotices?: HookBinaryNotice[];
+}
+
+/**
+ * Issue #1637 — one hook-binary notice, as the daemon reports it.
+ *
+ * - `"older"`: the hooks run an older release (`version`).
+ * - `"unreported"`: the hooks run a copy so old it does not report a version.
+ * - `"unprobeable"`: the hooks' copy did not answer when asked its version.
+ * - `"ephemeral_location"`: this deck runs from a disk image or a translocated
+ *   location and found no installed copy to pin instead, so it installed no
+ *   hooks; `binary` is its own path.
+ * - `"unknown"`: a reason a newer daemon added.
+ */
+export interface HookBinaryNotice {
+  binary: string;
+  agents: string[];
+  version?: string;
+  daemonVersion: string;
+  reason: "older" | "unreported" | "unprobeable" | "ephemeral_location" | "unknown";
+  /** What to do, in the daemon's words. Never carries a path or a command. */
+  remedy: string;
+  /**
+   * The command that applies the fix, when there is one, shown after
+   * `remedy` and copied by the Copy button. The daemon composes it from
+   * trusted data only, and the bridge drops one that a display would alter.
+   */
+  command?: string;
 }
 
 /**

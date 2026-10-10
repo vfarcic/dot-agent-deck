@@ -59,6 +59,7 @@ pub mod focus_report;
 // crate switches it off. Every `git` the crate spawns is built here.
 pub(crate) mod git_env;
 pub mod hook;
+pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
@@ -127,6 +128,10 @@ mod test_temp;
 mod test_budget;
 #[cfg(test)]
 mod test_isolation;
+// Issue #1637: test-only. A Unix-style fixture path is not absolute on Windows,
+// so tests of absolute-vs-relative classification spell their paths through it.
+#[cfg(test)]
+mod test_paths;
 // Issue #1132: test-only, and shared for the same reason as the two above —
 // unit tests in `spawn.rs`, `ui.rs` and `state.rs` all drive the same `/bin/cat`
 // PTY byte target, and the content-keyed waits that make their assertions

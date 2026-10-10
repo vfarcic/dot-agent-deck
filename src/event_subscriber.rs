@@ -79,6 +79,7 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         if let Ok(mut sub) = subscribed {
             // Reset backoff on a successful subscribe (and resync).
             delay = config.initial_delay;
+            seed_hook_binary_notices(&client, &state).await;
             loop {
                 match sub.next_event().await {
                     Ok(Some(BroadcastMsg::Event(event))) => {
@@ -103,6 +104,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     // `UiState`, which this task cannot touch.
                     Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
                         state.write().await.queue_worktree_kept(kept);
+                    }
+                    // Issue #1637: the daemon's hook-binary notices changed.
+                    // The whole list replaces what the dashboard footer shows.
+                    Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {
+                        state.write().await.hook_binary_notices = payload.notices;
                     }
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored
@@ -148,6 +154,24 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
 /// matching the TUI's startup hydration bound in spirit: a wedged daemon must not
 /// stall the subscriber, and an opened stream is not being read while they run.
 const RESYNC_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`seed_hook_binary_notices`] waits for the daemon's `Hello`.
+const HOOK_NOTICE_SEED_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Issue #1637: read the daemon's hook-binary notices once a subscription is
+/// open, so any change after this read is on the stream and is applied after
+/// it. Whatever the read gets replaces what the state holds: a daemon that
+/// omits the field (one that predates the notices, or has none) and a `Hello`
+/// that fails or does not answer in time both leave no notice, since the list
+/// held may be a previous daemon's.
+async fn seed_hook_binary_notices(client: &DaemonClient, state: &SharedState) {
+    let notices =
+        match tokio::time::timeout(HOOK_NOTICE_SEED_TIMEOUT, client.hook_binary_notices()).await {
+            Ok(Ok(notices)) => notices.unwrap_or_default(),
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        };
+    state.write().await.hook_binary_notices = notices;
+}
 
 /// Issue #1520: the subscriber is resubscribing after a gap. Open the new
 /// stream, re-read the daemon's agents and reconcile this state with them
@@ -766,6 +790,60 @@ mod tests {
              closures are counted again, which is what makes the case above meaningful; \
              saw {seen:?}"
         );
+    }
+
+    /// Scenario (issue #1637, Qodo on #1656): the TUI holds a previous
+    /// daemon's hook-binary notice and reconnects. A daemon whose `Hello`
+    /// carries notices replaces it; one whose `Hello` omits the field, and a
+    /// `Hello` that fails, both leave the TUI with no notice rather than the
+    /// previous daemon's.
+    #[tokio::test]
+    async fn a_reconnect_replaces_or_clears_the_hook_binary_notices() {
+        use crate::hook_binary::{HookBinaryNotice, HookBinaryReason};
+        let stale = HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL.into(),
+            command: None,
+        };
+        let fresh = HookBinaryNotice {
+            binary: "/opt/other/dot-agent-deck".into(),
+            ..stale.clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for (name, reply, expected) in [
+            ("with", Some(Some(vec![fresh.clone()])), vec![fresh.clone()]),
+            ("omitted", Some(None), Vec::new()),
+            ("failed", None, Vec::new()),
+        ] {
+            let socket = dir.path().join(format!("{name}.sock"));
+            let server = match reply {
+                Some(notices) => {
+                    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                    Some(tokio::spawn(async move {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let (mut rd, mut wr) = stream.into_split();
+                        let _ = read_frame(&mut rd).await;
+                        let mut resp = AttachResponse::hello(PROTOCOL_VERSION);
+                        resp.hook_binary_notices = notices;
+                        let resp = serde_json::to_vec(&resp).unwrap();
+                        write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
+                    }))
+                }
+                // Nothing listens: the `Hello` fails at the connect.
+                None => None,
+            };
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            state.write().await.hook_binary_notices = vec![stale.clone()];
+            seed_hook_binary_notices(&DaemonClient::new(socket), &state).await;
+            assert_eq!(state.read().await.hook_binary_notices, expected, "{name}");
+            if let Some(server) = server {
+                server.await.unwrap();
+            }
+        }
     }
 
     /// Qodo on #1577: a daemon that is down while the subscriber retries fails

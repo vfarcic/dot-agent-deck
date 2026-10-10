@@ -1447,6 +1447,28 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (issue #1637): the daemon reports a hook-binary notice in a live
+   * snapshot. `mapDesktopSnapshot` carries it onto the connection the deck
+   * view and the overview render, and a snapshot without notices carries none.
+   */
+  it("carries the daemon's hook-binary notices onto the mapped connection", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const notice = {
+      binary: "/opt/homebrew/bin/dot-agent-deck",
+      agents: ["Claude Code", "Codex"],
+      version: "0.45.1",
+      daemonVersion: "0.46.0",
+      reason: "older" as const,
+      remedy: "Run:",
+      command: "brew upgrade dot-agent-deck",
+    };
+    const withNotice = structuredClone(snapshot);
+    withNotice.connection.hookBinaryNotices = [notice];
+    expect(mapDesktopSnapshot(withNotice).connection.hookBinaryNotices).toEqual([notice]);
+    expect(mapDesktopSnapshot(snapshot).connection.hookBinaryNotices).toBeUndefined();
+  });
+
+  /**
    * The M8 audit's prompt finding, at the seam that closes it. The deck renders
    * `task` straight into a DOM text node, so the bridge — not the tile — makes
    * it a display copy: sanitised of controls and bidi overrides, and clamped to

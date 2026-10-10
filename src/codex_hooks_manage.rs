@@ -2262,24 +2262,70 @@ fn codex_present_on_path() -> bool {
 /// Guarded, idempotent, and best-effort: SKIPs unless `codex` is on `PATH` and a
 /// real home resolves (never a `/tmp` write), and any failure is logged, never
 /// fatal.
-pub fn auto_install_and_trust_at_startup() {
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637). After a
+/// takeover that is the new copy, and the trust recorded here is for its
+/// command, so Codex may ask the user once to review the changed hooks.
+pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
-        return;
+        return Vec::new();
     }
     let Some(home) = codex_home() else {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
-        return;
+        return Vec::new();
     };
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
     let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
-        return;
+        return Vec::new();
     };
+    let pins = binary_paths
+        .iter()
+        .map(|binary| crate::hook_binary::HookPin {
+            agent: crate::event::AgentType::Codex,
+            config: home.join("hooks.json"),
+            binary: binary.clone(),
+        })
+        .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
+    pins
+}
+
+/// What Codex's hooks are pinned to now, read back from the active
+/// `CODEX_HOME`'s `hooks.json` without installing or trusting anything (issue
+/// #1637's pin refresh, `CODEX.configured_pins`): every binary a deck entry
+/// names, across events. An empty list when `hooks.json` is missing; `None`
+/// under the same guards as [`auto_install_and_trust_at_startup`] or when
+/// the file cannot be read, which leaves the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    if !codex_present_on_path() {
+        return None;
+    }
+    configured_pins_in(&codex_home()?)
+}
+
+/// [`configured_pins`] for an explicit Codex home.
+fn configured_pins_in(home: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    let path = home.join("hooks.json");
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::Codex,
+                config: path.clone(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// Log what [`auto_install_and_trust_at_startup`]'s trust write came to.
@@ -2319,6 +2365,42 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back every binary
+    /// Codex's `hooks.json` pins, one per distinct binary across events and
+    /// writing nothing; a missing file names nothing, and an unparseable one
+    /// is no evidence.
+    #[test]
+    fn configured_pins_reads_every_pinned_binary_back_without_writing() {
+        let home = crate::test_temp::tempdir().expect("codex home tempdir");
+        let path = home.path().join("hooks.json");
+        assert_eq!(configured_pins_in(home.path()), Some(Vec::new()));
+        assert!(!path.exists(), "a read-back creates nothing");
+        std::fs::write(&path, b"[").unwrap();
+        assert_eq!(configured_pins_in(home.path()), None);
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let current = crate::test_paths::abs("/opt/current/dot-agent-deck");
+        let (old, current) = (old.as_str(), current.as_str());
+        let rule = |binary: &str| serde_json::json!([{"hooks": [{"type": "command", "command": expected_hook_command(binary)}]}]);
+        let root = serde_json::json!({
+            "hooks": {
+                "SessionStart": rule(current),
+                "Stop": rule(old),
+                "PostToolUse": rule(current),
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]
+            }
+        });
+        std::fs::write(&path, root.to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut binaries: Vec<String> = configured_pins_in(home.path())
+            .expect("readable hooks.json")
+            .into_iter()
+            .map(|pin| pin.binary)
+            .collect();
+        binaries.sort();
+        assert_eq!(binaries, vec![current.to_string(), old.to_string()]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
     use spec::spec;
 
     /// The child half of `codex_trust_008`: when re-executed with these set,

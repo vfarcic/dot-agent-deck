@@ -13,6 +13,65 @@ mod common;
 use common::{TuiDeck, write_hook_line};
 use spec::spec;
 
+/// Scenario: Deliver stamped hooks to the real daemon and watch the card move
+/// from its initial session to Working and Idle. Neither the daemon's own build
+/// nor a different build of the same release may raise a hook-binary notice.
+#[spec("hooks/delivery/009")]
+#[cfg(unix)]
+#[test]
+fn delivery_009_stamped_hooks_apply_without_notices_for_the_same_release() {
+    use dot_agent_deck::daemon_protocol::{AttachRequest, PROTOCOL_VERSION};
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 28)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let hello = || {
+        common::attach_request_on(
+            deck.attach_socket_path(),
+            &AttachRequest::Hello {
+                client_version: PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .expect("Hello response")
+    };
+    let own_build = hello().build_version.expect("daemon build");
+    let release = own_build.split("-g").next().unwrap();
+    let events = deck.subscribe_events();
+    for (kind, build, rendered) in [
+        ("session_start", own_build.clone(), "stamp1637"),
+        ("tool_start", own_build.clone(), "Working"),
+        ("idle", format!("{release}-gdeadbeef01234567"), "Idle"),
+    ] {
+        // A different sender spelling is deliberate: a same-file sender is
+        // suppressed independently of its build, which would make the equal
+        // release/different-build assertion vacuous.
+        let sender = if kind == "idle" {
+            deck.workdir().join("opt/another/dot-agent-deck")
+        } else {
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        };
+        let event = serde_json::json!({
+            "session_id": "stamp1637", "pane_id": "stamp-pane-1637",
+            "agent_type": "claude_code", "event_type": kind,
+            "timestamp": "2026-10-10T12:00:00Z", "tool_name": "Bash",
+            "deck_build": build, "deck_exe": sender
+        });
+        write_hook_line(deck.hook_socket_path(), &event.to_string()).unwrap();
+        events.wait_for(
+            |e| e.session_id == "stamp1637" && serde_json::to_value(&e.event_type).unwrap() == kind,
+            std::time::Duration::from_secs(10),
+        );
+        deck.wait_for_string(rendered);
+        let notices = hello().hook_binary_notices.expect("notices on Hello");
+        assert!(
+            notices.is_empty(),
+            "same-release stamp raised a notice: {notices:?}"
+        );
+        assert!(!deck.snapshot_grid().contains("hooks run"));
+    }
+}
+
 /// Scenario: Start a daemon-owned stand-in pane and send Claude hooks through the real hook CLI with that pane's own identity and capability. A client subscribing after the first completed turn must receive only later final replies, with the selected agent's identity and increasing sequence, without replaying the earlier reply or reading the terminal's sentinel; a later turn that ends with no final message, after a subagent's Stop, must arrive as exactly one empty reply.
 #[spec("voice/reading-reply/001")]
 #[cfg(unix)]

@@ -342,6 +342,72 @@ pub struct DesktopConnection {
     /// live bridge builds, and absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnected_reason: Option<DisconnectedReasonDto>,
+    /// Issue #1637: agents whose hooks on this deck run an older
+    /// `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+    /// from the daemon's `Hello` reply. Each carries the daemon's own remedy, so
+    /// this app and the TUI show the same words. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+}
+
+/// One hook-binary notice as the webview reads it (issue #1637). Every string
+/// is sanitized: a remote deck's daemon composed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookBinaryNoticeDto {
+    pub binary: String,
+    pub agents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub daemon_version: String,
+    pub reason: dot_agent_deck::daemon_protocol::HookBinaryReason,
+    pub remedy: String,
+    /// The command the Copy button copies, exactly as shown. Dropped, not
+    /// cleaned, when it carries anything a display would hide or alter (a
+    /// control, bidi or line-separator character), so what is copied is
+    /// always what is displayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Whether `command` can be shown and copied verbatim.
+fn is_copyable_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES
+        && !command.chars().any(|c| {
+            c.is_control()
+                || dot_agent_deck::untrusted_text::is_bidi_format_char(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
+}
+
+impl HookBinaryNoticeDto {
+    pub(crate) fn new(notice: &dot_agent_deck::daemon_protocol::HookBinaryNotice) -> Self {
+        let command = notice
+            .command
+            .as_deref()
+            .filter(|command| is_copyable_command(command))
+            .map(str::to_string);
+        let mut remedy = safe_display_text(&notice.remedy);
+        // A `Run:` whose command is dropped would end the strip with nothing
+        // to run, so it reads as the daemon's no-command advice instead.
+        if command.is_none() && remedy == dot_agent_deck::daemon_protocol::REMEDY_RUN {
+            remedy = dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL.to_string();
+        }
+        Self {
+            binary: safe_message(notice.binary.clone()),
+            agents: notice
+                .agents
+                .iter()
+                .map(|agent| safe_message(agent.clone()))
+                .collect(),
+            version: notice.version.clone().map(safe_message),
+            daemon_version: safe_message(notice.daemon_version.clone()),
+            reason: notice.reason,
+            remedy,
+            command,
+        }
+    }
 }
 
 /// [`DesktopConnection::disconnected_reason`] on the wire.
@@ -2578,6 +2644,7 @@ pub(crate) fn disconnected_snapshot(
             listing_options: false,
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
+            hook_binary_notices: Vec::new(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -4805,5 +4872,53 @@ mod tests {
             serde_json::to_value(&plain).unwrap(),
             serde_json::json!("not observed")
         );
+    }
+
+    /// Issue #1637 audit A3: a notice whose command carries a newline (a
+    /// hidden second command) or a bidi override reaches the webview with no
+    /// command at all, so there is nothing to copy; a newline in the remedy's
+    /// words is removed from what is shown. A clean command passes verbatim.
+    #[test]
+    fn a_hook_notice_command_that_display_would_alter_is_dropped() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = |remedy: &str, command: Option<&str>| HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: remedy.into(),
+            command: command.map(str::to_string),
+        };
+        for hostile in [
+            "brew upgrade dot-agent-deck\ntouch /tmp/hook-notice-marker",
+            "brew upgrade dot-agent-deck\r",
+            "brew upgrade \u{202E}kced-tnega-tod",
+            "brew upgrade dot-agent-deck\u{2028}touch x",
+        ] {
+            let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(hostile)));
+            assert_eq!(dto.command, None, "{hostile:?}");
+            // Never a bare `Run:`: the dropped command's lead-in becomes the
+            // daemon's no-command advice.
+            assert_eq!(
+                dto.remedy,
+                dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL,
+                "{hostile:?}"
+            );
+        }
+        let over_cap = format!(
+            "/{} hooks install",
+            "a".repeat(dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES)
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(&over_cap)));
+        assert_eq!(dto.command, None);
+        assert_eq!(
+            dto.remedy,
+            dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:\ntouch /tmp/x", None));
+        assert!(!dto.remedy.contains('\n'), "{:?}", dto.remedy);
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some("brew upgrade dot-agent-deck")));
+        assert_eq!(dto.command.as_deref(), Some("brew upgrade dot-agent-deck"));
     }
 }

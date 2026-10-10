@@ -625,34 +625,78 @@ fn durable_binary_path() -> Result<String, String> {
 /// Guarded, idempotent, and best-effort: SKIPs unless `devin` is on `PATH` and a
 /// real config dir resolves, and any failure is logged, never fatal. Never prints
 /// to stdout (it runs on the dashboard startup path).
-pub fn auto_install() {
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     if !devin_present_on_path() {
         tracing::debug!("devin startup install: skipped (devin not on PATH)");
-        return;
+        return Vec::new();
     }
     let Some(config_dir) = devin_config_dir() else {
         tracing::debug!("devin startup install: skipped (no config dir resolves)");
-        return;
+        return Vec::new();
     };
 
     let binary_path = match durable_binary_path() {
         Ok(binary_path) => binary_path,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return Vec::new();
         }
     };
 
-    match auto_install_to(&config_dir, &binary_path) {
-        Ok((true, named)) => crate::agent_hook_config::log_auto_install_change(
-            "devin",
-            &config_path(&config_dir),
-            &named,
-            "devin startup auto-install",
-        ),
-        Ok((false, _)) => {}
-        Err(e) => tracing::warn!("auto-install: failed to write Devin hooks: {e}"),
+    let named = match auto_install_to(&config_dir, &binary_path) {
+        Ok((changed, named)) => {
+            if changed {
+                crate::agent_hook_config::log_auto_install_change(
+                    "devin",
+                    &config_path(&config_dir),
+                    &named,
+                    "devin startup auto-install",
+                );
+            }
+            named
+        }
+        Err(e) => {
+            tracing::warn!("auto-install: failed to write Devin hooks: {e}");
+            return Vec::new();
+        }
+    };
+    vec![crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::Devin,
+        config: config_path(&config_dir),
+        binary: named,
+    }]
+}
+
+/// What Devin's hooks are pinned to now, read back from its config without
+/// installing anything (issue #1637's pin refresh, `DEVIN.configured_pins`).
+/// An empty list when the config file is missing; `None` under the same
+/// guards as [`auto_install`] or when the config cannot be read, which leaves
+/// the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    if !devin_present_on_path() {
+        return None;
     }
+    configured_pins_in(&devin_config_dir()?)
+}
+
+/// [`configured_pins`] for an explicit config dir.
+fn configured_pins_in(config_dir: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    let path = config_path(config_dir);
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::Devin,
+                config: path.clone(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// `dot-agent-deck hooks install --agent devin` — the explicit, chatty install.
@@ -688,6 +732,32 @@ pub fn uninstall() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back what Devin's
+    /// config pins, writing nothing — not even the backup an install makes of
+    /// an unparseable file, which is no evidence. A missing config names
+    /// nothing.
+    #[test]
+    fn configured_pins_reads_the_config_back_without_writing() {
+        let dir = crate::test_temp::tempdir().expect("config tempdir");
+        let config = config_path(dir.path());
+        assert_eq!(configured_pins_in(dir.path()), Some(Vec::new()));
+        assert!(!config.exists(), "a read-back creates nothing");
+        std::fs::write(&config, b"{ // a comment\n}").unwrap();
+        assert_eq!(configured_pins_in(dir.path()), None);
+        assert!(!dir.path().join("config.json.bak").exists());
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let command = crate::agent_hook_config::build_command(old, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
+        let root = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}
+        });
+        std::fs::write(&config, root.to_string()).unwrap();
+        let pins = configured_pins_in(dir.path()).expect("readable config");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].binary, old);
+        assert_eq!(pins[0].agent, crate::event::AgentType::Devin);
+    }
 
     fn read_back(dir: &Path) -> Value {
         let contents = std::fs::read_to_string(config_path(dir)).expect("read config.json");

@@ -1144,12 +1144,51 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// Intended for dashboard startup — **never prints to stdout**, including on
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
-pub fn auto_install() {
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637), so the daemon
+/// can name the binary Claude Code's events come from.
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     auto_install_to_gated(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
         || installed_claude_accepts_stop_failure().0,
-    );
+    )
+    .into_iter()
+    .collect()
+}
+
+/// What Claude Code's hooks are pinned to now, read back from its settings
+/// without installing anything (issue #1637's pin refresh,
+/// `CLAUDE.configured_pins`). An empty list when the settings file is
+/// missing, and `None` when its directory is (as at startup, which installs
+/// nothing then) or the file cannot be read, which leaves the pins the daemon
+/// knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    configured_pins_in(&settings_path())
+}
+
+/// [`configured_pins`] against an explicit settings path. Like
+/// [`auto_install_to_gated`], nothing is read unless the settings directory
+/// exists.
+fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    if path.parent().is_none_or(|p| !p.exists()) {
+        return None;
+    }
+    let Some(settings) = crate::agent_hook_config::read_json_config(path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&settings, owned_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.to_path_buf(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// [`auto_install`] against an explicit settings path, with the binary-path
@@ -1172,8 +1211,11 @@ pub fn auto_install() {
 /// Issue #714: this seam installs the base hook set, which every Claude Code
 /// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
 /// is the same seam with the gate injected, and what [`auto_install`] calls.
-pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
-    auto_install_to_gated(path, resolve, || false);
+pub fn auto_install_to(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Option<crate::hook_binary::HookPin> {
+    auto_install_to_gated(path, resolve, || false)
 }
 
 /// [`auto_install_to`] with the `StopFailure` gate injected (issue #714):
@@ -1185,9 +1227,9 @@ pub fn auto_install_to_gated(
     path: &Path,
     resolve: impl FnOnce() -> Result<String, String>,
     stop_failure: impl FnOnce() -> bool,
-) {
+) -> Option<crate::hook_binary::HookPin> {
     if path.parent().is_none_or(|p| !p.exists()) {
-        return;
+        return None;
     }
 
     let binary_path = match resolve() {
@@ -1196,26 +1238,26 @@ pub fn auto_install_to_gated(
         // command name, not a build-artifact path that breaks later.
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
         tracing::warn!("auto-install: {e}");
-        return;
+        return None;
     }
 
     let _guard = match lock_settings(path) {
         Ok(guard) => guard,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let before = settings.clone();
@@ -1228,13 +1270,18 @@ pub fn auto_install_to_gated(
 
     // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
     // still a change and is published — PRD #381 M4.
+    let pin = crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::ClaudeCode,
+        config: path.to_path_buf(),
+        binary: outcome.named.clone(),
+    };
     if settings == before {
-        return;
+        return Some(pin);
     }
 
     if let Err(e) = write_settings(path, &settings) {
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
-        return;
+        return None;
     }
     let binary_path = outcome.named.clone();
     crate::agent_hook_config::log_auto_install_change(
@@ -1261,6 +1308,7 @@ pub fn auto_install_to_gated(
             outcome.installed.join(", ")
         );
     }
+    Some(pin)
 }
 
 /// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty
@@ -1404,6 +1452,104 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back what Claude
+    /// Code's settings pin, writing nothing: no evidence for a missing
+    /// settings directory or an unparseable file (which is left as it is), no
+    /// pin for missing settings or settings holding no deck hook, and the
+    /// binary the deck's hooks name once they are there.
+    #[test]
+    fn configured_pins_reads_the_settings_back_without_writing() {
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        assert_eq!(
+            configured_pins_in(&dir.path().join("absent").join("settings.json")),
+            None,
+            "no settings directory, as at startup"
+        );
+        let path = dir.path().join("settings.json");
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
+        assert!(!path.exists(), "a read-back creates nothing");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(configured_pins_in(&path), None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(!dir.path().join("settings.json.bak").exists());
+        let user_only = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]}
+        });
+        std::fs::write(&path, user_only.to_string()).unwrap();
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let pinned = serde_json::json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": hook_command(old)}]}],
+                "PreToolUse": [{"hooks": [{"type": "command", "command": hook_command(old)}]}]
+            }
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let pins = configured_pins_in(&path).expect("readable settings");
+        assert_eq!(
+            pins,
+            vec![crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.clone(),
+                binary: old.to_string(),
+            }]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Scenario (Qodo on #1656): Claude Code's hooks are pinned to an older
+    /// copy, which raised its notice, and then the user deletes
+    /// `settings.json`. The next refresh reads it as naming nothing, so the
+    /// notice clears within one refresh; a settings file that becomes
+    /// unreadable instead keeps the pin and the notice.
+    #[test]
+    fn deleting_the_settings_clears_the_notice_and_a_read_error_keeps_it() {
+        use crate::hook_binary::{DeckIdentity, HookBinaryState, PinRefresh};
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let path = dir.path().join("settings.json");
+        let old = dir.path().join("missing-old").join("dot-agent-deck");
+        let old = old.to_string_lossy().into_owned();
+        let pinned = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook_command(&old)}]}]}
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let pins = configured_pins_in(&path).expect("readable settings");
+        // `old` does not exist, so its probe fails: an `Unprobeable` notice.
+        let mut state = HookBinaryState::from_startup(deck.clone(), &pins, None);
+        assert_eq!(state.notices().len(), 1);
+        let refresh = |path: &Path| {
+            PinRefresh::classify(
+                &deck,
+                configured_pins_in(path)
+                    .map(|pins| vec![(crate::event::AgentType::ClaudeCode, pins)])
+                    .unwrap_or_default(),
+            )
+        };
+
+        #[cfg(unix)]
+        {
+            // A directory where the settings file should be: unreadable.
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(configured_pins_in(&path), None);
+            assert!(!state.apply_refresh(refresh(&path)));
+            assert_eq!(state.notices().len(), 1, "a read error keeps the pin");
+            std::fs::remove_dir(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(state.apply_refresh(refresh(&path)));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
+    }
 
     /// A malformed `settings.json` is copied to `settings.json.bak` — but never
     /// THROUGH a symlink planted at that path, and since #537 never over one

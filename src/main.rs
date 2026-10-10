@@ -1964,15 +1964,28 @@ fn main() -> ExitCode {
                 // the TUI when an agent is added. The TUI still runs the same
                 // loop; every installer is idempotent, and Codex and Devin have
                 // run in both processes since they were added here.
-                {
+                //
+                // Issue #1637: each installer reports what it left the agent's
+                // hooks pinned to, so the daemon can tell the user when that is
+                // an older copy of the deck before any hook fires.
+                let hook_binaries = {
                     use dot_agent_deck::agent_registry::ALL;
+                    let mut pins = Vec::new();
                     for spec in ALL {
                         if let Some(install) = spec.startup_auto_install {
-                            install();
+                            pins.extend(install());
                         }
                     }
-                }
-                run_daemon_serve_cli()
+                    // The resolution the installers' takeover check already
+                    // made, not a fresh one per caller.
+                    let resolution = dot_agent_deck::hook_binary::process_resolution();
+                    dot_agent_deck::hook_binary::HookBinaryState::from_startup(
+                        dot_agent_deck::hook_binary::DeckIdentity::current(resolution),
+                        &pins,
+                        dot_agent_deck::hook_binary::refused_ephemeral_location(resolution),
+                    )
+                };
+                run_daemon_serve_cli(hook_binaries)
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
@@ -3423,7 +3436,9 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// to be (re)installed when the binary version changes — not every time
 /// the daemon starts.
 #[tokio::main]
-async fn run_daemon_serve_cli() -> ExitCode {
+async fn run_daemon_serve_cli(
+    hook_binaries: dot_agent_deck::hook_binary::HookBinaryState,
+) -> ExitCode {
     // NOTE: logging is initialized by the `DaemonCmd::Serve` dispatch arm in
     // `main`, before the login-shell PATH capture and before this runtime is
     // built — so it is intentionally NOT initialized again here (a second
@@ -3435,7 +3450,9 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // inherits the launching TUI's directory and the two agree on the file by
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
-    let state = Arc::new(RwLock::new(AppState::default()));
+    let mut initial = AppState::default();
+    initial.hook_binaries = hook_binaries;
+    let state = Arc::new(RwLock::new(initial));
     // Issue #1121: the BIND side, so these are deliberately the pure
     // resolvers and not `endpoint_resolve`'s client ones — the primary
     // endpoint is the new spelling, never one the compatibility read chose.
@@ -3476,13 +3493,25 @@ async fn run_daemon_serve_cli() -> ExitCode {
     let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
         dot_agent_deck::daemon_restart::InstallRecord::capture(),
     ));
+    let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_legacy_aliases(
             dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
             dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
         )
         .with_restart_control(restart_control.clone());
-    if let Err(e) = run_daemon_with(&path, daemon).await {
+    // Issue #1637: re-read the agents' hook configs periodically, so a notice
+    // about an older copy the hooks are still set up to call stays, and one
+    // the user has since fixed clears, without a restart. Here rather than in
+    // `run_daemon_with`, which in-process test daemons also run: only this
+    // daemon was started with the hook pins it reads.
+    let pin_refresh = tokio::spawn(dot_agent_deck::daemon::run_hook_pin_refresh(
+        refresh_state,
+        daemon.event_tx.clone(),
+    ));
+    let result = run_daemon_with(&path, daemon).await;
+    pin_refresh.abort();
+    if let Err(e) = result {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
     }

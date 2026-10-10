@@ -1759,6 +1759,143 @@ pub async fn ingest_event(
     ingest_event_unless(state, event_tx, registry, event, false, None, || false).await;
 }
 
+/// Issue #1637: record which `dot-agent-deck` sent an admitted hook line
+/// (its `deck_build` / `deck_exe` stamp, or the absence of one), and broadcast
+/// the notices when that changes them. Under the state's write guard, so a
+/// `SubscribeEventsWithSnapshot` reply holds a change or its stream does.
+async fn observe_hook_sender(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_type: &crate::event::AgentType,
+    line: &str,
+) {
+    let sender = crate::hook_binary::HookLineSender::from_line(line);
+    // The steady state — an agent's hooks sending the stamp they sent last time
+    // — changes nothing, so it is settled under a read guard and never queues
+    // behind or blocks the event's own write.
+    if !state
+        .read()
+        .await
+        .hook_binaries
+        .would_change(agent_type, &sender)
+    {
+        return;
+    }
+    let mut state = state.write().await;
+    if state.hook_binaries.observe(agent_type, &sender) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
+/// Issue #1637: every [`crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL`], read
+/// the agents' hook configs again for the binaries they pin, and apply what
+/// changed to the notices. `daemon serve` runs it for the daemon's lifetime.
+///
+/// The configs are read, and any new pin probed, on a detached thread before
+/// the state lock is taken ([`crate::hook_binary::PinRefresh::collect`],
+/// [`spawn_detached_collection`]); the result is then applied under the write
+/// lock in one step, which touches no file ([`apply_hook_pin_refresh`]). The
+/// first read is one interval after start, since startup has just read the
+/// same configs.
+///
+/// The thread is detached rather than a `spawn_blocking` task because the
+/// runtime's teardown waits for every blocking task it started, so a read
+/// stuck in the filesystem would hold the daemon's exit (audit A9). Aborting
+/// this task drops only the wait; the thread finishes, or is ended with the
+/// process. Only one read runs at a time: this loop waits for it, and a read
+/// left running by an aborted loop holds [`HOOK_PIN_COLLECTING`] until it ends.
+pub async fn run_hook_pin_refresh(state: SharedState, event_tx: broadcast::Sender<BroadcastMsg>) {
+    let period = crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let deck = state.read().await.hook_binaries.deck().clone();
+        let Some(collected) = spawn_detached_collection(&HOOK_PIN_COLLECTING, move || {
+            crate::hook_binary::PinRefresh::collect(&deck)
+        }) else {
+            tracing::warn!(
+                "hook pin refresh: the previous read of the agents' hook configs has not finished; skipped"
+            );
+            continue;
+        };
+        let refresh = match collected.await {
+            Ok(refresh) => refresh,
+            Err(_) => {
+                tracing::warn!("hook pin refresh: reading the agents' hook configs failed");
+                continue;
+            }
+        };
+        apply_hook_pin_refresh(&state, &event_tx, refresh).await;
+    }
+}
+
+/// Set while a hook-pin read started by [`run_hook_pin_refresh`] is running.
+static HOOK_PIN_COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Run `collect` on a detached thread and return a receiver for its result,
+/// unless `in_flight` says a previous one is still running, or no thread
+/// could be made: `None` then, and nothing runs. `in_flight` is set until
+/// `collect` returns or panics; a panic drops the sender, which the receiver
+/// reports as an error.
+fn spawn_detached_collection<T: Send + 'static>(
+    in_flight: &'static AtomicBool,
+    collect: impl FnOnce() -> T + Send + 'static,
+) -> Option<tokio::sync::oneshot::Receiver<T>> {
+    struct Release(&'static AtomicBool);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let release = Release(in_flight);
+    let spawned = std::thread::Builder::new()
+        .name("hook-pin-refresh".into())
+        .spawn(move || {
+            // Released before the result is sent, so a caller that has the
+            // result may start the next one; a panic releases it unwinding.
+            let value = collect();
+            drop(release);
+            let _ = tx.send(value);
+        });
+    match spawned {
+        Ok(_) => Some(rx),
+        Err(e) => {
+            // The closure, and with it `release`, was dropped with the error.
+            tracing::warn!("hook pin refresh: could not start a thread to read the configs: {e}");
+            None
+        }
+    }
+}
+
+/// Apply one [`crate::hook_binary::PinRefresh`] under the state's write guard,
+/// and broadcast the notices when that changes them.
+async fn apply_hook_pin_refresh(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    refresh: crate::hook_binary::PinRefresh,
+) {
+    let mut state = state.write().await;
+    if state.hook_binaries.apply_refresh(refresh) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
 /// [`ingest_event`] for a raw event the hook socket's provenance gate admitted
 /// (issue #318). `unproven` is the gate's verdict that the event comes from an
 /// outside agent — a pane, or a paneless agent, this daemon never issued a hook
@@ -4729,6 +4866,11 @@ async fn run_hook_loop_with_idle_timeout(
                                     &line,
                                 );
                             }
+                            // Issue #1637: which deck binary sent this line,
+                            // read off the line like the token, and never part
+                            // of the event.
+                            observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
+                                .await;
                             ingest_hook_event(
                                 &state,
                                 &event_tx,
@@ -11954,5 +12096,108 @@ mod hook_provenance_audit_tests {
             !log.contains(&old_token),
             "the token is never logged: {log}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_pin_refresh_tests {
+    use super::*;
+    use crate::event::AgentType;
+    use crate::hook_binary::{DeckIdentity, HookBinaryState, HookPin, PinRefresh};
+
+    /// Scenario (issue #1637 audit A9): a hook-config read is stuck, as one on
+    /// a FIFO with no writer would be. While it runs a second read is refused
+    /// rather than started; aborting the task waiting on it and shutting its
+    /// runtime down both finish at once instead of waiting for the read; once
+    /// the read ends, a new one may start.
+    #[test]
+    fn a_stuck_collection_blocks_neither_shutdown_nor_runs_twice() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let waiter = runtime.spawn(async move {
+            let collected = spawn_detached_collection(&IN_FLIGHT, move || {
+                started_tx.send(()).unwrap();
+                let _ = unblock_rx.recv();
+                1
+            })
+            .expect("the first collection starts");
+            collected.await
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the collection started");
+        assert!(
+            spawn_detached_collection(&IN_FLIGHT, || 2).is_none(),
+            "a second collection is not started while the first runs"
+        );
+
+        waiter.abort();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runtime shut down while the collection was still stuck");
+        assert!(IN_FLIGHT.load(Ordering::Acquire), "still running");
+
+        unblock_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while IN_FLIGHT.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collection never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let next = spawn_detached_collection(&IN_FLIGHT, || 3).expect("a new collection starts");
+        assert_eq!(next.blocking_recv(), Ok(3));
+    }
+
+    /// Scenario (issue #1637): the daemon knows Codex's hooks are pinned to a
+    /// copy it cannot run, and shows a notice. A refresh then reads Codex's
+    /// config and finds it names no deck binary any more: applying it under
+    /// the state lock clears the notice and broadcasts the new, empty list
+    /// once; the same refresh again broadcasts nothing.
+    #[tokio::test]
+    async fn a_refresh_that_changes_the_notices_broadcasts_them_once() {
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let mut initial = crate::state::AppState::default();
+        initial.hook_binaries = HookBinaryState::from_startup(
+            deck.clone(),
+            &[HookPin {
+                agent: AgentType::Codex,
+                config: std::path::PathBuf::from("/cfg/hooks.json"),
+                binary: crate::test_paths::abs("/nonexistent/dad-1637/dot-agent-deck"),
+            }],
+            None,
+        );
+        assert_eq!(initial.hook_binaries.notices().len(), 1);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(initial));
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let none_pinned = || PinRefresh::classify(&deck, vec![(AgentType::Codex, Vec::new())]);
+
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        match rx.try_recv() {
+            Ok(BroadcastMsg::HookBinaryNotice(sent)) => assert!(sent.notices.is_empty()),
+            other => panic!("expected one notice broadcast, got {other:?}"),
+        }
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged refresh broadcasts nothing"
+        );
+        assert!(state.read().await.hook_binaries.notices().is_empty());
     }
 }

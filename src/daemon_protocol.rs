@@ -114,6 +114,16 @@ use tracing::{error, info, warn};
 use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
+
+// Issue #1637: the hook-binary notice types `AttachResponse` and
+// `BroadcastMsg::HookBinaryNotice` carry, re-exported as wire types so a client
+// names them through the protocol module rather than `hook_binary`, which also
+// holds the daemon's probing and install-time logic.
+pub use crate::hook_binary::{
+    HookBinaryNotice, HookBinaryNotices, HookBinaryReason, MAX_NOTICE_COMMAND_BYTES, REMEDY_RUN,
+    REMEDY_UPGRADE_OR_REINSTALL,
+};
+
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
@@ -3099,6 +3109,18 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #1637: the agents whose hooks run a `dot-agent-deck` older than
+    /// this daemon (or that this deck could not install hooks for, issue
+    /// #1157), with what to do about each. Set on the [`AttachRequest::Hello`]
+    /// and [`AttachRequest::SubscribeEventsWithSnapshot`] replies, so a client
+    /// learns it on connect and again on every reconnect; a change mid-session
+    /// arrives as [`crate::event::BroadcastMsg::HookBinaryNotice`].
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the key and an older daemon omits it. `Some(vec![])` is a daemon
+    /// reporting nothing to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_binary_notices: Option<Vec<crate::hook_binary::HookBinaryNotice>>,
     /// Issue #887: this daemon's registered-schedule revision
     /// ([`crate::scheduler::Scheduler::revision`]), populated on the
     /// [`AttachRequest::ListAgents`] reply.
@@ -6325,6 +6347,7 @@ async fn handle_connection(
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
             }
+            resp.hook_binary_notices = Some(state.read().await.hook_binaries.notices());
             write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::ReloadSchedules => {
@@ -7030,16 +7053,20 @@ async fn handle_subscribe_events_with_snapshot(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
 ) -> io::Result<()> {
-    let (rx, mut records) = {
+    let (rx, mut records, notices) = {
         let guard = state.read().await;
         let rx = event_tx.subscribe();
         let mut records = registry.agent_records();
         guard.attach_live_sessions(&mut records);
         guard.attach_orchestrator_context_paths(&mut records);
-        (rx, records)
+        (rx, records, guard.hook_binaries.notices())
     };
     crate::agent_pty::attach_cli_names(&mut records);
-    forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
+    let mut resp = AttachResponse::agent_records(records);
+    // Issue #1637: read under the same guard as the receiver, so a notice
+    // change is either in this reply or on the stream.
+    resp.hook_binary_notices = Some(notices);
+    forward_event_stream(stream, rx, &resp).await
 }
 
 /// PRD #1497: [`AttachRequest::SubscribeTurnReplies`]. The receiver is opened

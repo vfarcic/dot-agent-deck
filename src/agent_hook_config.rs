@@ -1179,6 +1179,86 @@ pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
     out
 }
 
+/// The largest hook config or plugin file the pin refresh reads (issue #1637
+/// audit A9); a longer one is no evidence. The deck's own entries take a few
+/// hundred bytes per event and a hand-kept settings file a few kilobytes, so
+/// 4 MiB is far past any real one while still bounding what one read can
+/// allocate.
+pub(crate) const MAX_HOOK_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most distinct absolute executables [`configured_deck_executables`]
+/// collects from one config. Larger than
+/// [`crate::hook_binary::MAX_BINARIES_PER_AGENT`], so the daemon's own cap is
+/// what decides; small enough that a config listing thousands of distinct
+/// binaries allocates nothing in proportion to them. Relative commands are
+/// counted separately, under
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`], so however many a
+/// config lists ahead of an absolute pin, they never crowd it out (Qodo on
+/// #1656).
+pub(crate) const MAX_CONFIGURED_EXECUTABLES: usize = 64;
+
+/// A JSON hook config read for a read-back (issue #1637's pin refresh):
+/// `Some(Some(json))` when it was read, `Some(None)` when it is confirmed
+/// missing — evidence that it names nothing — and `None` when it is
+/// unreadable, not a regular file, longer than [`MAX_HOOK_CONFIG_BYTES`] or
+/// not JSON — no evidence either way. Reads through
+/// [`crate::bounded_read::read_config_file`], so it neither blocks on a FIFO
+/// with no writer nor reads a huge file whole (audit A9). Reads only: unlike
+/// the installers' readers it never sets a malformed file aside.
+pub(crate) fn read_json_config(path: &Path) -> Option<Option<Value>> {
+    match crate::bounded_read::read_config_file(path, MAX_HOOK_CONFIG_BYTES).ok()? {
+        Some(text) => serde_json::from_str(&text).ok().map(Some),
+        None => Some(None),
+    }
+}
+
+/// The distinct executables the deck's entries in a JSON hook config name,
+/// in file order: every command under `root.hooks.<event>[]`, in either shape
+/// [`rule_command_strs`] reads, that `executable_of` recognises as the deck's.
+/// Collects at most [`MAX_CONFIGURED_EXECUTABLES`] absolute paths and
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`] relative commands no
+/// longer than [`crate::hook_binary::MAX_RELATIVE_PIN_BYTES`], each counted on
+/// its own, and stops once both are full (audit A9). Read-only, for issue
+/// #1637's pin refresh.
+pub(crate) fn configured_deck_executables(
+    root: &Value,
+    executable_of: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
+    let mut out: Vec<String> = Vec::new();
+    let (mut absolute, mut relative) = (0usize, 0usize);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return out;
+    };
+    for rules in hooks.values().filter_map(Value::as_array) {
+        for exe in rule_command_strs(rules)
+            .into_iter()
+            .filter_map(&executable_of)
+        {
+            if absolute >= MAX_CONFIGURED_EXECUTABLES && relative >= MAX_RELATIVE_PINS_PER_AGENT {
+                return out;
+            }
+            let count = if Path::new(&exe).is_absolute() {
+                if absolute >= MAX_CONFIGURED_EXECUTABLES {
+                    continue;
+                }
+                &mut absolute
+            } else {
+                if relative >= MAX_RELATIVE_PINS_PER_AGENT || exe.len() > MAX_RELATIVE_PIN_BYTES {
+                    continue;
+                }
+                &mut relative
+            };
+            if seen.insert(exe.clone()) {
+                *count += 1;
+                out.push(exe);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn strip_deck_commands(
     rules: &mut Vec<Value>,
     mut is_target: impl FnMut(&str) -> bool,
@@ -1602,6 +1682,13 @@ impl KeptDeckEntry {
 /// installs that each resolve to themselves still do not rewrite the agent's
 /// config on every start.
 ///
+/// **A sibling an eligible newer copy supersedes is not kept either** (issue
+/// #1637, [`crate::hook_binary::Takeover`]): when the installing binary is an
+/// install outside any temporary location and the sibling's `--version`
+/// reports a strictly older release, it is passed over exactly as a dead pin
+/// is, so it is overwritten in place and the event keeps one deck entry. A
+/// tie, a newer sibling and a sibling whose version cannot be read are kept.
+///
 /// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
 pub(crate) fn auto_install_kept_entry(
     rules: &[Value],
@@ -1610,6 +1697,7 @@ pub(crate) fn auto_install_kept_entry(
     executable_of: impl Fn(&str) -> Option<String>,
     command_for_exe: impl Fn(&str) -> String,
 ) -> Option<KeptDeckEntry> {
+    let takeover = crate::hook_binary::Takeover::current();
     let exe = rules
         .iter()
         .filter_map(|rule| rule.get("hooks").and_then(Value::as_array))
@@ -1620,6 +1708,7 @@ pub(crate) fn auto_install_kept_entry(
             executable_of(command)
                 .filter(|exe| auto_install_keeps(exe))
                 .filter(|exe| ensure_hook_path_is_shell_safe(exe).is_ok())
+                .filter(|exe| executables_match(exe, binary_path) || !takeover.supersedes(exe))
         })?;
     Some(if executables_match(&exe, binary_path) {
         KeptDeckEntry::ThisBinary
@@ -1674,6 +1763,134 @@ fn process_label() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    /// `f` on a thread of its own, failing rather than hanging when it does
+    /// not return within ten seconds.
+    #[cfg(unix)]
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read blocked")
+    }
+
+    /// Scenario (issue #1637 audit A9): a hook config replaced by a FIFO with
+    /// no writer, directly and through a symlink. The pin refresh's read
+    /// returns at once with no evidence instead of waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_config_is_no_evidence_and_does_not_block() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("settings.json");
+        mkfifo_at(&fifo);
+        let link = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [fifo, link] {
+            let json = within_ten_seconds(move || read_json_config(&path));
+            assert_eq!(json, None);
+        }
+    }
+
+    /// Scenario (audit A9): a directory where the config should be is not a
+    /// regular file, so it is no evidence; a regular file there is read.
+    #[test]
+    fn a_non_regular_config_is_no_evidence() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_json_config(&path), Some(Some(json!({}))));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_json_config(&path), Some(None), "missing names nothing");
+    }
+
+    /// Scenario (audit A9): a config one byte past
+    /// [`MAX_HOOK_CONFIG_BYTES`] is no evidence, and one exactly at the cap
+    /// is read.
+    #[test]
+    fn an_oversized_config_is_rejected() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut huge = b"{\"hooks\": {}}".to_vec();
+        huge.resize(MAX_HOOK_CONFIG_BYTES as usize + 1, b' ');
+        std::fs::write(&path, &huge).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        huge.truncate(MAX_HOOK_CONFIG_BYTES as usize);
+        std::fs::write(&path, &huge).unwrap();
+        assert!(
+            matches!(read_json_config(&path), Some(Some(_))),
+            "at the cap is read"
+        );
+    }
+
+    /// Scenario (Qodo on #1656): a config lists far more distinct relative
+    /// deck commands than any real one, then an absolute pin to an older
+    /// copy. The relative ones are capped on their own, an over-long one is
+    /// passed over, and the absolute pin is still collected.
+    #[test]
+    fn relative_commands_do_not_crowd_out_an_absolute_pin() {
+        use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let long = "x".repeat(MAX_RELATIVE_PIN_BYTES + 1);
+        let mut commands: Vec<Value> = vec![json!({"command": format!("{long} hook")})];
+        commands.extend(
+            (0..MAX_CONFIGURED_EXECUTABLES * 2)
+                .map(|n| json!({"command": format!("bin-{n}/dot-agent-deck hook")})),
+        );
+        commands.push(json!({"command": format!("{old} hook")}));
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        let expected: Vec<String> = (0..MAX_RELATIVE_PINS_PER_AGENT)
+            .map(|n| format!("bin-{n}/dot-agent-deck"))
+            .chain([old.to_string()])
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    /// Scenario (audit A9): a config naming far more distinct deck binaries
+    /// than any real one, each many times over. What is collected stops at
+    /// [`MAX_CONFIGURED_EXECUTABLES`], in file order, with no duplicates.
+    #[test]
+    fn a_config_with_many_distinct_pins_is_capped_and_deduped() {
+        let deck = |n: usize| crate::test_paths::abs(&format!("/opt/deck-{n}/dot-agent-deck"));
+        let commands: Vec<Value> = (0..MAX_CONFIGURED_EXECUTABLES * 4)
+            .flat_map(|n| {
+                let command = format!("{} hook", deck(n));
+                [
+                    json!({"command": command.clone()}),
+                    json!({"command": command}),
+                ]
+            })
+            .collect();
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        assert_eq!(found.len(), MAX_CONFIGURED_EXECUTABLES);
+        let distinct: std::collections::HashSet<&String> = found.iter().collect();
+        assert_eq!(distinct.len(), found.len(), "no duplicates");
+        assert_eq!(found[0], deck(0));
+        assert_eq!(
+            found[MAX_CONFIGURED_EXECUTABLES - 1],
+            deck(MAX_CONFIGURED_EXECUTABLES - 1)
+        );
+    }
 
     /// Scenario: an automatic install keeps another install's entry only when
     /// that install is positively live and durable. A missing pin, a
@@ -2059,6 +2276,137 @@ mod tests {
         if let Some(named) = named {
             assert_eq!(named, a, "{agent}: the entries still name A");
         }
+    }
+
+    /// A live deck stub at `path` whose `--version` prints `version`, or, for
+    /// `None`, the plain `exit 0` stub every keep-rule fixture uses.
+    #[cfg(unix)]
+    fn seed_versioned_deck(path: &Path, version: Option<&str>) -> String {
+        let seeded = seed_deck(path);
+        if let Some(version) = version {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho 'dot-agent-deck {version}'\n").as_bytes(),
+            )
+            .unwrap();
+        }
+        seeded
+    }
+
+    /// Every event's rules with the deck's commands blanked, so a comparison
+    /// sees the user's handlers, the order and each rule's `matcher`.
+    #[cfg(unix)]
+    fn rules_around_the_deck(agent: &str, path: &Path) -> Value {
+        let suffix = format!("hook --agent {agent}");
+        let mut document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for rules in document["hooks"].as_object_mut().unwrap().values_mut() {
+            for rule in rules.as_array_mut().unwrap() {
+                for handler in rule["hooks"].as_array_mut().into_iter().flatten() {
+                    if handler["command"]
+                        .as_str()
+                        .is_some_and(|command| command.ends_with(&suffix))
+                    {
+                        handler["command"] = Value::String("<deck>".into());
+                    }
+                }
+            }
+        }
+        document["hooks"].take()
+    }
+
+    /// Issue #1637: an automatic install by B under `takeover`, over a file
+    /// whose deck entry pins A reporting `pinned` (or nothing). Returns A, B
+    /// and the config path.
+    #[cfg(unix)]
+    fn auto_install_over_a_versioned_pin(
+        agent: &str,
+        fixture: &Path,
+        pinned: Option<&str>,
+        takeover: crate::hook_binary::Takeover,
+    ) -> (String, String, std::path::PathBuf, Value) {
+        let home = fixture.join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_versioned_deck(&fixture.join("homebrew").join("dot-agent-deck"), pinned);
+        let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+        let around = rules_around_the_deck(agent, &path);
+        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        (a, b, path, around)
+    }
+
+    /// Issue #1637's takeover matrix for one writer.
+    #[cfg(unix)]
+    fn takeover_matrix(agent: &str) {
+        use crate::hook_binary::Takeover;
+        // A newer, eligible copy replaces an older pin in place: one deck
+        // entry per event, where the old one was, with the user's handler and
+        // every rule's `matcher` unchanged.
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (_, b, path, around) = auto_install_over_a_versioned_pin(
+            agent,
+            fixture.path(),
+            Some("0.0.1"),
+            Takeover::eligible("1.0.0"),
+        );
+        assert_every_event_names(agent, &path, &b, "a newer eligible copy takes the pin over");
+        assert_eq!(
+            rules_around_the_deck(agent, &path),
+            around,
+            "{agent}: only the deck's command changed"
+        );
+
+        // Kept: a tie, a newer pin, an unprobeable pin, and an ineligible copy
+        // even when it is newer.
+        for (pinned, takeover, why) in [
+            (
+                Some("1.0.0"),
+                Takeover::eligible("1.0.0"),
+                "a tie keeps the pin",
+            ),
+            (
+                Some("2.0.0"),
+                Takeover::eligible("1.0.0"),
+                "an older copy never displaces a newer pin",
+            ),
+            (
+                None,
+                Takeover::eligible("1.0.0"),
+                "a pin whose version cannot be read is kept",
+            ),
+            (
+                Some("0.0.1"),
+                Takeover::ineligible(),
+                "a copy that is not an install never takes over",
+            ),
+        ] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let (a, _, path, _) =
+                auto_install_over_a_versioned_pin(agent, fixture.path(), pinned, takeover);
+            assert_every_event_names(agent, &path, &a, why);
+        }
+    }
+
+    /// Scenario: Codex hooks pin an older live install; a newer eligible copy's automatic install switches them to itself in place, while a tie, a newer pin, an unprobeable pin and an ineligible copy leave them alone.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_takeover_matrix() {
+        takeover_matrix("codex");
+    }
+
+    /// Scenario: the same takeover matrix for Claude Code's settings file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_takeover_matrix() {
+        takeover_matrix("claude-code");
+    }
+
+    /// Scenario: the same takeover matrix for Devin's config file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_takeover_matrix() {
+        takeover_matrix("devin");
     }
 
     /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.
