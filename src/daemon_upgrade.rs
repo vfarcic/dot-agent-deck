@@ -1261,8 +1261,10 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
             Err(RemoteDaemonError::Malformed(reason)) => Err(PortError::ReplyUnreadable(format!(
                 "the remote's reply to the restart request was not usable: {reason}"
             ))),
-            // Failures from before the request was sent: ssh never got a
-            // session, or the remote binary said it did not send it.
+            // Failures from before the request was sent: refused before ssh
+            // ran (issue #1619), ssh never got a session, or the remote binary
+            // said it did not send it.
+            Err(e @ RemoteDaemonError::NotSent(_)) => Err(PortError::Other(e.to_string())),
             Err(
                 e @ RemoteDaemonError::Ssh(
                     SshError::ConnectionRefused { .. }
@@ -2483,6 +2485,7 @@ mod tests {
                     let probe = DaemonProbe {
                         running: true,
                         hello: Some(hello("0.39.0", "old")),
+                        confirm_stdin: false,
                     };
                     return Ok(SshOutput {
                         status: 0,
@@ -2682,6 +2685,7 @@ mod tests {
                     let probe = DaemonProbe {
                         running: true,
                         hello: Some(hello(version, build)),
+                        confirm_stdin: false,
                     };
                     return Ok(SshOutput {
                         status: 0,
@@ -2759,6 +2763,37 @@ mod tests {
         );
         assert_eq!(installed_version.as_deref(), Some("0.40.0"));
         assert!(!outcome.summary("box").contains("too old"));
+    }
+
+    /// Scenario: the user confirmed a stop set too large for the command
+    /// line, and the installed build cannot read it from stdin. The port
+    /// refuses before running anything, and the upgrade reads that as a
+    /// request that was never sent — a plain failure, not an unreadable reply
+    /// that might hide a restart (issue #1619).
+    #[test]
+    fn a_stop_set_the_installed_build_cannot_take_is_reported_as_not_sent() {
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct NeverRuns;
+        impl SshExecutor for NeverRuns {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                panic!("nothing should run on the remote: {command}");
+            }
+        }
+        let port = SshDaemonPort::new(
+            NeverRuns,
+            SshTarget::parse("u@h", 22, None),
+            crate::remote::RemoteDeckBinary::DefaultInstall,
+        );
+        let request = RestartDaemonRequest {
+            confirm: Some(crate::daemon_restart::stop_set_over_the_argument_limit()),
+            ..RestartDaemonRequest::default()
+        };
+        let restarted = DaemonPort::restart(&port, &request);
+        assert!(
+            matches!(&restarted, Err(PortError::Other(r)) if r.contains("dot-agent-deck daemon restart")),
+            "{restarted:?}"
+        );
     }
 
     fn remote_plan_for(version: &str) -> UpgradePlan {
@@ -2896,7 +2931,11 @@ mod tests {
         }
         let port = |running, hello| {
             SshDaemonPort::new(
-                Probes(DaemonProbe { running, hello }),
+                Probes(DaemonProbe {
+                    running,
+                    hello,
+                    confirm_stdin: false,
+                }),
                 SshTarget::parse("u@h", 22, None),
                 crate::remote::RemoteDeckBinary::DefaultInstall,
             )
@@ -2969,6 +3008,7 @@ mod tests {
                     serde_json::to_string(&DaemonProbe {
                         running: true,
                         hello: Some(hello_from("0.40.0", "same", instance)),
+                        confirm_stdin: false,
                     })
                 } else {
                     self.restarted.set(true);
@@ -3679,6 +3719,7 @@ mod tests {
                     let probe = DaemonProbe {
                         running: true,
                         hello: Some(hello),
+                        confirm_stdin: false,
                     };
                     return Ok(SshOutput {
                         status: 0,
@@ -3742,6 +3783,7 @@ mod tests {
                     serde_json::to_string(&DaemonProbe {
                         running: true,
                         hello: Some(hello_from("0.39.0", "old", "old-process")),
+                        confirm_stdin: false,
                     })
                 } else {
                     serde_json::to_string(&RemoteRestartReport {

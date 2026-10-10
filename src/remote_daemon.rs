@@ -14,7 +14,7 @@
 //! upgrade flow adapts it to its own port trait in [`crate::daemon_upgrade`],
 //! and the start flow uses it directly in [`crate::daemon_start`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -22,7 +22,9 @@ use thiserror::Error;
 
 use crate::daemon_client::RemoteEndpoint;
 use crate::daemon_protocol::RestartStopSet;
-use crate::daemon_restart::{DaemonProbe, RemoteRestartReport, encode_stop_set_hex};
+use crate::daemon_restart::{
+    DaemonProbe, MAX_CONFIRM_HEX_LEN, RemoteRestartReport, encode_stop_set_hex,
+};
 use crate::remote::{
     RemoteBinaryPath, RemoteDeckBinary, RemoteEntry, SshError, SshExecutor, SshTarget,
 };
@@ -117,6 +119,10 @@ pub enum RemoteDaemonError {
     /// parse: none at all, more than the cap, or a line that is not its JSON.
     #[error("the remote command printed no reply this build can parse: {0}")]
     Malformed(String),
+    /// Refused here, before anything ran on the remote: the request could not
+    /// be passed to the installed build (issue #1619).
+    #[error("{0}")]
+    NotSent(String),
 }
 
 /// A remote machine's daemon, reached through the deck binary installed there.
@@ -135,6 +141,11 @@ pub struct SshDaemonPort<E: SshExecutor> {
     /// as `DOT_AGENT_DECK_ATTACH_SOCKET`, so the probe and the restart reach
     /// the daemon the tunnel reaches rather than the remote shell's default.
     socket: Option<String>,
+    /// Whether the last probe through the current binary reported that its
+    /// `restart-installed` reads `--confirm-stdin` (issue #1619). `false` until
+    /// a probe says otherwise, and again whenever the binary is repointed, so
+    /// a build that was never asked is sent only `--confirm-hex`.
+    confirm_stdin: Cell<bool>,
     probe_deadline: Duration,
     restart_deadline: Duration,
 }
@@ -146,6 +157,7 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             target,
             binary: RefCell::new(binary),
             socket: None,
+            confirm_stdin: Cell::new(false),
             probe_deadline: REMOTE_PROBE_DEADLINE,
             restart_deadline: REMOTE_RESTART_DEADLINE,
         }
@@ -199,6 +211,7 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// Run later commands through `binary` instead.
     pub fn set_binary(&self, binary: RemoteDeckBinary) {
         *self.binary.borrow_mut() = binary;
+        self.confirm_stdin.set(false);
     }
 
     /// The binary later commands run, as spelled for the remote shell.
@@ -230,7 +243,10 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// [`Self::min_probe_budget`] starts nothing and is an error, so the probe
     /// never runs past `budget`.
     pub fn probe_within(&self, budget: Duration) -> Result<DaemonProbe, RemoteDaemonError> {
-        self.run_json("daemon probe --json", self.probe_deadline.min(budget))
+        let probe: DaemonProbe =
+            self.run_json("daemon probe --json", self.probe_deadline.min(budget))?;
+        self.confirm_stdin.set(probe.confirm_stdin);
+        Ok(probe)
     }
 
     /// The shortest budget [`Self::probe_within`] honours — the executor's
@@ -242,6 +258,14 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// `daemon restart-installed --json` on the remote: ask that machine's
     /// daemon to restart onto the build installed at its own path.
     /// `expected_version` and `confirm` are passed through to the daemon.
+    ///
+    /// The confirmed stop set goes on the remote command's stdin when the last
+    /// [`Self::probe`] reported that the binary reads it there, so its size is
+    /// not bound by the command line (issue #1619). An older binary is sent it
+    /// as `--confirm-hex`, which every build reads, and a set whose encoding
+    /// exceeds [`MAX_CONFIRM_HEX_LEN`] is refused here as
+    /// [`RemoteDaemonError::NotSent`] rather than sent as a command the remote
+    /// could not start.
     pub fn restart_installed(
         &self,
         expected_version: Option<&str>,
@@ -252,12 +276,36 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             args.push_str(" --expect-version ");
             args.push_str(&crate::remote::shell_word(version));
         }
+        let mut input = None;
         if let Some(set) = confirm {
-            // Hex: no shell metacharacter can appear in it.
-            args.push_str(" --confirm-hex ");
-            args.push_str(&encode_stop_set_hex(set));
+            if self.confirm_stdin.get() {
+                args.push_str(" --confirm-stdin");
+                input = Some(serde_json::to_vec(set).map_err(|e| {
+                    RemoteDaemonError::NotSent(format!("the stop set could not be encoded: {e}"))
+                })?);
+            } else {
+                // Hex: no shell metacharacter can appear in it.
+                let hex = encode_stop_set_hex(set);
+                if hex.len() > MAX_CONFIRM_HEX_LEN {
+                    return Err(RemoteDaemonError::NotSent(format!(
+                        "the work to stop is too large to pass to the installed build at {} \
+                         ({} bytes encoded, over the {MAX_CONFIRM_HEX_LEN}-byte limit), and that \
+                         build is too old to read it another way, so the daemon was not asked to \
+                         restart; restart it on that machine with `dot-agent-deck daemon restart`",
+                        self.binary(),
+                        hex.len()
+                    )));
+                }
+                args.push_str(" --confirm-hex ");
+                args.push_str(&hex);
+            }
         }
-        self.run_json(&args, self.restart_deadline)
+        let output = self.run_bounded_command_with(
+            &self.command(&args),
+            input.as_deref(),
+            self.restart_deadline,
+        )?;
+        parse_json_reply(output)
     }
 
     /// `<binary> --version` on the remote, classified exactly as `connect`'s
@@ -367,12 +415,32 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         command: &str,
         deadline: Duration,
     ) -> Result<crate::remote::SshOutput, RemoteDaemonError> {
-        let capped = self.executor.run_capped_within(
-            &self.target,
-            command,
-            REMOTE_DAEMON_REPLY_CAP,
-            deadline,
-        )?;
+        self.run_bounded_command_with(command, None, deadline)
+    }
+
+    /// [`Self::run_bounded_command`], with `input` written to the command's
+    /// stdin when there is one.
+    fn run_bounded_command_with(
+        &self,
+        command: &str,
+        input: Option<&[u8]>,
+        deadline: Duration,
+    ) -> Result<crate::remote::SshOutput, RemoteDaemonError> {
+        let capped = match input {
+            Some(input) => self.executor.run_capped_within_input(
+                &self.target,
+                command,
+                input,
+                REMOTE_DAEMON_REPLY_CAP,
+                deadline,
+            )?,
+            None => self.executor.run_capped_within(
+                &self.target,
+                command,
+                REMOTE_DAEMON_REPLY_CAP,
+                deadline,
+            )?,
+        };
         if capped.truncated {
             return Err(RemoteDaemonError::Malformed(format!(
                 "more than {REMOTE_DAEMON_REPLY_CAP} bytes"
@@ -393,30 +461,38 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         args: &str,
         deadline: Duration,
     ) -> Result<T, RemoteDaemonError> {
-        // A stream that reached the cap is not a reply this build wrote,
-        // whatever the exit status — and a remote that kept writing past it
-        // usually dies of the closed pipe, so its status says nothing useful.
-        let output = self.run_bounded(args, deadline)?;
-        // Remote-controlled text: scrubbed before it can reach a terminal.
-        let stderr = crate::remote::scrub_remote_text(output.stderr.trim());
-        if output.status == CLAP_USAGE_EXIT {
-            return Err(RemoteDaemonError::Unsupported { stderr });
-        }
-        if output.status != 0 {
-            return Err(RemoteDaemonError::Failed {
-                status: output.status,
-                stderr,
-            });
-        }
-        let line = output
-            .stdout
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .ok_or_else(|| RemoteDaemonError::Malformed("no output".into()))?;
-        serde_json::from_str(line).map_err(|e| RemoteDaemonError::Malformed(e.to_string()))
+        parse_json_reply(self.run_bounded(args, deadline)?)
     }
+}
+
+/// Parse the last non-empty stdout line of a plumbing command as `T`, after
+/// reading its exit status: a usage error is [`RemoteDaemonError::Unsupported`]
+/// and any other failure [`RemoteDaemonError::Failed`]. A stream that reached
+/// the cap was refused before this, whatever the exit status — and a remote
+/// that kept writing past it usually dies of the closed pipe, so its status
+/// says nothing useful.
+fn parse_json_reply<T: DeserializeOwned>(
+    output: crate::remote::SshOutput,
+) -> Result<T, RemoteDaemonError> {
+    // Remote-controlled text: scrubbed before it can reach a terminal.
+    let stderr = crate::remote::scrub_remote_text(output.stderr.trim());
+    if output.status == CLAP_USAGE_EXIT {
+        return Err(RemoteDaemonError::Unsupported { stderr });
+    }
+    if output.status != 0 {
+        return Err(RemoteDaemonError::Failed {
+            status: output.status,
+            stderr,
+        });
+    }
+    let line = output
+        .stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| RemoteDaemonError::Malformed("no output".into()))?;
+    serde_json::from_str(line).map_err(|e| RemoteDaemonError::Malformed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -425,9 +501,11 @@ mod tests {
     use crate::daemon_protocol::{AttachResponse, RestartAgent, RestartDaemonReply};
     use crate::remote::SshOutput;
 
-    /// Records each command and answers from a script.
+    /// Records each command, and what was written to its stdin, and answers
+    /// from a script.
     struct Scripted {
         commands: RefCell<Vec<String>>,
+        inputs: RefCell<Vec<Vec<u8>>>,
         reply: SshOutput,
     }
 
@@ -436,12 +514,25 @@ mod tests {
             self.commands.borrow_mut().push(command.to_string());
             Ok(self.reply.clone())
         }
+
+        fn run_capped_within_input(
+            &self,
+            target: &SshTarget,
+            command: &str,
+            input: &[u8],
+            max_capture_bytes: usize,
+            _deadline: Duration,
+        ) -> Result<crate::remote::CappedOutput, SshError> {
+            self.inputs.borrow_mut().push(input.to_vec());
+            self.run_capped(target, command, max_capture_bytes)
+        }
     }
 
     fn port(status: i32, stdout: &str, stderr: &str) -> SshDaemonPort<Scripted> {
         SshDaemonPort::new(
             Scripted {
                 commands: RefCell::new(Vec::new()),
+                inputs: RefCell::new(Vec::new()),
                 reply: SshOutput {
                     status,
                     stdout: stdout.to_string(),
@@ -459,6 +550,7 @@ mod tests {
         let line = serde_json::to_string(&DaemonProbe {
             running: true,
             hello: Some(hello.clone()),
+            confirm_stdin: false,
         })
         .unwrap();
         let p = port(0, &format!("noise\n{line}\n\n"), "");
@@ -523,6 +615,7 @@ mod tests {
         };
         let scripted = || Scripted {
             commands: RefCell::new(Vec::new()),
+            inputs: RefCell::new(Vec::new()),
             reply: SshOutput {
                 status: 0,
                 stdout: line.clone(),
@@ -585,6 +678,118 @@ mod tests {
             )
         );
         assert!(!commands[0].contains(';') && !commands[0].contains('\''));
+        assert!(p.executor.inputs.borrow().is_empty(), "nothing on stdin");
+    }
+
+    fn needs_confirmation_report() -> RemoteRestartReport {
+        RemoteRestartReport {
+            running: true,
+            reply: Some(RestartDaemonReply::NeedsConfirmation {
+                at_stake: RestartStopSet::default(),
+                stale: false,
+            }),
+            unsupported: false,
+        }
+    }
+
+    /// Scenario: the installed build's `daemon probe --json` reports that it
+    /// reads `--confirm-stdin`, and the stop set to confirm is larger than the
+    /// 128 KiB argument limit once hex-encoded. The restart command carries
+    /// `--confirm-stdin` and stays short, and the set's JSON is written to its
+    /// stdin (issue #1619).
+    #[test]
+    fn a_build_that_reads_stdin_is_sent_the_stop_set_there() {
+        let probe = serde_json::to_string(&DaemonProbe {
+            running: false,
+            hello: None,
+            confirm_stdin: true,
+        })
+        .unwrap();
+        let p = port(0, &probe, "");
+        assert!(p.probe().unwrap().confirm_stdin);
+
+        let report = needs_confirmation_report();
+        let p = SshDaemonPort {
+            executor: Scripted {
+                commands: RefCell::new(Vec::new()),
+                inputs: RefCell::new(Vec::new()),
+                reply: SshOutput {
+                    status: 0,
+                    stdout: serde_json::to_string(&report).unwrap(),
+                    stderr: String::new(),
+                },
+            },
+            ..p
+        };
+        let set = crate::daemon_restart::stop_set_over_the_argument_limit();
+        assert_eq!(
+            p.restart_installed(Some("0.46.0"), Some(&set)).unwrap(),
+            report
+        );
+        let commands = p.executor.commands.borrow();
+        assert_eq!(
+            commands.as_slice(),
+            [
+                "~/.local/bin/dot-agent-deck daemon restart-installed --json --expect-version 0.46.0 --confirm-stdin"
+            ]
+        );
+        let inputs = p.executor.inputs.borrow();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            crate::daemon_restart::read_stop_set(inputs[0].as_slice()).unwrap(),
+            set
+        );
+    }
+
+    /// Scenario: the installed build never said it reads `--confirm-stdin` —
+    /// it was not probed, it predates the flag, or the port was repointed at
+    /// another binary since. A small set still goes as `--confirm-hex`; one
+    /// whose encoding is past the argument limit is refused here, with nothing
+    /// run on the remote and a message naming the restart on that machine
+    /// (issue #1619).
+    #[test]
+    fn a_build_that_does_not_read_stdin_never_gets_the_flag() {
+        let probe = serde_json::to_string(&DaemonProbe {
+            running: false,
+            hello: None,
+            confirm_stdin: true,
+        })
+        .unwrap();
+        let p = port(0, &probe, "");
+        p.probe().unwrap();
+        p.set_binary(RemoteDeckBinary::try_from("/opt/homebrew/bin/dot-agent-deck").unwrap());
+        let big = crate::daemon_restart::stop_set_over_the_argument_limit();
+        match p.restart_installed(Some("0.46.0"), Some(&big)) {
+            Err(RemoteDaemonError::NotSent(why)) => assert!(
+                why.contains("/opt/homebrew/bin/dot-agent-deck")
+                    && why.contains("dot-agent-deck daemon restart"),
+                "{why}"
+            ),
+            other => panic!("expected the oversized set to be refused here, got {other:?}"),
+        }
+        assert_eq!(
+            p.executor.commands.borrow().len(),
+            1,
+            "only the probe ran: {:?}",
+            p.executor.commands.borrow()
+        );
+
+        let small = RestartStopSet {
+            agents: vec![RestartAgent {
+                id: "a1".into(),
+                label: "one".into(),
+                pane_id: None,
+                cwd: None,
+            }],
+            roles: vec![],
+        };
+        let _ = p.restart_installed(Some("0.46.0"), Some(&small));
+        let commands = p.executor.commands.borrow();
+        assert!(
+            commands[1].ends_with(&format!("--confirm-hex {}", encode_stop_set_hex(&small))),
+            "{commands:?}"
+        );
+        assert!(p.executor.inputs.borrow().is_empty(), "nothing on stdin");
     }
 
     /// PRD #1487 audit A1: the production executor shape — the upgrade path's
@@ -656,6 +861,116 @@ mod tests {
                 ),
                 other => panic!("expected the deadline to stop the command, got {other:?}"),
             }
+        }
+
+        /// Scenario: through the production executor, a remote whose probe
+        /// reports `--confirm-stdin` is asked to restart with a stop set past
+        /// the 128 KiB argument limit once hex-encoded. The stand-in `ssh`
+        /// saves its stdin and its last argument, as a remote shell would get
+        /// them: the whole set arrives on stdin, more than a pipe buffer of it,
+        /// and the command is short (issue #1619).
+        #[test]
+        fn a_stop_set_past_the_argument_limit_reaches_the_remote_on_stdin() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let d = dir.path();
+            let probe = serde_json::to_string(&DaemonProbe {
+                running: true,
+                hello: None,
+                confirm_stdin: true,
+            })
+            .unwrap();
+            std::fs::write(d.join("probe.json"), probe).unwrap();
+            let report = needs_confirmation_report();
+            std::fs::write(
+                d.join("report.json"),
+                serde_json::to_string(&report).unwrap(),
+            )
+            .unwrap();
+            let body = format!(
+                "dir='{}'\nfor last; do :; done\n\
+                 case \"$last\" in\n\
+                 *'daemon probe'*) cat \"$dir/probe.json\" ;;\n\
+                 *restart-installed*) cat > \"$dir/stdin\"; \
+                 printf '%s' \"$last\" > \"$dir/command\"; cat \"$dir/report.json\" ;;\n\
+                 esac",
+                d.display()
+            );
+            let p = port_running(d, &body)
+                .with_deadlines(Duration::from_secs(20), Duration::from_secs(20));
+            let probed = p.probe().unwrap();
+            assert!(probed.confirm_stdin, "{probed:?}");
+            let set = crate::daemon_restart::stop_set_over_the_argument_limit();
+            let started = Instant::now();
+            assert_eq!(
+                p.restart_installed(Some("0.46.0"), Some(&set)).unwrap(),
+                report
+            );
+            assert!(started.elapsed() < MUST_RETURN_WITHIN);
+            let command = std::fs::read_to_string(d.join("command")).unwrap();
+            assert_eq!(
+                command,
+                "~/.local/bin/dot-agent-deck daemon restart-installed --json --expect-version 0.46.0 --confirm-stdin"
+            );
+            let stdin = std::fs::read(d.join("stdin")).unwrap();
+            assert!(stdin.len() > 64 * 1024, "{} bytes", stdin.len());
+            assert_eq!(
+                crate::daemon_restart::read_stop_set(stdin.as_slice()).unwrap(),
+                set
+            );
+        }
+
+        /// Scenario: a remote restart command that answers and exits without
+        /// reading the stop set written to its stdin, leaving behind a
+        /// descendant that holds that stdin and reads it only three seconds
+        /// later. The call returns at once rather than when the payload is
+        /// consumed, and the writer has stopped by the time the descendant
+        /// reads: it gets what fit in the pipe, then end of input, not the
+        /// whole set. A writer still blocked would deliver all of it
+        /// (issue #1619).
+        #[test]
+        fn a_remote_that_never_reads_its_stdin_stops_the_writer() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let d = dir.path();
+            let report = needs_confirmation_report();
+            let line = serde_json::to_string(&report).unwrap();
+            std::fs::write(d.join("report.json"), line).unwrap();
+            let count = d.join("count");
+            let body = format!(
+                // A background job's stdin is `/dev/null` unless it is
+                // handed one explicitly, so the pipe goes through fd 3.
+                "exec 3<&0\n\
+                 (sleep 3; wc -c <&3 > '{count}.tmp'; mv '{count}.tmp' '{count}') >/dev/null 2>&1 &\n\
+                 exec cat '{report}' </dev/null 3<&-",
+                count = count.display(),
+                report = d.join("report.json").display()
+            );
+            let p = port_running(d, &body);
+            p.confirm_stdin.set(true);
+            let set = crate::daemon_restart::stop_set_over_the_argument_limit();
+            let payload = serde_json::to_vec(&set).unwrap().len();
+            let started = Instant::now();
+            assert_eq!(
+                p.restart_installed(Some("0.46.0"), Some(&set)).unwrap(),
+                report
+            );
+            assert!(
+                started.elapsed() < DEADLINE,
+                "the unread payload held the call: {:?}",
+                started.elapsed()
+            );
+            let until = Instant::now() + Duration::from_secs(15);
+            while !count.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let read: usize = std::fs::read_to_string(&count)
+                .expect("the descendant reached end of input")
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(
+                read < payload,
+                "the writer kept writing after the call returned: {read} of {payload} bytes"
+            );
         }
 
         /// Scenario: the remote command prints without end on stdout. The
@@ -770,6 +1085,7 @@ mod tests {
             let line = serde_json::to_string(&DaemonProbe {
                 running: false,
                 hello: None,
+                confirm_stdin: false,
             })
             .unwrap();
             let p = port_running(dir.path(), &format!("printf '%s\\n' '{line}'"));
@@ -829,6 +1145,7 @@ mod tests {
             let line = serde_json::to_string(&DaemonProbe {
                 running: false,
                 hello: None,
+                confirm_stdin: false,
             })
             .unwrap();
             let p = port_running(
