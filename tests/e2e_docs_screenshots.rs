@@ -894,9 +894,10 @@ fn docs_screenshot_host_metrics() {
     capture(&deck, "host-metrics", |grid| {
         grid.contains("Host of this deck")
             && grid.contains("0.42 across 16 cores")
-            && grid
-                .lines()
-                .any(|line| line.contains("Sample age") && line.trim_end().ends_with(" 0 ms"))
+            && grid.lines().any(|line| {
+                // The grid retains the overlay's right border after the value.
+                line.contains("Sample age") && line.trim_end_matches([' ', '│']).ends_with(" 0 ms")
+            })
     });
 }
 
