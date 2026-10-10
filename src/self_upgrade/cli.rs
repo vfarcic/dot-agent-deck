@@ -215,6 +215,9 @@ impl Host for CliHost {
     fn is_wsl(&self) -> bool {
         self.inner.is_wsl()
     }
+    fn cancelled(&self) -> bool {
+        self.interrupt.is_set()
+    }
 }
 
 /// The CLI's `SIGINT`/`SIGTERM` handler, installed while it upgrades a copy.
@@ -438,8 +441,12 @@ async fn upgrade_each(
 /// [`execute::execute`] on a blocking thread: its subprocesses and file work
 /// block there, and its downloads are driven through the current runtime's
 /// handle. Once `interrupt` is set while it waits on a download, the upgrade
-/// is dropped there, before it changed anything ([`UpgradeError::Cancelled`]);
-/// its commands see the interruption through the host.
+/// is dropped there, before the installed copy is changed
+/// ([`UpgradeError::Cancelled`]); its private staging directory is then
+/// removed on a best-effort basis. The `select!` cannot interrupt the
+/// synchronous work after the downloads, so that work sees the interruption
+/// through the host: its commands are refused, and [`Host::cancelled`] stops
+/// it right before it would rename the new copy into place.
 async fn execute_blocking(
     host: Arc<dyn Host>,
     plan: UpgradePlan,

@@ -412,10 +412,14 @@ impl Outcome {
 /// `staging_root` is where this upgrade creates its private staging
 /// directory ([`super::plan::PlanOptions::staging_root`]).
 ///
-/// Every await in it is a download, before anything is changed, so a client
-/// may drop it at an await to cancel the upgrade (the CLI does,
+/// Every await in it is a download, before the installed copy is changed, so
+/// a client may drop it at an await to cancel the upgrade (the CLI does,
 /// [`super::cli`]). Keep it so: an await after a change would let a drop
-/// abandon an upgrade half done.
+/// abandon an upgrade half done. A drop there leaves this upgrade's private
+/// staging directory, whose removal is best effort. Past the downloads, a
+/// cancellation is seen through `host`: its commands are refused, and
+/// [`Host::cancelled`] is asked right before each rename that installs the
+/// new copy.
 pub async fn execute(
     host: &dyn Host,
     plan: &UpgradePlan,
@@ -461,9 +465,13 @@ pub async fn execute(
             let staging = Staging::create(staging_root, version)?;
             let downloaded =
                 download_verified(host, source, version, asset, provenance, staging.dir()).await?;
-            atomic_replace(target, &downloaded.bytes, &downloaded.sha256, |candidate| {
-                verify::verify_binary_version(host, candidate, version)
-            })?;
+            atomic_replace(
+                host,
+                target,
+                &downloaded.bytes,
+                &downloaded.sha256,
+                |candidate| verify::verify_binary_version(host, candidate, version),
+            )?;
             Ok(Outcome::Replaced {
                 path: target.clone(),
                 version: version.to_string(),
@@ -990,12 +998,14 @@ fn set_mode(_file: &std::fs::File, _mode: u32) -> std::io::Result<()> {
 /// Replace `target` with `bytes` atomically: write a temporary file in the
 /// same directory, fsync it, run `check` on it (the new binary's `--version`),
 /// hash it again against `sha256`, and only then rename it over `target` and
-/// fsync the directory. On any failure the temporary file is removed and
-/// `target` is left as it was.
+/// fsync the directory. On any failure, a cancellation through `host` seen
+/// just before the rename included ([`UpgradeError::Cancelled`]), the
+/// temporary file is removed and `target` is left as it was.
 ///
 /// The replaced binary's mode is not preserved: the new file is always
 /// written `0o755`, whatever `target`'s mode was.
 pub fn atomic_replace(
+    host: &dyn Host,
     target: &Path,
     bytes: &[u8],
     sha256: &str,
@@ -1013,6 +1023,11 @@ pub fn atomic_replace(
         write_new_file(&temp, bytes, 0o755)?;
         check(&temp)?;
         verify::rehash(&temp, sha256)?;
+        // The check and the hash run no command a cancellation could refuse,
+        // so ask here, last thing before the rename.
+        if host.cancelled() {
+            return Err(UpgradeError::Cancelled);
+        }
         std::fs::rename(&temp, target)?;
         #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
@@ -1308,6 +1323,13 @@ fn swap_from_mount(
         let _ = std::fs::remove_dir_all(&incoming);
         return Err(e);
     }
+    // The last point the swap can stop at: past it, the two renames and any
+    // rollback run to the end, and nothing asks about a cancellation again,
+    // so an app is never left half swapped.
+    if host.cancelled() {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return Err(UpgradeError::Cancelled);
+    }
     if let Err(e) = std::fs::rename(app, &outgoing) {
         let _ = std::fs::remove_dir_all(&incoming);
         return Err(e.into());
@@ -1334,16 +1356,22 @@ mod tests {
         let target = dir.path().join("dot-agent-deck");
         std::fs::write(&target, b"old").unwrap();
         let mut checked = None;
-        atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |candidate| {
-            assert_eq!(std::fs::read(candidate).unwrap(), b"new");
-            assert_eq!(
-                candidate.parent(),
-                target.parent(),
-                "the temp file is in the same directory"
-            );
-            checked = Some(candidate.to_path_buf());
-            Ok(())
-        })
+        atomic_replace(
+            &FakeHost::new(),
+            &target,
+            b"new",
+            &verify::sha256_hex(b"new"),
+            |candidate| {
+                assert_eq!(std::fs::read(candidate).unwrap(), b"new");
+                assert_eq!(
+                    candidate.parent(),
+                    target.parent(),
+                    "the temp file is in the same directory"
+                );
+                checked = Some(candidate.to_path_buf());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert!(!checked.unwrap().exists());
@@ -1361,12 +1389,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dot-agent-deck");
         std::fs::write(&target, b"old").unwrap();
-        let err = atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |_| {
-            Err(UpgradeError::VersionMismatch {
-                expected: "0.46.0".into(),
-                actual: "v0.45.0".into(),
-            })
-        })
+        let err = atomic_replace(
+            &FakeHost::new(),
+            &target,
+            b"new",
+            &verify::sha256_hex(b"new"),
+            |_| {
+                Err(UpgradeError::VersionMismatch {
+                    expected: "0.46.0".into(),
+                    actual: "v0.45.0".into(),
+                })
+            },
+        )
         .unwrap_err();
         assert!(matches!(err, UpgradeError::VersionMismatch { .. }));
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
@@ -1714,6 +1748,9 @@ mod tests {
         fn is_wsl(&self) -> bool {
             self.inner.is_wsl()
         }
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     /// Scenario: the user cancels the app upgrade while Gatekeeper assesses
@@ -1763,6 +1800,95 @@ mod tests {
             host.refused.lock().unwrap()
         );
         assert!(!ran.iter().any(|line| line.starts_with(DITTO)), "{ran:?}");
+    }
+
+    /// Scenario: the user cancels the upgrade while the new binary is checked
+    /// and hashed a last time, a moment no command is running to refuse. The
+    /// rename that would install it does not happen: the target is
+    /// byte-for-byte the old binary, no temporary file is left beside it, and
+    /// the upgrade says it was cancelled.
+    #[test]
+    fn execute_035_a_cancellation_during_the_final_rehash_leaves_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dot-agent-deck");
+        std::fs::write(&target, b"old").unwrap();
+        let temp = dir
+            .path()
+            .join(format!(".dot-agent-deck.upgrade-{}", std::process::id()));
+        let mut host = FakeHost::new();
+        let cancel = host.cancel.clone();
+        host = host.handle(&temp.to_string_lossy(), move |args| {
+            assert_eq!(args, ["--version"]);
+            // The probe answers, and the user cancels as it returns.
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            ok("dot-agent-deck 0.46.0\n")
+        });
+        let err = atomic_replace(
+            &host,
+            &target,
+            b"new",
+            &verify::sha256_hex(b"new"),
+            |candidate| verify::verify_binary_version(&host, candidate, "0.46.0"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpgradeError::Cancelled), "{err:?}");
+        assert_eq!(host.ran().len(), 1, "the probe ran: {:?}", host.ran());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["dot-agent-deck"], "no temporary file is left");
+    }
+
+    /// Scenario: the user cancels the app upgrade once the new app is copied
+    /// next to the installed one and its copy has passed the last check, just
+    /// before the two renames that swap it in. The installed app is
+    /// byte-for-byte unchanged, the copy is removed, the upgrade says it was
+    /// cancelled, and the release's disk image is still detached.
+    #[test]
+    fn execute_036_a_cancellation_before_the_app_commit_leaves_the_app() {
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let mut host = with_version_answer(fake_mac("TEAM123", true), &work.join("mount"));
+        let codesign = host.handlers.remove(CODESIGN).unwrap();
+        let cancel = host.cancel.clone();
+        host = host.handle_io(CODESIGN, move |args| {
+            let result = codesign(args);
+            // The copy's Team ID is the last check before the swap: the user
+            // cancels as it returns.
+            if args[0] == "-dv" && args.iter().any(|arg| arg.contains(".upgrade-")) {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        });
+        let err = swap_app(
+            &host,
+            Path::new("/s/x.dmg"),
+            &app,
+            "TEAM123",
+            "0.46.0",
+            &work,
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpgradeError::Cancelled), "{err:?}");
+        let ran = host.ran();
+        assert!(ran.iter().any(|line| line.starts_with(DITTO)), "{ran:?}");
+        assert_eq!(
+            std::fs::read(app.join("Contents/MacOS").join(CLI_BINARY)).unwrap(),
+            b"old"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(app.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [DESKTOP_APP_BUNDLE], "the copy is removed");
+        assert!(
+            ran.iter()
+                .any(|line| line.starts_with(&format!("{HDIUTIL} detach"))),
+            "the image was not detached: ran {ran:?}"
+        );
     }
 
     #[test]
@@ -2227,12 +2353,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dot-agent-deck");
         std::fs::write(&target, b"old").unwrap();
-        let err = atomic_replace(&target, b"new", &verify::sha256_hex(b"new"), |candidate| {
-            // Another process swaps the checked file before the rename.
-            std::fs::remove_file(candidate).unwrap();
-            std::fs::write(candidate, b"evil").unwrap();
-            Ok(())
-        })
+        let err = atomic_replace(
+            &FakeHost::new(),
+            &target,
+            b"new",
+            &verify::sha256_hex(b"new"),
+            |candidate| {
+                // Another process swaps the checked file before the rename.
+                std::fs::remove_file(candidate).unwrap();
+                std::fs::write(candidate, b"evil").unwrap();
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(matches!(err, UpgradeError::StagedChanged { .. }), "{err:?}");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");

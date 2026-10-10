@@ -165,6 +165,14 @@ pub trait Host: Send + Sync {
     fn home(&self) -> Option<PathBuf>;
     /// Whether this is Linux running under WSL.
     fn is_wsl(&self) -> bool;
+    /// Whether the user has cancelled the upgrade. Asked by the install work
+    /// that runs no command right before it changes the installed copy (a
+    /// rename), so a cancellation that arrived during synchronous work, such
+    /// as the last hash, still stops it there. False for a client that does
+    /// not cancel; the CLI's [`cli::CliHost`] reads its interruption.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// [`Host`] for the machine this process runs on.
@@ -754,9 +762,9 @@ pub enum UpgradeError {
     Io(String),
     #[error("This install is not upgraded from here: {0}")]
     NotActionable(String),
-    /// The user cancelled the upgrade while it downloaded the release, before
-    /// it changed anything.
-    #[error("The upgrade was cancelled while it downloaded the release. Nothing was changed.")]
+    /// The user cancelled the upgrade while it downloaded the release, or
+    /// later but before it changed the installed copy.
+    #[error("The upgrade was cancelled before it changed the installed copy. Nothing was changed.")]
     Cancelled,
     /// `error` stopped the app swap, and the release's disk image could not
     /// be detached afterwards: it is still attached at `mount`.
@@ -1374,6 +1382,9 @@ pub(crate) mod test_host {
         pub log: Mutex<Vec<String>>,
         /// Each command line run, with the bound it was given.
         pub bounds: Mutex<Vec<(String, std::time::Duration)>>,
+        /// What [`Host::cancelled`] answers. Shared, so a handler can cancel
+        /// the upgrade while it runs.
+        pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     pub fn ok(stdout: &str) -> CommandOutput {
@@ -1548,6 +1559,9 @@ pub(crate) mod test_host {
 
         fn is_wsl(&self) -> bool {
             self.wsl
+        }
+        fn cancelled(&self) -> bool {
+            self.cancel.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 }
