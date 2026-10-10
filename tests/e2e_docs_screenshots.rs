@@ -78,8 +78,24 @@ fn launch_fixture_with(
         let pid = deck
             .child_pid()
             .expect("the PTY backend reports the deck's pid");
-        let environ = std::fs::read(format!("/proc/{pid}/environ"))
-            .unwrap_or_else(|e| panic!("read the deck's environment: {e}"));
+        // portable-pty's `pre_exec` closes every fd above 2, std's
+        // close-on-exec status pipe included, so `spawn` can return while
+        // the child is still the fork of this test process and its environ
+        // is this process's own, ambient `ANTHROPIC_API_KEY` and all. Read it
+        // only once the pid runs another binary and has an environment: an
+        // environ read between the exec's mm switch and its argument setup
+        // is empty, which would pass the check below without proving it.
+        let test_exe = std::env::current_exe().expect("this test's executable");
+        let read_environ = || std::fs::read(format!("/proc/{pid}/environ"));
+        let execed = common::wait_until(Duration::from_secs(10), || {
+            std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe != test_exe)
+                && read_environ().is_ok_and(|env| !env.is_empty())
+        });
+        assert!(
+            execed,
+            "the deck process (pid {pid}) never exec'd its binary"
+        );
+        let environ = read_environ().unwrap_or_else(|e| panic!("read the deck's environment: {e}"));
         for entry in environ.split(|b| *b == 0) {
             for key in common::AGENT_CREDENTIAL_ENV {
                 assert!(

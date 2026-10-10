@@ -176,13 +176,15 @@ function frame(kind: number, payload: unknown): Buffer {
   return Buffer.concat([header, body]);
 }
 
+type AttachResponse = { ok?: boolean; error?: string; applied_cols?: number; applied_rows?: number };
+
 /**
  * Send one request on a fresh connection to the daemon's attach socket and
  * resolve with the socket once the daemon's response frame says ok. Anything
  * after the response — an attach stream's replay and live output — is read and
  * dropped, so the daemon never blocks writing to this client.
  */
-function request(socketPath: string, payload: unknown): Promise<Socket> {
+function request(socketPath: string, payload: unknown, onResponse?: (response: AttachResponse) => void): Promise<Socket> {
   return new Promise((settle, fail) => {
     const socket = connect(socketPath);
     let buffered = Buffer.alloc(0);
@@ -204,12 +206,13 @@ function request(socketPath: string, payload: unknown): Promise<Socket> {
       if (buffered.length < 5 + length) return;
       answered = true;
       clearTimeout(timer);
-      const response = JSON.parse(buffered.subarray(5, 5 + length).toString()) as { ok?: boolean; error?: string };
+      const response = JSON.parse(buffered.subarray(5, 5 + length).toString()) as AttachResponse;
       if (buffered[0] !== KIND_RESP || !response.ok) {
         socket.destroy();
         fail(new Error(`the daemon refused ${JSON.stringify(payload)}: ${JSON.stringify(response)}`));
         return;
       }
+      onResponse?.(response);
       settle(socket);
     });
   });
@@ -626,6 +629,22 @@ export class Deck {
   /** Issue #1457 — every mounted terminal's grid as `[cols, rows]`. */
   async grids(): Promise<[number, number][]> {
     return (await this.terminalScreens()).map(({ cols, rows }) => [cols, rows]);
+  }
+
+  /** Read the daemon's applied grid without contributing a viewport or claiming focus. */
+  async appliedGrid(agentId: string): Promise<[number, number]> {
+    let applied: AttachResponse = {};
+    const stream = await request(this.env.DOT_AGENT_DECK_ATTACH_SOCKET as string, {
+      op: "attach-stream",
+      id: agentId,
+      // With neither rows/cols nor geometry_updates, this subscribes without
+      // registering a viewer constraint (AgentPtyRegistry's legacy observer).
+    }, (response) => { applied = response; });
+    stream.destroy();
+    if (!applied.applied_cols || !applied.applied_rows) {
+      throw new Error(`the daemon reported no applied grid for ${agentId}: ${JSON.stringify(applied)}`);
+    }
+    return [applied.applied_cols, applied.applied_rows];
   }
 
   /**

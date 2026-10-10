@@ -29,16 +29,53 @@ export const DECK_BIN = "dot-agent-deck";
 export const DECK_EXE_ENV = "DOT_AGENT_DECK_EXE";
 
 /**
- * The CLI the extension shells: the deck's own absolute path from
- * {@link DECK_EXE_ENV} when the deck set one, otherwise the bare
- * {@link DECK_BIN} — so an older deck that sets nothing keeps working exactly
- * as before. The value is used verbatim (argv exec, no shell), so a path with
- * spaces needs no quoting. `env` is a parameter rather than `process.env` so
- * this module stays import- and global-free and unit-testable.
+ * The operator's override, honoured by every hook command and bundled plugin
+ * the deck ships (`platform::paths::DOT_AGENT_DECK_BIN` on the Rust side, PRD
+ * #1497). The deck never sets it; the `task run-all` sandbox exports it so an
+ * agent there reports through the build under test. MUST stay in sync with
+ * that constant.
+ *
+ * It selects the executable the extension runs, so it is honoured only when it
+ * is an absolute path (see {@link isAbsoluteOverride}): a bare name would be
+ * looked up in Pi's `$PATH` and a relative path against its working directory,
+ * the exposure issue #536 removed.
  */
-export function resolveDeckBin(env: Readonly<Record<string, string | undefined>>): string {
+export const DECK_BIN_OVERRIDE_ENV = "DOT_AGENT_DECK_BIN";
+
+/**
+ * Whether `value` is an absolute path on `platform` (a `process.platform`
+ * value), the only form {@link DECK_BIN_OVERRIDE_ENV} is honoured in. Checked
+ * verbatim, with no trimming, exactly as the deck's hook commands and its
+ * OpenCode plugin check it: `/…` off Windows; a drive-qualified `C:\…` or a
+ * UNC `\\…` on it.
+ */
+export function isAbsoluteOverride(value: string, platform: string): boolean {
+	return platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(value) : value.startsWith("/");
+}
+
+/**
+ * The CLI the extension shells: the operator's override from
+ * {@link DECK_BIN_OVERRIDE_ENV} when it is an absolute path, else the deck's
+ * own absolute path from {@link DECK_EXE_ENV} when the deck set one, otherwise
+ * the bare {@link DECK_BIN} — so an older deck that sets nothing keeps working
+ * exactly as before. The value is used verbatim (argv exec, no shell), so a
+ * path with spaces needs no quoting. `env` and `platform` are parameters
+ * rather than `process.env` and `process.platform` so this module stays
+ * import- and global-free and unit-testable.
+ */
+export function resolveDeckBin(
+	env: Readonly<Record<string, string | undefined>>,
+	platform: string,
+): string {
+	const override = env[DECK_BIN_OVERRIDE_ENV];
+	if (typeof override === "string" && isAbsoluteOverride(override, platform)) {
+		return override;
+	}
 	const exe = env[DECK_EXE_ENV];
-	return typeof exe === "string" && exe.trim().length > 0 ? exe : DECK_BIN;
+	if (typeof exe === "string" && exe.trim().length > 0) {
+		return exe;
+	}
+	return DECK_BIN;
 }
 
 /**
@@ -142,6 +179,32 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
 
 /**
+ * The `agent-event` flags that announce a settled turn's final reply (PRD
+ * #1497): the reply itself comes on the CLI's stdin, and the second flag says
+ * the message it came from ended in an error. The deck reads a short summary
+ * of it aloud while reading mode is on.
+ *
+ * The text never goes on the command line, where any local user who can list
+ * processes could read it (`/proc/<pid>/cmdline`). `pi.exec` spawns with stdin
+ * ignored and takes no stdin option (Pi 0.84.4 and 1.1.0), so a report that
+ * carries a reply is spawned by {@link execWithStdin} instead.
+ */
+export const TURN_REPLY_STDIN_FLAG = "--turn-reply-stdin";
+export const TURN_REPLY_FAILED_FLAG = "--turn-reply-failed";
+
+/**
+ * The longest reply written to the CLI's stdin, in UTF-8 bytes: what the deck
+ * keeps of a reply (`MAX_TURN_REPLY_BYTES`), so nothing past it is ever sent.
+ */
+export const MAX_TURN_REPLY_BYTES = 8192;
+
+/** A settled turn's final reply, as the extension reports it. */
+export interface TurnReply {
+	text: string;
+	failed: boolean;
+}
+
+/**
  * Build the argv for `dot-agent-deck agent-event`. Rejects any type the CLI
  * does not accept so a bogus `--type` can never reach it, and appends each
  * non-blank detail as its own flag in a fixed order. With no detail, a
@@ -156,6 +219,7 @@ export function buildAgentEventArgv(
 	type: string,
 	detail: AgentEventDetail = {},
 	declarePromptReports = false,
+	reply?: TurnReply,
 ): string[] {
 	if (!isAgentEventType(type)) {
 		throw new Error(
@@ -183,6 +247,16 @@ export function buildAgentEventArgv(
 	for (const [flag, value] of flags) {
 		if (typeof value === "string" && value.trim().length > 0) {
 			argv.push(`${flag}=${value}`);
+		}
+	}
+	// PRD #1497: LAST, and only on a report that carries a reply (an empty
+	// one included: the turn ended with nothing to read) — an older CLI's
+	// refusal of it is handled by `createReporter`, which drops the reply
+	// first. Only the flags: the text goes on stdin (`turnReplyStdin`).
+	if (turnReplyStdin(reply) !== undefined) {
+		argv.push(TURN_REPLY_STDIN_FLAG);
+		if (reply!.failed) {
+			argv.push(TURN_REPLY_FAILED_FLAG);
 		}
 	}
 	return argv;
@@ -306,6 +380,21 @@ export type DetailEvent = (typeof DETAIL_EVENTS)[number];
  */
 export const MAX_PROMPT_CHARS = 4000;
 
+/** Cut `text` to at most `max` UTF-8 bytes, never splitting a code point. */
+function clipUtf8(text: string, max: number): string {
+	let bytes = 0;
+	let end = 0;
+	for (const char of text) {
+		const size = char.codePointAt(0)! < 0x80 ? 1 : char.codePointAt(0)! < 0x800 ? 2 : char.codePointAt(0)! < 0x10000 ? 3 : 4;
+		if (bytes + size > max) {
+			return text.slice(0, end);
+		}
+		bytes += size;
+		end += char.length;
+	}
+	return text;
+}
+
 /** Cut `text` to at most `max` code points, never splitting a surrogate pair. */
 function clip(text: string, max: number): string {
 	const chars = Array.from(text);
@@ -356,10 +445,91 @@ export function piToolDetail(toolName: string, args: unknown): string | undefine
 	}
 }
 
+/**
+ * The final reply in one of Pi's messages (PRD #1497): the text blocks of an
+ * assistant message, joined, with its thinking and tool calls left out, and
+ * `failed` when the message ended in an error (`stopReason: "error"`). An
+ * errored message with no text carries its `errorMessage` instead. `undefined`
+ * for any other message, and for one with nothing to read.
+ */
+export function piAssistantReply(message: unknown): TurnReply | undefined {
+	const record = asRecord(message);
+	if (!record || record.role !== "assistant") {
+		return undefined;
+	}
+	const blocks = Array.isArray(record.content) ? record.content : [];
+	const text = blocks
+		.map((block) => asRecord(block))
+		.filter((block): block is Record<string, unknown> => block !== null && block.type === "text")
+		.map((block) => nonBlankString(block.text)?.trim())
+		.filter((part): part is string => part !== undefined)
+		.join("\n\n");
+	const failed = record.stopReason === "error";
+	const said = text.length > 0 ? text : failed ? nonBlankString(record.errorMessage)?.trim() : undefined;
+	return said === undefined ? undefined : { text: clipUtf8(said, MAX_TURN_REPLY_BYTES), failed };
+}
+
+/**
+ * The stdin a report carrying `reply` writes for {@link TURN_REPLY_STDIN_FLAG}:
+ * its text, at most {@link MAX_TURN_REPLY_BYTES} — empty for a reply with
+ * nothing to read, which the deck takes as the turn ending with no reply — or
+ * `undefined` when the report carries no reply, in which case no reply flag
+ * is sent either.
+ */
+export function turnReplyStdin(reply: TurnReply | undefined): string | undefined {
+	if (reply === undefined) {
+		return undefined;
+	}
+	return reply.text.trim().length > 0 ? clipUtf8(reply.text, MAX_TURN_REPLY_BYTES) : "";
+}
+
+/**
+ * Keeps the last assistant reply of the run Pi is in, for its `agent_settled`
+ * report (PRD #1497). `observe` is handed every `agent_start` and
+ * `message_end` in the order Pi emits them: a run starting forgets the last
+ * run's reply, and each assistant message replaces the one before, so what
+ * `take` answers at `agent_settled` is the run's final reply. An assistant
+ * message with nothing to read (only thinking or tool calls, empty, or an
+ * error with no message) replaces it too, with an empty reply: the commentary
+ * an earlier message carried is not the turn's reply, and the deck is told
+ * the turn ended with nothing to read (audit A2). `take` answers `undefined`
+ * only when no run or assistant message was seen since the last `take`, and
+ * clears what it answers, so each turn end is reported once.
+ */
+export function createTurnReplyTracker(): {
+	observe: (eventName: string, event: unknown) => void;
+	take: () => TurnReply | undefined;
+} {
+	let last: TurnReply | undefined;
+	let ran = false;
+	return {
+		observe(eventName, event) {
+			if (eventName === "agent_start") {
+				last = undefined;
+				ran = true;
+			} else if (eventName === "message_end") {
+				const message = asRecord(event)?.message;
+				if (asRecord(message)?.role === "assistant") {
+					last = piAssistantReply(message) ?? { text: "", failed: asRecord(message)?.stopReason === "error" };
+					ran = true;
+				}
+			}
+		},
+		take() {
+			const reply = ran ? (last ?? { text: "", failed: false }) : undefined;
+			last = undefined;
+			ran = false;
+			return reply;
+		},
+	};
+}
+
 /** What the extension reports for one Pi event: the `--type` and its detail. */
 export interface AgentEventReport {
 	type: AgentEventType;
 	detail: AgentEventDetail;
+	/** A settled turn's final reply (PRD #1497), on `agent_settled` only. */
+	reply?: TurnReply;
 }
 
 /**
@@ -371,7 +541,12 @@ export interface AgentEventReport {
  * `agent_start` that follows still moves the card to Thinking — and so does an
  * `input` Pi is not going to queue (see the `input` arm).
  */
-export function piEventReport(eventName: string, event: unknown, cwd: string | undefined): AgentEventReport | null {
+export function piEventReport(
+	eventName: string,
+	event: unknown,
+	cwd: string | undefined,
+	reply?: TurnReply,
+): AgentEventReport | null {
 	const detail: AgentEventDetail = {};
 	const dir = nonBlankString(cwd);
 	if (dir !== undefined) {
@@ -379,7 +554,8 @@ export function piEventReport(eventName: string, event: unknown, cwd: string | u
 	}
 	const state = piEventToAgentState(eventName);
 	if (state) {
-		return { type: state, detail };
+		// PRD #1497: only the settled turn carries its reply.
+		return eventName === "agent_settled" && reply !== undefined ? { type: state, detail, reply } : { type: state, detail };
 	}
 	const payload = asRecord(event) ?? {};
 	switch (eventName) {
@@ -444,12 +620,15 @@ export type ReportLevel = (typeof REPORT_LEVELS)[number];
 
 /**
  * The argv for `report` at `level`, or `null` when that level has nothing to
- * send for it — a detail report at `lifecycle`.
+ * send for it — a detail report at `lifecycle`. The report's reply (PRD
+ * #1497) is added only with `withReply`, and only at `declared`: the CLI that
+ * takes it is newer than the declaration, so a deck that cannot take the
+ * declaration cannot take the reply either.
  */
-export function reportArgvAt(report: AgentEventReport, level: ReportLevel): string[] | null {
+export function reportArgvAt(report: AgentEventReport, level: ReportLevel, withReply = false): string[] | null {
 	switch (level) {
 		case "declared":
-			return buildAgentEventArgv(report.type, report.detail, true);
+			return buildAgentEventArgv(report.type, report.detail, true, withReply ? report.reply : undefined);
 		case "detail":
 			return buildAgentEventArgv(report.type, report.detail);
 		case "lifecycle":
@@ -486,25 +665,46 @@ export class DeckExecError extends Error {
  * level alone and retries a lifecycle report once, bare, so the card keeps its
  * status. Every report is best-effort: nothing here throws. `signal` is handed
  * to every `run` for that report.
+ *
+ * A settled turn's reply (PRD #1497) rides on top of whatever level the
+ * session is at. The reply flags are the newest the extension sends, so a CLI
+ * that refuses any flag of a report carrying a reply cannot take the reply:
+ * the first such refusal drops the reply for the rest of the session and
+ * sends the report again at the same level, and only a refusal of that steps
+ * the level down. The levels themselves move exactly as they did before. A
+ * report carrying the reply hands `run` its text as `stdin`
+ * ({@link turnReplyStdin}); every other report hands it none.
  */
-export function createReporter(run: (argv: string[], signal?: AbortSignal) => Promise<unknown>): {
+export function createReporter(
+	run: (argv: string[], signal?: AbortSignal, stdin?: string) => Promise<unknown>,
+): {
 	send: (report: AgentEventReport, signal?: AbortSignal) => Promise<void>;
 	level: () => ReportLevel;
+	replies: () => boolean;
 } {
 	let level: ReportLevel = "declared";
+	let replies = true;
 	const send = async (report: AgentEventReport, signal?: AbortSignal): Promise<void> => {
 		let tried: ReportLevel | null = level;
+		let withReply = replies && report.reply !== undefined;
 		while (tried !== null) {
-			const argv = reportArgvAt(report, tried);
+			const argv = reportArgvAt(report, tried, withReply);
 			if (argv === null) {
 				return;
 			}
+			// The reply flags are on `argv` exactly when this is defined.
+			const stdin = tried === "declared" && withReply ? turnReplyStdin(report.reply) : undefined;
 			try {
-				await run(argv, signal);
+				await (stdin === undefined ? run(argv, signal) : run(argv, signal, stdin));
 				level = tried;
 				return;
 			} catch (err) {
 				if (err instanceof DeckExecError && isUnsupportedFlagFailure(err.outcome)) {
+					if (withReply) {
+						withReply = false;
+						replies = false;
+						continue;
+					}
 					tried = levelBelow(tried);
 					continue;
 				}
@@ -516,7 +716,7 @@ export function createReporter(run: (argv: string[], signal?: AbortSignal) => Pr
 			}
 		}
 	};
-	return { send, level: () => level };
+	return { send, level: () => level, replies: () => replies };
 }
 
 /**
@@ -608,4 +808,115 @@ export function spawnFailureMessage(argv: string[], err: unknown, bin: string = 
 			? ` (is \`${DECK_BIN}\` installed and on PATH?)`
 			: ` (does \`${bin}\` still exist?)`;
 	return `Failed to run \`${cmd}\`${hint}: ${reason}`;
+}
+
+/** The part of a spawned child {@link execWithStdin} uses (Node's `ChildProcess`). */
+export interface StdinChild {
+	stdin: { on(event: string, listener: (...args: any[]) => void): unknown; end(data: string): unknown } | null;
+	stdout: { on(event: string, listener: (...args: any[]) => void): unknown } | null;
+	stderr: { on(event: string, listener: (...args: any[]) => void): unknown } | null;
+	kill(signal?: "SIGTERM" | "SIGKILL"): boolean;
+	once(event: string, listener: (...args: any[]) => void): unknown;
+}
+
+/** Node's `child_process.spawn`, as {@link execWithStdin} calls it. */
+export type SpawnWithStdin = (
+	command: string,
+	args: string[],
+	options: { cwd?: string; shell: false; stdio: ["pipe", "pipe", "pipe"]; windowsHide: boolean },
+) => StdinChild;
+
+/** How long {@link execWithStdin} waits for a SIGTERMed child before SIGKILL, as `pi.exec` does. */
+const FORCE_KILL_AFTER_MS = 5000;
+/** How long after `exit` it waits for the output pipes to close, as `pi.exec` does. */
+const EXIT_STDIO_GRACE_MS = 100;
+
+/**
+ * Run `bin argv` and write `stdin` to it (PRD #1497), resolving with the same
+ * `{code, stdout, stderr, killed}` `pi.exec` gives, which cannot write a
+ * child's stdin. Spawned the way `pi.exec` spawns: an argv array, no shell,
+ * in `cwd`, killed on `signal` (SIGTERM, then SIGKILL after 5s) or after
+ * `timeout` ms when one is given. Rejects only when the child cannot be
+ * spawned (e.g. ENOENT), which callers report as a spawn failure. A child that
+ * exits without reading its stdin — an older CLI refusing a flag — is not an
+ * error here: the write's EPIPE is ignored and its exit code answers. A child
+ * killed by a signal reports a non-zero code.
+ */
+export function execWithStdin(
+	spawn: SpawnWithStdin,
+	bin: string,
+	argv: string[],
+	stdin: string,
+	options: { signal?: AbortSignal; cwd?: string; timeout?: number } = {},
+): Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> {
+	return new Promise((resolve, reject) => {
+		let child: StdinChild;
+		try {
+			child = spawn(bin, argv, { cwd: options.cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		} catch (err) {
+			reject(err);
+			return;
+		}
+		let stdout = "";
+		let stderr = "";
+		let killed = false;
+		let settled = false;
+		let exitCode: number | null = null;
+		const timers: Array<ReturnType<typeof setTimeout>> = [];
+		const kill = () => {
+			if (killed) {
+				return;
+			}
+			killed = true;
+			child.kill("SIGTERM");
+			timers.push(setTimeout(() => child.kill("SIGKILL"), FORCE_KILL_AFTER_MS));
+		};
+		const cleanup = () => {
+			settled = true;
+			for (const timer of timers) {
+				clearTimeout(timer);
+			}
+			options.signal?.removeEventListener("abort", kill);
+		};
+		const finish = (code: number | null) => {
+			if (settled) {
+				return;
+			}
+			cleanup();
+			resolve({ stdout, stderr, code: code ?? 1, killed });
+		};
+		child.once("error", (err: unknown) => {
+			if (settled) {
+				return;
+			}
+			cleanup();
+			reject(err);
+		});
+		child.once("exit", (code: number | null) => {
+			if (settled) {
+				return;
+			}
+			exitCode = code;
+			timers.push(setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS));
+		});
+		child.once("close", (code: number | null) => finish(code ?? exitCode));
+		child.stdout?.on("data", (chunk: unknown) => {
+			stdout += String(chunk);
+		});
+		child.stderr?.on("data", (chunk: unknown) => {
+			stderr += String(chunk);
+		});
+		if (options.signal?.aborted) {
+			kill();
+		} else {
+			options.signal?.addEventListener("abort", kill, { once: true });
+		}
+		if (options.timeout !== undefined && options.timeout > 0) {
+			timers.push(setTimeout(kill, options.timeout));
+		}
+		// An older CLI exits on its usage error without reading stdin, and the
+		// write then fails with EPIPE; its exit code is the answer, not this.
+		child.stdin?.on("error", () => {});
+		child.stdin?.end(stdin);
+	});
 }

@@ -2457,6 +2457,34 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the Codex and Devin installers, which share the backup helper (`agent_hook_config::backup_malformed`, unit-covered there); the `.bak` the deck writes when the name is free (`hook_rule_identification_017`); the startup install's logged form of the same refusal.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/011 — Hook commands run the binary `DOT_AGENT_DECK_BIN` names when it is an absolute path, and the install otherwise (PRD #1497).
+- **Layer:** as `hooks/install/007` (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`), then each written command run through `/bin/sh -c`, the way Claude Code runs a hook on Linux and macOS.
+- **Agent:** none (recording stubs stand in for the install at `$HOME/.local/bin/dot-agent-deck` and for a build at a path with a space in it).
+- **Asserts:** every deck command is the installed path behind `platform::paths::HOOK_BIN_OVERRIDE_PREFIX`; run with `DOT_AGENT_DECK_BIN` unset, empty, a bare name the build's directory on `PATH` would resolve, or a path relative to the build's directory as the working directory, it executes the install, and set to an absolute path it executes the binary it names, each with `hook --agent claude-code` and the hook payload on stdin intact. This is what lets `task run-all`'s agents report through the build under test while every other session keeps the installed release.
+- **Does not assert:** the Codex and Devin writers (`*_hooks_manage`'s `install_migrates_the_plain_form_and_uninstall_removes_both_forms`), the outer shells other than `sh` (`agent_hook_config`'s `the_override_command_runs_the_override_else_the_installed_binary` runs bash, zsh and fish where installed), the OpenCode plugin and Pi extension (their own unit tests), or a real Claude Code firing the hook.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/012 — A re-install over the plain hook command an older release wrote migrates it in place, without a duplicate (PRD #1497).
+- **Layer:** as `hooks/install/007`.
+- **Agent:** none (a stub install at `$HOME/.local/bin/dot-agent-deck`).
+- **Asserts:** with `settings.json` seeded with the plain `<install> hook --agent claude-code` under three hook types and a user hook beside them, `hooks install` leaves every hook type with exactly one deck command, in the override form, the user hook untouched and no plain entry left; a second install leaves the file byte for byte as it was.
+- **Does not assert:** what an older release does with the override form (measured by hand against 0.45.0 for `docs/develop/local-run.md`, not automated); the unattended startup install's keep rule for another live install (`hooks/install/006`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/013 — An uninstall removes the deck's hook commands in both the plain and the override form (PRD #1497).
+- **Layer:** as `hooks/install/007`, running `hooks uninstall --agent claude-code`.
+- **Agent:** none.
+- **Asserts:** with one plain and one override-form deck command and a user hook seeded, the uninstall leaves only the user hook.
+- **Does not assert:** the Codex and Devin uninstallers (their `install_migrates_the_plain_form_and_uninstall_removes_both_forms` units).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/014 — An install from a deck path containing a backslash is refused and the settings are kept (PRD #1497).
+- **Layer:** as `hooks/install/007`, the deck run from a scratch copy in a directory named `back\'; touch PWNED; #` with no installed deck to prefer, so that path is the one the install would pin.
+- **Agent:** none.
+- **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
+- **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
+- **Platform coverage:** mac+linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
@@ -7340,6 +7368,52 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** an absent-path listing starts at the daemon's HOME; a child path copied verbatim from that reply browses into a fixture with no `.dot-agent-deck.toml` and `is_project: false`; the Claude registry entry's returned `default_command` forms the start command; `StartAgent` uses the second listing's canonical path; after readiness-gated prompt delivery, the unique on-disk filename omitted from the prompt appears in the real agent pane and on the attached TUI's rendered vt100 grid.
 - **Does not assert:** the real Tauri window or its form controls (no `tauri-driver` tier, #953); alternate agents or models; authoring and orchestration modes; desktop fallback against missing capabilities; model prose beyond the literal sentinel filename.
 - **Platform coverage:** mac+linux, developer machine only (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2 needs a developer's Claude credential and the harness uses Unix-domain sockets and Unix PTYs).
+
+### Voice reading
+
+#### voice/reading-reply
+
+##### voice/reading-reply/001 — A per-agent reading subscription delivers final replies only for turns finished after reading starts, and a turn with no final reply as one empty reply.
+- **Layer:** L2 lane 1, PTY-attached (real binary and isolated daemon; production client library and hook CLI).
+- **Agent:** none (daemon-owned `cat` stand-in exporting its own hook capability; synthetic Claude Stop payloads).
+- **Asserts:** a Stop processed before subscription is not replayed; two later Stop payloads deliver their exact final-reply sentinels once, with the selected agent and pane ids, normal-turn outcomes, and increasing sequence numbers; unrelated terminal text is not included; a subagent's Stop carrying a sentinel delivers nothing, and the turn that then ends with a Stop carrying no final message delivers exactly one empty reply (the explicit turn with nothing to read).
+- **Does not assert:** provider speech, desktop summarisation or reading controls, genuine agent work, other-agent filtering, permission/error announcement text, Codex rollout tailing, or OpenCode reply capture.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
+
+##### voice/reading-reply/002 — A REAL interactive Claude Haiku turn delivers its discovered sentinel filename through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine Claude Stop hook).
+- **Agent:** REAL interactive Claude Code on Haiku, using the `prompt/voice-keys/001` harness with imported credentials, seeded onboarding and per-folder trust, and `--allowedTools Bash Read`.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel file discovered by Claude; the sentinel is also visible in the attached pane and the agent remains running. The full filename is never supplied in the prompt, and reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, other-agent filtering, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Claude authentication and runs nowhere in CI.
+
+##### voice/reading-reply/003 — A Codex turn reported by both its Stop hook and its rollout is delivered once, and the stream ends when the agent exits.
+- **Layer:** L2 lane 1, PTY-attached (real binary and isolated daemon; production client library, Codex hook CLI and rollout tailer).
+- **Agent:** none (daemon-owned `cat` stand-in exporting its own hook capability, reported through the Codex hook CLI; Codex-shaped hook payloads and a rollout file holding the captured `task_complete` record with its turn id and reply replaced).
+- **Asserts:** with the rollout's `task_complete` first and the Stop hook (which names no turn) second, and again in the reverse order, each turn's reply arrives once, carrying the turn id its `UserPromptSubmit` began, and no second copy follows within two rollout polls; stopping the agent ends the subscription cleanly.
+- **Does not assert:** a real Codex process, a failed or quota-blocked Codex turn's reply, the desktop's handling of the ended stream, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
+
+##### voice/reading-reply/004 — A REAL interactive OpenCode turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine OpenCode plugin events).
+- **Agent:** REAL interactive OpenCode on the cheap test model, using the `prompt/voice-keys/005` harness with imported credentials.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by OpenCode; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, subagent filtering, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local OpenCode authentication and runs nowhere in CI.
+
+##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, genuine Codex Stop hook and rollout tailer).
+- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; ChatGPT-login hosts can override the model with `DOT_AGENT_DECK_CODEX_TEST_MODEL`.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Codex; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window spanning multiple rollout polls, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
+
+##### voice/reading-reply/006 — A REAL interactive Pi Haiku turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine bundled Pi extension).
+- **Agent:** REAL interactive Pi on Anthropic `claude-haiku-4-5` with `--approve`, using the `pi/live/001` startup path where the daemon materializes the bundled extension in the isolated HOME.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 90 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Pi; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Pi and `ANTHROPIC_API_KEY` and runs nowhere in CI.
 
 ### Test harness teardown (issue #1566)
 

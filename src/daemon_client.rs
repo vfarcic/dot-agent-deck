@@ -2853,6 +2853,48 @@ impl DaemonClient {
         Ok(EventSubscription { rd, _wr: wr })
     }
 
+    /// PRD #1497: open a subscription to the finished-turn replies of the agent
+    /// `id` names ([`AttachRequest::SubscribeTurnReplies`]). Returns once the
+    /// daemon has confirmed it; every turn of that agent that ends after that is
+    /// on the returned stream, and none from before it.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_TURN_REPLIES`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything but the `Hello`. The
+    /// capability is read from a fresh `Hello`, not the cache: reading is turned
+    /// on at an arbitrary moment, possibly long after the cache was filled and
+    /// the daemon behind this socket replaced. A daemon replaced between that
+    /// `Hello` and the request refuses the unknown variant, which comes back as
+    /// [`ClientError::Server`] and opens nothing.
+    pub async fn subscribe_turn_replies(
+        &self,
+        id: &str,
+    ) -> Result<GatedQuery<TurnReplySubscription>, ClientError> {
+        if !self
+            .fresh_capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_TURN_REPLIES)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeTurnReplies { id: id.to_owned() },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "subscribe-turn-replies failed".into()),
+            ));
+        }
+        // The write half stays alive with the subscription, for the reason
+        // `subscribe_events` gives.
+        Ok(GatedQuery::Answered(TurnReplySubscription { rd, _wr: wr }))
+    }
+
     /// Issue #1555: open an event subscription together with the daemon's agents
     /// as of the instant it opened
     /// ([`AttachRequest::SubscribeEventsWithSnapshot`]), so no event on the
@@ -3311,6 +3353,63 @@ impl EventSubscription {
                     );
                     return Ok(None);
                 }
+            }
+        }
+    }
+}
+
+/// PRD #1497: a long-lived `subscribe-turn-replies` connection, opened by
+/// [`DaemonClient::subscribe_turn_replies`]. Yields one
+/// [`crate::daemon_protocol::TurnReply`] per `next_reply` call until the daemon
+/// ends the stream or the socket drops. Holds both transport halves for its
+/// lifetime, like [`EventSubscription`], so dropping it is what tells the daemon
+/// the subscriber went away.
+pub struct TurnReplySubscription {
+    rd: TransportReadHalf,
+    _wr: TransportWriteHalf,
+}
+
+impl TurnReplySubscription {
+    /// Read the next reply. `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an
+    /// unexpected frame kind — the caller resubscribes if it still wants
+    /// replies. A daemon of this build ends the stream when the agent exits
+    /// ([`crate::daemon_protocol::TURN_REPLIES_END_AGENT_EXITED`]), after which
+    /// no reply of that agent can follow. A malformed payload is an `Err`. The text is re-bounded to
+    /// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`], so a misbehaving peer
+    /// cannot hand the caller more than a daemon of this build would.
+    pub async fn next_reply(&mut self) -> io::Result<Option<crate::daemon_protocol::TurnReply>> {
+        match read_frame(&mut self.rd).await? {
+            None => Ok(None),
+            Some((KIND_EVENT, payload)) => {
+                let mut reply = serde_json::from_slice::<crate::daemon_protocol::TurnReply>(
+                    &payload,
+                )
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed turn reply: {e}"),
+                    )
+                })?;
+                let bounded = crate::daemon_protocol::clamp_turn_reply(&reply.reply.text).len();
+                reply.reply.text.truncate(bounded);
+                Ok(Some(reply))
+            }
+            Some((KIND_STREAM_END, reason)) => {
+                if reason == crate::daemon_protocol::TURN_REPLIES_END_AGENT_EXITED {
+                    tracing::debug!("subscribe_turn_replies: the agent exited");
+                } else if !reason.is_empty() {
+                    tracing::warn!(
+                        reason = %String::from_utf8_lossy(&reason),
+                        "subscribe_turn_replies: daemon ended stream"
+                    );
+                }
+                Ok(None)
+            }
+            Some((kind, _)) => {
+                tracing::warn!(
+                    "unexpected frame kind 0x{kind:02x} on subscribe-turn-replies stream — ending"
+                );
+                Ok(None)
             }
         }
     }

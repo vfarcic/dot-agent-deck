@@ -233,6 +233,7 @@ enum OutcomeKind {
     ParamAmbiguous,
     ResolutionFailed,
     TranscriptionFailed,
+    Dropped,
 }
 
 impl fmt::Display for OutcomeKind {
@@ -248,6 +249,7 @@ impl fmt::Display for OutcomeKind {
             Self::ParamAmbiguous => "param_ambiguous",
             Self::ResolutionFailed => "resolution_failed",
             Self::TranscriptionFailed => "transcription_failed",
+            Self::Dropped => "dropped",
         })
     }
 }
@@ -315,6 +317,7 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
         }
         VoiceOutcome::ResolutionFailed { .. } => (None, OutcomeKind::ResolutionFailed, None),
         VoiceOutcome::TranscriptionFailed { .. } => (None, OutcomeKind::TranscriptionFailed, None),
+        VoiceOutcome::Dropped { .. } => (None, OutcomeKind::Dropped, None),
     }
 }
 

@@ -141,7 +141,7 @@ pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "pres
 /// Every entry has its counterpart in [`DICTATION_OFF_PHRASES`] (#1544): a
 /// phrasing that enters the mode but has no matching exit would be typed into
 /// the prompt when the user says it to leave.
-pub const DICTATION_ON_PHRASES: [&str; 11] = [
+pub const DICTATION_ON_PHRASES: [&str; 13] = [
     "type on",
     "typing on",
     "start typing",
@@ -153,6 +153,8 @@ pub const DICTATION_ON_PHRASES: [&str; 11] = [
     "speaking on",
     "start speaking",
     "dictate on",
+    "writing on",
+    "start writing",
 ];
 
 /// What leaves the dictation mode, said as the whole utterance.
@@ -167,7 +169,7 @@ pub const DICTATION_ON_PHRASES: [&str; 11] = [
 /// could be meant as voice off: it is the counterpart of *"start talking"*, and
 /// heard as an exit it costs nothing a user cannot see — the mode ends, the
 /// microphone stays open, and *"voice off"* still turns it off.
-pub const DICTATION_OFF_PHRASES: [&str; 11] = [
+pub const DICTATION_OFF_PHRASES: [&str; 13] = [
     "type off",
     "typing off",
     "stop typing",
@@ -179,6 +181,8 @@ pub const DICTATION_OFF_PHRASES: [&str; 11] = [
     "speaking off",
     "stop speaking",
     "dictate off",
+    "writing off",
+    "stop writing",
 ];
 
 /// What turns voice off while the dictation mode is on, said as the whole
@@ -221,6 +225,42 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 /// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
 /// and *"stop listening"* are different whole phrases and keep their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
+
+/// What starts reading mode for the open agent (PRD #1497), said as the whole
+/// utterance.
+///
+/// Whole-utterance equality for [`DICTATION_ON_PHRASES`]' reason: entering a
+/// mode must never ground on words said in passing — *"start reading the
+/// logs"* is not this. Answered locally in every mode, ahead of the dictation
+/// mode's own classification, so *"reading on"* said while typing starts
+/// reading rather than being typed.
+pub const READING_ON_PHRASES: [&str; 4] = [
+    "reading on",
+    "start reading",
+    "reading mode on",
+    "read to me",
+];
+
+/// What ends reading mode, said as the whole utterance (PRD #1497). Answered
+/// locally in every mode, like [`READING_ON_PHRASES`].
+pub const READING_OFF_PHRASES: [&str; 4] = [
+    "reading off",
+    "stop reading",
+    "reading mode off",
+    "done reading",
+];
+
+/// What silences the app's own speech (PRD #1497 D6, D8), said as the whole
+/// utterance. It cuts off what is being said and drops what is waiting, and
+/// leaves reading on.
+///
+/// Answered locally on every screen and in every mode while reading is on or
+/// the app is speaking — the one list D8 lets through while the app is
+/// speaking, together with the bare *"stop"* forms ([`TYPING_STOP_PHRASES`]),
+/// which mean this only while speech is playing or reading is on outside
+/// typing mode (see `outcome::reading_intercept`). With reading off and
+/// nothing being said they are not reserved, so typing mode types them.
+pub const QUIET_PHRASES: [&str; 5] = ["quiet", "be quiet", "silence", "hush", "shush"];
 
 /// What empties the open agent's prompt while the dictation mode is on (PRD
 /// #1541), said as the whole utterance. Outside the mode on the agent screen
@@ -501,6 +541,8 @@ mod tests {
             "speaking on",
             "start speaking",
             "dictate on",
+            "writing on",
+            "start writing",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_ON_PHRASES),
@@ -523,6 +565,8 @@ mod tests {
             "speaking off",
             "stop speaking",
             "dictate off",
+            "writing off",
+            "stop writing",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_OFF_PHRASES),
@@ -649,7 +693,7 @@ mod tests {
     /// A newly shared phrase would make classification order determine an action.
     #[test]
     fn voice_dictation_reserved_phrase_lists_are_pairwise_disjoint() {
-        let lists: [(&str, &[&str]); 9] = [
+        let lists: [(&str, &[&str]); 12] = [
             ("dictation on", &DICTATION_ON_PHRASES),
             ("dictation off", &DICTATION_OFF_PHRASES),
             ("submit", &SUBMIT_PHRASES),
@@ -659,6 +703,9 @@ mod tests {
             ("clear prompt", &CLEAR_PROMPT_PHRASES),
             ("scratch", &SCRATCH_PHRASES),
             ("opener", &DICTATION_OPENERS),
+            ("reading on", &READING_ON_PHRASES),
+            ("reading off", &READING_OFF_PHRASES),
+            ("quiet", &QUIET_PHRASES),
         ];
         for (left_index, (left_name, left)) in lists.iter().enumerate() {
             for (right_name, right) in lists.iter().skip(left_index + 1) {

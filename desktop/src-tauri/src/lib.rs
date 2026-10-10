@@ -1490,6 +1490,19 @@ fn ensure_main_webview(webview: &Webview) -> Result<(), String> {
     }
 }
 
+/// PRD #1497 — a save turned reading's Settings switch off: every webview of
+/// this app ends its reading, a start in progress included.
+fn emit_reading_consent_off(app: &AppHandle) {
+    let _ = app.emit("desktop://reading-consent-off", ());
+}
+
+/// PRD #1497 — a save left reading's Settings switch on and in force: a start
+/// that read the settings before the save reached the disk, and was refused,
+/// is tried again.
+fn emit_reading_consent_on(app: &AppHandle) {
+    let _ = app.emit("desktop://reading-consent-on", ());
+}
+
 fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
 }
@@ -2560,10 +2573,15 @@ async fn desktop_set_settings(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
+    voice_state: State<'_, VoiceState>,
     settings: DesktopSettings,
     base: Option<DesktopSettings>,
 ) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
     ensure_main_webview(&webview)?;
+    // Held from the write until its voice settings are in force, so the saves
+    // put them in force in the order they were written and an older save
+    // finishing late cannot act on settings a newer one replaced.
+    let order = voice_state.saves.lock().await;
     // On a blocking worker: the save is synchronous filesystem work — a read,
     // an `fsync`, a rename — and since #828 it can also wait up to
     // `SAVE_LOCK_WAIT` for another window's save to let go of the lock. None of
@@ -2578,7 +2596,20 @@ async fn desktop_set_settings(
     })?;
     let failure = match saved {
         Ok(written) => {
-            apply_selection(&app, &state, &written).await;
+            voice_state
+                .put_saved_in_force(
+                    order,
+                    &written,
+                    |consented| {
+                        if consented {
+                            emit_reading_consent_on(&app)
+                        } else {
+                            emit_reading_consent_off(&app)
+                        }
+                    },
+                    apply_selection(&app, &state, &written),
+                )
+                .await;
             return Ok(written);
         }
         Err(failure) => failure,
@@ -2601,7 +2632,20 @@ async fn desktop_set_settings(
     else {
         return Err(message.into());
     };
-    apply_selection(&app, &state, &disk).await;
+    voice_state
+        .put_saved_in_force(
+            order,
+            &disk,
+            |consented| {
+                if consented {
+                    emit_reading_consent_on(&app)
+                } else {
+                    emit_reading_consent_off(&app)
+                }
+            },
+            apply_selection(&app, &state, &disk),
+        )
+        .await;
     Err(crate::dto::DesktopSettingsSaveError::Partial(
         crate::dto::DesktopPartialSettingsSave {
             message,
@@ -2925,6 +2969,44 @@ pub(crate) struct VoiceState {
     /// (a spawned task outliving the command that started it) and every
     /// `spawn_blocking` below need.
     hold: voice::VoiceHold,
+    /// PRD #1497 — reading's sessions, one per agent being read.
+    reading: ReadingSessions,
+    /// PRD #1497 — the saved settings, published to the provider speech
+    /// requests in flight so a save that no longer permits one cancels it.
+    speech: voice::speech::SpeechRevocation,
+    /// PRD #1497 — orders settings saves until their voice settings are in
+    /// force ([`Self::put_saved_in_force`]).
+    saves: tokio::sync::Mutex<()>,
+}
+
+impl VoiceState {
+    /// A save wrote `settings`: reading ends unless it is still consented to,
+    /// and every provider speech request they do not permit is cancelled — at
+    /// once, before `deck_work` (retargeting the selection, which can wait on
+    /// a daemon) is awaited, since the settings are already on disk (PR
+    /// #1617's third review). `order` is released then, so the next save puts
+    /// its own settings in force after these and need not wait on the deck
+    /// work.
+    ///
+    /// Every save then calls `consent` with whether reading is consented to,
+    /// which tells every webview of this app (PR #1617's fourth review): with
+    /// it off, a webview whose start is in progress has nothing here to end,
+    /// and a window other than the one that saved never sees the new settings
+    /// otherwise; with it on, a start that read the settings before this save
+    /// reached the disk was refused, and is tried again.
+    async fn put_saved_in_force(
+        &self,
+        order: tokio::sync::MutexGuard<'_, ()>,
+        settings: &DesktopSettings,
+        consent: impl FnOnce(bool),
+        deck_work: impl std::future::Future<Output = ()>,
+    ) {
+        consent(self.reading.end_unless_consented(settings));
+        self.speech
+            .publish(&settings.voice.clone().unwrap_or_default());
+        drop(order);
+        deck_work.await;
+    }
 }
 
 impl Default for VoiceState {
@@ -2936,6 +3018,9 @@ impl Default for VoiceState {
             // sentence for it already is. The sleep inhibit is the same: the
             // platform is not asked for anything until voice is switched on.
             hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
+            reading: ReadingSessions::default(),
+            speech: voice::speech::SpeechRevocation::default(),
+            saves: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -3380,6 +3465,12 @@ fn selector_rows_beyond_voice(
 /// and trusted no further: the typing itself goes through the webview's own
 /// `sendTerminalInput` to the pane on screen, never to whatever this names.
 ///
+/// **`reading` is the seventh** (PRD #1497): whether reading mode is on and
+/// whether the app's speech overlapped this utterance, two booleans with
+/// nothing to bound. While the app was speaking only a way of silencing it is
+/// answered, and everything else is dropped with no Commands backend call
+/// ([`voice::handle_utterance_with_modes`]).
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -3408,6 +3499,7 @@ async fn desktop_voice_resolve(
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
     endpoints: Option<crate::settings::EndpointSettings>,
     dictation: Option<voice::VoiceDictationTarget>,
+    reading: Option<voice::VoiceReadingState>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3447,6 +3539,7 @@ async fn desktop_voice_resolve(
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
+            reading: reading.unwrap_or_default(),
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3465,6 +3558,8 @@ struct VoiceDeclaration<'a> {
     deck_step: Option<&'a [voice::VoiceDeckChoice]>,
     endpoints: Option<&'a crate::settings::EndpointSettings>,
     dictation: Option<&'a voice::VoiceDictationTarget>,
+    /// PRD #1497 — reading mode and the app's own speech, two booleans.
+    reading: voice::VoiceReadingState,
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
@@ -3489,7 +3584,7 @@ async fn resolve_declared_utterance(
     // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
-    let mut result = voice::handle_utterance_with_dictation(
+    let mut result = voice::handle_utterance_with_modes(
         resolver,
         voice::table(),
         screen,
@@ -3498,6 +3593,7 @@ async fn resolve_declared_utterance(
         declared.directories,
         declared.new_agent,
         declared.dictation,
+        declared.reading,
         transcript,
         labels,
         show_deck,
@@ -3594,6 +3690,7 @@ async fn desktop_voice_choice(
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
             dictation: None,
+            reading: voice::VoiceReadingState::default(),
         },
     ))
 }
@@ -3924,6 +4021,500 @@ fn voice_decks(
             }
         })
         .collect()
+}
+
+/// How reading mode's next sentence is to be spoken (PRD #1497 D9):
+/// the provider's text-to-speech, the operating system's voice, or nothing
+/// and why. Read per call, for `desktop_voice_resolve`'s reason: a changed
+/// Speech source or connection applies to the next sentence.
+///
+/// Reaches nothing: the answer is a function of the settings document.
+#[tauri::command]
+async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::SpeechPlan, String> {
+    ensure_main_webview(&webview)?;
+    let settings = voice_settings_now().await?;
+    Ok(voice::speech::plan_for(&settings))
+}
+
+/// The voice settings as they are now, read on a blocking thread: the speech
+/// and reading commands are async, and the read is file I/O (PR #1617's
+/// review).
+async fn voice_settings_now() -> Result<crate::settings::VoiceSettings, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::settings::load_settings_without_decks()
+            .voice
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| safe_message(format!("the settings could not be read: {error}")))
+}
+
+/// The provider's audio for one sentence of reading mode (PRD #1497 M4), as
+/// raw MP3 bytes the webview decodes and plays.
+///
+/// Spends the Commands connection's key, so the text is bounded here before
+/// anything is sent ([`voice::speech::MAX_SPEECH_INPUT_CHARS`] after a byte
+/// bound that refuses an oversized IPC argument outright).
+///
+/// Refused, with nothing sent, unless reading's Settings switch is on, its
+/// one-time notice has been shown — or `text` is that notice's exact words —
+/// and the speech source resolves to the provider
+/// ([`voice::speech::speech_permitted`], checked against the settings as they
+/// are now, and again after the keychain read, immediately before the
+/// request, when they must also still name the connection the request was
+/// prepared for — [`voice::speech::permitted_on`]): the webview cannot use
+/// this to send arbitrary text to the provider outside reading mode's consent,
+/// nor before the user was told where replies go (re-audit R1). A save while
+/// the request is in flight that no longer permits it — the switch off, the
+/// notice not shown for a sentence other than the notice, or another
+/// connection — cancels it ([`voice::speech::SpeechRevocation`]).
+///
+/// Each of those answers is a [`voice::speech::SpeechError::Refused`], told
+/// apart from a failure so the webview never speaks a refused sentence with
+/// the system voice instead.
+#[tauri::command]
+async fn desktop_voice_speech_audio(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+    text: String,
+) -> Result<Response, voice::speech::SpeechError> {
+    use voice::speech::SpeechError;
+    ensure_main_webview(&webview).map_err(SpeechError::failed)?;
+    // Four bytes a character at most, so this refuses nothing the character
+    // bound would keep.
+    if text.len() > voice::speech::MAX_SPEECH_INPUT_CHARS * 4 {
+        return Err(SpeechError::failed("that is too long to speak"));
+    }
+    // Registered before the first settings read, so every save from here on
+    // is held against this request — one that lands before its connection
+    // is known included (PR #1617's fourth review).
+    let ticket = voice_state.speech.register(&text);
+    let settings = voice_settings_now().await.map_err(SpeechError::failed)?;
+    voice::speech::speech_permitted(&settings, &text).map_err(SpeechError::refused)?;
+    let intent = settings.intent;
+    let revoked = voice_state.speech.prepared_for(ticket, intent.clone());
+    let audio = voice::speech::unless_revoked(
+        voice::speech::synthesise(
+            &intent,
+            Arc::new(KeychainSecretStore::new()),
+            &text,
+            || async { voice::speech::permitted_on(&voice_settings_now().await?, &intent, &text) },
+        ),
+        revoked,
+    )
+    .await?;
+    Ok(Response::new(audio))
+}
+
+/// PRD #1497 M5 — start reading one agent: its turns, permission prompts and
+/// errors become sentences sent down `on_sentence` until
+/// [`desktop_voice_reading_stop`], the Settings switch turned off, or the
+/// webview dropping the channel. The webview starts one per agent on the deck
+/// it reads (decision 3 of 2026-10-09), so many run at once.
+///
+/// # What it refuses, in words
+///
+/// The Settings switch first (D4): reading sends agent replies to the Commands
+/// connection, so with `[voice] reading` off — or on, with its one-time notice
+/// not yet recorded as shown (audit A5) — it answers
+/// [`ReadingStart::NotEnabled`] and nothing is subscribed. Then the agent's
+/// type ([`voice::reading::agent_gap`]) and the deck's daemon
+/// ([`voice::reading::DaemonTurnEvents`]), either of which answers
+/// [`ReadingStart::Unavailable`] with why — a daemon too old to report finished
+/// turns among them, which is about the whole deck ([`ReadingScope::Deck`]),
+/// so the webview says it once for the deck rather than once per agent.
+///
+/// The deck is the one `deck_id` names, resolved against the observed set like
+/// every deck-scoped action, never the selection.
+///
+/// # The reply stays here
+///
+/// Summaries are made Rust-side ([`voice::reading::read_turns`]) through the
+/// Commands connection, read per turn, so the agent's final reply never
+/// crosses into the webview — only the finished sentence does.
+#[tauri::command]
+async fn desktop_voice_reading_start(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    voice_state: State<'_, VoiceState>,
+    deck_id: String,
+    agent_id: String,
+    agent_label: String,
+    on_sentence: Channel<voice::reading::ReadingSentence>,
+) -> Result<ReadingStart, String> {
+    ensure_main_webview(&webview)?;
+    let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad(&deck_id) || bad(&agent_id) || agent_label.len() > MAX_VOICE_DECK_ID_BYTES {
+        return Err("the agent sent with that command is not one a pane shows".to_string());
+    }
+    // Taken before anything is awaited: the switch turned off on a save makes
+    // this one stale, and it is then never installed.
+    let ticket = voice_state.reading.begin();
+    let settings = voice_settings_now().await?;
+    // Audit A5: the switch on AND its one-time notice shown, so no reply is
+    // subscribed to before the user was told where it goes.
+    if !settings.reading_permitted() {
+        return Ok(ReadingStart::not_enabled());
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let snapshot = daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
+    let agent_type = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .map(|agent| agent.agent_type.clone());
+    if let Some(gap) = agent_type.as_deref().and_then(voice::reading::agent_gap) {
+        return Ok(ReadingStart::Unavailable {
+            sentence: voice::reading::unavailable_sentence(&gap),
+            scope: ReadingScope::Agent,
+        });
+    }
+    let unavailable = |reason: &str| ReadingStart::Unavailable {
+        sentence: voice::reading::unavailable_sentence(reason),
+        scope: ReadingScope::Deck,
+    };
+    let daemon = match state.daemon.trusted(scope.endpoint()).await {
+        Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
+        _ => return Ok(unavailable(voice::reading::DAEMON_UNREACHABLE)),
+    };
+    let target = voice::reading::ReadingTarget {
+        deck_id,
+        agent_id,
+        agent_type,
+    };
+    let source = voice::reading::DaemonTurnEvents::new(daemon.client.clone());
+    let events = match voice::reading::TurnEventSource::subscribe(&source, &target).await {
+        Ok(events) => events,
+        // The agent exited between being listed and being subscribed.
+        Err(reason) if reason == voice::reading::AGENT_GONE => return Ok(ReadingStart::Gone),
+        // The deck answered and refused this agent only, for now: it serves
+        // as many reply streams as it allows (audit A4).
+        Err(reason) if reason == voice::reading::TOO_MANY_READERS => {
+            return Ok(ReadingStart::Busy {
+                sentence: voice::reading::unavailable_sentence(&reason),
+            });
+        }
+        Err(reason) => return Ok(unavailable(&reason)),
+    };
+    // PR #1617's review: the opt-in, read again now that the subscription
+    // answered — it may have been turned off while it was being confirmed.
+    let Ok(events) =
+        reading_events_still_consented(voice_settings_now().await?.reading_permitted(), events)
+    else {
+        return Ok(ReadingStart::not_enabled());
+    };
+    let Ok(events) = reading_events_still_in_scope(&scope, events) else {
+        return Ok(unavailable(voice::reading::DECK_CHANGED));
+    };
+    let agent = voice::summary::agent_name(&agent_label);
+    let ender = on_sentence.clone();
+    let summariser = settings_summariser();
+    let started = voice_state.reading.start(
+        ticket,
+        move || async move {
+            voice::reading::read_turns(&agent, events, &summariser, |sentence| {
+                on_sentence.send(sentence).is_ok()
+            })
+            .await;
+        },
+        Box::new(move || {
+            let _ = ender.send(voice::reading::ended_sentence());
+        }),
+    );
+    Ok(match started {
+        Ok(session) => ReadingStart::Started { session },
+        Err(StaleStart::Revoked) => ReadingStart::not_enabled(),
+    })
+}
+
+/// PR #1617's review: reading's opt-in is read once more after the
+/// subscription answered, immediately before the session is installed. With it
+/// off the session is refused and `events` is dropped, which closes the
+/// subscription.
+fn reading_events_still_consented(
+    permitted: bool,
+    events: voice::reading::TurnEvents,
+) -> Result<voice::reading::TurnEvents, ()> {
+    if permitted { Ok(events) } else { Err(()) }
+}
+
+/// Audit AU-S1: reading's subscription outlives the start, so its deck is
+/// checked once more after the subscription answered and right before the
+/// session is installed — the publication point [`crate::dto::DeckScope::revalidate`]
+/// exists for. A deck that left the fleet (or a fleet that moved) while the
+/// subscription was being confirmed is refused, and `events` is dropped, which
+/// closes the subscription.
+fn reading_events_still_in_scope(
+    scope: &crate::dto::DeckScope,
+    events: voice::reading::TurnEvents,
+) -> Result<voice::reading::TurnEvents, String> {
+    scope.revalidate()?;
+    Ok(events)
+}
+
+/// PRD #1497 M5 — end the reading session `session` named, if it is still
+/// running. Idempotent: a session already ended is left alone, and no other
+/// session is touched.
+#[tauri::command]
+async fn desktop_voice_reading_stop(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+    session: u64,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    voice_state.reading.stop(session);
+    Ok(())
+}
+
+/// What [`desktop_voice_reading_start`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum ReadingStart {
+    /// Reading started; `session` is what stops it.
+    Started { session: u64 },
+    /// The Settings switch is off (D4).
+    NotEnabled { sentence: String },
+    /// Reading cannot run for this agent on this daemon, and `scope` says
+    /// whether that is about this agent or the whole deck.
+    Unavailable {
+        sentence: String,
+        scope: ReadingScope,
+    },
+    /// The agent is no longer on its deck: nothing to read, and nothing to
+    /// say — the webview stops reading it, as when its events close.
+    Gone,
+    /// The agent's deck already serves as many reply streams as it allows,
+    /// across every window reading it (audit A4). About this agent and for
+    /// now: the webview tries it again, a bounded number of times, as its own
+    /// sessions on that deck end.
+    Busy { sentence: String },
+}
+
+/// What a [`ReadingStart::Unavailable`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadingScope {
+    /// This agent only: its type reports no turn ends.
+    Agent,
+    /// The deck: its daemon is too old, did not answer, or left the decks.
+    Deck,
+}
+
+impl ReadingStart {
+    fn not_enabled() -> Self {
+        Self::NotEnabled {
+            sentence: voice::reading::READING_NOT_ENABLED.to_string(),
+        }
+    }
+}
+
+/// Tells the webview a session ended on this side (a
+/// [`voice::reading::ReadingSentenceKind::Ended`] sentence down its channel).
+type ReadingEnder = Box<dyn FnOnce() + Send>;
+
+/// The reading sessions this app runs: one per agent being read (decision 3
+/// of 2026-10-09: every agent on the deck being viewed). Each one's turn
+/// events come from the agent's deck, subscribed per session
+/// ([`voice::reading::DaemonTurnEvents`]).
+pub(crate) struct ReadingSessions {
+    state: Arc<std::sync::Mutex<ReadingState>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct ReadingState {
+    current: std::collections::HashMap<u64, ReadingSession>,
+    /// The ticket of the latest start ([`ReadingSessions::begin`]).
+    latest_start: u64,
+    /// Every start up to this ticket began before the switch was last turned
+    /// off ([`ReadingSessions::end_unless_consented`]).
+    revoked_through: u64,
+    /// Sessions whose task is spawned and not yet in `current`
+    /// ([`ReadingSessions::start`]).
+    installing: std::collections::HashSet<u64>,
+    /// Of `installing`, those whose task already ended: never put in
+    /// `current` (audit A3, a session closed before its start answered).
+    ended_early: std::collections::HashSet<u64>,
+}
+
+/// Held by a session's task for as long as it runs: when the task ends — by
+/// itself, because the agent's events ended, or aborted — it takes its
+/// session out of [`ReadingState::current`], so a session that closed
+/// naturally does not stay registered (audit A3).
+struct SessionRegistration {
+    state: std::sync::Weak<std::sync::Mutex<ReadingState>>,
+    id: u64,
+}
+
+impl Drop for SessionRegistration {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.current.remove(&self.id).is_none() && state.installing.contains(&self.id) {
+            state.ended_early.insert(self.id);
+        }
+    }
+}
+
+struct ReadingSession {
+    task: tauri::async_runtime::JoinHandle<()>,
+    ender: ReadingEnder,
+}
+
+/// A start in progress, from [`ReadingSessions::begin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadingTicket(u64);
+
+/// Why [`ReadingSessions::start`] installed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleStart {
+    /// The switch was turned off after this start began.
+    Revoked,
+}
+
+impl Default for ReadingSessions {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(ReadingState::default())),
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl ReadingSessions {
+    fn state(&self) -> std::sync::MutexGuard<'_, ReadingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A start begins.
+    fn begin(&self) -> ReadingTicket {
+        let mut state = self.state();
+        state.latest_start += 1;
+        ReadingTicket(state.latest_start)
+    }
+
+    /// Install the start `ticket` names — `task` spawned beside every other
+    /// session — and name it, unless the switch was turned off since it
+    /// began. A stale start spawns nothing, and `task` is dropped with
+    /// whatever it holds (the subscription's receiver). `ender` is how
+    /// [`Self::end_unless_consented`] tells the webview.
+    ///
+    /// The session leaves [`ReadingState::current`] when its task ends, on
+    /// its own as well as when it is stopped (audit A3): a task that ended
+    /// before it was installed — its agent's events closed while the start
+    /// was answering — is never installed. The task is spawned with no lock
+    /// held, because a runtime that is shutting down drops a spawned future
+    /// at once, and its registration then takes the lock.
+    fn start<F>(
+        &self,
+        ticket: ReadingTicket,
+        task: impl FnOnce() -> F,
+        ender: ReadingEnder,
+    ) -> Result<u64, StaleStart>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = {
+            let mut state = self.state();
+            if ticket.0 <= state.revoked_through {
+                return Err(StaleStart::Revoked);
+            }
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.installing.insert(id);
+            id
+        };
+        let registration = SessionRegistration {
+            state: Arc::downgrade(&self.state),
+            id,
+        };
+        let task = task();
+        let task = tauri::async_runtime::spawn(async move {
+            let _registration = registration;
+            task.await;
+        });
+        let mut state = self.state();
+        state.installing.remove(&id);
+        if state.ended_early.remove(&id) {
+            return Ok(id);
+        }
+        // Turned off while the task was being spawned: the save found nothing
+        // to end, so this start ends here.
+        if ticket.0 <= state.revoked_through {
+            drop(state);
+            task.abort();
+            return Err(StaleStart::Revoked);
+        }
+        state.current.insert(id, ReadingSession { task, ender });
+        Ok(id)
+    }
+
+    /// End `session` if it is running. The webview asked, so it is not told.
+    fn stop(&self, session: u64) {
+        let ended = self.state().current.remove(&session);
+        if let Some(ended) = ended {
+            ended.task.abort();
+        }
+    }
+
+    /// Audit A-B1: the settings were saved, and with reading's switch off
+    /// every session ends now — its task stops, so no further summary is
+    /// requested — and the webview is told on each, so it drops the queued
+    /// speech. Every start still in progress is made stale, so it is not
+    /// installed after this. Answers whether reading is consented to.
+    fn end_unless_consented(&self, settings: &DesktopSettings) -> bool {
+        let consented = settings
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.reading == crate::settings::ReadingConsent::On);
+        if consented {
+            return true;
+        }
+        let ended: Vec<ReadingSession> = {
+            let mut state = self.state();
+            state.revoked_through = state.latest_start;
+            state.current.drain().map(|(_, session)| session).collect()
+        };
+        for ended in ended {
+            ended.task.abort();
+            (ended.ender)();
+        }
+        false
+    }
+}
+
+/// The real [`voice::reading::TurnSummariser`]: the settings read per call
+/// (so a revoked opt-in stops the very next request), and the Commands
+/// connection they name with its key from the keychain. The summariser runs
+/// `load` on a blocking thread, as [`voice_settings_now`] does, because reading
+/// runs on the shared async runtime and this is file I/O.
+fn settings_summariser() -> voice::reading::SettingsSummariser {
+    voice::reading::SettingsSummariser::new(
+        Arc::new(|| {
+            crate::settings::load_settings_without_decks()
+                .voice
+                .unwrap_or_default()
+        }),
+        Box::new(|intent, gate| {
+            Box::new(
+                voice::summary::HttpSummaryTransport::new(
+                    voice::summary::protocol_for(intent),
+                    Arc::new(KeychainSecretStore::new()),
+                    intent.endpoint.clone(),
+                )
+                .gated(gate),
+            )
+        }),
+    )
 }
 
 /// PRD #802 — what can be said on this screen, for the discovery overlay.
@@ -5723,9 +6314,13 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_reading_start,
+            desktop_voice_reading_stop,
             desktop_voice_choice,
             desktop_voice_number,
             desktop_voice_commands,
+            desktop_voice_speech_plan,
+            desktop_voice_speech_audio,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");
@@ -5776,6 +6371,333 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A reading session whose task runs until aborted, and records being
+    /// dropped (aborted) and its ender being called.
+    fn held_session(sessions: &ReadingSessions) -> (u64, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let aborted = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicUsize::new(0));
+        let guard = Dropped(Arc::clone(&aborted));
+        let told = Arc::clone(&ended);
+        let ticket = sessions.begin();
+        let id = sessions
+            .start(
+                ticket,
+                move || async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                },
+                Box::new(move || {
+                    told.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .expect("a start with the switch on installs");
+        (id, aborted, ended)
+    }
+
+    fn wait_for(flag: &AtomicBool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the session task was not aborted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Scenario (audit A-B1, decision 3 of 2026-10-09): with Reading on and
+    /// two agents being read, the user turns Reading off in Settings and
+    /// saves; both sessions' tasks are aborted at once (no further summary can
+    /// be requested) and the webview is told once on each. A save that keeps
+    /// the switch on leaves them alone, and a stop the webview asked for ends
+    /// that session only and does not tell it.
+    #[test]
+    fn voice_reading_a_settings_save_without_consent_ends_every_session() {
+        let consenting = |reading| DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                reading,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let sessions = ReadingSessions::default();
+        let (_, aborted, ended) = held_session(&sessions);
+        let (_, other_aborted, other_ended) = held_session(&sessions);
+        sessions.end_unless_consented(&consenting(crate::settings::ReadingConsent::On));
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+        assert!(!aborted.load(Ordering::SeqCst));
+
+        sessions.end_unless_consented(&consenting(crate::settings::ReadingConsent::Off));
+        wait_for(&aborted);
+        wait_for(&other_aborted);
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        assert_eq!(other_ended.load(Ordering::SeqCst), 1);
+        // Nothing left to end: a second save says nothing more.
+        sessions.end_unless_consented(&DesktopSettings::default());
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+
+        let (id, aborted, ended) = held_session(&sessions);
+        let (_, kept_aborted, _) = held_session(&sessions);
+        sessions.stop(id);
+        wait_for(&aborted);
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !kept_aborted.load(Ordering::SeqCst),
+            "stopping one session ended another"
+        );
+    }
+
+    /// Scenario (PR #1617's third review): with reading on and a provider
+    /// speech request in flight, the user turns Reading off and the
+    /// save's deck work (retargeting the selection against a daemon) is slow.
+    /// The reading session ends and the speech request is cancelled before
+    /// that deck work finishes, and the next save is not held behind it.
+    #[tokio::test]
+    async fn voice_reading_a_save_ends_reading_and_speech_before_its_deck_work() {
+        let voice_state = VoiceState::default();
+        let (_, aborted, ended) = held_session(&voice_state.reading);
+        let intent = crate::settings::IntentSettings::for_backend(
+            crate::settings::IntentBackend::OpenaiCompatible,
+        );
+        let mut revoked = Box::pin(voice_state.speech.revoked(intent.clone(), "Finished."));
+        let off = DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                intent,
+                reading: crate::settings::ReadingConsent::Off,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let order = voice_state.saves.lock().await;
+        let (finish_deck_work, deck_work) = tokio::sync::oneshot::channel::<()>();
+        let told = AtomicUsize::new(0);
+        let save = voice_state.put_saved_in_force(
+            order,
+            &off,
+            |consented| {
+                assert!(!consented);
+                told.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                let _ = deck_work.await;
+            },
+        );
+        tokio::pin!(save);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut save)
+                .await
+                .is_err(),
+            "the deck work is still running"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoked)
+                .await
+                .ok(),
+            Some(voice::speech::PROVIDER_SPEECH_NOT_PERMITTED.to_string()),
+            "the speech request was not cancelled before the deck work finished"
+        );
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            told.load(Ordering::SeqCst),
+            1,
+            "the webviews were not told before the deck work finished"
+        );
+        wait_for(&aborted);
+        assert!(
+            voice_state.saves.try_lock().is_ok(),
+            "the next save waits on this one's deck work"
+        );
+        finish_deck_work.send(()).expect("the deck work is waiting");
+        save.await;
+    }
+
+    /// Scenario (PR #1617's fourth review): a save that turns Reading off
+    /// tells the webviews even when this process holds no reading session — a
+    /// start can be in progress, or another window's speech can be playing,
+    /// with nothing here to end — and a save that keeps it on tells them it is
+    /// on, so a start refused before the save reached the disk is retried.
+    #[tokio::test]
+    async fn voice_reading_every_save_tells_the_webviews_whether_reading_is_on() {
+        let voice_state = VoiceState::default();
+        let consenting = |reading| DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                reading,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let told = Mutex::new(Vec::new());
+        for (settings, expected) in [
+            (consenting(crate::settings::ReadingConsent::On), true),
+            (consenting(crate::settings::ReadingConsent::Off), false),
+            (DesktopSettings::default(), false),
+        ] {
+            let order = voice_state.saves.lock().await;
+            voice_state
+                .put_saved_in_force(
+                    order,
+                    &settings,
+                    |consented| told.lock().unwrap().push(consented),
+                    async {},
+                )
+                .await;
+            assert_eq!(told.lock().unwrap().last(), Some(&expected));
+        }
+        assert_eq!(told.lock().unwrap().len(), 3);
+    }
+
+    /// Scenario (decision 3 of 2026-10-09): what a reading start answers
+    /// reaches the webview in the shape `ReadingStartDto` reads — a refusal
+    /// about the deck marked `deck`, one about the agent marked `agent`, an
+    /// agent that left its deck as `gone`, and a deck at its reader bound as
+    /// `busy`.
+    #[test]
+    fn voice_reading_start_answers_serialise_as_the_webview_reads_them() {
+        assert_eq!(
+            serde_json::to_value(ReadingStart::Unavailable {
+                sentence: "Reading is not available: x.".to_string(),
+                scope: ReadingScope::Deck,
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "unavailable", "sentence": "Reading is not available: x.", "scope": "deck" })
+        );
+        assert_eq!(
+            serde_json::to_value(ReadingStart::Unavailable {
+                sentence: "y".to_string(),
+                scope: ReadingScope::Agent,
+            })
+            .unwrap()["scope"],
+            "agent"
+        );
+        assert_eq!(
+            serde_json::to_value(ReadingStart::Gone).unwrap(),
+            serde_json::json!({ "kind": "gone" })
+        );
+        assert_eq!(
+            serde_json::to_value(ReadingStart::Busy {
+                sentence: "z".to_string()
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "busy", "sentence": "z" })
+        );
+        assert_eq!(
+            serde_json::to_value(ReadingStart::Started { session: 3 }).unwrap(),
+            serde_json::json!({ "kind": "started", "session": 3 })
+        );
+    }
+
+    /// Scenario (decision 3 of 2026-10-09): two agents' starts overlap — the
+    /// first one begins, the second one begins and is installed, then the
+    /// first one answers. Both are installed and run side by side; neither
+    /// start makes the other stale.
+    #[test]
+    fn voice_reading_overlapping_starts_for_two_agents_both_install() {
+        let sessions = ReadingSessions::default();
+        let first = sessions.begin();
+        let (second, second_aborted, _) = held_session(&sessions);
+        let installed = sessions.start(first, std::future::pending::<()>, Box::new(|| {}));
+        let first = installed.expect("an earlier start still installs");
+        assert_ne!(first, second);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !second_aborted.load(Ordering::SeqCst),
+            "the other agent's session was aborted"
+        );
+        assert_eq!(sessions.state().current.len(), 2);
+    }
+
+    /// Scenario (audit A3): an agent being read exits, so its session's
+    /// events close and its task ends by itself. The session is taken out of
+    /// the running set, both when it ends after being installed and when it
+    /// ends before its start answered, and a later stop of it is a no-op.
+    #[test]
+    fn voice_reading_a_session_that_ends_by_itself_is_deregistered() {
+        let sessions = ReadingSessions::default();
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        let id = sessions
+            .start(
+                sessions.begin(),
+                move || async move {
+                    let _ = closed.await;
+                },
+                Box::new(|| {}),
+            )
+            .expect("installed");
+        assert!(sessions.state().current.contains_key(&id));
+        close.send(()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sessions.state().current.contains_key(&id) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the ended session stayed registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        sessions.stop(id);
+
+        // Ended before the start finished installing it: never installed.
+        let quick = sessions
+            .start(sessions.begin(), || async {}, Box::new(|| {}))
+            .expect("a start with the switch on answers");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = sessions.state();
+            if !state.current.contains_key(&quick) && state.installing.is_empty() {
+                assert!(state.ended_early.is_empty(), "nothing is left behind");
+                break;
+            }
+            drop(state);
+            assert!(
+                std::time::Instant::now() < until,
+                "the quick session stayed registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(sessions.state().current.is_empty());
+    }
+
+    /// Scenario (PR #1617 review): "reading on" is said with the opt-in on,
+    /// and while the subscription is being confirmed the user turns Read turns
+    /// aloud off. The opt-in read again just before installing refuses the
+    /// session and drops the subscription; a save that turned it off makes
+    /// the start stale even when that read came first.
+    #[test]
+    fn voice_reading_consent_revoked_while_starting_is_not_installed() {
+        let (source, events) = tokio::sync::mpsc::channel::<voice::reading::TurnEvent>(1);
+        let kept =
+            reading_events_still_consented(true, events).expect("an opt-in still on installs");
+        assert!(!source.is_closed());
+        drop(kept);
+        let (source, events) = tokio::sync::mpsc::channel::<voice::reading::TurnEvent>(1);
+        assert!(reading_events_still_consented(false, events).is_err());
+        assert!(source.is_closed(), "the subscription was not dropped");
+
+        let sessions = ReadingSessions::default();
+        let ticket = sessions.begin();
+        sessions.end_unless_consented(&DesktopSettings::default());
+        let spawned = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&spawned);
+        let refused = sessions.start(
+            ticket,
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                async {}
+            },
+            Box::new(|| {}),
+        );
+        assert_eq!(refused, Err(StaleStart::Revoked));
+        assert!(!spawned.load(Ordering::SeqCst));
+        // A start that begins after the save is not stale.
+        held_session(&sessions);
+    }
 
     fn voice_listing(entries: usize) -> voice::VoiceDirectories {
         voice::VoiceDirectories {
@@ -6040,6 +6962,7 @@ mod tests {
                 deck_step: None,
                 endpoints: Some(endpoints),
                 dictation: None,
+                reading: voice::VoiceReadingState::default(),
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
@@ -6238,6 +7161,7 @@ mod tests {
             deck_step: None,
             endpoints: Some(endpoints),
             dictation: None,
+            reading: voice::VoiceReadingState::default(),
         };
         assert_eq!(
             answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
@@ -6780,6 +7704,9 @@ mod tests {
                     Arc::new(voice::CaptureSession::new(Arc::new(source))),
                     Arc::new(voice::WakeLock::new(Arc::new(inhibitor))),
                 ),
+                reading: ReadingSessions::default(),
+                speech: voice::speech::SpeechRevocation::default(),
+                saves: tokio::sync::Mutex::new(()),
             },
             stopped,
             counts,
@@ -6936,6 +7863,9 @@ mod tests {
                     voice::StubInhibitor::refusing(),
                 ))),
             ),
+            reading: ReadingSessions::default(),
+            speech: voice::speech::SpeechRevocation::default(),
+            saves: tokio::sync::Mutex::new(()),
         };
 
         let (opened, _ticket) = voice_state
@@ -7017,6 +7947,40 @@ mod tests {
             }),
             ..DesktopSettings::default()
         }
+    }
+
+    /// PRD #1497 audit AU-S1: a deck that leaves the fleet while reading's
+    /// subscription is being confirmed is refused at the point the session
+    /// would be installed, and the subscription's receiver is dropped — its
+    /// source sees the session go. A fleet that did not move installs it.
+    #[tokio::test]
+    async fn voice_reading_is_not_installed_for_a_deck_that_left_while_subscribing() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let both = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        crate::dto::apply_settings_selection(&both);
+        let build_box = both
+            .connectable_endpoints()
+            .into_iter()
+            .find(|endpoint| format!("{endpoint:?}").contains("build-box"))
+            .expect("the fleet has build-box");
+        let wire = crate::dto::deck_wire_id(&build_box);
+
+        let scope = crate::dto::DeckScope::resolve(Some(&wire)).expect("an observed deck");
+        let (source, events) = tokio::sync::mpsc::channel(1);
+        let kept = reading_events_still_in_scope(&scope, events)
+            .expect("an unmoved fleet installs the session");
+        assert!(!source.is_closed());
+        drop(kept);
+
+        let scope = crate::dto::DeckScope::resolve(Some(&wire)).expect("an observed deck");
+        let (source, events) = tokio::sync::mpsc::channel(1);
+        // The deck leaves while the subscription is confirming.
+        crate::dto::apply_settings_selection(&fleet_of(&["laptop.example.com"]));
+        let refused = reading_events_still_in_scope(&scope, events)
+            .expect_err("the departed deck's session is not installed");
+        assert!(refused.contains("left the fleet"), "{refused}");
+        assert!(source.is_closed(), "the subscription was dropped");
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
     }
 
     /// A configured deck with no socket path gets NO transport and NO watcher,

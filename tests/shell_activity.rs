@@ -32,6 +32,10 @@
 mod child_lifetime_bound;
 
 #[cfg(unix)]
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
+#[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
 use std::io::Read as _;
@@ -596,7 +600,7 @@ fn shell_activity_003_session_id_discriminator_classifies_the_measured_confounde
 
 /// RAII guard for the detached target's real pid, so a panic between
 /// discovering it and the explicit kill below still reaps it rather than
-/// leaking a 30s `sleep` into the runner's process tree — the same pattern
+/// leaking a 120s `sleep` into the runner's process tree — the same pattern
 /// `SpawnedGrandchild` uses in `status/shell-activity/001`. A second SIGKILL
 /// after the process has already exited just returns ESRCH, which this
 /// ignores.
@@ -617,22 +621,12 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Scenario: spawns a real PTY pane running `/bin/sh` through
-/// `AgentPtyRegistry::spawn_agent` (the same registry path a real agent pane
-/// uses), tagged `agent_type: Some(AgentType::ClaudeCode)` so the shape
-/// catalog actually reaches the scan (`shell_tool_shape_key` filters by
-/// agent kind before the classifier ever sees a shape), whose script sleeps
-/// briefly and then has a `python3` child call `os.setsid()` and `execv`
-/// into `/bin/sleep` — a genuine `setsid`-detached, marker-tagged,
-/// Bash-tool-argv-shaped process on pipes, off the pane's PTY entirely,
-/// exactly the topology `status/shell-activity/386-argv-notes.md` measured
-/// for a real Claude Bash-tool child and the one #370's own test never
-/// exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
-/// and asserts the pane reads idle before the detached child appears, busy
-/// while it lives — independently confirmed via `process_table()` +
-/// `descendants()` that the found descendant has no controlling terminal, is
-/// its own session leader, and carries a session id different from the
-/// pane's own shell — and idle again once the child is killed.
+/// Scenario: spawns a real PTY shell tagged as a Claude pane and confirms it
+/// reads idle before releasing a gated, Bash-tool-shaped detached child whose
+/// startup deliberately exceeds the old four-second busy poll.
+/// Waits independently for that child's exec and verifies it has no controlling
+/// terminal, leads its own session, and differs from the shell's session;
+/// Asserts the pane reads busy while the child lives and idle after killing it.
 #[cfg(unix)]
 #[spec("status/shell-activity/004")]
 #[test]
@@ -643,6 +637,11 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     child_lifetime_bound::arm();
 
     const PANE_ID: &str = "shell-activity-004-pane";
+    // A real process-table sample has taken 19–20s under build contention
+    // (issue #862). Allow 30s for setup and each signal edge between samples,
+    // while the child outlives those waits; a synchronous sample can overrun
+    // the budget, so this is a polling bound rather than a timeout on ps.
+    const SIGNAL_BUDGET: Duration = Duration::from_secs(30);
     let marker = format!("shell-activity-004-target-{}", std::process::id());
     // A fixed `sleep 0.3` before the detached child launched used to give the
     // pre-edge assertion below an "observable idle window" to sample inside
@@ -658,27 +657,36 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     // pre-edge read no longer depends on winning a timing race at all. The
     // python3 one-liner setsid()'s itself (detaching from the pane's
     // controlling terminal and becoming its own session leader, exactly as
-    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 30`
+    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 120`
     // with an argv crafted to carry the measured Bash-tool shape
     // (`shell-snapshots/snapshot-` and `&& eval `) so the argv cross-check is
-    // exercised against a real process, not just a fixture string. 30s is a
-    // generous backstop bound in case the test panics before the explicit
+    // exercised against a real process, not just a fixture string. 120s is a
+    // backstop bound in case the test panics before the explicit
     // kill below runs; `KillOnDrop` and the explicit kill both aim to end it
-    // long before that. The trailing `sleep 5` keeps the pane's own shell
+    // long before that. The trailing `sleep 120` keeps the pane's own shell
     // alive (and so its registry entry) past the detached child's death —
     // without it the shell has nothing left to run and exits the instant the
     // killed child is reaped, so the pane disappears from the snapshot
     // instead of reading idle.
-    let ready_marker =
-        std::env::temp_dir().join(format!("shell-activity-004-ready-{}", std::process::id()));
-    // Best-effort: a stale file from a prior crashed run under the same pid
-    // (pids do wrap) would otherwise let the gated shell run immediately.
-    let _ = std::fs::remove_file(&ready_marker);
+    let fixture = test_temp::tempdir().expect("shell-activity fixture directory");
+    let ready_marker = fixture.path().join("ready");
+    let target_argv = format!("shell-snapshots/snapshot- && eval {marker}");
+    // The ready path is interpolated inside shell double quotes below.
+    assert!(
+        !ready_marker
+            .to_string_lossy()
+            .contains(['"', '$', '`', '\\', '\n', '\r']),
+        "fixture path cannot be interpolated into the shell command: {ready_marker:?}"
+    );
     let command = format!(
-        "while [ ! -e \"{ready}\" ]; do sleep 0.05; done; python3 -c \"import os; os.setsid(); \
-         os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; sleep 5",
+        "while [ ! -e \"{ready}\" ]; do sleep 0.05; done; python3 -c \"import os, time; time.sleep(5); os.setsid(); \
+         os.execv('/bin/sleep', ['{target_argv}', '120'])\"; sleep 120",
         ready = ready_marker.display(),
     );
+    // Keep the five-second startup delay as a regression stimulus: the old
+    // four-second busy poll deterministically said idle before setsid ran.
+    // Readiness must be established independently of how quickly the host
+    // gets around to launching the detached child.
 
     let registry = Arc::new(AgentPtyRegistry::new());
     let id = registry
@@ -723,7 +731,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     // yet, so the pane must read idle. No longer a race against a fixed
     // sleep — the only thing this loop can observe before the marker is
     // written below is `None` (pane not registered yet) or `Some(false)`.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + SIGNAL_BUDGET;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -740,46 +748,40 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     std::fs::write(&ready_marker, b"go")
         .expect("write ready marker to release the gated shell script");
 
-    // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let mut state = busy_for_pane(&registry);
-    while state != Some(true) && Instant::now() < deadline {
+    // Establish the stimulus BEFORE asking the registry to classify it.
+    // The old 4s busy poll also paid for shell/python startup, and timed out
+    // with Some(false) when no detached child existed yet. Wait on the real
+    // process topology instead. The argv prefix proves execv has completed:
+    // a detached python still running its -c script also contains the marker,
+    // but is not yet the Bash-tool-shaped sleep this test needs.
+    // Issue #862: sample with the shell as a root to obtain candidate argv.
+    let startup = Instant::now();
+    let deadline = startup + SIGNAL_BUDGET;
+    let (own_row, target) = loop {
+        let table = process_table(&[shell_pid]).expect("process_table() must enumerate on unix");
+        let own_row = table.iter().find(|p| p.pid == shell_pid);
+        let children = descendants(&table, shell_pid);
+        let target = children.iter().find(|p| {
+            p.command_line.read().is_some_and(|argv| {
+                argv.strip_prefix(&target_argv)
+                    .is_some_and(|tail| tail.starts_with(' '))
+            })
+        });
+        if let (Some(own_row), Some(target)) = (own_row, target) {
+            break (own_row.clone(), (*target).clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached child never reached its exec-ready topology; shell={own_row:?}, \
+             descendants={children:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
-        state = busy_for_pane(&registry);
-    }
-    assert_eq!(
-        state,
-        Some(true),
-        "a real detached-on-pipes descendant, off the pane's PTY entirely, in its own POSIX \
-         session, carrying the Bash-tool argv shape, must read busy — this is exactly the #370 \
-         defect: the old tcgetpgrp body compares pgids on the pane's own PTY and can never \
-         observe a child that never touches it"
+    };
+    target_guard.0 = Some(target.pid);
+    eprintln!(
+        "detached child exec-ready after {:?}: {target:?}",
+        startup.elapsed()
     );
-
-    // Independent oracle: confirm this is genuinely the topology #370 could
-    // never see, not just that the snapshot happened to say `true`.
-    // Issue #862: name the pane's shell as the sample's root, so the argv phase
-    // reads the command line of its detached descendants — which is what the
-    // `marker` search below needs.
-    let table = process_table(&[shell_pid]).expect("process_table() must enumerate on unix");
-    let own_row = table
-        .iter()
-        .find(|p| p.pid == shell_pid)
-        .expect("the pane's own shell must appear in its own process table sample");
-    let target = descendants(&table, shell_pid)
-        .into_iter()
-        .find(|p| {
-            p.command_line
-                .read()
-                .is_some_and(|argv| argv.contains(&marker))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "detached target carrying marker {marker:?} not found among descendants of \
-                 shell pid {shell_pid}"
-            )
-        })
-        .clone();
     assert!(
         !target.has_controlling_tty,
         "the detached child must have no controlling terminal — it never touches the pane's \
@@ -794,7 +796,20 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         "the detached child must be in a different POSIX session than the pane's own shell — \
          the load-bearing condition the whole discriminator rests on: {target:?}"
     );
-    target_guard.0 = Some(target.pid);
+
+    // Rising edge: the independently verified child lives throughout this
+    // wait, so a classifier miss is distinct from delayed fixture startup.
+    let deadline = Instant::now() + SIGNAL_BUDGET;
+    let mut state = busy_for_pane(&registry);
+    while state != Some(true) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        state = busy_for_pane(&registry);
+    }
+    assert_eq!(
+        state,
+        Some(true),
+        "a verified detached-on-pipes Bash-tool-shaped child must read busy: {target:?}"
+    );
 
     // Falling edge: kill the detached child and confirm the signal clears. A
     // test that only asserted the rising edge would pass against an
@@ -804,7 +819,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     unsafe {
         libc::kill(target.pid, libc::SIGKILL);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + SIGNAL_BUDGET;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -818,7 +833,6 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     registry.close_agent(&id).unwrap();
-    let _ = std::fs::remove_file(&ready_marker);
 }
 
 // ---------------------------------------------------------------------------

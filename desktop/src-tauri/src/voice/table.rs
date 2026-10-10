@@ -1388,6 +1388,11 @@ mod tests {
                 ("interrupt_agent", "interruptAgent", vec!["agent"]),
                 ("clear_prompt", "clearAgentPrompt", vec!["agent"]),
                 ("scratch_that", "scratchLastDictation", vec!["agent"]),
+                // PRD #1497's reading pair targets the pane on screen, and
+                // `hush_reading` is callable everywhere: speech can outlive its pane.
+                ("reading_on", "startReading", vec![]),
+                ("reading_off", "stopReading", vec![]),
+                ("hush_reading", "quietSpeech", vec![]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
                 // The directory browser inside that dialog — `overview`, plus
@@ -2007,6 +2012,8 @@ mod tests {
         // PRD #1541's three prompt commands because their whole-utterance
         // vocabulary is exactly what the agent screen answers locally outside
         // typing mode, which is what keeps the model from ever dispatching them.
+        // PRD #1497's reading pair for the dictation pair's reason, and `hush_reading`
+        // because "silence" or "hush" said in passing must not cut the app off.
         assert_eq!(
             whole,
             vec![
@@ -2016,6 +2023,9 @@ mod tests {
                 "interrupt_agent",
                 "clear_prompt",
                 "scratch_that",
+                "reading_on",
+                "reading_off",
+                "hush_reading",
                 "discard_new_agent"
             ]
         );
@@ -2365,13 +2375,20 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
+        // `reading_on` / `reading_off` (PRD #1497, decision 2 of 2026-10-09):
+        // they flip the Settings switch, which is not tied to a pane.
+        // `hush_reading` (D6): reading speaks on every screen, and "stop" or
+        // "quiet" always works.
         assert_eq!(
             everywhere,
             vec![
                 "clear_dashboard_filter",
                 "close",
                 "voice_off",
-                "list_commands"
+                "list_commands",
+                "reading_on",
+                "reading_off",
+                "hush_reading"
             ]
         );
         // And every OTHER row still has both cases, which is what keeps the
@@ -2446,6 +2463,9 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
+                "reading_on",
+                "reading_off",
+                "hush_reading",
                 "next_page",
                 "previous_page"
             ]
@@ -2463,6 +2483,9 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
+                "reading_on",
+                "reading_off",
+                "hush_reading",
                 "open_new_agent",
                 "next_page",
                 "previous_page",
@@ -2490,7 +2513,10 @@ mod tests {
                 "submit_prompt",
                 "interrupt_agent",
                 "clear_prompt",
-                "scratch_that"
+                "scratch_that",
+                "reading_on",
+                "reading_off",
+                "hush_reading"
             ]
         );
     }
@@ -2562,6 +2588,8 @@ mod tests {
                     "speaking on",
                     "start speaking",
                     "dictate on",
+                    "writing on",
+                    "start writing",
                 ],
             ),
             (
@@ -2579,6 +2607,8 @@ mod tests {
                     "speaking off",
                     "stop speaking",
                     "dictate off",
+                    "writing off",
+                    "stop writing",
                 ],
             ),
         ] {

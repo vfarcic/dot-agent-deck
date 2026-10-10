@@ -21,6 +21,7 @@
  * which is why they are not dependencies of this package.
  */
 
+import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -30,8 +31,10 @@ import {
 	buildWorkDoneArgv,
 	createReporter,
 	createSerialQueue,
+	createTurnReplyTracker,
 	DeckExecError,
 	execFailureMessage,
+	execWithStdin,
 	piEventReport,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
@@ -40,14 +43,16 @@ import {
 } from "./orchestrator.ts";
 
 /**
- * The deck CLI this pane shells: the absolute path the spawning deck exported
- * in `DOT_AGENT_DECK_EXE`, or the bare name for an older deck that did not
- * (issue #1385). Read once — the value is fixed for the life of the process.
+ * The deck CLI this pane shells: the operator's absolute `DOT_AGENT_DECK_BIN`
+ * (PRD #1497), else the absolute path the spawning deck exported in
+ * `DOT_AGENT_DECK_EXE`, or the bare name for an older deck that did not (issue
+ * #1385). Read once — the value is fixed for the life of the process.
  */
-const deckBin = resolveDeckBin(process.env);
+const deckBin = resolveDeckBin(process.env, process.platform);
 
 /**
- * Shell `dot-agent-deck <argv>` via Pi's exec helper. Throws a clear Error on a
+ * Shell `dot-agent-deck <argv>` via Pi's exec helper, or with `stdin` written
+ * to it, run in `stdin.cwd` (the session's directory). Throws a clear Error on a
  * spawn failure (missing binary) or a non-zero exit, so tool callers surface
  * `isError` to the LLM. Returns the exec result on success.
  */
@@ -55,10 +60,17 @@ async function runDeck(
 	pi: ExtensionAPI,
 	argv: string[],
 	signal: AbortSignal | undefined,
+	stdin?: { text: string; cwd: string | undefined },
 ) {
 	let outcome: { code: number; stdout: string; stderr: string; killed: boolean };
 	try {
-		outcome = await pi.exec(deckBin, argv, { signal });
+		// PRD #1497: `pi.exec` cannot write a child's stdin, so a report that
+		// carries a turn's reply spawns the CLI itself and hands it the reply
+		// there rather than on the command line.
+		outcome =
+			stdin === undefined
+				? await pi.exec(deckBin, argv, { signal })
+				: await execWithStdin(spawn, deckBin, argv, stdin.text, { signal, cwd: stdin.cwd });
 	} catch (err) {
 		throw new Error(spawnFailureMessage(argv, err, deckBin));
 	}
@@ -135,18 +147,32 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// a flag as unknown — an older deck; see `createReporter`. A deck that
 	// predates the declaration still gets the detail, and one that predates the
 	// detail still gets the status.
-	const reporter = createReporter((argv, signal) => runDeck(pi, argv, signal));
+	//
+	// The session directory the last report was sent from, for the one report
+	// spawned outside `pi.exec` (a settled turn's reply on stdin), which runs
+	// there the way `pi.exec` runs a command in the session's directory.
+	let reportCwd: string | undefined;
+	const reporter = createReporter((argv, signal, stdin) =>
+		runDeck(pi, argv, signal, stdin === undefined ? undefined : { text: stdin, cwd: reportCwd }),
+	);
 	// Every report, with its retries, runs to completion before the next one
 	// starts, so the deck receives them in the order Pi emitted them.
 	const inOrder = createSerialQueue();
-	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> =>
-		inOrder(async () => {
-			const decided = piEventReport(eventName, event, ctx.cwd);
+	// PRD #1497: the run's last assistant reply, attached to `agent_settled`.
+	// Observed synchronously in each handler, so it follows Pi's event order.
+	const replies = createTurnReplyTracker();
+	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
+		replies.observe(eventName, event);
+		const reply = eventName === "agent_settled" ? replies.take() : undefined;
+		return inOrder(async () => {
+			const decided = piEventReport(eventName, event, ctx.cwd, reply);
 			if (!decided) {
 				return;
 			}
+			reportCwd = ctx.cwd;
 			await reporter.send(decided, ctx.signal);
 		});
+	};
 
 	// --- PRD #201: NATIVE prompt delivery on session_start ----------------
 	// Pull the seed/prompt the daemon prepared for this pane (`get-seed`) and,
@@ -208,6 +234,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("tool_execution_end", async (event, ctx) => {
 		await report("tool_execution_end", event, ctx);
+	});
+	// PRD #1497: each finished message, for the settled turn's final reply.
+	// Reports nothing by itself.
+	pi.on("message_end", (event) => {
+		replies.observe("message_end", event);
 	});
 	pi.on("agent_settled", async (event, ctx) => {
 		await report("agent_settled", event, ctx);

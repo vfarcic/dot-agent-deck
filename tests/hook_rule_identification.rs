@@ -53,6 +53,17 @@ fn write_deck_binary(path: &Path) {
     }
 }
 
+/// The Claude Code command an install writes for `exe_word` (already quoted
+/// for the platform's shell): wrapped in the `DOT_AGENT_DECK_BIN` override on
+/// Unix (PRD #1497), plain on Windows, where `cmd.exe` has no such expansion.
+fn written(exe_word: &str) -> String {
+    #[cfg(unix)]
+    let prefix = dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX;
+    #[cfg(windows)]
+    let prefix = "";
+    format!("{prefix}{exe_word} hook --agent claude-code")
+}
+
 fn settings_path() -> (tempfile::TempDir, PathBuf) {
     let dir = test_temp::tempdir().expect("create settings dir");
     let path = dir.path().join("settings.json");
@@ -151,7 +162,7 @@ fn hook_rule_identification_001_repeated_install_renamed_binary_stays_single_rul
     let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         pre_tool_use,
-        vec![format!("{binary} hook --agent claude-code")],
+        vec![written(binary)],
         "PreToolUse must hold exactly one rule for the renamed binary; got {pre_tool_use:?}"
     );
 }
@@ -289,7 +300,7 @@ fn hook_rule_identification_006_legacy_rule_is_recognised_and_replaced() {
     let rules = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         rules,
-        vec!["/usr/local/bin/foo-tool hook --agent claude-code".to_string()],
+        vec![written("/usr/local/bin/foo-tool")],
         "a legacy rule under the historical default binary name must be replaced by \
          the fresh rule regardless of the installing binary's own name; got {rules:?}"
     );
@@ -335,9 +346,9 @@ fn hook_rule_identification_008_spaced_binary_path_round_trips() {
     let (_dir, path) = settings_path();
     let binary = "/Applications/My Deck/dot-agent-deck";
     #[cfg(unix)]
-    let expected_command = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
+    let expected_command = written("'/Applications/My Deck/dot-agent-deck'");
     #[cfg(windows)]
-    let expected_command = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
+    let expected_command = written("\"/Applications/My Deck/dot-agent-deck\"");
 
     install_to(&path, binary).expect("install");
     let after_one = rule_commands(&read_settings(&path), "PreToolUse");
@@ -568,8 +579,8 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
 
     let settings = read_settings(&path);
     let pre_tool_use = rule_commands(&settings, "PreToolUse");
-    let build_a_command = format!("{build_a_str} hook --agent claude-code");
-    let build_b_command = format!("{build_b_str} hook --agent claude-code");
+    let build_a_command = written(&build_a_str);
+    let build_b_command = written(&build_b_str);
 
     assert!(
         !pre_tool_use.contains(&build_a_command),
@@ -936,8 +947,10 @@ fn hook_rule_identification_020_co_located_user_command_survives_install() {
         "the user's own hook co-located in the deck's rule object must survive \
          install — auto-install runs at every startup; got {commands:?}"
     );
+    // PRD #1497: the co-located command is the old plain form, and the
+    // install migrates it in place to the override form.
     assert_eq!(
-        commands.iter().filter(|c| *c == &deck_command).count(),
+        commands.iter().filter(|c| **c == written(binary)).count(),
         1,
         "the installing binary must end up with exactly one rule of its own, not \
          zero and not a duplicate beside the co-located one; got {commands:?}"
@@ -991,7 +1004,7 @@ fn hook_rule_identification_021_settings_are_published_by_rename_not_truncated_i
     let commands = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         commands,
-        vec!["/opt/tools/worker-agent-deck hook --agent claude-code".to_string()],
+        vec![written("/opt/tools/worker-agent-deck")],
         "the destination path must carry the freshly installed rule; got {commands:?}"
     );
 }
@@ -1076,7 +1089,7 @@ fn hook_rule_identification_022_concurrent_installs_never_tear_or_lose_updates()
     let settings = read_settings(&path);
     let commands = rule_commands(&settings, "PreToolUse");
     for i in 0..4 {
-        let expected = format!("{} hook --agent claude-code", binary(i));
+        let expected = written(&binary(i));
         assert!(
             commands.contains(&expected),
             "every concurrent installer's rule must survive — a missing one is a \
@@ -1183,9 +1196,9 @@ fn hook_rule_identification_025_either_platforms_quoting_is_recognised_as_this_b
     let single = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
     let double = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
     #[cfg(unix)]
-    let native = single;
+    let native = written("'/Applications/My Deck/dot-agent-deck'");
     #[cfg(windows)]
-    let native = double;
+    let native = written("\"/Applications/My Deck/dot-agent-deck\"");
     write_settings(
         &path,
         &json!({
@@ -1200,7 +1213,7 @@ fn hook_rule_identification_025_either_platforms_quoting_is_recognised_as_this_b
     let rules = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         rules,
-        vec![native.to_string()],
+        vec![native],
         "both quoting forms name this binary, so the install must collapse them into \
          its one native rule; got {rules:?}"
     );

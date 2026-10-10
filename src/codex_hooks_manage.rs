@@ -363,7 +363,7 @@ fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path
 ///
 /// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
 /// install is kept rather than replaced (PRD #1487 —
-/// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
+/// [`crate::agent_hook_config::auto_install_kept_entry`]), and an event with
 /// no such entry gets the first kept install's command rather than this
 /// binary's. Returns every binary the installed events now name — the first
 /// kept install's first, then any other an event kept for itself — which is
@@ -403,10 +403,29 @@ fn install_impl(
     // along. (`Notification` and `TurnStart` were dropped as unknown in the same
     // probe, so the class is real but not every name is in it.)
     //
-    // The consequence, stated rather than left to be discovered: nothing cleans
-    // a FOREIGN install's retired-event rule during install. That is the same
-    // tradeoff already accepted for the installed events, and `uninstall_from`
-    // still clears every deck-signature command wide.
+    // The consequence, stated rather than left to be discovered: a FOREIGN
+    // install's retired-event hook is left in place by install, with two
+    // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`),
+    // which apply only to a command naming a deck install (this binary, or an
+    // executable sharing its basename; audit A1): a user's own executable
+    // that merely ends in the deck's verb is never touched. One whose
+    // executable has no safe spelling is removed, and one in the legacy
+    // `DOT_AGENT_DECK_BIN` wrapper, or one whose executable needs quoting and
+    // is not spelled as the current command for it, is rebuilt into the
+    // current form in place. Codex runs `SessionEnd`, so leaving either would
+    // leave it runnable.
+    // `uninstall_from` still clears every deck-signature command wide.
+    //
+    // Trust, for those two: a removal leaves the removed handler's trust record
+    // behind, and since Codex pins a grant to the hash of command, `matcher`
+    // and `async`, that record authorises nothing but the removed command. A
+    // handler that followed it in the same rule moves up one index and is held
+    // for review, as any re-keyed grant is (issue #1034); an emptied rule is
+    // kept unless it is the last, so no later rule moves. A rebuild moves
+    // nothing, but changes the command and so its hash: the trust write grants
+    // the rebuilt command only when it names a binary the install named (this
+    // binary, or a sibling an automatic install kept), exactly as for any
+    // command the install writes, and Codex otherwise holds it for review.
     //
     // An event key left empty is NOT dropped by this INSTALL sweep, while
     // Devin's install sweep does drop it. (Both adapters' `uninstall` drop
@@ -422,6 +441,15 @@ fn install_impl(
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
             strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            crate::agent_hook_config::remediate_retired_deck_handlers(
+                arr,
+                command_is_deck_owned,
+                deck_command_executable,
+                binary_path,
+                HOOK_COMMAND_SUFFIX,
+                HOOK_SHELL,
+                crate::agent_hook_config::EmptiedRule::KeepInterior,
+            );
         }
     }
 
@@ -431,6 +459,7 @@ fn install_impl(
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             deck_command_executable,
+            expected_hook_command,
         )
     };
     let keeper = match mode {
@@ -559,6 +588,8 @@ fn install_to_reporting(
     mode: InstallMode,
 ) -> std::io::Result<(bool, Vec<String>)> {
     let path = codex_home.join("hooks.json");
+    // Before the config is read, so a refusal leaves it as it was (PRD #1497).
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
     std::fs::create_dir_all(codex_home)?;
@@ -2383,9 +2414,76 @@ mod tests {
                 .unwrap_or_else(|| panic!("event {event} present"));
             assert_eq!(arr.len(), 1, "one deck rule per event ({event})");
             let cmd = arr[0]["hooks"][0]["command"].as_str().expect("command str");
-            assert_eq!(cmd, "/abs/dot-agent-deck hook --agent codex");
+            assert_eq!(
+                cmd,
+                format!(
+                    "{} hook --agent codex",
+                    crate::agent_hook_config::overridable_command_word(
+                        "/abs/dot-agent-deck",
+                        cfg!(windows)
+                    )
+                )
+            );
             assert_eq!(arr[0]["hooks"][0]["type"].as_str(), Some("command"));
         }
+    }
+
+    /// PRD #1497: a `hooks.json` holding the plain `<path> hook --agent codex`
+    /// command an older release wrote is migrated in place to the
+    /// `DOT_AGENT_DECK_BIN` form, one deck entry per event and the user's hook
+    /// kept; an uninstall over a file holding both forms removes both.
+    #[cfg(unix)]
+    #[test]
+    fn install_migrates_the_plain_form_and_uninstall_removes_both_forms() {
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        let binary = "/abs/dot-agent-deck";
+        let plain = format!("{binary} {HOOK_COMMAND_SUFFIX}");
+        let overridden = format!(
+            "{}{binary} {HOOK_COMMAND_SUFFIX}",
+            crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+        );
+        let user = "/usr/local/bin/audit.sh";
+        std::fs::write(
+            dir.path().join("hooks.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": plain }] },
+                    { "hooks": [{ "type": "command", "command": user }] }
+                ]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(dir.path(), binary).expect("install");
+        let root = read_back(dir.path());
+        for &event in CODEX_HOOK_EVENTS {
+            let commands = commands_for(&root, event);
+            let deck: Vec<_> = commands
+                .iter()
+                .filter(|c| c.ends_with(HOOK_COMMAND_SUFFIX))
+                .collect();
+            assert_eq!(deck, vec![&overridden], "{event}: {commands:?}");
+        }
+        assert!(commands_for(&root, "Stop").contains(&user.to_string()));
+
+        // A file holding both forms, as a 0.45.1 start can leave one.
+        std::fs::write(
+            dir.path().join("hooks.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": {
+                "Stop": [{ "hooks": [
+                    { "type": "command", "command": overridden },
+                    { "type": "command", "command": user }
+                ] }],
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": plain }] }]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        uninstall_from(dir.path()).expect("uninstall");
+        let root = read_back(dir.path());
+        assert_eq!(commands_for(&root, "Stop"), vec![user.to_string()]);
+        assert!(commands_for(&root, "SessionStart").is_empty());
     }
 
     /// Write a real, executable file at `path` (creating its directory) and

@@ -166,16 +166,133 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
+    // PRD #1497: the turn's final reply, for the daemon's reading
+    // subscribers. Read from the raw payload, so a reply of a strange shape
+    // costs the reply and never the event.
+    let reply = serde_json::from_str::<Value>(&input)
+        .ok()
+        .and_then(|payload| match agent {
+            "opencode" => extract_opencode_turn_reply(&payload),
+            "codex" => extract_codex_hook_turn_reply(&payload),
+            _ => extract_turn_reply(&payload),
+        });
+
     // Issue #318: present this pane's hook capability token, so the daemon can
     // tell this pane's own report from one naming it from outside.
     let token = crate::hook_provenance::token_from_env();
-    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
+    let json = match crate::event::agent_event_line(&event, token.as_deref())
+        .and_then(|line| with_turn_reply(line, reply.as_ref()))
+    {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
 
     let _ = send_to_socket(&json);
     ExitCode::SUCCESS
+}
+
+/// PRD #1497: `line` with `reply` added under
+/// [`crate::turn_reply::TURN_REPLY_LINE_KEY`], or unchanged when there is none —
+/// so an event with no reply is sent exactly as before.
+fn with_turn_reply(
+    line: String,
+    reply: Option<&crate::daemon_protocol::FinalReply>,
+) -> serde_json::Result<String> {
+    let Some(reply) = reply else {
+        return Ok(line);
+    };
+    let mut value: Value = serde_json::from_str(&line)?;
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            crate::turn_reply::TURN_REPLY_LINE_KEY.to_string(),
+            serde_json::to_value(reply)?,
+        );
+    }
+    serde_json::to_string(&value)
+}
+
+/// PRD #1497: the final reply a Claude-compatible hook payload carries — the
+/// `last_assistant_message` of a main-agent `Stop`, or of a `StopFailure`
+/// (marked failed). `None` for every other hook and for a `Stop` fired inside
+/// a subagent (one whose payload names an `agent_id`). A main-agent turn end
+/// whose message is missing, not a string, or blank is still a turn end, and
+/// answers an empty reply (audit A2): the turn ended with nothing to read. The
+/// text is cut to [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8
+/// boundary, and a `turn_id` (Codex reports one) is kept.
+pub fn extract_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    let failed = match payload.get("hook_event_name").and_then(Value::as_str)? {
+        "Stop" => false,
+        "StopFailure" => true,
+        _ => return None,
+    };
+    if payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return None;
+    }
+    let text = payload
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: text.to_owned(),
+            failed,
+        },
+    ))
+}
+
+/// PRD #1497: [`extract_turn_reply`] for a Codex hook payload, except that a
+/// `Stop` that does not carry `last_assistant_message` at all reports nothing
+/// rather than an empty reply. Codex also reports each turn in its rollout
+/// (`crate::codex_rollout_tail`), and whichever report reaches the daemon
+/// first is the turn's one frame (`crate::turn_reply::TurnReplyHub::publish`),
+/// so a `Stop` that cannot say whether there was a reply must not claim there
+/// was none. A `null` or blank message is Codex saying there was none.
+pub fn extract_codex_hook_turn_reply(
+    payload: &Value,
+) -> Option<crate::daemon_protocol::FinalReply> {
+    payload.get("last_assistant_message")?;
+    extract_turn_reply(payload)
+}
+
+/// PRD #1497: the final reply the deck's OpenCode plugin attaches to the report
+/// of a session going idle (`session.idle`, or `session.status` with status
+/// `idle`) — the text of the session's last assistant message, under `reply`,
+/// with `reply_failed` set when the turn ended on a `session.error`
+/// (`crate::opencode_manage`). `None` for every other event and for a missing
+/// or non-string `reply`, which the plugin leaves off an idle report that is
+/// not a known main session's turn end. A blank `reply` is that turn ending
+/// with nothing to read, and answers an empty reply (audit A2).
+pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    let idle = match payload.get("event").and_then(Value::as_str)? {
+        "session.idle" => true,
+        "session.status" | "session.status.updated" => payload
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("idle")),
+        _ => false,
+    };
+    if !idle {
+        return None;
+    }
+    let text = payload.get("reply")?.as_str()?;
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: text.to_owned(),
+            failed: payload
+                .get("reply_failed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+    ))
 }
 
 fn read_stdin() -> Option<String> {
@@ -908,6 +1025,99 @@ pub fn build_agent_event_cli(
         schema_version: None,
         live_target: None,
     }
+}
+
+/// How long `dot-agent-deck agent-event --turn-reply-stdin` waits for its
+/// stdin to end. The bundled Pi extension writes the reply and closes stdin
+/// as it spawns the CLI, so the read ends at once; the bound is for a stdin
+/// nobody closes (a terminal, a held-open pipe), which costs the report its
+/// reply and never the report.
+pub const TURN_REPLY_STDIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// PRD #1497: the reply `dot-agent-deck agent-event --turn-reply-stdin` reads
+/// from `input`: at most [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] plus
+/// the three bytes that complete a character straddling the bound — the
+/// daemon keeps no more ([`crate::turn_reply::normalize`] cuts it there) — so
+/// a longer input is never read in full. A character the read cut short is
+/// dropped; any other invalid UTF-8 becomes U+FFFD. `None` when `input` gives
+/// nothing, fails, or has not ended within `timeout`: the reader runs on a
+/// thread of its own, so a stdin nobody closes cannot hold the report.
+///
+/// What follows the bound is read and discarded until `input` ends, still
+/// within `timeout`, so a writer blocked on a full pipe is released instead of
+/// waiting on a reader that stopped reading (PR #1617's macOS hang). A writer
+/// that has not finished by then costs the wait, never the reply.
+pub fn read_turn_reply_stdin<R>(input: R, timeout: std::time::Duration) -> Option<String>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    let limit = (crate::daemon_protocol::MAX_TURN_REPLY_BYTES + 3) as u64;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (drained_tx, drained) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut input = input.take(limit);
+        let read = input.read_to_end(&mut bytes).map(|_| bytes);
+        let full = matches!(&read, Ok(bytes) if bytes.len() as u64 == limit);
+        let _ = tx.send(read);
+        if full {
+            let _ = std::io::copy(&mut input.into_inner(), &mut std::io::sink());
+        }
+        let _ = drained_tx.send(());
+    });
+    let bytes = rx.recv_timeout(timeout).ok()?.ok()?;
+    let _ = drained.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) if err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// PRD #1497: the final reply `dot-agent-deck agent-event --turn-reply-stdin`
+/// carries — the bundled Pi extension's last assistant text for a settled turn —
+/// bounded like every other route ([`crate::turn_reply::normalize`]). `text` is
+/// `None` when the report did not ask for a reply (no `--turn-reply-stdin`), and
+/// what stdin gave otherwise, empty included. Only a turn end (`--type
+/// finished`, an [`EventType::Idle`]) carries one; on any other `--type`, and
+/// without the flag, it is `None`, so the line is sent exactly as before. A
+/// turn end whose reply is blank answers an empty reply: the turn ended with
+/// nothing to read (audit A2).
+pub fn agent_event_cli_turn_reply(
+    event_type: &EventType,
+    text: Option<String>,
+    failed: bool,
+) -> Option<crate::daemon_protocol::FinalReply> {
+    if *event_type != EventType::Idle {
+        return None;
+    }
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: text?,
+            failed,
+        },
+    ))
+}
+
+/// The hook-socket line `dot-agent-deck agent-event` sends: `event` with this
+/// pane's token ([`crate::event::agent_event_line`]) and, beside it, the
+/// settled turn's `reply` under [`crate::turn_reply::TURN_REPLY_LINE_KEY`] —
+/// the shape a Claude-compatible hook's line takes, so the daemon reads both
+/// the same way.
+pub fn agent_event_cli_line(
+    event: &AgentEvent,
+    token: Option<&str>,
+    reply: Option<&crate::daemon_protocol::FinalReply>,
+) -> serde_json::Result<String> {
+    crate::event::agent_event_line(event, token).and_then(|line| with_turn_reply(line, reply))
 }
 
 /// The total-operation budget for a `delegate`'s reply — the same 5s
@@ -1951,7 +2161,171 @@ mod tests {
         }
     }
 
+    /// PRD #1497: `agent-event --turn-reply-stdin` reads the reply whole when
+    /// it fits, never more than the daemon keeps plus a straddling character,
+    /// drops a character the bound cut short, and gives up on a stdin that
+    /// does not end instead of holding the report.
+    #[test]
+    fn read_turn_reply_stdin_is_bounded_and_never_blocks() {
+        use crate::daemon_protocol::MAX_TURN_REPLY_BYTES;
+        use std::io::Cursor;
+        use std::time::{Duration, Instant};
+        let wait = Duration::from_secs(5);
+
+        let reply = "All 42 tests pass.\n\n--not-a-flag é😀";
+        assert_eq!(
+            read_turn_reply_stdin(Cursor::new(reply.as_bytes().to_vec()), wait).as_deref(),
+            Some(reply)
+        );
+        assert_eq!(read_turn_reply_stdin(Cursor::new(Vec::new()), wait), None);
+
+        // Far past the bound: what is read stops at the bound plus three bytes,
+        // and normalizing it gives exactly what normalizing all of it would.
+        let long = format!("a{}", "€".repeat(MAX_TURN_REPLY_BYTES));
+        let read = read_turn_reply_stdin(Cursor::new(long.clone().into_bytes()), wait)
+            .expect("a long reply");
+        assert!(read.len() <= MAX_TURN_REPLY_BYTES + 3, "{}", read.len());
+        assert!(read.len() > MAX_TURN_REPLY_BYTES);
+        let normalize = |text: String| {
+            crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+                turn_id: None,
+                text,
+                failed: false,
+            })
+        };
+        assert_eq!(normalize(read), normalize(long));
+
+        // A character the bound cuts short is dropped, never turned into U+FFFD.
+        let straddling = format!("{}😀tail", "a".repeat(MAX_TURN_REPLY_BYTES));
+        let read = read_turn_reply_stdin(Cursor::new(straddling.into_bytes()), wait).unwrap();
+        assert_eq!(read, "a".repeat(MAX_TURN_REPLY_BYTES));
+        // Invalid bytes inside the text are replaced, not fatal.
+        let read = read_turn_reply_stdin(Cursor::new(b"ok \xff done".to_vec()), wait).unwrap();
+        assert_eq!(read, "ok \u{FFFD} done");
+
+        /// A stdin nobody closes: `read` blocks until the test drops `_open`.
+        struct NeverEnds(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (_open, held) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        assert_eq!(
+            read_turn_reply_stdin(NeverEnds(held), Duration::from_millis(100)),
+            None
+        );
+        assert!(started.elapsed() < wait, "{:?}", started.elapsed());
+    }
+
+    /// PR #1617: a writer that sends far more than the bound through a real
+    /// pipe — past the 64 KiB a Linux pipe holds, so a reader that stopped at
+    /// the bound would leave it blocked until the reader went away and then
+    /// fail it with EPIPE — finishes its write whole, and the reply is still
+    /// the bounded prefix.
+    #[cfg(unix)]
+    #[test]
+    fn read_turn_reply_stdin_drains_a_writer_past_the_bound() {
+        use crate::daemon_protocol::MAX_TURN_REPLY_BYTES;
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let input = "x".repeat(256 * 1024);
+        let writing = {
+            let input = input.clone();
+            std::thread::spawn(move || writer.write_all(input.as_bytes()))
+        };
+        let read = read_turn_reply_stdin(reader, Duration::from_secs(10)).expect("a reply");
+        assert_eq!(
+            &read[..MAX_TURN_REPLY_BYTES],
+            &input[..MAX_TURN_REPLY_BYTES]
+        );
+        writing
+            .join()
+            .expect("writer thread")
+            .expect("the whole write is consumed, never refused");
+    }
+
     /// A lifecycle report with no detail is the frame it has always been.
+    /// PRD #1497: the Pi extension's `--turn-reply-stdin` on a `--type finished`
+    /// report becomes the line's `turn_reply`, which the daemon reads as it
+    /// reads a hook's; no other `--type` carries one, a blank text carries
+    /// none, and a line without one is the line it always was.
+    #[test]
+    fn agent_event_cli_turn_reply_rides_the_line_beside_a_settled_event() {
+        let finished = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-3".into()),
+            EventType::Idle,
+            AgentEventDetail::default(),
+        );
+        let reply = agent_event_cli_turn_reply(
+            &EventType::Idle,
+            Some("All 42 tests pass.\n\nNothing changed.".into()),
+            false,
+        )
+        .expect("a settled turn's reply");
+        let line = agent_event_cli_line(&finished, Some("tok"), Some(&reply)).unwrap();
+        assert_eq!(
+            crate::turn_reply::reply_from_line(&line),
+            Some(crate::daemon_protocol::FinalReply {
+                turn_id: None,
+                text: "All 42 tests pass.\n\nNothing changed.".into(),
+                failed: false,
+            })
+        );
+        // The event itself is unchanged and still parses as one.
+        let parsed: AgentEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.event_type, EventType::Idle);
+        assert_eq!(parsed.agent_id.as_deref(), Some("agent-3"));
+
+        let failed = agent_event_cli_turn_reply(&EventType::Idle, Some("--boom".into()), true)
+            .expect("a failed turn's reply");
+        assert!(failed.failed);
+        assert_eq!(failed.text, "--boom");
+
+        for other in [
+            EventType::Thinking,
+            EventType::ToolStart,
+            EventType::WaitingForInput,
+        ] {
+            assert_eq!(
+                agent_event_cli_turn_reply(&other, Some("text".into()), false),
+                None,
+                "{other:?}"
+            );
+        }
+        // Audit A2: a flagged turn end with a blank reply is a turn that
+        // ended with nothing to read, reported as an empty reply; without the
+        // flag there is no reply at all.
+        let blank = agent_event_cli_turn_reply(&EventType::Idle, Some("  \n ".into()), false)
+            .expect("a turn end with nothing to read");
+        assert!(blank.is_empty());
+        assert!(!blank.failed);
+        assert_eq!(
+            agent_event_cli_turn_reply(&EventType::Idle, None, false),
+            None
+        );
+        let plain = agent_event_cli_line(&finished, Some("tok"), None).unwrap();
+        assert_eq!(
+            plain,
+            crate::event::agent_event_line(&finished, Some("tok")).unwrap()
+        );
+        assert_eq!(crate::turn_reply::reply_from_line(&plain), None);
+    }
+
+    /// PRD #1497: an over-long reply is clamped to the daemon's bound before
+    /// it is sent, the same as every other route's.
+    #[test]
+    fn agent_event_cli_turn_reply_is_bounded() {
+        let long = "é".repeat(crate::daemon_protocol::MAX_TURN_REPLY_BYTES);
+        let reply = agent_event_cli_turn_reply(&EventType::Idle, Some(long), false).unwrap();
+        assert!(reply.text.len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES);
+    }
+
     #[test]
     fn agent_event_cli_without_detail_keeps_the_legacy_frame() {
         let event = build_agent_event_cli(

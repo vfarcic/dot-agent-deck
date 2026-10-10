@@ -205,7 +205,13 @@ fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
 /// the PATH the resolver produced, not either writer's quoting, so comparing the
 /// unquoted spelling keeps every assertion here exact on both platforms rather
 /// than encoding one platform's spelling.
+///
+/// The `DOT_AGENT_DECK_BIN` wrapper (PRD #1497) is stripped first, for the
+/// same reason: what is pinned here is the installed path that follows it.
 fn unquoted_command(command: &str) -> String {
+    let command = command
+        .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+        .unwrap_or(command);
     for quote in ['\'', '"'] {
         if let Some(rest) = command.strip_prefix(quote)
             && let Some((exe, tail)) = rest.split_once(quote)

@@ -2145,13 +2145,91 @@ fn normalize_quota_blocked_metadata(
     }
 }
 
+/// PRD #1497: publish the final reply a hook-socket `line` carries beside its
+/// turn-ending `event` ([`crate::turn_reply::TURN_REPLY_LINE_KEY`]).
+///
+/// Only for an attested or legacy-admitted event (the caller has excluded an
+/// outside agent's), only for a turn end — `Idle`, or the `Error` /
+/// `QuotaBlocked` a failed turn becomes — and only when the event names its
+/// agent and that agent is the live owner of the pane it names, so a payload
+/// cannot speak for another pane's agent.
+///
+/// Review RV-B1: a Codex turn is reported twice — by its `Stop` hook, whose
+/// payload names no turn, and by its rollout's `task_complete`, which does —
+/// and the hub can drop the second report only when both name the turn (and
+/// only within the bounds [`crate::turn_reply::TurnReplyHub::publish`]
+/// defines). So the turn a
+/// Codex `UserPromptSubmit` (a `Thinking` carrying
+/// [`crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY`]) begins is
+/// recorded here, and a Codex turn end whose reply names no turn is given it.
+/// One source per turn was the alternative: suppressing the `Stop` reply would
+/// leave only the rollout, which is read every
+/// [`crate::codex_rollout_tail::POLL_INTERVAL`] and only when Codex named a
+/// rollout to watch, and suppressing the rollout's would lose the errored turn
+/// it alone reports. Matching on the reply's text was not considered: two turns
+/// can end with the same words.
+fn publish_hook_turn_reply(
+    registry: &AgentPtyRegistry,
+    event: &AgentEvent,
+    attested_agent: Option<&str>,
+    line: &str,
+) {
+    use crate::event::{AgentType, EventType};
+    if event.is_daemon_synthetic() {
+        return;
+    }
+    let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+    else {
+        return;
+    };
+    if attested_agent.is_some_and(|attested| attested != agent_id) {
+        return;
+    }
+    let codex = event.agent_type == AgentType::Codex;
+    if codex && event.event_type == EventType::Thinking {
+        if let Some(turn_id) = event
+            .metadata
+            .get(crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY)
+            && registry.is_live_owner(pane_id, agent_id)
+        {
+            registry.turn_replies().begin_turn(agent_id, turn_id);
+        }
+        return;
+    }
+    if !matches!(
+        event.event_type,
+        EventType::Idle | EventType::Error | EventType::QuotaBlocked
+    ) {
+        return;
+    }
+    let Some(mut reply) = crate::turn_reply::reply_from_line(line) else {
+        return;
+    };
+    if codex && registry.is_live_owner(pane_id, agent_id) {
+        let begun = registry.turn_replies().take_begun_turn(agent_id);
+        reply.turn_id = reply.turn_id.or(begun);
+    }
+    registry.publish_turn_reply(pane_id, agent_id, reply);
+}
+
 /// Issue #714: queue the Codex rollout tailer's side of a Codex hook event
 /// (`crate::codex_rollout_tail`). `SessionStart` / `UserPromptSubmit` name the
 /// rollout and the turn to watch; a native `Stop` for the watched turn disarms
-/// it. Only for an event whose pane and agent name the pane's LIVE owner, so a
-/// payload can never make the daemon read a file on another pane's behalf. The
-/// file itself is opened and read by [`run_codex_rollout_monitor`], never here.
-fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
+/// it — but only a `Stop` whose hook `line` carried the turn's final reply
+/// ([`crate::turn_reply::reply_from_line`]). A `Stop` without one leaves the
+/// turn armed, so its `task_complete` is still read for the reply (PRD #1497
+/// re-audit R3) and disarms it then, but it queues
+/// [`crate::codex_rollout_tail::ArmCommand::StoppedWithoutReply`], which retires
+/// the watch with nothing delivered if that record has not come within
+/// [`crate::codex_rollout_tail::DRAIN_AFTER_STOP`]. A hook CLI older than PRD
+/// #1497 attaches no reply to any `Stop`, so under one every Codex turn takes
+/// that path. A `Stop` that names no turn queues nothing.
+/// `crate::codex_rollout_tail`'s module doc lists every way a watch ends.
+/// Only for an event whose pane and agent
+/// name the pane's LIVE owner, so a payload can never make the daemon read a
+/// file on another pane's behalf. The file itself is opened and read by
+/// [`run_codex_rollout_monitor`], never here.
+fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent, line: &str) {
     use crate::codex_rollout_tail::{
         ArmCommand, ArmRequest, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
     };
@@ -2175,9 +2253,21 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
             let Some(turn_id) = turn_id else {
                 return;
             };
-            ArmCommand::Disarm {
-                agent_id: agent_id.to_string(),
-                turn_id,
+            // The rollout is the turn's only report of its reply when the
+            // `Stop` carried none (`crate::hook::extract_codex_hook_turn_reply`),
+            // so the watch stays armed, but only for the bounded drain.
+            if crate::turn_reply::reply_from_line(line).is_none() {
+                ArmCommand::StoppedWithoutReply {
+                    pane_id: pane_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    turn_id,
+                }
+            } else {
+                ArmCommand::Disarm {
+                    pane_id: pane_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    turn_id,
+                }
             }
         }
         crate::event::EventType::SessionStart | crate::event::EventType::Thinking
@@ -2204,7 +2294,8 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
 }
 
 /// Issues #714 and #1359: the daemon half of Codex failed-turn detection
-/// (`crate::codex_rollout_tail`).
+/// (`crate::codex_rollout_tail`), and PRD #1497's source of a Codex turn's final
+/// reply when no `Stop` hook reports it (an errored turn runs none).
 ///
 /// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
 /// commands the hook loop queued, then polls every armed tailer on a blocking
@@ -2232,6 +2323,14 @@ async fn run_codex_rollout_monitor(
         }
         let failures;
         (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
+        // PRD #1497: a watched turn's reply, published before its failure (if
+        // any) is reported, as the hook loop publishes a reply before its
+        // event. It is dropped as a duplicate of the turn's `Stop` report only
+        // under the conditions `crate::turn_reply::TurnReplyHub::publish`
+        // defines (both name the turn, nothing else recorded between them).
+        for found in tailers.take_replies() {
+            registry.publish_turn_reply(&found.pane_id, &found.agent_id, found.reply);
+        }
         for failure in failures {
             report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
@@ -3459,6 +3558,12 @@ fn clamp_for_log(line: &str) -> std::borrow::Cow<'_, str> {
 /// wrote, every first-party producer now puts its pane's token on it, and a
 /// capability in `deck.log` is exactly the leak the token check exists to
 /// avoid — already a live one for a `DaemonMessage` line that failed to decode.
+///
+/// PRD #1497 audit AU-B3: and so is a turn's final reply. A turn-ending line
+/// carries the agent's reply under [`crate::turn_reply::TURN_REPLY_LINE_KEY`]
+/// (a hook's `Stop`, the OpenCode plugin's idle report, Pi's `agent-event`),
+/// and that text reaches only `subscribe-turn-replies` connections — never the
+/// log, whichever diagnostic the line trips ([`redact_hook_token`] says how).
 fn hook_line_for_log(line: &str) -> String {
     crate::config_validation::escape_for_terminal(&clamp_for_log(&redact_hook_token(line)))
         .into_owned()
@@ -3489,17 +3594,58 @@ fn hook_line_for_log(line: &str) -> String {
 /// that does not parse cannot be walked: every such hex run in it is masked,
 /// and a line containing a `\u` escape, which could spell a token in a form
 /// the mask does not recognise, is not logged at all beyond saying so.
+///
+/// A turn reply is withheld the same two ways (PRD #1497): in a line that
+/// parses, every [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member at any depth
+/// is replaced by its serialized length; in one that does not, nothing from the
+/// first occurrence of that key onwards is logged, only how many bytes were
+/// withheld. Every producer serializes the key after the event's identifiers
+/// (`serde_json` writes members in sorted order), so what is logged of such a
+/// line is still the part a diagnostic needs.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+        withhold_turn_replies(&mut value);
         redact_json_capabilities(&mut value);
         return std::borrow::Cow::Owned(value.to_string());
     }
     if line.contains("\\u") {
         return std::borrow::Cow::Borrowed("<withheld: an unparseable line with a \\u escape>");
     }
-    match mask_capability_runs(line) {
+    let (head, withheld) = match line.find(crate::turn_reply::TURN_REPLY_LINE_KEY) {
+        Some(at) => (&line[..at], Some(line.len() - at)),
+        None => (line, None),
+    };
+    let head = match mask_capability_runs(head) {
         Some(masked) => std::borrow::Cow::Owned(masked),
-        None => std::borrow::Cow::Borrowed(line),
+        None => std::borrow::Cow::Borrowed(head),
+    };
+    match withheld {
+        None => head,
+        Some(bytes) => std::borrow::Cow::Owned(format!(
+            "{head}<withheld: a turn reply and the {bytes} bytes from it on>"
+        )),
+    }
+}
+
+/// [`redact_hook_token`]'s turn-reply half over a parsed line: every
+/// [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member, at any depth, becomes a
+/// note of its serialized length.
+fn withhold_turn_replies(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(withhold_turn_replies),
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if key == crate::turn_reply::TURN_REPLY_LINE_KEY {
+                    *item = serde_json::Value::String(format!(
+                        "<withheld: {} bytes>",
+                        item.to_string().len()
+                    ));
+                } else {
+                    withhold_turn_replies(item);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4472,7 +4618,7 @@ async fn run_hook_loop_with_idle_timeout(
                             // An outside agent's rollout is not this daemon's to
                             // tail; the arm is for panes it spawned.
                             if !unproven {
-                                queue_codex_rollout_arm(&pty_registry, &event);
+                                queue_codex_rollout_arm(&pty_registry, &event, &line);
                             }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
@@ -4556,6 +4702,20 @@ async fn run_hook_loop_with_idle_timeout(
                             // different connection, so doing it first only
                             // means a client that reacts to the event by
                             // listing agents sees the fresher answer.
+                            //
+                            // PRD #1497: a turn-ending event's final reply goes
+                            // to `subscribe-turn-replies` connections, published
+                            // BEFORE the event is broadcast, so a client that
+                            // has seen this turn end and subscribes afterwards
+                            // is not handed its reply as if it were new.
+                            if !unproven {
+                                publish_hook_turn_reply(
+                                    &pty_registry,
+                                    &event,
+                                    attested_agent.as_deref(),
+                                    &line,
+                                );
+                            }
                             ingest_hook_event(
                                 &state,
                                 &event_tx,
@@ -4948,24 +5108,230 @@ mod hook_ingestion_tests {
                 .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
             event
         };
-        queue_codex_rollout_arm(&registry, &prompt("someone-else"));
+        queue_codex_rollout_arm(&registry, &prompt("someone-else"), "");
         let mut classified = prompt(&owner);
         classified.metadata.insert(
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
         );
-        queue_codex_rollout_arm(&registry, &classified);
+        queue_codex_rollout_arm(&registry, &classified, "");
         assert!(registry.codex_rollout_arms().drain().is_empty());
 
-        queue_codex_rollout_arm(&registry, &prompt(&owner));
+        queue_codex_rollout_arm(&registry, &prompt(&owner), "");
         let mut stop = prompt(&owner);
         stop.event_type = crate::event::EventType::Idle;
-        queue_codex_rollout_arm(&registry, &stop);
+        queue_codex_rollout_arm(
+            &registry,
+            &stop,
+            r#"{"turn_reply":{"text":"All tests pass."}}"#,
+        );
         let queued = registry.codex_rollout_arms().drain();
         assert!(
             matches!(&queued[..], [ArmCommand::Arm(req), ArmCommand::Disarm { turn_id, .. }]
                 if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
             "{queued:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario (PRD #1497 re-audit R3): a Codex turn `t1` is armed, and its
+    /// `Stop` arrives naming `t1` but without a reply (no
+    /// `last_assistant_message`, or a hook CLI older than PRD #1497), BEFORE
+    /// Codex has written the turn's `task_complete`. The `Stop` queues no
+    /// disarm, so the next poll still reads the rollout, hands the turn's
+    /// reply once and disarms it. A `Stop` that did carry the reply disarms the turn as
+    /// before, and its later `task_complete` hands nothing — the hook's frame
+    /// was the turn's one.
+    #[test]
+    fn codex_stop_without_a_reply_keeps_the_rollout_read_for_that_turn() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, CodexRolloutTailers,
+        };
+        use std::io::Write as _;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-r3".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T05-00-00-r3.jsonl");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&rollout)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        append("{\"type\":\"session_meta\"}\n");
+        let event = |event_type, turn: &str| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-r3".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                rollout.to_string_lossy().into_owned(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), turn.to_string());
+            event
+        };
+        let complete = |turn: &str, text: &str| {
+            format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\",\"last_agent_message\":\"{text}\"}}}}\n"
+            )
+        };
+        let live = |pane: &str, agent: &str| registry.is_live_owner(pane, agent);
+        let mut tailers = CodexRolloutTailers::default();
+        let poll = |tailers: &mut CodexRolloutTailers| {
+            for command in registry.codex_rollout_arms().drain() {
+                tailers.apply(command);
+            }
+            tailers.tick(live);
+            tailers.take_replies()
+        };
+
+        // The Stop carries no reply: the turn stays armed through the next
+        // poll, which reads the task_complete Codex writes after it.
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Thinking, "t1"),
+            "",
+        );
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle, "t1"),
+            r#"{"event_type":"idle"}"#,
+        );
+        assert!(poll(&mut tailers).is_empty(), "nothing written yet");
+        append(&complete("t1", "All 42 tests pass."));
+        let replies = poll(&mut tailers);
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].reply.turn_id.as_deref(), Some("t1"));
+        assert_eq!(replies[0].reply.text, "All 42 tests pass.");
+        assert!(
+            !tailers.is_armed(&owner),
+            "the turn's task_complete disarms it"
+        );
+        assert!(poll(&mut tailers).is_empty(), "handed once");
+
+        // The Stop carries the reply: the turn is disarmed, and its
+        // task_complete hands nothing more.
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Thinking, "t2"),
+            "",
+        );
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle, "t2"),
+            r#"{"event_type":"idle","turn_reply":{"text":"Done."}}"#,
+        );
+        assert!(poll(&mut tailers).is_empty());
+        append(&complete("t2", "Done."));
+        assert!(poll(&mut tailers).is_empty(), "a disarmed turn is not read");
+        assert!(!tailers.is_armed(&owner));
+        registry.shutdown_all();
+    }
+
+    /// Scenario (PRD #1497 re-audit R3): a Codex turn `t1` is armed and its
+    /// `Stop` arrives without a reply, but Codex never writes the turn's
+    /// `task_complete`. The `Stop` queues the bounded drain; once
+    /// `DRAIN_AFTER_STOP` has passed the next poll retires the watch, closes
+    /// the rollout and hands nothing, and a `task_complete` written later is
+    /// not read.
+    #[test]
+    fn codex_stop_without_a_reply_retires_the_watch_after_the_drain() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+            CodexRolloutTailers, DRAIN_AFTER_STOP,
+        };
+        use std::io::Write as _;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-drain".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T11-00-00-dr.jsonl");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&rollout)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        append("{\"type\":\"session_meta\"}\n");
+        let event = |event_type| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-drain".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                rollout.to_string_lossy().into_owned(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
+            event
+        };
+        let live = |pane: &str, agent: &str| registry.is_live_owner(pane, agent);
+        let mut tailers = CodexRolloutTailers::default();
+
+        queue_codex_rollout_arm(&registry, &event(crate::event::EventType::Thinking), "");
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle),
+            r#"{"event_type":"idle"}"#,
+        );
+        let queued = registry.codex_rollout_arms().drain();
+        assert!(
+            matches!(&queued[..], [ArmCommand::Arm(_), ArmCommand::StoppedWithoutReply { turn_id, .. }] if turn_id == "t1"),
+            "{queued:?}"
+        );
+        for command in queued {
+            tailers.apply(command);
+        }
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.is_armed(&owner), "the drain has only just begun");
+        assert!(tailers.holds_file(&owner));
+
+        let after_drain = std::time::Instant::now() + DRAIN_AFTER_STOP;
+        assert!(tailers.tick_at(after_drain, live).is_empty());
+        assert!(
+            !tailers.is_armed(&owner),
+            "no task_complete within the drain"
+        );
+        assert!(!tailers.holds_file(&owner), "the rollout is closed");
+        assert!(tailers.take_replies().is_empty());
+
+        append(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\",\"last_agent_message\":\"Too late.\"}}\n",
+        );
+        assert!(tailers.tick(live).is_empty());
+        assert!(
+            tailers.take_replies().is_empty(),
+            "the retired turn hands nothing"
         );
         registry.shutdown_all();
     }
@@ -5016,7 +5382,7 @@ mod hook_ingestion_tests {
         // The hook loop's order for a prompt: queue its arm, then apply it.
         let submit = |turn: &'static str| {
             let event = prompt(turn);
-            queue_codex_rollout_arm(&registry, &event);
+            queue_codex_rollout_arm(&registry, &event, "");
             ingest_event(&state, &event_tx, &registry, event)
         };
         let failure = || CodexTurnFailure {
@@ -5192,7 +5558,9 @@ mod hook_ingestion_tests {
             .iter()
             .map(|c| match c {
                 ArmCommand::Arm(req) => (req.path.as_deref(), req.turn_id.as_deref()),
-                ArmCommand::Disarm { .. } => panic!("no Stop was sent: {c:?}"),
+                ArmCommand::Disarm { .. } | ArmCommand::StoppedWithoutReply { .. } => {
+                    panic!("no Stop was sent: {c:?}")
+                }
             })
             .collect();
         assert_eq!(
@@ -5397,14 +5765,16 @@ mod hook_ingestion_tests {
                 .count()
         }
 
-        /// [`Self::notices`], polled until at least one has landed and the
-        /// count has stopped moving.
+        /// [`Self::notices`], polled until at least two occurrences (one
+        /// notice's echo and output) have landed and the count has stopped
+        /// moving. A quiet gap after just the echo does not mean the stand-in
+        /// has read its input.
         async fn settled_notices(&self) -> usize {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut last = self.notices().await;
             loop {
                 let now = self.notices().await;
-                if now > 0 && now == last {
+                if now >= 2 && now == last {
                     return now;
                 }
                 assert!(
@@ -5615,10 +5985,10 @@ mod hook_ingestion_tests {
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (review): a notice task waiting on a stalled orchestrator
-    /// writer is cancelled when its delegation is superseded, so repeated
-    /// delegations to a blocked worker leave at most one notice queued on that
-    /// writer, and releasing it delivers only the current delegation's notice.
+    /// Scenario: hold an orchestrator's writer and repeatedly supersede a
+    /// delegation to a blocked worker. Release the writer and wait for the
+    /// terminal echo and stand-in output, proving only the current notice lands
+    /// (issue #714, review).
     #[tokio::test]
     async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
         let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;
@@ -6606,6 +6976,108 @@ mod hook_ingestion_tests {
                  cover that site: {raw:?}"
             );
         }
+    }
+
+    /// PRD #1497 audit AU-B3: a turn-ending line carries the agent's private
+    /// reply, and no diagnostic that logs the raw line may put it in the log.
+    /// Drives the real `run_hook_loop` with lines built by the production
+    /// producer (`agent_event_cli_line`, the shape Pi's `agent-event` and every
+    /// hook's `Stop` send): one whose `event_type` is a typo (the
+    /// unrecognized-event warning), one cut off inside the reply (unparseable,
+    /// the `Malformed event:` warning), and one that parses but is not an event.
+    /// The sentinel never reaches the captured log, while each warning still
+    /// names the line's identifiers.
+    #[tokio::test]
+    async fn hook_diagnostics_never_log_a_turn_reply() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        const SENTINEL: &str = "PRIVATE_REPLY_SENTINEL_1497_e71f";
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        let fixture = HookLoopFixture::start();
+
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "reply-log-session", "agent_type": "pi", "event_type": "idle",
+            "timestamp": "2026-10-08T12:00:00Z", "pane_id": "reply-log-pane", "metadata": {},
+        }))
+        .unwrap();
+        let reply = crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: format!("{SENTINEL}: all tests pass. {}", "padding ".repeat(80)),
+            failed: false,
+        };
+        let line = crate::hook::agent_event_cli_line(&event, None, Some(&reply)).unwrap();
+        assert!(
+            line.contains(SENTINEL),
+            "the producer put the reply on the line"
+        );
+        let unknown = line.replace("\"event_type\":\"idle\"", "\"event_type\":\"idel\"");
+        assert_ne!(unknown, line, "the typo must land in the line");
+        let cut = line[..line.find(SENTINEL).unwrap() + SENTINEL.len()].to_owned();
+        let not_an_event = line.replace(
+            "\"session_id\":\"reply-log-session\"",
+            "\"session_id\":7,\"note\":\"reply-log-session\"",
+        );
+        assert_ne!(not_an_event, line);
+
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        for line in [&unknown, &cut, &not_an_event] {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream
+            .write_all(format!("{}\n", padded_session_start("reply-log-sentinel", 0)).as_bytes())
+            .await
+            .expect("write sentinel");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("reply-log-sentinel").await;
+
+        drop(subscriber_guard);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            raw.contains("unrecognized event_type") && raw.matches("Malformed event:").count() == 2,
+            "every diagnostic was reached, or this proves nothing: {raw}"
+        );
+        assert!(
+            !raw.contains(SENTINEL) && !raw.contains("all tests pass"),
+            "a turn reply reached the log: {raw}"
+        );
+        assert!(
+            raw.contains("reply-log-session") && raw.contains("<withheld"),
+            "the diagnostics still name the line and say what was withheld: {raw}"
+        );
     }
 
     // ── Issue #1159: why the two tests below no longer race a 2-second window ──

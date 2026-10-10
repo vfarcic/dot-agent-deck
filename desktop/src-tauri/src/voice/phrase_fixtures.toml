@@ -869,6 +869,35 @@ screen = "agent"
 action = "dictation_off"
 outcome = "dispatch"
 
+# PRD #1497 R3-2 — the writing phrasings, each with its counterpart.
+[[fixtures]]
+name = "dictation-on-writing-on"
+utterance = "Writing on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-writing"
+utterance = "start writing"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-writing-off"
+utterance = "writing off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-writing"
+utterance = "Stop writing."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
 # A switch phrase said INSIDE a sentence is not a switch. The first three go
 # through the local `type` opener; the last three reach the model, through an
 # opener no list holds, with a reserved phrase in the middle of what is to be
@@ -967,6 +996,83 @@ name = "voice-off-stop-voice"
 utterance = "stop voice"
 screen = "agent"
 action = "voice_off"
+outcome = "dispatch"
+
+# PRD #1497 — reading's switches and the way of silencing the app's speech.
+# Like the dictation switches above, every one of these is `heard_as_whole` and
+# answered by the local fast path (`reading_intercept`) before any model call,
+# so these pin the whole pipeline's answer for the phrasings users say. None of
+# the three has `screens` (decision 2 of 2026-10-09): "reading on" and "reading
+# off" flip the Settings switch from any screen, so each is pinned on the
+# overview and the deck as well as in an agent's pane.
+[[fixtures]]
+name = "reading-on"
+utterance = "reading on"
+screen = "agent"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-read-to-me-politely"
+utterance = "Okay, read to me."
+screen = "agent"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-start-reading-on-the-overview"
+utterance = "start reading"
+screen = "overview"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-on-the-deck"
+utterance = "Reading on."
+screen = "deck"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off"
+utterance = "Reading off."
+screen = "agent"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-stop-reading"
+utterance = "stop reading"
+screen = "agent"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-on-the-deck"
+utterance = "reading off"
+screen = "deck"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-done-reading-on-the-overview"
+utterance = "done reading"
+screen = "overview"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "quiet-on-the-agent-screen"
+utterance = "quiet"
+screen = "agent"
+action = "hush_reading"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "quiet-be-quiet-on-the-overview"
+utterance = "Be quiet, please."
+screen = "overview"
+action = "hush_reading"
 outcome = "dispatch"
 
 # PRD #1541 — the typing-mode prompt commands: interrupt the open agent's

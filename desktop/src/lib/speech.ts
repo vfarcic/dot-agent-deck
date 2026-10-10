@@ -1,0 +1,428 @@
+/**
+ * PRD #1497 M4 — reading mode's voice: one queue, two sources.
+ *
+ * Reading mode hands {@link SpeechQueue.say} a sentence for an agent; the
+ * queue speaks it with whichever source `desktop_voice_speech_plan` names
+ * (D9): the Commands connection's text-to-speech, fetched Rust-side and played
+ * here through Web Audio, or the operating system's voice through the Web
+ * Speech API. Both play in the webview, which is why the queue lives here.
+ *
+ * # Quiet by default (D6)
+ *
+ * New speech for an agent that already has a sentence WAITING replaces that
+ * sentence rather than queueing behind it, so a burst of events is heard as
+ * its latest state instead of as a backlog. Only that agent's: the queue is
+ * shared by every agent being read, and one agent's sentence never replaces
+ * another's. A sentence already being spoken is left to finish.
+ * {@link SpeechQueue.interrupt} stops the current sentence at once and drops
+ * everything waiting — what "stop" and "quiet" do.
+ *
+ * # Worded when it is said
+ *
+ * A sentence can be handed over as a function, called when the queue takes
+ * it up to say it: reading's sentence about an agent drops the agent's name
+ * when that agent's pane is open at that moment (decision 4 of 2026-10-09),
+ * and the moment it is queued may be long before.
+ *
+ * The provider's audio takes a round trip to prepare, and the open pane can
+ * change during it, so a {@link Worded} sentence is worded again right before
+ * its audio plays (audit A6). When the wording changed, the audio for the
+ * sentence's `safe` form (the one naming the agent, right whichever pane is
+ * open) is prepared and played instead: a sentence without the name is never
+ * played once its agent's pane is no longer the open one. A refusal of that
+ * second request is still never answered with the system voice (D9).
+ *
+ * # "Is speaking" (D8)
+ *
+ * {@link SpeechQueue.speaking} is true from the moment a sentence is taken off
+ * the queue — including while its provider audio is being fetched — until the
+ * queue is empty, and does not flicker between back-to-back sentences.
+ * Reading mode uses it to honour only the interrupt rows while the app is
+ * talking, so the microphone hearing the app's own voice can at worst make it
+ * stop itself.
+ *
+ * # The system voice on Linux
+ *
+ * WebKitGTK implements `speechSynthesis` only when it was built with speech
+ * synthesis support and the desktop has a speech provider installed; without
+ * one it may be absent or may accept an utterance and say nothing. The system
+ * voice here therefore rejects when the API is missing and gives up on an
+ * utterance after a length-based deadline rather than waiting forever, and the
+ * provider voice (an OpenAI-compatible connection) is what works regardless.
+ */
+
+import type { DeckBridge, SpeechPlanDto } from "./bridge";
+
+/**
+ * One way of saying a sentence. Resolves when it has been said or stopped.
+ * `recheck`, when given, is asked right before the audio plays: it answers
+ * the text to say instead when `text` is no longer the right wording, and
+ * `undefined` otherwise. A voice that says `text` at once may ignore it.
+ */
+export interface SpeechVoice {
+  speak(text: string, signal: AbortSignal, recheck?: () => string | undefined): Promise<void>;
+}
+
+export interface SpeechQueueDeps {
+  /** Which source speaks the next sentence; asked once per sentence. */
+  plan: () => Promise<SpeechPlanDto>;
+  provider: SpeechVoice;
+  system: SpeechVoice;
+  /** A sentence could not be spoken, and why. */
+  onProblem?: (reason: string) => void;
+}
+
+/**
+ * A sentence worded when it is said: `say` answers the wording for that
+ * moment, and `safe` is the wording that is right at any moment (reading's
+ * sentence naming its agent), played when the moment changed while the audio
+ * for `say`'s answer was being prepared.
+ */
+export interface Worded {
+  say: () => string;
+  safe: string;
+}
+
+/** A sentence, or how to word it when it is said. */
+export type SpeechText = string | (() => string) | Worded;
+
+/** `text` worded now. */
+export function wordedNow(text: SpeechText): string {
+  if (typeof text === "string") return text;
+  return typeof text === "function" ? text() : text.say();
+}
+
+interface Waiting {
+  agent: string;
+  text: SpeechText;
+}
+
+/** Said when the webview has no speech synthesis at all. */
+export const NO_SYSTEM_VOICE = "this system has no speech voice";
+
+/**
+ * The provider's speech was refused rather than failed: the settings no
+ * longer permit it (reading's opt-in off, or another source) or the Commands
+ * connection changed (PR #1617's review). Never answered with the system
+ * voice, even under Auto — a refusal is not an outage.
+ */
+export class SpeechRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpeechRefusedError";
+  }
+}
+
+/**
+ * What `desktop_voice_speech_audio` rejected with, as an error: `{ kind:
+ * "refused" | "failed", message }`, the first a {@link SpeechRefusedError}.
+ */
+export function speechAudioError(cause: unknown): Error {
+  if (typeof cause === "object" && cause !== null && "kind" in cause && "message" in cause) {
+    const message = String(cause.message);
+    return cause.kind === "refused" ? new SpeechRefusedError(message) : new Error(message);
+  }
+  if (cause instanceof Error) return cause;
+  return new Error(typeof cause === "string" ? cause : "speech failed");
+}
+
+export class SpeechQueue {
+  private waiting: Waiting[] = [];
+  private current: AbortController | null = null;
+  /** The key the sentence being said was queued under. */
+  private currentAgent: string | null = null;
+  private active = false;
+  private readonly listeners = new Set<(speaking: boolean) => void>();
+
+  constructor(private readonly deps: SpeechQueueDeps) {}
+
+  /** Whether a sentence is being prepared or spoken. */
+  get speaking(): boolean {
+    return this.active;
+  }
+
+  /** The sentences waiting, oldest first (not the one being spoken). */
+  get pending(): readonly Waiting[] {
+    return this.waiting;
+  }
+
+  /**
+   * Speak `text` for `agent`. Replaces a sentence for the same agent that has
+   * not started yet; otherwise queues it. A function is called when the
+   * sentence is taken up to be said, and its answer is what is said.
+   */
+  say(agent: string, text: SpeechText): void {
+    const entry = typeof text === "string" ? text.trim() : text;
+    if (entry === "") return;
+    const at = this.waiting.findIndex((waiting) => waiting.agent === agent);
+    if (at >= 0) {
+      this.waiting[at] = { agent, text: entry };
+    } else {
+      this.waiting.push({ agent, text: entry });
+    }
+    void this.pump();
+  }
+
+  /** Stop the current sentence now and drop every waiting one. */
+  interrupt(): void {
+    this.waiting = [];
+    this.current?.abort();
+  }
+
+  /**
+   * Drop every waiting sentence whose key `match` accepts, and stop the one
+   * being said if its key does; every other sentence is kept, in order.
+   */
+  drop(match: (agent: string) => boolean): void {
+    this.waiting = this.waiting.filter((waiting) => !match(waiting.agent));
+    if (this.currentAgent !== null && match(this.currentAgent)) this.current?.abort();
+  }
+
+  /** Be told when {@link speaking} changes. Returns the unsubscribe. */
+  subscribe(listener: (speaking: boolean) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private setActive(active: boolean): void {
+    if (this.active === active) return;
+    this.active = active;
+    for (const listener of this.listeners) listener(active);
+  }
+
+  private async pump(): Promise<void> {
+    if (this.active) return;
+    this.setActive(true);
+    try {
+      for (let next = this.waiting.shift(); next !== undefined; next = this.waiting.shift()) {
+        const controller = new AbortController();
+        this.current = controller;
+        this.currentAgent = next.agent;
+        try {
+          // Raced against the abort so an interrupt ends the sentence here at
+          // once, whatever the voice does about its own signal.
+          await Promise.race([this.speakOne(next.text, controller.signal), aborted(controller.signal)]);
+        } catch (error) {
+          if (!controller.signal.aborted) this.deps.onProblem?.(reason(error));
+        } finally {
+          this.current = null;
+          this.currentAgent = null;
+        }
+      }
+    } finally {
+      this.setActive(false);
+    }
+  }
+
+  /**
+   * Say one sentence, worded as late as each source allows: the system voice
+   * speaks the moment it is handed the text, so it is worded then; the
+   * provider's audio is prepared first, so it is worded before and checked
+   * again right before it plays (see the module comment).
+   */
+  private async speakOne(entry: SpeechText, signal: AbortSignal): Promise<void> {
+    const word = () => wordedNow(entry).trim();
+    if (word() === "") return;
+    const plan = await this.deps.plan();
+    if (signal.aborted) return;
+    switch (plan.kind) {
+      case "system": {
+        const text = word();
+        return text === "" ? undefined : this.deps.system.speak(text, signal);
+      }
+      case "unavailable":
+        this.deps.onProblem?.(plan.reason);
+        return;
+      case "provider": {
+        const text = word();
+        if (text === "") return;
+        const recheck = () => {
+          if (word() === text) return undefined;
+          return typeof entry === "object" ? entry.safe.trim() : word();
+        };
+        try {
+          await this.deps.provider.speak(text, signal, recheck);
+        } catch (error) {
+          if (signal.aborted || !plan.fallbackToSystem || error instanceof SpeechRefusedError) throw error;
+          const now = word();
+          if (now !== "") await this.deps.system.speak(now, signal);
+        }
+      }
+    }
+  }
+}
+
+function aborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+function reason(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : "speech failed";
+}
+
+/**
+ * How long the system voice is given for `text` before it is cancelled: a
+ * generous speaking rate plus a margin, so a voice that never reports the end
+ * of an utterance cannot hold the queue.
+ */
+export function systemVoiceDeadlineMs(text: string): number {
+  return Math.min(60_000, 3_000 + text.length * 120);
+}
+
+/** The parts of `speechSynthesis` the system voice uses. */
+export interface SynthLike {
+  speak(utterance: SpeechSynthesisUtterance): void;
+  cancel(): void;
+}
+
+/** The operating system's voice, through the Web Speech API. */
+export function systemVoice(
+  synth: SynthLike | undefined = globalThis.speechSynthesis,
+  utter: ((text: string) => SpeechSynthesisUtterance) | undefined = typeof SpeechSynthesisUtterance === "undefined"
+    ? undefined
+    : (text) => new SpeechSynthesisUtterance(text),
+): SpeechVoice {
+  return {
+    speak(text, signal) {
+      if (synth === undefined || utter === undefined) return Promise.reject(new Error(NO_SYSTEM_VOICE));
+      if (signal.aborted) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const utterance = utter(text);
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          signal.removeEventListener("abort", stop);
+          if (error) reject(error);
+          else resolve();
+        };
+        const stop = () => {
+          synth.cancel();
+          finish();
+        };
+        const deadline = setTimeout(stop, systemVoiceDeadlineMs(text));
+        signal.addEventListener("abort", stop, { once: true });
+        utterance.onend = () => finish();
+        utterance.onerror = (event) => {
+          // A cancel reports itself as an error; it is a stop, not a failure.
+          if (signal.aborted || event.error === "interrupted" || event.error === "canceled") finish();
+          else finish(new Error(`the system voice failed (${event.error})`));
+        };
+        synth.speak(utterance);
+      });
+    },
+  };
+}
+
+/** The parts of an `AudioContext` the provider voice uses. */
+export interface AudioContextLike {
+  readonly destination: AudioNode;
+  resume?(): Promise<void>;
+  decodeAudioData(data: ArrayBuffer): Promise<AudioBuffer>;
+  createBufferSource(): AudioBufferSourceNode;
+}
+
+/**
+ * The longest provider audio played for one sentence, in seconds. The Rust
+ * side caps the bytes at about two minutes of MP3; a decoded clip longer than
+ * this is refused rather than played, whatever its bytes said.
+ */
+export const MAX_PROVIDER_AUDIO_SECONDS = 120;
+
+/** Added to a clip's own length before its playback is given up on. */
+export const PROVIDER_PLAYBACK_MARGIN_MS = 2_000;
+
+/** Said when decoded provider audio is longer than {@link MAX_PROVIDER_AUDIO_SECONDS}. */
+export const PROVIDER_AUDIO_TOO_LONG = "the speech service's audio is too long to play";
+
+/**
+ * How long a decoded clip of `seconds` may play before it is stopped: its own
+ * length (or the cap, for a length the decoder did not report) plus a margin,
+ * so a source that never reports its end cannot hold the queue.
+ */
+export function providerPlaybackDeadlineMs(seconds: number, maxSeconds = MAX_PROVIDER_AUDIO_SECONDS): number {
+  const length = Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds, maxSeconds) : maxSeconds;
+  return length * 1_000 + PROVIDER_PLAYBACK_MARGIN_MS;
+}
+
+/**
+ * The Commands connection's text-to-speech: audio fetched Rust-side, decoded
+ * and played with Web Audio. The context is created on first use and reused.
+ *
+ * Bounded twice after the Rust side's byte cap: a decoded clip longer than
+ * `maxSeconds` is refused before it plays, and playback is stopped at
+ * {@link providerPlaybackDeadlineMs} if the source never reports its end.
+ *
+ * Right before a clip plays, `recheck` is asked whether its text is still the
+ * one to say; when it answers another, that text's audio is prepared and
+ * played instead, without asking again (the queue answers a wording that is
+ * right whatever happens next).
+ */
+export function providerVoice(
+  fetchAudio: (text: string) => Promise<ArrayBuffer>,
+  makeContext: () => AudioContextLike = () => new AudioContext(),
+  maxSeconds = MAX_PROVIDER_AUDIO_SECONDS,
+): SpeechVoice {
+  let context: AudioContextLike | undefined;
+  const prepare = async (text: string, signal: AbortSignal): Promise<{ ctx: AudioContextLike; buffer: AudioBuffer } | undefined> => {
+    const audio = await fetchAudio(text);
+    if (signal.aborted) return undefined;
+    context ??= makeContext();
+    const ctx = context;
+    await ctx.resume?.();
+    const buffer = await ctx.decodeAudioData(audio);
+    if (signal.aborted) return undefined;
+    if (Number.isFinite(buffer.duration) && buffer.duration > maxSeconds) throw new Error(PROVIDER_AUDIO_TOO_LONG);
+    return { ctx, buffer };
+  };
+  return {
+    async speak(text, signal, recheck) {
+      let prepared = await prepare(text, signal);
+      if (prepared === undefined) return;
+      const instead = recheck?.();
+      if (instead !== undefined && instead !== "" && instead !== text) {
+        prepared = await prepare(instead, signal);
+        if (prepared === undefined) return;
+      }
+      const { ctx, buffer } = prepared;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      await new Promise<void>((resolve) => {
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        const finish = () => {
+          clearTimeout(deadline);
+          signal.removeEventListener("abort", stop);
+          resolve();
+        };
+        const stop = () => {
+          try {
+            source.stop();
+          } catch {
+            // Already stopped.
+          }
+          finish();
+        };
+        signal.addEventListener("abort", stop, { once: true });
+        source.onended = finish;
+        deadline = setTimeout(stop, providerPlaybackDeadlineMs(buffer.duration, maxSeconds));
+        source.start();
+      });
+    },
+  };
+}
+
+/** The queue reading mode uses, wired to the bridge and the real voices. */
+export function createSpeechQueue(bridge: DeckBridge, onProblem?: (reason: string) => void): SpeechQueue {
+  return new SpeechQueue({
+    plan: () => bridge.voiceSpeechPlan(),
+    provider: providerVoice((text) => bridge.voiceSpeechAudio(text)),
+    system: systemVoice(),
+    onProblem,
+  });
+}

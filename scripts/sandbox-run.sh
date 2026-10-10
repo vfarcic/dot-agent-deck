@@ -76,6 +76,13 @@ else
   [ -n "$bin" ] || die "no dot-agent-deck build under $checkout/target — nothing can talk to the sandbox daemon"
 fi
 [ -x "$bin" ] || die "no dot-agent-deck binary at $bin"
+# Absolute, because DOT_AGENT_DECK_BIN (below) is honoured only as an absolute
+# path; a relative value would be ignored and agents would report through the
+# installed release.
+case $bin in
+  /*) ;;
+  *) bin="$PWD/$bin" ;;
+esac
 
 # --- isolation ---------------------------------------------------------------
 #
@@ -115,6 +122,16 @@ export DOT_AGENT_DECK_DESKTOP_CONFIG="$sandbox/desktop.toml"
 # (desktop/src-tauri/src/daemon_bridge.rs). Pinned so a daemon it starts is this
 # build, not a sibling binary or whatever is first on PATH.
 export DOT_AGENT_DECK_BINARY="$bin"
+
+# Every agent's hook command, the OpenCode plugin and the Pi extension honour
+# this in place of the binary they name (PRD #1497). Without it a sandbox
+# agent's hooks run the absolute installed path the agent's own config holds —
+# the release — so status still reaches this sandbox's daemon (the socket above
+# is inherited) but anything the release predates, such as the turn's reply for
+# voice reading, is dropped. Panes inherit it, nested devbox layers included.
+# It takes effect only once the hook entries carry the override — `hooks
+# install` from this build writes them (docs/develop/local-run.md).
+export DOT_AGENT_DECK_BIN="$bin"
 
 # Panes inherit this PATH, so an agent inside the sandbox that types a bare
 # `dot-agent-deck` must reach the branch build — not whatever is installed.
