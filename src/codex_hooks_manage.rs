@@ -3558,28 +3558,30 @@ mod tests {
             "trustStatus": "untrusted"
         });
         let reply = |hooks: Value| {
-            json!({"id": 2, "result": {"data": [{"hooks": hooks, "warnings": [], "errors": []}]}})
-                .to_string()
+            let group = json!({"hooks": hooks, "warnings": [], "errors": []});
+            format!("{}\n", json!({"id": 2, "result": {"data": [group]}}))
         };
-        let script = format!(
-            "#!/bin/sh\n\
+        // The script is a constant: every path and reply it needs sits in a
+        // file beside it, found through `$0`, so nothing from the fixture's
+        // location is ever spliced into shell source (Greptile on PR #1655).
+        std::fs::write(root.join("project.txt"), project.display().to_string())
+            .expect("write the project path for the stand-in");
+        std::fs::write(root.join("listed.json"), reply(json!([entry])))
+            .expect("write the listed reply");
+        std::fs::write(root.join("empty.json"), reply(json!([]))).expect("write the empty reply");
+        let script = "#!/bin/sh\n\
              [ \"$1\" = app-server ] || exit 2\n\
-             pwd -P > '{pwd}'\n\
+             dir=$(dirname \"$0\")\n\
+             pwd -P > \"$dir/pwd.txt\"\n\
              IFS= read -r _initialize\n\
-             printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"stand-in\"}}}}'\n\
+             printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"stand-in\"}}'\n\
              IFS= read -r list\n\
-             printf '%s\\n' \"$list\" > '{request}'\n\
-             if [ \"$(pwd -P)\" = '{project}' ]; then\n\
-             printf '%s\\n' '{listed}'\n\
+             printf '%s\\n' \"$list\" > \"$dir/request.txt\"\n\
+             if [ \"$(pwd -P)\" = \"$(cat \"$dir/project.txt\")\" ]; then\n\
+             cat \"$dir/listed.json\"\n\
              else\n\
-             printf '%s\\n' '{empty}'\n\
-             fi\n",
-            pwd = pwd_record.display(),
-            request = request_record.display(),
-            project = project.display(),
-            listed = reply(json!([entry])),
-            empty = reply(json!([])),
-        );
+             cat \"$dir/empty.json\"\n\
+             fi\n";
         let codex = root.join("codex");
         crate::test_isolation::write_script(&codex, script).expect("write codex stand-in");
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
