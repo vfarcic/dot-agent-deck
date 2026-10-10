@@ -79,7 +79,15 @@ git rev-list --left-right --count <sha>...origin/main  # "0  0" is origin/main i
 
 - a branch other than `main`, or `detached HEAD at <sha>`;
 - a sha that is not `origin/main`, unless the user chose to dispatch onto an older base after a step 3 refusal, in which case report the distance they chose;
-- **no clause at all**: that is an older build or a probe that failed, never a base that is fine. Fall back to the sha and distance you read in step 1 or step 2, and say the clause was missing.
+- **no clause at all**: that is an older build or a probe that failed, never a base that is fine. Fall back to the branch's own record below, and say the clause was missing.
+
+**The clause is a probe of `HEAD` taken just before `git worktree add` runs, not a reading of the worktree.** It and the unit's real base differ only if something moves the dispatcher checkout's `HEAD` while the dispatch runs, and nothing in this procedure does. When the clause is missing, or you need the authoritative answer, read the commit the unit's branch was created at from its first reflog entry, which later commits in the unit do not change:
+
+```bash
+git reflog show --format=%h agent/dispatch-<name> | tail -1   # the commit the branch was cut at
+```
+
+That sha and the clause's should match; a mismatch means `HEAD` moved mid-dispatch, and the reflog's sha is the base to report.
 
 Catching it here costs one stopped unit, before the unit has spent any time working from the wrong tree.
 
