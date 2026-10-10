@@ -244,9 +244,8 @@ pub(crate) fn cli_beside(
 }
 
 /// Plan the running app and `cli`, the CLI beside it when one is installed,
-/// each through its own install method, both against `releases`: the newest
-/// release on the app's channel, and the newest prerelease for a CLI on the
-/// beta formula ([`ReleaseSource::releases_for`]).
+/// each through its own install method and on its own release channel, from
+/// `releases` ([`ReleaseSource::releases_for`]).
 pub(crate) fn plan_copies(
     running: &Installation,
     cli: Option<&Installation>,
@@ -400,9 +399,9 @@ pub(crate) async fn desktop_self_upgrade_check(
     .await
     .map_err(|e| safe_message(e.to_string()))?
     .map_err(safe_message)?;
-    // The CLI beside the app is planned against the same release, so both
-    // copies follow the app's channel; a CLI on the beta formula also gets
-    // the newest prerelease, the only kind its formula can reach.
+    // Each copy is planned on its own channel: a stable CLI beside a
+    // prerelease app is offered the newest stable release, and a CLI on the
+    // beta formula the newest prerelease, the only kind its formula reaches.
     let releases = ReleaseSource::from_build()
         .releases_for(&running, cli.as_ref())
         .await
@@ -1267,6 +1266,7 @@ mod tests {
         // formula cannot reach it and how to switch, with nothing to confirm.
         let dto = check(Releases {
             latest: "0.47.0".into(),
+            stable: Some("0.47.0".into()),
             prerelease: Some("0.47.0-beta.1".into()),
         });
         assert_eq!(dto.app.action, "swap-app");
@@ -1284,6 +1284,7 @@ mod tests {
         // upgraded, and the stable switch is still mentioned.
         let dto = check(Releases {
             latest: "0.47.0".into(),
+            stable: Some("0.47.0".into()),
             prerelease: Some("0.47.0-beta.3".into()),
         });
         let cli = dto.cli.expect("the Homebrew CLI is found");

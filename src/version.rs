@@ -57,35 +57,44 @@ fn parse_tag(tag: &str) -> Option<semver::Version> {
     semver::Version::parse(stripped).ok()
 }
 
-/// The tag of the newest release on `channel`, and the tag of the newest
-/// prerelease ([`newest_prerelease_tag`]): `latest_url` (a GitHub
-/// `releases/latest` endpoint) answers for `Stable`, `list_url` (a GitHub
-/// `releases` list endpoint) for `Prerelease`. The prerelease channel reads
-/// the list anyway; the stable channel reads it as well only with
-/// `with_prerelease`, and otherwise answers `None` for it. Every client's
-/// release check goes through `crate::self_upgrade` to here: the TUI's badge,
-/// `dot-agent-deck upgrade` and the desktop app.
+/// What a release lookup found, as tags. Each is `None` when the lookup did
+/// not read it or nothing of that kind is published.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReleaseTags {
+    /// The newest stable release.
+    pub stable: Option<String>,
+    /// The highest version published, a prerelease included.
+    pub newest: Option<String>,
+    /// The newest prerelease ([`newest_prerelease_tag`]).
+    pub prerelease: Option<String>,
+}
+
+/// Look up the releases a machine's copies need: `latest_url` (a GitHub
+/// `releases/latest` endpoint) for the newest stable release when `stable`,
+/// and `list_url` (a GitHub `releases` list endpoint) for the highest
+/// version and the newest prerelease when `list`. Without `stable`, the
+/// newest stable release is taken from the list when it was read. Every
+/// client's release check goes through `crate::self_upgrade` to here: the
+/// TUI's badge, `dot-agent-deck upgrade` and the desktop app.
 pub(crate) async fn fetch_release_tags(
-    channel: ReleaseChannel,
     latest_url: &str,
     list_url: &str,
-    with_prerelease: bool,
-) -> Result<(String, Option<String>), String> {
-    match channel {
-        ReleaseChannel::Stable => {
-            let latest = stable_tag(get_json(latest_url).await?)?;
-            let prerelease = if with_prerelease {
-                newest_prerelease_tag(&get_json::<Vec<GitHubRelease>>(list_url).await?)
-            } else {
-                None
-            };
-            Ok((latest, prerelease))
-        }
-        ReleaseChannel::Prerelease => {
-            let releases = get_json::<Vec<GitHubRelease>>(list_url).await?;
-            Ok((newest_tag(&releases)?, newest_prerelease_tag(&releases)))
+    stable: bool,
+    list: bool,
+) -> Result<ReleaseTags, String> {
+    let mut tags = ReleaseTags::default();
+    if stable {
+        tags.stable = Some(stable_tag(get_json(latest_url).await?)?);
+    }
+    if list {
+        let releases = get_json::<Vec<GitHubRelease>>(list_url).await?;
+        tags.newest = Some(newest_tag(&releases)?);
+        tags.prerelease = newest_prerelease_tag(&releases);
+        if tags.stable.is_none() {
+            tags.stable = newest_stable_tag(&releases);
         }
     }
+    Ok(tags)
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(api_url: &str) -> Result<T, String> {
@@ -131,6 +140,19 @@ fn newest_tag(releases: &[GitHubRelease]) -> Result<String, String> {
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, tag)| tag.clone())
         .ok_or_else(|| "no published release names a version".to_string())
+}
+
+/// The tag with the highest version among `releases` that is a stable
+/// release: neither a draft, nor marked a prerelease, nor carrying a SemVer
+/// prerelease suffix. `None` when no such release is listed.
+fn newest_stable_tag(releases: &[GitHubRelease]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .filter(|(version, _)| version.pre.is_empty())
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
 }
 
 /// The tag with the highest version among `releases` that carries a SemVer
@@ -282,6 +304,22 @@ mod tests {
                 release("v0.46.0", false, false),
                 release("v0.48.0-beta.1", true, true)
             ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_newest_stable_tag_skips_prereleases_and_drafts() {
+        assert_eq!(
+            newest_stable_tag(&release_list()).as_deref(),
+            Some("v0.46.0")
+        );
+        let mut list = release_list();
+        list.push(release("v0.47.0", true, false));
+        list.push(release("v0.47.1", false, true));
+        assert_eq!(newest_stable_tag(&list).as_deref(), Some("v0.46.0"));
+        assert_eq!(
+            newest_stable_tag(&[release("v0.47.0-rc.1", false, false)]),
             None
         );
     }

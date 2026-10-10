@@ -22,6 +22,7 @@ use super::{
     CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, INSTALL_TIMEOUT,
     UpgradeError, VERIFY_TIMEOUT, run_checked,
 };
+use crate::version::ReleaseChannel;
 
 /// The largest asset accepted (the desktop disk image is the largest, at tens
 /// of megabytes).
@@ -73,32 +74,27 @@ impl ReleaseSource {
         source
     }
 
-    /// The releases to plan this machine's copies against: the newest release
-    /// on the running copy's channel ([`super::release_channel`]), which the
-    /// other copy is planned against too so the two follow one channel, and
-    /// the newest prerelease whenever either copy is on the
-    /// `dot-agent-deck-beta` formula, which can only reach a prerelease
-    /// ([`Releases`]).
+    /// The releases to plan this machine's copies against, each on its own
+    /// channel ([`super::plan::plan`]): the newest stable release whenever a
+    /// copy follows the stable channel, and the release list whenever a copy
+    /// follows the prerelease channel (a prerelease build, or the
+    /// `dot-agent-deck-beta` formula). [`Releases::latest`] is the newest
+    /// release on the running copy's channel ([`super::release_channel`]).
     pub async fn releases_for(
         &self,
         running: &Installation,
         other: Option<&Installation>,
     ) -> Result<Releases, UpgradeError> {
-        let with_prerelease = std::iter::once(running)
-            .chain(other)
-            .any(plan::on_beta_formula);
-        let (latest, prerelease) = crate::version::fetch_release_tags(
-            super::release_channel(running),
+        let lookups = Lookups::for_copies(running, other);
+        let tags = crate::version::fetch_release_tags(
             &self.api_url,
             &self.list_url,
-            with_prerelease,
+            lookups.stable,
+            lookups.list,
         )
         .await
         .map_err(UpgradeError::ReleaseLookup)?;
-        Ok(Releases {
-            latest: release_version(&latest)?,
-            prerelease: prerelease.as_deref().map(release_version).transpose()?,
-        })
+        releases_from(super::release_channel(running), &tags)
     }
 
     pub fn asset_url(&self, version: &str, asset: &str) -> String {
@@ -107,6 +103,50 @@ impl ReleaseSource {
             self.download_base.trim_end_matches('/')
         )
     }
+}
+
+/// Which release lookups a machine's copies need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lookups {
+    /// GitHub's `releases/latest`: some copy follows the stable channel.
+    stable: bool,
+    /// The release list: some copy follows the prerelease channel.
+    list: bool,
+}
+
+impl Lookups {
+    fn for_copies(running: &Installation, other: Option<&Installation>) -> Self {
+        let channels: Vec<_> = std::iter::once(running)
+            .chain(other)
+            .map(super::release_channel)
+            .collect();
+        Self {
+            stable: channels.contains(&ReleaseChannel::Stable),
+            list: channels.contains(&ReleaseChannel::Prerelease),
+        }
+    }
+}
+
+/// [`Releases`] from what the lookups found, `latest` being the newest on
+/// the running copy's `channel`.
+fn releases_from(
+    channel: ReleaseChannel,
+    tags: &crate::version::ReleaseTags,
+) -> Result<Releases, UpgradeError> {
+    let latest = match channel {
+        ReleaseChannel::Stable => tags.stable.as_deref(),
+        ReleaseChannel::Prerelease => tags.newest.as_deref(),
+    }
+    .ok_or_else(|| UpgradeError::ReleaseLookup("no published release names a version".into()))?;
+    Ok(Releases {
+        latest: release_version(latest)?,
+        stable: tags.stable.as_deref().map(release_version).transpose()?,
+        prerelease: tags
+            .prerelease
+            .as_deref()
+            .map(release_version)
+            .transpose()?,
+    })
 }
 
 /// `tag` without its leading `v`, refused unless it is a version.
@@ -888,6 +928,7 @@ fn swap_from_mount(
 mod tests {
     use super::*;
     use crate::self_upgrade::CommandOutput;
+    use crate::self_upgrade::detect::InstallMethod;
     use crate::self_upgrade::test_host::{FakeHost, fail, ok};
 
     #[test]
@@ -1159,6 +1200,90 @@ mod tests {
                 crate::repo_identity::RELEASES_LIST_API_URL
             );
         }
+    }
+
+    fn copy_at(version: &str, method: InstallMethod) -> Installation {
+        Installation {
+            copy: crate::self_upgrade::CopyKind::Cli,
+            executable: PathBuf::from("/x/dot-agent-deck"),
+            version: version.into(),
+            platform: Some(crate::self_upgrade::Platform::LinuxAmd64),
+            method,
+            tools: crate::self_upgrade::detect::Tools::default(),
+        }
+    }
+
+    #[test]
+    fn execute_021_each_copy_is_looked_up_on_its_own_channel() {
+        use crate::self_upgrade::HomebrewFormula;
+        let downloaded = || InstallMethod::DownloadedWritable {
+            binary: PathBuf::from("/x/dot-agent-deck"),
+        };
+        let formula = |formula| InstallMethod::Homebrew {
+            formula,
+            prefix: PathBuf::from("/opt/homebrew"),
+        };
+        let prerelease_app = copy_at("0.48.0-beta.1", downloaded());
+        let stable_app = copy_at("0.47.0", downloaded());
+        let stable_formula = copy_at("0.46.0", formula(HomebrewFormula::Stable));
+        let beta_formula = copy_at("0.48.0-beta.0", formula(HomebrewFormula::Beta));
+        let both = Lookups {
+            stable: true,
+            list: true,
+        };
+        // A stable formula beside a prerelease app, and the mirror.
+        assert_eq!(
+            Lookups::for_copies(&prerelease_app, Some(&stable_formula)),
+            both
+        );
+        assert_eq!(Lookups::for_copies(&stable_app, Some(&beta_formula)), both);
+        assert_eq!(
+            Lookups::for_copies(&stable_app, Some(&stable_formula)),
+            Lookups {
+                stable: true,
+                list: false
+            }
+        );
+        assert_eq!(
+            Lookups::for_copies(&prerelease_app, None),
+            Lookups {
+                stable: false,
+                list: true
+            }
+        );
+
+        // `latest` follows the running copy's channel; the stable release is
+        // carried for a stable copy beside it.
+        let tags = crate::version::ReleaseTags {
+            stable: Some("v0.47.0".into()),
+            newest: Some("v0.48.0-beta.1".into()),
+            prerelease: Some("v0.48.0-beta.1".into()),
+        };
+        let releases = releases_from(ReleaseChannel::Prerelease, &tags).unwrap();
+        assert_eq!(
+            releases,
+            Releases {
+                latest: "0.48.0-beta.1".into(),
+                stable: Some("0.47.0".into()),
+                prerelease: Some("0.48.0-beta.1".into()),
+            }
+        );
+        let options = plan::PlanOptions {
+            staging_root: PathBuf::from("/stage"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: verify::GH_NOT_INSTALLED.into(),
+            },
+        };
+        assert_eq!(
+            plan::plan(&stable_formula, &releases, &options).latest,
+            "0.47.0"
+        );
+        assert_eq!(
+            releases_from(ReleaseChannel::Stable, &tags).unwrap().latest,
+            "0.47.0"
+        );
+        assert!(releases_from(ReleaseChannel::Stable, &Default::default()).is_err());
     }
 
     #[test]

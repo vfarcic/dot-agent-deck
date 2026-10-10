@@ -139,19 +139,24 @@ pub struct UpgradePlan {
 }
 
 /// The releases a client found, which every copy on the machine is planned
-/// against.
+/// against, each on its own channel ([`plan`]).
 ///
 /// The `dot-agent-deck-beta` Homebrew formula only ever receives prereleases
 /// (`release.yml`'s "Detect channel"), so `brew upgrade dot-agent-deck-beta`
 /// cannot reach a stable release: a copy on it is offered [`Self::prerelease`]
-/// in place and told about a newer stable release separately. Every other copy
-/// is offered [`Self::latest`].
+/// in place and told about a newer stable release separately. A copy on the
+/// stable channel is offered [`Self::stable`], and a prerelease copy the
+/// highest of the three.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Releases {
     /// The newest release on the running copy's channel, without a leading
     /// `v`: the highest version, stable included, on the prerelease channel,
     /// and the newest stable release on the stable channel.
     pub latest: String,
+    /// The newest stable release, without a leading `v`, when the lookup
+    /// read it: what a copy on the stable channel is offered, whichever
+    /// channel the running copy follows.
+    pub stable: Option<String>,
     /// The newest prerelease, without a leading `v`, when the lookup read it;
     /// `None` when it did not or none is published.
     pub prerelease: Option<String>,
@@ -159,11 +164,16 @@ pub struct Releases {
 
 impl From<&str> for Releases {
     /// What a lookup that found only `latest` knows: a prerelease `latest` is
-    /// also the newest prerelease known.
+    /// also the newest prerelease known, and a stable one the newest stable.
     fn from(latest: &str) -> Self {
         let latest = latest.strip_prefix('v').unwrap_or(latest).to_string();
         let prerelease = is_prerelease(&latest).then(|| latest.clone());
-        Self { latest, prerelease }
+        let stable = (!is_prerelease(&latest)).then(|| latest.clone());
+        Self {
+            latest,
+            stable,
+            prerelease,
+        }
     }
 }
 
@@ -199,13 +209,47 @@ pub fn release_asset_url(version: &str, asset: &str) -> String {
     )
 }
 
+impl Releases {
+    /// The newest stable release known.
+    fn newest_stable(&self) -> Option<String> {
+        self.stable
+            .clone()
+            .or_else(|| (!is_prerelease(&self.latest)).then(|| self.latest.clone()))
+    }
+
+    /// The newest prerelease known.
+    fn newest_prerelease(&self) -> Option<String> {
+        self.prerelease
+            .clone()
+            .or_else(|| is_prerelease(&self.latest).then(|| self.latest.clone()))
+    }
+
+    /// The highest version known, a prerelease included.
+    fn highest(&self) -> String {
+        [self.newest_stable(), self.newest_prerelease()]
+            .into_iter()
+            .flatten()
+            .fold(self.latest.clone(), |highest, version| {
+                if super::is_newer(&highest, &version) {
+                    version
+                } else {
+                    highest
+                }
+            })
+    }
+}
+
 /// Decide what to offer `installation` for `releases`. Pure.
 ///
-/// A copy on the `dot-agent-deck-beta` formula is offered `brew upgrade` only
-/// for the newest prerelease newer than it; a stable release newer than both
-/// is noticed with the command that switches formulas, and when no newer
-/// prerelease exists that notice is the whole plan. Every other copy is
-/// offered [`Releases::latest`].
+/// Each copy is planned on its OWN channel ([`super::release_channel`]),
+/// whichever channel the running copy follows. A copy on the stable channel
+/// is offered the newest stable release, never a prerelease its install
+/// cannot deliver (the stable Homebrew formula receives none). A copy whose
+/// own version is a prerelease is offered the highest release known. A copy
+/// on the `dot-agent-deck-beta` formula is offered `brew upgrade` only for
+/// the newest prerelease newer than it; a stable release newer than both is
+/// noticed with the command that switches formulas, and when no newer
+/// prerelease exists that notice is the whole plan.
 pub fn plan(
     installation: &Installation,
     releases: &Releases,
@@ -214,13 +258,10 @@ pub fn plan(
     let current = installation.version.as_str();
     let (latest, stable_switch) = if on_beta_formula(installation) {
         let prerelease = releases
-            .prerelease
-            .clone()
-            .or_else(|| is_prerelease(&releases.latest).then(|| releases.latest.clone()))
+            .newest_prerelease()
             .filter(|prerelease| super::is_newer(current, prerelease));
-        let stable = Some(releases.latest.clone()).filter(|stable| {
-            !is_prerelease(stable)
-                && super::is_newer(current, stable)
+        let stable = releases.newest_stable().filter(|stable| {
+            super::is_newer(current, stable)
                 && prerelease
                     .as_deref()
                     .is_none_or(|prerelease| super::is_newer(prerelease, stable))
@@ -230,8 +271,16 @@ pub fn plan(
             (None, Some(stable)) => (stable.clone(), Some(stable)),
             (None, None) => (releases.latest.clone(), None),
         }
+    } else if is_prerelease(current) {
+        (releases.highest(), None)
     } else {
-        (releases.latest.clone(), None)
+        // No stable release known (the lookup read none): nothing to offer.
+        (
+            releases
+                .newest_stable()
+                .unwrap_or_else(|| current.to_string()),
+            None,
+        )
     };
     let action = if !super::is_newer(current, &latest) {
         PlanAction::UpToDate
@@ -1276,6 +1325,7 @@ mod tests {
     fn releases(latest: &str, prerelease: Option<&str>) -> Releases {
         Releases {
             latest: latest.into(),
+            stable: (!is_prerelease(latest)).then(|| latest.to_string()),
             prerelease: prerelease.map(str::to_string),
         }
     }
@@ -1454,6 +1504,102 @@ mod tests {
                 HomebrewFormula::Beta.name(),
                 HomebrewFormula::Stable.name()
             )
+        );
+    }
+
+    /// A copy on the stable `dot-agent-deck` formula at `version`.
+    fn brew_stable(version: &str) -> Installation {
+        let mut found = cli(
+            &format!(
+                "/home/linuxbrew/.linuxbrew/Cellar/dot-agent-deck/{version}/bin/dot-agent-deck"
+            ),
+            InstallMethod::Homebrew {
+                formula: HomebrewFormula::Stable,
+                prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+            },
+        );
+        found.version = version.into();
+        found.tools.brew = Some(PathBuf::from(BREW));
+        found
+    }
+
+    #[test]
+    fn plan_029_a_stable_formula_beside_a_prerelease_app_is_offered_the_newest_stable() {
+        // The running app is a prerelease, so its channel's newest release is
+        // the next beta; the stable formula cannot deliver that and is planned
+        // on its own channel.
+        let found = Releases {
+            latest: "0.48.0-beta.1".into(),
+            stable: Some("0.47.0".into()),
+            prerelease: Some("0.48.0-beta.1".into()),
+        };
+        let plan = plan(&brew_stable("0.46.0"), &found, &options());
+        assert_eq!(plan.latest, "0.47.0");
+        assert_eq!(
+            plan.action,
+            PlanAction::BrewUpgrade {
+                brew: PathBuf::from(BREW),
+                formula: HomebrewFormula::Stable,
+            }
+        );
+        assert_eq!(
+            plan.confirm_question().as_deref(),
+            Some("Upgrade dot-agent-deck to v0.47.0?")
+        );
+
+        // Already on the newest stable: up to date, never offered the beta.
+        let plan = super::plan(&brew_stable("0.47.0"), &found, &options());
+        assert_eq!(plan.action, PlanAction::UpToDate);
+        assert!(!plan.text().contains("beta"), "{}", plan.text());
+
+        // A downloaded stable binary is on the stable channel the same way.
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let downloaded = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        assert_eq!(
+            super::plan(&downloaded, &found, &options()).latest,
+            "0.47.0"
+        );
+    }
+
+    #[test]
+    fn plan_030_a_beta_formula_beside_a_stable_app_is_offered_the_newest_beta() {
+        // The mirror: the running app is stable, the CLI on the beta formula
+        // is offered the newest prerelease, and no stable switch while the
+        // stable release is older than it.
+        let found = Releases {
+            latest: "0.47.0".into(),
+            stable: Some("0.47.0".into()),
+            prerelease: Some("0.48.0-beta.1".into()),
+        };
+        let plan = plan(&brew_beta("0.48.0-beta.0", true), &found, &options());
+        assert_eq!(plan.latest, "0.48.0-beta.1");
+        assert_eq!(
+            plan.action,
+            PlanAction::BrewUpgrade {
+                brew: PathBuf::from(BREW),
+                formula: HomebrewFormula::Beta,
+            }
+        );
+        assert_eq!(plan.stable_switch, None);
+
+        // And a downloaded prerelease copy beside a stable app is offered the
+        // highest release it can reach, a prerelease included.
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let mut downloaded = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        downloaded.version = "0.48.0-beta.0".into();
+        assert_eq!(
+            super::plan(&downloaded, &found, &options()).latest,
+            "0.48.0-beta.1"
         );
     }
 

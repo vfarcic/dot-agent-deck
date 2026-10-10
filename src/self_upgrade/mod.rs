@@ -512,9 +512,9 @@ pub fn reported_version(host: &dyn Host, binary: &Path) -> Option<String> {
 /// The release channel `installation` follows: `Prerelease` for the
 /// `dot-agent-deck-beta` Homebrew formula, which only ever receives
 /// prereleases, or for any copy whose own version is a prerelease; `Stable`
-/// otherwise. A client looks the newest release up on its running copy's
-/// channel and plans the other copy on the machine against that same release,
-/// except that a copy on the beta formula is offered only a prerelease
+/// otherwise. Each copy on the machine is planned on its own channel
+/// ([`plan::plan`]), so a stable copy beside a prerelease one is never offered
+/// a prerelease, and a copy on the beta formula is offered only a prerelease
 /// ([`plan::Releases`]).
 pub fn release_channel(installation: &Installation) -> ReleaseChannel {
     match installation.method {
