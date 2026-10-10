@@ -192,8 +192,105 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// path and is paid only where the alternative was a wrong verdict. A negative
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
+///
+/// **Contention is the larger of two readings, not the load average alone.**
+/// The second is [`stall_factor`] over [`machine_stall_share`]: the share of
+/// recent time in which every non-idle task was stalled on IO or memory. The
+/// load average under-reads that starvation badly, and the waits this feeds
+/// failed on it: during PRD #1631's broad `cargo test-e2e` run thirteen tests
+/// failed with `io full` at 52-79% of their windows, and a reading on the same
+/// box afterwards showed a 1-minute load of 16.8 on 16 CPUs (a factor of 1.05)
+/// beside `io full avg10=60.5` (a factor of 2.5). `version_001`'s isolated rerun
+/// logged `io-full=71.9%` at a load of 11.2 on 16 CPUs — a factor of exactly
+/// 1.0 from the load average. Both readings share [`MAX_LOAD_FACTOR`]'s cap.
 pub fn load_scaled(base: Duration) -> Duration {
-    base.mul_f64(load_factor(machine_load_per_cpu()))
+    base.mul_f64(contention_factor(
+        machine_load_per_cpu(),
+        machine_stall_share(),
+    ))
+}
+
+/// The factor [`load_scaled`] applies: the larger of [`load_factor`] and
+/// [`stall_factor`], so either kind of contention widens the ceiling and
+/// neither can narrow what the other widened. Both are already clamped to
+/// `1.0..=MAX_LOAD_FACTOR`, so the result is too.
+pub(crate) fn contention_factor(load_per_cpu: Option<f64>, stall_share: Option<f64>) -> f64 {
+    load_factor(load_per_cpu).max(stall_factor(stall_share))
+}
+
+/// How much slower than an idle box work progresses when every non-idle task
+/// is stalled for `stall_share` of the time (a fraction in `0.0..=1.0`): only
+/// the remaining `1 - stall_share` makes progress, so the same work takes
+/// `1 / (1 - stall_share)` as long. Clamped to `1.0..=MAX_LOAD_FACTOR`, so a
+/// box stalled 92.8% of the time — what `dispatch_009` measured when it failed
+/// alone — widens a ceiling 6x rather than 14x.
+///
+/// An unmeasurable or non-finite share yields 1.0, for [`load_factor`]'s
+/// reason: the absence of a measurement is not evidence of a loaded machine.
+pub(crate) fn stall_factor(stall_share: Option<f64>) -> f64 {
+    match stall_share {
+        Some(share) if share.is_finite() => {
+            let progress = 1.0 - share.clamp(0.0, 1.0);
+            if progress <= 1.0 / MAX_LOAD_FACTOR {
+                MAX_LOAD_FACTOR
+            } else {
+                (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
+            }
+        }
+        _ => 1.0,
+    }
+}
+
+/// The larger of the IO and memory `full` stall shares from Pressure Stall
+/// Information, as a fraction, or `None` where neither file can be read (any
+/// host but Linux, a kernel without `CONFIG_PSI`, a container hiding
+/// `/proc/pressure`).
+///
+/// Each file contributes the larger of its `avg10` and `avg60`: `avg10` sees a
+/// stall that began seconds before the wait did, and `avg60` keeps a lull of a
+/// few seconds inside a starved minute from reading as a quiet box. `full`
+/// rather than `some`, and IO and memory rather than CPU, for the reason
+/// [`load_context`]'s STARVED verdict uses the same three: `full` is the share
+/// during which nothing runnable made progress, and CPU contention is what the
+/// load average already measures.
+pub fn machine_stall_share() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |file: &str| {
+            std::fs::read_to_string(format!("/proc/pressure/{file}"))
+                .ok()
+                .and_then(|text| parse_psi_full_share(&text))
+        };
+        match (read("io"), read("memory")) {
+            (Some(io), Some(memory)) => Some(io.max(memory)),
+            (one, other) => one.or(other),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The larger of the `avg10` and `avg60` fields on the `full` line of a PSI
+/// file, as a fraction rather than the percentage the kernel prints.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_psi_full_share(text: &str) -> Option<f64> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("full"))?;
+    let field = |name: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find_map(|f| f.strip_prefix(name))?
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    let percent = match (field("avg10="), field("avg60=")) {
+        (Some(a), Some(b)) => a.max(b),
+        (one, other) => one.or(other)?,
+    };
+    Some(percent / 100.0)
 }
 
 /// The factor [`load_scaled`] multiplies its base by, split out from it so the
@@ -273,6 +370,26 @@ pub const DAEMON_TASK_START_BASE: Duration = Duration::from_secs(8);
 #[allow(dead_code)]
 pub fn daemon_task_start_budget() -> Duration {
     load_scaled(DAEMON_TASK_START_BASE)
+}
+
+/// The base ceiling on an out-of-process `dot-agent-deck daemon serve`
+/// ([`DaemonProc`]) binding its attach socket, before [`load_scaled`] widens it.
+///
+/// A third quantity beside [`CHILD_BOOT_BASE`] and [`DAEMON_TASK_START_BASE`],
+/// for the reason the second's doc gives for not sharing a constant: this is a
+/// `fork` + `execve` of the full deck binary, its runtime coming up, and the
+/// daemon's startup up to the attach listener's `bind` — which is past the hook
+/// socket, a state write and a schedules load. 10 s is the flat ceiling this
+/// replaced, so a quiet box reports a daemon that never binds exactly as soon
+/// as it did. What changed is that a starved box now stretches it: six tests
+/// failed against the flat 10 s in PRD #1631's broad e2e run with `io full` at
+/// 52-72%, and `dispatch_009` failed against it alone at 92.8%.
+pub const DAEMON_PROCESS_BOOT_BASE: Duration = Duration::from_secs(10);
+
+/// [`load_scaled`] applied to [`DAEMON_PROCESS_BOOT_BASE`].
+#[allow(dead_code)]
+pub fn daemon_process_boot_budget() -> Duration {
+    load_scaled(DAEMON_PROCESS_BOOT_BASE)
 }
 
 /// Issue #709: how long after a child stops being live its output is still
@@ -9452,7 +9569,7 @@ pub fn spawn_daemon_serve_with_env(
     }
     let child = cmd.spawn().expect("spawn `dot-agent-deck daemon serve`");
 
-    let proc = DaemonProc {
+    let mut proc = DaemonProc {
         child,
         hook_socket,
         attach_socket,
@@ -9470,17 +9587,26 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding) or a bounded timeout elapses.
-    fn wait_for_attach_socket(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// binding), failing at once if the daemon exits first and otherwise after
+    /// [`daemon_process_boot_budget`].
+    fn wait_for_attach_socket(&mut self) {
+        let budget = daemon_process_boot_budget();
+        let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
                 return;
             }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "daemon exited ({status}) before binding its attach socket at {}; stderr:\n{}",
+                    self.attach_socket.display(),
+                    std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "daemon never bound its attach socket at {} within 10s",
+            "daemon never bound its attach socket at {} within {budget:?}",
             self.attach_socket.display()
         );
     }

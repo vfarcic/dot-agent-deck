@@ -5068,11 +5068,80 @@ fn measured_load_still_widens_between_one_and_the_cap() {
         MAX_LOAD_FACTOR,
         "a runaway load average must clamp at the cap"
     );
+}
+
+/// Scenario: Map a PSI `full` stall share to a slowdown factor: none or a
+/// non-finite share leaves a ceiling alone, a box stalled half the time
+/// doubles it, and a nearly fully stalled box hits the cap instead of
+/// multiplying a wait without bound.
+#[test]
+fn stall_share_widens_by_the_progress_it_leaves() {
     assert_eq!(
-        load_scaled(Duration::from_secs(8)),
-        Duration::from_secs(8).mul_f64(load_factor(machine_load_per_cpu())),
-        "load_scaled must be exactly load_factor applied to the base"
+        stall_factor(None),
+        1.0,
+        "an unmeasured stall must not widen"
     );
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(stall_factor(Some(bad)), 1.0, "{bad} is not a stall share");
+    }
+    assert_eq!(stall_factor(Some(0.0)), 1.0, "a quiet box keeps its base");
+    assert_eq!(
+        stall_factor(Some(0.5)),
+        2.0,
+        "half the time stalled is half speed"
+    );
+    assert_eq!(
+        stall_factor(Some(0.928)),
+        MAX_LOAD_FACTOR,
+        "dispatch_009's isolated 92.8% must clamp at the cap"
+    );
+    assert_eq!(stall_factor(Some(1.0)), MAX_LOAD_FACTOR);
+    assert_eq!(
+        stall_factor(Some(-0.3)),
+        1.0,
+        "a share below zero never shrinks"
+    );
+}
+
+/// Scenario: Combine the load average with the stall share and take the
+/// larger, so the IO-starved, low-load box PRD #1631 measured still widens
+/// its ceilings, and the result is what `load_scaled` applies.
+#[test]
+fn contention_is_the_larger_of_load_and_stall() {
+    // The reading behind this change: load 16.8 on 16 CPUs beside io full 60.5%.
+    let factor = contention_factor(Some(16.8 / 16.0), Some(0.605));
+    assert!(
+        (factor - 1.0 / (1.0 - 0.605)).abs() < 1e-9,
+        "an IO-starved box at a near-1.0 load must scale by its stall, got {factor}"
+    );
+    assert_eq!(
+        contention_factor(Some(44.0 / 16.0), Some(0.0)),
+        2.75,
+        "a CPU-loaded box with no IO stall keeps #709's load scaling"
+    );
+    assert_eq!(contention_factor(None, None), 1.0);
+    assert_eq!(contention_factor(Some(1000.0), Some(1.0)), MAX_LOAD_FACTOR);
+    let base = Duration::from_secs(8);
+    let scaled = load_scaled(base);
+    assert!(
+        scaled >= base && scaled <= base.mul_f64(MAX_LOAD_FACTOR),
+        "load_scaled must stay between its base and the cap, got {scaled:?}"
+    );
+}
+
+/// Scenario: Read the `full` line of real `/proc/pressure/io` captures as a
+/// fraction, taking the larger of `avg10` and `avg60`, and get `None` for a
+/// file with no usable `full` line.
+#[test]
+fn psi_full_share_takes_the_larger_recent_average() {
+    let io = "some avg10=71.28 avg60=52.51 avg300=58.16 total=285448512127\n\
+              full avg10=60.50 avg60=47.42 avg300=52.35 total=240720008324\n";
+    assert_eq!(parse_psi_full_share(io), Some(0.605));
+    let lull = "full avg10=3.00 avg60=72.00 avg300=50.00 total=1\n";
+    assert_eq!(parse_psi_full_share(lull), Some(0.72));
+    assert_eq!(parse_psi_full_share("some avg10=9.00 avg60=9.00\n"), None);
+    assert_eq!(parse_psi_full_share("full avg10=x avg60=y\n"), None);
+    assert_eq!(parse_psi_full_share(""), None);
 }
 
 // -----------------------------------------------------------------------

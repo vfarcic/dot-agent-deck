@@ -277,7 +277,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
     // match cannot succeed. Short names keep the assertion about what this test
     // is actually for (both panes come back, under their saved names) instead of
     // depending on a pane-column frame that no longer exists.
-    let restored = common::wait_until(Duration::from_secs(10), || {
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         let grid = deck.snapshot_grid();
         grid.contains("r-alpha") && grid.contains("r-beta")
     });
@@ -389,7 +389,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
 
     // The orchestration tab must be rebuilt AND shown (start cursor): its
     // non-start role panes render as deck cards by role name, in saved order.
-    let rebuilt = common::wait_until(Duration::from_secs(15), || {
+    let rebuilt = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
         let g = deck.snapshot_grid();
         g.contains("coder") && g.contains("reviewer")
     });
@@ -421,7 +421,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
         &record,
         "Build the feature end to end",
         1,
-        Duration::from_secs(15),
+        common::load_scaled(Duration::from_secs(15)),
     );
     assert!(
         replayed,
@@ -481,7 +481,7 @@ fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
 
     // Fallback: the saved orchestrator pane returns as a PLAIN dashboard card
     // (its saved name), never an orchestration tab.
-    let fell_back = common::wait_until(Duration::from_secs(10), || {
+    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         deck.snapshot_grid().contains("orchestrator")
     });
     assert!(
@@ -568,7 +568,7 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
     // (its saved name `orchestrator`). RED today: the startup panic prevents any
     // pane from ever rendering, so this times out — the final grid captures the
     // `index out of bounds` panic text rather than a dashboard.
-    let fell_back = common::wait_until(Duration::from_secs(10), || {
+    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         deck.snapshot_grid().contains("orchestrator")
     });
     assert!(
