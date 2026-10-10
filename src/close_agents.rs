@@ -251,21 +251,34 @@ fn resolve(
                     continue;
                 }
                 seen_slugs.push(slug);
-                let records = registry.dispatched_units();
-                match records.resolve_name(name, caller) {
+                // Resolve under the record's lock, then let it go before the
+                // candidates' panes are read from the registry.
+                let resolution = {
+                    let records = registry.dispatched_units();
+                    match records.resolve_name(name, caller) {
+                        Ok(unit) => Ok(unit.clone()),
+                        Err(r) => {
+                            let candidates: Vec<DispatchedUnit> = r
+                                .candidates
+                                .iter()
+                                .filter_map(|id| records.get(id).cloned())
+                                .collect();
+                            Err((r, candidates))
+                        }
+                    }
+                };
+                match resolution {
                     Ok(unit) => resolved.push(Resolved {
                         selector: name.clone(),
-                        scope: scope_of_unit(unit),
-                        unit: Some(unit.clone()),
+                        scope: scope_of_unit(&unit),
+                        unit: Some(unit),
                         by_pane: false,
                         named_pane: None,
                     }),
-                    Err(r) => {
+                    Err((r, candidates)) => {
                         let mut target = CloseTarget::refused(name, r.reason, r.message);
-                        target.candidates = r
-                            .candidates
+                        target.candidates = candidates
                             .iter()
-                            .filter_map(|id| records.get(id))
                             .map(|u| AmbiguousCandidate {
                                 unit_id: u.id.clone(),
                                 name: u.name.clone(),
@@ -1480,6 +1493,31 @@ mod tests {
             .start_agent(into("orch-a", "a-later"))
             .await
             .expect_err("a closed instance cannot be resurrected");
+        deck.shutdown().await;
+    }
+
+    /// Scenario: one name matches live units in two clones. A person's close by
+    /// that name is refused as ambiguous and stops nothing; the refusal lists
+    /// each candidate's unit id, panes and worktree so it can be closed by id.
+    #[tokio::test]
+    async fn an_ambiguous_name_lists_every_candidate_and_stops_nothing() {
+        let deck = Deck::new().await;
+        let a = deck.start("unit-a", "sleep 30", None).await;
+        let b = deck.start("unit-b", "sleep 30", None).await;
+        let first = deck.single_unit("fix", ("disp", "nobody"), "unit-a", &a);
+        let second = deck.single_unit("fix", ("disp", "nobody"), "unit-b", &b);
+        let report = deck.close(by_name("fix"), None, true, false).await;
+        let target = &report.targets[0];
+        assert_eq!(target.reason, Some(CloseRefusalReason::Ambiguous));
+        let ids: Vec<&str> = target
+            .candidates
+            .iter()
+            .map(|c| c.unit_id.as_str())
+            .collect();
+        assert_eq!(ids, vec![first.as_str(), second.as_str()]);
+        assert_eq!(target.candidates[0].panes, vec!["unit-a".to_string()]);
+        assert!(target.candidates[1].worktree.ends_with("wt-fix"));
+        assert!(deck.live(&a) && deck.live(&b));
         deck.shutdown().await;
     }
 
