@@ -1855,6 +1855,8 @@ mod tests {
 
     /// A `brew upgrade` plan for the stable formula from 0.46.0 to 0.47.0,
     /// with `brew` at `/opt/homebrew/bin/brew`.
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     fn brew_plan() -> UpgradePlan {
         let mut found = copy_at(
             "0.46.0",
@@ -1878,6 +1880,8 @@ mod tests {
 
     /// Run `plan` on a machine whose upgraded `dot-agent-deck` answers
     /// `--version` with `reported` (or not at all).
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     fn brew_upgrade_reporting(reported: Option<&str>) -> Result<Outcome, UpgradeError> {
         let mut host = FakeHost::new()
             .exe("/opt/homebrew/bin/brew")

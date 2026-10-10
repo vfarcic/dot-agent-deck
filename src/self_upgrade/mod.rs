@@ -1333,6 +1333,8 @@ pub(crate) mod test_host {
             )
         }
 
+        // Used only by Unix-gated tests: native Windows is unsupported (#164).
+        #[cfg(unix)]
         pub fn link(mut self, from: &str, to: &str) -> Self {
             self.links.insert(PathBuf::from(from), PathBuf::from(to));
             self
@@ -1343,16 +1345,22 @@ pub(crate) mod test_host {
             self
         }
 
+        // Used only by Unix-gated tests: native Windows is unsupported (#164).
+        #[cfg(unix)]
         pub fn on_path(mut self, dir: &str) -> Self {
             self.path.push(PathBuf::from(dir));
             self
         }
 
+        // Used only by Unix-gated tests: native Windows is unsupported (#164).
+        #[cfg(unix)]
         pub fn home(mut self, dir: &str) -> Self {
             self.home = Some(PathBuf::from(dir));
             self
         }
 
+        // Used only by Unix-gated tests: native Windows is unsupported (#164).
+        #[cfg(unix)]
         pub fn wsl(mut self) -> Self {
             self.wsl = true;
             self

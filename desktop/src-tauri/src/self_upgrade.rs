@@ -723,6 +723,8 @@ mod tests {
             )
         }
 
+        // Used only by Unix-gated tests: native Windows is unsupported (#164).
+        #[cfg(unix)]
         fn link(mut self, from: &str, to: &str) -> Self {
             self.links.insert(PathBuf::from(from), PathBuf::from(to));
             self

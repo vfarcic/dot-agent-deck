@@ -509,7 +509,10 @@ fn running_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_upgrade::test_host::{FakeHost, fail, ok};
+    use crate::self_upgrade::test_host::{FakeHost, fail};
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    use crate::self_upgrade::test_host::ok;
 
     fn inputs(exe: &str) -> DetectInputs {
         DetectInputs {
