@@ -494,6 +494,39 @@ function speaking(plan: SpeechPlanDto = { kind: "provider", fallbackToSystem: fa
 }
 
 describe("DeckReader with speech in flight", () => {
+  /** Scenario: A held prompt waits behind another agent's speech when voice answers it. The silent retraction drops only that agent's prompt, and the agent's next new prompt is still heard. */
+  it("question/desktop/016: a voice answer retracts the queued prompt without silencing other agents", async () => {
+    const h = speaking();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: still speaking." });
+    await flush();
+    h.sinks.get("tester")!({ kind: "permission", text: "Tester: allow Bash?" });
+    h.sinks.get("tester")!({ kind: "blocked", text: "Tester: stopped with an error." });
+    h.sinks.get("coder")!({ kind: "permission", text: "Coder: allow edits?" });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: last summary." });
+    expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["Tester: allow Bash?", "Tester: stopped with an error.", "Coder: allow edits?", "Tester: last summary."]);
+
+    // This is the wire control message required from the Rust reading pipeline.
+    // The cast keeps this RED test executable before the DTO gains that kind.
+    h.sinks.get("tester")!(JSON.parse('{"kind":"permission_answered","text":"","bare":""}') as ReadingSentenceDto);
+    expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["Tester: stopped with an error.", "Coder: allow edits?", "Tester: last summary."]);
+    h.provider.finish();
+    await flush();
+    h.provider.finish();
+    await flush();
+    h.provider.finish();
+    await flush();
+    expect(h.provider.fetched).toEqual(["Coder: still speaking.", "Tester: stopped with an error.", "Coder: allow edits?", "Tester: last summary."]);
+    expect(h.provider.aborted).toEqual([]);
+
+    h.sinks.get("tester")!({ kind: "permission", text: "Tester: allow a new command?" });
+    h.provider.finish();
+    await flush();
+    expect(h.provider.fetched.at(-1)).toBe("Tester: allow a new command?");
+    h.reader.dispose();
+  });
+
   /** Scenario (decision 4): the tester's summary is queued while the tester's pane is open, and the user opens the coder's pane before it is said; it is said naming the tester. Queued while the coder's pane is open and said after the tester's opens, it drops the name. */
   it("decides the name when the sentence is said", async () => {
     const h = speaking();

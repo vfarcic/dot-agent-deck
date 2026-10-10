@@ -11395,6 +11395,7 @@ mod hook_provenance_audit_tests {
     use super::*;
     use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
     use crate::state::{AppState, MAX_UNPROVEN_SESSIONS, SessionStatus};
+    use spec::spec;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
@@ -11492,6 +11493,29 @@ mod hook_provenance_audit_tests {
         async fn send(&self, payload: serde_json::Value) {
             let mut stream = self.open(payload).await;
             Self::finish(&mut stream).await;
+        }
+
+        /// Send an unheld question through the real socket and wait for its
+        /// one reply, which barriers both registry mutation and broadcast.
+        async fn question(&self, pane: &str, event: serde_json::Value, token: Option<&str>) {
+            let payload = serde_json::to_value(crate::event::DaemonMessage::Question(
+                crate::event::QuestionSignal {
+                    pane_id: pane.to_string(),
+                    token: token.map(str::to_string),
+                    event: event_of(event),
+                    hold: false,
+                    ack: false,
+                },
+            ))
+            .unwrap();
+            let mut stream = self.open(payload).await;
+            let mut reply = String::new();
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut reply))
+                .await
+                .expect("question connection completed")
+                .expect("read question reply");
+            serde_json::from_str::<crate::question::QuestionReply>(reply.trim())
+                .expect("an admitted unheld question returns a release");
         }
 
         async fn open(&self, payload: serde_json::Value) -> UnixStream {
@@ -12026,6 +12050,267 @@ mod hook_provenance_audit_tests {
 
     fn event_of(payload: serde_json::Value) -> AgentEvent {
         serde_json::from_value(payload).expect("a well-formed event")
+    }
+
+    /// Scenario: A token-less producer sends unheld question messages with an
+    /// invented outer pane, first SessionStart then a status-only fallback.
+    /// Their broadcasts stay unproven, so a registry-free client keeps those
+    /// cards outside its managed panes and within its outside-card budget.
+    #[spec("question/detect/013")]
+    #[tokio::test]
+    async fn question_detect_013_unattested_questions_keep_the_outside_card_budget() {
+        let mut deck = AuditDeck::start(Arc::new(AgentPtyRegistry::new())).await;
+        let mut client = AppState::default();
+        let mut failures = Vec::new();
+        for kind in ["session_start", "waiting_for_input"] {
+            let pane = format!("outside-question-{kind}");
+            // Control: the equivalent raw-event path marks its broadcast.
+            let raw_pane = format!("raw-control-{kind}");
+            deck.send(line(
+                &format!("raw-{kind}"),
+                Some(&raw_pane),
+                None,
+                kind,
+                None,
+            ))
+            .await;
+            let BroadcastMsg::Event(raw) = deck.events.try_recv().expect("raw event broadcast")
+            else {
+                panic!("expected a raw-event control");
+            };
+            assert!(
+                raw.metadata
+                    .contains_key(crate::event::UNPROVEN_METADATA_KEY)
+            );
+
+            // A status-only fallback updates an outside session that has
+            // already started; it does not create a session by itself.
+            if kind == "waiting_for_input" {
+                deck.send(line(
+                    &format!("question-{kind}"),
+                    Some(&pane),
+                    None,
+                    "session_start",
+                    None,
+                ))
+                .await;
+                deck.drain(Some(&mut client));
+                assert!(client.sessions.contains_key(&format!("question-{kind}")));
+                assert!(!client.managed_pane_ids.contains(&pane));
+            }
+
+            deck.question(
+                &pane,
+                line(
+                    &format!("question-{kind}"),
+                    Some("invented-inner-pane"),
+                    None,
+                    kind,
+                    None,
+                ),
+                None,
+            )
+            .await;
+            let BroadcastMsg::Event(event) =
+                deck.events.try_recv().expect("question status broadcast")
+            else {
+                panic!("expected a question status event");
+            };
+            assert_eq!(event.pane_id.as_deref(), Some(pane.as_str()));
+            if !event
+                .metadata
+                .contains_key(crate::event::UNPROVEN_METADATA_KEY)
+            {
+                failures.push(format!("{kind}: question broadcast lost daemon_unproven"));
+            }
+            client.apply_event(event);
+            assert!(
+                client.sessions.contains_key(&format!("question-{kind}")),
+                "the outside card is still shown for {kind}"
+            );
+            if client.managed_pane_ids.contains(&pane) {
+                failures.push(format!(
+                    "{kind}: registry-free client promoted the invented pane to managed"
+                ));
+            }
+        }
+        // Feed a real raw-event outside flood into the same registry-free
+        // client; both earlier question cards must count toward its budget.
+        for index in 0..MAX_UNPROVEN_SESSIONS + 1 {
+            let pane = format!("question-budget-flood-{index}");
+            deck.send(line(&pane, Some(&pane), None, "session_start", None))
+                .await;
+            deck.drain(Some(&mut client));
+        }
+        if client.sessions.len() > MAX_UNPROVEN_SESSIONS {
+            failures.push(format!(
+                "outside-card budget exceeded: {} > {MAX_UNPROVEN_SESSIONS}",
+                client.sessions.len()
+            ));
+        }
+        deck.stop().await;
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// Scenario: A exits on several panes and B replaces it with an unknown
+    /// type. Unheld status-only questions carrying A's tokens must leave B's
+    /// types unknown; a fresh control agent's own question learns its type.
+    #[spec("question/detect/014")]
+    #[tokio::test]
+    async fn question_detect_014_a_departed_owners_question_cannot_type_its_successor() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut displaced = Vec::new();
+        for index in 0..16 {
+            let pane = format!("question-successor-{index}");
+            let old = spawn(&registry, Some(&pane), "/usr/bin/true");
+            let token = registry.hook_token_of(&old).expect("old token");
+            displaced.push((pane, old, token));
+        }
+        wait_until_nothing_lives(&registry).await;
+        let successors: Vec<_> = displaced
+            .iter()
+            .map(|(pane, _, _)| spawn(&registry, Some(pane), "cat"))
+            .collect();
+        let type_of = |id: &str| {
+            registry
+                .agent_records()
+                .into_iter()
+                .find(|r| r.id == id)
+                .expect("live successor")
+                .agent_type
+        };
+        for successor in &successors {
+            assert_eq!(
+                type_of(successor),
+                None,
+                "precondition: the successor's type is unknown"
+            );
+        }
+        let mut deck = AuditDeck::start(registry.clone()).await;
+        for (index, (pane, old, token)) in displaced.iter().enumerate() {
+            deck.question(
+                pane,
+                line(
+                    &format!("departed-question-{index}"),
+                    Some(pane),
+                    Some(old),
+                    "thinking",
+                    None,
+                ),
+                Some(token),
+            )
+            .await;
+        }
+        deck.drain(None);
+        let typed: Vec<_> = successors
+            .iter()
+            .filter(|id| type_of(id).is_some())
+            .cloned()
+            .collect();
+        // A fresh pane isolates the positive control from the same
+        // pane-only lookup defect being reproduced on the reused panes.
+        let pane = "question-own-type-control";
+        let own_agent = spawn(&registry, Some(pane), "cat");
+        let own_token = registry.hook_token_of(&own_agent).expect("successor token");
+        deck.question(
+            pane,
+            line(
+                "own-question",
+                Some(pane),
+                Some(&own_agent),
+                "thinking",
+                None,
+            ),
+            Some(&own_token),
+        )
+        .await;
+        let own_type = type_of(&own_agent);
+        deck.stop().await;
+        assert_eq!(
+            own_type,
+            Some(crate::event::AgentType::Pi),
+            "a fresh agent's own question still records its type"
+        );
+        assert!(
+            typed.is_empty(),
+            "a departed owner's status-only question typed {} successors: {typed:?}",
+            typed.len()
+        );
+    }
+
+    /// Scenario: An outside question is admitted for an unknown pane, and the
+    /// deck spawns an agent on that pane immediately after admission. The
+    /// outside producer's reported type must not become the fresh agent's type.
+    #[spec("question/detect/015")]
+    #[tokio::test]
+    async fn question_detect_015_an_unattested_question_cannot_type_an_agent_spawned_after_admission()
+     {
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+        const PANE: &str = "question-admission-race";
+
+        struct SpawnOnQuestion {
+            registry: Arc<AgentPtyRegistry>,
+            spawned: Arc<Mutex<Option<String>>>,
+        }
+        #[derive(Default)]
+        struct QuestionLog {
+            message: String,
+        }
+        impl tracing::field::Visit for QuestionLog {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpawnOnQuestion {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = QuestionLog::default();
+                event.record(&mut fields);
+                // This handler log occurs after the real provenance gate and
+                // before the registry type write. Spawn synchronously here to
+                // force that interleaving, without a sleep or production seam.
+                if fields.message == "Received question" && self.spawned.lock().unwrap().is_none() {
+                    let agent = spawn(&self.registry, Some(PANE), "cat");
+                    *self.spawned.lock().unwrap() = Some(agent);
+                }
+            }
+        }
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawned = Arc::new(Mutex::new(None));
+        let subscriber = tracing_subscriber::registry().with(SpawnOnQuestion {
+            registry: registry.clone(),
+            spawned: spawned.clone(),
+        });
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        let deck = AuditDeck::start(registry.clone()).await;
+        deck.question(
+            PANE,
+            line("outside-race-question", Some(PANE), None, "thinking", None),
+            None,
+        )
+        .await;
+        let fresh = spawned
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the fresh agent was spawned after admission");
+        let learned = registry
+            .agent_records()
+            .into_iter()
+            .find(|r| r.id == fresh)
+            .expect("the fresh agent is live")
+            .agent_type;
+        deck.stop().await;
+        assert_eq!(
+            learned, None,
+            "the already-admitted Unattested question typed the fresh agent"
+        );
     }
 
     /// Scenario: A token-less running report for a role-shaped pane nobody

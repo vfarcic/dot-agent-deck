@@ -1362,6 +1362,126 @@ mod tests {
         }
     }
 
+    /// Drive status frames through reading's conversion, coalescing and
+    /// session loop, recording what would reach the webview before it closes.
+    async fn question_reading_script(
+        script: Vec<(AgentEvent, Duration)>,
+    ) -> Vec<serde_json::Value> {
+        let script = script
+            .into_iter()
+            .filter_map(|(event, gap)| {
+                status_turn_event(&event, "a").map(|turn| (Incoming::Status(turn), gap))
+            })
+            .collect();
+        let (tx, events) = mpsc::channel(16);
+        for event in coalesced(script).await {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let mut sentences = Vec::new();
+        read_turns("tester", events, &Recording::default(), |sentence| {
+            if sentence.kind != ReadingSentenceKind::Closed {
+                sentences.push(serde_json::to_value(sentence).unwrap());
+            }
+            true
+        })
+        .await;
+        sentences
+    }
+
+    fn delayed_permission_notice() -> AgentEvent {
+        let mut notice = status("a", EventType::WaitingForInput);
+        notice.metadata.insert(
+            dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY.to_string(),
+            "permission_prompt".to_string(),
+        );
+        notice
+    }
+
+    fn held_permission_prompt(id: &str) -> AgentEvent {
+        let mut prompt = status("a", EventType::PermissionRequest);
+        prompt.tool_name = Some("Bash".into());
+        prompt.tool_detail = Some("touch x".into());
+        let question = dot_agent_deck::question::claude_permission_request(
+            id.into(),
+            "Bash",
+            None,
+            Some("touch x".into()),
+            None,
+            1,
+            None,
+        )
+        .question;
+        prompt.set_question(&question);
+        prompt
+    }
+
+    /// Scenario: Claude's permission hook announces a prompt, then its delayed
+    /// notification describes that same pending prompt six seconds later.
+    /// Reading speaks it once; a Claude with only the notification still speaks.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_permission_hook_and_its_notification_are_announced_once() {
+        let notice_only = question_reading_script(vec![(delayed_permission_notice(), SHORT)]).await;
+        assert_eq!(
+            notice_only.len(),
+            1,
+            "older Claude's notification is still announced"
+        );
+        assert_eq!(notice_only[0]["kind"], "permission");
+
+        let prompt = held_permission_prompt("held-prompt");
+        let sentences = question_reading_script(vec![
+            (prompt, Duration::from_secs(6)),
+            (delayed_permission_notice(), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["The tester is asking for permission: Bash: touch x."],
+            "the delayed permission_prompt must not announce the same pending prompt again"
+        );
+    }
+
+    /// Scenario: Reading announces a held Claude prompt and the deck answers
+    /// it by voice. Reading forwards a silent retraction to the speech queue
+    /// and suppresses the answered prompt's delayed notification.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_016_answering_a_held_prompt_retracts_its_announcement() {
+        let prompt = held_permission_prompt("held-prompt");
+        let mut answered = status("a", EventType::Thinking);
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+        );
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+            "held-prompt".to_string(),
+        );
+        let sentences = question_reading_script(vec![
+            (prompt, SHORT),
+            (answered, Duration::from_secs(6)),
+            (delayed_permission_notice(), SHORT),
+            (held_permission_prompt("next-prompt"), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences[0]["kind"], "permission",
+            "the held prompt is announced"
+        );
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["permission", "permission_answered", "permission"],
+            "the voice answer must retract the queued prompt and suppress its delayed notification"
+        );
+        assert_eq!(sentences[1]["text"], "", "a retraction is never spoken");
+    }
+
     #[test]
     fn voice_reading_status_events_are_filtered_to_the_agent_and_to_what_stops_it() {
         let mut permission = status("a", EventType::PermissionRequest);

@@ -130,6 +130,46 @@ fn pick(question_index: u32, options: &[u32]) -> Selection {
     }
 }
 
+/// Scenario: The model fills Colour with the spoken free text, but also picks
+/// Sizes' textless free-text option using words already cited for Colour.
+/// Grounding drops the borrowed selection and keeps the correct Colour answer.
+#[test]
+fn question_desktop_007_grounding_drops_a_textless_selection_borrowing_another_questions_words() {
+    let correct = ModelAnswer::answer(0, &[4])
+        .with_text("a hamster named Bob")
+        .citing("type my own colour: a hamster named Bob");
+    for borrowed in [
+        "a hamster named Bob",
+        "type my own colour: a hamster named Bob",
+    ] {
+        let mut answer = correct.clone().and(1, &[4]).citing(borrowed);
+        ground("type my own colour: a hamster named Bob", &mut answer)
+            .expect("the correct half stands rather than refusing the whole answer");
+        assert_eq!(
+            answer.selections, correct.selections,
+            "Sizes must keep waiting when its textless selection borrows Colour's evidence"
+        );
+    }
+}
+
+/// Scenario: Colour's free text and Sizes' textless selection each cite their
+/// own spoken words. Grounding keeps both selections, including Sizes' choice.
+#[test]
+fn question_desktop_007_grounding_keeps_a_selection_citing_its_own_words() {
+    let mut answer = ModelAnswer::answer(0, &[4])
+        .with_text("a hamster named Bob")
+        .citing("type my own colour: a hamster named Bob")
+        .and(1, &[4])
+        .citing("and type my own sizes");
+    let expected = answer.clone();
+    ground(
+        "type my own colour: a hamster named Bob and type my own sizes",
+        &mut answer,
+    )
+    .expect("each question has its own grounded evidence");
+    assert_eq!(answer, expected);
+}
+
 /// Scenario: The daemon reports a Claude Code permission prompt whose text
 /// carries a bidi override and a control character, with a keyboard-only
 /// option on a form and a question whose channel the deck cannot use. The
