@@ -118,6 +118,11 @@ pub const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// than leaving the dialog on Upgrading for good.
 pub const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// The most of each output stream a command's capture keeps: the head is
+/// kept and the rest is read and dropped, so a command (or a descendant still
+/// holding its pipes) that writes without end cannot grow the capture.
+pub const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
 /// The machine, as far as upgrading needs to ask about it. [`SystemHost`] is
 /// the real one; tests implement it to fake an install.
 pub trait Host: Send + Sync {
@@ -170,7 +175,7 @@ impl Host for SystemHost {
         if let Some(path) = &self.path {
             command.env("PATH", path);
         }
-        run_bounded(&mut command, timeout)
+        run_bounded(&mut command, timeout, &stop_child)
     }
 
     fn find_program(&self, name: &str) -> Option<PathBuf> {
@@ -241,83 +246,219 @@ impl Host for SystemHost {
     }
 }
 
+/// How long the output of a command that exited is still read, so a
+/// descendant that inherited its pipes and keeps them open cannot hold the
+/// call until its bound.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a command signalled to stop is given to exit before it is taken
+/// to be one that cannot be stopped.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a reader looks at whether it has been told to stop.
+#[cfg(unix)]
+const READ_POLL_MS: i32 = 50;
+
 /// Run `command` (stdin closed, stdout and stderr captured) for at most
-/// `timeout`. A command still running then is killed, and the error says how
-/// long it was given and whether it could be stopped: a command `pkexec`
-/// started runs as root, which this user cannot signal, so it may still be
-/// running. Its output is read on two threads so a chatty command cannot fill
-/// a pipe and stall; after a timeout they are left to finish on their own, as
-/// a grandchild may hold the pipes open.
+/// `timeout`.
+///
+/// On Unix the command runs in a process group of its own, and one still
+/// running at the bound is stopped by `SIGKILL` to that group alone, so what
+/// it started dies with it; a descendant that moved to another group or
+/// session escapes it. The error says how long the command was given and
+/// whether it was stopped (`stop` returning whether it exited): a command
+/// `pkexec` started runs as root, which this user cannot signal, so it may
+/// still be running, and a thread waits for it so it does not stay a zombie.
+///
+/// The output is read on two threads, so a chatty command cannot fill a pipe
+/// and stall. Each keeps at most [`MAX_CAPTURE_BYTES`] of its stream and
+/// reads and drops the rest. They stop at the bound, or [`EXIT_GRACE`] after
+/// the command exits, even when a descendant still holds the pipes: on Unix
+/// they wait for data with `poll` and look at a stop flag between waits, and
+/// once they stop the read ends are closed, so a descendant still writing
+/// gets `EPIPE`. Elsewhere a reader stops at the end of its stream only.
 fn run_bounded(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
+    stop: &dyn Fn(&mut std::process::Child) -> bool,
 ) -> std::io::Result<CommandOutput> {
-    use std::io::Read;
     use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    for (stream, pipe) in [
-        (
-            0,
-            child
-                .stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        ),
-        (
-            1,
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        ),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            let _ = tx.send((stream, bytes));
-        });
-    }
-    drop(tx);
+    let stop_reading = Arc::new(AtomicBool::new(false));
+    let readers = [
+        drain(child.stdout.take(), stop_reading.clone()),
+        drain(child.stderr.take(), stop_reading.clone()),
+    ];
+    let finish = |readers: [std::thread::JoinHandle<Vec<u8>>; 2]| {
+        stop_reading.store(true, Ordering::SeqCst);
+        readers.map(|reader| reader.join().unwrap_or_default())
+    };
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        let now = Instant::now();
+        let exited = match child.try_wait() {
+            Ok(exited) => exited,
+            Err(e) => {
+                let stopped = stop(&mut child);
+                if !stopped {
+                    reap_later(child);
+                }
+                finish(readers);
+                return Err(e);
+            }
+        };
+        if let Some(status) = exited {
             break status;
         }
-        let now = Instant::now();
         if now >= deadline {
-            let stopped = child.kill().is_ok();
+            let stopped = stop(&mut child);
             if stopped {
                 let _ = child.wait();
+            } else {
+                reap_later(child);
             }
+            finish(readers);
             return Err(timed_out(timeout, stopped));
         }
         std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
     };
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    for _ in 0..2 {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left.max(Duration::from_millis(100))) {
-            Ok((0, bytes)) => stdout = bytes,
-            Ok((_, bytes)) => stderr = bytes,
-            Err(_) => break,
-        }
+    let until = deadline.min(Instant::now() + EXIT_GRACE);
+    while !readers.iter().all(std::thread::JoinHandle::is_finished) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let [stdout, stderr] = finish(readers);
     Ok(CommandOutput {
         success: status.success(),
         code: status.code(),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
+}
+
+/// A child's output pipe, as [`drain`] reads it.
+#[cfg(unix)]
+trait Pipe: std::io::Read + std::os::fd::AsRawFd + Send + 'static {}
+#[cfg(unix)]
+impl<T: std::io::Read + std::os::fd::AsRawFd + Send + 'static> Pipe for T {}
+#[cfg(not(unix))]
+trait Pipe: std::io::Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: std::io::Read + Send + 'static> Pipe for T {}
+
+/// Whether `pipe` has something to read (its end included), waiting at most
+/// [`READ_POLL_MS`].
+#[cfg(unix)]
+fn readable(pipe: &impl Pipe) -> std::io::Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd` for a descriptor `pipe` owns and keeps open
+    // for the duration of the call.
+    match unsafe { libc::poll(&mut fd, 1, READ_POLL_MS) } {
+        -1 => {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+        0 => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+#[cfg(not(unix))]
+fn readable(_pipe: &impl Pipe) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// Read `pipe` on a thread of its own until its end or until `stop` is set,
+/// keeping the first [`MAX_CAPTURE_BYTES`]. The pipe is closed when the
+/// thread ends.
+fn drain(
+    pipe: Option<impl Pipe>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let Some(mut pipe) = pipe else {
+            return kept;
+        };
+        let mut buffer = [0u8; 8192];
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            match readable(&pipe) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = MAX_CAPTURE_BYTES - kept.len();
+                    kept.extend_from_slice(&buffer[..n.min(room)]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        kept
+    })
+}
+
+/// Stop a command that outlived its bound: `SIGKILL` its process group (on
+/// Unix) and the command itself, then wait up to [`STOP_GRACE`] for it to
+/// exit. Returns whether it did, which a command running as root does not.
+fn stop_child(child: &mut std::process::Child) -> bool {
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill(2) with a negative pid signals the process group
+        // `run_bounded` gave the command, whose id is the command's pid. The
+        // command is not reaped yet, so that id cannot have been reused for
+        // somebody else's group. A failure (EPERM for a group of root's,
+        // ESRCH for one already gone) leaves the exit check below to decide.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let deadline = Instant::now() + STOP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+/// Wait for `child`, which could not be stopped, on a thread of its own, so
+/// it is reaped whenever it exits instead of staying a zombie.
+fn reap_later(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("self-upgrade-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// A command that outlived `timeout`, in words for the user.
@@ -622,6 +763,139 @@ mod tests {
         assert_eq!(
             timed_out(INSTALL_TIMEOUT, false).to_string(),
             "it did not finish within 15 minutes and could not be stopped, so it may still be running"
+        );
+    }
+
+    /// Whether `pid` has been reaped: `kill(pid, 0)` answers `ESRCH` only
+    /// once nothing holds the pid, a zombie included.
+    fn reaped(pid: i32) -> bool {
+        // SAFETY: signal 0 checks only that the pid exists; nothing is sent.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Whether `pid` has exited: reaped, or a zombie waiting for its parent.
+    fn exited(pid: i32) -> bool {
+        reaped(pid)
+            || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let (_, rest) = stat.rsplit_once(')')?;
+                    rest.split_whitespace().next().map(|state| state == "Z")
+                })
+                .unwrap_or(false)
+    }
+
+    fn eventually(what: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        what()
+    }
+
+    fn pid_in(file: &Path) -> i32 {
+        assert!(
+            eventually(|| std::fs::read_to_string(file).is_ok_and(|s| s.ends_with('\n'))),
+            "{} was never written",
+            file.display()
+        );
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// Scenario: a command starts a descendant that keeps writing to the
+    /// inherited stdout without end, then exits. The call returns soon after
+    /// the command exits, well inside its bound, with the head of the output
+    /// capped at `MAX_CAPTURE_BYTES`, and the descendant, whose pipe is
+    /// closed, dies of it.
+    #[test]
+    fn host_004_a_descendant_holding_the_pipes_neither_holds_the_call_nor_grows_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("writer.pid");
+        let script = format!(
+            "yes aaaaaaaaaaaaaaa & echo $! > '{}'; sleep 1; exit 0",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let output = SystemHost::default()
+            .run_within(
+                Path::new(SH),
+                &[OsStr::new("-c"), OsStr::new(&script)],
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let writer = pid_in(&pid_file);
+        let elapsed = started.elapsed();
+        let writer_died = eventually(|| exited(writer));
+        if !writer_died {
+            // SAFETY: the pid was just read from the writer itself.
+            unsafe { libc::kill(writer, libc::SIGKILL) };
+        }
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+        assert!(output.success);
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
+        assert!(output.stdout.starts_with("aaaaaaaaaaaaaaa\n"));
+        assert!(writer_died, "the descendant kept writing to a closed pipe");
+    }
+
+    /// Scenario: a command that starts a descendant and then hangs is run
+    /// past its bound. The whole process group is stopped, so the descendant
+    /// dies with the command rather than running on.
+    #[test]
+    fn host_005_a_timed_out_command_is_stopped_with_its_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let script = format!("sleep 60 & echo $! > '{}'; sleep 60", pid_file.display());
+        let err = SystemHost::default()
+            .run_within(
+                Path::new(SH),
+                &[OsStr::new("-c"), OsStr::new(&script)],
+                Duration::from_millis(500),
+            )
+            .unwrap_err();
+        let descendant = pid_in(&pid_file);
+        let died = eventually(|| exited(descendant));
+        if !died {
+            // SAFETY: the pid was just read from the descendant itself.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        assert_eq!(
+            err.to_string(),
+            "it did not finish within 500 milliseconds and was stopped"
+        );
+        assert!(died, "the descendant outlived its timed-out command");
+    }
+
+    /// Scenario: a command outlives its bound and cannot be stopped, as a
+    /// command `pkexec` runs as root cannot be. The kill is faked to be
+    /// refused (a real root child is impractical in a test); the error says
+    /// it may still be running, and once it exits on its own it is reaped
+    /// rather than left a zombie.
+    #[test]
+    fn host_006_a_child_whose_kill_is_refused_is_reaped_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let script = format!("echo $$ > '{}'; sleep 1", pid_file.display());
+        let mut command = std::process::Command::new(SH);
+        command.args(["-c", &script]);
+        let refuse = |_: &mut std::process::Child| false;
+        let err = run_bounded(&mut command, Duration::from_millis(300), &refuse).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "it did not finish within 300 milliseconds and could not be stopped, so it may still be running"
+        );
+        let child = pid_in(&pid_file);
+        assert!(!reaped(child), "the child was not yet due to exit");
+        assert!(
+            eventually(|| reaped(child)),
+            "the child that could not be stopped was never reaped"
         );
     }
 }
