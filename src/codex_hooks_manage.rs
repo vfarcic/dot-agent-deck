@@ -2292,6 +2292,7 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
+    pins
 }
 
 /// Log what [`auto_install_and_trust_at_startup`]'s trust write came to.
@@ -2326,7 +2327,6 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
              degrade to stdout classification"
         ),
     }
-    pins
 }
 
 #[cfg(test)]
