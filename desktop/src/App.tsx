@@ -46,6 +46,7 @@ import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPane
 import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
+import { fixtureSelfUpgradeApi } from "./data/fixture";
 import { useSelfUpgradeCheck } from "./hooks/useSelfUpgradeCheck";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
@@ -240,8 +241,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * at start and every `UPDATE_RECHECK_INTERVAL`, shown in the rail on every
    * screen and as a dismissible banner on the dashboard, both opening one
    * dialog. Here because the notice is the app's, not one screen's.
+   *
+   * The fixture's stand-in (`?selfupgrade=1`) is reachable only outside a Tauri
+   * build: the Tauri CLI sets `TAURI_ENV_PLATFORM` for the builds it runs, so
+   * there the condition is a constant and the call is folded away.
    */
-  const selfUpgradeApi = useMemo(() => tauriSelfUpgradeApi(), []);
+  const selfUpgradeApi = useMemo(
+    () => tauriSelfUpgradeApi() ?? (!import.meta.env.TAURI_ENV_PLATFORM && runtime.mode === "fixture" ? fixtureSelfUpgradeApi() : undefined),
+    [runtime.mode],
+  );
   const { check: selfUpgrade, recheck: recheckSelfUpgrade } = useSelfUpgradeCheck(selfUpgradeApi);
   const [selfUpgradeOpen, setSelfUpgradeOpen] = useState(false); // voice-registry-exempt: the newer-release dialog (issue #1635) — opened only by the rail button and the dashboard banner, and it asks before upgrading anything
   const [dismissedSelfUpgrade, setDismissedSelfUpgrade] = useState<string>(); // voice-registry-exempt: which newer-release banner was dismissed — it hides a notice and opens nothing

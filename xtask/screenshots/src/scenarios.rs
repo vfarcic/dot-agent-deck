@@ -117,6 +117,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "self-upgrade",
+        description: "The desktop Dashboard with the newer-release banner and the rail's upgrade button, and the Upgrade to v0.47.0 dialog open at its first question: the app from a .dmg and a Homebrew CLI, each one release behind.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "settings-voice",
         description: "Desktop Voice settings.",
         clients: &[Client::Desktop],

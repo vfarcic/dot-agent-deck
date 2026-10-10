@@ -58,6 +58,8 @@ Nothing appears while both copies are current, or while the app cannot reach Git
 
 The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**. It has one section for the app and, when a `dot-agent-deck` CLI is installed on this machine, one for the CLI. Each says which version you have, how that copy was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case.
 
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: one section for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, one for the dot-agent-deck CLI installed with Homebrew, and below them the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+
 1. The dialog asks about one copy at a time, the app first, for example `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead.
 2. While a copy upgrades, its section says **Upgrading…** and the dialog cannot be closed.
 3. The result appears under that copy's section, then the dialog asks about the next copy, if any.
