@@ -186,6 +186,11 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// the base is returned unscaled rather than at the maximum multiplier. [`load_factor`]
 /// carries that reasoning and the measurement behind it.
 ///
+/// **Contention is the load average OR an I/O / memory stall, whichever is
+/// worse** — see [`stall_factor`]. The load average alone missed the starvation
+/// that failed `delegate_012` with an empty snapshot: 15 on 16 CPUs is a factor
+/// of 1.0, while `/proc/pressure/io` reported `full` for 68% of the window.
+///
 /// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
 /// negative window in which something must NOT happen: the waits it feeds return
 /// the moment their condition holds, so a wider ceiling is free on the happy
@@ -193,7 +198,36 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
 pub fn load_scaled(base: Duration) -> Duration {
-    base.mul_f64(load_factor(machine_load_per_cpu()))
+    base.mul_f64(contention_factor(
+        machine_load_per_cpu(),
+        load_context::full_stall_share(),
+    ))
+}
+
+/// The factor [`load_scaled`] applies: the larger of [`load_factor`] and
+/// [`stall_factor`], so each source can only widen a ceiling the other left
+/// alone and the cap binds on both.
+pub(crate) fn contention_factor(load_per_cpu: Option<f64>, stall_share: Option<f64>) -> f64 {
+    load_factor(load_per_cpu).max(stall_factor(stall_share))
+}
+
+/// The factor an I/O or memory stall widens a ceiling by: `1 / (1 - share)`,
+/// clamped to `1.0..=`[`MAX_LOAD_FACTOR`].
+///
+/// `share` is the fraction of recent time during which NOTHING runnable made
+/// progress (PSI `full`), so a child that needs a fixed amount of progress gets
+/// it at roughly `1 - share` of the idle rate, and needs `1 / (1 - share)` of
+/// the idle time. At `delegate_012`'s measured 68% that is ~3.1, turning the
+/// 8 s [`CHILD_BOOT_BASE`] that expired into ~25 s; at 83% or more the cap
+/// binds. Unmeasurable (`None`, non-finite) is 1.0 for [`load_factor`]'s reason.
+pub(crate) fn stall_factor(stall_share: Option<f64>) -> f64 {
+    match stall_share {
+        Some(share) if share.is_finite() => {
+            let progress = (1.0 - share.clamp(0.0, 1.0)).max(1.0 / MAX_LOAD_FACTOR);
+            (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
+        }
+        _ => 1.0,
+    }
 }
 
 /// The factor [`load_scaled`] multiplies its base by, split out from it so the
@@ -302,6 +336,15 @@ const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 ///   generous ceiling might otherwise have slowed — a stand-in that DIED rather
 ///   than printed — still fails about as fast as it did against 2 s.
 ///
+/// **The ceiling is re-read while waiting, and can only move later.** Sizing it
+/// once at the start missed a stall that began mid-wait, and the load average
+/// missed an I/O stall altogether: `delegate_012` reported an empty snapshot
+/// after the flat 8 s at load 15 on 16 CPUs, with `io full` at 68% of its
+/// window. Each poll re-takes [`child_boot_budget`] from the wait's start and
+/// keeps the later deadline, so a stall that develops extends it while one that
+/// clears never shortens it, and it stays bounded by [`CHILD_BOOT_BASE`] x
+/// [`MAX_LOAD_FACTOR`].
+///
 /// Use it only for the boot leg. A wait on a BEHAVIOUR the daemon must perform
 /// belongs on that behaviour's own budget, and a negative window in which
 /// something must not happen must not be widened at all — its length is part of
@@ -312,13 +355,15 @@ pub async fn wait_for_child_first_output(
     agent_id: &str,
     needle: &[u8],
 ) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + child_boot_budget();
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + child_boot_budget();
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     loop {
         let snapshot = registry.snapshot(agent_id).unwrap_or_default();
         if snapshot.windows(needle.len()).any(|w| w == needle) {
             return snapshot;
         }
+        deadline = deadline.max(started + child_boot_budget());
         let now = tokio::time::Instant::now();
         if now >= deadline || drain_deadline.is_some_and(|drained| now >= drained) {
             return snapshot;
