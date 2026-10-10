@@ -58,6 +58,13 @@ pub const REMOTE_PROBE_DEADLINE: Duration = PLUMBING_START_ALLOWANCE;
 pub const REMOTE_RESTART_DEADLINE: Duration =
     PLUMBING_START_ALLOWANCE.saturating_add(crate::daemon_client::RESTART_REQUEST_TIMEOUT);
 
+/// How much longer a restart whose confirmation goes on stdin may run than
+/// [`REMOTE_RESTART_DEADLINE`]: the remote reads its stdin before it sends the
+/// request, for up to [`crate::daemon_restart::CONFIRM_STDIN_TIMEOUT`], and a
+/// deadline that did not count that could kill a session whose request had
+/// just gone out (issue #1619, Qodo 4236548121).
+pub const REMOTE_RESTART_STDIN_EXTRA: Duration = crate::daemon_restart::CONFIRM_STDIN_TIMEOUT;
+
 /// The daemon's worst case before it answers a restart request.
 const DAEMON_RESTART_WORST_CASE_MS: u128 = crate::daemon_restart::RESTART_VERIFY_TIMEOUT
     .as_millis()
@@ -71,6 +78,12 @@ const _: () = assert!(
 const _: () = assert!(
     REMOTE_RESTART_DEADLINE.as_millis()
         > PLUMBING_START_ALLOWANCE.as_millis() + DAEMON_RESTART_WORST_CASE_MS
+);
+const _: () = assert!(
+    REMOTE_RESTART_DEADLINE.as_millis() + REMOTE_RESTART_STDIN_EXTRA.as_millis()
+        > PLUMBING_START_ALLOWANCE.as_millis()
+            + crate::daemon_restart::CONFIRM_STDIN_TIMEOUT.as_millis()
+            + DAEMON_RESTART_WORST_CASE_MS
 );
 
 /// The exit code clap uses for a usage error — what a deck binary that predates
@@ -307,11 +320,14 @@ impl<E: SshExecutor> SshDaemonPort<E> {
                 )));
             }
         }
-        let output = self.run_bounded_command_with(
-            &self.command(&args),
-            input.as_deref(),
-            self.restart_deadline,
-        )?;
+        let deadline = if input.is_some() {
+            self.restart_deadline
+                .saturating_add(REMOTE_RESTART_STDIN_EXTRA)
+        } else {
+            self.restart_deadline
+        };
+        let output =
+            self.run_bounded_command_with(&self.command(&args), input.as_deref(), deadline)?;
         parse_json_reply(output)
     }
 
