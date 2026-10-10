@@ -508,6 +508,17 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// unreleased stream before any build that serves it shipped, so it changed
 /// the meaning of nothing a released client reads either.
 ///
+/// **PRD #1258 contributes no bump for [`AttachRequest::HostMetrics`]**, on the
+/// same rung: its one sender,
+/// [`crate::daemon_client::DaemonClient::host_metrics`], withholds it unless
+/// [`CAP_HOST_METRICS`] is advertised, and its answer
+/// [`AttachResponse::host_metrics`] is an additive optional field. It reads the
+/// host and changes no state, and no existing field or verb changed meaning, so
+/// no [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual — a cached
+/// capability set outliving a daemon replaced by an older build — fails
+/// closed: that daemon refuses the unknown variant and the client reports an
+/// error rather than numbers.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -850,6 +861,18 @@ pub const CAP_LAST_COMMAND: &str = "last-command";
 /// rollout tailer, which run on every platform this builds for.
 pub const CAP_TURN_REPLIES: &str = "turn-replies";
 
+/// Capability string for [`AttachRequest::HostMetrics`] (PRD #1258): this
+/// daemon reports its own host's disk, load and memory. Held by
+/// [`crate::daemon_client::DaemonClient::host_metrics`], so no call site checks
+/// it itself.
+///
+/// **Unix only.** Disk is read with `statvfs(3)` and load with `/proc/loadavg`
+/// or `getloadavg(3)`, none of which a Windows build has; there the dispatch arm
+/// refuses the verb, so advertising it would promise a reading the daemon
+/// cannot take. A client against such a daemon shows "not available from this
+/// deck", exactly as it does against a daemon that predates the verb.
+pub const CAP_HOST_METRICS: &str = "host-metrics";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1001,7 +1024,8 @@ fn invalid_client_id_message() -> String {
 /// not `#[cfg]`-gated, and neither is issue #1555's
 /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`] nor PRD #1497's [`CAP_TURN_REPLIES`].
 /// PRD #1487's [`CAP_RESTART_DAEMON`] is on both lists: its dispatch arm is
-/// not `#[cfg]`-gated either.
+/// not `#[cfg]`-gated either. PRD #1258's [`CAP_HOST_METRICS`] is on the Unix
+/// list only: its dispatch arm refuses the verb elsewhere.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -1022,6 +1046,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
+    CAP_HOST_METRICS,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -2533,6 +2558,25 @@ pub enum AttachRequest {
         #[serde(default)]
         successor: RestartSuccessor,
     },
+    /// PRD #1258: "how loaded is your host?" — disk free/total for the deck's
+    /// three watched roles, load per CPU, CPU count and memory, with the
+    /// sample's age. **Read-only.** The reply rides back on
+    /// [`AttachResponse::host_metrics`]; the shape is
+    /// [`crate::host_metrics::HostMetrics`], which names roles and never a
+    /// path.
+    ///
+    /// Answered from the daemon's [`crate::host_metrics::HostMetricsCache`],
+    /// sampled on demand and reused for
+    /// [`crate::host_metrics::HOST_METRICS_MAX_AGE`] — no timer drives it.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_HOST_METRICS`]**, by its
+    /// one sender [`crate::daemon_client::DaemonClient::host_metrics`], so it
+    /// contributes no [`PROTOCOL_VERSION`] bump: an older daemon is never sent
+    /// it, and refuses it with the generic `malformed request: …` if a raw
+    /// sender skips the check, changing nothing.
+    ///
+    /// Its own short-lived connection: one request, one response, close.
+    HostMetrics,
 }
 
 /// PRD #1487: who starts the daemon that replaces one answering
@@ -3169,6 +3213,11 @@ pub struct AttachResponse {
     /// older client ignores the key and an older daemon omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// PRD #1258: the answer to [`AttachRequest::HostMetrics`]. `None` on every
+    /// other response, and on a refusal. Additive + optional, and the request
+    /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_metrics: Option<crate::host_metrics::HostMetrics>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -3576,6 +3625,9 @@ pub async fn serve_attach_with_restart(
     // Notify stores a permit if no waiter is registered, so a signal sent
     // between the monitor's loop iterations isn't lost.
     let change_notify: Arc<Notify> = registry.change_notify();
+    // PRD #1258: one host sample per attach server, shared by every connection
+    // so a cache hit holds across clients and reconnects.
+    let host_metrics = Arc::new(crate::host_metrics::HostMetricsCache::new());
     loop {
         match listener.accept().await {
             Ok(stream) => {
@@ -3589,6 +3641,7 @@ pub async fn serve_attach_with_restart(
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
                 let restart = restart.clone();
+                let host_metrics = host_metrics.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -3628,6 +3681,7 @@ pub async fn serve_attach_with_restart(
                         reuse_registry,
                         worktree_registry,
                         restart,
+                        host_metrics,
                     )
                     .await
                     {
@@ -3683,6 +3737,34 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
+}
+
+/// PRD #1258: answer [`AttachRequest::HostMetrics`] from `cache`.
+///
+/// The age is read here, on Tokio's clock, and the sample (blocking syscalls)
+/// is taken on a blocking thread, so a slow filesystem stalls this connection
+/// and not a runtime worker.
+#[cfg(unix)]
+async fn host_metrics_response(
+    cache: Arc<crate::host_metrics::HostMetricsCache>,
+) -> AttachResponse {
+    let now = tokio::time::Instant::now();
+    match tokio::task::spawn_blocking(move || cache.read_at(now)).await {
+        Ok(metrics) => AttachResponse {
+            host_metrics: Some(metrics),
+            ..AttachResponse::ok()
+        },
+        Err(e) => AttachResponse::err(format!("host-metrics: the sampler failed: {e}")),
+    }
+}
+
+/// Not advertised here — see [`CAP_HOST_METRICS`] — so only a raw sender that
+/// skipped the capability check reaches this.
+#[cfg(not(unix))]
+async fn host_metrics_response(
+    _cache: Arc<crate::host_metrics::HostMetricsCache>,
+) -> AttachResponse {
+    AttachResponse::err("host-metrics is not supported on this platform")
 }
 
 /// PRD #20 M3 / R20-003/006 (findings #3, #4, #7): compute the honest
@@ -4619,6 +4701,7 @@ async fn handle_connection(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     restart: Arc<crate::daemon_restart::RestartControl>,
+    host_metrics: Arc<crate::host_metrics::HostMetricsCache>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -6081,6 +6164,9 @@ async fn handle_connection(
                 )
                 .await?
             }
+        }
+        AttachRequest::HostMetrics => {
+            write_resp(&mut stream, &host_metrics_response(host_metrics).await).await?
         }
         AttachRequest::RecordOrchestratorContext {
             pane_id,
@@ -7640,6 +7726,33 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Scenario: Read memory from an unreadable source and a malformed fixture;
+    /// unavailable readings stay absent while a readable available-memory field
+    /// survives independently, with a complete fixture proving valid values work.
+    #[cfg(target_os = "linux")]
+    #[spec("protocol/host-metrics/004")]
+    #[test]
+    fn host_metrics_004_unreadable_memory_is_absent_not_zero() {
+        let root = tempfile::tempdir().unwrap();
+        // Reading a directory fails even for a root test process, unlike chmod(0).
+        assert_eq!(
+            crate::host_metrics::read_memory_from(root.path()),
+            (None, None)
+        );
+        let meminfo = root.path().join("meminfo");
+        std::fs::write(&meminfo, "MemTotal: 100 kB\nMemAvailable: 40 kB\n").unwrap();
+        assert_eq!(
+            crate::host_metrics::read_memory_from(&meminfo),
+            (Some(60 * 1024), Some(40 * 1024))
+        );
+        std::fs::write(&meminfo, "MemTotal: unreadable kB\nMemAvailable: 40 kB\n").unwrap();
+        assert_eq!(
+            crate::host_metrics::read_memory_from(&meminfo),
+            (None, Some(40 * 1024)),
+            "an unreadable total must not erase the available field or become zero used bytes"
+        );
+    }
 
     /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
     /// daemon in reverse publication order leave the record on the newer file,

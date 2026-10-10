@@ -1318,6 +1318,20 @@ pub enum FocusReport {
     Superseded,
 }
 
+/// PRD #1258 — what [`DaemonClient::host_metrics`] got.
+///
+/// `NotAvailable` is an **outcome, not an error**, for the reason
+/// [`FocusReport::Withheld`] is one: a daemon that predates the verb, or runs
+/// where it cannot sample (Windows), is an ordinary deck, and both clients show
+/// "not available from this deck" for it rather than a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostMetricsReport {
+    /// The daemon advertises `host-metrics` and answered with its host's sample.
+    Available(crate::host_metrics::HostMetrics),
+    /// The daemon does not advertise `host-metrics`, so nothing was sent.
+    NotAvailable,
+}
+
 /// PRD #1223 — the answer to a request this client sends only to a daemon that
 /// advertises it: the queries [`DaemonClient::list_directories`] and
 /// [`DaemonClient::new_agent_options`], and the start
@@ -2617,6 +2631,40 @@ impl DaemonClient {
             ));
         }
         Ok(FocusReport::Recorded)
+    }
+
+    /// PRD #1258 — ask the daemon for its host's disk, load and memory.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_HOST_METRICS`]**, answering
+    /// [`HostMetricsReport::NotAvailable`] without sending anything. The
+    /// capability comes from [`Self::capabilities`], one `Hello` per endpoint
+    /// until that cache is invalidated; the residual — a cache outliving a
+    /// daemon replaced by an older build — fails closed, as that daemon refuses
+    /// the unknown variant and this returns [`ClientError::Server`].
+    ///
+    /// The numbers describe the **daemon's** host: for a remote deck, the
+    /// remote machine.
+    pub async fn host_metrics(&self) -> Result<HostMetricsReport, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_HOST_METRICS)
+        {
+            return Ok(HostMetricsReport::NotAvailable);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::HostMetrics).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "host-metrics failed".into()),
+            ));
+        }
+        resp.host_metrics
+            .map(HostMetricsReport::Available)
+            .ok_or_else(|| {
+                ClientError::Malformed("host-metrics reply carried no host_metrics".into())
+            })
     }
 
     /// Issue #1445 — tell the daemon the orchestrator in `pane_id` was re-armed
@@ -4430,6 +4478,90 @@ mod tests {
             "a refused attach must register no viewer"
         );
         registry.shutdown_all();
+    }
+
+    /// Scenario: An older daemon answers Hello with either no capabilities or
+    /// unrelated capabilities; the host-metrics query returns NotAvailable.
+    /// A subsequent Hello acts as a socket barrier and proves no metrics frame arrived.
+    #[cfg(unix)]
+    #[spec("protocol/host-metrics/003")]
+    #[tokio::test]
+    async fn host_metrics_003_missing_capability_sends_no_frame() {
+        for advertised in [
+            None,
+            Some(vec![crate::daemon_protocol::CAP_FOCUS_GAINED.to_string()]),
+        ] {
+            let (_dir, path, listener) = {
+                let _guard = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("older-daemon.sock");
+                let listener = bind_attach_listener(&path).expect("bind older daemon");
+                (dir, path, listener)
+            };
+            let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                loop {
+                    let mut stream = listener.accept().await.expect("accept query");
+                    let (kind, payload) = read_frame(&mut stream)
+                        .await
+                        .unwrap()
+                        .expect("request frame");
+                    assert_eq!(kind, KIND_REQ);
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let op = request["op"].as_str().unwrap().to_string();
+                    seen_tx.send(op.clone()).unwrap();
+                    let response = if op == "hello" {
+                        AttachResponse {
+                            capabilities: advertised.clone(),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        AttachResponse::err("unexpected request to an older daemon")
+                    };
+                    crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = DaemonClient::new(path);
+            assert!(matches!(
+                client
+                    .host_metrics()
+                    .await
+                    .expect("withholding is not an error"),
+                HostMetricsReport::NotAvailable
+            ));
+            assert_eq!(
+                seen_rx.recv().await.as_deref(),
+                Some("hello"),
+                "capability handshake"
+            );
+            // A completed barrier query replaces a timing-based negative assertion.
+            let (mut rd, mut wr) = client.connect().await.unwrap();
+            issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: PROTOCOL_VERSION,
+                    client_build_version: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                seen_rx.recv().await.as_deref(),
+                Some("hello"),
+                "no metrics frame before barrier"
+            );
+            assert!(
+                matches!(
+                    seen_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "no extra frames"
+            );
+            server.abort();
+        }
     }
 
     /// PRD #1105 — a handle with no identity has nothing to claim focus as. That

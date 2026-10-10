@@ -1114,6 +1114,36 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** what the daemon does with each value (`orchestration/delegate/026` for the settled fact being held for an upgrade, `/027` for the ready fact's interface buffer, `/028` for an unattributed one); which fact a given child produces, which is the wrapper's `InterfaceWatch` and is behavioural (`codex/wrap/006`); that the marker is authenticated — it is not, deliberately, which is why guard 2 exists.
 - **Platform coverage:** mac+linux+windows.
 
+#### protocol/host-metrics
+
+##### protocol/host-metrics/001 — The daemon serves host numbers by role without exposing paths.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, no PTY).
+- **Agent:** none.
+- **Asserts:** Hello advertises `host-metrics`; the reply contains exactly `working_root`, `worktree_parent`, and `temp_root`, bounded nonzero disk totals, CPU count, optional finite load, Linux memory readings, and numeric sample timestamp/age; serialized strings contain no absolute path.
+- **Does not assert:** TUI or desktop rendering; remote transport; unsupported-platform capability withholding; exact host utilisation.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/002 — Socket queries reuse a fresh cached sample and refresh an expired one.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** after the first reply completes, advancing time 250 ms and requesting on another connection preserves the sample timestamp and every payload field except age; age increases by exactly 250 ms; after the max age, the next query resets age through an on-demand refresh.
+- **Does not assert:** background sampling; wall-clock timing; clients' rendering; sampler cost.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/003 — The client withholds metrics queries from older daemons.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** absent capabilities and unrelated capabilities both produce `NotAvailable`; a completed Hello barrier proves the peer received no metrics request frame.
+- **Does not assert:** the supported query's response decoding; client rendering; cached capabilities outliving a daemon replacement.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/004 — An unreadable memory field is absent rather than zero.
+- **Layer:** unit (daemon memory-reader fixture).
+- **Agent:** none.
+- **Asserts:** an unreadable source produces absent readings; valid fixture values convert kB to bytes; malformed total memory leaves used memory absent while preserving available memory.
+- **Does not assert:** macOS memory sampling; disk/load failures; UI placeholders.
+- **Platform coverage:** linux.
+
 #### protocol/live-target
 
 ##### protocol/live-target/001 — `AgentEvent.live_target` preserves every target-kind and writability value while remaining optional for legacy events (PRD #20 M3).
