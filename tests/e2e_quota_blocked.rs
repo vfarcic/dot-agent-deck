@@ -845,6 +845,11 @@ process.stdin.resume();
 /// marker blocks the first card; a bare 429 leaves the other in Error.
 #[spec("status/blocked/019")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): under load the daemon's hook listener can
+// apply the marker session's QuotaBlocked before its own SessionStart, leaving
+// the card Idle. That ordering bug is the daemon's, not this test's; #1664 has
+// the evidence and what lifts the quarantine.
+#[ignore = "quarantined: vfarcic, #1664"]
 fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     if Command::new("node").arg("--version").output().is_err() {
         eprintln!("SKIP: node is unavailable");

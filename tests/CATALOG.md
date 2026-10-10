@@ -782,6 +782,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 ##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1664"]` (CLAUDE.md rule 6). Under load the daemon's hook listener can apply the marker session's QuotaBlocked before its own SessionStart, so the card stays Idle; #1664 has the evidence, the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
 - **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
 - **Does not assert:** a real OpenCode API request.
