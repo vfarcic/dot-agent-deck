@@ -2703,6 +2703,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** what happens to a successor that was already spawned when the signal arrived (it runs on its own); Windows' Ctrl-C delivery.
 - **Platform coverage:** linux+mac.
 
+##### lifecycle/wire-restart/009 — `restart-installed --confirm-stdin` reads a confirmation too large for the command line (issue #1619).
+- **Layer:** L2 (lane 1, a real headless daemon and the real installed CLI with its confirmation piped to stdin).
+- **Agent:** three synthetic cat stand-ins, including two orchestration roles.
+- **Asserts:** a 600-agent confirmation whose hex form exceeds 128 KiB is read whole from stdin and answered as stale with the real three disclosed, leaving the daemon, agents and role map untouched; the disclosed set sent the same way is accepted and the daemon is replaced.
+- **Does not assert:** the laptop side choosing stdin over `--confirm-hex` or the ssh transport (`remote_daemon` unit tests own those); a remote whose ssh client drops stdin.
+- **Platform coverage:** linux+mac.
+
 
 #### lifecycle/wire-stop
 

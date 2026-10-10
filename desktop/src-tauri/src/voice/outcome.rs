@@ -2142,7 +2142,10 @@ fn resolve_param(
 ///    utterance less an edge politeness word — the comparison `heard_as_whole`
 ///    grounding makes, so *"okay, send it please"* is answered here as *"send
 ///    it"* is. Never a prefix or a suffix test — see [`SUBMIT_PHRASES`] for
-///    the false positive that rules out, and why it is unrecoverable.
+///    the false positive that rules out, and why it is unrecoverable. On
+///    every screen for [`SUBMIT_PHRASES`]; for the rest of `submit_prompt`'s
+///    `heard_as_whole` entries (*"go ahead"*), only on a screen where the row
+///    is callable, so elsewhere they reach the model as before (issue #1246).
 /// 2. **A close said on its own over the New agent dialog** — one of the
 ///    whole utterances `close` declares for the dialog, by the same
 ///    comparison. There the row answers to nothing else, so the utterance has
@@ -2249,6 +2252,23 @@ fn local_intercept(
 
     if said_whole(transcript.text(), SUBMIT_PHRASES)
         && let Some(row) = table.row(SUBMIT_ROW)
+    {
+        return Some(dispatch(row, Vec::new()));
+    }
+
+    // The row's own whole utterances beyond that list — "go ahead", "that is
+    // the end", "finished" — answered here only where the row can run (issue
+    // #1246). Asked of the model, a bare "go ahead" on the agent screen came
+    // back as `close` four times in four, which grounding refused, so nothing
+    // was sent. Off the agent screen they still go to the model: there a bare
+    // "go ahead" is `start_new_agent`'s over the New agent dialog, and
+    // answering it here would refuse it instead. The comparison is the row's
+    // own whole-utterance one, so "go ahead and close it" is not a submit.
+    if let Some(row) = table.row(SUBMIT_ROW)
+        && row.callable(screen, directories, new_agent)
+        && let (ActionGrounding::HeardAsWhole(phrases), _) =
+            row.grounding_for(directories, new_agent)
+        && said_whole(transcript.text(), phrases.iter().map(String::as_str))
     {
         return Some(dispatch(row, Vec::new()));
     }
@@ -12646,9 +12666,9 @@ mod tests {
 
     /// Scenario: the user says "send it", "submit" or "go ahead" and nothing
     /// else — with the transcriber's own casing and punctuation, and an edge
-    /// "okay" or "please" — and the prompt is sent, through the local fast
-    /// path where the phrase is one of `SUBMIT_PHRASES` and through the model
-    /// where it is not.
+    /// "okay" or "please" — and the prompt is sent on the agent screen with no
+    /// model call: `SUBMIT_PHRASES` and, since issue #1246, the rest of the
+    /// row's whole utterances are answered by the local fast path there.
     #[tokio::test]
     async fn voice_outcome_a_whole_submit_utterance_still_submits_on_both_paths() {
         // The fast path: no model call at all — an edge politeness word
@@ -12660,6 +12680,11 @@ mod tests {
             "press enter",
             "okay, send it please",
             "please just send it now",
+            "go ahead",
+            "Go ahead.",
+            "yes, go ahead",
+            "submit it now",
+            "That is the end.",
         ] {
             let resolver = CountingResolver::default();
             let answer = handle_utterance(
@@ -12680,26 +12705,199 @@ mod tests {
             );
             assert_eq!(resolver.calls(), 0, "{said}");
         }
-        // The model's path, held to the same whole-utterance rule.
-        for said in [
-            "go ahead",
-            "Go ahead.",
-            "yes, go ahead",
-            "submit it now",
-            "That is the end.",
-        ] {
-            let resolver = StubResolver::new().answering(said, IntentAnswer::new(SUBMIT_ROW));
-            let outcome = run_everything(&resolver, Screen::Agent, said).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == SUBMIT_ROW),
-                "{said}: {outcome:?}"
-            );
-        }
         // And the model's check accepts every fast-path phrase too, so the two
         // paths never disagree about what a submission sounds like.
         let submit = table().row(SUBMIT_ROW).expect("row");
         for said in ["send it", "submit", "go ahead"] {
             assert!(action_grounded(submit, said, None, None), "{said}");
+        }
+    }
+
+    // -- issue #1246: the row's own whole utterances, where it is callable --
+
+    /// `submit_prompt`'s `heard_as_whole` entries that `SUBMIT_PHRASES` does
+    /// not hold — the ones the fast path answers only where the row runs.
+    fn submit_phrases_beyond_the_list() -> Vec<String> {
+        let ActionGrounding::HeardAsWhole(phrases) =
+            &table().row(SUBMIT_ROW).expect("row").grounding
+        else {
+            panic!("`submit_prompt` is no longer whole-utterance grounded");
+        };
+        let beyond: Vec<String> = phrases
+            .iter()
+            .filter(|phrase| !SUBMIT_PHRASES.contains(&phrase.as_str()))
+            .cloned()
+            .collect();
+        assert!(
+            beyond.iter().any(|phrase| phrase == "go ahead"),
+            "{beyond:?}"
+        );
+        beyond
+    }
+
+    /// Scenario: with unsent text in an agent's prompt, the user says a bare
+    /// "go ahead" (or "finished", "that is the end", "submit it"), with the
+    /// New agent form, a directory listing or nothing declared. The prompt is
+    /// sent at once and no model is asked — before issue #1246 the model
+    /// answered "go ahead" with `close`, which was refused, and nothing was sent.
+    #[tokio::test]
+    async fn voice_outcome_go_ahead_on_the_agent_screen_submits_without_the_model() {
+        let level = listing(&["docs", "billing"], true);
+        let form = new_agent_form();
+        let mut said_all: Vec<String> = submit_phrases_beyond_the_list();
+        said_all.extend(["Go ahead.", "okay, go ahead please"].map(String::from));
+        for said in &said_all {
+            for (directories, new_agent) in [(None, None), (Some(&level), Some(&form))] {
+                let resolver = CountingResolver::answering(IntentAnswer::new(CLOSE_ROW));
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    directories,
+                    new_agent,
+                    Transcript::new(said),
+                )
+                .await;
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, then_submit: false, .. } if action == SUBMIT_ROW),
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(answer.outcome.sentence(), "Sent.", "{said}");
+                assert_eq!(resolver.calls(), 0, "{said}");
+                assert_eq!(answer.resolve_ms, None, "{said}");
+            }
+        }
+    }
+
+    /// Scenario: on the agent dashboard with the New agent form filled in,
+    /// the user says "go ahead". It still reaches the model, which starts the
+    /// agent — the fast path that now sends "go ahead" on the agent screen
+    /// does not answer it here, where `submit_prompt` cannot run.
+    #[tokio::test]
+    async fn voice_outcome_go_ahead_over_the_new_agent_form_still_reaches_the_model() {
+        let level = listing(&["docs", "billing"], true);
+        let form = new_agent_form();
+        for said in ["go ahead", "Go ahead.", "okay, go ahead please"] {
+            let resolver = CountingResolver::answering(IntentAnswer::new("start_new_agent"));
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                Some(&level),
+                Some(&form),
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. } if action == "start_new_agent"),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(resolver.calls(), 1, "{said}");
+        }
+    }
+
+    /// Scenario: on the Daemons screen and the agent dashboard, dialog open or
+    /// not, every one of `submit_prompt`'s whole utterances that
+    /// `SUBMIT_PHRASES` does not hold falls through the local fast path to
+    /// the model, exactly as before issue #1246.
+    #[test]
+    fn voice_outcome_submit_phrases_beyond_the_list_pass_through_off_the_agent_screen() {
+        let level = listing(&["docs", "billing"], true);
+        let form = new_agent_form();
+        let dialog = VoiceNewAgent { form: None };
+        for screen in [Screen::Deck, Screen::Overview] {
+            for (directories, new_agent) in [
+                (None, None),
+                (None, Some(&dialog)),
+                (Some(&level), Some(&form)),
+            ] {
+                for said in submit_phrases_beyond_the_list() {
+                    let intercepted = local_intercept(
+                        table(),
+                        screen,
+                        directories,
+                        new_agent,
+                        &Transcript::new(&said),
+                    );
+                    assert_eq!(intercepted, None, "{screen:?} {said}");
+                }
+            }
+        }
+    }
+
+    /// Scenario: with unsent text in an agent's prompt, the user says a longer
+    /// sentence that starts or ends with a submit phrase — "go ahead and close
+    /// it", "that is the end of the file" — and the model is steered to
+    /// `submit_prompt`. Enter is not pressed: the fast path does not take it,
+    /// and the model's pick is refused as not asked for.
+    #[tokio::test]
+    async fn voice_outcome_a_submit_phrase_inside_a_longer_sentence_does_not_submit() {
+        for said in [
+            "go ahead and close it",
+            "go ahead with the refactor",
+            "okay go ahead and start it",
+            "that is the end of the file",
+            "finished the tests",
+            "submit it to the reviewer",
+            "send it to the reviewer",
+        ] {
+            for screen in Screen::ALL {
+                let intercepted =
+                    local_intercept(table(), screen, None, None, &Transcript::new(said));
+                assert!(
+                    !matches!(&intercepted, Some(VoiceOutcome::Dispatch { action, .. }) if action == SUBMIT_ROW),
+                    "{screen:?} {said}: {intercepted:?}"
+                );
+            }
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(SUBMIT_ROW));
+            let outcome = run_everything(&resolver, Screen::Agent, said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == SUBMIT_ROW),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: every `SUBMIT_PHRASES` entry, on every screen, with the New
+    /// agent dialog and a directory listing declared or not, is answered by
+    /// the fast path exactly as before issue #1246 — sent on the agent screen,
+    /// refused with the row's hint on the other two.
+    #[test]
+    fn voice_outcome_submit_phrases_behave_as_before_on_every_screen() {
+        let level = listing(&["docs", "billing"], true);
+        let form = new_agent_form();
+        let dialog = VoiceNewAgent { form: None };
+        for screen in Screen::ALL {
+            for (directories, new_agent) in [
+                (None, None),
+                (None, Some(&dialog)),
+                (Some(&level), Some(&form)),
+            ] {
+                for said in SUBMIT_PHRASES {
+                    let intercepted = local_intercept(
+                        table(),
+                        screen,
+                        directories,
+                        new_agent,
+                        &Transcript::new(said),
+                    );
+                    let as_before = match screen {
+                        Screen::Agent => {
+                            matches!(&intercepted, Some(VoiceOutcome::Dispatch { action, .. }) if action == SUBMIT_ROW)
+                        }
+                        Screen::Deck | Screen::Overview => {
+                            matches!(&intercepted, Some(VoiceOutcome::Unavailable { action, .. }) if action == SUBMIT_ROW)
+                        }
+                    };
+                    assert!(as_before, "{screen:?} {said}: {intercepted:?}");
+                }
+            }
         }
     }
 
