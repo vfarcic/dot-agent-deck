@@ -3211,6 +3211,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setProblem(reason);
   }, []);
   /**
+   * PRD #1401 — a dispatch whose effect settles later: `pending` now, through
+   * {@link reportRefused} so the resolver's sentence (written before anything
+   * ran) is not shown, then how it ended — unless the user has said something
+   * since ({@link forget} moves the generation), whose report this must not
+   * cover.
+   */
+  const reportPending = useCallback((pending: string, work: Promise<string | undefined>, done: string) => {
+    reportRefused(pending);
+    const reported = reportGeneration.current;
+    void work.then((failed) => {
+      if (reportGeneration.current === reported) setProblem(failed ?? done);
+    });
+  }, [reportRefused]);
+  /**
    * Type one utterance's words into the open agent's prompt, then start the
    * countdown to a send (PRD #802 D6, rebuilt).
    *
@@ -3972,6 +3986,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       scratchLastDictation,
       reportNothingToClose,
       reportRefused,
+      reportPending,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

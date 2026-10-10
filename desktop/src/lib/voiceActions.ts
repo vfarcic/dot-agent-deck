@@ -264,6 +264,17 @@ export type VoiceActionContext = {
    */
   reportRefused: (reason: string) => void;
   /**
+   * PRD #1401 — say what a dispatch whose effect settles LATER is doing, and
+   * then how it ended: `pending` now, in place of the resolver's sentence
+   * (which was written before anything ran, and would claim a success nobody
+   * has seen yet), then `done` when `work` resolves to `undefined`, or the
+   * sentence it resolves to when it did not happen. A later report is
+   * dropped once the user has said something else, whose report it must not
+   * cover. `work` resolves rather than rejects, so a caller with no voice
+   * surface (the toolbar's button) leaves no rejection unhandled.
+   */
+  reportPending: (pending: string, work: Promise<string | undefined>, done: string) => void;
+  /**
    * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
    * has, reached by voice. Answers `undefined` when it closed, or the dialog's
    * own sentence when it would not: while a start is in flight every route is
@@ -434,10 +445,13 @@ export type VoiceActionContext = {
   openPullRequest: (target: { deckId: string; agentId: string }) => string | undefined;
   /**
    * PRD #1401 — hand the page the browser is showing to the system browser,
-   * and close the in-app one: the toolbar's Open in browser and the
-   * `open_pr_in_browser` row. Answers the sentence when no pull request is open.
+   * and close the in-app one once the system browser has it: the toolbar's
+   * Open in browser and the `open_pr_in_browser` row. Answers the sentence when
+   * no pull request is open, and otherwise the hand-off in flight, which
+   * settles to `undefined` when it happened or to the sentence saying why
+   * not — in which case the in-app page stays open and says so too.
    */
-  openPullRequestInBrowser: () => string | undefined;
+  openPullRequestInBrowser: () => string | Promise<string | undefined>;
   /**
    * PRD #1401 — close the in-app browser, back to exactly the screen under it.
    *
@@ -485,6 +499,11 @@ export type VoiceActionEntry = {
   /** Why this capability is not a spoken command. Mutually exclusive with `voice`. */
   no_voice?: string;
 };
+
+/** PRD #1401 — what voice says while the system browser is being handed the page. */
+export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
+/** …and once it has it: `open_pr_in_browser`'s own `report` in `commands.toml`, said when it is true. */
+export const PULL_REQUEST_HANDED_OFF = "Opened it in your browser.";
 
 export const VOICE_ACTIONS = {
   // -- the ones the command table names today -----------------------------
@@ -1124,9 +1143,13 @@ export const VOICE_ACTIONS = {
     label: "Open the pull request on screen in the system browser",
     voice: true,
     needs: ["openPullRequestInBrowser"],
-    run: (context: Pick<VoiceActionContext, "openPullRequestInBrowser"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
-      const refused = context.openPullRequestInBrowser();
-      if (refused !== undefined) context.reportRefused?.(refused);
+    /* The hand-off is reported when it has happened, not when it was asked
+       for: a system browser that would not open leaves the page in the app,
+       and "Opened it in your browser" would then be false. */
+    run: (context: Pick<VoiceActionContext, "openPullRequestInBrowser"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>) => {
+      const handoff = context.openPullRequestInBrowser();
+      if (typeof handoff === "string") context.reportRefused?.(handoff);
+      else context.reportPending?.(PULL_REQUEST_HANDING_OFF, handoff, PULL_REQUEST_HANDED_OFF);
     },
   },
 
@@ -1382,7 +1405,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

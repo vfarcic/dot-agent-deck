@@ -1,4 +1,4 @@
-import { CircleAlert, CircleCheck, CircleDashed, Eye, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft } from "lucide-react";
+import { CircleAlert, CircleCheck, CircleDashed, CircleHelp, Eye, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft } from "lucide-react";
 import type { AgentPullRequest } from "../types";
 import type { PullRequestReview, PullRequestState } from "../lib/bridge";
 import { pullRequestLabel } from "../lib/pullRequest";
@@ -14,7 +14,9 @@ const PR_STATE_ICON: Record<PullRequestState, typeof GitPullRequest> = {
   draft: GitPullRequestDraft,
   merged: GitMerge,
   closed: GitPullRequestClosed,
-  unknown: GitPullRequest,
+  /* A question mark, as the TUI's `?`: a state the deck could not read is not
+     an open pull request, and showing the open icon said it was. */
+  unknown: CircleHelp,
 };
 
 const PR_REVIEW_ICON: Record<PullRequestReview, typeof GitPullRequest> = {

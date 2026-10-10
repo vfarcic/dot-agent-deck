@@ -39,7 +39,7 @@ export type PrBrowserBounds = { x: number; y: number; width: number; height: num
 
 export type PrBrowserScroll = "down" | "up" | "top" | "bottom";
 
-/** What Rust emits to the main webview when the page closed itself. */
+/** What Rust emits to the main webview when the page closed itself, with the generation of the open it closed. */
 export const PR_BROWSER_CLOSED_EVENT = "pr-browser://closed";
 
 /** The host inside the app: each call is one of `lib.rs`'s `desktop_pr_browser_*` commands. */
@@ -48,17 +48,21 @@ export function tauriPrBrowser(): PrBrowserHost {
      concurrently, and an open, a close and an open again (a pane re-mounted)
      must not land as open, open, close. */
   let queue: Promise<unknown> = Promise.resolve();
-  const call = (command: string, args?: Record<string, unknown>): Promise<void> => {
+  const call = <T = void>(command: string, args?: Record<string, unknown>): Promise<T> => {
     const next = queue.then(async () => {
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke(command, args);
+      return invoke<T>(command, args);
     });
     queue = next.catch(() => undefined);
     return next;
   };
+  /* The open the app is showing, as Rust numbers them: a close event names
+     the open it closed, and one about an earlier page — its close spawned
+     before this open replaced it — is not about the page on screen. */
+  let generation: number | undefined;
   return {
     available: true,
-    open: (url, bounds) => call("desktop_pr_browser_open", { url, bounds }),
+    open: async (url, bounds) => { generation = await call<number>("desktop_pr_browser_open", { url, bounds }); },
     setBounds: (bounds) => call("desktop_pr_browser_bounds", { bounds }),
     setVisible: (visible) => call("desktop_pr_browser_visible", { visible }),
     back: () => call("desktop_pr_browser_back"),
@@ -69,7 +73,7 @@ export function tauriPrBrowser(): PrBrowserHost {
     onClosed: (listener) => {
       let unlisten: (() => void) | undefined;
       let stopped = false;
-      void import("@tauri-apps/api/event").then(({ listen }) => listen(PR_BROWSER_CLOSED_EVENT, () => listener())).then((stop) => {
+      void import("@tauri-apps/api/event").then(({ listen }) => listen<number>(PR_BROWSER_CLOSED_EVENT, (event) => { if (event.payload === generation) listener(); })).then((stop) => {
         if (stopped) stop();
         else unlisten = stop;
       });

@@ -15,13 +15,26 @@ export type PullRequestBrowserSession = {
 };
 
 /**
+ * What counts as one of the app's dialogs: anything that says it is one. Every
+ * dialog the app draws is mounted only while it is open, so a dialog in the
+ * document is a dialog on screen.
+ *
+ * The role, not only `aria-modal`: the voice surface's "What you can say" list
+ * is a `role="dialog"` drawn over the whole screen and deliberately NOT
+ * `aria-modal` (it fences nothing, so it must not claim to — see its note in
+ * `VoiceControlPanel`). It covers the page all the same, and the page drawn
+ * over it would hide the list the user just asked for.
+ */
+const DIALOG_SELECTOR = "[role='dialog'], [role='alertdialog'], [aria-modal='true']";
+
+/**
  * The dialogs of the app's own that can come up over the browser. A native
  * webview is drawn above everything the main webview renders, so while one of
  * these is open the page is hidden rather than left covering it. The agent's
  * pane is excluded: the browser is opened over it.
  */
 function coveredByDialog(self: Element | null): boolean {
-  for (const modal of Array.from(document.querySelectorAll("[aria-modal='true']"))) {
+  for (const modal of Array.from(document.querySelectorAll(DIALOG_SELECTOR))) {
     if (modal === self || self?.contains(modal) || modal.contains(self)) continue;
     if (modal.classList.contains("agent-pane-overlay")) continue;
     return true;
@@ -36,7 +49,7 @@ function useCovered(ref: React.RefObject<HTMLElement | null>): boolean {
     const check = () => setCovered(coveredByDialog(ref.current));
     check();
     const observer = new MutationObserver(check);
-    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-modal"] });
+    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-modal", "role"] });
     return () => observer.disconnect();
   }, [ref]);
   return covered;
@@ -59,11 +72,18 @@ function useCovered(ref: React.RefObject<HTMLElement | null>): boolean {
  * document at all; the page's own script turns an unused Escape into a close
  * (`pr_browser::ESCAPE_SCRIPT`) and {@link PrBrowserHost.onClosed} reports it.
  */
-export function PullRequestBrowser({ session, host, zoom, onClose, onBack, onOpenExternal, onClosedByPage }: {
+export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBack, onOpenExternal, onClosedByPage }: {
   session: PullRequestBrowserSession;
   host: PrBrowserHost;
   /** The app's zoom level. Not a factor anything multiplies by (see `bounds`): a change of it moves the frame, which is reported again. */
   zoom: number;
+  /**
+   * Why the last thing asked of the page did not happen — Back, a spoken
+   * scroll, or the hand-off to the system browser — in the host's own words.
+   * Shown under the toolbar rather than in the frame, because the page is drawn
+   * over the frame and would hide it.
+   */
+  problem?: string;
   onClose: () => void;
   onBack: () => void;
   onOpenExternal: () => void;
@@ -171,6 +191,7 @@ export function PullRequestBrowser({ session, host, zoom, onClose, onBack, onOpe
             <button type="button" className="pr-browser-control" onClick={onClose} title="Close (Esc)" aria-label="Close pull request"><X size={14} aria-hidden="true" /><span>Close</span></button>
           </div>
         </header>
+        {problem && <p className="pr-browser-problem" role="alert" title={displayText(problem, DISPLAY_LIMITS.message)}>{displayText(problem, DISPLAY_LIMITS.message)}</p>}
         <div ref={frameRef} className="pr-browser-frame" data-testid="pr-browser-frame">
           {failure ? (
             <p className="pr-browser-notice" role="alert">{failure}</p>

@@ -845,12 +845,15 @@ describe("the pull request browser by voice (PRD #1401)", () => {
     expect(refused.reportRefused).toHaveBeenCalledWith("Coder has no pull request.");
   });
 
-  /** Scenario: "open it in the browser" hands the page off, or says no pull request is open. */
+  /** Scenario: "open it in the browser" hands the page off and reports it once it has happened, or says no pull request is open. */
   it("hands the open pull request to the system browser, or says none is open", async () => {
-    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
-    const handed = { ...base(), openPullRequestInBrowser: vi.fn(() => undefined) };
+    const { dispatchVoiceAction, PULL_REQUEST_HANDED_OFF, PULL_REQUEST_HANDING_OFF } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const work = Promise.resolve(undefined);
+    const handed = { ...base(), reportPending: vi.fn(), openPullRequestInBrowser: vi.fn(() => work) };
     expect(dispatchVoiceAction("openPullRequestInBrowser", handed, target)).toBe(true);
     expect(handed.openPullRequestInBrowser).toHaveBeenCalledTimes(1);
+    expect(handed.reportPending).toHaveBeenCalledWith(PULL_REQUEST_HANDING_OFF, work, PULL_REQUEST_HANDED_OFF);
+    expect(handed.reportRefused).not.toHaveBeenCalled();
 
     const none = { ...base(), openPullRequestInBrowser: vi.fn(() => "No pull request is open.") };
     dispatchVoiceAction("openPullRequestInBrowser", none, target);

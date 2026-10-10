@@ -114,10 +114,10 @@ The badge appears by itself: you do not link the pull request. An agent gets one
 
 1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.
 2. Read, comment and review on the page as you would on github.com.
-3. Use the toolbar above the page: **Back** goes back one page, **Open in browser** opens the page you are on in your system browser and closes it in the app, and **Close** closes it.
+3. Use the toolbar above the page: **Back** goes back one page, **Open in browser** opens the page you are on in your system browser and closes it in the app, and **Close** closes it. If your system browser does not open, or the page cannot go back, the page stays in the app and a message under the toolbar says why, so you can try again.
 4. Press `Escape` to close the page and return to where you were. When you are typing in the page or a menu or dialog of GitHub's is open, `Escape` closes that first, as it does on github.com.
 
-A link to a site other than GitHub opens in your system browser, and the page stays where it was. While one of the app's own dialogs is open, for example Settings, the page is hidden, and it comes back when the dialog closes.
+A link to a site other than GitHub opens in your system browser, and the page stays where it was. While one of the app's own dialogs is open, for example Settings or voice's "What you can say" list, the page is hidden, and it comes back when the dialog closes.
 
 ### Signing in to GitHub in the app
 

@@ -53,7 +53,7 @@
 //! default store, which is still persistent.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -88,7 +88,9 @@ pub const CLOSE_URL: &str = close_url!();
 const CLOSE_HOST: &str = "close.dot-agent-deck.invalid";
 
 /// Told to the main webview when the browser closed itself (the page's
-/// Escape), so the app returns to the screen under it.
+/// Escape, or a sign-out that failed), so the app returns to the screen under
+/// it. Carries the generation of the open it closed ([`open`]'s answer), so
+/// the app ignores one that is about a page it has since replaced.
 pub const CLOSED_EVENT: &str = "pr-browser://closed";
 
 /// The profile's directory under the app's data directory.
@@ -503,23 +505,82 @@ impl<R: Runtime> Effects for AppEffects<R> {
     fn close(&self) {
         // Never inside the hook: the webview is in the middle of deciding a
         // navigation, and destroying it there would pull it out from under
-        // its own callback.
+        // its own callback. Tagged with the session it was asked in, so it
+        // never closes one opened after it (`in_session`).
         let app = self.0.clone();
+        let generation = GENERATIONS.current();
         tauri::async_runtime::spawn(async move {
-            close_browser(&app);
-            let _ = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, ());
+            in_session(&SESSION, &GENERATIONS, generation, || {
+                close_browser(&app);
+                let _ = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, generation);
+            })
+            .await;
         });
     }
 
     fn navigate(&self, url: &Url) {
         let app = self.0.clone();
         let url = url.clone();
+        let generation = GENERATIONS.current();
         tauri::async_runtime::spawn(async move {
-            if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-                let _ = webview.navigate(url);
-            }
+            in_session(&SESSION, &GENERATIONS, generation, || {
+                if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
+                    let _ = webview.navigate(url);
+                }
+            })
+            .await;
         });
     }
+}
+
+/// Which open of the browser is current. Every [`open`] starts a new one —
+/// including one that reuses the open webview for another pull request — so
+/// a page effect asked for under one open can tell that it is now another's.
+#[derive(Debug)]
+pub struct Generations(AtomicU64);
+
+impl Generations {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// A new open has begun; its generation.
+    pub fn begin(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// The app's generations, advanced by [`open`] while it holds [`SESSION`].
+static GENERATIONS: Generations = Generations::new();
+
+/// Runs a page effect that was spawned outside the command queue — the
+/// Escape close, or a GitHub link loaded in place — only if the open that
+/// asked for it is still the current one. It takes [`SESSION`] first, so it
+/// cannot interleave with an [`open`] (which advances the generation under
+/// the same lock) or with a sign-out: an effect from an earlier open finds
+/// another generation and does nothing, rather than closing or navigating the
+/// page that replaced its own. Answers whether the effect ran.
+///
+/// What it decides from is the generation current when the page's hook
+/// fired, so it cannot tell an effect asked for by the old page in the
+/// moment between [`open`] advancing the generation and the new page loading
+/// in a reused webview.
+pub async fn in_session(
+    session: &tokio::sync::Mutex<()>,
+    generations: &Generations,
+    generation: u64,
+    effect: impl FnOnce(),
+) -> bool {
+    let _session = session.lock().await;
+    if generations.current() != generation {
+        return false;
+    }
+    effect();
+    true
 }
 
 /// A navigation hook's hand-off to the system browser, through [`HAND_OFF`].
@@ -544,13 +605,37 @@ fn hand_off(url: &Url) {
 
 /// Hands `url` to the operating system's default browser. Only `http(s)`
 /// ever reaches it — the callers classify first.
-fn open_in_system_browser(url: &Url) {
+fn system_browser(url: &Url) -> Result<(), String> {
     if !matches!(url.scheme(), "https" | "http") {
-        return;
+        return Err("The page on screen has no address the system browser can open.".into());
     }
-    if let Err(error) = open::that_detached(url.as_str()) {
+    open::that_detached(url.as_str())
+        .map_err(|error| format!("The system browser did not open: {error}"))
+}
+
+/// A navigation hook's launch: nobody is waiting on it, so a failure is logged.
+fn open_in_system_browser(url: &Url) {
+    if let Err(error) = system_browser(url) {
         eprintln!("dot-agent-deck-desktop: could not open the system browser: {error}");
     }
+}
+
+/// Open in browser, in order: the page must be a GitHub page on `https` —
+/// the address check [`open_external`] has always made — then `open` hands
+/// it to the system browser, and only once that has succeeded does `close`
+/// close the in-app page. A launch that failed answers its own error and
+/// leaves the page where it is, so the user still has it.
+pub fn handoff_page(
+    url: &Url,
+    open: impl FnOnce(&Url) -> Result<(), String>,
+    close: impl FnOnce(),
+) -> Result<(), String> {
+    if !matches!(classify(url), Navigation::Stay) || !matches!(url.scheme(), "https") {
+        return Err("The page on screen has no address the system browser can open.".into());
+    }
+    open(url)?;
+    close();
+    Ok(())
 }
 
 fn close_browser<R: Runtime>(app: &AppHandle<R>) {
@@ -606,22 +691,31 @@ fn builder<R: Runtime>(
         .data_store_identifier(profile.data_store_identifier)
 }
 
-/// Opens the browser on `url` over `bounds`, or moves an open one there.
+/// Opens the browser on `url` over `bounds`, or moves an open one there, and
+/// answers the open's generation — what [`CLOSED_EVENT`] carries, so the app
+/// can tell a close of this page from a late one of a page before it.
 /// Waits while a sign-out is clearing the profile, so a page never loads into
-/// a profile that is half deleted.
-pub async fn open<R: Runtime>(app: &AppHandle<R>, url: &str, bounds: Bounds) -> Result<(), String> {
+/// a profile that is half deleted, and is refused while a clear the platform
+/// never confirmed may still be running ([`admit_open`]).
+pub async fn open<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &str,
+    bounds: Bounds,
+) -> Result<u64, String> {
     let bounds = bounds.checked()?;
     let url = Url::parse(url).map_err(|_| "That pull request address is not a URL.".to_string())?;
     if !is_pull_request_url(&url) {
         return Err("Only a pull request on github.com opens in the app.".into());
     }
     let _session = SESSION.lock().await;
+    admit_open(&CLEARING)?;
+    let generation = GENERATIONS.begin();
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
         webview.navigate(url).map_err(|error| error.to_string())?;
         place(&webview, bounds)?;
         let _ = webview.show();
         let _ = webview.set_focus();
-        return Ok(());
+        return Ok(generation);
     }
     let window = app
         .get_window(MAIN_WEBVIEW_LABEL)
@@ -638,8 +732,23 @@ pub async fn open<R: Runtime>(app: &AppHandle<R>, url: &str, bounds: Bounds) -> 
     #[cfg(target_os = "linux")]
     overlay::attach(&webview, bounds)?;
     let _ = webview.set_focus();
+    Ok(generation)
+}
+
+/// Whether a pull request may open now. Not while `clearing` is raised: that
+/// is a sign-out still running — which [`open`] has already waited out by
+/// taking the session — or one whose clear the platform never confirmed and
+/// may still be deleting the profile ([`sign_out_with`]).
+pub fn admit_open(clearing: &AtomicBool) -> Result<(), String> {
+    if clearing.load(Ordering::SeqCst) {
+        return Err(STILL_CLEARING.into());
+    }
     Ok(())
 }
+
+/// Why a pull request cannot open, or the sign-in be cleared again, while an
+/// unconfirmed clear may still be running.
+const STILL_CLEARING: &str = "The app is still clearing your GitHub sign-in, and the system has not said it has finished. Try again in a moment; if this keeps happening, restart the app.";
 
 fn place<R: Runtime>(webview: &tauri::Webview<R>, bounds: Bounds) -> Result<(), String> {
     #[cfg(target_os = "linux")]
@@ -708,16 +817,12 @@ pub fn scroll<R: Runtime>(app: &AppHandle<R>, scroll: Scroll) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
-/// Open in browser: the page on screen in the system browser, then close.
+/// Open in browser: the page on screen in the system browser, then close —
+/// in that order and only on success ([`handoff_page`]).
 pub fn open_external<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let webview = open_webview(app)?;
     let url = webview.url().map_err(|error| error.to_string())?;
-    if !matches!(classify(&url), Navigation::Stay) || !matches!(url.scheme(), "https") {
-        return Err("The page on screen has no address the system browser can open.".into());
-    }
-    open_in_system_browser(&url);
-    close_browser(app);
-    Ok(())
+    handoff_page(&url, system_browser, || close_browser(app))
 }
 
 /// The toolbar's Close, `Escape` in the app, and voice's "close".
@@ -814,19 +919,66 @@ pub struct SignOutTimeouts {
     pub clear: Duration,
 }
 
-/// Lowers [`CLEARING`] however sign-out ends.
-struct Raised<'a>(&'a AtomicBool);
+/// Lowers [`CLEARING`] however sign-out ends — at once, or, for a clear the
+/// platform has not confirmed, when it does ([`Raised::lower_when`]).
+struct Raised(&'static AtomicBool);
 
-impl<'a> Raised<'a> {
-    fn raise(flag: &'a AtomicBool) -> Self {
+impl Raised {
+    fn raise(flag: &'static AtomicBool) -> Self {
         flag.store(true, Ordering::SeqCst);
         Self(flag)
     }
+
+    /// Keep the flag raised until the platform answers `answer` — the delete
+    /// may still be running after sign-out gave up waiting on it, and a page
+    /// opened meanwhile would load into a profile being deleted under it. A
+    /// platform that drops its callback without answering ends the wait too:
+    /// nothing will run it now.
+    fn lower_when(self, answer: Answer) {
+        let flag = self.0;
+        std::mem::forget(self);
+        tokio::spawn(async move {
+            let _ = answer.await;
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Lower the flag as `clear` says: now for an answered one, later for
+    /// one still unconfirmed, which is a failure either way.
+    fn settle(self, clear: Clear) -> Result<(), String> {
+        match clear {
+            Clear::Answered(result) => {
+                drop(self);
+                result
+            }
+            Clear::Unconfirmed(answer) => {
+                self.lower_when(answer);
+                Err(CLEAR_UNCONFIRMED.into())
+            }
+        }
+    }
 }
 
-impl Drop for Raised<'_> {
+impl Drop for Raised {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// What became of a clear the platform was asked for.
+enum Clear {
+    /// The platform answered, in time, or dropped its callback (no answer).
+    Answered(Result<(), String>),
+    /// No answer in time; the delete may still be running.
+    Unconfirmed(Answer),
+}
+
+/// `answer` to a clear within `limit`, keeping it when it is late.
+async fn clear_within(mut answer: Answer, limit: Duration) -> Clear {
+    match tokio::time::timeout(limit, &mut answer).await {
+        Ok(Ok(result)) => Clear::Answered(result),
+        Ok(Err(_)) => Clear::Answered(Err("the system gave no answer.".into())),
+        Err(_) => Clear::Unconfirmed(answer),
     }
 }
 
@@ -851,13 +1003,18 @@ async fn awaited(answer: Answer, limit: Duration, late: &str) -> Result<(), Stri
 ///    page put back (signed out) or the hidden webview closed. A delete the
 ///    platform reports as failed, or does not confirm in time, is an error,
 ///    and the open browser is closed rather than reloaded.
+/// 4. A delete not confirmed in time leaves `clearing` raised until the
+///    platform does answer, since it may still be running: until then no pull
+///    request opens ([`admit_open`]) and a second sign-out is refused, each
+///    saying why, rather than either touching a profile being deleted.
 pub async fn sign_out_with(
     host: &impl SignOutHost,
     session: &tokio::sync::Mutex<()>,
-    clearing: &AtomicBool,
+    clearing: &'static AtomicBool,
     timeouts: SignOutTimeouts,
 ) -> Result<(), String> {
     let _session = session.lock().await;
+    admit_open(clearing)?;
     let raised = Raised::raise(clearing);
     match host.browser() {
         Browser::Open { resume } => {
@@ -868,18 +1025,10 @@ pub async fn sign_out_with(
             )
             .await
             {
-                Ok(()) => {
-                    awaited(
-                        host.clear(ClearWith::Browser),
-                        timeouts.clear,
-                        CLEAR_UNCONFIRMED,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
+                Ok(()) => clear_within(host.clear(ClearWith::Browser), timeouts.clear).await,
+                Err(error) => Clear::Answered(Err(error)),
             };
-            drop(raised);
-            match cleared {
+            match raised.settle(cleared) {
                 Ok(()) => {
                     if let Some(url) = resume {
                         host.resume(url);
@@ -894,12 +1043,8 @@ pub async fn sign_out_with(
         }
         Browser::Closed => {
             host.open_scratch()?;
-            let cleared = awaited(
-                host.clear(ClearWith::Scratch),
-                timeouts.clear,
-                CLEAR_UNCONFIRMED,
-            )
-            .await;
+            let cleared = clear_within(host.clear(ClearWith::Scratch), timeouts.clear).await;
+            let cleared = raised.settle(cleared);
             host.close_scratch();
             cleared
         }
@@ -1047,7 +1192,9 @@ impl<R: Runtime> SignOutHost for AppSignOut<R> {
 
     fn close_browser(&self) {
         close_browser(&self.app);
-        let _ = self.app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, ());
+        let _ = self
+            .app
+            .emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, GENERATIONS.current());
     }
 }
 
@@ -2169,9 +2316,14 @@ mod tests {
         let midway = host.log();
         let session_free = session.try_lock().is_ok();
         let result = running.await.expect("sign-out ran");
-        assert!(
-            !host.clearing.load(Ordering::SeqCst),
-            "the flag stayed raised"
+        // Raised afterwards exactly when the platform never confirmed a clear
+        // it was asked for — it may still be deleting (`Raised::lower_when`).
+        let unconfirmed =
+            result == Err(CLEAR_UNCONFIRMED.into()) && matches!(host.clear, FakeAnswer::Never);
+        assert_eq!(
+            host.clearing.load(Ordering::SeqCst),
+            unconfirmed,
+            "the flag is raised after sign-out only while a clear is unconfirmed"
         );
         assert!(session.try_lock().is_ok(), "the session stayed held");
         (midway, session_free, result, host.log())
@@ -2301,5 +2453,145 @@ mod tests {
             Err("the pull request page did not close in time.".into())
         );
         assert_eq!(log, ["leave", "browser:close"]);
+    }
+
+    /// Scenario: the platform confirms nothing within the timeout, then
+    /// finishes the delete later. Until it does, a pull request is refused
+    /// with a message saying why, and so is a second sign-out; once the late
+    /// completion arrives, both may run again.
+    #[tokio::test(start_paused = true)]
+    async fn open_is_refused_after_an_unconfirmed_clear_until_the_late_completion() {
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::After(Duration::ZERO, Ok(())),
+            FakeAnswer::Never,
+        ));
+        let session: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
+        let result = sign_out_with(&*host, session, host.clearing, TIMEOUTS).await;
+        assert_eq!(result, Err(CLEAR_UNCONFIRMED.into()));
+        assert!(session.try_lock().is_ok(), "the session stayed held");
+        assert_eq!(admit_open(host.clearing), Err(STILL_CLEARING.into()));
+        assert_eq!(
+            sign_out_with(&*host, session, host.clearing, TIMEOUTS).await,
+            Err(STILL_CLEARING.into()),
+            "a second clear started over one still running"
+        );
+
+        let late = host.kept.lock().unwrap().remove(0);
+        // Long after the timeout: the platform's own completion.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(admit_open(host.clearing), Err(STILL_CLEARING.into()));
+        late.send(Ok(())).unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admit_open(host.clearing), Ok(()));
+    }
+
+    /// Scenario: the user presses Open in browser and the system browser
+    /// refuses to start. The launch's own error comes back and the in-app
+    /// page is not closed; a launch that works closes it, after.
+    #[test]
+    fn a_failed_hand_off_keeps_the_page_and_a_working_one_closes_it_after() {
+        let page = url("https://github.com/o/r/pull/7/files");
+        let steps = RefCell::new(Vec::new());
+        let result = handoff_page(
+            &page,
+            |opened| {
+                steps.borrow_mut().push(format!("open:{opened}"));
+                Err("no browser".to_string())
+            },
+            || steps.borrow_mut().push("close".into()),
+        );
+        assert_eq!(result, Err("no browser".into()));
+        assert_eq!(*steps.borrow(), [format!("open:{page}")]);
+
+        steps.borrow_mut().clear();
+        let result = handoff_page(
+            &page,
+            |opened| {
+                steps.borrow_mut().push(format!("open:{opened}"));
+                Ok(())
+            },
+            || steps.borrow_mut().push("close".into()),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*steps.borrow(), [format!("open:{page}"), "close".into()]);
+    }
+
+    /// The address check stays on the hand-off: a page that is not GitHub's
+    /// on `https` is neither handed to the system browser nor closed.
+    #[test]
+    fn the_hand_off_refuses_an_address_off_github() {
+        for refused in [
+            "https://example.com/",
+            "http://github.com/o/r/pull/7",
+            "about:blank",
+        ] {
+            let steps = RefCell::new(Vec::new());
+            let result = handoff_page(
+                &url(refused),
+                |_| {
+                    steps.borrow_mut().push("open");
+                    Ok(())
+                },
+                || steps.borrow_mut().push("close"),
+            );
+            assert!(result.is_err(), "{refused}");
+            assert!(steps.borrow().is_empty(), "{refused}");
+        }
+    }
+
+    /// Scenario: the page's Escape asks for a close, and before the spawned
+    /// close runs the app opens another pull request. The stale close does
+    /// nothing to the new page; a close asked under the new one closes it.
+    #[tokio::test]
+    async fn a_close_from_an_earlier_open_does_not_close_the_new_one() {
+        let session = tokio::sync::Mutex::const_new(());
+        let generations = Generations::new();
+        let closed = RefCell::new(Vec::new());
+
+        let first = generations.begin();
+        let asked_under_first = generations.current();
+        let second = generations.begin();
+        assert_ne!(first, second);
+
+        let ran = in_session(&session, &generations, asked_under_first, || {
+            closed.borrow_mut().push(asked_under_first)
+        })
+        .await;
+        assert!(!ran);
+        assert!(
+            closed.borrow().is_empty(),
+            "a stale close closed the new page"
+        );
+
+        let ran = in_session(&session, &generations, generations.current(), || {
+            closed.borrow_mut().push(second)
+        })
+        .await;
+        assert!(ran);
+        assert_eq!(*closed.borrow(), [second]);
+    }
+
+    /// A page effect waits for an open in progress, and then sees its
+    /// generation: it cannot slip in between the open's check and its page.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_effect_waits_for_an_open_that_holds_the_session() {
+        let session: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
+        let generations: &'static Generations = Box::leak(Box::new(Generations::new()));
+        let first = generations.begin();
+        let opening = session.lock().await;
+        let effect =
+            tokio::spawn(async move { in_session(session, generations, first, || {}).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        generations.begin();
+        drop(opening);
+        assert!(
+            !effect.await.unwrap(),
+            "the effect ran against the newer open"
+        );
     }
 }

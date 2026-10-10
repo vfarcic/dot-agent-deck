@@ -6086,13 +6086,14 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
 
 /// PRD #1401 — open the in-app pull request browser on `url` over `bounds`
 /// (the agent screen's frame, in the window's logical pixels), or move the open
-/// one there. Only a github.com pull request URL is accepted.
+/// one there. Only a github.com pull request URL is accepted. Answers the
+/// open's generation, which the closed event carries.
 #[tauri::command]
 async fn desktop_pr_browser_open(
     webview: Webview,
     url: String,
     bounds: pr_browser::Bounds,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     ensure_main_webview(&webview)?;
     pr_browser::open(webview.app_handle(), &url, bounds).await
 }

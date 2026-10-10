@@ -19,7 +19,11 @@
  * `OutputReader`, `ConfigurationPanels`'s four sheets and `App`'s command
  * palette and shortcut guide each declare `aria-modal="true"` over the same
  * mounted background and each call nothing here, so the claim is as untrue for
- * them as it was for the pane. They are left alone deliberately — the two
+ * them as it was for the pane. PRD #1401's pull request browser is the third
+ * caller, and the first that opens over another: it comes up over a
+ * still-mounted pane, so only the topmost open caller fences (see `stack`
+ * below) and the pane beneath it is background like the rest. They are left
+ * alone deliberately — the two
  * surfaces wired up are the ones whose PRDs came with the audit that found
  * this — rather than because they are exempt. `VoiceControlPanel` is the one
  * that is exempt: it omits `aria-modal` on purpose (see its own note), so it
@@ -139,10 +143,80 @@ export const VOICE_PEER_PROPS = { "data-modal-peer": "voice" } as const;
 /** The same marker, as the selector the walk tests each sibling against. */
 const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-peer"]}"]`;
 
+/**
+ * One open fenced overlay: whatever this hook was given to fence, once it has
+ * rendered. The node is refreshed on every commit, so an overlay whose root
+ * element was replaced is fenced by its new one.
+ */
+type Fenced = { node: HTMLElement | null };
+
+/**
+ * PRD #1401 — every open fenced overlay, in the order it opened. The LAST one
+ * is the topmost and the only one that fences; the ones beneath it are
+ * background to it like anything else.
+ *
+ * **Why one owner rather than one walk per overlay.** The in-app pull request
+ * browser opens over a still-mounted agent pane, and both call this hook. With
+ * a walk each, each marked the other: the pane's walk reached the browser as
+ * one of its siblings and the browser's reached the pane, so the frontmost
+ * toolbar was as inert as the pane under it and neither could be used. A
+ * per-overlay exemption ("skip other dialogs") would have been the broad hole
+ * the audit closed — so the walk is done once, for the topmost overlay, and
+ * the marks are held here rather than per instance, so no overlay's cleanup
+ * can unmark what the topmost one still needs marked.
+ *
+ * Open order rather than DOM order: an overlay that opens is what the user
+ * just asked for, and the one place two are open together (the browser over
+ * the pane) opens the later one over the earlier. Closing the topmost hands the
+ * fence back to the one beneath it on the same commit.
+ */
+const stack: Fenced[] = [];
+/** The elements the fence marked, and only those, so an element inert for some other reason keeps its own state. */
+let marked = new Set<Element>();
+
+/** The topmost open overlay that has a node in the document. */
+function topmost(): Fenced | undefined {
+  for (let index = stack.length - 1; index >= 0; index -= 1) {
+    if (stack[index].node?.isConnected) return stack[index];
+  }
+  return undefined;
+}
+
+/**
+ * Mark everything that is not the topmost overlay or on its path to `<body>`,
+ * and unmark what the previous pass marked and this one does not. Idempotent:
+ * every open overlay calls it on every one of its commits.
+ */
+function fence() {
+  const next = new Set<Element>();
+  const node = topmost()?.node;
+  if (node) {
+    let child: Element = node;
+    let parent = child.parentElement;
+    while (parent) {
+      for (const sibling of Array.from(parent.children)) {
+        if (sibling === child) continue;
+        // The one exemption, and the only one. See the note above.
+        if (sibling.matches(VOICE_PEER_SELECTOR)) continue;
+        // Inert for a reason of its own, which is not ours to undo later.
+        if (sibling.hasAttribute("inert") && !marked.has(sibling)) continue;
+        next.add(sibling);
+      }
+      if (parent === document.body) break;
+      child = parent;
+      parent = parent.parentElement;
+    }
+  }
+  for (const element of marked) if (!next.has(element)) element.removeAttribute("inert");
+  for (const element of next) if (!element.hasAttribute("inert")) element.setAttribute("inert", "");
+  marked = next;
+}
+
 export function useInertBackground<T extends HTMLElement>(open: boolean) {
   const ref = useRef<T>(null);
   /** What had focus when this opened, so that closing can give it back. */
   const opener = useRef<Element | null>(null);
+  const entry = useRef<Fenced>({ node: null });
 
   /**
    * Captured FIRST — before the walk below, on the same commit, moves focus
@@ -153,26 +227,31 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
     if (open) opener.current = document.activeElement;
   }, [open]);
 
+  /**
+   * Onto the stack when it opens, off it when it closes — and the fence
+   * re-drawn for whatever is then on top. Declared before the walk, so that
+   * an overlay is on the stack by the time its first walk asks who is topmost,
+   * and before the focus restore, whose cleanup needs the overlay beneath
+   * (where the opener usually is) already live again.
+   */
+  useEffect(() => {
+    if (!open) return;
+    const mine = entry.current;
+    stack.push(mine);
+    return () => {
+      const index = stack.indexOf(mine);
+      if (index >= 0) stack.splice(index, 1);
+      mine.node = null;
+      fence();
+    };
+  }, [open]);
+
   useEffect(() => {
     const node = ref.current;
     if (!open || !node) return;
-
-    const marked: Element[] = [];
-    let child: Element = node;
-    let parent = child.parentElement;
-    while (parent) {
-      for (const sibling of Array.from(parent.children)) {
-        if (sibling === child) continue;
-        // The one exemption, and the only one. See the note above.
-        if (sibling.matches(VOICE_PEER_SELECTOR)) continue;
-        if (sibling.hasAttribute("inert")) continue;
-        sibling.setAttribute("inert", "");
-        marked.push(sibling);
-      }
-      if (parent === document.body) break;
-      child = parent;
-      parent = parent.parentElement;
-    }
+    entry.current.node = node;
+    fence();
+    if (topmost() !== entry.current) return;
 
     // Focus containment's other half. `inert` removes the background from the
     // tab order, but a control that ALREADY had focus when the pane opened —
@@ -180,17 +259,14 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
     // a background element in the sibling-pane layout — is merely blurred by
     // it, leaving focus on `<body>` and the first Tab landing wherever the
     // document happens to start. Moving it into the pane is what makes the
-    // dialog behave like one.
+    // dialog behave like one. Only the topmost overlay does it: one beneath
+    // must not take focus from the one the user is looking at.
     //
     // Focus on a voice peer is left where it is: the numbered choice's dialog
     // takes focus while it is open (PRD #1261), and this walk runs on every
     // commit, so pulling focus back here would take it from the dialog mid-answer.
     const active = document.activeElement;
     if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR)) node.focus();
-
-    return () => {
-      for (const element of marked) element.removeAttribute("inert");
-    };
   });
 
   /**

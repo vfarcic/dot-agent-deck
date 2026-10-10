@@ -629,6 +629,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const prBrowserHost = useContext(PrBrowserHostContext);
   const [prBrowser, setPrBrowser] = useState<(PullRequestBrowserSession & { over: DeckView }) | undefined>(undefined);
   prBrowserOpen.current = prBrowser !== undefined;
+  /* What the open page last failed to do, held against the session it failed
+     in so a new page never inherits an old failure. Cleared by the next thing
+     asked of it. */
+  // voice-registry-exempt: a report of what the page did not do, written by the entries that asked it, and not something anybody opens
+  const [prBrowserProblem, setPrBrowserProblem] = useState<{ session: PullRequestBrowserSession; text: string }>();
+  /** Run one thing on the open page, and show why if it did not happen. Settles to that sentence, or `undefined`. */
+  const onPrBrowserPage = useCallback((session: PullRequestBrowserSession, work: Promise<void>): Promise<string | undefined> => {
+    setPrBrowserProblem(undefined);
+    return work.then(() => undefined, (cause: unknown) => {
+      const text = cause instanceof Error ? cause.message : String(cause);
+      setPrBrowserProblem({ session, text });
+      return text;
+    });
+  }, []);
   const pullRequestContext = useMemo<PullRequestContext>(() => ({
     openPullRequest: (target) => {
       const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
@@ -641,15 +655,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       setPrBrowser({ deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view });
       return undefined;
     },
+    /* Closed only once the system browser has the page: a hand-off that
+       failed leaves it here, with the reason under the toolbar, so the user
+       still has it and can try again. */
     openPullRequestInBrowser: () => {
       if (!prBrowser) return PULL_REQUEST_NONE_OPEN;
-      void prBrowserHost.openExternal().catch(() => undefined);
-      setPrBrowser(undefined);
-      return undefined;
+      const session = prBrowser;
+      return onPrBrowserPage(session, prBrowserHost.openExternal()).then((failed) => {
+        if (failed === undefined) setPrBrowser((open) => (open === session ? undefined : open));
+        return failed;
+      });
     },
     closePullRequest: () => setPrBrowser(undefined),
-    pullRequestBack: () => { void prBrowserHost.back().catch(() => undefined); },
-  }), [prBrowser, prBrowserHost, runtime.fleet, view]);
+    pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser, prBrowserHost.back()); },
+  }), [onPrBrowserPage, prBrowser, prBrowserHost, runtime.fleet, view]);
   const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
   const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
   /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
@@ -958,7 +977,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
-          void prBrowserHost.scroll(move).catch(() => undefined);
+          void onPrBrowserPage(prBrowser, prBrowserHost.scroll(move));
           return undefined;
         } }
         : overviewVoiceContext.current?.scrollDashboard
@@ -1007,7 +1026,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1143,6 +1162,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
             session={prBrowser}
             host={prBrowserHost}
             zoom={zoom.level}
+            problem={prBrowserProblem?.session === prBrowser ? prBrowserProblem.text : undefined}
             onClose={() => VOICE_ACTIONS.closePullRequest.run(pullRequestContext)}
             onBack={() => VOICE_ACTIONS.pullRequestBack.run(pullRequestContext)}
             onOpenExternal={() => VOICE_ACTIONS.openPullRequestInBrowser.run(pullRequestContext)}
