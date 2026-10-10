@@ -18,7 +18,11 @@
 //!   again from the same old build and Relaunch stays reachable until the app
 //!   restarts;
 //! - one upgrade at a time, run on a blocking thread because it waits on
-//!   subprocesses (`brew`, `pkexec`, `hdiutil`) for as long as they take;
+//!   subprocesses (`brew`, `pkexec`, `hdiutil`) for as long as they take,
+//!   with the slot claimed before the plan is validated and held until the
+//!   result is published;
+//! - the copies whose privileged install did not finish and may still be
+//!   running as root, which are not started again until the app restarts;
 //! - the relaunch, offered only once the app bundle was actually replaced;
 //! - the camelCase DTOs the webview renders.
 //!
@@ -166,6 +170,9 @@ struct Inner {
     running: AtomicBool,
     /// The app's own copy, once an upgrade installed it.
     installed: Mutex<Option<Installed>>,
+    /// The copies whose upgrade did not finish and may still be running as
+    /// root ([`SelfUpgradeState::mark_unfinished`]).
+    unfinished: Mutex<Vec<SelfCopy>>,
     /// Run by [`SelfUpgradeState::claim`] once the plan is validated, so a
     /// test can complete another upgrade at exactly that moment.
     #[cfg(test)]
@@ -213,6 +220,9 @@ pub(crate) const NOTHING_TO_RELAUNCH: &str =
     "Agent Deck was not replaced, so there is nothing new to relaunch into.";
 /// What it reads when the check its dialog shows is no longer kept.
 pub(crate) const PLAN_GONE: &str = "The upgrade plan this dialog shows is no longer current, so nothing was changed. Close the dialog and open it again to see the current plan.";
+/// What it reads, and what that copy's plan says, after an upgrade of the
+/// copy did not finish and may still be running.
+pub(crate) const INSTALL_MAY_BE_RUNNING: &str = "An earlier upgrade of this copy did not finish and may still be running, so it is not started again. Check which version is installed, and restart Agent Deck to upgrade it again.";
 /// What it reads when it asks to upgrade the app again before relaunching.
 pub(crate) const APP_ALREADY_INSTALLED: &str =
     "Agent Deck was already upgraded. Relaunch it to run the new version.";
@@ -252,6 +262,9 @@ impl SelfUpgradeState {
     pub(crate) fn plan_for(&self, copy: SelfCopy, check_id: u64) -> Result<UpgradePlan, String> {
         if copy == SelfCopy::App && self.installed().is_some() {
             return Err(APP_ALREADY_INSTALLED.to_string());
+        }
+        if self.is_unfinished(copy) {
+            return Err(INSTALL_MAY_BE_RUNNING.to_string());
         }
         let checks = lock(&self.inner.checks);
         if checks.is_empty() {
@@ -313,6 +326,45 @@ impl SelfUpgradeState {
                 notice: safe_message(notice),
             });
         }
+    }
+
+    /// Remember that an upgrade of `copy` failed with `error`, when that is
+    /// an install that may still be running as root
+    /// ([`UpgradeError::InstallUnfinished`]). Until the app restarts, the
+    /// copy is not started again — a second install would race the first —
+    /// and its plan says so. This app cannot tell when that install ends: it
+    /// runs as root, and the core only reaps it.
+    pub(crate) fn mark_unfinished(&self, copy: SelfCopy, error: &UpgradeError) {
+        if let UpgradeError::InstallUnfinished(unfinished) = error
+            && unfinished.may_still_be_running
+        {
+            let mut copies = lock(&self.inner.unfinished);
+            if !copies.contains(&copy) {
+                copies.push(copy);
+            }
+        }
+    }
+
+    fn is_unfinished(&self, copy: SelfCopy) -> bool {
+        lock(&self.inner.unfinished).contains(&copy)
+    }
+
+    /// Check `check_id`'s plans for the webview, as this app's state leaves
+    /// them: [`check_dto`], and a copy whose upgrade may still be running is
+    /// not offered, its plan ending with why.
+    pub(crate) fn answer(&self, check_id: u64, checked: &Checked) -> CheckDto {
+        let mut dto = check_dto(check_id, checked, self.installed().as_ref());
+        for plan in std::iter::once(&mut dto.app).chain(dto.cli.as_mut()) {
+            if self.is_unfinished(plan.copy) {
+                plan.actionable = false;
+                plan.confirm_question = None;
+                plan.lines.push(LineDto {
+                    text: INSTALL_MAY_BE_RUNNING.to_string(),
+                    command: None,
+                });
+            }
+        }
+        dto
     }
 
     pub(crate) fn installed(&self) -> Option<Installed> {
@@ -490,10 +542,12 @@ pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
 }
 
 /// A failed upgrade for the webview: the error, then what the core says to do
-/// instead. When the failure was the privilege prompt itself — dismissed,
-/// refused, or `pkexec` failing — the verified file is still staged, and the
-/// core hands over the exact command that installs it
-/// ([`UpgradeError::fallback`]).
+/// instead ([`UpgradeError::fallback`]). When the failure was the privilege
+/// prompt itself — dismissed, refused, or `pkexec` not running — the verified
+/// file is still staged, and the core hands over the exact command that
+/// installs it. When the install started and did not complete, the core says
+/// what it found at the target and offers that command only when the target
+/// is known not to be the new version.
 pub(crate) fn failure_dto(copy: SelfCopy, error: &UpgradeError) -> RunDto {
     let mut lines = vec![PlanLine::Text(error.to_string())];
     lines.extend(error.fallback());
@@ -548,11 +602,7 @@ pub(crate) async fn desktop_self_upgrade_check(
     })
     .await
     .map_err(|e| safe_message(e.to_string()))?;
-    Ok(check_dto(
-        check_id,
-        &checked,
-        installed_state.installed().as_ref(),
-    ))
+    Ok(installed_state.answer(check_id, &checked))
 }
 
 /// Carry out the plan for `copy` that check `check_id` found — the check the
@@ -592,7 +642,10 @@ pub(crate) async fn desktop_self_upgrade_run(
             state.mark_installed(copy, &outcome, &dto);
             dto
         }
-        Err(error) => failure_dto(copy, &error),
+        Err(error) => {
+            state.mark_unfinished(copy, &error);
+            failure_dto(copy, &error)
+        }
     })
 }
 
@@ -1670,5 +1723,57 @@ mod tests {
         }
         // A refused claim never keeps the slot.
         assert!(state.begin().is_ok());
+    }
+
+    fn unfinished(may_still_be_running: bool) -> UpgradeError {
+        UpgradeError::InstallUnfinished(Box::new(
+            dot_agent_deck::self_upgrade::UnfinishedInstall {
+                command: "/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb".into(),
+                detail: "it did not finish within 15 minutes and could not be stopped, so it may still be running".into(),
+                may_still_be_running,
+                target: dot_agent_deck::self_upgrade::InstallTarget::Package,
+                found: dot_agent_deck::self_upgrade::Found::NotChecked,
+                install: None,
+                version: LATEST.into(),
+            },
+        ))
+    }
+
+    /// Scenario: the app's privileged install outlives its bound and cannot
+    /// be stopped, so it may still be running as root. The result says to
+    /// wait and check, offering no install command, and until the app
+    /// restarts the same copy is not offered or started again; the CLI
+    /// beside it still is. An install that was stopped blocks nothing.
+    #[test]
+    fn self_upgrade_033_an_install_that_may_still_be_running_is_not_started_again() {
+        let state = SelfUpgradeState::default();
+        let id = state.next_check_id();
+        let checked = state.store(id, checked_against(LATEST)).1;
+        let error = unfinished(true);
+        let dto = failure_dto(SelfCopy::App, &error);
+        assert!(!dto.ok && !dto.relaunch);
+        assert!(
+            commands(&dto.lines).iter().all(|c| !c.contains("apt")),
+            "{dto:?}"
+        );
+        assert_eq!(commands(&dto.lines), vec!["dpkg -s agent-deck"]);
+        state.mark_unfinished(SelfCopy::App, &error);
+
+        assert_eq!(
+            state.claim(SelfCopy::App, id).err().as_deref(),
+            Some(INSTALL_MAY_BE_RUNNING)
+        );
+        assert!(state.claim(SelfCopy::Cli, id).is_ok());
+        let answer = state.answer(id, &checked);
+        assert!(!answer.app.actionable);
+        assert_eq!(answer.app.confirm_question, None);
+        assert_eq!(
+            answer.app.lines.last().map(|line| line.text.as_str()),
+            Some(INSTALL_MAY_BE_RUNNING)
+        );
+        assert!(answer.cli.as_ref().is_some_and(|cli| cli.actionable));
+
+        state.mark_unfinished(SelfCopy::Cli, &unfinished(false));
+        assert!(state.claim(SelfCopy::Cli, id).is_ok());
     }
 }
