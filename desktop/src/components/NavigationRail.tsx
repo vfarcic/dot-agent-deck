@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { BookMarked, Bot, FolderGit2, Keyboard, LayoutList, Network, Settings2, SquareTerminal } from "lucide-react";
 import type { ConnectionView, DesktopFeatures } from "../types";
 import type { RailScreen, ShellOverlayState } from "../hooks/useShellOverlays";
@@ -33,7 +34,7 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * else here reads the flag: the entries that remain dispatch exactly as they
  * did.
  */
-export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void }) {
+export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts, update }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void; /** Issue #1635: the newer-release notice, which renders nothing while there is none. */ update?: ReactNode }) {
   const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.orchestration || overlays.settings);
   /* Daemons is what the deck's rail used to call Runs: on the deck it clears the
      overlays, as Runs always did, and from the overview it goes to the deck. */
@@ -53,6 +54,7 @@ export function NavigationRail({ screen, overlays, context, connection, features
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />
       </nav>
       <div className="rail-bottom">
+        {update}
         {/* The sheet lists the deck's shortcuts, so it is offered where they work. */}
         {onShowShortcuts && <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={onShowShortcuts}><Keyboard size={18} /></button>}
         {/* PRD #741 final audit F5: `connection.message` is daemon-supplied —

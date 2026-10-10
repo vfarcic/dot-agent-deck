@@ -1,0 +1,35 @@
+---
+source: tests/render_upgrade_dialog.rs
+expression: text
+---
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                                                  │  
+  │ dot-agent-deck: update available: v0.47.0 (current: v0.46.0)                                                     │  
+  │ Downloaded binary at /home/u/.local/bin/dot-agent-deck. Upgrading downloads `dot-agent-deck-linux-amd64` from    │  
+  │ release v0.47.0, checks it, and replaces /home/u/.local/bin/dot-agent-deck.                                      │  
+  │ Its checksum is checked against the release's checksum file. Build provenance will NOT be checked: the GitHub    │  
+  │ CLI (`gh`) is not installed.                                                                                     │  
+  │                                                                                                                  │  
+  │ Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)                                           │  
+  │ Installed from the Agent Deck `.deb` (package `agent-deck`).                                                     │  
+  │ Upgrading downloads `dot-agent-deck-desktop-alpha-linux-amd64.deb` from release v0.47.0 and checks it. The       │  
+  │ command to install it, which checks the checksum again before `sudo`, is shown once the download is verified.    │  
+  │ Its checksum is checked against the release's checksum file. Build provenance will NOT be checked: the GitHub    │  
+  │ CLI (`gh`) is not installed.                                                                                     │  
+  │                                                                                                                  │  
+  │ Upgrade dot-agent-deck to v0.47.0?                                                                               │  
+  │                                                                                                                  │  
+  │ > Cancel   — close, changing nothing                                                                             │  
+  │   Upgrade  — upgrade it now                                                                                      │  
+  │                                                                                                                  │  
+  │ ↑/↓ choose · Enter confirms · Esc closes                                                                         │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

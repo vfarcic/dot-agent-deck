@@ -43,6 +43,11 @@ import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
+import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
+import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
+import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
+import { fixtureSelfUpgradeApi } from "./data/fixture";
+import { useSelfUpgradeCheck } from "./hooks/useSelfUpgradeCheck";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
@@ -231,6 +236,24 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const features = desktopFeaturesOf(runtime);
   const view = useMemo(() => (features.showDeck ? requestedView : overviewInsteadOfDeck(requestedView)), [features.showDeck, requestedView]);
+  /**
+   * Issue #1635 — a newer release of this app (or of the CLI beside it): asked
+   * at start and every `UPDATE_RECHECK_INTERVAL`, shown in the rail on every
+   * screen and as a dismissible banner on the dashboard, both opening one
+   * dialog. Here because the notice is the app's, not one screen's.
+   *
+   * The fixture's stand-in (`?selfupgrade=1`) is reachable only outside a Tauri
+   * build: the Tauri CLI sets `TAURI_ENV_PLATFORM` for the builds it runs, so
+   * there the condition is a constant and the call is folded away.
+   */
+  const selfUpgradeApi = useMemo(
+    () => tauriSelfUpgradeApi() ?? (!import.meta.env.TAURI_ENV_PLATFORM && runtime.mode === "fixture" ? fixtureSelfUpgradeApi() : undefined),
+    [runtime.mode],
+  );
+  const { check: selfUpgrade, recheck: recheckSelfUpgrade } = useSelfUpgradeCheck(selfUpgradeApi);
+  const [selfUpgradeOpen, setSelfUpgradeOpen] = useState(false); // voice-registry-exempt: the newer-release dialog (issue #1635) — opened only by the rail button and the dashboard banner, and it asks before upgrading anything
+  const [dismissedSelfUpgrade, setDismissedSelfUpgrade] = useState<string>(); // voice-registry-exempt: which newer-release banner was dismissed — it hides a notice and opens nothing
+  const openSelfUpgrade = useCallback(() => setSelfUpgradeOpen(true), []);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
    * because both are the app's and not one screen's — and `DeckShell` is the
@@ -994,7 +1017,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -1055,9 +1078,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       <VoiceChoiceOpen.Provider value={choiceOpen}>
       <KeyboardInput.Provider value={noteKeyboard}>
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
-        <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
+        <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} update={<SelfUpgradeRailButton check={selfUpgrade} onOpen={openSelfUpgrade} />} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        {selfUpgradeOpen && selfUpgrade && selfUpgradeApi && <SelfUpgradeDialog check={selfUpgrade} api={selfUpgradeApi} onClose={() => { setSelfUpgradeOpen(false); recheckSelfUpgrade(); }} />}
+        {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
       </KeyboardInput.Provider>
       </VoiceChoiceOpen.Provider>
