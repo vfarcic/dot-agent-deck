@@ -4289,6 +4289,11 @@ mod quit_dialog_race_tests {
     /// `$ ^C` of the #1579 run's final grid.
     const PANE_GOT_CTRL_C: &str = "$ ^C";
 
+    /// The file the fake writes when it enters the busy submit, beside the gate.
+    fn submitted_marker(gate: &Path) -> PathBuf {
+        gate.with_extension("submitted")
+    }
+
     #[derive(Clone, Copy, PartialEq)]
     enum Screen {
         Dashboard,
@@ -4373,7 +4378,9 @@ mod quit_dialog_race_tests {
                 (Screen::Name, b'\r') => {
                     // The submit: busy until the gate opens, reading nothing
                     // and redrawing nothing, then on the start role in
-                    // PaneInput — the order the real handler does it in.
+                    // PaneInput — the order the real handler does it in. The
+                    // marker tells the test the busy section has begun.
+                    std::fs::write(submitted_marker(&gate), b"").unwrap();
                     while !gate.exists() {
                         std::thread::sleep(Duration::from_millis(20));
                     }
@@ -4482,22 +4489,44 @@ mod quit_dialog_race_tests {
     /// the quit dialog — however long the open stays busy.
     #[test]
     fn step_three_waits_out_the_open_and_its_ctrl_c_opens_the_quit_dialog() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let fake = Fake::spawn("fixed");
         // The spawns return a while after the submit, from outside the steps
-        // under test — the way the daemon finishes on its own schedule.
+        // under test — the way the daemon finishes on its own schedule. The
+        // gate opens only once the fake is inside the busy submit, so that
+        // section is exercised on every run however slow the form flow was,
+        // and only after checking `open_orchestration` is still waiting it out:
+        // without the fix it returns as soon as the submit key is sent.
+        let returned = Arc::new(AtomicBool::new(false));
         let gate = fake.gate.clone();
+        let returned_seen = Arc::clone(&returned);
         let opener = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            while !submitted_marker(&gate).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let reached = submitted_marker(&gate).exists();
+            std::thread::sleep(Duration::from_millis(500));
+            let returned_early = returned_seen.load(Ordering::SeqCst);
             std::fs::write(&gate, b"").expect("open the gate");
+            (reached, returned_early)
         });
-        open_orchestration(&fake.deck).expect("the orchestration opens");
+        let opened = open_orchestration(&fake.deck);
+        returned.store(true, Ordering::SeqCst);
+        let (reached, returned_early) = opener.join().unwrap();
+        opened.expect("the orchestration opens");
+        assert!(reached, "the fake never entered the busy submit");
+        assert!(
+            !returned_early,
+            "open_orchestration returned while the deck was still busy opening the orchestration"
+        );
         assert_eq!(
             footer_mode(&fake.deck.grid()),
             Some(FooterMode::Typing),
             "open_orchestration returned before the deck left the form"
         );
         open_quit_dialog(&fake.deck, "the fake TUI").expect("the quit dialog opens");
-        opener.join().unwrap();
         let grid = fake.deck.grid();
         assert!(grid.contains("> Detach"), "{grid}");
         assert!(
