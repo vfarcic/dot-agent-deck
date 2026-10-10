@@ -30,6 +30,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
+| Upgrade the app, and the `dot-agent-deck` CLI on this machine, to a newer release | The upgrade button at the bottom of the rail, or **Upgrade…** on the Dashboard's banner | [Upgrade the app](#upgrade-the-app) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
 
@@ -43,6 +44,41 @@ These are TUI-only:
 - Installing the deck on a remote machine (`dot-agent-deck remote add`). Once it is installed, the desktop app can [start a daemon there](daemons.md#start-a-daemon-from-the-app) and [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version.
 
 The desktop app has two things the TUI does not: one Dashboard over several daemons at once, and voice control.
+
+## Upgrade the app
+
+The app checks for a newer release when it starts and every 6 hours while it runs. When this machine's app or its `dot-agent-deck` CLI is behind, two things appear:
+
+- an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
+- a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
+
+Nothing appears while both copies are current, or while the app cannot reach GitHub. The TUI shows the same notice as `Update available: v<new> (current: v<yours>)` in its footer, and upgrades with `dot-agent-deck upgrade` in a terminal ([Installation → Upgrading](../installation.md#upgrading)), which shows the same plan as this dialog.
+
+### The upgrade dialog
+
+The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**. It has one section for the app and, when a `dot-agent-deck` CLI is installed on this machine, one for the CLI. Each says which version you have, how that copy was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case.
+
+1. The dialog asks about one copy at a time, the app first, for example `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead.
+2. While a copy upgrades, its section says **Upgrading…** and the dialog cannot be closed.
+3. The result appears under that copy's section, then the dialog asks about the next copy, if any.
+4. When nothing is left to ask, **Close** closes the dialog, and the app checks again.
+
+A copy that cannot be upgraded from the app, such as a CLI installed with Nix or built from source, says what to do instead, and the dialog offers only **Close**. Most commands shown in the dialog have a copy button beside them.
+
+### What you see on each outcome
+
+| Copy | What you see | What to do |
+| --- | --- | --- |
+| The app, from a `.dmg` in a folder you can write | `Replaced <path> with v<new>. Quit and reopen Agent Deck to run it.`, and a **Relaunch** button | Press **Relaunch** to restart the app on the new version, or quit and reopen it later. Your agents keep running, as when you quit the app. |
+| The app, from a `.dmg` in a folder you cannot write, or an unsigned app | Why it cannot be replaced, and `Download <link>, open it, and drag Agent Deck.app into <folder>, replacing the old one.` | Do that, then reopen the app. |
+| The app, from the `.deb` | Your system's password prompt, then `Installed v<new>.` | Quit and reopen the app to run the new version. There is no **Relaunch** for the `.deb`. |
+| The app, from the `.deb`, when you dismiss the password prompt or it fails | `` `pkexec …` failed: … ``, then `It was downloaded and checked, but not installed. Install it with:` and a `sudo apt install …` command | Run the command in a terminal, then quit and reopen the app. If the system has no graphical password prompt, the dialog shows the command straight away. |
+| The CLI, from Homebrew | `` `brew upgrade dot-agent-deck` finished; it now reports v<new>. `` | Nothing. |
+| The CLI, a downloaded binary | `Upgraded <path> to v<new>.`, or, in a directory you cannot write, the password prompt on Linux and then `Installed v<new>.` | Nothing. Where the password prompt is dismissed, fails or is not available, run the command the dialog shows. |
+
+If **Relaunch** fails, the dialog shows why under its buttons; quit the app and open it again yourself. For any other failure, the copy's section shows the error and says whether anything changed; [Installation → When an upgrade fails](../installation.md#when-an-upgrade-fails) lists the messages and what to do.
+
+Upgrading does not stop the daemon or its agents. If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
 
 ## Features behind the `experimental` flag
 

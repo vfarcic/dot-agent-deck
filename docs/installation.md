@@ -241,7 +241,7 @@ If macOS reports the app as damaged or from an unidentified developer:
 - The release notes say the `.dmg` is signed and notarized: do not override the warning; [report it](https://github.com/vfarcic/dot-agent-deck/issues).
 - The release notes say the `.dmg` is unsigned: the warning is expected. Once the file has passed [the provenance check](#verify-the-download), follow the workaround in those notes.
 
-The app carries its own copy of the binary at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck` and does not put it on your `PATH`. To use `dot-agent-deck` in a terminal, install the CLI too, at the same version as the app.
+The app carries its own copy of the binary at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck` and does not put it on your `PATH`. To use `dot-agent-deck` in a terminal, install the CLI too, at the same version as the app; the app's upgrade dialog then upgrades both ([Keep the CLI and the desktop app on the same release](#keep-the-cli-and-the-desktop-app-on-the-same-release)).
 
 ### Linux
 
@@ -284,7 +284,7 @@ When it connects, the app checks whether it and the daemon can work together:
 
 **Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
-`daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this.
+`daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this: `dot-agent-deck upgrade` and the desktop app's upgrade dialog each offer to upgrade the other ([Keep the CLI and the desktop app on the same release](#keep-the-cli-and-the-desktop-app-on-the-same-release)).
 
 ## How it runs
 
@@ -294,13 +294,90 @@ The daemon owns the agents. Quitting the TUI with **Detach** leaves them running
 
 ## Upgrading
 
-Upgrade with the method you installed with (`brew upgrade dot-agent-deck`, a new download over the old file, `nix profile upgrade` on your profile entry, or a new build), then relaunch:
+### Notice a new release
+
+Both clients tell you when a newer release exists:
+
+- **TUI**: when it starts, it checks for a newer release and, if there is one, shows `Update available: v<new> (current: v<yours>)` at the right end of the footer. Upgrade with `dot-agent-deck upgrade` in another terminal (below).
+- **Desktop app**: it checks when it starts and every 6 hours while it runs. When this machine's app or CLI is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner with the same text and an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays.
+
+Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and the desktop app tries again later.
+
+### Upgrade with `dot-agent-deck upgrade`
+
+```bash
+dot-agent-deck upgrade           # show what would be done, then ask before each upgrade
+dot-agent-deck upgrade --check   # only show what would be done; change nothing
+dot-agent-deck upgrade --yes     # upgrade without asking
+```
+
+It prints a plan for the copy you ran, and for the desktop app when one is installed on this machine: the version you have, the newest release, how the copy was installed, and what upgrading it does. For each copy it can upgrade itself, it then asks, for example `Upgrade dot-agent-deck to v0.47.0? [y/N]`. Only `y` or `yes` upgrades; anything else prints `Skipped.`. When its input is not a terminal (a script), it asks nothing, upgrades nothing, and says to run `dot-agent-deck upgrade --yes`. It exits non-zero when it cannot look the release up or an upgrade it attempted failed.
+
+When a copy is already current it prints `dot-agent-deck is up to date (v<version>).`
+
+### What upgrading does for each install method
+
+Each copy is upgraded the way it was installed. The same plan is shown by `dot-agent-deck upgrade` and by the desktop app's dialog.
+
+| Copy | Installed with | What upgrading does |
+| --- | --- | --- |
+| CLI | [Homebrew](#homebrew-macos--linux) | Runs `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta` for the beta formula; see [Beta and stable](#beta-and-stable)). If `brew` cannot be found, it shows the command to run instead. |
+| CLI | [A downloaded binary](#download-binary) in a directory you can write, such as `~/.local/bin` | Downloads the new binary, checks it, and replaces the file in place. |
+| CLI | A downloaded binary in a directory you cannot write, such as `/usr/local/bin` | Downloads the new binary and checks it, then shows the command that installs it, which starts with `sudo`. The desktop app on Linux asks for your password instead and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the same command. |
+| CLI | [Nix](#nix) | Changes nothing. It says to update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`. |
+| CLI | [A source build](#build-from-source), including `cargo install` and a binary run from `target/` | Changes nothing. It says to check out the new release's tag and rebuild. |
+| CLI | Another system package | Changes nothing. It says to upgrade that package with your package manager. |
+| Desktop app | The `.dmg`, in `/Applications` or another folder you can write | Downloads the new `.dmg`, checks it, including its signature and notarization, replaces the app, and offers **Relaunch**. |
+| Desktop app | The `.dmg`, in a folder you cannot write, or an unsigned app | Changes nothing. It gives the download link and says to drag **Agent Deck** into that folder, replacing the old one. |
+| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` always shows that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
+
+Where no desktop app exists for the platform (Linux arm64, macOS Intel, WSL), only the CLI is upgraded, and nothing is reported as missing. Inside WSL, the CLI is upgraded the same way as on Linux.
+
+**What is checked before anything is replaced.** The download's checksum must match the release's checksum file, or nothing changes. When the [GitHub CLI](https://cli.github.com/) is installed and logged in, the checksum file's build provenance is also checked; when it is not, the plan says `Build provenance will NOT be checked:` and why, before you confirm, so install and log in to `gh` first if you want that check. A new CLI binary must report the release's version before it replaces the old one. A command shown for you to run starts by checking the downloaded file's checksum again, so `sudo` only installs the checked file.
+
+### Keep the CLI and the desktop app on the same release
+
+The CLI and the desktop app come from the same release and should run the same version. You do not have to upgrade them one by one: whichever one you upgrade from also finds the other on this machine and offers to upgrade it, each through its own install method (a Homebrew CLI next to a `.dmg` app is upgraded with `brew upgrade`, for example).
+
+- `dot-agent-deck upgrade` looks for the desktop app in `/Applications` and `~/Applications` on macOS, and for the `agent-deck` package on Linux.
+- The desktop app looks for `dot-agent-deck` on your login shell's `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `/home/linuxbrew/.linuxbrew/bin`. The copy of the binary inside the app is upgraded with the app.
+
+A copy counts as installed only when it runs and reports its version. Where the other copy cannot be upgraded from the client you are in, the plan shows the command for it instead.
+
+### Beta and stable
+
+A CLI installed from the `dot-agent-deck-beta` formula, or any copy running a pre-release version (such as `0.47.0-beta.1`), follows pre-releases: it is offered the newest pre-release, and a stable release once that is newer than every pre-release. Every other copy follows stable releases only. The CLI and the desktop app on one machine follow the channel of the copy you upgrade from.
+
+The beta formula only ever receives pre-releases, so `brew upgrade dot-agent-deck-beta` cannot install a stable release. When a stable release is newer than what the beta formula offers, the plan says so and shows the switch to the stable formula:
+
+```bash
+brew uninstall dot-agent-deck-beta && brew install vfarcic/tap/dot-agent-deck
+```
+
+### When an upgrade fails
+
+The error is printed in place of the result, and says whether anything changed. The common ones:
+
+| Message | What to do |
+| --- | --- |
+| `Cannot check for a newer release: …` | The release could not be looked up, usually no network or GitHub refusing the request. Try again later. |
+| `Cannot download …` | The download failed. Nothing was changed. Try again. |
+| `… does not match … Nothing was changed.` or `… has no entry for …` | The download did not match the release's checksum file. Try again; if it keeps happening, [report it](https://github.com/vfarcic/dot-agent-deck/issues) and do not install the file by hand. |
+| `The build provenance of … could not be verified, so nothing was changed.` | `gh attestation verify` refused the release's checksum file. Do not install the release by hand; [report it](https://github.com/vfarcic/dot-agent-deck/issues). |
+| `The upgrade plan said build provenance would be checked, but it cannot be now: …` | `gh` was removed or logged out between the plan and the upgrade. Log in with `gh auth login` and run the upgrade again. |
+| `` `pkexec …` failed: … `` followed by `It was downloaded and checked, but not installed. Install it with:` | The password prompt was dismissed or failed. Run the command shown. |
+| `The download folder … is not safe to use: …` | The folder the deck downloads into is not private to you (it is a link, belongs to another user, or others can write to it). Remove it or make it private to you, then try again. |
+| `WARNING: … was installed, but it is NOT the verified build …` | The installed file is not the one that was checked. Do not run it; reinstall from the release page the message names. |
+
+### After upgrading
+
+Relaunch the TUI:
 
 ```bash
 dot-agent-deck
 ```
 
-On launch the TUI compares its build with the running daemon's. If they differ:
+Upgrading does not stop a running daemon or its agents. On launch the TUI compares its build with the running daemon's. If they differ:
 
 - **No agents running**: the old daemon is restarted on the new binary without asking.
 - **Agents running, TUI in a terminal**: the TUI prints `Daemon version mismatch`, the two builds, and the agents a restart would stop. Press `S` to restart the daemon (stopping those agents), or any other key to keep the current daemon and attach to it with your agents intact. Upgrade later, when no agents are running.
@@ -309,7 +386,7 @@ On launch the TUI compares its build with the running daemon's. If they differ:
 
 If you keep an older daemon, features added by the newer release may not work against it; see [Troubleshooting → Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon).
 
-If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. For the desktop app, install the new release's package the same way as the first time.
+If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. After the desktop app is upgraded, it connects to the running daemon as before; if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
 
 ## Versioning
 
