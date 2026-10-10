@@ -599,7 +599,7 @@ pub enum UpgradeError {
     #[error("{error}")]
     StillMounted {
         error: Box<UpgradeError>,
-        mount: String,
+        mount: PathBuf,
     },
 }
 
@@ -631,7 +631,7 @@ impl UpgradeError {
         match self {
             Self::StillMounted { error, mount } => {
                 let mut lines = error.fallback();
-                lines.extend(execute::still_mounted(Path::new(mount)));
+                lines.extend(execute::still_mounted(mount));
                 lines
             }
             Self::PrivilegeFailed {

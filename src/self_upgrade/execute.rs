@@ -1065,19 +1065,29 @@ fn check_app(host: &dyn Host, app: &Path, team_id: &str, assess: bool) -> Result
     Ok(())
 }
 
+/// What the user reads when the release's disk image is still attached at a
+/// mount point whose path cannot be shown faithfully, before the command
+/// that lists the attached images.
+pub const STILL_MOUNTED_UNSHOWABLE: &str = "Warning: the release's disk image is still attached, at a folder whose path cannot be shown safely. List the attached images with the command below, then detach this release's with `hdiutil detach -force` and its mount point:";
+
 /// The lines that tell the user the release's disk image is still attached
-/// at `mount`, and how to detach it.
+/// at `mount`, and how to detach it. The detach command is built only for a
+/// path it can name faithfully ([`plan::detach_image_command`]); for any
+/// other, the user is told how to find the image instead.
 pub(crate) fn still_mounted(mount: &Path) -> Vec<PlanLine> {
-    vec![
-        PlanLine::Text(format!(
-            "Warning: the release's disk image is still attached at {}. Detach it with:",
-            mount.display()
-        )),
-        PlanLine::Command(format!(
-            "{HDIUTIL} detach -force {}",
-            super::shell_word(&mount.to_string_lossy())
-        )),
-    ]
+    match plan::detach_image_command(Path::new(HDIUTIL), mount) {
+        Some(command) => vec![
+            PlanLine::Text(format!(
+                "Warning: the release's disk image is still attached at {}. Detach it with:",
+                mount.display()
+            )),
+            PlanLine::Command(command),
+        ],
+        None => vec![
+            PlanLine::Text(STILL_MOUNTED_UNSHOWABLE.to_string()),
+            PlanLine::Command(format!("{HDIUTIL} info")),
+        ],
+    }
 }
 
 /// A disk image attached at `mount`, detached when this is dropped — on an
@@ -1168,7 +1178,7 @@ pub fn swap_app(
         Err(error) if detached => Err(error),
         Err(error) => Err(UpgradeError::StillMounted {
             error: Box::new(error),
-            mount: mount.display().to_string(),
+            mount,
         }),
     }
 }
@@ -2517,5 +2527,50 @@ mod tests {
         );
         assert_eq!(unfinished(&unanswered).install, None);
         assert_eq!(unanswered.fallback().last(), Some(&check));
+    }
+
+    /// Scenario: the release's image is left attached at a mount point whose
+    /// path a terminal or the dialog would not show as the shell reads it: a
+    /// newline, a bidi override, bytes that are not UTF-8. No detach command
+    /// is built for it; the user is told to list the attached images
+    /// instead. A path with an apostrophe and a space is quoted as one shell
+    /// word.
+    // Unix paths, and non-UTF-8 ones: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_031_a_detach_command_names_only_a_path_it_can_show_faithfully() {
+        use std::os::unix::ffi::OsStrExt;
+        let unshowable = [
+            PathBuf::from("/s/v0.46.0-ab/mo\nunt"),
+            PathBuf::from("/s/v0.46.0-ab/\u{202E}tnuom"),
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/s/v0.46.0-ab/mo\xffunt")),
+        ];
+        for mount in unshowable {
+            let lines = still_mounted(&mount);
+            assert_eq!(
+                lines,
+                vec![
+                    PlanLine::Text(STILL_MOUNTED_UNSHOWABLE.into()),
+                    PlanLine::Command(format!("{HDIUTIL} info")),
+                ],
+                "{mount:?}"
+            );
+            let err = UpgradeError::StillMounted {
+                error: Box::new(UpgradeError::Io("x".into())),
+                mount: mount.clone(),
+            };
+            assert_eq!(err.fallback(), lines, "{mount:?}");
+        }
+
+        let mount = Path::new("/s/it's here/mount");
+        assert_eq!(
+            still_mounted(mount),
+            vec![
+                PlanLine::Text(
+                    "Warning: the release's disk image is still attached at /s/it's here/mount. Detach it with:".into()
+                ),
+                PlanLine::Command(format!("{HDIUTIL} detach -force '/s/it'\\''s here/mount'")),
+            ]
+        );
     }
 }

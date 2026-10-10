@@ -438,6 +438,18 @@ pub fn install_binary_command(
     ))
 }
 
+/// The command that detaches the disk image mounted at `mount` with
+/// `hdiutil`, forced. `None` when `mount` cannot be shown faithfully
+/// ([`shown_path`]).
+pub fn detach_image_command(hdiutil: &Path, mount: &Path) -> Option<String> {
+    let (hdiutil, mount) = (shown_path(hdiutil)?, shown_path(mount)?);
+    Some(format!(
+        "{} detach -force {}",
+        shell_word(hdiutil),
+        shell_word(mount)
+    ))
+}
+
 /// The command that installs the verified `.deb` at `staged`: a checksum
 /// check, then `sudo apt install <staged>`. `None` as for
 /// [`install_binary_command`].

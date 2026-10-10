@@ -32,14 +32,36 @@ pub enum Answers<'a> {
 /// Write `text` as one line, filtered the way the TUI and the desktop app
 /// filter what they show: control and bidi formatting characters are dropped,
 /// so a path or a subprocess's message cannot move the cursor, clear the
-/// screen or reorder the line. The core builds no shown command with such a
-/// character in it, so a command is printed unchanged.
+/// screen or reorder the line. Commands go through [`say_items`], which never
+/// rewrites one.
 fn say(out: &mut dyn Write, text: &str) {
     let _ = writeln!(
         out,
         "{}",
         crate::untrusted_text::strip_control_and_bidi(text, false)
     );
+}
+
+/// What the CLI prints in place of a command its output filter would change.
+pub const COMMAND_NOT_SHOWN: &str =
+    "(A command is left out here, because it contains characters that cannot be shown safely.)";
+
+/// Write `items` one line each: prose as [`say`] writes it, and a command
+/// indented and exactly as the core built it. The core builds no command that
+/// [`say`]'s filter would change, so one that it would is not printed in any
+/// form, rewritten or not: [`COMMAND_NOT_SHOWN`] says it was left out.
+fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
+    for item in items {
+        match item {
+            plan::PlanLine::Text(text) => say(out, text),
+            plan::PlanLine::Command(command)
+                if crate::untrusted_text::strip_control_and_bidi(command, false) == *command =>
+            {
+                let _ = writeln!(out, "{}", item.render());
+            }
+            plan::PlanLine::Command(_) => say(out, COMMAND_NOT_SHOWN),
+        }
+    }
 }
 
 /// Run the subcommand. Returns whether everything it attempted succeeded.
@@ -93,9 +115,7 @@ pub async fn run(
         if i > 0 {
             let _ = writeln!(out);
         }
-        for line in plan.lines() {
-            say(out, &line);
-        }
+        say_items(out, &plan.items());
     }
     if args.check {
         return true;
@@ -115,16 +135,12 @@ pub async fn run(
         .await
         {
             Ok(outcome) => {
-                for line in outcome.lines() {
-                    say(out, &line);
-                }
+                say_items(out, &outcome.items());
                 ok &= outcome.upgraded();
             }
             Err(e) => {
                 say(out, &e.to_string());
-                for line in plan::render_lines(&e.fallback()) {
-                    say(out, &line);
-                }
+                say_items(out, &e.fallback());
                 ok = false;
             }
         }
@@ -405,5 +421,30 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "`brew upgrade dot-agent-deck` failed: ]0;ownedError\n"
         );
+    }
+
+    /// Scenario: the CLI prints a result whose lines include commands. One
+    /// the core built prints exactly as built, and one its output filter
+    /// would change (a bidi override in a path) is not printed in any form,
+    /// rewritten or not: a line says a command was left out instead.
+    #[test]
+    fn cli_006_a_command_the_filter_would_change_is_refused_not_rewritten() {
+        let faithful = r"/usr/bin/hdiutil detach -force '/s/it'\''s here/mount'";
+        let hostile = "/usr/bin/hdiutil detach -force '/s/mo\u{202E}unt'";
+        let mut out = Vec::new();
+        say_items(
+            &mut out,
+            &[
+                plan::PlanLine::Text("Detach it with:".into()),
+                plan::PlanLine::Command(hostile.into()),
+                plan::PlanLine::Command(faithful.into()),
+            ],
+        );
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(
+            printed,
+            format!("Detach it with:\n{COMMAND_NOT_SHOWN}\n  {faithful}\n")
+        );
+        assert!(!printed.contains("/s/mount"), "{printed}");
     }
 }
