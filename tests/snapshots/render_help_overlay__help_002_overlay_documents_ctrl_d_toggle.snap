@@ -1,5 +1,6 @@
 ---
 source: tests/render_help_overlay.rs
+assertion_line: 97
 expression: buf
 ---
                                                                                                               
@@ -44,6 +45,7 @@ expression: buf
    │  g                  generate .dot-agent-deck.toml   restored automatically on launch.               │    
    │  y / n              approve / deny permission                                                       │    
    │  s                  schedules manager                                                               │    
+   │  o                  open pull request                                                               │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    

@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto, type PullRequestInfoDto, type VoiceResultDto, type VoiceStatusDto } from "./lib/bridge";
 import { PrBrowserHostContext, type PrBrowserHost } from "./lib/prBrowser";
-import { PullRequestBadge } from "./components/AgentTile";
+import { PullRequestBadge } from "./components/PullRequestBadge";
 import { pullRequestFromDto, pullRequestLabel } from "./lib/pullRequest";
 import type { DeckActionResult, DeckRuntimeState } from "./types";
 

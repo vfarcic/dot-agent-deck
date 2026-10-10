@@ -1177,6 +1177,29 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #1401: unconditional — every agent on a branch with a pull request
+    // gets a badge, and this is the only place that answer comes from. Idle
+    // (no `git`, no `gh`) while no live session works on a non-default branch.
+    let pull_request_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        let interval = crate::pull_request::refresh_interval_from(
+            std::env::var(crate::pull_request::DOT_AGENT_DECK_PR_REFRESH_SECS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        tokio::spawn(async move {
+            crate::pull_request::run_pull_request_monitor(
+                registry,
+                monitor_state,
+                monitor_event_tx,
+                interval,
+            )
+            .await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -1206,6 +1229,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    pull_request_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -2044,6 +2068,9 @@ fn notify_orchestrator_of_quota_block(
 ///   scrubbed ([`normalize_quota_blocked_metadata`]);
 /// * every other event type loses every `quota_blocked_*` key, so a reason can
 ///   only ever travel with the status it explains;
+/// * `pull_request` (PRD #1401), the daemon's report of a card's pull request,
+///   is stripped from every producer frame, and the hook loop drops a
+///   producer's `pull_request` event outright;
 /// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
 ///   markers (its Codex-rollout block, and the lift after a pane restart), are
 ///   stripped from every producer frame;
@@ -2065,6 +2092,10 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    // PRD #1401: the pull request a card's badge opens is the daemon's alone.
+    event
+        .metadata
+        .remove(crate::event::PULL_REQUEST_METADATA_KEY);
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,
@@ -4615,6 +4646,21 @@ async fn run_hook_loop_with_idle_timeout(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            // PRD #1401: a pull request report is the
+                            // daemon's alone — its URL is what a card's badge
+                            // opens — so a producer's copy goes no further.
+                            if event.event_type == crate::event::EventType::PullRequest {
+                                warn!(
+                                    verb = "agent_event",
+                                    claimed_pane = %escape_id_for_log(
+                                        event.pane_id.as_deref().unwrap_or("<none>")
+                                    ),
+                                    reason = "daemon_authored_event_type",
+                                    "hook socket: dropped a producer's pull_request event; \
+                                     only the daemon reports an agent's pull request"
+                                );
+                                continue;
+                            }
                             // An outside agent's rollout is not this daemon's to
                             // tail; the arm is for panes it spawned.
                             if !unproven {

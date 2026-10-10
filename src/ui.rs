@@ -7052,6 +7052,9 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// PRD #1401: open the selected card's pull request in the system browser
+    /// (dashboard `o`). No pull request, nothing opened.
+    OpenPullRequest,
     /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
     /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
     /// with a blank context (same outcome as pressing `a`).
@@ -8399,6 +8402,46 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// PRD #1401: open a pull request `url` in the system browser without blocking
+/// the render loop — `$BROWSER` when it is set (the first entry of a
+/// `:`-separated list, `%s` replaced by the URL or the URL appended), the
+/// platform opener otherwise. Only a `https://github.com/` URL is opened: the
+/// daemon only ever reports one, and this is the one place a URL from the wire
+/// reaches a process spawn.
+fn open_in_system_browser(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://github.com/") || url.chars().any(char::is_control) {
+        return Err("not a GitHub pull request URL".to_string());
+    }
+    let browser = std::env::var("BROWSER").unwrap_or_default();
+    let command = browser.split(':').next().unwrap_or("").trim();
+    if command.is_empty() {
+        return open::that_detached(url).map_err(|e| e.to_string());
+    }
+    let mut words = command.split_whitespace();
+    let program = words.next().unwrap_or(command);
+    let mut args: Vec<String> = words.map(str::to_string).collect();
+    if args.iter().any(|arg| arg.contains("%s")) {
+        for arg in &mut args {
+            *arg = arg.replace("%s", url);
+        }
+    } else {
+        args.push(url.to_string());
+    }
+    let mut child = std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    // Reaped off the render thread, so a browser that stays in the foreground
+    // neither blocks the deck nor lingers as a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Open the project repository in the user's browser and build the status
 /// message for whichever way that went.
 ///
@@ -8555,6 +8598,103 @@ fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `state`, and
+/// its colour — GitHub's own colour roles (green open, grey draft, purple
+/// merged, red closed) in the palette's terms.
+fn pull_request_state_glyph(state: crate::pull_request::PullRequestState) -> (&'static str, Color) {
+    use crate::pull_request::PullRequestState;
+    match state {
+        PullRequestState::Open => ("⊙", palette::STATUS_WORKING),
+        PullRequestState::Draft => ("◌", palette::STATUS_IDLE),
+        PullRequestState::Merged => ("◆", palette::STATUS_WAITING),
+        PullRequestState::Closed => ("⊘", palette::STATUS_ERROR),
+        PullRequestState::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `review`, and
+/// its colour.
+fn pull_request_review_glyph(
+    review: crate::pull_request::PullRequestReview,
+) -> (&'static str, Color) {
+    use crate::pull_request::PullRequestReview;
+    match review {
+        PullRequestReview::Approved => ("✓", palette::STATUS_WORKING),
+        PullRequestReview::ChangesRequested => ("✗", palette::STATUS_ERROR),
+        PullRequestReview::ReviewRequired => ("◐", palette::STATUS_THINKING),
+        PullRequestReview::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: a card's pull request badge in its forms, widest first —
+/// `#<n>` with the state and review glyphs, then without the review glyph,
+/// then the number alone. A PR with no review decision has no first form.
+fn pull_request_badge_forms(pr: &crate::pull_request::PullRequestInfo) -> Vec<Vec<Span<'static>>> {
+    let number = Span::styled(
+        format!("#{}", pr.number),
+        text_primary().add_modifier(Modifier::BOLD),
+    );
+    let (state_glyph, state_color) = pull_request_state_glyph(pr.state);
+    let state = Span::styled(state_glyph, Style::default().fg(state_color));
+    let mut forms = Vec::new();
+    if let Some(review) = pr.review {
+        let (review_glyph, review_color) = pull_request_review_glyph(review);
+        forms.push(vec![
+            Span::raw(" "),
+            number.clone(),
+            Span::raw(" "),
+            state.clone(),
+            Span::raw(" "),
+            Span::styled(review_glyph, Style::default().fg(review_color)),
+            Span::raw(" "),
+        ]);
+    }
+    forms.push(vec![
+        Span::raw(" "),
+        number.clone(),
+        Span::raw(" "),
+        state,
+        Span::raw(" "),
+    ]);
+    forms.push(vec![Span::raw(" "), number, Span::raw(" ")]);
+    forms
+}
+
+/// PRD #1401: the bottom border's two labels — the pull request badge on the
+/// left and the `Last`/`Tools` stats on the right — fitted into
+/// `usable_width` cells together. The stats shorten first (their own forms),
+/// then the badge drops its glyphs; if no badge form fits beside any stats
+/// form, the badge wins and the stats go, and a badge that fits nowhere is
+/// dropped. With no pull request this is [`card_stats_border_label`] alone.
+#[doc(hidden)]
+pub fn card_bottom_border_labels(
+    usable_width: u16,
+    pull_request: Option<&crate::pull_request::PullRequestInfo>,
+    last: &str,
+    tools: usize,
+) -> (Option<Vec<Span<'static>>>, Option<String>) {
+    use unicode_width::UnicodeWidthStr;
+    let Some(pr) = pull_request else {
+        return (None, card_stats_border_label(usable_width, last, tools));
+    };
+    let width = |form: &[Span<'_>]| form.iter().map(|s| s.content.width()).sum::<usize>();
+    let forms = pull_request_badge_forms(pr);
+    for form in &forms {
+        let remaining = (usable_width as usize).saturating_sub(width(form));
+        let remaining = u16::try_from(remaining).unwrap_or(u16::MAX);
+        if let Some(stats) = card_stats_border_label(remaining, last, tools) {
+            return (Some(form.clone()), Some(stats));
+        }
+    }
+    let badge = forms
+        .into_iter()
+        .find(|form| width(form) <= usable_width as usize);
+    match badge {
+        Some(badge) => (Some(badge), None),
+        None => (None, card_stats_border_label(usable_width, last, tools)),
+    }
 }
 
 /// Pick the widest `Last`/`Tools` form that fits a card's bottom border, or
@@ -9420,6 +9560,11 @@ fn handle_normal_key(
     // so existing muscle memory keeps working while lowercase `s` is added.
     if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
+    }
+    // PRD #1401: open the selected card's pull request (default `o`). The
+    // dispatcher resolves the card and does nothing when it has none.
+    if kb.matches(KbAction::OpenPullRequest, &key) && total > 0 {
+        return Action::OpenPullRequest;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -11650,6 +11795,32 @@ fn dispatch_action(
                     "No active agent to send prompt to.".to_string(),
                     std::time::Instant::now(),
                 ));
+            }
+        }
+        Action::OpenPullRequest => {
+            let url = selected_id
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|session| session.pull_request.as_ref())
+                .map(|pr| pr.url.clone());
+            match url {
+                Some(url) => match open_in_system_browser(&url) {
+                    Ok(()) => {
+                        ui.status_message =
+                            Some((format!("Opened {url}"), std::time::Instant::now()));
+                    }
+                    Err(e) => {
+                        ui.status_message = Some((
+                            format!("Could not open the pull request: {e}"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                },
+                None => {
+                    ui.status_message = Some((
+                        "This agent has no pull request.".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
         Action::SendPermissionResponse(approve) => {
@@ -19648,6 +19819,9 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
+        // PRD #1401: the terminal has no in-app browser, so this hands the PR
+        // to the system browser.
+        help_key_line(&n(KbAction::OpenPullRequest), "Open pull request"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -21159,8 +21333,12 @@ fn render_session_card(
     // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
     // are expensive there, and the `Last:` label already says "time since".
     let elapsed = format_elapsed(session.last_activity, now);
-    let stats_title = card_stats_border_label(
+    // PRD #1401: the pull request badge takes the bottom-LEFT border, which
+    // was empty, so it costs no row at any density. The two share the row: the
+    // stats shorten first, then the badge drops its glyphs, then the stats go.
+    let (pr_badge, stats_title) = card_bottom_border_labels(
         area.width.saturating_sub(2),
+        session.pull_request.as_ref(),
         &elapsed,
         session.tool_count as usize,
     );
@@ -21175,6 +21353,9 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+    if let Some(badge) = pr_badge {
+        block = block.title_bottom(Line::from(badge).alignment(ratatui::layout::Alignment::Left));
+    }
     // Omitted entirely when even the shortest form would overrun the corners.
     if let Some(stats) = stats_title {
         block = block.title_bottom(

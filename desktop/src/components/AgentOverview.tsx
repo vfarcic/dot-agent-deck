@@ -17,6 +17,8 @@ import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
+import { PullRequestBadge } from "./PullRequestBadge";
+import { OpenPullRequest } from "../lib/prBrowser";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -45,6 +47,8 @@ export type OverviewAgent = Pick<
   "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
   /* Issue #1496 — read by the dashboard filter, not rendered. */
   | "agentType" | "daemonStatus" | "authoringKind"
+  /* PRD #1401 — the badge beside the agent's name. */
+  | "pullRequest"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -71,7 +75,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest } = agent;
   return {
     id,
     daemonId,
@@ -90,6 +94,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     lastActivityMs,
     spawnedAtMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
+    ...(pullRequest ? { pullRequest } : {}),
   };
 }
 
@@ -2429,6 +2434,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   */
   const openAgent = useContext(OpenAgentContext);
   const stopControls = useContext(StopControlsContext);
+  const openPullRequest = useContext(OpenPullRequest);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -2473,6 +2479,20 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             */}
             {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
+            {/*
+              PRD #1401 — the same badge the agent's tile and screen show, and
+              the same click: it opens the PR in the in-app browser directly,
+              over this screen, rather than opening the agent first. It is a
+              button, so a click on it never also opens the agent's pane (see
+              `clickLandedOnRowControl`).
+            */}
+            {agent.pullRequest && (
+              <PullRequestBadge
+                pullRequest={agent.pullRequest}
+                testId="overview-pr-badge"
+                onOpen={openPullRequest && agent.pullRequest.url ? () => openPullRequest({ deckId: agent.daemonId, agentId: agent.id }) : undefined}
+              />
+            )}
             {openAgent && (
               <button
                 className="overview-open-agent"

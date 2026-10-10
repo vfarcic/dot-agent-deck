@@ -5346,9 +5346,12 @@ pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
         // Issue #714: `QuotaBlocked` says the provider refused the agent, which
         // is the opposite of a turn.
+        // PRD #1401: `PullRequest` is the daemon's report about the branch,
+        // never the agent's.
         EventType::ShellBusy
         | EventType::ShellIdle
         | EventType::QuotaBlocked
+        | EventType::PullRequest
         | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
@@ -10389,6 +10392,12 @@ fn overlay_snapshot_onto_kept_card(
     snap: &SessionSnapshot,
     observed: Option<DateTime<Utc>>,
 ) {
+    // PRD #1401: the pull request is the daemon's alone and not ordered by
+    // activity — its report moves no `last_activity` — so the reply wins
+    // whatever its stamp. Every report broadcast before the reply was built was
+    // applied to the state the reply was built from (one write lock covers both),
+    // so the reply is never the older of the two.
+    session.pull_request = snap.pull_request.clone();
     if let Some(observed) = observed
         && observed > session.last_activity
         && observed <= Utc::now()
@@ -10458,6 +10467,8 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     };
     session.active_tool = snap.active_tool.clone();
     session.tool_count = snap.tool_count;
+    // PRD #1401: the daemon's pull request for the card's branch.
+    session.pull_request = snap.pull_request.clone();
     session.first_prompts = snap.first_prompts.clone();
     session.last_user_prompt = snap.last_user_prompt.clone();
     // PRD #20 blocker-4: restore the durable live-target so a history-only /
@@ -11517,6 +11528,51 @@ impl AppState {
     /// half then finds no tab and no attachment either. A session tagged with a
     /// DIFFERENT agent id is a successor's and is kept, and so is the pane's
     /// registration while any session remains on it.
+    /// PRD #1401: put the pull request an [`EventType::PullRequest`] reports on
+    /// the card it names — by session id, or by pane and agent for a card a
+    /// client filed under a placeholder key (the reuse guard's mapping). No
+    /// card is ever created for one: a report about a card the client does not
+    /// hold has nothing to land on, and the next `ListAgents` carries the
+    /// field anyway.
+    fn apply_pull_request_report(
+        &mut self,
+        event: &AgentEvent,
+        pull_request: Option<crate::pull_request::PullRequestInfo>,
+    ) {
+        for (id, session) in self.sessions.iter_mut() {
+            let same_card = *id == event.session_id
+                || (event.pane_id.is_some()
+                    && session.pane_id == event.pane_id
+                    && session.agent_id == event.agent_id);
+            if same_card {
+                session.pull_request = pull_request.clone();
+            }
+        }
+    }
+
+    /// PRD #1401: the daemon side of [`Self::apply_pull_request_report`] —
+    /// set `pull_request` on every live session `want` maps, and return one
+    /// [`EventType::PullRequest`] per session whose value changed, for the
+    /// caller to broadcast while it still holds the lock it called this under.
+    ///
+    /// `want` maps a session id to the pull request its branch has now
+    /// (`None`: no badge). Sessions it does not name are left as they are.
+    pub fn set_pull_requests(
+        &mut self,
+        want: &HashMap<String, Option<crate::pull_request::PullRequestInfo>>,
+    ) -> Vec<AgentEvent> {
+        let mut changed = Vec::new();
+        for (id, session) in self.sessions.iter_mut() {
+            let Some(next) = want.get(id) else { continue };
+            if session.pull_request == *next {
+                continue;
+            }
+            session.pull_request = next.clone();
+            changed.push(crate::pull_request::report_event(session));
+        }
+        changed
+    }
+
     pub fn apply_daemon_pane_closed(&mut self, pane_id: &str, agent_id: Option<&str>) {
         let doomed: Vec<String> = self
             .sessions
@@ -14860,6 +14916,14 @@ impl AppState {
             }
             return AppliedEvent::StatusAsserted;
         }
+        // PRD #1401: the daemon's pull request report is a statement ABOUT a
+        // card's branch, not anything its agent did, so none of the machinery
+        // below (admission, activity, journal, status) applies to it. It only
+        // ever lands on a card that already exists.
+        if let Some(pull_request) = event.pull_request_report() {
+            self.apply_pull_request_report(&event, pull_request);
+            return AppliedEvent::Rejected;
+        }
         // Issue #697: the daemon evicted an outside agent's card to stay within
         // `MAX_UNPROVEN_SESSIONS`. Like the pane-closed announcement it is a
         // statement about a card, not a conversation ending, and it must not
@@ -16685,6 +16749,8 @@ impl AppState {
                 // produced by this build. No status change.
                 false
             }
+            // PRD #1401: returned early at the top of `apply_event_unsettled`.
+            EventType::PullRequest => false,
             EventType::SessionEnd => unreachable!(),
         };
         // Issue #714: the reason exists only beside the status it explains.

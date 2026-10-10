@@ -1,5 +1,6 @@
 ---
 source: tests/render_keybindings.rs
+assertion_line: 111
 expression: text
 ---
                                                                                                                         
@@ -36,6 +37,7 @@ expression: text
         │  g                  Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
         │  y / n              Approve / deny permission                                                       │         
         │  s                  Schedules manager                                                               │         
+        │  o                  Open pull request                                                               │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         
