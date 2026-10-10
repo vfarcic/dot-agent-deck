@@ -5254,6 +5254,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a terminal resized while an upgrade runs (that state shows the same request with no Close, as the running dialog has none).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/014 — A dialog drawn larger again after the resize state selects Cancel, so Enter never upgrades until Upgrade is chosen again.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 120×40, then 8×60, then 120×40).
+- **Agent:** none.
+- **Asserts:** with the plan read and Upgrade selected, the shrunk frame draws `> Close` and the first restored frame draws `> Cancel`, and on each frame the button drawn as selected is the one `selected()` reports; Enter on the restored dialog does not yield `Run`; Down then Enter yields `Run`, as what of the plan was seen is kept.
+- **Does not assert:** a click on Upgrade in the restored frame (the same `choose` the keys reach), or a resize while an upgrade runs.
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.

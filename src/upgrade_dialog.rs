@@ -428,6 +428,17 @@ impl UpgradeDialog {
         self.scroll = self.scroll.saturating_add_signed(rows).min(self.max_scroll);
     }
 
+    /// Record whether this frame is too small to show the plan. Going into
+    /// that state puts the selection back on Cancel, so a dialog drawn larger
+    /// again never comes back with Upgrade chosen: it has to be chosen again.
+    /// What of the plan was seen is kept.
+    fn set_too_small(&mut self, too_small: bool) {
+        if too_small && !self.too_small {
+            self.selected = UpgradeChoice::Cancel;
+        }
+        self.too_small = too_small;
+    }
+
     fn page_rows(&self) -> isize {
         isize::try_from(self.page.max(1)).unwrap_or(isize::MAX)
     }
@@ -807,11 +818,14 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
     let text_width = usize::from(most.width);
     let phase = dialog.phase();
 
-    let (mut footer, buttons, first_button_row) = footer_rows(dialog, phase, text_width);
+    // This frame's size decides what is selected, so it is settled before
+    // anything that draws the selection. The footer's rows do not depend on
+    // the selection, only on the width.
+    let footer_len = footer_rows(dialog, phase, text_width).0.len();
     // The "more above" row, the footer and its hint leave the body the rest.
-    let room = usize::from(most.height).saturating_sub(1 + footer.len() + 1);
-    if most.width < MIN_TEXT_WIDTH || room == 0 {
-        dialog.too_small = true;
+    let room = usize::from(most.height).saturating_sub(1 + footer_len + 1);
+    dialog.set_too_small(most.width < MIN_TEXT_WIDTH || room == 0);
+    if dialog.too_small {
         // The footer as it would be at the narrowest width that shows a plan,
         // when this one is narrower, so the size asked for is enough.
         let rows = if most.width < MIN_TEXT_WIDTH {
@@ -819,13 +833,13 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
                 .0
                 .len()
         } else {
-            footer.len()
+            footer_len
         };
         // One body row, the marker row and the hint, the border, the margin.
         let needed = u16::try_from(rows + 1 + 2 + 2 + 2).unwrap_or(u16::MAX);
         return render_too_small(frame, phase, &title, needed);
     }
-    dialog.too_small = false;
+    let (mut footer, buttons, first_button_row) = footer_rows(dialog, phase, text_width);
 
     let mut body: Vec<Line<'static>> = Vec::new();
     let mut layout = Layout {

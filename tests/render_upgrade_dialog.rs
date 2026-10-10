@@ -928,3 +928,80 @@ fn upgrade_dialog_013_a_too_short_terminal_shows_the_resize_state() {
     assert!(!flat(&text).contains("too small"), "{text}");
     assert!(text.contains("↓ more"), "{text}");
 }
+
+/// The button drawn with the `>` cursor in `text`, if any.
+fn drawn_selection(text: &str) -> Option<UpgradeChoice> {
+    let rows: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().trim_matches('│').trim().to_string())
+        .filter(|row| row.starts_with("> "))
+        .collect();
+    assert!(
+        rows.len() <= 1,
+        "more than one button drawn as selected\n{text}"
+    );
+    let row = rows.first()?;
+    Some(if row.starts_with("> Cancel") {
+        UpgradeChoice::Cancel
+    } else if row.starts_with("> Upgrade") {
+        UpgradeChoice::Upgrade
+    } else if row.starts_with("> Close") {
+        UpgradeChoice::Close
+    } else {
+        panic!("unknown selected button {row:?}\n{text}")
+    })
+}
+
+/// Scenario: At 120×40, read this TUI's CLI plan and select Upgrade, then shrink the terminal to 8×60 so the dialog asks for a larger one, then grow it back and draw it once. The restored dialog shows Cancel selected, so Enter closes rather than upgrades; Upgrade has to be chosen again, and since the plan was already read it then runs.
+#[spec("upgrade/upgrade-dialog/014")]
+#[test]
+fn upgrade_dialog_014_restoring_from_the_resize_state_selects_cancel_and_cannot_run() {
+    let mut dialog = UpgradeDialog::new(vec![writable_cli()]);
+    let first = render_at(&mut dialog, 120, 40);
+    assert!(!flat(&first).contains("too small"), "{first}");
+    dialog.handle_key(key(KeyCode::Down));
+    assert_eq!(dialog.selected(), UpgradeChoice::Upgrade);
+    let selected = render_at(&mut dialog, 120, 40);
+    assert_eq!(
+        drawn_selection(&selected),
+        Some(dialog.selected()),
+        "{selected}"
+    );
+
+    // Shrink: the dialog asks for a larger terminal, and what it draws as
+    // selected is what it reports.
+    let shrunk = render_at(&mut dialog, 8, 60);
+    assert!(flat(&shrunk).contains("too small"), "{shrunk}");
+    assert_eq!(
+        drawn_selection(&shrunk),
+        Some(UpgradeChoice::Close),
+        "{shrunk}"
+    );
+    assert_eq!(dialog.selected(), UpgradeChoice::Close);
+
+    // Restore, drawn once: Cancel is selected, on screen and in the state.
+    let restored = render_at(&mut dialog, 120, 40);
+    assert!(!flat(&restored).contains("too small"), "{restored}");
+    assert_eq!(
+        drawn_selection(&restored),
+        Some(UpgradeChoice::Cancel),
+        "the restored dialog draws Cancel as selected\n{restored}"
+    );
+    assert_eq!(dialog.selected(), UpgradeChoice::Cancel);
+    let mut entered = dialog.clone();
+    assert_ne!(
+        entered.handle_key(key(KeyCode::Enter)),
+        Effect::Run(0),
+        "Enter on the restored dialog never upgrades"
+    );
+
+    // The plan was already read, so choosing Upgrade again runs it.
+    dialog.handle_key(key(KeyCode::Down));
+    let chosen = render_at(&mut dialog, 120, 40);
+    assert_eq!(
+        drawn_selection(&chosen),
+        Some(UpgradeChoice::Upgrade),
+        "{chosen}"
+    );
+    assert_eq!(dialog.handle_key(key(KeyCode::Enter)), Effect::Run(0));
+}
