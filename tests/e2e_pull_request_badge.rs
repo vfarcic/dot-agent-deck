@@ -347,25 +347,23 @@ fn pr_002_absent_pull_request_keeps_daemon_healthy() {
         }
         let mut daemon = fixture.daemon();
         fixture.start(&daemon);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let records = daemon.agent_records();
-            assert_eq!(records.len(), 1, "agent stays served for {case}");
-            assert!(
-                records[0]
-                    .live
-                    .as_ref()
-                    .and_then(|live| live.pull_request.as_ref())
-                    .is_none(),
-                "no PR expected for {case}: {:?}",
-                records[0]
-            );
-            assert!(
-                daemon.is_alive_public(),
-                "daemon remains healthy for {case}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        assert!(
+            !common::wait_until(Duration::from_secs(2), || {
+                let records = daemon.agent_records();
+                records.len() != 1
+                    || records[0]
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.pull_request.as_ref())
+                        .is_some()
+            }),
+            "agent must stay served without a PR for {case}: {:?}",
+            daemon.agent_records()
+        );
+        assert!(
+            daemon.is_alive_public(),
+            "daemon remains healthy for {case}"
+        );
         if case == "default" {
             assert!(
                 !fixture.scratch.path().join("calls").exists(),

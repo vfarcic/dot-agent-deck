@@ -50,6 +50,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
 - **Platform coverage:** mac+linux.
 
+##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (real agent).
+- **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
+- **Platform coverage:** mac+linux.
+
 ### Dashboard panes
 
 #### dashboard/pane
