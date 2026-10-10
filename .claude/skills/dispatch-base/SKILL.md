@@ -84,10 +84,11 @@ git rev-list --left-right --count <sha>...origin/main  # "0  0" is origin/main i
 - a sha that is not `origin/main`, unless the user chose to dispatch onto an older base after a step 3 refusal, in which case report the distance they chose;
 - **no clause at all**: that is an older build, or a probe of `HEAD` that failed, in which case `dispatch` cut the worktree from `HEAD` without naming it. It is never a base that is fine. Fall back to the branch's own record below, and say the clause was missing.
 
-**When the clause is missing, read the commit the unit's branch was created at from its first reflog entry**, which later commits in the unit do not change:
+**When the clause is missing, read the commit the unit's branch was created at from its first reflog entry**, which later commits in the unit do not change. Take the branch from the worktree the success line names rather than from the name you passed: `dispatch` sanitizes the name before it builds the branch, so `fix auth` becomes `agent/dispatch-fix-auth`. Read it right after the dispatch, before the unit has had time to switch branch:
 
 ```bash
-git reflog show --format='%h %gs' agent/dispatch-<name> | tail -1   # "<sha> branch: Created from <...>"
+branch=$(git -C <dir> rev-parse --abbrev-ref HEAD)              # <dir> from the success line
+git reflog show --format='%h %gs' "$branch" | tail -1          # "<sha> branch: Created from <...>"
 ```
 
 **Use that sha only when the subject starts `branch: Created from`.** It reads `Created from HEAD` when `dispatch` cut the worktree with no start-point, which is what a missing clause means, and `Created from <full sha>` when it passed the sha it reported. An empty result or any other subject means the reflog cannot answer, because it is disabled, expired or was rewritten. Then say the base could not be verified, and do not report a sha.
