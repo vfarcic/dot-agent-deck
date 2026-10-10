@@ -1090,9 +1090,31 @@ pub(crate) fn still_mounted(mount: &Path) -> Vec<PlanLine> {
     }
 }
 
+/// Whether something is at `mount`, the empty folder an attach was given: a
+/// file system mounted on it, or anything in it.
+fn occupied(mount: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Some(here), Some(parent)) = (
+            std::fs::metadata(mount).ok(),
+            mount
+                .parent()
+                .and_then(|parent| std::fs::metadata(parent).ok()),
+        ) && here.dev() != parent.dev()
+        {
+            return true;
+        }
+    }
+    std::fs::read_dir(mount).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// A disk image attached at `mount`, detached when this is dropped — on an
 /// early return or a panic as much as at the end — unless [`Self::detach`]
-/// already did.
+/// already did. It is held from before `hdiutil attach` runs, so an attach
+/// that mounted the image and then failed, timed out or panicked is cleaned
+/// up too: a detach runs only when something is at the mount point, which
+/// this upgrade created empty in its private staging directory.
 struct Attached<'a> {
     host: &'a dyn Host,
     mount: PathBuf,
@@ -1100,9 +1122,16 @@ struct Attached<'a> {
 }
 
 impl<'a> Attached<'a> {
-    /// Attach `dmg` read-only at `mount`.
+    /// Attach `dmg` read-only at `mount`. When the attach fails, whatever it
+    /// left at `mount` is detached; when that cannot be, the error is
+    /// [`UpgradeError::StillMounted`].
     fn attach(host: &'a dyn Host, dmg: &Path, mount: &Path) -> Result<Self, UpgradeError> {
-        run_checked(
+        let mut attached = Self {
+            host,
+            mount: mount.to_path_buf(),
+            attached: true,
+        };
+        let result = run_checked(
             host,
             Path::new(HDIUTIL),
             &[
@@ -1115,17 +1144,29 @@ impl<'a> Attached<'a> {
                 dmg.as_os_str(),
             ],
             INSTALL_TIMEOUT,
-        )?;
-        Ok(Self {
-            host,
-            mount: mount.to_path_buf(),
-            attached: true,
-        })
+        );
+        match result {
+            Ok(_) => Ok(attached),
+            Err(error) if attached.detach() => Err(error),
+            Err(error) => {
+                // Reported in the error; dropping the guard would only try
+                // the same detach again.
+                attached.attached = false;
+                Err(UpgradeError::StillMounted {
+                    error: Box::new(error),
+                    mount: mount.to_path_buf(),
+                })
+            }
+        }
     }
 
     /// Detach the image, forcing it when a plain detach fails. Returns
-    /// whether it is detached.
+    /// whether it is detached; with nothing at the mount point there is
+    /// nothing to detach.
     fn detach(&mut self) -> bool {
+        if self.attached && !occupied(&self.mount) {
+            self.attached = false;
+        }
         if self.attached {
             let detach = |extra: &[&OsStr]| {
                 let mut args = vec![OsStr::new("detach"), self.mount.as_os_str()];
@@ -1157,6 +1198,7 @@ impl Drop for Attached<'_> {
 /// [`check_app`] and its bundled CLI must report `version`. It is copied next to
 /// `app` with `ditto`, checked again, and swapped in by two renames, the second
 /// of which is rolled back if it fails. The image is detached on every path
+/// that returns or unwinds, an attach that failed after mounting included
 /// ([`Attached`]). When it cannot be, a successful swap returns where it is
 /// still attached, and a failed one says so in its error
 /// ([`UpgradeError::StillMounted`]).
@@ -2527,6 +2569,109 @@ mod tests {
         );
         assert_eq!(unfinished(&unanswered).install, None);
         assert_eq!(unanswered.fallback().last(), Some(&check));
+    }
+
+    /// [`fake_mac_detaching`] whose `hdiutil attach` fails: having mounted
+    /// the image (the mount point filled) when `mounts`, and by timing out
+    /// when `times_out`, else by exiting 1.
+    fn fake_mac_attach_failing(
+        mounts: bool,
+        times_out: bool,
+        plain: bool,
+        force: bool,
+    ) -> FakeHost {
+        let mut host = fake_mac_detaching(true, plain, force);
+        let detach = host.handlers.remove(HDIUTIL).unwrap();
+        host.handle_io(HDIUTIL, move |args| {
+            if args[0] != "attach" {
+                return detach(args);
+            }
+            if mounts {
+                let mount = PathBuf::from(&args[5]);
+                std::fs::create_dir_all(mount.join(DESKTOP_APP_BUNDLE)).unwrap();
+            }
+            if times_out {
+                Err(crate::self_upgrade::timed_out(INSTALL_TIMEOUT, true))
+            } else {
+                Ok(fail(
+                    "hdiutil: attach failed - Resource temporarily unavailable",
+                ))
+            }
+        })
+    }
+
+    /// Scenario: `hdiutil attach` mounts the release's image at this
+    /// upgrade's mount point and then fails or times out. The mount point is
+    /// detached anyway, plain and then forced; when that fails too, the error
+    /// says the image is still attached and how to detach it. An attach that
+    /// mounted nothing detaches nothing.
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_030_an_attach_that_mounted_and_then_failed_is_detached() {
+        let swap = |host: &FakeHost, root: &Path| {
+            let app = installed_app(root);
+            swap_app(
+                host,
+                Path::new("/s/x.dmg"),
+                &app,
+                "TEAM123",
+                "0.46.0",
+                &root.join("work"),
+            )
+            .unwrap_err()
+        };
+        let detaches = |host: &FakeHost| {
+            host.ran()
+                .into_iter()
+                .filter(|line| line.starts_with(&format!("{HDIUTIL} detach")))
+                .collect::<Vec<_>>()
+        };
+
+        for times_out in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mount = root.path().join("work/mount");
+            let host = fake_mac_attach_failing(true, times_out, true, false);
+            let err = swap(&host, root.path());
+            assert!(
+                matches!(err, UpgradeError::CommandFailed { .. }),
+                "{times_out}: {err:?}"
+            );
+            assert_eq!(
+                detaches(&host),
+                [format!("{HDIUTIL} detach {}", mount.display())],
+                "{times_out}"
+            );
+
+            let root = tempfile::tempdir().unwrap();
+            let mount = root.path().join("work/mount");
+            let host = fake_mac_attach_failing(true, times_out, false, false);
+            let err = swap(&host, root.path());
+            assert!(
+                matches!(&err, UpgradeError::StillMounted { error, mount: left }
+                    if matches!(**error, UpgradeError::CommandFailed { .. }) && *left == mount),
+                "{times_out}: {err:?}"
+            );
+            assert_eq!(
+                detaches(&host),
+                [
+                    format!("{HDIUTIL} detach {}", mount.display()),
+                    format!("{HDIUTIL} detach {} -force", mount.display()),
+                ],
+                "{times_out}"
+            );
+            let fallback = plan::render_lines(&err.fallback()).join("\n");
+            assert!(
+                fallback.contains(&format!("still attached at {}", mount.display())),
+                "{fallback}"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let host = fake_mac_attach_failing(false, false, true, true);
+        let err = swap(&host, root.path());
+        assert!(matches!(err, UpgradeError::CommandFailed { .. }), "{err:?}");
+        assert!(detaches(&host).is_empty(), "{:?}", host.ran());
     }
 
     /// Scenario: the release's image is left attached at a mount point whose
