@@ -1583,7 +1583,7 @@ It was originally written as "a ONE-FILE change". That count was wrong. PRD #802
 Two practical consequences when you add your own row:
 
 - **Expect `cargo test-fast` to go red in five files with value mismatches, and read that as the pinning working.** Each failure names the expected and actual row set; add your row to each. None of it is plumbing left undone and none of it surfaces at runtime.
-- **The seventh file is conditional and usually will not apply to you.** Rule 13's `overtaken` planted-bad-input test names a specific registry entry that has *no* row; give that entry a row and the plant has to move to another unspoken entry. It only bites when the entry you are voice-enabling happens to be the one the plant names.
+- **The seventh file is conditional and usually will not apply to you.** linkage-check rule 14's `overtaken` planted-bad-input test names a specific registry entry that has *no* row; give that entry a row and the plant has to move to another unspoken entry. It only bites when the entry you are voice-enabling happens to be the one the plant names.
 
 **Scope the promise correctly.** It covers *commands*, which is the case that grows per feature. Activation modes, the dictation countdown and the destructive-confirmation flow are plumbing — built once, not extended per feature — so "one more costs a row and no implementation" is true for commands and not for new *interaction modes*, which should be rare.
 
