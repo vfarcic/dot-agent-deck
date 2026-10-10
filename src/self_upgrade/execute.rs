@@ -1197,7 +1197,7 @@ impl Drop for Attached<'_> {
 /// The image is attached read-only under `work_dir`; the app in it must pass
 /// [`check_app`] and its bundled CLI must report `version`. It is copied next to
 /// `app` with `ditto`, checked again, and swapped in by two renames, the second
-/// of which is rolled back if it fails. The image is detached on every path
+/// of which is rolled back if it fails. A detach is attempted on every path
 /// that returns or unwinds, an attach that failed after mounting included
 /// ([`Attached`]). When it cannot be, a successful swap returns where it is
 /// still attached, and a failed one says so in its error
