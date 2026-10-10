@@ -2944,13 +2944,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const listen = useCallback(async (ours: () => boolean, carried = false) => {
     if (!voiceStart) return;
     setPhase("opening");
+    /* PRD #1631 — a fresh recording's segment starts before the device is
+       opened, not after: capture can begin recording while `voiceStart` is
+       still pending, so the app's speech that starts and ends during the
+       open is in this recording and must stay marked. */
+    if (!carried) reader.startSegment(false);
     try {
       await voiceStart();
       if (!ours()) return;
-      /* PRD #1631 — after a `voiceStop` the device was kept open, so this
-         recording already holds what was heard since that stop, the app's
-         own speech included: the segment keeps it marked. */
-      reader.startSegment(carried);
+      /* After a `voiceStop` the device was kept open, so this recording
+         already holds what was heard since that stop, the app's own speech
+         included: the segment keeps it marked. */
+      if (carried) reader.startSegment(true);
       hearNumbers();
       setPhase("listening");
     } catch (cause) {

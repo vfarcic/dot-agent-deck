@@ -313,11 +313,16 @@ pub fn verbatim_slice<'a>(transcript: &'a str, quoted: &str) -> Option<&'a str> 
 /// Words are one answer's, not two. A selection with no text whose evidence
 /// lies entirely within the evidence or the words of another question's
 /// free-text selection — the model reusing the words of "type my own colour: a hamster
-/// named Bob" to also pick another question's option — is dropped, so that
-/// question keeps waiting, rather than refusing the answer it borrowed from.
-pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<(), String> {
+/// named Bob" to also pick another question's option — or a free-text
+/// selection whose words and evidence both repeat an earlier one's for
+/// another question, is taken out of
+/// `answer` and returned, rather than refusing the answer it borrowed from.
+/// The caller still validates it with the rest ([`judge`]), so dropping can
+/// never make an invalid answer acceptable, and leaves its question
+/// unanswered, clearing any earlier answer to it.
+pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<Vec<ModelSelection>, String> {
     if answer.kind != ModelKind::Answer {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let refused = || {
         format!(
@@ -338,29 +343,42 @@ pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<(), String> 
             selection.text = Some(slice.to_string());
         }
     }
-    let borrows = |selection: &ModelSelection| {
-        let has_text = |s: &ModelSelection| s.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    let has_text = |s: &ModelSelection| s.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    // Whether `words` lie within the evidence or the words of `owner`.
+    let within = |owner: &ModelSelection, words: &str| {
+        [owner.evidence.as_deref(), owner.text.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|cited| verbatim_slice(cited, words).is_some())
+    };
+    // A textless selection borrows from any other question's free text; one
+    // with text borrows only when its words and its evidence both repeat an
+    // EARLIER free-text selection's — the model copying "a hamster named Bob"
+    // onto Sizes' free-text option too — so the first to claim words keeps them.
+    let borrows = |at: usize, selection: &ModelSelection| {
         let Some(evidence) = selection.evidence.as_deref() else {
             return false;
         };
-        !has_text(selection)
-            && answer.selections.iter().any(|owner| {
-                owner.question_index != selection.question_index
-                    && has_text(owner)
-                    && [owner.evidence.as_deref(), owner.text.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .any(|cited| verbatim_slice(cited, evidence).is_some())
-            })
+        let text = selection.text.as_deref().filter(|t| !t.trim().is_empty());
+        answer.selections.iter().enumerate().any(|(from, owner)| {
+            owner.question_index != selection.question_index
+                && has_text(owner)
+                && within(owner, evidence)
+                && match text {
+                    None => true,
+                    Some(text) => from < at && within(owner, text),
+                }
+        })
     };
-    let kept: Vec<ModelSelection> = answer
+    let (dropped, kept): (Vec<_>, Vec<_>) = answer
         .selections
         .iter()
-        .filter(|selection| !borrows(selection))
-        .cloned()
-        .collect();
+        .enumerate()
+        .partition(|(at, selection)| borrows(*at, selection));
+    let dropped: Vec<ModelSelection> = dropped.into_iter().map(|(_, s)| s.clone()).collect();
+    let kept: Vec<ModelSelection> = kept.into_iter().map(|(_, s)| s.clone()).collect();
     answer.selections = kept;
-    Ok(())
+    Ok(dropped)
 }
 
 /// Take one utterance to a verdict about the pending `question`.
@@ -430,7 +448,7 @@ pub async fn resolve(
         return finish(verdict, None);
     }
     if let Some(answer) = fast_path(question, &words) {
-        return finish(judge(agent, question, &form, answer), None);
+        return finish(judge(agent, question, &form, answer, &[]), None);
     }
     let started = std::time::Instant::now();
     let answered = resolver
@@ -443,7 +461,7 @@ pub async fn resolve(
     let resolve_ms = Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
     let verdict = match answered {
         Ok(mut answer) => match ground(transcript.text(), &mut answer) {
-            Ok(()) => judge(agent, question, &form, answer),
+            Ok(dropped) => judge(agent, question, &form, answer, &dropped),
             Err(sentence) => QuestionVerdict::Refused { sentence },
         },
         Err(error) => QuestionVerdict::Refused {
@@ -508,19 +526,47 @@ fn fast_path(question: &DesktopPendingQuestion, words: &[String]) -> Option<Mode
 }
 
 /// A model's (or the fast path's) answer, validated and merged into `form`.
+///
+/// `dropped` are the selections [`ground`] took out for borrowing another
+/// question's words. They are validated with the rest first — an invalid one
+/// refuses the answer exactly as if nothing had been dropped — and then leave
+/// their questions unanswered: an earlier answer to such a question is
+/// cleared from `form`, so a drop can never make the form more sendable.
 fn judge(
     agent: &str,
     question: &DesktopPendingQuestion,
     form: &[Selection],
     answer: ModelAnswer,
+    dropped: &[ModelSelection],
 ) -> QuestionVerdict {
     match answer.kind {
         ModelKind::NotAnswer => QuestionVerdict::NotAnswer,
         ModelKind::Cancel => cancelled(),
-        ModelKind::Answer => match validate(agent, question, &answer.selections) {
-            Ok(selections) => answered(agent, question, merge(form, selections)),
-            Err(sentence) => QuestionVerdict::Refused { sentence },
-        },
+        ModelKind::Answer => {
+            if !dropped.is_empty() {
+                let all: Vec<ModelSelection> =
+                    answer.selections.iter().chain(dropped).cloned().collect();
+                if let Err(sentence) = validate(agent, question, &all) {
+                    return QuestionVerdict::Refused { sentence };
+                }
+            }
+            match validate(agent, question, &answer.selections) {
+                Ok(selections) => {
+                    // Validated above, so each index fits a question.
+                    let cleared: Vec<Selection> = form
+                        .iter()
+                        .filter(|old| {
+                            !dropped
+                                .iter()
+                                .any(|d| d.question_index == i64::from(old.question_index))
+                        })
+                        .cloned()
+                        .collect();
+                    answered(agent, question, merge(&cleared, selections))
+                }
+                Err(sentence) => QuestionVerdict::Refused { sentence },
+            }
+        }
     }
 }
 

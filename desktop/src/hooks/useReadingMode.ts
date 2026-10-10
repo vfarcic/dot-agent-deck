@@ -11,7 +11,10 @@
  * recording of the app's own voice ends after the voice does. Nor does the
  * next `voiceStart` begin a segment when it carries on with the kept device:
  * that recording began at the `voiceStop`, so speech that started and ended
- * while the previous utterance was worked on is in it.
+ * while the previous utterance was worked on is in it. A fresh open begins its
+ * segment before `voiceStart` is called rather than when it returns: capture
+ * can be recording before the open resolves, so speech during the open is in
+ * that recording too.
  */
 
 import { useEffect, useMemo, useRef } from "react";
@@ -32,8 +35,9 @@ export interface UseReadingMode {
    * with the device kept open since the last {@link takeSegment} (PR #1451),
    * whose buffer already holds whatever was heard while that utterance was
    * transcribed and resolved: the app's speech in that interval stays marked
-   * on the segment. Otherwise the device opened afresh and a new segment
-   * starts now.
+   * on the segment. Otherwise the device is about to be opened afresh and a
+   * new segment starts now — called before the open, not after it, so the
+   * app's speech while the open is pending stays marked.
    */
   startSegment: (carried: boolean) => void;
 }
