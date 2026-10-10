@@ -154,7 +154,7 @@ fn proxy_connection(
             let _ = release_list_rx
                 .lock()
                 .expect("attach-race release receiver")
-                .recv_timeout(Duration::from_secs(10));
+                .recv_timeout(attach_race_wait());
             write_wire_frame(&mut downstream, &response_frame)?;
             relay_after_first_response(downstream, upstream)
         }
@@ -260,7 +260,7 @@ impl AttachRaceGate {
     fn wait_for_empty_snapshot(&self, attempt: usize) {
         let count = self
             .list_snapshot_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(attach_race_wait())
             .unwrap_or_else(|error| {
                 panic!(
                     "attach-race attempt {attempt}: TUI hydration did not capture ListAgents: \
@@ -278,7 +278,7 @@ impl AttachRaceGate {
 
     fn wait_for_subscription(&self, attempt: usize) {
         self.subscription_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(attach_race_wait())
             .unwrap_or_else(|error| {
                 panic!(
                     "attach-race attempt {attempt}: TUI event subscription was not active while \
@@ -291,7 +291,7 @@ impl AttachRaceGate {
     fn wait_for_surface_event(&self, attempt: usize, pane_id: &str) {
         let payload = self
             .event_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(attach_race_wait())
             .unwrap_or_else(|error| {
                 panic!(
                     "attach-race attempt {attempt}: no card-surface event crossed the TUI's live \
@@ -573,6 +573,18 @@ impl DesktopAttachClient {
     }
 }
 
+/// PRD #1258: the ceiling on each must-happen step of an attach-race attempt —
+/// the TUI booting far enough to hydrate and subscribe, the desktop start
+/// reaching the registry, the event crossing, the card rendering, and the
+/// proxy's hold on hydration until the test releases it — load-scaled from the
+/// fixed 10 s these waits used. The mid-attach test went red twice in 23 runs
+/// of this file on a box with `io full` at 70-80%, each time at ~38 s, and
+/// passed alone in between: the shape #709's scaling exists for. Every wait
+/// returns the instant its condition holds, so an idle box pays nothing.
+fn attach_race_wait() -> Duration {
+    common::load_scaled(Duration::from_secs(10))
+}
+
 fn run_mid_attach_start_attempt(attempt: usize) {
     let daemon = common::spawn_daemon_serve(None, "0");
     assert!(
@@ -591,7 +603,7 @@ fn run_mid_attach_start_attempt(attempt: usize) {
     gate.wait_for_empty_snapshot(attempt);
     gate.wait_for_subscription(attempt);
     start_plain_from_desktop(&daemon, canonical_string(cwd.path()), &pane_id, &label);
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let records = daemon.wait_for_agent_count(1, attach_race_wait());
     assert_eq!(
         records.len(),
         1,
@@ -604,7 +616,7 @@ fn run_mid_attach_start_attempt(attempt: usize) {
     gate.release_hydration();
 
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
+        common::wait_until(attach_race_wait(), || {
             deck.snapshot_grid().contains(&label)
         }),
         "attach-race attempt {attempt}: the desktop-started card-surface event crossed the \

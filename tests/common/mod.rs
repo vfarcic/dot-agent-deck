@@ -9517,8 +9517,16 @@ pub fn spawn_daemon_serve_with_env(
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
     /// binding) or a bounded timeout elapses.
+    ///
+    /// PRD #1258: the bound is the binary's own lazy-spawn bound
+    /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
+    /// widened by [`load_scaled`]. It was a fixed 10 s, shorter than the time
+    /// the deck itself gives a daemon to bind, and a STARVED lane-1 run lost
+    /// seven tests to it — `deck.log` from the same run showed one daemon's
+    /// pre-bind work alone taking 5.7 s.
     fn wait_for_attach_socket(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
+        let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
                 return;
@@ -9526,7 +9534,7 @@ impl DaemonProc {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "daemon never bound its attach socket at {} within 10s",
+            "daemon never bound its attach socket at {} within {budget:?}",
             self.attach_socket.display()
         );
     }
