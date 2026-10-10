@@ -1639,6 +1639,22 @@ const READY_TO_POINTER_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const MEASURED_LATENCY_CEILING: Duration = Duration::from_secs(34);
 
+/// The base ceiling on a wrapped replacement painting its ready banner, before
+/// [`common::load_scaled`] widens it — the boot leg `/026`, `/027` and `/029`
+/// open with.
+///
+/// A BOOT, not a behaviour, for [`common::CHILD_BOOT_BASE`]'s reason: the
+/// banner is the control that the replacement got going at all, and the wait
+/// returns the instant it appears. It was a flat 10 s, and on a 16-core box at
+/// load average 87 (PSI cpu some 84%) all three tests failed together at that
+/// instant with an EMPTY snapshot — the debug deck binary, `wrap`'s Codex hook
+/// install and the `sh` under it had not been scheduled through to a first byte
+/// yet. Kept at 10 s rather than the shared 8 s base because this boot is a
+/// `wrap` plus a child, heavier than the bare `sh` that base was sized against,
+/// so an idle box keeps exactly the bound it had.
+#[cfg(unix)]
+const WRAPPED_BANNER_BOOT_BASE: Duration = Duration::from_secs(10);
+
 /// Issue #243: the ready prompt a wrapped Codex stand-in paints once its
 /// interface exists, carrying a nonce so a snapshot match cannot be anything but
 /// this fixture's own banner.
@@ -1782,7 +1798,7 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         &daemon.registry,
         &new_agent_id,
         WRAPPED_READY_BANNER.as_bytes(),
-        Duration::from_secs(10),
+        common::load_scaled(WRAPPED_BANNER_BOOT_BASE),
     )
     .await;
     assert!(
@@ -2100,7 +2116,7 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         &daemon.registry,
         &new_agent_id,
         banner.as_bytes(),
-        Duration::from_secs(10),
+        common::load_scaled(WRAPPED_BANNER_BOOT_BASE),
     )
     .await;
     assert!(

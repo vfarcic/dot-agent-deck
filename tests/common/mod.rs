@@ -11482,7 +11482,15 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // A daemon task getting going, not a behaviour: both readiness waits below
+    // take `daemon_task_start_budget`. They were flat 5 s ceilings, and all nine
+    // `pane_restart` tests failed together at the attach one in a `test-fast`
+    // run under `/proc/pressure/io full` 89% — the attach listener binds behind
+    // a synchronous `LoadedSchedules::load()`, so an I/O stall lands squarely in
+    // the gap between the two sockets. Each wait returns the instant its socket
+    // accepts, so an idle box pays nothing for the headroom.
+    let budget = daemon_task_start_budget();
+    let deadline = tokio::time::Instant::now() + budget;
     let mut ready = false;
     while tokio::time::Instant::now() < deadline {
         if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
@@ -11493,7 +11501,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket was not accepting connections within 5s"
+        "in-process daemon hook socket was not accepting connections within {budget:?}"
     );
 
     // Issue #954: and the ATTACH socket too, because this function hands one
@@ -11513,7 +11521,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // harness-sized version of that bug being written next. `daemon_status.rs`
     // had already hand-rolled this wait for its own calls; the other consumer,
     // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
-    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let attach_deadline = tokio::time::Instant::now() + budget;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < attach_deadline {
         if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
@@ -11524,7 +11532,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         attach_ready,
-        "in-process daemon attach socket {} was not accepting connections within 5s",
+        "in-process daemon attach socket {} was not accepting connections within {budget:?}",
         attach_path.display()
     );
 
