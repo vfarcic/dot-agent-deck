@@ -427,18 +427,48 @@ pub(crate) fn parse_team_id(codesign_stderr: &str) -> Option<String> {
 
 /// This process's own copy.
 pub fn running(host: &dyn Host, copy: CopyKind) -> Result<Installation, super::UpgradeError> {
-    let executable = crate::platform::paths::executable_path()
-        .map(PathBuf::from)
-        .and_then(|path| host.canonicalize(&path))
-        .ok_or(super::UpgradeError::NoExecutable)?;
+    let executable = running_executable(host).ok_or(super::UpgradeError::NoExecutable)?;
     Ok(inspect(
         host,
         copy,
         &executable,
         &running_version(),
-        Some(env!("DAD_BUILD_ID")),
+        running_build_id(),
         Platform::current(),
     ))
+}
+
+/// This process's executable, with every symlink resolved. Under the `e2e`
+/// feature only, `DOT_AGENT_DECK_TEST_RUNNING_EXE` names it instead, taken as
+/// given, so an L2 test can make the real binary look installed somewhere it
+/// is not — a folder the test can write, or a `/nix/store` path no test can
+/// create. The in-process override `effective_current_exe` reads cannot reach
+/// a spawned binary, which is why this is an environment variable; it is
+/// gated on the feature for the reason that function's doc gives.
+fn running_executable(host: &dyn Host) -> Option<PathBuf> {
+    #[cfg(feature = "e2e")]
+    if let Ok(exe) = std::env::var("DOT_AGENT_DECK_TEST_RUNNING_EXE")
+        && !exe.is_empty()
+    {
+        return Some(PathBuf::from(exe));
+    }
+    crate::platform::paths::executable_path()
+        .map(PathBuf::from)
+        .and_then(|path| host.canonicalize(&path))
+}
+
+/// This build's id, which only [`detect`]'s `-dirty` check reads. Under the
+/// `e2e` feature, a test that replaced the running version
+/// (`DOT_AGENT_DECK_TEST_RUNNING_VERSION`) gets none: the id describes the
+/// real build, not the version the test made it report, and a test binary
+/// built from a checkout with uncommitted changes would otherwise be detected
+/// as a source build on one machine and not on another.
+fn running_build_id() -> Option<&'static str> {
+    #[cfg(feature = "e2e")]
+    if std::env::var("DOT_AGENT_DECK_TEST_RUNNING_VERSION").is_ok_and(|v| !v.is_empty()) {
+        return None;
+    }
+    Some(env!("DAD_BUILD_ID"))
 }
 
 /// The version this build reports. Under the `e2e` feature only,

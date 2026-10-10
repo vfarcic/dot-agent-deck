@@ -232,10 +232,21 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// STUB (issue #1635): what the TUI adds after upgrading the copy it runs
-    /// from.
-    pub fn tui_restart_line(&self, _version: &str) -> Option<PlanLine> {
-        None
+    /// What the TUI adds after upgrading the copy it runs from to `version`:
+    /// the running process is still the old build until it is restarted. Once
+    /// the copy is staged, the user installs it first. `None` for the desktop
+    /// app, which is not the TUI the user restarts.
+    pub fn tui_restart_line(&self, version: &str) -> Option<PlanLine> {
+        let line = match self {
+            Self::AppReplaced { .. } => return None,
+            Self::Staged { .. } => {
+                format!("Once it is installed, quit the TUI and start it again to run v{version}.")
+            }
+            Self::Replaced { .. } | Self::BrewUpgraded { .. } | Self::Installed { .. } => {
+                format!("Quit the TUI and start it again to run v{version}.")
+            }
+        };
+        Some(PlanLine::Text(line))
     }
 
     /// What to tell the user, as a terminal prints it ([`Self::items`]).

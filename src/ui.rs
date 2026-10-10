@@ -373,6 +373,10 @@ pub enum UiMode {
     /// selection emits [`Action::ConfirmCloseSelected`] and performs the
     /// teardown. The selection index lives in `UiState::close_confirm`.
     CloseConfirm,
+    /// Issue #1635: the upgrade dialog, opened by the `open_upgrade` key
+    /// (default `u`) or a click on the footer's update badge. Its state lives
+    /// in `UiState::upgrade_dialog`.
+    Upgrade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2280,8 +2284,20 @@ struct UiState {
     keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
-    /// Populated by the background version-check task when a newer release is available.
-    update_available: Option<String>,
+    /// Issue #1635: the last release check's plans, mirrored from
+    /// `AppState::upgrade_check` each frame. Drives the footer badge and seeds
+    /// the upgrade dialog.
+    upgrade_check: Option<Arc<crate::upgrade_dialog::UpgradeCheck>>,
+    /// Issue #1635: the open upgrade dialog. Kept while an upgrade runs even
+    /// if `Ctrl+C` took the deck to the quit dialog, so the upgrade key
+    /// reopens it on the same run.
+    upgrade_dialog: Option<crate::upgrade_dialog::UpgradeDialog>,
+    /// Issue #1635: where the running upgrade reports back. The upgrade runs
+    /// on a tokio task; the render loop drains this each frame.
+    upgrade_results: Option<std::sync::mpsc::Receiver<(usize, crate::upgrade_dialog::RunResult)>>,
+    /// Issue #1635: a dialog that ran an upgrade was closed, so the next frame
+    /// starts a fresh release check.
+    upgrade_recheck: bool,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
     /// The command-entry lock: while engaged, a keystroke aimed at a focused
@@ -2700,7 +2716,10 @@ impl UiState {
             config,
             keybindings,
             last_bell_status: HashMap::new(),
-            update_available: None,
+            upgrade_check: None,
+            upgrade_dialog: None,
+            upgrade_results: None,
+            upgrade_recheck: false,
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             session_warnings: Vec::new(),
@@ -7052,6 +7071,12 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
+    /// (default `u`) and a click on the footer's update badge.
+    OpenUpgrade,
+    /// Issue #1635: a click on one of the upgrade dialog's buttons — mouse
+    /// parity for its keys.
+    UpgradeChoose(crate::upgrade_dialog::UpgradeChoice),
     /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
     /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
     /// with a blank context (same outcome as pressing `a`).
@@ -8399,6 +8424,145 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// Issue #1635: the upgrade dialog owns the keyboard while it is open.
+fn handle_upgrade_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    match ui.upgrade_dialog.as_mut() {
+        Some(dialog) => {
+            let effect = dialog.handle_key(key);
+            apply_upgrade_effect(ui, effect);
+        }
+        None => ui.mode = UiMode::Normal,
+    }
+    Action::Continue
+}
+
+/// Issue #1635: open the upgrade dialog on the last check's plans. A dialog
+/// kept because its upgrade was still running (or finished while the deck
+/// was elsewhere) is reopened instead, so its result is not lost. With no copy
+/// behind, the status bar says so in the core's words.
+fn open_upgrade_dialog(ui: &mut UiState) {
+    if ui.upgrade_dialog.is_some() {
+        ui.mode = UiMode::Upgrade;
+        return;
+    }
+    let check = ui.upgrade_check.clone();
+    match check {
+        Some(check) if check.notice().is_some() => {
+            ui.upgrade_dialog = Some(crate::upgrade_dialog::UpgradeDialog::new(
+                check.plans.clone(),
+            ));
+            ui.mode = UiMode::Upgrade;
+        }
+        Some(check) => {
+            let message = check
+                .plans
+                .first()
+                .map_or_else(String::new, |plan| plan.headline());
+            ui.status_message = Some((message, std::time::Instant::now()));
+        }
+        None => {
+            ui.status_message = Some((
+                "No newer release has been found.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Issue #1635: act on what a key or a click did in the upgrade dialog.
+fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect) {
+    use crate::upgrade_dialog::{Effect, RunResult};
+    match effect {
+        Effect::None => {}
+        Effect::Close => {
+            // After an upgrade, check again, as the desktop app does on Close.
+            if ui
+                .upgrade_dialog
+                .take()
+                .is_some_and(|dialog| dialog.ran_any())
+            {
+                ui.upgrade_recheck = true;
+            }
+            ui.mode = UiMode::Normal;
+        }
+        Effect::Run(index) => {
+            let Some(plan) = ui
+                .upgrade_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.plans().get(index).cloned())
+            else {
+                return;
+            };
+            // The first plan is always this TUI's own copy
+            // (`upgrade_dialog::check`).
+            let this_tui = index == 0;
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    ui.upgrade_results = Some(rx);
+                    handle.spawn(async move {
+                        let result = crate::upgrade_dialog::run(plan, this_tui).await;
+                        let _ = tx.send((index, result));
+                    });
+                }
+                Err(e) => {
+                    if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                        dialog.finish(
+                            index,
+                            RunResult::from_error(&crate::self_upgrade::UpgradeError::Io(
+                                e.to_string(),
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Issue #1635: hand a finished upgrade's result to its dialog, and start the
+/// re-check a closed dialog asked for. Runs once per frame on the render
+/// thread; neither step blocks.
+fn drain_upgrade_results(ui: &mut UiState, state: &SharedState) {
+    use std::sync::mpsc::TryRecvError;
+    let received = match ui.upgrade_results.as_ref().map(|rx| rx.try_recv()) {
+        None | Some(Err(TryRecvError::Empty)) => None,
+        Some(Ok(finished)) => Some(finished),
+        Some(Err(TryRecvError::Disconnected)) => {
+            let index = match ui.upgrade_dialog.as_ref().map(|d| d.phase()) {
+                Some(crate::upgrade_dialog::Phase::Running(index)) => index,
+                _ => 0,
+            };
+            Some((
+                index,
+                crate::upgrade_dialog::RunResult::from_error(
+                    &crate::self_upgrade::UpgradeError::Io(
+                        "the upgrade stopped before it reported a result".to_string(),
+                    ),
+                ),
+            ))
+        }
+    };
+    if let Some((index, result)) = received {
+        ui.upgrade_results = None;
+        if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+            dialog.finish(index, result);
+        }
+        if ui.mode != UiMode::Upgrade {
+            ui.status_message = Some((
+                "The upgrade finished. Open the upgrade dialog to see the result.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    if std::mem::take(&mut ui.upgrade_recheck)
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        let state = state.clone();
+        handle.spawn(async move { crate::upgrade_dialog::refresh(&state).await });
+    }
+}
+
 /// Open the project repository in the user's browser and build the status
 /// message for whichever way that went.
 ///
@@ -9420,6 +9584,11 @@ fn handle_normal_key(
     // so existing muscle memory keeps working while lowercase `s` is added.
     if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
+    }
+    // Issue #1635: open the upgrade dialog the footer badge names (default
+    // `u`), shared with a click on the badge.
+    if kb.matches(KbAction::OpenUpgrade, &key) {
+        return Action::OpenUpgrade;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -10473,7 +10642,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 /// about to happen. The modal owns the keyboard until it is answered; `Ctrl+C`
 /// keeps its own carve-out to the quit flow.
 fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if mode == UiMode::CloseConfirm {
+    // Issue #1635: the upgrade dialog owns the keyboard the same way, so a
+    // tab switch or a new pane cannot slip in under an upgrade's question.
+    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
         return None;
     }
     match global_action(kb, key) {
@@ -10779,7 +10950,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // Issue #142: the Schedules manager is a topmost modal as well.
         // The wheel over it belongs to ITS list (handled before this guard),
         // never to whatever pane the centered dialog happens to cover.
-        | UiMode::ScheduledTasks => true,
+        | UiMode::ScheduledTasks
+        // Issue #1635: the upgrade dialog is a topmost modal.
+        | UiMode::Upgrade => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -12393,6 +12566,13 @@ fn dispatch_action(
         // `s`/`S` key and the `[Schedules s]` button-bar button. Loads the
         // schedules from the global config and snapshots which currently have a
         // live tab/agent (for the status indicator), then switches mode.
+        Action::OpenUpgrade => open_upgrade_dialog(ui),
+        Action::UpgradeChoose(choice) => {
+            if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                let effect = dialog.choose(choice);
+                apply_upgrade_effect(ui, effect);
+            }
+        }
         Action::OpenScheduledTasks => {
             let tasks = config::LoadedSchedules::load().tasks;
             ui.scheduled_tasks = tasks;
@@ -13285,6 +13465,22 @@ fn handle_key_event(
             }
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
+            // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
+            // while an upgrade runs; the running upgrade's dialog is kept so the
+            // upgrade key reopens it on the same run.
+            UiMode::Upgrade if is_ctrl_c => {
+                if !ui
+                    .upgrade_dialog
+                    .as_ref()
+                    .is_some_and(crate::upgrade_dialog::UpgradeDialog::is_running)
+                {
+                    ui.upgrade_dialog = None;
+                }
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::Upgrade => handle_upgrade_key(key, ui),
         });
     }
 
@@ -14336,10 +14532,10 @@ pub fn run_tui(
 
         let snapshot = state.blocking_read().clone();
 
-        // Pick up version-check result once
-        if ui.update_available.is_none() {
-            ui.update_available = snapshot.update_available.clone();
-        }
+        // Issue #1635: the latest release check, and the result of an
+        // upgrade the dialog started.
+        ui.upgrade_check = snapshot.upgrade_check.clone();
+        drain_upgrade_results(&mut ui, &state);
 
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
@@ -15418,6 +15614,9 @@ pub fn run_tui(
                         // buttons live in `modal_button_rects` and any miss is
                         // consumed here rather than reaching the pane behind it.
                         | UiMode::ScheduledTasks
+                        // Issue #1635: the upgrade dialog's buttons live in
+                        // `modal_button_rects` too.
+                        | UiMode::Upgrade
                 );
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
@@ -17318,6 +17517,14 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         // event loop).
         ui.close_confirm_displayed = true;
     }
+    if ui.mode == UiMode::Upgrade
+        && let Some(dialog) = ui.upgrade_dialog.as_ref()
+    {
+        ui.modal_button_rects = crate::upgrade_dialog::render(frame, dialog)
+            .into_iter()
+            .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
+            .collect();
+    }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
@@ -18844,15 +19051,19 @@ fn render_bottom_bar(
                     has_pane_control,
                     extra_buttons,
                 );
-                // Preserve the "update available" badge by right-aligning it
-                // after the bar when set (it's a separate notification, not the
-                // removed legend text).
-                if let Some(ref latest) = ui.update_available {
-                    let badge = format!(
-                        " Update available: v{latest} (current: v{}) ",
-                        env!("DAD_VERSION")
+                // Issue #1635: the update badge, right-aligned after the bar when
+                // a copy on this machine is behind — the same words as the
+                // desktop app's notice, naming the key that opens the upgrade
+                // dialog. A click on it opens the dialog too; it is drawn over
+                // the bar's right end, so its rect is hit-tested first.
+                let mut rects = rects;
+                if let Some(notice) = ui.upgrade_check.as_ref().and_then(|check| check.notice()) {
+                    let badge = crate::upgrade_dialog::badge_text(
+                        &notice,
+                        &display_notation(&ui.keybindings, KbAction::OpenUpgrade),
                     );
-                    let bw = badge.chars().count() as u16;
+                    let bw = u16::try_from(unicode_width::UnicodeWidthStr::width(badge.as_str()))
+                        .unwrap_or(u16::MAX);
                     if bw < area.width {
                         let badge_area = Rect {
                             x: area.x + area.width - bw,
@@ -18870,6 +19081,7 @@ fn render_bottom_bar(
                             )),
                             badge_area,
                         );
+                        rects.insert(0, (Action::OpenUpgrade, badge_area));
                     }
                 }
                 ui.button_rects = rects;
@@ -19648,6 +19860,9 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
+        // Issue #1635: opens the upgrade dialog while the footer's update
+        // badge shows.
+        help_key_line(&n(KbAction::OpenUpgrade), "Upgrade (update badge)"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -42715,7 +42930,8 @@ mod tests {
             | UiMode::QuitConfirm
             | UiMode::StopConfirm
             | UiMode::ScheduledTasks
-            | UiMode::CloseConfirm => mode,
+            | UiMode::CloseConfirm
+            | UiMode::Upgrade => mode,
         }
     }
 
@@ -42736,6 +42952,7 @@ mod tests {
             UiMode::StopConfirm,
             UiMode::ScheduledTasks,
             UiMode::CloseConfirm,
+            UiMode::Upgrade,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)

@@ -52,7 +52,7 @@ The app checks for a newer release when it starts and every 6 hours while it run
 - an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
 - a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
 
-Nothing appears while both copies are current, or while the app cannot reach GitHub. The TUI shows the same notice as `Update available: v<new> (current: v<yours>)` in its footer, and upgrades with `dot-agent-deck upgrade` in a terminal ([Installation → Upgrading](../installation.md#upgrading)), which shows the same plan as this dialog.
+Nothing appears while both copies are current, or while the app cannot reach GitHub. The TUI checks on the same schedule and shows the same notice at the right end of its footer; pressing `u` there opens its own upgrade dialog, with the same plans and the same one-copy-at-a-time questions as this one ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plan too.
 
 ### The upgrade dialog
 

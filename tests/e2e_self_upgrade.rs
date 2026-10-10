@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", target_os = "linux"))]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Upgrading this machine's copy of dot-agent-deck (issue #1635), through the
 //! real binary against a fake release server: the TUI's badge, its upgrade
@@ -10,10 +10,11 @@
 //! chose (`DOT_AGENT_DECK_TEST_RUNNING_EXE`), and where releases are looked up
 //! and downloaded (`DOT_AGENT_DECK_TEST_RELEASES_API_URL`,
 //! `DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL`,
-//! `DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE`). The "release" it downloads is
-//! a copy of the binary under test with a marker appended, so it answers
-//! `--version` with the release's version and a replaced file is recognisable.
-//! Linux only: appending bytes to a Mach-O binary breaks its signature.
+//! `DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE`). The "release binary" it
+//! downloads is a small script that answers `--version` as dot-agent-deck
+//! [`RELEASE`]: the core checks a download only by its checksum and that
+//! answer, so the script exercises the whole download → check → replace path
+//! without moving a few hundred megabytes of debug binary per test.
 
 mod common;
 
@@ -28,28 +29,13 @@ use common::TuiDeck;
 use dot_agent_deck::self_upgrade::Platform;
 use spec::spec;
 
-/// What a running copy older than any release reports.
+/// What a running copy older than the release reports.
 const OLD_VERSION: &str = "0.0.1";
-/// Appended to the served binary so a replaced file can be told apart.
-const MARKER: &[u8] = b"\n#dot-agent-deck-upgrade-test-release\n";
+/// The release the fake server offers.
+const RELEASE: &str = "9.9.9";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_dot-agent-deck")
-}
-
-/// The version the binary under test reports, which is the version the fake
-/// release carries.
-fn real_version() -> String {
-    let out = Command::new(bin())
-        .arg("--version")
-        .output()
-        .expect("run --version");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let version = stdout
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("unexpected --version output {stdout:?}"));
-    version.strip_prefix('v').unwrap_or(version).to_string()
 }
 
 fn cli_asset() -> &'static str {
@@ -171,11 +157,11 @@ fn serve(mut stream: TcpStream, latest: &str, asset: &[u8], manifest: &str) {
     let _ = reader.read_to_end(&mut rest);
 }
 
-/// The release the fake server offers: the binary under test plus
-/// [`MARKER`], and a checksum manifest that lists it (or a wrong checksum).
+/// The release binary the fake server offers — a script that answers
+/// `--version` as dot-agent-deck [`RELEASE`] — and a checksum manifest that
+/// lists it (or a wrong checksum).
 fn release(correct_checksum: bool) -> (Vec<u8>, String) {
-    let mut asset = std::fs::read(bin()).expect("read binary under test");
-    asset.extend_from_slice(MARKER);
+    let asset = format!("#!/bin/sh\necho 'dot-agent-deck {RELEASE}'\n").into_bytes();
     let sha = if correct_checksum {
         sha256_hex(&asset)
     } else {
@@ -235,9 +221,9 @@ fn run_upgrade(server: &FakeReleases, exe: &Path, home: &Path, args: &[&str]) ->
 #[spec("upgrade/tui-upgrade/001")]
 #[test]
 fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(true);
-    let server = FakeReleases::start(&version, asset.clone(), manifest);
+    let server = FakeReleases::start(version, asset.clone(), manifest);
     let dir = common::harness_tempdir().expect("tempdir");
     let exe = writable_install(dir.path());
     let old = std::fs::read(&exe).unwrap();
@@ -280,9 +266,9 @@ fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
 #[spec("upgrade/tui-upgrade/002")]
 #[test]
 fn tui_upgrade_002_nix_copy_is_notify_only() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(true);
-    let server = FakeReleases::start(&version, asset, manifest);
+    let server = FakeReleases::start(version, asset, manifest);
     let exe = PathBuf::from("/nix/store/0000000000000000-dot-agent-deck-0.0.1/bin/dot-agent-deck");
 
     let deck = deck(&server, &exe, &[]);
@@ -305,7 +291,7 @@ fn tui_upgrade_002_nix_copy_is_notify_only() {
 #[spec("upgrade/tui-upgrade/003")]
 #[test]
 fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(true);
     let server = FakeReleases::start(OLD_VERSION, asset, manifest);
     let dir = common::harness_tempdir().expect("tempdir");
@@ -323,7 +309,7 @@ fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
     });
     assert!(!badge_shown, "{}", deck.snapshot_grid());
 
-    server.set_latest(&version);
+    server.set_latest(version);
     assert!(
         deck.wait_for_grid_string_within(
             &format!("update available: v{version}"),
@@ -338,9 +324,9 @@ fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
 #[spec("upgrade/cli-upgrade/001")]
 #[test]
 fn cli_upgrade_001_check_prints_the_plan_and_changes_nothing() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(true);
-    let server = FakeReleases::start(&version, asset, manifest);
+    let server = FakeReleases::start(version, asset, manifest);
     let dir = common::harness_tempdir().expect("tempdir");
     let exe = writable_install(dir.path());
     let old = std::fs::read(&exe).unwrap();
@@ -373,9 +359,9 @@ fn cli_upgrade_001_check_prints_the_plan_and_changes_nothing() {
 #[spec("upgrade/cli-upgrade/002")]
 #[test]
 fn cli_upgrade_002_yes_replaces_the_binary() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(true);
-    let server = FakeReleases::start(&version, asset.clone(), manifest);
+    let server = FakeReleases::start(version, asset.clone(), manifest);
     let dir = common::harness_tempdir().expect("tempdir");
     let exe = writable_install(dir.path());
 
@@ -401,9 +387,9 @@ fn cli_upgrade_002_yes_replaces_the_binary() {
 #[spec("upgrade/cli-upgrade/003")]
 #[test]
 fn cli_upgrade_003_checksum_mismatch_leaves_the_old_binary() {
-    let version = real_version();
+    let version = RELEASE;
     let (asset, manifest) = release(false);
-    let server = FakeReleases::start(&version, asset, manifest);
+    let server = FakeReleases::start(version, asset, manifest);
     let dir = common::harness_tempdir().expect("tempdir");
     let exe = writable_install(dir.path());
     let old = std::fs::read(&exe).unwrap();

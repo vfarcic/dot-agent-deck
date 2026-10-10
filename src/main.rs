@@ -2482,12 +2482,10 @@ async fn run_tui_session() -> ExitCode {
     // the TUI's `AppState` mirrors live agent activity.
     spawn_event_subscriber(attach_path.clone(), state.clone());
 
-    let version_state = state.clone();
-    tokio::spawn(async move {
-        if let Some(latest) = dot_agent_deck::version::check_for_update().await {
-            version_state.write().await.update_available = Some(latest);
-        }
-    });
+    // Issue #1635: check for a newer release at start and every re-check
+    // interval, and plan this machine's copies, for the footer badge and the
+    // upgrade dialog.
+    tokio::spawn(dot_agent_deck::upgrade_dialog::run_checker(state.clone()));
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 

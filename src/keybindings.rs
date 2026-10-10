@@ -335,12 +335,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         default: "s",
         description: "Schedules manager",
     },
-    // Issue #1635: open the upgrade dialog. STUB: unbound until implemented.
+    // Issue #1635: open the upgrade dialog the footer's update badge names.
+    // Default `u`, free in command mode; the badge and the help overlay read
+    // the active binding, so a rebind shows there too.
     ActionSpec {
         action: Action::OpenUpgrade,
         section: Section::Dashboard,
         name: "open_upgrade",
-        default: "",
+        default: "u",
         description: "Upgrade",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused

@@ -298,10 +298,21 @@ The daemon owns the agents. Quitting the TUI with **Detach** leaves them running
 
 Both clients tell you when a newer release exists:
 
-- **TUI**: when it starts, it checks for a newer release and, if there is one, shows `Update available: v<new> (current: v<yours>)` at the right end of the footer. Upgrade with `dot-agent-deck upgrade` in another terminal (below).
+- **TUI**: it checks when it starts and every 6 hours while it runs. When this machine's CLI or desktop app is behind, the right end of the footer shows a notice such as `dot-agent-deck: update available: v0.47.0 (current: v0.46.0) · u to upgrade`. Press `u` in command mode, or click the notice, to open the upgrade dialog ([Upgrade from the TUI](#upgrade-from-the-tui)). `dot-agent-deck upgrade` in another terminal works too.
 - **Desktop app**: it checks when it starts and every 6 hours while it runs. When this machine's app or CLI is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner with the same text and an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays.
 
-Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and the desktop app tries again later.
+Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and both clients try again later.
+
+### Upgrade from the TUI
+
+Press `u` in command mode, or click the update notice in the footer, to open a dialog titled **Upgrade to v<new>**. The key can be remapped as `open_upgrade` ([Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings)). It shows the same plan as `dot-agent-deck upgrade`: one section for the CLI you are running and, when the desktop app is installed on this machine, one for the app. Each says which version you have, how that copy was installed, what upgrading it does, and whether the download's build provenance will be checked.
+
+1. The dialog asks about one copy at a time, the CLI first, for example `Upgrade dot-agent-deck to v0.47.0?`. **Cancel** is selected; press `Down` (or `j`) to select **Upgrade**, then `Enter`. Nothing changes until you choose **Upgrade**: `Enter` on **Cancel**, or `Esc`, closes the dialog having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead.
+2. While a copy upgrades, its section says **Upgrading…**, and the TUI keeps running; `Esc` does not close the dialog until the upgrade finishes.
+3. The result appears under that copy's section, then the dialog asks about the next copy, if any. After the CLI you are running is upgraded, the result says `Quit the TUI and start it again to run v<new>.`: the TUI you have open still runs the old version until you restart it (see [After upgrading](#after-upgrading)).
+4. When nothing is left to ask, `Enter` or `Esc` closes the dialog; after an upgrade, the TUI then checks again.
+
+A copy that cannot be upgraded from the TUI, such as a CLI installed with Nix or built from source, says what to do instead, and the dialog offers only **Close**. Where the plan shows a command to run, such as the `sudo install` command for a directory you cannot write, select it in your terminal to copy it; most terminals need `Shift` held while you drag, because the TUI uses the mouse.
 
 ### Upgrade with `dot-agent-deck upgrade`
 
@@ -317,7 +328,7 @@ When a copy is already current it prints `dot-agent-deck is up to date (v<versio
 
 ### What upgrading does for each install method
 
-Each copy is upgraded the way it was installed. The same plan is shown by `dot-agent-deck upgrade` and by the desktop app's dialog.
+Each copy is upgraded the way it was installed. The same plan is shown by `dot-agent-deck upgrade`, the TUI's upgrade dialog and the desktop app's dialog.
 
 | Copy | Installed with | What upgrading does |
 | --- | --- | --- |
@@ -329,7 +340,7 @@ Each copy is upgraded the way it was installed. The same plan is shown by `dot-a
 | CLI | Another system package | Changes nothing. It says to upgrade that package with your package manager. |
 | Desktop app | The `.dmg`, in `/Applications` or another folder you can write | Downloads the new `.dmg`, checks it, including its signature and notarization, replaces the app, and offers **Relaunch**. |
 | Desktop app | The `.dmg`, in a folder you cannot write, or an unsigned app | Changes nothing. It gives the download link and says to drag **Agent Deck** into that folder, replacing the old one. |
-| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` always shows that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
+| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` and the TUI always show that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
 
 Where no desktop app exists for the platform (Linux arm64, macOS Intel, WSL), only the CLI is upgraded, and nothing is reported as missing. Inside WSL, the CLI is upgraded the same way as on Linux.
 
@@ -339,7 +350,7 @@ Where no desktop app exists for the platform (Linux arm64, macOS Intel, WSL), on
 
 The CLI and the desktop app come from the same release and should run the same version. You do not have to upgrade them one by one: whichever one you upgrade from also finds the other on this machine and offers to upgrade it, each through its own install method (a Homebrew CLI next to a `.dmg` app is upgraded with `brew upgrade`, for example).
 
-- `dot-agent-deck upgrade` looks for the desktop app in `/Applications` and `~/Applications` on macOS, and for the `agent-deck` package on Linux.
+- `dot-agent-deck upgrade` and the TUI look for the desktop app in `/Applications` and `~/Applications` on macOS, and for the `agent-deck` package on Linux.
 - The desktop app looks for `dot-agent-deck` on your login shell's `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `/home/linuxbrew/.linuxbrew/bin`. The copy of the binary inside the app is upgraded with the app.
 
 A copy counts as installed only when it runs and reports its version. Where the other copy cannot be upgraded from the client you are in, the plan shows the command for it instead.

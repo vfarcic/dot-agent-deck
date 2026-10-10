@@ -1,7 +1,5 @@
 use serde::Deserialize;
 
-use crate::repo_identity;
-
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -59,36 +57,14 @@ fn parse_tag(tag: &str) -> Option<semver::Version> {
     semver::Version::parse(stripped).ok()
 }
 
-async fn fetch_latest_version(channel: ReleaseChannel) -> Option<String> {
-    fetch_release_tag(
-        channel,
-        repo_identity::RELEASES_API_URL,
-        repo_identity::RELEASES_LIST_API_URL,
-    )
-    .await
-    .ok()
-}
-
-/// The tag of the newest release on `channel`, or why it could not be read:
-/// `latest_url` (a GitHub `releases/latest` endpoint) answers for `Stable`,
-/// `list_url` (a GitHub `releases` list endpoint) for `Prerelease`. The
-/// startup nudge uses it and ignores the error.
-pub(crate) async fn fetch_release_tag(
-    channel: ReleaseChannel,
-    latest_url: &str,
-    list_url: &str,
-) -> Result<String, String> {
-    fetch_release_tags(channel, latest_url, list_url, false)
-        .await
-        .map(|(latest, _)| latest)
-}
-
-/// The tag of the newest release on `channel`, as [`fetch_release_tag`]
-/// reads it, and the tag of the newest prerelease ([`newest_prerelease_tag`]).
-/// The prerelease channel reads the list anyway; the stable channel reads it
-/// as well only with `with_prerelease`, and otherwise answers `None` for it.
-/// `dot-agent-deck upgrade` and the desktop app (`crate::self_upgrade`) use it
-/// and report the error.
+/// The tag of the newest release on `channel`, and the tag of the newest
+/// prerelease ([`newest_prerelease_tag`]): `latest_url` (a GitHub
+/// `releases/latest` endpoint) answers for `Stable`, `list_url` (a GitHub
+/// `releases` list endpoint) for `Prerelease`. The prerelease channel reads
+/// the list anyway; the stable channel reads it as well only with
+/// `with_prerelease`, and otherwise answers `None` for it. Every client's
+/// release check goes through `crate::self_upgrade` to here: the TUI's badge,
+/// `dot-agent-deck upgrade` and the desktop app.
 pub(crate) async fn fetch_release_tags(
     channel: ReleaseChannel,
     latest_url: &str,
@@ -169,25 +145,6 @@ fn newest_prerelease_tag(releases: &[GitHubRelease]) -> Option<String> {
         .filter(|(version, _)| !version.pre.is_empty())
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, tag)| tag.clone())
-}
-
-/// Returns the latest version string if a newer release exists, `None` otherwise.
-/// All errors are silently swallowed — this must never block or crash the app.
-///
-/// An `e2e` build does not ask. The L2 harness drives the real binary on a
-/// machine with network access, so whether the badge appears depended on
-/// whether GitHub answered that runner's unauthenticated request; when it
-/// did, the badge covered the right end of the footer that tests match on
-/// (`visibility_001` on PR #1617's CI). Gated on the feature rather than an
-/// env var for the reason `effective_current_exe` in `src/platform/paths.rs` gives: a
-/// release build carries no switch to turn the check off.
-pub async fn check_for_update() -> Option<String> {
-    if cfg!(feature = "e2e") {
-        return None;
-    }
-    let current = current_version();
-    let tag = fetch_latest_version(ReleaseChannel::of_version(&current.to_string())).await?;
-    should_notify(&current, &tag)
 }
 
 /// Pull the version number out of `dot-agent-deck --version` output.

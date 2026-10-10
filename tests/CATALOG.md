@@ -5194,25 +5194,25 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
-- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test, `e2e`-only seams for the running version, the running executable's path and the release URLs).
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers `--version` as the release, `e2e`-only seams for the running version, the running executable's path and the release URLs).
 - **Agent:** none.
 - **Asserts:** the footer shows `update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 ##### upgrade/tui-upgrade/002 — A copy installed with Nix is told what to do and offered no confirmation.
 - **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server, a faked `/nix/store` path).
 - **Agent:** none.
 - **Asserts:** `u` opens the dialog with `Installed with Nix` and `> Close`, no question and no Cancel; Enter closes it.
 - **Does not assert:** that the TUI runs from a real Nix store.
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 ##### upgrade/tui-upgrade/003 — The TUI notices a release published while it runs.
 - **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server whose newest release changes mid-test, the `e2e`-only re-check interval seam at 1 s).
 - **Agent:** none.
 - **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one, the badge appears within 30 s without a restart.
 - **Does not assert:** the production 6-hour interval (`upgrade/upgrade-dialog/006` pins the constant).
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 #### upgrade/cli-upgrade
 
@@ -5221,21 +5221,21 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** exit 0; the headline, `Downloaded binary at <path>.` and `Build provenance will NOT be checked`; the file is unchanged.
 - **Does not assert:** the confirmation prompt on a terminal (`self_upgrade::cli` unit tests).
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release.
 - **Layer:** L2 (lane 1, real subprocess, fake release server).
 - **Agent:** none.
 - **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte.
 - **Does not assert:** provenance verification, the non-writable `sudo` path.
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/003 — A checksum mismatch aborts and leaves the old binary.
 - **Layer:** L2 (lane 1, real subprocess, fake release server serving a wrong checksum).
 - **Agent:** none.
 - **Asserts:** non-zero exit, `<asset> does not match checksums.txt` and `Nothing was changed.`, and the file is unchanged.
 - **Does not assert:** a missing manifest entry or an ambiguous one (core unit tests).
-- **Platform coverage:** linux.
+- **Platform coverage:** mac+linux.
 
 ### Remote diagnostics (PRD #345)
 
