@@ -21,7 +21,8 @@ import {
  * It shows each copy's plan in the crate's own words, then offers the copies
  * that can be upgraded from here one at a time, the app first, each behind its
  * own Upgrade. Nothing is upgraded until Upgrade is pressed: Cancel, Escape
- * and a click outside before then change nothing. A copy that cannot be
+ * and a click outside before then change nothing. Each question opens with
+ * Cancel focused, as the TUI's does, so Enter alone never upgrades. A copy that cannot be
  * upgraded from here (Nix, a source build, an app folder you cannot write)
  * shows what to do instead, with any command copyable, and only Close.
  *
@@ -90,11 +91,13 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
           <PlanSection key={plan.copy} plan={plan} result={results[plan.copy]} running={running === plan.copy} copyText={copyText} />
         ))}
         {phase === "confirm" && offer && (
-          <div className="self-upgrade-actions" data-testid="self-upgrade-confirm" data-copy={offer.copy}>
+          /* Keyed by copy so each question mounts afresh and focuses Cancel
+             again: Enter alone never upgrades, as in the TUI. */
+          <div key={offer.copy} className="self-upgrade-actions" data-testid="self-upgrade-confirm" data-copy={offer.copy}>
             <p className="self-upgrade-question" data-testid="self-upgrade-question">{displayText(offer.confirmQuestion ?? "", DISPLAY_LIMITS.message)}</p>
             <div>
-              <button className="button secondary" data-testid="self-upgrade-cancel" onClick={() => cancel(offer)}>Cancel</button>
-              <button className="button primary" data-testid="self-upgrade-start" autoFocus onClick={() => upgrade(offer)}>Upgrade</button>
+              <button className="button secondary" data-testid="self-upgrade-cancel" autoFocus onClick={() => cancel(offer)}>Cancel</button>
+              <button className="button primary" data-testid="self-upgrade-start" onClick={() => upgrade(offer)}>Upgrade</button>
             </div>
           </div>
         )}

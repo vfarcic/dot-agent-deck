@@ -309,4 +309,25 @@ describe("SelfUpgradeDialog", () => {
     expect(command).toHaveTextContent("sudo install /stage/x /usr/local/bin/dot-agent-deck");
     expect(copyText).not.toHaveBeenCalled();
   });
+  /** Scenario: Each question opens with Cancel focused, as the TUI starts on Cancel, so Enter alone never upgrades: on the first question Enter on the focused button closes the dialog having run nothing, and after an upgrade the next copy's question focuses Cancel again. */
+  it("self_upgrade_dialog_011 focuses Cancel on every question so Enter never upgrades", async () => {
+    const { api, finish } = controlledApi();
+    const onClose = vi.fn();
+    const { unmount } = render(<SelfUpgradeDialog check={checkOf(APP_DEB, CLI_BREW)} api={api} onClose={onClose} />);
+
+    expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
+    expect(screen.getByTestId("self-upgrade-start")).not.toHaveFocus();
+    /* A focused button's Enter is its click. */
+    fireEvent.click(document.activeElement as HTMLElement);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(api.run).not.toHaveBeenCalled();
+    unmount();
+
+    render(<SelfUpgradeDialog check={checkOf(APP_DEB, CLI_BREW)} api={api} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await finish(DEB_INSTALLED);
+    expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "cli");
+    expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
+    expect(api.run).toHaveBeenCalledTimes(1);
+  });
 });
