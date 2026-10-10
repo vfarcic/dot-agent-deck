@@ -1157,6 +1157,34 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     .collect()
 }
 
+/// What Claude Code's hooks are pinned to now, read back from its settings
+/// without installing anything (issue #1637's pin refresh,
+/// `CLAUDE.configured_pins`). `None` when Claude Code's settings cannot be
+/// read, which leaves the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    configured_pins_in(&settings_path())
+}
+
+/// [`configured_pins`] against an explicit settings path. Like
+/// [`auto_install_to_gated`], nothing is read unless the settings directory
+/// exists.
+fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    if path.parent().is_none_or(|p| !p.exists()) {
+        return None;
+    }
+    let settings = crate::agent_hook_config::read_json_config(path)?;
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&settings, owned_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.to_path_buf(),
+                binary,
+            })
+            .collect(),
+    )
+}
+
 /// [`auto_install`] against an explicit settings path, with the binary-path
 /// resolver injected — the seam PRD #381 M3 exists to open.
 ///
@@ -1418,6 +1446,46 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back what Claude
+    /// Code's settings pin, writing nothing: no evidence for a missing or
+    /// unparseable file (which is left as it is), no pin for settings holding
+    /// no deck hook, and the binary the deck's hooks name once they are there.
+    #[test]
+    fn configured_pins_reads_the_settings_back_without_writing() {
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let path = dir.path().join("settings.json");
+        assert_eq!(configured_pins_in(&path), None);
+        assert!(!path.exists(), "a read-back creates nothing");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(configured_pins_in(&path), None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(!dir.path().join("settings.json.bak").exists());
+        let user_only = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]}
+        });
+        std::fs::write(&path, user_only.to_string()).unwrap();
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
+        let old = "/opt/old/dot-agent-deck";
+        let pinned = serde_json::json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": hook_command(old)}]}],
+                "PreToolUse": [{"hooks": [{"type": "command", "command": hook_command(old)}]}]
+            }
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let pins = configured_pins_in(&path).expect("readable settings");
+        assert_eq!(
+            pins,
+            vec![crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.clone(),
+                binary: old.to_string(),
+            }]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     /// A malformed `settings.json` is copied to `settings.json.bak` — but never
     /// THROUGH a symlink planted at that path, and since #537 never over one

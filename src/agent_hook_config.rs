@@ -1179,6 +1179,40 @@ pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
     out
 }
 
+/// A JSON hook config read for a read-back (issue #1637's pin refresh), or
+/// `None` when it is missing, unreadable or not JSON — no evidence either
+/// way. Reads only: unlike the installers' readers it never sets a malformed
+/// file aside.
+pub(crate) fn read_json_config(path: &Path) -> Option<Value> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The distinct executables the deck's entries in a JSON hook config name,
+/// in file order: every command under `root.hooks.<event>[]`, in either shape
+/// [`rule_command_strs`] reads, that `executable_of` recognises as the deck's.
+/// Read-only, for issue #1637's pin refresh.
+pub(crate) fn configured_deck_executables(
+    root: &Value,
+    executable_of: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return out;
+    };
+    for rules in hooks.values().filter_map(Value::as_array) {
+        for exe in rule_command_strs(rules)
+            .into_iter()
+            .filter_map(&executable_of)
+        {
+            if !out.contains(&exe) {
+                out.push(exe);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn strip_deck_commands(
     rules: &mut Vec<Value>,
     mut is_target: impl FnMut(&str) -> bool,

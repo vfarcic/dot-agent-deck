@@ -971,10 +971,49 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
 /// of it. The first matching line wins, as before.
 fn existing_binary_path(root: &Path) -> Option<String> {
     let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    binary_path_literal(&js)
+}
+
+/// The `BINARY_PATH` literal in plugin source `js` — [`existing_binary_path`]'s
+/// parse.
+fn binary_path_literal(js: &str) -> Option<String> {
     js.lines()
         .filter_map(|line| line.strip_prefix("const BINARY_PATH = "))
         .filter_map(|rest| rest.strip_suffix(';'))
         .find_map(|literal| serde_json::from_str::<String>(literal).ok())
+}
+
+/// What the OpenCode plugin is pinned to now, read back from every root's
+/// plugin file without installing anything (issue #1637's pin refresh,
+/// `OPENCODE.configured_pins`), one pin per binary as [`auto_install`] reports
+/// them. A root with no plugin file is skipped; `None` when no root has one,
+/// or one cannot be read or carries no readable `BINARY_PATH`, which leaves the
+/// pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    configured_pins_in(&candidate_roots())
+}
+
+/// [`configured_pins`] over explicit roots.
+fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookPin>> {
+    let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
+    let mut read_any = false;
+    for root in roots {
+        let js = match std::fs::read_to_string(plugin_file(root)) {
+            Ok(js) => js,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        read_any = true;
+        let binary = binary_path_literal(&js)?;
+        if out.iter().all(|pin| pin.binary != binary) {
+            out.push(crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::OpenCode,
+                config: root.clone(),
+                binary,
+            });
+        }
+    }
+    read_any.then_some(out)
 }
 
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
@@ -1254,6 +1293,32 @@ pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back the
+    /// `BINARY_PATH` each root's plugin pins, one pin per binary. A root with
+    /// no plugin is skipped; no plugin anywhere, or a plugin with no readable
+    /// `BINARY_PATH`, is no evidence.
+    #[test]
+    fn configured_pins_reads_each_plugin_back() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        assert_eq!(configured_pins_in(&roots), None);
+        let old = "/opt/old/dot-agent-deck";
+        for root in &roots {
+            std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
+        }
+        std::fs::write(plugin_file(&roots[0]), plugin_template(old)).unwrap();
+        let pins = configured_pins_in(&roots).expect("one plugin read");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].binary, old);
+        std::fs::write(plugin_file(&roots[1]), plugin_template(old)).unwrap();
+        assert_eq!(
+            configured_pins_in(&roots).expect("two plugins read").len(),
+            1
+        );
+        std::fs::write(plugin_file(&roots[1]), b"// hand-edited\n").unwrap();
+        assert_eq!(configured_pins_in(&roots), None);
+    }
     #[cfg(unix)]
     use spec::spec;
 

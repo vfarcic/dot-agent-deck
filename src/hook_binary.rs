@@ -1048,6 +1048,21 @@ struct TrustedPin {
 }
 
 impl TrustedPin {
+    /// `binary` from an agent's config, resolved through the filesystem and
+    /// compared with this deck.
+    fn classify(deck: &DeckIdentity, binary: &str) -> Self {
+        let resolved = resolve(Path::new(binary));
+        Self {
+            binary: binary.to_string(),
+            resolved: resolved
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            is_self: deck.exe.is_some() && resolved.as_ref() == deck.exe.as_ref(),
+            homebrew: is_homebrew_spelling(binary)
+                || resolved.as_deref().is_some_and(has_cellar_component),
+        }
+    }
+
     /// Whether a hook line's `deck_exe` names this pin. Lexical.
     fn names(&self, exe: &str) -> bool {
         self.binary == exe || self.resolved.as_deref() == Some(exe)
@@ -1061,11 +1076,13 @@ impl TrustedPin {
 pub const MAX_BINARIES_PER_AGENT: usize = 8;
 
 /// How long a binary's hook lines may stop before a line for the same agent
-/// from another binary clears that binary's notice. Lines from two binaries
-/// for one agent are normal — Codex's own `wrap` beside its hooks, or hooks
-/// pinned to different copies per event — so another binary's line alone
-/// never clears a notice; a notice whose binary has gone quiet this long is
-/// one the user has fixed, by reinstalling the hooks or upgrading in place.
+/// from another binary clears that binary's notice, for a binary no agent
+/// config pins. Lines from two binaries for one agent are normal — Codex's own
+/// `wrap` beside its hooks, or hooks pinned to different copies per event — so
+/// another binary's line alone never clears a notice; a notice whose unpinned
+/// binary has gone quiet this long is one the user has fixed. A pinned
+/// binary's notice does not clear by quiet time at all (see
+/// [`HOOK_PIN_REFRESH_INTERVAL`]).
 pub const HOOK_BINARY_QUIET_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// How often a steady stream of lines from one binary refreshes when it was
@@ -1080,6 +1097,78 @@ const SEEN_REFRESH: Duration = Duration::from_secs(30);
 /// its binary has actually been quiet for [`HOOK_BINARY_QUIET_AFTER`].
 const CLEAR_AFTER: Duration = HOOK_BINARY_QUIET_AFTER.saturating_add(SEEN_REFRESH);
 
+/// How often the daemon reads the agents' hook configs again for the binaries
+/// they name ([`PinRefresh`]). A notice about a binary a config names clears
+/// once a read shows no config names it any more, so this is how long a fixed
+/// config can go on showing the old copy's notice, and how long a newly pinned
+/// older copy can go unnoticed.
+pub const HOOK_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One pin a refresh read, classified outside any lock.
+#[derive(Debug, Clone)]
+struct RefreshedPin {
+    trusted: TrustedPin,
+    /// `--version`, for a pin that is not this deck.
+    probe: Option<Result<String, String>>,
+}
+
+/// What one read of the agents' hook configs found (issue #1637): for each
+/// agent whose configs were read, the binaries they name, resolved and probed
+/// through the filesystem before the daemon takes its state lock, so
+/// [`HookBinaryState::apply_refresh`] applies it under that lock without
+/// touching the filesystem. An agent whose configs could not be read is
+/// absent, which keeps its pins as they were.
+#[derive(Debug, Clone, Default)]
+pub struct PinRefresh {
+    agents: Vec<(AgentType, Vec<RefreshedPin>)>,
+}
+
+impl PinRefresh {
+    /// Read every agent's hook configs ([`crate::agent_registry::AgentSpec::configured_pins`])
+    /// and [`Self::classify`] what they name. Reads only: nothing is installed,
+    /// written or taken over. Filesystem work and `--version` probes, so it
+    /// runs off the daemon's state lock.
+    pub fn collect(deck: &DeckIdentity) -> Self {
+        let read = crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| {
+                let read = spec.configured_pins?;
+                read().map(|pins| (spec.agent_type.clone(), pins))
+            })
+            .collect();
+        Self::classify(deck, read)
+    }
+
+    /// `read` holds, for each agent whose configs were read, the pins they
+    /// name; an empty list is evidence that none is named. Each pin is
+    /// resolved and classified as at startup, and a pin that is not this deck
+    /// is probed with `--version` through the shared cache and budget, so a
+    /// pin whose file has not changed spawns nothing. A pin that is not an
+    /// absolute path is passed over, since probing it would run whatever the
+    /// name finds.
+    pub(crate) fn classify(deck: &DeckIdentity, read: Vec<(AgentType, Vec<HookPin>)>) -> Self {
+        let agents = read
+            .into_iter()
+            .map(|(agent, pins)| {
+                let mut fresh: Vec<RefreshedPin> = Vec::new();
+                for pin in pins {
+                    if fresh.len() >= MAX_BINARIES_PER_AGENT
+                        || !Path::new(&pin.binary).is_absolute()
+                        || fresh.iter().any(|known| known.trusted.binary == pin.binary)
+                    {
+                        continue;
+                    }
+                    let trusted = TrustedPin::classify(deck, &pin.binary);
+                    let probe = (!trusted.is_self).then(|| probe_version(Path::new(&pin.binary)));
+                    fresh.push(RefreshedPin { trusted, probe });
+                }
+                (agent, fresh)
+            })
+            .collect();
+        Self { agents }
+    }
+}
+
 /// The daemon's record of which binaries each agent's hooks run, and the
 /// notices that follow from it.
 ///
@@ -1088,9 +1177,10 @@ const CLEAR_AFTER: Duration = HOOK_BINARY_QUIET_AFTER.saturating_add(SEEN_REFRES
 /// other's notice while the other is still sending (see
 /// [`HOOK_BINARY_QUIET_AFTER`]).
 ///
-/// Only [`Self::from_startup`] touches the filesystem. [`Self::observe`] runs
-/// under the daemon's state lock on producer-asserted data and
-/// [`Self::notices`] on every `Hello`, so both are pure: a hook line's path is
+/// Only [`Self::from_startup`] touches the filesystem, and [`PinRefresh::collect`]
+/// outside the state. [`Self::observe`] and [`Self::apply_refresh`] run under
+/// the daemon's state lock, [`Self::observe`] on producer-asserted data, and
+/// [`Self::notices`] on every `Hello`, so all three are pure: a hook line's path is
 /// compared lexically against this deck's own path and the trusted pins, never
 /// resolved (issue #1637 audit A2).
 #[derive(Debug, Clone, Default)]
@@ -1137,44 +1227,114 @@ impl HookBinaryState {
             {
                 continue;
             }
-            let resolved = resolve(Path::new(&pin.binary));
-            let trusted = TrustedPin {
-                binary: pin.binary.clone(),
-                resolved: resolved
-                    .as_deref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                is_self: state.deck.exe.is_some() && resolved.as_ref() == state.deck.exe.as_ref(),
-                homebrew: is_homebrew_spelling(&pin.binary)
-                    || resolved.as_deref().is_some_and(has_cellar_component),
-            };
-            let (is_self, homebrew) = (trusted.is_self, trusted.homebrew);
-            known.push(trusted);
-            if is_self {
+            let trusted = TrustedPin::classify(&state.deck, &pin.binary);
+            known.push(trusted.clone());
+            if trusted.is_self {
                 continue;
             }
-            let (version, reason) = match probe_version(Path::new(&pin.binary)) {
-                Ok(version) if is_newer_release(&state.deck.version, &version) => {
-                    (Some(version), Some(HookBinaryReason::Older))
-                }
-                Ok(version) => (Some(version), None),
-                Err(_) => (None, Some(HookBinaryReason::Unprobeable)),
-            };
-            state.record(
-                &pin.agent,
-                AgentStatus {
-                    binary: pin.binary.clone(),
-                    version,
-                    reason,
-                    homebrew,
-                },
-                now,
-            );
+            let status = state.probed_status(&trusted, probe_version(Path::new(&pin.binary)));
+            state.record(&pin.agent, status, now);
         }
         if let Some(exe) = ephemeral_exe {
             state.warn_once(&exe, HookBinaryReason::EphemeralLocation, &[]);
             state.ephemeral = Some(exe);
         }
         state
+    }
+
+    /// Who this daemon is, for [`PinRefresh::collect`].
+    pub fn deck(&self) -> &DeckIdentity {
+        &self.deck
+    }
+
+    /// The status a pin's `--version` probe implies.
+    fn probed_status(&self, pin: &TrustedPin, probe: Result<String, String>) -> AgentStatus {
+        let (version, reason) = match probe {
+            Ok(version) if is_newer_release(&self.deck.version, &version) => {
+                (Some(version), Some(HookBinaryReason::Older))
+            }
+            Ok(version) => (Some(version), None),
+            Err(_) => (None, Some(HookBinaryReason::Unprobeable)),
+        };
+        AgentStatus {
+            binary: pin.binary.clone(),
+            version,
+            reason,
+            homebrew: pin.homebrew,
+        }
+    }
+
+    /// Apply a [`PinRefresh`]. Returns whether the notices changed.
+    ///
+    /// For each agent it read, the agent's pins become the ones its configs
+    /// name now. A status for a binary that was pinned and no longer is
+    /// clears, and so does one for a pin that is now this deck. A new pin is
+    /// recorded from its probe, as at startup, so an older copy pinned
+    /// mid-session raises its notice; a pin already known takes its probe
+    /// only when the probe reports a different version than the one recorded,
+    /// which is a file replaced in place, so a failed probe or an unchanged
+    /// file leaves what its own lines said. A line-learned status spelled as a
+    /// new pin resolves becomes that pin's. An agent the refresh could not
+    /// read is left as it was.
+    ///
+    /// Pure, like [`Self::observe`]: everything the filesystem had to say was
+    /// gathered by [`PinRefresh::collect`].
+    pub fn apply_refresh(&mut self, refresh: PinRefresh) -> bool {
+        self.apply_refresh_at(refresh, Instant::now())
+    }
+
+    fn apply_refresh_at(&mut self, refresh: PinRefresh, now: Instant) -> bool {
+        let before = self.notices();
+        for (agent, fresh) in refresh.agents {
+            let previous = self.pins.remove(&agent).unwrap_or_default();
+            let pins: Vec<TrustedPin> = fresh.iter().map(|pin| pin.trusted.clone()).collect();
+            if let Some(tracked) = self.statuses.get_mut(&agent) {
+                tracked.retain(|tracked| {
+                    let binary = &tracked.status.binary;
+                    let pinned = pins.iter().find(|pin| &pin.binary == binary);
+                    let was_pinned = previous.iter().any(|pin| &pin.binary == binary);
+                    !(was_pinned && pinned.is_none()) && !pinned.is_some_and(|pin| pin.is_self)
+                });
+                for pin in &pins {
+                    if tracked
+                        .iter()
+                        .any(|known| known.status.binary == pin.binary)
+                    {
+                        continue;
+                    }
+                    if let Some(learned) = tracked
+                        .iter_mut()
+                        .find(|known| pin.names(&known.status.binary))
+                    {
+                        learned.status.binary = pin.binary.clone();
+                        learned.status.homebrew = pin.homebrew;
+                    }
+                }
+            }
+            for RefreshedPin { trusted, probe } in fresh {
+                let Some(probe) = probe else { continue };
+                let known = self
+                    .statuses
+                    .get(&agent)
+                    .and_then(|tracked| {
+                        tracked
+                            .iter()
+                            .find(|tracked| tracked.status.binary == trusted.binary)
+                    })
+                    .map(|tracked| tracked.status.version.clone());
+                let apply = match (&known, &probe) {
+                    (None, _) => true,
+                    (Some(recorded), Ok(version)) => recorded.as_ref() != Some(version),
+                    (Some(_), Err(_)) => false,
+                };
+                if apply {
+                    let status = self.probed_status(&trusted, probe);
+                    self.record(&agent, status, now);
+                }
+            }
+            self.pins.insert(agent, pins);
+        }
+        self.notices() != before
     }
 
     /// Record what a hook line from `agent` says about the binary that sent
@@ -1186,7 +1346,8 @@ impl HookBinaryState {
     /// absent — and the caller still applies the event. The line updates only
     /// its own binary's status; another binary's notice for the same agent is
     /// cleared only once that binary has sent nothing for
-    /// [`HOOK_BINARY_QUIET_AFTER`].
+    /// [`HOOK_BINARY_QUIET_AFTER`], and never while an agent's config pins
+    /// it ([`Self::apply_refresh`] clears that one).
     pub fn observe(&mut self, agent: &AgentType, sender: &HookLineSender) -> bool {
         self.observe_at(agent, sender, Instant::now())
     }
@@ -1210,8 +1371,9 @@ impl HookBinaryState {
         for status in next {
             self.record(agent, status, now);
         }
+        let pins = self.pins.get(agent).map_or(&[][..], Vec::as_slice);
         if let Some(tracked) = self.statuses.get_mut(agent) {
-            tracked.retain(|tracked| !Self::cleared_by(tracked, &seen, now));
+            tracked.retain(|tracked| !Self::cleared_by(tracked, &seen, pins, now));
         }
         self.notices() != before
     }
@@ -1222,6 +1384,7 @@ impl HookBinaryState {
             return false;
         }
         let tracked = self.statuses.get(agent).map_or(&[][..], Vec::as_slice);
+        let pins = self.pins.get(agent).map_or(&[][..], Vec::as_slice);
         let seen: Vec<String> = next.iter().map(|status| status.binary.clone()).collect();
         next.iter().any(|status| {
             tracked
@@ -1233,16 +1396,25 @@ impl HookBinaryState {
                 })
         }) || tracked
             .iter()
-            .any(|tracked| Self::cleared_by(tracked, &seen, now))
+            .any(|tracked| Self::cleared_by(tracked, &seen, pins, now))
     }
 
     /// Whether a line for the same agent from `seen` clears `tracked`: it
-    /// raised a notice, is another binary, and has been quiet for at least
-    /// [`HOOK_BINARY_QUIET_AFTER`] (measured as [`CLEAR_AFTER`] from its
-    /// recorded `last_seen`).
-    fn cleared_by(tracked: &Tracked, seen: &[String], now: Instant) -> bool {
+    /// raised a notice, is another binary, no config of the agent's pins it,
+    /// and it has been quiet for at least [`HOOK_BINARY_QUIET_AFTER`]
+    /// (measured as [`CLEAR_AFTER`] from its recorded `last_seen`).
+    ///
+    /// A pinned binary's quiet proves nothing: a Codex hook pinned to an old
+    /// copy for one event sends nothing until that event happens, while the
+    /// pane's current `wrap` keeps sending. Its notice clears when its own
+    /// line reports a current build, or when [`Self::apply_refresh`] finds no
+    /// config naming it. The quiet rule is for a binary only hook lines named
+    /// (a `DOT_AGENT_DECK_BIN` override, a project's own settings), which no
+    /// config the deck reads can vouch for either way.
+    fn cleared_by(tracked: &Tracked, seen: &[String], pins: &[TrustedPin], now: Instant) -> bool {
         tracked.status.reason.is_some()
             && !seen.contains(&tracked.status.binary)
+            && !pins.iter().any(|pin| pin.binary == tracked.status.binary)
             && now.saturating_duration_since(tracked.last_seen) >= CLEAR_AFTER
     }
 
@@ -1914,7 +2086,8 @@ mod tests {
         assert_eq!(sender.deck_exe, None, "a path with a newline is dropped");
         assert_eq!(sender.deck_build.as_deref(), Some("0.0.1-gabc1234"));
 
-        for own in [None, Some("/home/u/.local/bin/dot-agent-deck".to_string())] {
+        let old = abs("/opt/old");
+        for own in [None, Some(abs("/home/u/.local/bin/dot-agent-deck"))] {
             let mut state = HookBinaryState {
                 deck: DeckIdentity {
                     self_install_path: own,
@@ -1923,25 +2096,27 @@ mod tests {
                 ..HookBinaryState::default()
             };
             // Even a sender constructed past `from_line` is validated again.
+            // Each is absolute on this platform, so it is refused for what it
+            // carries rather than for not being absolute.
             for exe in [
-                "/opt/old/dot-agent-deck\n touch /tmp/hook-notice-marker #",
-                "/opt/old/\u{202E}kced-tnega-tod",
-                "/opt/old/\u{2028}dot-agent-deck",
-                "relative/dot-agent-deck",
+                format!("{old}/dot-agent-deck\n touch /tmp/hook-notice-marker #"),
+                format!("{old}/\u{202E}kced-tnega-tod"),
+                format!("{old}/\u{2028}dot-agent-deck"),
+                "relative/dot-agent-deck".to_string(),
             ] {
                 state.observe(
                     &AgentType::ClaudeCode,
                     &HookLineSender {
                         deck_build: Some("0.0.1-gabc1234".into()),
-                        deck_exe: Some(exe.into()),
+                        deck_exe: Some(exe),
                     },
                 );
                 for notice in state.notices() {
                     assert!(!notice.binary.contains("touch"), "{notice:?}");
                     assert!(!notice.binary.contains('\u{202E}'), "{notice:?}");
-                    assert!(!notice.remedy.contains("/opt/old"), "{notice:?}");
+                    assert!(!notice.remedy.contains(&old), "{notice:?}");
                     if let Some(command) = &notice.command {
-                        assert!(!command.contains("/opt/old"), "{notice:?}");
+                        assert!(!command.contains(&old), "{notice:?}");
                         assert!(!command.chars().any(char::is_control), "{notice:?}");
                     }
                 }
@@ -2157,17 +2332,18 @@ mod tests {
             None,
         );
         FS_RESOLUTIONS.with(|count| count.set(0));
-        let existing = dir.path().to_string_lossy().into_owned();
+        // Absolute on this platform, so each reaches the comparison rather than
+        // being dropped at validation.
         for exe in [
-            existing.as_str(),
-            "/nonexistent/automount/dot-agent-deck",
-            "/opt/homebrew/bin/dot-agent-deck",
+            dir.path().to_string_lossy().into_owned(),
+            abs("/nonexistent/automount/dot-agent-deck"),
+            abs("/opt/homebrew/bin/dot-agent-deck"),
         ] {
             state.observe(
                 &AgentType::ClaudeCode,
                 &HookLineSender {
                     deck_build: Some("0.0.1-gabc1234".into()),
-                    deck_exe: Some(exe.into()),
+                    deck_exe: Some(exe),
                 },
             );
             let _ = state.notices();
@@ -2409,15 +2585,24 @@ mod tests {
         }
     }
 
-    /// Scenario: the user fixes the hooks, and only this deck's lines arrive
-    /// for Codex from then on. The older copy's notice stays while that copy
-    /// was seen recently, and clears with the first line once it has sent
-    /// nothing for `CLEAR_AFTER` (`HOOK_BINARY_QUIET_AFTER` plus the refresh
-    /// interval a recorded time can trail by).
+    /// `codex_pinned_to` with no pin, so an older copy is known only from its
+    /// own hook lines.
+    fn codex_unpinned() -> HookBinaryState {
+        let mut state = codex_pinned_to(&abs("/opt/unused/dot-agent-deck"));
+        state.pins.clear();
+        state
+    }
+
+    /// Scenario: an older copy no agent config names — known only from its
+    /// own hook lines — stops sending, and only this deck's lines arrive for
+    /// Codex from then on. The older copy's notice stays while that copy was
+    /// seen recently, and clears with the first line once it has sent nothing
+    /// for `CLEAR_AFTER` (`HOOK_BINARY_QUIET_AFTER` plus the refresh interval
+    /// a recorded time can trail by).
     #[test]
-    fn a_notice_clears_once_its_binary_has_gone_quiet() {
+    fn a_line_learned_notice_clears_once_its_binary_has_gone_quiet() {
         let old = abs("/opt/old/dot-agent-deck");
-        let mut state = codex_pinned_to(&old);
+        let mut state = codex_unpinned();
         let start = Instant::now();
         let older = HookLineSender {
             deck_build: Some("0.45.0-gabc1234".into()),
@@ -2438,15 +2623,15 @@ mod tests {
     }
 
     /// Scenario (auditor on #1656): the daemon's own sequence, which records
-    /// a line only when `would_change_at` says so. The older copy's line is
-    /// recorded, its repeat 29 seconds later is skipped as unchanged, and this
-    /// deck's lines then arrive steadily. The notice stays until the older
-    /// copy has really sent nothing for `HOOK_BINARY_QUIET_AFTER`, counted
-    /// from its skipped last line rather than the recorded one.
+    /// a line only when `would_change_at` says so. The older, unpinned copy's
+    /// line is recorded, its repeat 29 seconds later is skipped as unchanged,
+    /// and this deck's lines then arrive steadily. The notice stays until the
+    /// older copy has really sent nothing for `HOOK_BINARY_QUIET_AFTER`,
+    /// counted from its skipped last line rather than the recorded one.
     #[test]
     fn the_quiet_time_counts_from_a_line_the_daemon_skipped() {
         let old = abs("/opt/old/dot-agent-deck");
-        let mut state = codex_pinned_to(&old);
+        let mut state = codex_unpinned();
         let older = HookLineSender {
             deck_build: Some("0.45.0-gabc1234".into()),
             deck_exe: Some(old.clone()),
@@ -3168,7 +3353,7 @@ mod tests {
         };
         let current = HookLineSender {
             deck_build: Some("0.46.0-gabc1234".into()),
-            deck_exe: Some("/opt/current/dot-agent-deck".into()),
+            deck_exe: Some(abs("/opt/current/dot-agent-deck")),
         };
         assert!(state.would_change(&AgentType::ClaudeCode, &current));
         // A first status with no reason is in no notice.
@@ -3178,7 +3363,7 @@ mod tests {
 
         let older = HookLineSender {
             deck_build: Some("0.45.0-gabc1234".into()),
-            deck_exe: Some("/opt/current/dot-agent-deck".into()),
+            deck_exe: Some(abs("/opt/current/dot-agent-deck")),
         };
         assert!(state.would_change(&AgentType::ClaudeCode, &older));
         assert!(state.observe(&AgentType::ClaudeCode, &older));
@@ -3195,5 +3380,254 @@ mod tests {
             deck_exe: None,
         };
         assert!(!state.would_change(&AgentType::ClaudeCode, &invalid));
+    }
+
+    /// A pin a refresh read: this deck's own when `probe` is `None`.
+    fn fresh(binary: &str, probe: Option<Result<String, String>>) -> RefreshedPin {
+        RefreshedPin {
+            trusted: TrustedPin {
+                binary: binary.to_string(),
+                resolved: None,
+                is_self: probe.is_none(),
+                homebrew: false,
+            },
+            probe,
+        }
+    }
+
+    fn refresh_of(agent: AgentType, pins: Vec<RefreshedPin>) -> PinRefresh {
+        PinRefresh {
+            agents: vec![(agent, pins)],
+        }
+    }
+
+    /// `codex_pinned_to(old)` with the notice startup's probe raises for it.
+    fn codex_with_old_pin(old: &str, at: Instant) -> HookBinaryState {
+        let mut state = codex_pinned_to(old);
+        state.record(
+            &AgentType::Codex,
+            AgentStatus {
+                binary: old.to_string(),
+                version: Some("0.45.0".into()),
+                reason: Some(HookBinaryReason::Older),
+                homebrew: false,
+            },
+            at,
+        );
+        state
+    }
+
+    /// Scenario (Qodo on #1656): Codex's config pins an older copy for an
+    /// event that never happens, so that copy sends nothing, while the pane's
+    /// own `wrap` — this deck — sends current lines every ten seconds for far
+    /// longer than the quiet time. The older copy's notice stays: its quiet
+    /// proves nothing while a config still names it.
+    #[test]
+    fn a_pinned_idle_hook_keeps_its_notice_beside_current_wrap_lines() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let start = Instant::now();
+        let mut state = codex_with_old_pin(&old, start);
+        let shown = state.notices();
+        assert_eq!(shown.len(), 1);
+        let wrap = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
+        };
+        let mut at = start;
+        while at < start + CLEAR_AFTER * 3 {
+            if state.would_change_at(&AgentType::Codex, &wrap, at) {
+                assert!(!state.observe_at(&AgentType::Codex, &wrap, at));
+            }
+            assert_eq!(state.notices(), shown, "{:?}", at - start);
+            at += Duration::from_secs(10);
+        }
+    }
+
+    /// Scenario: the user reinstalls Codex's hooks from this deck, so its
+    /// config names this deck instead of the older copy. The next refresh
+    /// clears the older copy's notice and reports one change, and the same
+    /// refresh again reports none, so the daemon broadcasts once.
+    #[test]
+    fn a_refresh_that_no_longer_names_the_old_pin_clears_its_notice() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let own = abs("/home/u/.local/bin/dot-agent-deck");
+        let now = Instant::now();
+        let mut state = codex_with_old_pin(&old, now);
+        assert_eq!(state.notices().len(), 1);
+        assert!(state.apply_refresh_at(refresh_of(AgentType::Codex, vec![fresh(&own, None)]), now));
+        assert!(state.notices().is_empty());
+        assert_eq!(state.pins[&AgentType::Codex].len(), 1);
+        assert!(state.pins[&AgentType::Codex][0].is_self);
+        assert!(
+            !state.apply_refresh_at(refresh_of(AgentType::Codex, vec![fresh(&own, None)]), now)
+        );
+
+        // A config that names no deck binary at all is evidence too.
+        let mut state = codex_with_old_pin(&old, now);
+        assert!(state.apply_refresh_at(refresh_of(AgentType::Codex, Vec::new()), now));
+        assert!(state.notices().is_empty());
+    }
+
+    /// Scenario: mid-session the user points Codex's hooks at an older copy.
+    /// The next refresh raises its notice, as startup would have; a refresh
+    /// naming a copy of this deck's release raises nothing.
+    #[test]
+    fn a_refresh_that_adds_an_older_pin_raises_its_notice() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let same = abs("/opt/same/dot-agent-deck");
+        let now = Instant::now();
+        let mut state = codex_unpinned();
+        assert!(!state.apply_refresh_at(
+            refresh_of(
+                AgentType::Codex,
+                vec![fresh(&same, Some(Ok("0.46.0".into())))]
+            ),
+            now
+        ));
+        assert!(state.notices().is_empty());
+        assert!(state.apply_refresh_at(
+            refresh_of(
+                AgentType::Codex,
+                vec![
+                    fresh(&same, Some(Ok("0.46.0".into()))),
+                    fresh(&old, Some(Ok("0.45.0".into()))),
+                ]
+            ),
+            now
+        ));
+        let notices = state.notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].binary, old);
+        assert_eq!(notices[0].reason, HookBinaryReason::Older);
+        assert_eq!(notices[0].agents, vec!["Codex"]);
+        assert_eq!(notices[0].version.as_deref(), Some("0.45.0"));
+    }
+
+    /// Scenario: a refresh cannot read Codex's config (missing, unparseable
+    /// or unreadable), so the reader reports no evidence and the agent is
+    /// absent from the refresh. The pin and its notice stay exactly as they
+    /// were; and an agent the refresh did read leaves other agents alone.
+    #[test]
+    fn a_refresh_with_an_unreadable_config_changes_nothing() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let now = Instant::now();
+        let mut state = codex_with_old_pin(&old, now);
+        let shown = state.notices();
+        let pins = state.pins.clone();
+        assert!(!state.apply_refresh_at(PinRefresh::default(), now));
+        assert!(!state.apply_refresh_at(refresh_of(AgentType::ClaudeCode, Vec::new()), now));
+        assert_eq!(state.notices(), shown);
+        assert_eq!(state.pins[&AgentType::Codex], pins[&AgentType::Codex]);
+    }
+
+    /// Scenario: a pinned copy is upgraded in place, and its hooks are idle.
+    /// The refresh's probe reports the new version, which differs from the
+    /// one recorded, so the notice clears; a failed probe of a known pin
+    /// changes nothing.
+    #[test]
+    fn a_refresh_reprobes_a_pin_replaced_in_place() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let now = Instant::now();
+        let mut state = codex_with_old_pin(&old, now);
+        assert!(!state.apply_refresh_at(
+            refresh_of(
+                AgentType::Codex,
+                vec![fresh(&old, Some(Err("budget".into())))]
+            ),
+            now
+        ));
+        assert!(!state.apply_refresh_at(
+            refresh_of(
+                AgentType::Codex,
+                vec![fresh(&old, Some(Ok("0.45.0".into())))]
+            ),
+            now
+        ));
+        assert_eq!(state.notices().len(), 1);
+        assert!(state.apply_refresh_at(
+            refresh_of(
+                AgentType::Codex,
+                vec![fresh(&old, Some(Ok("0.46.0".into())))]
+            ),
+            now
+        ));
+        assert!(state.notices().is_empty());
+    }
+
+    /// Scenario: a binary first seen through its own hook lines, under its
+    /// resolved spelling, turns up in a refresh under the spelling a config
+    /// uses. It keeps one notice, under the config's spelling, and from then
+    /// on its quiet does not clear it.
+    #[test]
+    fn a_line_learned_binary_a_refresh_pins_keeps_one_notice() {
+        let link = abs("/opt/link/dot-agent-deck");
+        let real = abs("/opt/real/dot-agent-deck");
+        let start = Instant::now();
+        let mut state = codex_unpinned();
+        let older = HookLineSender {
+            deck_build: Some("0.45.0-gabc1234".into()),
+            deck_exe: Some(real.clone()),
+        };
+        assert!(state.observe_at(&AgentType::Codex, &older, start));
+        let mut pin = fresh(&link, Some(Ok("0.45.0".into())));
+        pin.trusted.resolved = Some(real.clone());
+        assert!(state.apply_refresh_at(refresh_of(AgentType::Codex, vec![pin]), start));
+        let notices = state.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].binary, link);
+        let wrap = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
+        };
+        assert!(!state.observe_at(&AgentType::Codex, &wrap, start + CLEAR_AFTER * 2));
+        assert_eq!(state.notices().len(), 1);
+    }
+
+    /// Scenario (audit A2): a refresh resolves the pins it read through the
+    /// filesystem while it is being collected, before the daemon takes its
+    /// state lock; applying it under the lock resolves nothing.
+    #[test]
+    fn a_refresh_touches_the_filesystem_only_before_the_lock() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pinned = dir.path().join("pinned").join("dot-agent-deck");
+        let own = dir.path().join("own").join("dot-agent-deck");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, b"").unwrap();
+        let mut state = codex_unpinned();
+        state.deck.exe = std::fs::canonicalize(&own).ok();
+        FS_RESOLUTIONS.with(|count| count.set(0));
+        let refresh = PinRefresh::classify(
+            &state.deck,
+            vec![(
+                AgentType::Codex,
+                vec![
+                    HookPin {
+                        agent: AgentType::Codex,
+                        config: PathBuf::from("/cfg"),
+                        binary: own.to_string_lossy().into_owned(),
+                    },
+                    HookPin {
+                        agent: AgentType::Codex,
+                        config: PathBuf::from("/cfg"),
+                        binary: pinned.to_string_lossy().into_owned(),
+                    },
+                    HookPin {
+                        agent: AgentType::Codex,
+                        config: PathBuf::from("/cfg"),
+                        binary: "relative/dot-agent-deck".into(),
+                    },
+                ],
+            )],
+        );
+        assert!(FS_RESOLUTIONS.with(std::cell::Cell::get) > 0);
+        let pins = &refresh.agents[0].1;
+        assert_eq!(pins.len(), 2, "a relative pin is not probed: {pins:?}");
+        assert!(pins[0].trusted.is_self && pins[0].probe.is_none());
+        assert!(!pins[1].trusted.is_self && pins[1].probe.is_some());
+        FS_RESOLUTIONS.with(|count| count.set(0));
+        state.apply_refresh(refresh);
+        let _ = state.notices();
+        assert_eq!(FS_RESOLUTIONS.with(std::cell::Cell::get), 0);
+        assert_eq!(state.pins[&AgentType::Codex].len(), 2);
     }
 }

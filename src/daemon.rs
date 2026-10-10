@@ -1791,6 +1791,54 @@ async fn observe_hook_sender(
     }
 }
 
+/// Issue #1637: every [`crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL`], read
+/// the agents' hook configs again for the binaries they pin, and apply what
+/// changed to the notices. `daemon serve` runs it for the daemon's lifetime.
+///
+/// The configs are read, and any new pin probed, on a blocking thread before
+/// the state lock is taken ([`crate::hook_binary::PinRefresh::collect`]); the
+/// result is then applied under the write lock in one step, which touches no
+/// file ([`apply_hook_pin_refresh`]). The first read is one interval after
+/// start, since startup has just read the same configs.
+pub async fn run_hook_pin_refresh(state: SharedState, event_tx: broadcast::Sender<BroadcastMsg>) {
+    let period = crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let deck = state.read().await.hook_binaries.deck().clone();
+        let refresh = match tokio::task::spawn_blocking(move || {
+            crate::hook_binary::PinRefresh::collect(&deck)
+        })
+        .await
+        {
+            Ok(refresh) => refresh,
+            Err(e) => {
+                tracing::warn!("hook pin refresh: reading the agents' hook configs failed: {e}");
+                continue;
+            }
+        };
+        apply_hook_pin_refresh(&state, &event_tx, refresh).await;
+    }
+}
+
+/// Apply one [`crate::hook_binary::PinRefresh`] under the state's write guard,
+/// and broadcast the notices when that changes them.
+async fn apply_hook_pin_refresh(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    refresh: crate::hook_binary::PinRefresh,
+) {
+    let mut state = state.write().await;
+    if state.hook_binaries.apply_refresh(refresh) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
 /// [`ingest_event`] for a raw event the hook socket's provenance gate admitted
 /// (issue #318). `unproven` is the gate's verdict that the event comes from an
 /// outside agent — a pane, or a paneless agent, this daemon never issued a hook
@@ -11978,5 +12026,52 @@ mod hook_provenance_audit_tests {
             !log.contains(&old_token),
             "the token is never logged: {log}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_pin_refresh_tests {
+    use super::*;
+    use crate::event::AgentType;
+    use crate::hook_binary::{DeckIdentity, HookBinaryState, HookPin, PinRefresh};
+
+    /// Scenario (issue #1637): the daemon knows Codex's hooks are pinned to a
+    /// copy it cannot run, and shows a notice. A refresh then reads Codex's
+    /// config and finds it names no deck binary any more: applying it under
+    /// the state lock clears the notice and broadcasts the new, empty list
+    /// once; the same refresh again broadcasts nothing.
+    #[tokio::test]
+    async fn a_refresh_that_changes_the_notices_broadcasts_them_once() {
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let mut initial = crate::state::AppState::default();
+        initial.hook_binaries = HookBinaryState::from_startup(
+            deck.clone(),
+            &[HookPin {
+                agent: AgentType::Codex,
+                config: std::path::PathBuf::from("/cfg/hooks.json"),
+                binary: "/nonexistent/dad-1637/dot-agent-deck".into(),
+            }],
+            None,
+        );
+        assert_eq!(initial.hook_binaries.notices().len(), 1);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(initial));
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let none_pinned = || PinRefresh::classify(&deck, vec![(AgentType::Codex, Vec::new())]);
+
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        match rx.try_recv() {
+            Ok(BroadcastMsg::HookBinaryNotice(sent)) => assert!(sent.notices.is_empty()),
+            other => panic!("expected one notice broadcast, got {other:?}"),
+        }
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged refresh broadcasts nothing"
+        );
+        assert!(state.read().await.hook_binaries.notices().is_empty());
     }
 }

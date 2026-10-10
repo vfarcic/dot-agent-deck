@@ -3493,13 +3493,25 @@ async fn run_daemon_serve_cli(
     let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
         dot_agent_deck::daemon_restart::InstallRecord::capture(),
     ));
+    let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_legacy_aliases(
             dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
             dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
         )
         .with_restart_control(restart_control.clone());
-    if let Err(e) = run_daemon_with(&path, daemon).await {
+    // Issue #1637: re-read the agents' hook configs periodically, so a notice
+    // about an older copy the hooks are still set up to call stays, and one
+    // the user has since fixed clears, without a restart. Here rather than in
+    // `run_daemon_with`, which in-process test daemons also run: only this
+    // daemon was started with the hook pins it reads.
+    let pin_refresh = tokio::spawn(dot_agent_deck::daemon::run_hook_pin_refresh(
+        refresh_state,
+        daemon.event_tx.clone(),
+    ));
+    let result = run_daemon_with(&path, daemon).await;
+    pin_refresh.abort();
+    if let Err(e) = result {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
     }
