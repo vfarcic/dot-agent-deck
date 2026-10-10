@@ -5662,8 +5662,10 @@ fn opencode_env_key_authorises() -> bool {
 /// way Codex is authenticated. See [`codex_test_model`].
 ///
 /// Measured 2026-10-10 on codex-cli 0.160.0 with a ChatGPT login: `codex exec
-/// --model gpt-5.6-luna` answered the probe, and the seven real-agent Codex tests
-/// ran on it under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` (issue #656). The same
+/// --model gpt-5.6-luna` answered the probe, and six of the seven real-agent
+/// Codex tests ran and passed on it under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`
+/// (issue #656); `codex_live_001` stayed unverified there because that host
+/// refuses unprivileged user namespaces, a precondition of its own. The same
 /// login refused `gpt-5.1-codex-mini` and `gpt-5.4-mini` with "The '<id>' model
 /// is not supported when using Codex with a ChatGPT account".
 pub(crate) const CODEX_TEST_MODEL_CHATGPT_DEFAULT: &str = "gpt-5.6-luna";
@@ -5859,7 +5861,14 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    let auth_path = host_home().join(".codex").join("auth.json");
+    // Both commands below read the home that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
+    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
+    // mode would be probed with the wrong login and, since #656, fail on a
+    // model refusal that the test itself would not meet.
+    let codex_home = host_home().join(".codex");
+    let auth_path = codex_home.join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -5871,6 +5880,7 @@ pub fn check_codex_available() -> Result<(), String> {
 
     let login = std::process::Command::new("codex")
         .args(["login", "status"])
+        .env("CODEX_HOME", &codex_home)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not check Codex login status: {e}"))?;
@@ -5903,6 +5913,7 @@ pub fn check_codex_available() -> Result<(), String> {
         .arg("--output-last-message")
         .arg(final_message.path())
         .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
+        .env("CODEX_HOME", &codex_home)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not run Codex model probe: {e}"))?;
