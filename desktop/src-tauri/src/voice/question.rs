@@ -317,6 +317,10 @@ pub fn verbatim_slice<'a>(transcript: &'a str, quoted: &str) -> Option<&'a str> 
 /// selection whose words and evidence both repeat an earlier one's for
 /// another question, is taken out of
 /// `answer` and returned, rather than refusing the answer it borrowed from.
+/// So is any selection whose evidence lies entirely within another question's
+/// strictly longer evidence — "large" picking a Colour inside Sizes' "small
+/// and large" — with or without text on either; two questions citing exactly
+/// the same words both keep them.
 /// The caller still validates it with the rest ([`judge`]), so dropping can
 /// never make an invalid answer acceptable, and leaves its question
 /// unanswered, clearing any earlier answer to it.
@@ -370,11 +374,26 @@ pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<Vec<ModelSel
                 }
         })
     };
+    // Evidence entirely within another question's strictly longer evidence —
+    // "large" inside "small and large" — is a fragment of that answer, not one
+    // of its own. Exactly the same words cited for two questions keep both.
+    let contained = |selection: &ModelSelection| {
+        let Some(evidence) = selection.evidence.as_deref() else {
+            return false;
+        };
+        let words = word_spans(evidence).len();
+        answer.selections.iter().any(|other| {
+            other.question_index != selection.question_index
+                && other.evidence.as_deref().is_some_and(|cited| {
+                    word_spans(cited).len() > words && verbatim_slice(cited, evidence).is_some()
+                })
+        })
+    };
     let (dropped, kept): (Vec<_>, Vec<_>) = answer
         .selections
         .iter()
         .enumerate()
-        .partition(|(at, selection)| borrows(*at, selection));
+        .partition(|(at, selection)| borrows(*at, selection) || contained(selection));
     let dropped: Vec<ModelSelection> = dropped.into_iter().map(|(_, s)| s.clone()).collect();
     let kept: Vec<ModelSelection> = kept.into_iter().map(|(_, s)| s.clone()).collect();
     answer.selections = kept;
