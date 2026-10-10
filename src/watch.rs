@@ -184,7 +184,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         // The output came from `printf`, so `sleep 30` is still holding the
-        // pipes open: a `run_once` that only wrote on exit would be done by now.
+        // pipes open. A `run_once` that only wrote on exit returns
+        // microseconds after its write, so the grace makes catching it
+        // independent of when the poll above happened to land.
+        std::thread::sleep(Duration::from_secs(1));
         assert!(
             !running.is_finished(),
             "output arrived only once the command exited, not while it ran"
