@@ -3074,9 +3074,11 @@ pub struct RunningAgent {
     pub tab_membership: Option<TabMembership>,
     /// Issue #1612: the working directories this agent was started in — its
     /// `cwd` and orchestration cwd as [`spawn_dirs`] resolved them before the
-    /// spawn, a relative one against the daemon's working directory. Kept so a
-    /// removal asks which directories an agent is rooted in without resolving
-    /// a path while it holds the registry lock (Qodo on PR #1642).
+    /// spawn, a relative one against the daemon's working directory — and every
+    /// cwd learned since through [`AgentPtyRegistry::set_agent_label`], resolved
+    /// the same way. Kept so a removal asks which directories an agent is
+    /// rooted in without resolving a path while it holds the registry lock
+    /// (Qodo on PR #1642).
     root_dirs: Vec<PathBuf>,
     /// Which AI agent this pane was spawned to run (PRD #76 M2.13).
     /// Captured from [`SpawnOptions::agent_type`] at spawn time and echoed
@@ -3343,10 +3345,9 @@ static QUOTA_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 impl RunningAgent {
     /// Issue #1612: the directories this agent is rooted in, read without
-    /// resolving anything: the ones its spawn resolved ([`Self::root_dirs`]),
-    /// and its current `cwd` and orchestration cwd as recorded — `cwd` can be
-    /// learned after the spawn ([`AgentPtyRegistry::set_agent_label`]), and an
-    /// orchestration cwd is always absolute.
+    /// resolving anything: the resolved ones in [`Self::root_dirs`], and its
+    /// current `cwd` and orchestration cwd as recorded (an orchestration cwd is
+    /// always absolute).
     fn rooted_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
         let orchestration_cwd = match &self.tab_membership {
             Some(TabMembership::Orchestration {
@@ -15255,6 +15256,12 @@ impl AgentPtyRegistry {
                 None
             }
         });
+        // Issue #1612 (Qodo on PR #1642): a learned cwd is resolved here, before
+        // the lock, and joins the directories the agent is rooted in. Earlier
+        // ones are kept rather than replaced: a removal that finds a directory
+        // an agent once worked in still in use leaves it, which is the safe
+        // direction, and the list grows only by distinct directories.
+        let learned = spawn_dirs(cwd.as_deref(), None);
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents
@@ -15262,6 +15269,11 @@ impl AgentPtyRegistry {
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         agent.display_name = display_name;
         agent.cwd = cwd;
+        for dir in learned {
+            if !agent.root_dirs.contains(&dir) {
+                agent.root_dirs.push(dir);
+            }
+        }
         Ok(())
     }
 
@@ -18563,7 +18575,12 @@ mod spawn_tests {
     /// it matches a hold on the absolute path it names — for a published agent
     /// too, whose resolved directories are kept on its record so the check
     /// resolves nothing under the registry lock (Qodo on PR #1642).
+    ///
+    /// Serialized with the tests that move the process's working directory,
+    /// which a relative path is resolved against (Qodo on PR #1642). Under
+    /// nextest every test is a process of its own and this costs nothing.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_relative_spawn_dir_is_resolved_against_the_daemons_working_directory() {
         let here = std::env::current_dir().unwrap();
         assert_eq!(
@@ -18591,6 +18608,13 @@ mod spawn_tests {
             .expect("spawn in a relative directory");
         assert!(registry.dir_in_use(&here.join("src")));
         assert!(registry.hold_dir_for_removal(&here.join("src")).is_none());
+
+        // A relative cwd learned after the spawn is resolved the same way.
+        registry
+            .set_agent_label(&id, None, Some("tests".to_string()))
+            .unwrap();
+        assert!(registry.dir_in_use(&here.join("tests")));
+        assert!(registry.hold_dir_for_removal(&here.join("tests")).is_none());
         registry.close_agent(&id).unwrap();
         registry.shutdown_all();
     }
