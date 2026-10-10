@@ -2093,6 +2093,8 @@ mod tests {
         (dir, staged, target, verify::sha256_hex(bytes))
     }
 
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     /// What `pkexec` answers when its password prompt is dismissed: exit 126,
     /// before it runs anything.
     fn dismissed() -> CommandOutput {
@@ -2111,6 +2113,8 @@ mod tests {
         }
     }
 
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     fn privileged(
         host: &FakeHost,
         staged: &Path,
@@ -2571,6 +2575,8 @@ mod tests {
         assert_eq!(unanswered.fallback().last(), Some(&check));
     }
 
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     /// [`fake_mac_detaching`] whose `hdiutil attach` fails: having mounted
     /// the image (the mount point filled) when `mounts`, and by timing out
     /// when `times_out`, else by exiting 1.
