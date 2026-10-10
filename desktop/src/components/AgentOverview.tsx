@@ -1235,10 +1235,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
-     digit, and a field or terminal keeps its own. */
+     digit, and a field or terminal keeps its own. A modal over the dashboard —
+     this screen's own confirmations, or one the app opens, such as the
+     newer-release dialog (issue #1635) — keeps them, as it keeps the scroll
+     keys above. */
   useEffect(() => {
     if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      if (modalOpen()) return;
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
       if (!agent) return;
