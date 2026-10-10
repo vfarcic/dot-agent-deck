@@ -1,6 +1,6 @@
 # PRD #1258: Resource-aware decks — daemon-served utilisation, and a deck recommendation when starting an agent
 
-**Status**: Draft — not started
+**Status**: In progress — M1–M4 implemented on branch `agent/dispatch-prd-1258` (2026-10-10); M5–M8 open
 **Priority**: Medium
 **Created**: 2026-09-23
 **Issue**: [#1258](https://github.com/vfarcic/dot-agent-deck/issues/1258)
@@ -76,13 +76,13 @@ Four commitments shape it.
 
 ### Iteration 1 — the daemon knows, and one client shows
 
-- [ ] **M1 — The sampler and the verb.** Host disk (per named role), load per core, and memory, sampled into a cache with a stated max age and served by a capability-gated `AttachRequest`. Protocol and socket tests for the bounds, the capability gate, and the freshness field. Rule 12's contract question answered in the PR.
-- [ ] **M2 — One load measurement in the tree.** The daemon's implementation becomes the only one; `src/test_budget.rs` and `tests/common/mod.rs` consume it instead of carrying their own, with #1245's macOS behaviour preserved and its macOS-only test still passing.
-- [ ] **M3 — The TUI overlay.** A keybinding opens it, it shows the attached deck's host with the sample age, and it is customisable like every other binding. L1 render tests, a catalog entry, and the keyboard-shortcuts doc updated.
+- [x] **M1 — The sampler and the verb.** Host disk (per named role), load per core, and memory, sampled into a cache with a stated max age and served by a capability-gated `AttachRequest`. Protocol and socket tests for the bounds, the capability gate, and the freshness field. Rule 12's contract question answered in the PR.
+- [x] **M2 — One load measurement in the tree.** The daemon's implementation becomes the only one; `src/test_budget.rs` and `tests/common/mod.rs` consume it instead of carrying their own, with #1245's macOS behaviour preserved and its macOS-only test still passing.
+- [x] **M3 — The TUI overlay.** A keybinding opens it, it shows the attached deck's host with the sample age, and it is customisable like every other binding. L1 render tests, a catalog entry, and the keyboard-shortcuts doc updated.
 
 ### Iteration 2 — several decks, and the recommendation
 
-- [ ] **M4 — The desktop surface.** Per-deck utilisation on the overview, several hosts at once, and the "not available from this deck" state for an older daemon. A Playwright spec for the surface.
+- [x] **M4 — The desktop surface.** Per-deck utilisation on the overview, several hosts at once, and the "not available from this deck" state for an older daemon. A Playwright spec for the surface.
 - [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom, a load ceiling and an available-memory floor, all three configurable per deck. The disk and load defaults are taken from the measurements in this document rather than invented; this document holds no measured memory figure, so the memory default is open question 5 and is settled from a measurement before M5 ships. Memory is in the verdict because rule 14's `SIGKILL`-ed `rustc` is a memory failure a deck with ample disk and low load can still produce. Clients display it and never recompute it. The request accepts an optional footprint from the caller — PRD #1264 passes a repository's expected per-unit size — and falls back to the deck's configured headroom floor without one. "No deck qualifies" states what is short. PRD #1264's deck recommendation is blocked on this milestone.
 - [ ] **M6 — Recommend and default.** The New agent flow's deck step pre-selects a qualifying deck and shows the reason; choosing another warns and proceeds. `dispatch` states its own deck's verdict in the result `handle_dispatch` writes back into the calling pane — not in the `SignalAck`, which the daemon sends before the handler runs and which claims only admission past the provenance gate (`src/event.rs`). Choosing among decks from `dispatch` is PRD #1264. An L2 test for the TUI path, one asserting the verdict arrives in the calling pane's dispatch result, and a Playwright spec for the desktop one.
 
@@ -116,3 +116,14 @@ Four commitments shape it.
 - `PROTOCOL_VERSION` is unchanged, and rule 12's cross-version test has been run and recorded.
 - Exactly one load-average implementation remains in the tree.
 - The sampler's cost is measured and stated, and no new timer was added.
+
+## Progress log
+
+### 2026-10-10 — M1–M4 (branch `agent/dispatch-prd-1258`)
+
+- **M1**: `src/host_metrics.rs` samples per-role disk (`working_root`, `worktree_parent`, `temp_root`; `statvfs` at the nearest existing ancestor), load per core and memory (Linux `/proc/meminfo`; absent on macOS) into a single-flight cache with `HOST_METRICS_MAX_AGE` = 2 s and no new timer. The wire types live in `src/daemon_protocol.rs`: `AttachRequest::HostMetrics` gated on `CAP_HOST_METRICS` (Unix only), an additive optional `AttachResponse::host_metrics`, and client-side reply bounds. `PROTOCOL_VERSION` is unchanged; there is no `CONTRACT_BREAKS` entry and no `.breaking.md`. Measured cost: a cold sample has a median of 105 µs and a cache hit takes 221 ns. Tests: `protocol/host-metrics/001`–`010`.
+- **M2**: `host_metrics::machine_load_per_cpu` is the only load implementation; `src/test_budget.rs` and `tests/common/mod.rs` consume it, with #1245's macOS behaviour and test preserved.
+- **M3**: the TUI overlay on the customisable `m` binding (`[dashboard] host_metrics`), Esc closes it. Tests: `dashboard/host-metrics/001`–`008`, `keybindings/remap/004`, `dashboard/help/002`. `dashboard/host-metrics/004` is a lane-1 PTY test with no agent, so it is not a reel clip.
+- **M4**: the desktop per-deck panel on the overview, shown for each connected deck, plus the "not available from this deck" state; `desktop/e2e/host-metrics.spec.ts`. The same words come from the shared fixture `tests/fixtures/host-metrics-copy.json`, read by both clients' tests (rule 22).
+- **Open questions settled for M1–M4**: Q1: three fixed roles, not yet configurable. Q4: strictly the attached deck. Q2, Q3 and Q5 belong to M5/M6 and remain open.
+- **Reds met under load**: fixed in this branch, except `status_blocked_019`, quarantined pending #1664 (a hook-listener ordering race). #1665 tracks a real `codex` on the e2e login-shell PATH.
