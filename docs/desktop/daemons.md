@@ -159,7 +159,7 @@ When the reason ends with `and it is still the daemon that was asked to restart`
 
 ## Upgrade the daemon on this machine
 
-When the daemon on this machine runs an older release than the app, for example because you updated the app while the daemon kept running, the app restarts the daemon onto the app's version, as the TUI does when it starts ([Installation → Upgrading](../installation.md#upgrading) has the TUI's prompt). The daemon it starts is the one that came with the app, the same one **Start daemon** starts, so nothing is downloaded or installed.
+When the daemon on this machine runs an older release than the app, for example because you updated the app while the daemon kept running, the app restarts the daemon onto the app's version, as the TUI does when it starts. The daemon it starts is the one that came with the app, the same one **Start daemon** starts, so nothing is downloaded or installed.
 
 **What happens when the app finds an older daemon here**, at start or while it is open:
 
@@ -169,7 +169,9 @@ When the daemon on this machine runs an older release than the app, for example 
   - **Keep current daemon**, the default, stops nothing, and the daemon keeps running the older version with your agents. Closing the dialog or pressing `Escape` is the same as **Keep current daemon**.
   - If what is running changes while you decide, nothing is stopped and the dialog shows the new list and asks again.
 
-The app does this once for each daemon version while it is open, so after **Keep current daemon**, or a restart that failed, it does not ask again until the next time you start the app. To upgrade sooner, press **Upgrade** on the **Local daemon** section of the Dashboard; hovering it shows both versions. The dialog asks first, then goes on as above.
+**In the TUI**, the same happens when `dot-agent-deck` starts and finds a daemon from a different build than its own: with nothing running it restarts the daemon without asking, and with agents running it prints `Daemon version mismatch`, the two builds and the agents a restart would stop. Press `S` to restart the daemon, stopping those agents, or any other key to keep the current daemon and attach to it with your agents intact. [Installation → Upgrading](../installation.md#upgrading) covers the TUI's other cases.
+
+The app does this once for each daemon version while it is open, so after **Keep current daemon**, or a restart that failed, it does not ask again until the next time you start the app. If an agent's pane or **New agent** is open when the app finds the older daemon, the dialog waits until you close it. To upgrade sooner, press **Upgrade** on the **Local daemon** section of the Dashboard; hovering it shows both versions. The dialog asks first, then goes on as above.
 
 The restarted daemon sets up the agent hooks again, as every daemon start does.
 

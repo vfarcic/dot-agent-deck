@@ -429,6 +429,25 @@ describe("UpgradeDialog", () => {
     await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
   });
 
+  /** Scenario: Opened on its own over a focused control, the dialog takes focus, so Escape is handled by the dialog and does not reach the window's listeners behind it. */
+  it("takes focus when it opens in its running phase", () => {
+    const { runtime } = controlledRuntime();
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    const behind = vi.fn();
+    window.addEventListener("keydown", behind);
+    try {
+      render(<UpgradeDialog target={LOCAL_TARGET} runtime={runtime} onClose={vi.fn()} autoStart />);
+      expect(document.activeElement).toBe(screen.getByTestId("upgrade-dialog"));
+      fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+      expect(behind).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", behind);
+      outside.remove();
+    }
+  });
+
   /** Scenario: Under React's StrictMode, which runs effects twice, the app's own upgrade still starts exactly once. */
   it("starts the app's own upgrade once under StrictMode", () => {
     const { runtime } = controlledRuntime();

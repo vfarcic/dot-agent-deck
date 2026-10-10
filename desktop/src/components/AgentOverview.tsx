@@ -1237,6 +1237,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   useEffect(() => {
     if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      // A modal this screen does not own covers it too, such as the Upgrade
+      // dialog the shell opens on its own (issue #1636): a digit pressed in it
+      // must not open a row hidden behind it.
+      if (modalOpen()) return;
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
       if (!agent) return;

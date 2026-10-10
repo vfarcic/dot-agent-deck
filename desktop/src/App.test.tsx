@@ -3025,6 +3025,23 @@ describe("upgrading an older local daemon at launch (issue #1636)", () => {
     expect(upgradeDaemon).toHaveBeenCalledTimes(1);
   });
 
+  /** Scenario: With another modal open (an agent pane, New agent), the app waits and opens its Upgrade dialog only once that modal has closed, so its buttons are never inert behind it. */
+  it("waits for another modal to close before upgrading on its own", async () => {
+    const live = runtime({ mode: "live", snapshot: olderLocal(), desktopFeatures: fixtureDesktopFeatures("") });
+    const other = document.createElement("div");
+    other.setAttribute("aria-modal", "true");
+    document.body.appendChild(other);
+    try {
+      render(<DeckShell runtime={live} />);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1200)); });
+      expect(live.upgradeDaemon).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    } finally {
+      other.remove();
+    }
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledExactlyOnceWith("deck-local", expect.any(Function)), { timeout: 3000 });
+  });
+
   /** Scenario: The app starts nothing on its own for a local daemon at its own release or newer, for a remote daemon, for a refused local daemon, or in the fixture preview. */
   it("starts nothing on its own unless the connected local daemon is older", () => {
     const cases: [string, Partial<DeckRuntimeState>][] = [];

@@ -148,6 +148,15 @@ export function UpgradeDialog({ target, runtime, onClose, autoStart = false }: {
     );
   };
 
+  /* Focus inside the dialog from the start, so Escape and Tab reach it: an
+     autoStart dialog opens in its running phase, with no button to take it,
+     over whatever had focus (Qodo, PR #1640). A button that autofocused keeps it. */
+  const section = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const element = section.current;
+    if (element && !element.contains(document.activeElement)) element.focus();
+  }, []);
+
   /* Started once, however often React runs the effect (StrictMode runs it twice). */
   const autoStarted = useRef(false);
   useEffect(() => {
@@ -209,6 +218,8 @@ export function UpgradeDialog({ target, runtime, onClose, autoStart = false }: {
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={dismiss}>
       <section
+        ref={section}
+        tabIndex={-1}
         className="confirm-dialog upgrade-dialog"
         role="alertdialog"
         aria-modal="true"
