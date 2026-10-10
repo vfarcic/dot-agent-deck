@@ -11387,7 +11387,7 @@ impl Drop for InProcDaemon {
     }
 }
 
-/// Bring up an in-process daemon and block until its hook socket accepts
+/// Bring up an in-process daemon and block until its hook and attach sockets accept
 /// connections (so an agent's first CLI call can't race startup). Mirrors
 /// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
 /// poll lives in `common`.
@@ -11437,7 +11437,12 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // A newly spawned daemon task must get a turn and finish synchronous
+    // startup before its sockets can accept. Use the harness's bounded,
+    // load-scaled task-start budget for each endpoint, rather than letting a
+    // five-second startup stall fail otherwise unrelated pane tests.
+    let hook_budget = daemon_task_start_budget();
+    let deadline = tokio::time::Instant::now() + hook_budget;
     let mut ready = false;
     while tokio::time::Instant::now() < deadline {
         if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
@@ -11448,7 +11453,8 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket was not accepting connections within 5s"
+        "in-process daemon hook socket {} was not accepting connections within {hook_budget:?}",
+        hook_path.display()
     );
 
     // Issue #954: and the ATTACH socket too, because this function hands one
@@ -11468,7 +11474,8 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // harness-sized version of that bug being written next. `daemon_status.rs`
     // had already hand-rolled this wait for its own calls; the other consumer,
     // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
-    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let attach_budget = daemon_task_start_budget();
+    let attach_deadline = tokio::time::Instant::now() + attach_budget;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < attach_deadline {
         if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
@@ -11479,7 +11486,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         attach_ready,
-        "in-process daemon attach socket {} was not accepting connections within 5s",
+        "in-process daemon attach socket {} was not accepting connections within {attach_budget:?}",
         attach_path.display()
     );
 
