@@ -901,8 +901,7 @@ const SELF_UPGRADE_DISPLAY_EXE: &str = "/home/dev/.local/bin/dot-agent-deck";
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_self_upgrade() {
-    use fake_releases::{FakeReleases, cli_asset};
-    use sha2::{Digest, Sha256};
+    use fake_releases::{FakeReleases, cli_asset, release_script, sha256_hex};
 
     html_dir();
     // The dialog prints the copy's path, and the upgrade plan needs a folder
@@ -927,11 +926,8 @@ fn docs_screenshot_self_upgrade() {
     std::fs::create_dir_all(exe.parent().unwrap()).expect("create the install's bin folder");
     std::fs::write(&exe, b"#!/bin/sh\necho old\n").expect("write the installed copy");
 
-    let asset = format!("#!/bin/sh\necho 'dot-agent-deck {SELF_UPGRADE_LATEST}'\n").into_bytes();
-    let sha: String = Sha256::digest(&asset)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let asset = release_script(SELF_UPGRADE_LATEST);
+    let sha = sha256_hex(&asset);
     let server = FakeReleases::start(
         SELF_UPGRADE_LATEST,
         asset,

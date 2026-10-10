@@ -11,22 +11,19 @@
 //! and downloaded (`DOT_AGENT_DECK_TEST_RELEASES_API_URL`,
 //! `DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL`,
 //! `DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE`). The "release binary" it
-//! downloads is a small script that answers `--version` as dot-agent-deck
-//! [`RELEASE`]: the core checks a download only by its checksum and that
-//! answer, so the script exercises the whole download → check → replace path
-//! without moving a few hundred megabytes of debug binary per test.
+//! downloads is a small script that answers `--version`, and nothing else
+//! ([`release_script`]).
 
 mod common;
+#[path = "support/fake_releases.rs"]
+mod fake_releases;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::TuiDeck;
-use dot_agent_deck::self_upgrade::Platform;
+use fake_releases::{FakeReleases, cli_asset, release_script, sha256_hex};
 use spec::spec;
 
 /// What a running copy older than the release reports.
@@ -38,130 +35,16 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_dot-agent-deck")
 }
 
-fn cli_asset() -> &'static str {
-    Platform::current()
-        .expect("a platform with release assets")
-        .cli_asset()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// A local stand-in for GitHub's release API and download host.
-struct FakeReleases {
-    port: u16,
-    latest: Arc<Mutex<String>>,
-}
-
-impl FakeReleases {
-    /// Serve `latest` as the newest stable release, its CLI asset as `asset`,
-    /// and `manifest` as its `checksums.txt`.
-    fn start(latest: &str, asset: Vec<u8>, manifest: String) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake release server");
-        let port = listener.local_addr().unwrap().port();
-        let latest = Arc::new(Mutex::new(latest.to_string()));
-        let shared = latest.clone();
-        let asset = Arc::new(asset);
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let latest = shared.lock().unwrap().clone();
-                let asset = asset.clone();
-                let manifest = manifest.clone();
-                std::thread::spawn(move || serve(stream, &latest, &asset, &manifest));
-            }
-        });
-        Self { port, latest }
-    }
-
-    fn set_latest(&self, version: &str) {
-        *self.latest.lock().unwrap() = version.to_string();
-    }
-
-    fn base(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    /// The seams that point the binary under test at this server, as a copy
-    /// running `OLD_VERSION` from `exe`.
-    fn env(&self, exe: &Path) -> Vec<(String, String)> {
-        vec![
-            (
-                "DOT_AGENT_DECK_TEST_RELEASES_API_URL".into(),
-                format!("{}/api/latest", self.base()),
-            ),
-            (
-                "DOT_AGENT_DECK_TEST_RELEASES_LIST_API_URL".into(),
-                format!("{}/api/list", self.base()),
-            ),
-            (
-                "DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE".into(),
-                format!("{}/download", self.base()),
-            ),
-            (
-                "DOT_AGENT_DECK_TEST_RUNNING_VERSION".into(),
-                OLD_VERSION.into(),
-            ),
-            (
-                "DOT_AGENT_DECK_TEST_RUNNING_EXE".into(),
-                exe.to_str().expect("UTF-8 path").into(),
-            ),
-        ]
-    }
-}
-
-fn serve(mut stream: TcpStream, latest: &str, asset: &[u8], manifest: &str) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return;
-    }
-    loop {
-        let mut header = String::new();
-        match reader.read_line(&mut header) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if header == "\r\n" || header == "\n" => break,
-            Ok(_) => {}
-        }
-    }
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let release = format!(r#"{{"tag_name":"v{latest}","draft":false,"prerelease":false}}"#);
-    let download = format!("/download/v{latest}/");
-    let (status, body): (&str, Vec<u8>) = if path == "/api/latest" {
-        ("200 OK", release.into_bytes())
-    } else if path.starts_with("/api/list") {
-        ("200 OK", format!("[{release}]").into_bytes())
-    } else if let Some(name) = path.strip_prefix(&download) {
-        if name == "checksums.txt" {
-            ("200 OK", manifest.as_bytes().to_vec())
-        } else if name == cli_asset() {
-            ("200 OK", asset.to_vec())
-        } else {
-            ("404 Not Found", Vec::new())
-        }
-    } else {
-        ("404 Not Found", Vec::new())
-    };
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
-    let _ = stream.flush();
-    let mut rest = Vec::new();
-    let _ = reader.read_to_end(&mut rest);
-}
-
 /// The release binary the fake server offers — a script that answers
 /// `--version` as dot-agent-deck [`RELEASE`] — and a checksum manifest that
 /// lists it (or a wrong checksum).
 fn release(correct_checksum: bool) -> (Vec<u8>, String) {
-    let asset = format!("#!/bin/sh\necho 'dot-agent-deck {RELEASE}'\n").into_bytes();
+    release_reporting(RELEASE, correct_checksum)
+}
+
+/// As [`release`], but the script answers `--version` as `reported`.
+fn release_reporting(reported: &str, correct_checksum: bool) -> (Vec<u8>, String) {
+    let asset = release_script(reported);
     let sha = if correct_checksum {
         sha256_hex(&asset)
     } else {
@@ -189,7 +72,7 @@ fn wait_for_file(path: &Path, want: &[u8], timeout: Duration) -> bool {
 
 fn deck(server: &FakeReleases, exe: &Path, extra: &[(&str, &str)]) -> TuiDeck {
     let mut builder = TuiDeck::builder().with_pty_size(200, 50);
-    for (key, value) in server.env(exe) {
+    for (key, value) in server.env(exe, OLD_VERSION) {
         builder = builder.with_env(key, value);
     }
     for (key, value) in extra {
@@ -211,7 +94,7 @@ fn run_upgrade(server: &FakeReleases, exe: &Path, home: &Path, args: &[&str]) ->
         .env("DOT_AGENT_DECK_STATE_DIR", home.join("state"))
         .env("DOT_AGENT_DECK_SOCKET", home.join("hook.sock"))
         .env("DOT_AGENT_DECK_ATTACH_SOCKET", home.join("attach.sock"));
-    for (key, value) in server.env(exe) {
+    for (key, value) in server.env(exe, OLD_VERSION) {
         command.env(key, value);
     }
     command.output().expect("run dot-agent-deck upgrade")
@@ -403,4 +286,36 @@ fn cli_upgrade_003_checksum_mismatch_leaves_the_old_binary() {
     );
     assert!(stdout.contains("Nothing was changed."), "{stdout}");
     assert_eq!(std::fs::read(&exe).unwrap(), old, "the old binary stays");
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` against a fake release server whose download has the right checksum but answers `--version` with a different version than the release. The upgrade fails with the core's version-mismatch message, exits non-zero, and leaves the old file byte for byte.
+#[spec("upgrade/cli-upgrade/004")]
+#[test]
+fn cli_upgrade_004_a_download_reporting_the_wrong_version_leaves_the_old_binary() {
+    let version = RELEASE;
+    let wrong = "1.2.3";
+    let (asset, manifest) = release_reporting(wrong, true);
+    let server = FakeReleases::start(version, asset, manifest);
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let old = std::fs::read(&exe).unwrap();
+
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a wrong version must fail\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "The downloaded binary reports v{wrong} instead of dot-agent-deck {version}. Nothing was changed."
+        )),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&exe).unwrap(),
+        old,
+        "the old binary stays byte for byte"
+    );
 }

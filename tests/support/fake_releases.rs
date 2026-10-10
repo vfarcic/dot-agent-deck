@@ -14,6 +14,28 @@ use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::self_upgrade::Platform;
 
+/// A stand-in for a release binary: a script that answers exactly one
+/// invocation, `--version`, as dot-agent-deck `version`, and fails on any
+/// other. The core checks a download only by its checksum and that answer, so
+/// the script exercises the whole download → check → replace path without
+/// moving a few hundred megabytes of debug binary, and a core that ran the
+/// download any other way would see it fail instead of an answer.
+pub(crate) fn release_script(version: &str) -> Vec<u8> {
+    format!(
+        "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n  echo 'dot-agent-deck {version}'\n  exit 0\nfi\necho 'unexpected invocation' >&2\nexit 64\n"
+    )
+    .into_bytes()
+}
+
+/// `bytes`' SHA-256, as `checksums.txt` lists it.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// This platform's CLI release asset, the one file besides `checksums.txt`
 /// the server offers for download.
 pub(crate) fn cli_asset() -> &'static str {
