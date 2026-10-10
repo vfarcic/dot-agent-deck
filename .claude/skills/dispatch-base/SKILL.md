@@ -87,10 +87,10 @@ git rev-list --left-right --count <sha>...origin/main  # "0  0" is origin/main i
 **The clause is a probe of `HEAD` taken just before `git worktree add` runs, not a reading of the worktree.** It and the unit's real base differ only if something moves the dispatcher checkout's `HEAD` while the dispatch runs, and nothing in this procedure does. When the clause is missing, or you need the authoritative answer, read the commit the unit's branch was created at from its first reflog entry, which later commits in the unit do not change:
 
 ```bash
-git reflog show --format=%h agent/dispatch-<name> | tail -1   # the commit the branch was cut at
+git reflog show --format='%h %gs' agent/dispatch-<name> | tail -1   # "<sha> branch: Created from HEAD"
 ```
 
-That sha and the clause's should match; a mismatch means `HEAD` moved mid-dispatch, and the reflog's sha is the base to report.
+**Use that sha only when the line reads `<sha> branch: Created from HEAD`.** An empty result or any other subject means the reflog cannot answer, because it is disabled, expired or was rewritten. Then say the base could not be verified, and do not report a sha. When it does answer, its sha and the clause's should match; a mismatch means `HEAD` moved mid-dispatch, and the reflog's sha is the base to report.
 
 Catching it here costs one stopped unit, before the unit has spent any time working from the wrong tree.
 
