@@ -333,6 +333,70 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
     }
 }
 
+/// Issue #1650: whether `reported`, the prompt a worker's agent reports it
+/// submitted, is a FRAGMENT of `pointer` — a non-empty part of it that is not
+/// the pointer itself — which means the pointer reached the agent cut short.
+///
+/// Codex 0.160.0 submitted `2b1b]` and `70540b]`, the last characters of the
+/// pointer, when the pointer was typed while it was still starting. Its turn on
+/// that text is not the task, so it must not count as proof that the task
+/// arrived. Narrow on purpose: a report [`crate::prompt_delivery::prompt_submission_matches`]
+/// accepts (the pointer, or its truncated report) is the pointer, and any
+/// other text — a prompt the user typed, an earlier delegation's pointer — is
+/// not evidence of a cut-short pointer, so it keeps its old meaning.
+pub fn is_pointer_fragment(pointer: &str, reported: &str) -> bool {
+    let reported = reported.trim();
+    !reported.is_empty()
+        && !crate::prompt_delivery::prompt_submission_matches(pointer, reported)
+        && pointer.trim() != reported
+        && pointer.contains(reported)
+}
+
+/// Issue #1650: reads a delivered worker's events in order and answers whether
+/// each proves the pointer landed, setting aside the turn an agent began on a
+/// fragment of the pointer ([`is_pointer_fragment`]).
+///
+/// A fragment's turn is reported as a `Thinking` carrying the fragment, then
+/// whatever the agent does with it — Codex ran `git` on `70540b]` — so every
+/// event after it is set aside too, until the next submitted-prompt report
+/// starts another turn. Events carry no delivery id, so this is the only place
+/// the two can be told apart.
+#[derive(Debug, Clone)]
+pub struct PointerTurnFilter {
+    pointer: String,
+    in_fragment_turn: bool,
+    saw_fragment: bool,
+}
+
+impl PointerTurnFilter {
+    pub fn new(pointer: &str) -> Self {
+        Self {
+            pointer: pointer.to_string(),
+            in_fragment_turn: false,
+            saw_fragment: false,
+        }
+    }
+
+    /// Whether `event` proves delivery, given `proves`, the answer the event
+    /// alone gives ([`crate::state::worker_event_proves_delivery`]).
+    pub fn proves(&mut self, event: &AgentEvent, proves: bool) -> bool {
+        if proves
+            && event.event_type == EventType::Thinking
+            && let Some(reported) = event.user_prompt.as_deref()
+        {
+            self.in_fragment_turn = is_pointer_fragment(&self.pointer, reported);
+            self.saw_fragment |= self.in_fragment_turn;
+            return !self.in_fragment_turn;
+        }
+        proves && !self.in_fragment_turn
+    }
+
+    /// Whether the worker's agent has submitted a fragment of the pointer.
+    pub fn saw_fragment(&self) -> bool {
+        self.saw_fragment
+    }
+}
+
 /// What the worker's screen shows about this delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Composer {
@@ -1078,6 +1142,9 @@ struct Watch {
     closing: oneshot::Receiver<()>,
     exited: oneshot::Receiver<()>,
     event_rx: broadcast::Receiver<BroadcastMsg>,
+    /// Issue #1650: sets aside a turn the worker began on a fragment of the
+    /// pointer.
+    turns: PointerTurnFilter,
 }
 
 impl Watch {
@@ -1114,7 +1181,22 @@ impl Watch {
                             continue;
                         }
                         match classify_event(&event) {
-                            EventVerdict::Received => return Err(RetryEnd::Received),
+                            EventVerdict::Received => {
+                                let fragments_before = self.turns.saw_fragment();
+                                if self.turns.proves(&event, true) {
+                                    return Err(RetryEnd::Received);
+                                }
+                                if !fragments_before && self.turns.saw_fragment() {
+                                    warn!(
+                                        pane_id = %escape_id_for_log(pane_id),
+                                        role = %escape_id_for_log(role),
+                                        delivery_id = %delivery_id,
+                                        "delegate retry: the worker submitted only part of its \
+                                         task pointer, so its turn is not the task; the pointer \
+                                         will be sent again"
+                                    );
+                                }
+                            }
                             EventVerdict::Blocked => return Err(RetryEnd::Blocked),
                             EventVerdict::Postpone if !postponed => {
                                 postponed = true;
@@ -1215,6 +1297,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
         closing: registry.pane_close_signal(&pane_id),
         exited: registry.agent_exit_signal(&worker_agent_id),
         event_rx,
+        turns: PointerTurnFilter::new(&pointer),
     };
     let waits = schedule.waits().to_vec();
     let total_attempts = waits.len();
@@ -1240,7 +1323,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     // comes out of the wait rather than stretching the schedule. A probe's
     // grace is not: it runs from the probe's own write (below).
     let mut anchor = tokio::time::Instant::now();
-    let redeliver_ctx = RedeliverCtx {
+    let mut redeliver_ctx = RedeliverCtx {
         registry: &registry,
         seq,
         retype,
@@ -1304,11 +1387,14 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
                 // retype step could only add a second copy, over a screen that
                 // scrolled the pointer away meanwhile. Latched, so no later
                 // attempt retypes it either.
-                Composer::PointerInHistory => {
+                // Issue #1650: unless the worker's agent has reported submitting
+                // only a fragment of the pointer — then the id on screen is the
+                // echo of the typing, not a submitted task, and the re-send goes on.
+                Composer::PointerInHistory if !watch.turns.saw_fragment() => {
                     seen_submitted = true;
                     continue;
                 }
-                Composer::PointerInComposer | Composer::Absent => {}
+                Composer::PointerInHistory | Composer::PointerInComposer | Composer::Absent => {}
             }
             // The screen does not show the pointer, which cannot tell an empty
             // composer from one holding the pointer off-screen or unechoed. The
@@ -1337,6 +1423,18 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
                 .await
             {
                 break 'outer end;
+            }
+            // Issue #1650: a worker whose agent submitted a fragment of the
+            // pointer reported that submission, so it will report a retyped
+            // pointer's too, and the fragment was not the task. The reason a
+            // wrapped Codex is never retyped — a submission the deck might not
+            // hear — does not hold for it, and without a retype it never gets
+            // its task. For the same reason an earlier reading that showed the
+            // pointer as submitted was the echo of its typing, not the task.
+            let fragment = watch.turns.saw_fragment();
+            if fragment {
+                redeliver_ctx.retype = RetypePolicy::Allowed;
+                seen_submitted = false;
             }
             match redeliver(
                 &redeliver_ctx,
@@ -2040,6 +2138,78 @@ mod tests {
             "agent_id": "a1",
         }))
         .unwrap()
+    }
+
+    /// Issue #1650: what codex-cli 0.160.0 submitted when the pointer was typed
+    /// while it was starting (`2b1b]`, `70540b]`) is a fragment; the pointer
+    /// itself, its truncated report and an unrelated prompt are not.
+    #[test]
+    fn a_cut_short_submission_is_a_pointer_fragment() {
+        let pointer =
+            "Read .dot-agent-deck/worker-task-tester.md for your task. [delivery d-6aaf2b1b]";
+        assert!(is_pointer_fragment(pointer, "2b1b]"));
+        assert!(is_pointer_fragment(pointer, "af2b1b]\n"));
+        assert!(is_pointer_fragment(
+            pointer,
+            "Read .dot-agent-deck/worker-task"
+        ));
+        assert!(!is_pointer_fragment(pointer, pointer));
+        assert!(!is_pointer_fragment(pointer, &format!("  {pointer}\n")));
+        assert!(!is_pointer_fragment(pointer, ""));
+        assert!(!is_pointer_fragment(pointer, "   "));
+        assert!(!is_pointer_fragment(pointer, "fix the login bug"));
+        // A long pointer is reported cut to the prompt budget: that is the
+        // pointer, not a fragment of it.
+        let long = format!(
+            "Read .dot-agent-deck/worker-task-{}.md for your task. [delivery d-6aaf2b1b]",
+            "r".repeat(300)
+        );
+        let reported = crate::prompt_delivery::truncate_on_char_boundary(
+            &long,
+            crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+        );
+        assert!(!is_pointer_fragment(&long, &reported));
+    }
+
+    fn prompt_event(prompt: &str) -> AgentEvent {
+        let mut event = event(EventType::Thinking);
+        event.user_prompt = Some(prompt.to_string());
+        event
+    }
+
+    /// Issue #1650: a turn on a fragment is not proof, nor is anything the
+    /// agent does in it; the next turn on the whole pointer is.
+    #[test]
+    fn a_turn_on_a_pointer_fragment_does_not_prove_delivery() {
+        let pointer =
+            "Read .dot-agent-deck/worker-task-tester.md for your task. [delivery d-6aaf2b1b]";
+        let mut turns = PointerTurnFilter::new(pointer);
+        assert!(!turns.saw_fragment());
+        assert!(!turns.proves(&prompt_event("af2b1b]"), true));
+        assert!(turns.saw_fragment());
+        assert!(!turns.proves(&event(EventType::ToolStart), true));
+        assert!(!turns.proves(&event(EventType::ToolEnd), true));
+        assert!(!turns.proves(&event(EventType::Idle), false));
+        assert!(turns.proves(&prompt_event(pointer), true));
+        assert!(turns.proves(&event(EventType::ToolStart), true));
+        assert!(turns.saw_fragment(), "the fragment stays on record");
+    }
+
+    /// Issue #1650: without a fragment, every event keeps the meaning it had —
+    /// a turn on some other prompt still stops the re-send (the no-duplicate
+    /// direction), and an event that proves nothing still proves nothing.
+    #[test]
+    fn a_turn_on_another_prompt_still_proves_delivery() {
+        let pointer =
+            "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]";
+        let mut turns = PointerTurnFilter::new(pointer);
+        assert!(turns.proves(&event(EventType::Thinking), true));
+        assert!(turns.proves(&prompt_event("fix the login bug"), true));
+        assert!(!turns.proves(&event(EventType::SessionStart), false));
+        assert!(!turns.saw_fragment());
+        // And a turn on another prompt after a fragment ends the fragment's turn.
+        assert!(!turns.proves(&prompt_event("d-7f3a9c21]"), true));
+        assert!(turns.proves(&prompt_event("fix the login bug"), true));
     }
 
     #[test]
