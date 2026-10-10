@@ -234,11 +234,77 @@ fn agent_cli_name(agent: &AgentType) -> Option<&'static str> {
 // Version probe and comparison
 // ---------------------------------------------------------------------------
 
-type ProbeKey = (PathBuf, Option<crate::daemon_restart::FileIdentity>);
+type Identity = Option<crate::daemon_restart::FileIdentity>;
 
-fn probe_cache() -> &'static Mutex<HashMap<ProbeKey, Result<String, String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<ProbeKey, Result<String, String>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The most canonical paths [`ProbeCache`] keeps a result for. Each agent's
+/// hooks pin at most [`MAX_BINARIES_PER_AGENT`] binaries, so this covers every
+/// agent's full set with room to spare (issue #1637 audit A10).
+const MAX_PROBE_CACHE_PATHS: usize = 64;
+
+/// One cached probe: the result for the file identity it was taken from.
+#[derive(Debug)]
+struct CachedProbe {
+    identity: Identity,
+    result: Result<String, String>,
+    /// When this entry was last read or written, in [`ProbeCache::clock`]
+    /// ticks, for least-recently-used eviction.
+    used: u64,
+}
+
+/// [`probe_version`]'s results, bounded (issue #1637 audit A10): one entry
+/// per canonical path, holding only the latest identity's result, so a file
+/// whose identity keeps changing replaces its entry instead of adding one,
+/// and at most [`MAX_PROBE_CACHE_PATHS`] paths, the least recently used
+/// evicted first. A lookup hits only for the identity it was stored under, so
+/// a replaced file is still probed again.
+#[derive(Debug, Default)]
+struct ProbeCache {
+    entries: HashMap<PathBuf, CachedProbe>,
+    clock: u64,
+}
+
+impl ProbeCache {
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, path: &Path, identity: &Identity) -> Option<Result<String, String>> {
+        let now = self.tick();
+        let entry = self.entries.get_mut(path)?;
+        if entry.identity != *identity {
+            return None;
+        }
+        entry.used = now;
+        Some(entry.result.clone())
+    }
+
+    fn insert(&mut self, path: PathBuf, identity: Identity, result: Result<String, String>) {
+        let used = self.tick();
+        if !self.entries.contains_key(&path) && self.entries.len() >= MAX_PROBE_CACHE_PATHS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(path, _)| path.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            path,
+            CachedProbe {
+                identity,
+                result,
+                used,
+            },
+        );
+    }
+}
+
+fn probe_cache() -> &'static Mutex<ProbeCache> {
+    static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ProbeCache::default()))
 }
 
 /// The probe time one window may still spend (see
@@ -297,11 +363,11 @@ thread_local! {
     static FS_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The release `binary --version` reports, run at most once per process for
-/// the same file: bounded by [`HOOK_BINARY_PROBE_TIMEOUT`] and by the window's
-/// [`HOOK_BINARY_PROBE_BUDGET`], stdout capped, and keyed by the canonical path
-/// and the file's identity so the four installers probe a shared pin once and a
-/// replaced file is probed again.
+/// The release `binary --version` reports, run once for the same file while
+/// it stays in the [`ProbeCache`]: bounded by [`HOOK_BINARY_PROBE_TIMEOUT`] and
+/// by the window's [`HOOK_BINARY_PROBE_BUDGET`], stdout capped, and keyed by
+/// the canonical path and the file's identity so the four installers probe a
+/// shared pin once and a replaced file is probed again.
 ///
 /// The bound covers the run of the binary ([`run_probe`]). Resolving the path,
 /// reading its identity and the `spawn` itself are filesystem calls made before
@@ -309,16 +375,13 @@ thread_local! {
 /// installers call this, never a hook line's ingest.
 pub fn probe_version(binary: &Path) -> Result<String, String> {
     let canonical = resolve(binary).unwrap_or_else(|| binary.to_path_buf());
-    let key = (
-        canonical.clone(),
-        crate::daemon_restart::FileIdentity::read(&canonical).ok(),
-    );
+    let identity = crate::daemon_restart::FileIdentity::read(&canonical).ok();
     if let Some(hit) = probe_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&key)
+        .get(&canonical, &identity)
     {
-        return hit.clone();
+        return hit;
     }
     let started = Instant::now();
     let allowance = probe_budget()
@@ -340,7 +403,7 @@ pub fn probe_version(binary: &Path) -> Result<String, String> {
     probe_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(key, result.clone());
+        .insert(canonical, identity, result.clone());
     result
 }
 
@@ -3228,6 +3291,55 @@ mod tests {
         std::fs::rename(&replacement, &stub).unwrap();
         assert_eq!(probe_version(Path::new(&stub)).as_deref(), Ok("0.0.2"));
         assert_eq!(count(), 2);
+    }
+
+    /// Scenario: one pinned file whose identity changes on every refresh, and
+    /// then more distinct paths than the cache keeps. The cache holds one
+    /// entry per path, the latest identity's, and evicts the least recently
+    /// used path past its limit (audit A10).
+    #[test]
+    fn the_probe_cache_keeps_one_identity_per_path_and_a_bounded_number_of_paths() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pinned = dir.path().join("pinned");
+        let identity_of = |len: usize| {
+            std::fs::write(&pinned, vec![b'x'; len]).unwrap();
+            crate::daemon_restart::FileIdentity::read(&pinned).ok()
+        };
+        let mut cache = ProbeCache::default();
+        let mut identities = Vec::new();
+        for n in 0..(MAX_PROBE_CACHE_PATHS * 3) {
+            let identity = identity_of(n + 1);
+            cache.insert(pinned.clone(), identity, Ok(format!("0.0.{n}")));
+            identities.push(identity);
+        }
+        assert_eq!(cache.entries.len(), 1, "one entry per path");
+        let latest = *identities.last().unwrap();
+        assert_eq!(
+            cache.get(&pinned, &latest),
+            Some(Ok(format!("0.0.{}", MAX_PROBE_CACHE_PATHS * 3 - 1)))
+        );
+        assert_eq!(
+            cache.get(&pinned, &identities[0]),
+            None,
+            "an older identity is a miss, so a replaced file is probed again"
+        );
+
+        for n in 0..(MAX_PROBE_CACHE_PATHS * 2) {
+            cache.insert(dir.path().join(format!("other-{n}")), None, Err("e".into()));
+            // Keep the pinned path the most recently used.
+            assert!(cache.get(&pinned, &latest).is_some());
+        }
+        assert_eq!(cache.entries.len(), MAX_PROBE_CACHE_PATHS);
+        assert!(cache.get(&pinned, &latest).is_some(), "a used path is kept");
+        assert_eq!(
+            cache.get(&dir.path().join("other-0"), &None),
+            None,
+            "the least recently used path was evicted"
+        );
+        let newest = dir
+            .path()
+            .join(format!("other-{}", MAX_PROBE_CACHE_PATHS * 2 - 1));
+        assert!(cache.get(&newest, &None).is_some());
     }
 
     /// Scenario: the startup budget. Each probe gets at most the per-probe

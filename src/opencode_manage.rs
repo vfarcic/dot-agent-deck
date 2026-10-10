@@ -987,8 +987,9 @@ fn binary_path_literal(js: &str) -> Option<String> {
 /// plugin file without installing anything (issue #1637's pin refresh,
 /// `OPENCODE.configured_pins`), one pin per binary as [`auto_install`] reports
 /// them. A root with no plugin file is skipped; `None` when no root has one,
-/// or one cannot be read or carries no readable `BINARY_PATH`, which leaves the
-/// pins the daemon knows.
+/// or one cannot be read (including one that is not a regular file or is past
+/// `MAX_HOOK_CONFIG_BYTES`, audit A9) or carries no readable `BINARY_PATH`,
+/// which leaves the pins the daemon knows.
 pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
     configured_pins_in(&candidate_roots())
 }
@@ -998,9 +999,13 @@ fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookP
     let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
     let mut read_any = false;
     for root in roots {
-        let js = match std::fs::read_to_string(plugin_file(root)) {
-            Ok(js) => js,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        // Bounded and non-blocking, as the JSON configs are read (audit A9).
+        let js = match crate::bounded_read::read_config_file(
+            &plugin_file(root),
+            crate::agent_hook_config::MAX_HOOK_CONFIG_BYTES,
+        ) {
+            Ok(Some(js)) => js,
+            Ok(None) => continue,
             Err(_) => return None,
         };
         read_any = true;
@@ -1317,6 +1322,49 @@ pub(crate) mod tests {
             1
         );
         std::fs::write(plugin_file(&roots[1]), b"// hand-edited\n").unwrap();
+        assert_eq!(configured_pins_in(&roots), None);
+    }
+
+    /// Scenario (issue #1637 audit A9): one root's plugin file is replaced by
+    /// a FIFO with no writer. The read-back returns at once with no evidence
+    /// rather than waiting for a writer, as it does for a plugin past the size
+    /// cap.
+    #[cfg(unix)]
+    #[test]
+    fn configured_pins_neither_blocks_on_a_fifo_nor_reads_an_oversized_plugin() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        for root in &roots {
+            std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            plugin_file(&roots[0]),
+            plugin_template("/opt/old/dot-agent-deck"),
+        )
+        .unwrap();
+        let fifo =
+            std::ffi::CString::new(plugin_file(&roots[1]).into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a NUL-terminated path; `mkfifo` only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let read = {
+            let roots = roots.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(configured_pins_in(&roots));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the read blocked on the FIFO")
+        };
+        assert_eq!(read, None);
+
+        std::fs::remove_file(plugin_file(&roots[1])).unwrap();
+        let mut huge = plugin_template("/opt/old/dot-agent-deck").into_bytes();
+        huge.resize(
+            crate::agent_hook_config::MAX_HOOK_CONFIG_BYTES as usize + 1,
+            b'\n',
+        );
+        std::fs::write(plugin_file(&roots[1]), huge).unwrap();
         assert_eq!(configured_pins_in(&roots), None);
     }
     #[cfg(unix)]

@@ -1795,11 +1795,19 @@ async fn observe_hook_sender(
 /// the agents' hook configs again for the binaries they pin, and apply what
 /// changed to the notices. `daemon serve` runs it for the daemon's lifetime.
 ///
-/// The configs are read, and any new pin probed, on a blocking thread before
-/// the state lock is taken ([`crate::hook_binary::PinRefresh::collect`]); the
-/// result is then applied under the write lock in one step, which touches no
-/// file ([`apply_hook_pin_refresh`]). The first read is one interval after
-/// start, since startup has just read the same configs.
+/// The configs are read, and any new pin probed, on a detached thread before
+/// the state lock is taken ([`crate::hook_binary::PinRefresh::collect`],
+/// [`spawn_detached_collection`]); the result is then applied under the write
+/// lock in one step, which touches no file ([`apply_hook_pin_refresh`]). The
+/// first read is one interval after start, since startup has just read the
+/// same configs.
+///
+/// The thread is detached rather than a `spawn_blocking` task because the
+/// runtime's teardown waits for every blocking task it started, so a read
+/// stuck in the filesystem would hold the daemon's exit (audit A9). Aborting
+/// this task drops only the wait; the thread finishes, or is ended with the
+/// process. Only one read runs at a time: this loop waits for it, and a read
+/// left running by an aborted loop holds [`HOOK_PIN_COLLECTING`] until it ends.
 pub async fn run_hook_pin_refresh(state: SharedState, event_tx: broadcast::Sender<BroadcastMsg>) {
     let period = crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL;
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -1807,18 +1815,67 @@ pub async fn run_hook_pin_refresh(state: SharedState, event_tx: broadcast::Sende
     loop {
         ticks.tick().await;
         let deck = state.read().await.hook_binaries.deck().clone();
-        let refresh = match tokio::task::spawn_blocking(move || {
+        let Some(collected) = spawn_detached_collection(&HOOK_PIN_COLLECTING, move || {
             crate::hook_binary::PinRefresh::collect(&deck)
-        })
-        .await
-        {
+        }) else {
+            tracing::warn!(
+                "hook pin refresh: the previous read of the agents' hook configs has not finished; skipped"
+            );
+            continue;
+        };
+        let refresh = match collected.await {
             Ok(refresh) => refresh,
-            Err(e) => {
-                tracing::warn!("hook pin refresh: reading the agents' hook configs failed: {e}");
+            Err(_) => {
+                tracing::warn!("hook pin refresh: reading the agents' hook configs failed");
                 continue;
             }
         };
         apply_hook_pin_refresh(&state, &event_tx, refresh).await;
+    }
+}
+
+/// Set while a hook-pin read started by [`run_hook_pin_refresh`] is running.
+static HOOK_PIN_COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Run `collect` on a detached thread and return a receiver for its result,
+/// unless `in_flight` says a previous one is still running, or no thread
+/// could be made: `None` then, and nothing runs. `in_flight` is set until
+/// `collect` returns or panics; a panic drops the sender, which the receiver
+/// reports as an error.
+fn spawn_detached_collection<T: Send + 'static>(
+    in_flight: &'static AtomicBool,
+    collect: impl FnOnce() -> T + Send + 'static,
+) -> Option<tokio::sync::oneshot::Receiver<T>> {
+    struct Release(&'static AtomicBool);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let release = Release(in_flight);
+    let spawned = std::thread::Builder::new()
+        .name("hook-pin-refresh".into())
+        .spawn(move || {
+            // Released before the result is sent, so a caller that has the
+            // result may start the next one; a panic releases it unwinding.
+            let value = collect();
+            drop(release);
+            let _ = tx.send(value);
+        });
+    match spawned {
+        Ok(_) => Some(rx),
+        Err(e) => {
+            // The closure, and with it `release`, was dropped with the error.
+            tracing::warn!("hook pin refresh: could not start a thread to read the configs: {e}");
+            None
+        }
     }
 }
 
@@ -12034,6 +12091,62 @@ mod hook_pin_refresh_tests {
     use super::*;
     use crate::event::AgentType;
     use crate::hook_binary::{DeckIdentity, HookBinaryState, HookPin, PinRefresh};
+
+    /// Scenario (issue #1637 audit A9): a hook-config read is stuck, as one on
+    /// a FIFO with no writer would be. While it runs a second read is refused
+    /// rather than started; aborting the task waiting on it and shutting its
+    /// runtime down both finish at once instead of waiting for the read; once
+    /// the read ends, a new one may start.
+    #[test]
+    fn a_stuck_collection_blocks_neither_shutdown_nor_runs_twice() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let waiter = runtime.spawn(async move {
+            let collected = spawn_detached_collection(&IN_FLIGHT, move || {
+                started_tx.send(()).unwrap();
+                let _ = unblock_rx.recv();
+                1
+            })
+            .expect("the first collection starts");
+            collected.await
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the collection started");
+        assert!(
+            spawn_detached_collection(&IN_FLIGHT, || 2).is_none(),
+            "a second collection is not started while the first runs"
+        );
+
+        waiter.abort();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runtime shut down while the collection was still stuck");
+        assert!(IN_FLIGHT.load(Ordering::Acquire), "still running");
+
+        unblock_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while IN_FLIGHT.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collection never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let next = spawn_detached_collection(&IN_FLIGHT, || 3).expect("a new collection starts");
+        assert_eq!(next.blocking_recv(), Ok(3));
+    }
 
     /// Scenario (issue #1637): the daemon knows Codex's hooks are pinned to a
     /// copy it cannot run, and shows a notice. A refresh then reads Codex's

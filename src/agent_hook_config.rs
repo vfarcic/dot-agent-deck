@@ -1179,24 +1179,43 @@ pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
     out
 }
 
+/// The largest hook config or plugin file the pin refresh reads (issue #1637
+/// audit A9); a longer one is no evidence. The deck's own entries take a few
+/// hundred bytes per event and a hand-kept settings file a few kilobytes, so
+/// 4 MiB is far past any real one while still bounding what one read can
+/// allocate.
+pub(crate) const MAX_HOOK_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most distinct executables [`configured_deck_executables`] collects from
+/// one config. Larger than [`crate::hook_binary::MAX_BINARIES_PER_AGENT`],
+/// which is applied after the non-absolute names are passed over, so a few
+/// bare names ahead of the absolute ones do not crowd them out; small enough
+/// that a config listing thousands of distinct binaries allocates nothing in
+/// proportion to them.
+pub(crate) const MAX_CONFIGURED_EXECUTABLES: usize = 64;
+
 /// A JSON hook config read for a read-back (issue #1637's pin refresh), or
-/// `None` when it is missing, unreadable or not JSON — no evidence either
-/// way. Reads only: unlike the installers' readers it never sets a malformed
-/// file aside.
+/// `None` when it is missing, unreadable, not a regular file, longer than
+/// [`MAX_HOOK_CONFIG_BYTES`] or not JSON — no evidence either way. Reads
+/// through [`crate::bounded_read::read_config_file`], so it neither blocks on
+/// a FIFO with no writer nor reads a huge file whole (audit A9). Reads only:
+/// unlike the installers' readers it never sets a malformed file aside.
 pub(crate) fn read_json_config(path: &Path) -> Option<Value> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let text = crate::bounded_read::read_config_file(path, MAX_HOOK_CONFIG_BYTES).ok()??;
+    serde_json::from_str(&text).ok()
 }
 
 /// The distinct executables the deck's entries in a JSON hook config name,
 /// in file order: every command under `root.hooks.<event>[]`, in either shape
 /// [`rule_command_strs`] reads, that `executable_of` recognises as the deck's.
-/// Read-only, for issue #1637's pin refresh.
+/// Stops at [`MAX_CONFIGURED_EXECUTABLES`] (audit A9). Read-only, for issue
+/// #1637's pin refresh.
 pub(crate) fn configured_deck_executables(
     root: &Value,
     executable_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return out;
     };
@@ -1205,7 +1224,10 @@ pub(crate) fn configured_deck_executables(
             .into_iter()
             .filter_map(&executable_of)
         {
-            if !out.contains(&exe) {
+            if out.len() >= MAX_CONFIGURED_EXECUTABLES {
+                return out;
+            }
+            if seen.insert(exe.clone()) {
                 out.push(exe);
             }
         }
@@ -1717,6 +1739,104 @@ fn process_label() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    /// `f` on a thread of its own, failing rather than hanging when it does
+    /// not return within ten seconds.
+    #[cfg(unix)]
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read blocked")
+    }
+
+    /// Scenario (issue #1637 audit A9): a hook config replaced by a FIFO with
+    /// no writer, directly and through a symlink. The pin refresh's read
+    /// returns at once with no evidence instead of waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_config_is_no_evidence_and_does_not_block() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("settings.json");
+        mkfifo_at(&fifo);
+        let link = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [fifo, link] {
+            let json = within_ten_seconds(move || read_json_config(&path));
+            assert_eq!(json, None);
+        }
+    }
+
+    /// Scenario (audit A9): a directory where the config should be is not a
+    /// regular file, so it is no evidence; a regular file there is read.
+    #[test]
+    fn a_non_regular_config_is_no_evidence() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_json_config(&path), Some(json!({})));
+    }
+
+    /// Scenario (audit A9): a config one byte past
+    /// [`MAX_HOOK_CONFIG_BYTES`] is no evidence, and one exactly at the cap
+    /// is read.
+    #[test]
+    fn an_oversized_config_is_rejected() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut huge = b"{\"hooks\": {}}".to_vec();
+        huge.resize(MAX_HOOK_CONFIG_BYTES as usize + 1, b' ');
+        std::fs::write(&path, &huge).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        huge.truncate(MAX_HOOK_CONFIG_BYTES as usize);
+        std::fs::write(&path, &huge).unwrap();
+        assert!(read_json_config(&path).is_some(), "at the cap is read");
+    }
+
+    /// Scenario (audit A9): a config naming far more distinct deck binaries
+    /// than any real one, each many times over. What is collected stops at
+    /// [`MAX_CONFIGURED_EXECUTABLES`], in file order, with no duplicates.
+    #[test]
+    fn a_config_with_many_distinct_pins_is_capped_and_deduped() {
+        let commands: Vec<Value> = (0..MAX_CONFIGURED_EXECUTABLES * 4)
+            .flat_map(|n| {
+                let command = format!("/opt/deck-{n}/dot-agent-deck hook");
+                [
+                    json!({"command": command.clone()}),
+                    json!({"command": command}),
+                ]
+            })
+            .collect();
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        assert_eq!(found.len(), MAX_CONFIGURED_EXECUTABLES);
+        let distinct: std::collections::HashSet<&String> = found.iter().collect();
+        assert_eq!(distinct.len(), found.len(), "no duplicates");
+        assert_eq!(found[0], "/opt/deck-0/dot-agent-deck");
+        assert_eq!(
+            found[MAX_CONFIGURED_EXECUTABLES - 1],
+            format!(
+                "/opt/deck-{}/dot-agent-deck",
+                MAX_CONFIGURED_EXECUTABLES - 1
+            )
+        );
+    }
 
     /// Scenario: an automatic install keeps another install's entry only when
     /// that install is positively live and durable. A missing pin, a
