@@ -2298,9 +2298,9 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
 /// What Codex's hooks are pinned to now, read back from the active
 /// `CODEX_HOME`'s `hooks.json` without installing or trusting anything (issue
 /// #1637's pin refresh, `CODEX.configured_pins`): every binary a deck entry
-/// names, across events. `None` under the same guards as
-/// [`auto_install_and_trust_at_startup`] or when the file cannot be read,
-/// which leaves the pins the daemon knows.
+/// names, across events. An empty list when `hooks.json` is missing; `None`
+/// under the same guards as [`auto_install_and_trust_at_startup`] or when
+/// the file cannot be read, which leaves the pins the daemon knows.
 pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
     if !codex_present_on_path() {
         return None;
@@ -2311,7 +2311,11 @@ pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
 /// [`configured_pins`] for an explicit Codex home.
 fn configured_pins_in(home: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
     let path = home.join("hooks.json");
-    let root = crate::agent_hook_config::read_json_config(&path)?;
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
     Some(
         crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
             .into_iter()
@@ -2364,12 +2368,14 @@ mod tests {
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back every binary
     /// Codex's `hooks.json` pins, one per distinct binary across events and
-    /// writing nothing; a missing or unparseable file is no evidence.
+    /// writing nothing; a missing file names nothing, and an unparseable one
+    /// is no evidence.
     #[test]
     fn configured_pins_reads_every_pinned_binary_back_without_writing() {
         let home = crate::test_temp::tempdir().expect("codex home tempdir");
         let path = home.path().join("hooks.json");
-        assert_eq!(configured_pins_in(home.path()), None);
+        assert_eq!(configured_pins_in(home.path()), Some(Vec::new()));
+        assert!(!path.exists(), "a read-back creates nothing");
         std::fs::write(&path, b"[").unwrap();
         assert_eq!(configured_pins_in(home.path()), None);
         let (old, current) = ("/opt/old/dot-agent-deck", "/opt/current/dot-agent-deck");

@@ -1159,8 +1159,10 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
 
 /// What Claude Code's hooks are pinned to now, read back from its settings
 /// without installing anything (issue #1637's pin refresh,
-/// `CLAUDE.configured_pins`). `None` when Claude Code's settings cannot be
-/// read, which leaves the pins the daemon knows.
+/// `CLAUDE.configured_pins`). An empty list when the settings file is
+/// missing, and `None` when its directory is (as at startup, which installs
+/// nothing then) or the file cannot be read, which leaves the pins the daemon
+/// knows.
 pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
     configured_pins_in(&settings_path())
 }
@@ -1172,7 +1174,11 @@ fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
     if path.parent().is_none_or(|p| !p.exists()) {
         return None;
     }
-    let settings = crate::agent_hook_config::read_json_config(path)?;
+    let Some(settings) = crate::agent_hook_config::read_json_config(path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
     Some(
         crate::agent_hook_config::configured_deck_executables(&settings, owned_command_executable)
             .into_iter()
@@ -1448,14 +1454,20 @@ mod tests {
     use super::*;
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back what Claude
-    /// Code's settings pin, writing nothing: no evidence for a missing or
-    /// unparseable file (which is left as it is), no pin for settings holding
-    /// no deck hook, and the binary the deck's hooks name once they are there.
+    /// Code's settings pin, writing nothing: no evidence for a missing
+    /// settings directory or an unparseable file (which is left as it is), no
+    /// pin for missing settings or settings holding no deck hook, and the
+    /// binary the deck's hooks name once they are there.
     #[test]
     fn configured_pins_reads_the_settings_back_without_writing() {
         let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        assert_eq!(
+            configured_pins_in(&dir.path().join("absent").join("settings.json")),
+            None,
+            "no settings directory, as at startup"
+        );
         let path = dir.path().join("settings.json");
-        assert_eq!(configured_pins_in(&path), None);
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
         assert!(!path.exists(), "a read-back creates nothing");
         std::fs::write(&path, b"{ not json").unwrap();
         assert_eq!(configured_pins_in(&path), None);
@@ -1485,6 +1497,57 @@ mod tests {
             }]
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Scenario (Qodo on #1656): Claude Code's hooks are pinned to an older
+    /// copy, which raised its notice, and then the user deletes
+    /// `settings.json`. The next refresh reads it as naming nothing, so the
+    /// notice clears within one refresh; a settings file that becomes
+    /// unreadable instead keeps the pin and the notice.
+    #[test]
+    fn deleting_the_settings_clears_the_notice_and_a_read_error_keeps_it() {
+        use crate::hook_binary::{DeckIdentity, HookBinaryState, PinRefresh};
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let path = dir.path().join("settings.json");
+        let old = dir.path().join("missing-old").join("dot-agent-deck");
+        let old = old.to_string_lossy().into_owned();
+        let pinned = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook_command(&old)}]}]}
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let pins = configured_pins_in(&path).expect("readable settings");
+        // `old` does not exist, so its probe fails: an `Unprobeable` notice.
+        let mut state = HookBinaryState::from_startup(deck.clone(), &pins, None);
+        assert_eq!(state.notices().len(), 1);
+        let refresh = |path: &Path| {
+            PinRefresh::classify(
+                &deck,
+                configured_pins_in(path)
+                    .map(|pins| vec![(crate::event::AgentType::ClaudeCode, pins)])
+                    .unwrap_or_default(),
+            )
+        };
+
+        #[cfg(unix)]
+        {
+            // A directory where the settings file should be: unreadable.
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(configured_pins_in(&path), None);
+            assert!(!state.apply_refresh(refresh(&path)));
+            assert_eq!(state.notices().len(), 1, "a read error keeps the pin");
+            std::fs::remove_dir(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(state.apply_refresh(refresh(&path)));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
     }
 
     /// A malformed `settings.json` is copied to `settings.json.bak` — but never

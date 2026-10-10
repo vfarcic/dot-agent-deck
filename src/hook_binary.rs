@@ -234,7 +234,32 @@ fn agent_cli_name(agent: &AgentType) -> Option<&'static str> {
 // Version probe and comparison
 // ---------------------------------------------------------------------------
 
-type Identity = Option<crate::daemon_restart::FileIdentity>;
+/// Which file a probe ran, and with which permission bits: a `chmod` that
+/// makes a pin executable leaves its [`crate::daemon_restart::FileIdentity`]
+/// unchanged but can change what running it does, so it is a different key
+/// (Qodo on #1656).
+type Identity = Option<(crate::daemon_restart::FileIdentity, u32)>;
+
+/// The identity [`probe_version`] caches a result under, read through one
+/// `metadata` call. Off Unix the permission bits are the read-only flag.
+fn probe_identity(path: &Path) -> Identity {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(meta.permissions().readonly());
+    Some((crate::daemon_restart::FileIdentity::of(&meta), mode))
+}
+
+/// How long a FAILED probe stays cached (Qodo on #1656). A success is kept for
+/// as long as the file's identity holds, since the same file reports the same
+/// version; a failure can be transient — the probe timed out on a loaded
+/// machine, or the file was repaired in a way its identity does not show — so
+/// it is retried after this long, through the same budget as any probe.
+pub const HOOK_BINARY_PROBE_FAILURE_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// The most canonical paths [`ProbeCache`] keeps a result for. Each agent's
 /// hooks pin at most [`MAX_BINARIES_PER_AGENT`] binaries, so this covers every
@@ -246,6 +271,9 @@ const MAX_PROBE_CACHE_PATHS: usize = 64;
 struct CachedProbe {
     identity: Identity,
     result: Result<String, String>,
+    /// When the probe ran, so a failure expires after
+    /// [`HOOK_BINARY_PROBE_FAILURE_RETRY`].
+    taken: Instant,
     /// When this entry was last read or written, in [`ProbeCache::clock`]
     /// ticks, for least-recently-used eviction.
     used: u64,
@@ -256,7 +284,8 @@ struct CachedProbe {
 /// whose identity keeps changing replaces its entry instead of adding one,
 /// and at most [`MAX_PROBE_CACHE_PATHS`] paths, the least recently used
 /// evicted first. A lookup hits only for the identity it was stored under, so
-/// a replaced file is still probed again.
+/// a replaced file is still probed again, and a failure only until
+/// [`HOOK_BINARY_PROBE_FAILURE_RETRY`] has passed.
 #[derive(Debug, Default)]
 struct ProbeCache {
     entries: HashMap<PathBuf, CachedProbe>,
@@ -269,17 +298,31 @@ impl ProbeCache {
         self.clock
     }
 
-    fn get(&mut self, path: &Path, identity: &Identity) -> Option<Result<String, String>> {
-        let now = self.tick();
+    fn get(
+        &mut self,
+        path: &Path,
+        identity: &Identity,
+        now: Instant,
+    ) -> Option<Result<String, String>> {
+        let tick = self.tick();
         let entry = self.entries.get_mut(path)?;
-        if entry.identity != *identity {
+        if entry.identity != *identity
+            || (entry.result.is_err()
+                && now.saturating_duration_since(entry.taken) >= HOOK_BINARY_PROBE_FAILURE_RETRY)
+        {
             return None;
         }
-        entry.used = now;
+        entry.used = tick;
         Some(entry.result.clone())
     }
 
-    fn insert(&mut self, path: PathBuf, identity: Identity, result: Result<String, String>) {
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        identity: Identity,
+        result: Result<String, String>,
+        taken: Instant,
+    ) {
         let used = self.tick();
         if !self.entries.contains_key(&path) && self.entries.len() >= MAX_PROBE_CACHE_PATHS {
             let oldest = self
@@ -296,6 +339,7 @@ impl ProbeCache {
             CachedProbe {
                 identity,
                 result,
+                taken,
                 used,
             },
         );
@@ -366,8 +410,10 @@ thread_local! {
 /// The release `binary --version` reports, run once for the same file while
 /// it stays in the [`ProbeCache`]: bounded by [`HOOK_BINARY_PROBE_TIMEOUT`] and
 /// by the window's [`HOOK_BINARY_PROBE_BUDGET`], stdout capped, and keyed by
-/// the canonical path and the file's identity so the four installers probe a
-/// shared pin once and a replaced file is probed again.
+/// the canonical path and the file's identity and permission bits so the
+/// four installers probe a shared pin once and a replaced or `chmod`ed file is
+/// probed again. A failure is cached for at most
+/// [`HOOK_BINARY_PROBE_FAILURE_RETRY`].
 ///
 /// The bound covers the run of the binary ([`run_probe`]). Resolving the path,
 /// reading its identity and the `spawn` itself are filesystem calls made before
@@ -375,15 +421,15 @@ thread_local! {
 /// installers call this, never a hook line's ingest.
 pub fn probe_version(binary: &Path) -> Result<String, String> {
     let canonical = resolve(binary).unwrap_or_else(|| binary.to_path_buf());
-    let identity = crate::daemon_restart::FileIdentity::read(&canonical).ok();
+    let identity = probe_identity(&canonical);
+    let started = Instant::now();
     if let Some(hit) = probe_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&canonical, &identity)
+        .get(&canonical, &identity, started)
     {
         return hit;
     }
-    let started = Instant::now();
     let allowance = probe_budget()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -403,7 +449,7 @@ pub fn probe_version(binary: &Path) -> Result<String, String> {
     probe_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(canonical, identity, result.clone());
+        .insert(canonical, identity, result.clone(), started);
     result
 }
 
@@ -1112,8 +1158,19 @@ struct TrustedPin {
 
 impl TrustedPin {
     /// `binary` from an agent's config, resolved through the filesystem and
-    /// compared with this deck.
+    /// compared with this deck. A relative command ([`Self::is_relative`]) is
+    /// classified from its spelling alone: resolving it would look it up
+    /// against the daemon's working directory and `PATH`, which are not the
+    /// agent's.
     fn classify(deck: &DeckIdentity, binary: &str) -> Self {
+        if !Path::new(binary).is_absolute() {
+            return Self {
+                binary: binary.to_string(),
+                resolved: None,
+                is_self: false,
+                homebrew: is_homebrew_spelling(binary),
+            };
+        }
         let resolved = resolve(Path::new(binary));
         Self {
             binary: binary.to_string(),
@@ -1130,6 +1187,52 @@ impl TrustedPin {
     fn names(&self, exe: &str) -> bool {
         self.binary == exe || self.resolved.as_deref() == Some(exe)
     }
+
+    /// Whether the config names this binary without a path, such as a bare
+    /// `dot-agent-deck` the agent finds on its own `PATH` (Qodo on #1656).
+    /// Such a pin is kept only so a stamp-less hook line can be attributed to
+    /// it: it is never resolved or probed, so the config alone raises no
+    /// notice for it, and its notice names the command as configured.
+    fn is_relative(&self) -> bool {
+        !Path::new(&self.binary).is_absolute()
+    }
+
+    /// Whether the daemon may run `binary --version` for this pin: not this
+    /// deck, and not a relative command, whose lookup would run whatever the
+    /// daemon's own working directory or `PATH` finds under that name.
+    fn is_probeable(&self) -> bool {
+        !self.is_self && !self.is_relative()
+    }
+}
+
+/// Whether a configured binary is kept as a pin at all: an absolute path, or
+/// a relative command no longer than [`MAX_RELATIVE_PIN_BYTES`].
+fn is_pin_spelling(binary: &str) -> bool {
+    Path::new(binary).is_absolute() || binary.len() <= MAX_RELATIVE_PIN_BYTES
+}
+
+/// Whether `binary` may join an agent's `pins`: not already there, and no
+/// cap reached — at most [`MAX_BINARIES_PER_AGENT`] in all, of which at most
+/// [`MAX_RELATIVE_PINS_PER_AGENT`] relative. The caller offers the absolute
+/// ones first, so relative commands never crowd an absolute pin out.
+fn admits_pin(pins: &[TrustedPin], binary: &str) -> bool {
+    if pins.len() >= MAX_BINARIES_PER_AGENT
+        || !is_pin_spelling(binary)
+        || pins.iter().any(|known| known.binary == binary)
+    {
+        return false;
+    }
+    Path::new(binary).is_absolute()
+        || pins.iter().filter(|pin| pin.is_relative()).count() < MAX_RELATIVE_PINS_PER_AGENT
+}
+
+/// `pins` with the absolute paths first, in their own order, then the
+/// relative commands, so the caps in [`admits_pin`] fall on the latter.
+fn absolute_first(pins: &[HookPin]) -> impl Iterator<Item = &HookPin> {
+    let absolute = |pin: &&HookPin| Path::new(&pin.binary).is_absolute();
+    pins.iter()
+        .filter(absolute)
+        .chain(pins.iter().filter(move |pin| !absolute(pin)))
 }
 
 /// The most binaries the daemon tracks for one agent's hooks, pins included.
@@ -1137,6 +1240,15 @@ impl TrustedPin {
 /// OpenCode per root), but a handful; a sender naming a new path on every line
 /// replaces the longest-unseen one rather than growing the state.
 pub const MAX_BINARIES_PER_AGENT: usize = 8;
+
+/// The most relative commands ([`TrustedPin::is_relative`]) the daemon keeps
+/// as one agent's pins, within [`MAX_BINARIES_PER_AGENT`]. A real config
+/// names the deck one way, so a couple covers it.
+pub const MAX_RELATIVE_PINS_PER_AGENT: usize = 2;
+
+/// The longest relative command kept as a pin; a longer one is passed over.
+/// A command name, or a short relative path, is far shorter.
+pub const MAX_RELATIVE_PIN_BYTES: usize = 256;
 
 /// How long a binary's hook lines may stop before a line for the same agent
 /// from another binary clears that binary's notice, for a binary no agent
@@ -1171,7 +1283,7 @@ pub const HOOK_PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 struct RefreshedPin {
     trusted: TrustedPin,
-    /// `--version`, for a pin that is not this deck.
+    /// `--version`, for a pin [`TrustedPin::is_probeable`].
     probe: Option<Result<String, String>>,
 }
 
@@ -1206,25 +1318,28 @@ impl PinRefresh {
     /// name; an empty list is evidence that none is named. Each pin is
     /// resolved and classified as at startup, and a pin that is not this deck
     /// is probed with `--version` through the shared cache and budget, so a
-    /// pin whose file has not changed spawns nothing. A pin that is not an
-    /// absolute path is passed over, since probing it would run whatever the
-    /// name finds.
+    /// pin whose file has not changed spawns nothing. A relative command is
+    /// kept, capped and unprobed ([`TrustedPin::is_relative`]), after the
+    /// absolute pins ([`admits_pin`]).
     pub(crate) fn classify(deck: &DeckIdentity, read: Vec<(AgentType, Vec<HookPin>)>) -> Self {
         let agents = read
             .into_iter()
             .map(|(agent, pins)| {
-                let mut fresh: Vec<RefreshedPin> = Vec::new();
-                for pin in pins {
-                    if fresh.len() >= MAX_BINARIES_PER_AGENT
-                        || !Path::new(&pin.binary).is_absolute()
-                        || fresh.iter().any(|known| known.trusted.binary == pin.binary)
-                    {
-                        continue;
+                let mut trusted_pins: Vec<TrustedPin> = Vec::new();
+                for pin in absolute_first(&pins) {
+                    if admits_pin(&trusted_pins, &pin.binary) {
+                        trusted_pins.push(TrustedPin::classify(deck, &pin.binary));
                     }
-                    let trusted = TrustedPin::classify(deck, &pin.binary);
-                    let probe = (!trusted.is_self).then(|| probe_version(Path::new(&pin.binary)));
-                    fresh.push(RefreshedPin { trusted, probe });
                 }
+                let fresh = trusted_pins
+                    .into_iter()
+                    .map(|trusted| {
+                        let probe = trusted
+                            .is_probeable()
+                            .then(|| probe_version(Path::new(&trusted.binary)));
+                        RefreshedPin { trusted, probe }
+                    })
+                    .collect();
                 (agent, fresh)
             })
             .collect();
@@ -1283,16 +1398,14 @@ impl HookBinaryState {
             ..Self::default()
         };
         let now = Instant::now();
-        for pin in pins {
+        for pin in absolute_first(pins) {
             let known = state.pins.entry(pin.agent.clone()).or_default();
-            if known.len() >= MAX_BINARIES_PER_AGENT
-                || known.iter().any(|known| known.binary == pin.binary)
-            {
+            if !admits_pin(known, &pin.binary) {
                 continue;
             }
             let trusted = TrustedPin::classify(&state.deck, &pin.binary);
             known.push(trusted.clone());
-            if trusted.is_self {
+            if !trusted.is_probeable() {
                 continue;
             }
             let status = state.probed_status(&trusted, probe_version(Path::new(&pin.binary)));
@@ -1337,8 +1450,12 @@ impl HookBinaryState {
     /// only when the probe reports a different version than the one recorded,
     /// which is a file replaced in place, so a failed probe or an unchanged
     /// file leaves what its own lines said. A line-learned status spelled as a
-    /// new pin resolves becomes that pin's. An agent the refresh could not
-    /// read is left as it was.
+    /// new pin resolves becomes that pin's, and is then re-decided by the
+    /// pin's probe like any known pin's; one a pin that is this deck names
+    /// clears instead, since its old reason would contradict what the pin now
+    /// is. A relative pin is recorded with no status: only a hook line can
+    /// raise one for it. An agent the refresh could not read is left as it
+    /// was.
     ///
     /// Pure, like [`Self::observe`]: everything the filesystem had to say was
     /// gathered by [`PinRefresh::collect`].
@@ -1363,6 +1480,13 @@ impl HookBinaryState {
                         .iter()
                         .any(|known| known.status.binary == pin.binary)
                     {
+                        continue;
+                    }
+                    if pin.is_self {
+                        // Whatever a line-learned status this pin now names
+                        // said, the pin is this deck: its reason would
+                        // contradict that, so it clears (Qodo on #1656).
+                        tracked.retain(|known| !pin.names(&known.status.binary));
                         continue;
                     }
                     if let Some(learned) = tracked
@@ -3303,43 +3427,52 @@ mod tests {
         let pinned = dir.path().join("pinned");
         let identity_of = |len: usize| {
             std::fs::write(&pinned, vec![b'x'; len]).unwrap();
-            crate::daemon_restart::FileIdentity::read(&pinned).ok()
+            probe_identity(&pinned)
         };
         let mut cache = ProbeCache::default();
+        let now = Instant::now();
         let mut identities = Vec::new();
         for n in 0..(MAX_PROBE_CACHE_PATHS * 3) {
             let identity = identity_of(n + 1);
-            cache.insert(pinned.clone(), identity, Ok(format!("0.0.{n}")));
+            cache.insert(pinned.clone(), identity, Ok(format!("0.0.{n}")), now);
             identities.push(identity);
         }
         assert_eq!(cache.entries.len(), 1, "one entry per path");
         let latest = *identities.last().unwrap();
         assert_eq!(
-            cache.get(&pinned, &latest),
+            cache.get(&pinned, &latest, now),
             Some(Ok(format!("0.0.{}", MAX_PROBE_CACHE_PATHS * 3 - 1)))
         );
         assert_eq!(
-            cache.get(&pinned, &identities[0]),
+            cache.get(&pinned, &identities[0], now),
             None,
             "an older identity is a miss, so a replaced file is probed again"
         );
 
         for n in 0..(MAX_PROBE_CACHE_PATHS * 2) {
-            cache.insert(dir.path().join(format!("other-{n}")), None, Err("e".into()));
+            cache.insert(
+                dir.path().join(format!("other-{n}")),
+                None,
+                Err("e".into()),
+                now,
+            );
             // Keep the pinned path the most recently used.
-            assert!(cache.get(&pinned, &latest).is_some());
+            assert!(cache.get(&pinned, &latest, now).is_some());
         }
         assert_eq!(cache.entries.len(), MAX_PROBE_CACHE_PATHS);
-        assert!(cache.get(&pinned, &latest).is_some(), "a used path is kept");
+        assert!(
+            cache.get(&pinned, &latest, now).is_some(),
+            "a used path is kept"
+        );
         assert_eq!(
-            cache.get(&dir.path().join("other-0"), &None),
+            cache.get(&dir.path().join("other-0"), &None, now),
             None,
             "the least recently used path was evicted"
         );
         let newest = dir
             .path()
             .join(format!("other-{}", MAX_PROBE_CACHE_PATHS * 2 - 1));
-        assert!(cache.get(&newest, &None).is_some());
+        assert!(cache.get(&newest, &None, now).is_some());
     }
 
     /// Scenario: the startup budget. Each probe gets at most the per-probe
@@ -3733,13 +3866,185 @@ mod tests {
         );
         assert!(FS_RESOLUTIONS.with(std::cell::Cell::get) > 0);
         let pins = &refresh.agents[0].1;
-        assert_eq!(pins.len(), 2, "a relative pin is not probed: {pins:?}");
+        assert_eq!(pins.len(), 3, "{pins:?}");
         assert!(pins[0].trusted.is_self && pins[0].probe.is_none());
         assert!(!pins[1].trusted.is_self && pins[1].probe.is_some());
+        assert!(pins[2].trusted.is_relative(), "{pins:?}");
+        assert!(pins[2].probe.is_none(), "a relative pin is not probed");
         FS_RESOLUTIONS.with(|count| count.set(0));
         state.apply_refresh(refresh);
         let _ = state.notices();
         assert_eq!(FS_RESOLUTIONS.with(std::cell::Cell::get), 0);
-        assert_eq!(state.pins[&AgentType::Codex].len(), 2);
+        assert_eq!(state.pins[&AgentType::Codex].len(), 3);
+    }
+
+    /// Scenario (Qodo on #1656): an older hook's path was learned from its
+    /// own lines, and the file is then repointed to this deck's executable,
+    /// which the config names through a different alias. The refresh
+    /// resolves the alias to this deck, so the learned status's old reason
+    /// would contradict the pin: it clears rather than carrying over.
+    #[test]
+    fn a_refresh_that_resolves_a_learned_older_binary_to_this_deck_clears_it() {
+        let own = abs("/home/u/.local/bin/dot-agent-deck");
+        let alias = abs("/opt/alias/dot-agent-deck");
+        let now = Instant::now();
+        let mut state = codex_unpinned();
+        // What the older copy's lines left, under the path that is now this
+        // deck's own file.
+        state.record(
+            &AgentType::Codex,
+            AgentStatus {
+                binary: own.clone(),
+                version: Some("0.45.0".into()),
+                reason: Some(HookBinaryReason::Older),
+                homebrew: false,
+            },
+            now,
+        );
+        assert_eq!(state.notices().len(), 1);
+        let mut pin = fresh(&alias, None);
+        pin.trusted.resolved = Some(own.clone());
+        assert!(state.apply_refresh_at(refresh_of(AgentType::Codex, vec![pin]), now));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
+        assert!(state.statuses[&AgentType::Codex].is_empty());
+    }
+
+    /// Scenario (Qodo on #1656): after startup, Codex's config is changed to
+    /// call the deck by name alone. The refresh keeps that command as a pin
+    /// without resolving or probing it, and raises nothing on the config
+    /// alone; a stamp-less line from Codex — an older copy found on the
+    /// agent's `PATH` — then raises `Unreported` naming the command exactly
+    /// as configured.
+    #[test]
+    fn a_relative_command_is_attributed_a_stamp_less_line_and_never_probed() {
+        let now = Instant::now();
+        let mut state = codex_unpinned();
+        let read = |binary: &str| {
+            vec![(
+                AgentType::Codex,
+                vec![HookPin {
+                    agent: AgentType::Codex,
+                    config: PathBuf::from("/cfg"),
+                    binary: binary.to_string(),
+                }],
+            )]
+        };
+        FS_RESOLUTIONS.with(|count| count.set(0));
+        let refresh = PinRefresh::classify(&state.deck, read("dot-agent-deck"));
+        assert_eq!(
+            FS_RESOLUTIONS.with(std::cell::Cell::get),
+            0,
+            "a relative pin is neither resolved nor probed"
+        );
+        assert!(refresh.agents[0].1[0].probe.is_none());
+        assert!(!state.apply_refresh_at(refresh, now));
+        assert!(
+            state.notices().is_empty(),
+            "the config alone raises nothing"
+        );
+
+        assert!(state.observe_at(&AgentType::Codex, &HookLineSender::default(), now));
+        let notices = state.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].binary, "dot-agent-deck");
+        assert_eq!(notices[0].reason, HookBinaryReason::Unreported);
+        assert_eq!(FS_RESOLUTIONS.with(std::cell::Cell::get), 0);
+
+        // Once the config names an absolute path instead, the notice clears.
+        let own = state.deck.exe.clone().unwrap();
+        let refresh = refresh_of(AgentType::Codex, vec![fresh(&own.to_string_lossy(), None)]);
+        assert!(state.apply_refresh_at(refresh, now));
+        assert!(state.notices().is_empty());
+    }
+
+    /// Scenario (Qodo on #1656): relative commands are capped on their own
+    /// and passed over when over-long, so however many a config lists ahead
+    /// of an absolute pin, the absolute pin is kept and probed.
+    #[test]
+    fn relative_pins_are_bounded_and_never_crowd_out_an_absolute_one() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let mut binaries: Vec<String> = vec!["x".repeat(MAX_RELATIVE_PIN_BYTES + 1)];
+        binaries.extend((0..MAX_BINARIES_PER_AGENT * 2).map(|n| format!("bin-{n}/dot-agent-deck")));
+        binaries.push(old.clone());
+        let pins: Vec<HookPin> = binaries
+            .into_iter()
+            .map(|binary| HookPin {
+                agent: AgentType::Codex,
+                config: PathBuf::from("/cfg"),
+                binary,
+            })
+            .collect();
+        let refresh = PinRefresh::classify(&deck("0.46.0"), vec![(AgentType::Codex, pins)]);
+        let kept: Vec<&str> = refresh.agents[0]
+            .1
+            .iter()
+            .map(|pin| pin.trusted.binary.as_str())
+            .collect();
+        let mut expected = vec![old.as_str()];
+        let relative: Vec<String> = (0..MAX_RELATIVE_PINS_PER_AGENT)
+            .map(|n| format!("bin-{n}/dot-agent-deck"))
+            .collect();
+        expected.extend(relative.iter().map(String::as_str));
+        assert_eq!(kept, expected);
+    }
+
+    /// Scenario (Qodo on #1656): a cached probe failure is retried once
+    /// `HOOK_BINARY_PROBE_FAILURE_RETRY` has passed, while a success is kept
+    /// for as long as the file's identity holds.
+    #[test]
+    fn a_cached_probe_failure_expires_and_a_success_does_not() {
+        let mut cache = ProbeCache::default();
+        let start = Instant::now();
+        let (failed, probed) = (PathBuf::from("/failed"), PathBuf::from("/probed"));
+        cache.insert(failed.clone(), None, Err("timed out".into()), start);
+        cache.insert(probed.clone(), None, Ok("0.45.0".into()), start);
+        let just_before = start + HOOK_BINARY_PROBE_FAILURE_RETRY - Duration::from_secs(1);
+        assert!(cache.get(&failed, &None, just_before).is_some());
+        let after = start + HOOK_BINARY_PROBE_FAILURE_RETRY;
+        assert_eq!(cache.get(&failed, &None, after), None);
+        assert_eq!(
+            cache.get(
+                &probed,
+                &None,
+                after + HOOK_BINARY_PROBE_FAILURE_RETRY * 100
+            ),
+            Some(Ok("0.45.0".into()))
+        );
+    }
+
+    /// Scenario (Qodo on #1656): a pinned copy cannot be run, so startup
+    /// raises its "did not report its version" notice; the user then repairs
+    /// it with `chmod +x` alone, which leaves its contents, size and inode as
+    /// they were. The next refresh probes it again — the permission bits are
+    /// part of the probe's cache key — and the notice becomes the older
+    /// copy's, with no daemon restart.
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_only_repair_is_probed_again_by_the_next_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let old = version_stub(
+            dir.path(),
+            "old",
+            "#!/bin/sh\necho 'dot-agent-deck 0.45.0'\n",
+        );
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let pins = vec![HookPin {
+            agent: AgentType::Codex,
+            config: PathBuf::from("/cfg"),
+            binary: old.clone(),
+        }];
+        let mut state = HookBinaryState::from_startup(deck("0.46.0"), &pins, None);
+        let notices = state.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].reason, HookBinaryReason::Unprobeable);
+
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refresh = PinRefresh::classify(state.deck(), vec![(AgentType::Codex, pins)]);
+        assert!(state.apply_refresh(refresh));
+        let notices = state.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].reason, HookBinaryReason::Older);
+        assert_eq!(notices[0].version.as_deref(), Some("0.45.0"));
     }
 }

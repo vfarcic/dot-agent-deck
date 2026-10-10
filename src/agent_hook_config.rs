@@ -1186,35 +1186,47 @@ pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
 /// allocate.
 pub(crate) const MAX_HOOK_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The most distinct executables [`configured_deck_executables`] collects from
-/// one config. Larger than [`crate::hook_binary::MAX_BINARIES_PER_AGENT`],
-/// which is applied after the non-absolute names are passed over, so a few
-/// bare names ahead of the absolute ones do not crowd them out; small enough
-/// that a config listing thousands of distinct binaries allocates nothing in
-/// proportion to them.
+/// The most distinct absolute executables [`configured_deck_executables`]
+/// collects from one config. Larger than
+/// [`crate::hook_binary::MAX_BINARIES_PER_AGENT`], so the daemon's own cap is
+/// what decides; small enough that a config listing thousands of distinct
+/// binaries allocates nothing in proportion to them. Relative commands are
+/// counted separately, under
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`], so however many a
+/// config lists ahead of an absolute pin, they never crowd it out (Qodo on
+/// #1656).
 pub(crate) const MAX_CONFIGURED_EXECUTABLES: usize = 64;
 
-/// A JSON hook config read for a read-back (issue #1637's pin refresh), or
-/// `None` when it is missing, unreadable, not a regular file, longer than
-/// [`MAX_HOOK_CONFIG_BYTES`] or not JSON — no evidence either way. Reads
-/// through [`crate::bounded_read::read_config_file`], so it neither blocks on
-/// a FIFO with no writer nor reads a huge file whole (audit A9). Reads only:
-/// unlike the installers' readers it never sets a malformed file aside.
-pub(crate) fn read_json_config(path: &Path) -> Option<Value> {
-    let text = crate::bounded_read::read_config_file(path, MAX_HOOK_CONFIG_BYTES).ok()??;
-    serde_json::from_str(&text).ok()
+/// A JSON hook config read for a read-back (issue #1637's pin refresh):
+/// `Some(Some(json))` when it was read, `Some(None)` when it is confirmed
+/// missing — evidence that it names nothing — and `None` when it is
+/// unreadable, not a regular file, longer than [`MAX_HOOK_CONFIG_BYTES`] or
+/// not JSON — no evidence either way. Reads through
+/// [`crate::bounded_read::read_config_file`], so it neither blocks on a FIFO
+/// with no writer nor reads a huge file whole (audit A9). Reads only: unlike
+/// the installers' readers it never sets a malformed file aside.
+pub(crate) fn read_json_config(path: &Path) -> Option<Option<Value>> {
+    match crate::bounded_read::read_config_file(path, MAX_HOOK_CONFIG_BYTES).ok()? {
+        Some(text) => serde_json::from_str(&text).ok().map(Some),
+        None => Some(None),
+    }
 }
 
 /// The distinct executables the deck's entries in a JSON hook config name,
 /// in file order: every command under `root.hooks.<event>[]`, in either shape
 /// [`rule_command_strs`] reads, that `executable_of` recognises as the deck's.
-/// Stops at [`MAX_CONFIGURED_EXECUTABLES`] (audit A9). Read-only, for issue
+/// Collects at most [`MAX_CONFIGURED_EXECUTABLES`] absolute paths and
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`] relative commands no
+/// longer than [`crate::hook_binary::MAX_RELATIVE_PIN_BYTES`], each counted on
+/// its own, and stops once both are full (audit A9). Read-only, for issue
 /// #1637's pin refresh.
 pub(crate) fn configured_deck_executables(
     root: &Value,
     executable_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
+    use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
     let mut out: Vec<String> = Vec::new();
+    let (mut absolute, mut relative) = (0usize, 0usize);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return out;
@@ -1224,10 +1236,22 @@ pub(crate) fn configured_deck_executables(
             .into_iter()
             .filter_map(&executable_of)
         {
-            if out.len() >= MAX_CONFIGURED_EXECUTABLES {
+            if absolute >= MAX_CONFIGURED_EXECUTABLES && relative >= MAX_RELATIVE_PINS_PER_AGENT {
                 return out;
             }
+            let count = if Path::new(&exe).is_absolute() {
+                if absolute >= MAX_CONFIGURED_EXECUTABLES {
+                    continue;
+                }
+                &mut absolute
+            } else {
+                if relative >= MAX_RELATIVE_PINS_PER_AGENT || exe.len() > MAX_RELATIVE_PIN_BYTES {
+                    continue;
+                }
+                &mut relative
+            };
             if seen.insert(exe.clone()) {
+                *count += 1;
                 out.push(exe);
             }
         }
@@ -1788,7 +1812,9 @@ mod tests {
         assert_eq!(read_json_config(&path), None);
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, b"{}").unwrap();
-        assert_eq!(read_json_config(&path), Some(json!({})));
+        assert_eq!(read_json_config(&path), Some(Some(json!({}))));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_json_config(&path), Some(None), "missing names nothing");
     }
 
     /// Scenario (audit A9): a config one byte past
@@ -1804,7 +1830,40 @@ mod tests {
         assert_eq!(read_json_config(&path), None);
         huge.truncate(MAX_HOOK_CONFIG_BYTES as usize);
         std::fs::write(&path, &huge).unwrap();
-        assert!(read_json_config(&path).is_some(), "at the cap is read");
+        assert!(
+            matches!(read_json_config(&path), Some(Some(_))),
+            "at the cap is read"
+        );
+    }
+
+    /// Scenario (Qodo on #1656): a config lists far more distinct relative
+    /// deck commands than any real one, then an absolute pin to an older
+    /// copy. The relative ones are capped on their own, an over-long one is
+    /// passed over, and the absolute pin is still collected.
+    #[test]
+    fn relative_commands_do_not_crowd_out_an_absolute_pin() {
+        use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
+        let old = if cfg!(windows) {
+            r"C:\opt\old\dot-agent-deck"
+        } else {
+            "/opt/old/dot-agent-deck"
+        };
+        let long = "x".repeat(MAX_RELATIVE_PIN_BYTES + 1);
+        let mut commands: Vec<Value> = vec![json!({"command": format!("{long} hook")})];
+        commands.extend(
+            (0..MAX_CONFIGURED_EXECUTABLES * 2)
+                .map(|n| json!({"command": format!("bin-{n}/dot-agent-deck hook")})),
+        );
+        commands.push(json!({"command": format!("{old} hook")}));
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        let expected: Vec<String> = (0..MAX_RELATIVE_PINS_PER_AGENT)
+            .map(|n| format!("bin-{n}/dot-agent-deck"))
+            .chain([old.to_string()])
+            .collect();
+        assert_eq!(found, expected);
     }
 
     /// Scenario (audit A9): a config naming far more distinct deck binaries

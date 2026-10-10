@@ -669,8 +669,9 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
 
 /// What Devin's hooks are pinned to now, read back from its config without
 /// installing anything (issue #1637's pin refresh, `DEVIN.configured_pins`).
-/// `None` under the same guards as [`auto_install`] or when the config cannot
-/// be read, which leaves the pins the daemon knows.
+/// An empty list when the config file is missing; `None` under the same
+/// guards as [`auto_install`] or when the config cannot be read, which leaves
+/// the pins the daemon knows.
 pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
     if !devin_present_on_path() {
         return None;
@@ -681,7 +682,11 @@ pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
 /// [`configured_pins`] for an explicit config dir.
 fn configured_pins_in(config_dir: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
     let path = config_path(config_dir);
-    let root = crate::agent_hook_config::read_json_config(&path)?;
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
     Some(
         crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
             .into_iter()
@@ -730,12 +735,14 @@ mod tests {
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back what Devin's
     /// config pins, writing nothing — not even the backup an install makes of
-    /// an unparseable file, which is no evidence.
+    /// an unparseable file, which is no evidence. A missing config names
+    /// nothing.
     #[test]
     fn configured_pins_reads_the_config_back_without_writing() {
         let dir = crate::test_temp::tempdir().expect("config tempdir");
         let config = config_path(dir.path());
-        assert_eq!(configured_pins_in(dir.path()), None);
+        assert_eq!(configured_pins_in(dir.path()), Some(Vec::new()));
+        assert!(!config.exists(), "a read-back creates nothing");
         std::fs::write(&config, b"{ // a comment\n}").unwrap();
         assert_eq!(configured_pins_in(dir.path()), None);
         assert!(!dir.path().join("config.json.bak").exists());

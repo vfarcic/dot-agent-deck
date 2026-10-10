@@ -986,8 +986,11 @@ fn binary_path_literal(js: &str) -> Option<String> {
 /// What the OpenCode plugin is pinned to now, read back from every root's
 /// plugin file without installing anything (issue #1637's pin refresh,
 /// `OPENCODE.configured_pins`), one pin per binary as [`auto_install`] reports
-/// them. A root with no plugin file is skipped; `None` when no root has one,
-/// or one cannot be read (including one that is not a regular file or is past
+/// them. A root whose directory exists but holds no plugin file names
+/// nothing, so with no plugin left anywhere, as after `hooks uninstall
+/// --agent opencode`, the list is empty (Qodo on #1656). `None` when no root
+/// exists (as at startup, which installs nothing then), or a plugin cannot be
+/// read (including one that is not a regular file or is past
 /// `MAX_HOOK_CONFIG_BYTES`, audit A9) or carries no readable `BINARY_PATH`,
 /// which leaves the pins the daemon knows.
 pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
@@ -996,8 +999,11 @@ pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
 
 /// [`configured_pins`] over explicit roots.
 fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookPin>> {
+    // The same gate as `auto_install_resolved`.
+    if !roots.iter().any(|root| root.exists()) {
+        return None;
+    }
     let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
-    let mut read_any = false;
     for root in roots {
         // Bounded and non-blocking, as the JSON configs are read (audit A9).
         let js = match crate::bounded_read::read_config_file(
@@ -1008,7 +1014,6 @@ fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookP
             Ok(None) => continue,
             Err(_) => return None,
         };
-        read_any = true;
         let binary = binary_path_literal(&js)?;
         if out.iter().all(|pin| pin.binary != binary) {
             out.push(crate::hook_binary::HookPin {
@@ -1018,7 +1023,7 @@ fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookP
             });
         }
     }
-    read_any.then_some(out)
+    Some(out)
 }
 
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
@@ -1300,18 +1305,21 @@ pub(crate) mod tests {
     use super::*;
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back the
-    /// `BINARY_PATH` each root's plugin pins, one pin per binary. A root with
-    /// no plugin is skipped; no plugin anywhere, or a plugin with no readable
-    /// `BINARY_PATH`, is no evidence.
+    /// `BINARY_PATH` each root's plugin pins, one pin per binary. No root at
+    /// all, or a plugin with no readable `BINARY_PATH`, is no evidence; a root
+    /// with no plugin names nothing, so roots without any name no pin.
     #[test]
     fn configured_pins_reads_each_plugin_back() {
         let fixture = crate::test_temp::tempdir().unwrap();
         let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
-        assert_eq!(configured_pins_in(&roots), None);
+        assert_eq!(configured_pins_in(&roots), None, "no root, as at startup");
+        std::fs::create_dir_all(&roots[0]).unwrap();
+        assert_eq!(configured_pins_in(&roots), Some(Vec::new()));
         let old = "/opt/old/dot-agent-deck";
         for root in &roots {
             std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
         }
+        assert_eq!(configured_pins_in(&roots), Some(Vec::new()));
         std::fs::write(plugin_file(&roots[0]), plugin_template(old)).unwrap();
         let pins = configured_pins_in(&roots).expect("one plugin read");
         assert_eq!(pins.len(), 1);
@@ -1323,6 +1331,40 @@ pub(crate) mod tests {
         );
         std::fs::write(plugin_file(&roots[1]), b"// hand-edited\n").unwrap();
         assert_eq!(configured_pins_in(&roots), None);
+    }
+
+    /// Scenario (Qodo on #1656): the OpenCode plugin pins an older copy,
+    /// which raised its notice, and then `hooks uninstall --agent opencode`
+    /// removes the plugin. The next refresh reads the roots as naming
+    /// nothing, so the notice clears within one refresh.
+    #[test]
+    fn uninstalling_the_plugin_clears_the_notice_within_one_refresh() {
+        use crate::hook_binary::{DeckIdentity, HookBinaryState, PinRefresh};
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        std::fs::create_dir_all(plugin_file(&roots[0]).parent().unwrap()).unwrap();
+        let old = fixture.path().join("missing-old").join("dot-agent-deck");
+        std::fs::write(
+            plugin_file(&roots[0]),
+            plugin_template(&old.to_string_lossy()),
+        )
+        .unwrap();
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let pins = configured_pins_in(&roots).expect("one plugin read");
+        // `old` does not exist, so its probe fails: an `Unprobeable` notice.
+        let mut state = HookBinaryState::from_startup(deck.clone(), &pins, None);
+        assert_eq!(state.notices().len(), 1);
+
+        uninstall_from(&plugin_file(&roots[0])).unwrap();
+        let read = configured_pins_in(&roots).expect("the roots were read");
+        assert!(read.is_empty());
+        let refresh = PinRefresh::classify(&deck, vec![(crate::event::AgentType::OpenCode, read)]);
+        assert!(state.apply_refresh(refresh));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
     }
 
     /// Scenario (issue #1637 audit A9): one root's plugin file is replaced by
