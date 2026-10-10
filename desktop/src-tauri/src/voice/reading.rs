@@ -157,6 +157,16 @@ pub enum TurnEvent {
     /// one line — "run cargo publish", "Bash: cargo publish" — and may be empty
     /// when the agent did not say.
     Permission { wants: String },
+    /// A notification that the agent is waiting on a permission prompt, with
+    /// no question of its own: Claude Code's `permission_prompt`. Said like a
+    /// [`TurnEvent::Permission`], except when it describes a prompt already
+    /// announced from its permission hook ([`coalesce`]).
+    PermissionNotice { wants: String },
+    /// The deck answered the agent's question itself — by voice — so the
+    /// prompt announced for it is decided and should not be said any more.
+    /// Never spoken: it retracts the agent's permission prompts still waiting
+    /// in the webview's speech queue.
+    PermissionAnswered,
     /// The agent stopped and cannot go on by itself.
     Blocked { cause: BlockCause },
 }
@@ -305,17 +315,30 @@ pub enum Incoming {
 /// Only events naming that agent, and not an outside agent's unproven report.
 /// A permission prompt is a `PermissionRequest`, or a `WaitingForInput` that is
 /// not some other kind of notification (Claude Code's is installed for
-/// permission prompts only). An error is an `Error` that ends work: not a
-/// failed tool call (an `Error` naming a tool, after which the agent carries
-/// on) and not the deck's own delivery notice about a message it could not
-/// hand the agent. A usage limit is a `QuotaBlocked`.
+/// permission prompts only) — a [`TurnEvent::PermissionNotice`] when it carries
+/// no question, as Claude Code's notification does not. An error is an `Error`
+/// that ends work: not a failed tool call (an `Error` naming a tool, after
+/// which the agent carries on) and not the deck's own delivery notice about a
+/// message it could not hand the agent. A usage limit is a `QuotaBlocked`. The
+/// deck's own answer to the agent's question is a
+/// [`TurnEvent::PermissionAnswered`], whatever status it reports (an allow
+/// reports `Thinking`, a deny `Unknown`).
 pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent> {
-    use dot_agent_deck::event::{DELIVERY_NOTICE_METADATA_KEY, UNPROVEN_METADATA_KEY};
+    use dot_agent_deck::event::{
+        DELIVERY_NOTICE_METADATA_KEY, QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
+        QUESTION_METADATA_KEY, UNPROVEN_METADATA_KEY,
+    };
     use dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY;
     if event.agent_id.as_deref() != Some(agent_id)
         || event.metadata.contains_key(UNPROVEN_METADATA_KEY)
     {
         return None;
+    }
+    if event
+        .metadata
+        .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+    {
+        return Some(TurnEvent::PermissionAnswered);
     }
     match event.event_type {
         EventType::PermissionRequest => Some(TurnEvent::Permission {
@@ -325,8 +348,13 @@ pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent
             .metadata
             .get(NOTIFICATION_TYPE_METADATA_KEY)
             .is_none_or(|kind| kind == "permission_prompt")
-            .then(|| TurnEvent::Permission {
-                wants: permission_wants(event),
+            .then(|| {
+                let wants = permission_wants(event);
+                if event.metadata.contains_key(QUESTION_METADATA_KEY) {
+                    TurnEvent::Permission { wants }
+                } else {
+                    TurnEvent::PermissionNotice { wants }
+                }
             }),
         EventType::Error
             if event.tool_name.is_none()
@@ -379,6 +407,14 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// merged exactly like one with text, so it is announced once, in its turn's
 /// place (audit A2).
 ///
+/// A permission prompt is announced once, too. Claude Code reports one prompt
+/// twice: its permission hook (a [`TurnEvent::Permission`]) when the prompt
+/// appears, and its `permission_prompt` notification (a
+/// [`TurnEvent::PermissionNotice`]) about six seconds later, which can be after
+/// the deck already answered the prompt. So each permission prompt absorbs the first
+/// notification after it, whenever it comes; a notification with no prompt
+/// before it — a Claude Code too old for the permission hook — is announced.
+///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
     use tokio::time::{Instant, sleep_until};
@@ -386,6 +422,8 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     let mut held: Option<(String, Instant)> = None;
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
+    // A permission prompt was announced and its notification has not come.
+    let mut notice_owed = false;
     loop {
         let next = match held.as_ref().map(|(_, until)| *until) {
             Some(until) => tokio::select! {
@@ -463,8 +501,17 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     }
                 }
             }
+            // The notification of the prompt already announced.
+            Some(Some(Incoming::Status(TurnEvent::PermissionNotice { .. }))) if notice_owed => {
+                notice_owed = false;
+            }
             Some(Some(Incoming::Status(status))) => {
                 release_held(&mut held, &mut emit, &mut announced);
+                match status {
+                    TurnEvent::Permission { .. } => notice_owed = true,
+                    TurnEvent::PermissionNotice { .. } => notice_owed = false,
+                    _ => {}
+                }
                 emit.push(status);
             }
         }
@@ -515,6 +562,10 @@ pub enum ReadingSentenceKind {
     Turn,
     /// A permission prompt, announced at once.
     Permission,
+    /// The deck answered the agent's question by voice. Not a sentence to
+    /// queue, and its text is empty: the webview drops this agent's
+    /// permission prompts still waiting to be said, and nothing else.
+    PermissionAnswered,
     /// An error or quota block, announced at once.
     Blocked,
     /// Reading ended on this side because its Settings switch was turned
@@ -762,11 +813,16 @@ pub fn bare_blocked_sentence(cause: BlockCause) -> String {
 /// The sentence for an alert, both ways.
 fn alert_sentence(agent: &str, event: &TurnEvent) -> Option<ReadingSentence> {
     Some(match event {
-        TurnEvent::Permission { wants } => ReadingSentence {
-            kind: ReadingSentenceKind::Permission,
-            text: permission_sentence(agent, wants),
-            bare: bare_permission_sentence(wants),
-        },
+        TurnEvent::Permission { wants } | TurnEvent::PermissionNotice { wants } => {
+            ReadingSentence {
+                kind: ReadingSentenceKind::Permission,
+                text: permission_sentence(agent, wants),
+                bare: bare_permission_sentence(wants),
+            }
+        }
+        TurnEvent::PermissionAnswered => {
+            ReadingSentence::same(ReadingSentenceKind::PermissionAnswered, String::new())
+        }
         TurnEvent::Blocked { cause } => ReadingSentence {
             kind: ReadingSentenceKind::Blocked,
             text: blocked_sentence(agent, *cause),
@@ -798,7 +854,10 @@ pub async fn announce(
     let (kind, reply) = match event {
         TurnEvent::Finished { reply } => (TurnKind::Finished, reply),
         TurnEvent::Failed { reply } => (TurnKind::Failed, reply),
-        TurnEvent::Permission { .. } | TurnEvent::Blocked { .. } => return None,
+        TurnEvent::Permission { .. }
+        | TurnEvent::PermissionNotice { .. }
+        | TurnEvent::PermissionAnswered
+        | TurnEvent::Blocked { .. } => return None,
     };
     let summary = summariser
         .summarise(TurnSummaryRequest {

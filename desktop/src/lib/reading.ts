@@ -100,11 +100,13 @@ export type ReadingStartDto =
 /**
  * One sentence to speak, from `desktop_voice_reading_start`'s channel — or,
  * as `ended`, word that the Rust side ended the session (the Settings switch
- * was turned off), or, as `closed`, that the agent's events ended (it exited).
- * Neither of those two is spoken.
+ * was turned off), or, as `closed`, that the agent's events ended (it exited),
+ * or, as `permission_answered`, that the deck answered the agent's question by
+ * voice, so its permission prompts still waiting to be said are dropped.
+ * None of those three is spoken.
  */
 export interface ReadingSentenceDto {
-  kind: "turn" | "permission" | "blocked" | "ended" | "closed";
+  kind: "turn" | "permission" | "blocked" | "ended" | "closed" | "permission_answered";
   /** The sentence naming the agent. */
   text: string;
   /** The same sentence without the agent's name, for when its pane is open. */
@@ -625,6 +627,14 @@ export class DeckReader {
       this.capacityFreed(record.target.deckId);
       return;
     }
+    if (sentence.kind === "permission_answered") {
+      // The prompt was answered, so saying it now would ask for what is
+      // already decided. Only this agent's prompts go: its errors and its
+      // summary, and every other agent's speech, stay queued.
+      const prompts = `${key}\u0000permission\u0000`;
+      this.deps.speech.drop((queued) => queued.startsWith(prompts));
+      return;
+    }
     const { deckId, agentId } = record.target;
     const say = () => {
       const open = this.deps.openPane?.();
@@ -633,8 +643,10 @@ export class DeckReader {
     /* A turn's summary replaces a waiting summary for the same agent (D6),
        and only that agent's: another agent's news is never dropped for it.
        Each permission prompt or error waits under a key of its own, so
-       nothing later drops what the user has to act on. */
-    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000alert\u0000${++this.alerts}`, { say, safe: sentence.text });
+       nothing later drops what the user has to act on — except the deck's
+       own answer to that agent's question, which drops its prompts (above). */
+    const alert = sentence.kind === "permission" ? "permission" : "alert";
+    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000${alert}\u0000${++this.alerts}`, { say, safe: sentence.text });
   }
 
   private problem(sentence: string): void {

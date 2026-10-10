@@ -2310,6 +2310,18 @@ struct QuestionConnection<'a, R> {
 /// or a missing token under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` — has its
 /// question metadata removed and is applied as a plain status event.
 ///
+/// `unproven` is the gate's verdict that the message comes from an outside
+/// agent (`Provenance::Unattested`). With `attested_agent` it is the whole
+/// admission verdict, and a status the message applies is ingested under it
+/// exactly as a raw hook event with that verdict is ([`ingest_hook_event`]):
+/// stamped unproven, so an attached client keeps it to an outside card within
+/// its budget, and never typing a deck agent's record. The type the event
+/// reports is written only for the generation that sent it — the attested
+/// agent, else the agent the event names — and only while that generation
+/// still holds the pane, as the raw-event path writes it; an outside agent's
+/// report writes none, since the deck may have spawned its own agent on the
+/// pane since the gate classified it.
+///
 /// The hold is registered and its event applied under ONE acquisition of the
 /// pane's question lifecycle ([`register_and_publish_held`], audit R1/R3), so
 /// no other transition on the pane ever sees the hold registered but not yet
@@ -2330,6 +2342,7 @@ struct QuestionConnection<'a, R> {
 async fn handle_question_signal<R>(
     signal: crate::event::QuestionSignal,
     attested_agent: Option<String>,
+    unproven: bool,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
@@ -2387,9 +2400,15 @@ where
             }
         }
     }
-    registry.set_agent_type(&pane_id, &event.agent_type);
+    if !unproven {
+        registry.set_agent_type_for_generation(
+            &pane_id,
+            attested_agent.as_deref().or(event.agent_id.as_deref()),
+            &event.agent_type,
+        );
+    }
     let Some((id, agent_id, _budget)) = holding else {
-        ingest_event(state, event_tx, registry, event).await;
+        ingest_hook_event(state, event_tx, registry, event, unproven, attested_agent).await;
         return Some(reply(QuestionReply::released(
             question_id.as_deref().unwrap_or(""),
             ReleaseReason::NotHeld,
@@ -4790,6 +4809,13 @@ async fn run_hook_loop_with_limits(
                                 }
                                 _ => None,
                             };
+                            // And whether it comes from an outside agent: the
+                            // rest of the admission verdict, which a question's
+                            // status keeps exactly as a raw event's does.
+                            let unproven = matches!(
+                                provenance,
+                                crate::hook_provenance::Provenance::Unattested
+                            );
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
@@ -5186,6 +5212,7 @@ async fn run_hook_loop_with_limits(
                                     let Some(held) = handle_question_signal(
                                         signal,
                                         attested_agent.clone(),
+                                        unproven,
                                         &state,
                                         &event_tx,
                                         &pty_registry,

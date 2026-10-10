@@ -309,6 +309,12 @@ pub fn verbatim_slice<'a>(transcript: &'a str, quoted: &str) -> Option<&'a str> 
 /// transcript's words, so what is sent is what was said, not the model's
 /// rendering of it. `Err` with the sentence to show when anything is not.
 /// A `cancel` or `not_answer` sends nothing and is not checked.
+///
+/// Words are one answer's, not two. A selection with no text whose evidence
+/// lies entirely within the evidence or the words of another question's
+/// free-text selection — the model reusing the words of "type my own colour: a hamster
+/// named Bob" to also pick another question's option — is dropped, so that
+/// question keeps waiting, rather than refusing the answer it borrowed from.
 pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<(), String> {
     if answer.kind != ModelKind::Answer {
         return Ok(());
@@ -332,6 +338,28 @@ pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<(), String> 
             selection.text = Some(slice.to_string());
         }
     }
+    let borrows = |selection: &ModelSelection| {
+        let has_text = |s: &ModelSelection| s.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+        let Some(evidence) = selection.evidence.as_deref() else {
+            return false;
+        };
+        !has_text(selection)
+            && answer.selections.iter().any(|owner| {
+                owner.question_index != selection.question_index
+                    && has_text(owner)
+                    && [owner.evidence.as_deref(), owner.text.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|cited| verbatim_slice(cited, evidence).is_some())
+            })
+    };
+    let kept: Vec<ModelSelection> = answer
+        .selections
+        .iter()
+        .filter(|selection| !borrows(selection))
+        .cloned()
+        .collect();
+    answer.selections = kept;
     Ok(())
 }
 
