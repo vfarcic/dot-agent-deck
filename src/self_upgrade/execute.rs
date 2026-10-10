@@ -522,6 +522,7 @@ pub async fn execute(
                         host,
                         pkexec,
                         &staged,
+                        &downloaded.sha256,
                         &plan.installation.version,
                         version,
                         command,
@@ -684,9 +685,18 @@ fn found_binary(target: &Path, previous: Option<&str>, sha256: &str) -> plan::Fo
     }
 }
 
-/// What `dpkg-query` says of the desktop package after an install from
-/// `previous` to `version` stopped.
-fn found_package(host: &dyn Host, previous: &str, version: &str) -> plan::Found {
+/// What `dpkg-query` says of the desktop package after an install of the
+/// verified `.deb` at `deb` (hashing to `sha256`) from `previous` stopped.
+///
+/// The new version is the one `deb` itself declares, read with `dpkg-deb`
+/// once the file is hashed again, not the release's: dpkg spells a
+/// prerelease `0.47.0~beta.1` where the release says `0.47.0-beta.1`. When
+/// that cannot be read, the state is not known.
+fn found_package(host: &dyn Host, deb: &Path, sha256: &str, previous: &str) -> plan::Found {
+    let version = match staged_deb_version(host, deb, sha256) {
+        Ok(version) => version,
+        Err(why) => return plan::Found::Unreadable(why),
+    };
     let output = host.run(
         Path::new(DPKG_QUERY),
         &[
@@ -715,6 +725,31 @@ fn found_package(host: &dyn Host, previous: &str, version: &str) -> plan::Found 
     }
 }
 
+/// The Debian version the verified `.deb` at `deb` declares, after hashing
+/// it again against `sha256`: `dpkg-deb -f <deb> Version`, bounded as a
+/// probe. The reason it cannot be read otherwise.
+fn staged_deb_version(host: &dyn Host, deb: &Path, sha256: &str) -> Result<String, String> {
+    verify::rehash(deb, sha256).map_err(|e| e.to_string())?;
+    let output = host
+        .run(
+            Path::new(DPKG_DEB),
+            &[OsStr::new("-f"), deb.as_os_str(), OsStr::new("Version")],
+        )
+        .map_err(|e| format!("`dpkg-deb` could not read the downloaded package: {e}"))?;
+    let version = output.stdout.trim();
+    if !output.success {
+        return Err(match output.stderr.trim() {
+            "" => "`dpkg-deb` could not read the downloaded package".to_string(),
+            stderr => stderr.to_string(),
+        });
+    }
+    if version.is_empty() || version.contains(char::is_whitespace) {
+        return Err("`dpkg-deb` did not report the downloaded package's version".to_string());
+    }
+    Ok(version.to_string())
+}
+
+const DPKG_DEB: &str = "/usr/bin/dpkg-deb";
 const DPKG_QUERY: &str = "/usr/bin/dpkg-query";
 
 /// Install the verified binary at `staged` over `target` behind `pkexec`.
@@ -983,15 +1018,17 @@ pub fn atomic_replace(
     result
 }
 
-/// Install a verified `.deb` behind `pkexec`, upgrading the package from
-/// `previous` to `version`. `fallback` is the command the user runs when the
-/// prompt itself fails. A failure past the prompt is classified as
-/// [`install_binary_privileged`]'s is, the package's state read from
-/// `dpkg-query` in place of a hash.
+/// Install the verified `.deb` at `deb` (hashing to `sha256`) behind
+/// `pkexec`, upgrading the package from `previous` to release `version`.
+/// `fallback` is the command the user runs when the prompt itself fails. A
+/// failure past the prompt is classified as [`install_binary_privileged`]'s
+/// is, the package's state read from `dpkg-query` in place of a hash and
+/// compared with the version `deb` declares ([`found_package`]).
 pub fn install_deb(
     host: &dyn Host,
     pkexec: &Path,
     deb: &Path,
+    sha256: &str,
     previous: &str,
     version: &str,
     fallback: Option<String>,
@@ -1010,7 +1047,7 @@ pub fn install_deb(
         privileged_error(
             failure,
             plan::InstallTarget::Package,
-            || found_package(host, previous, version),
+            || found_package(host, deb, sha256, previous),
             fallback,
             version,
         )
@@ -1340,6 +1377,7 @@ mod tests {
             &host,
             Path::new("/usr/bin/pkexec"),
             Path::new("/s/x.deb"),
+            NOT_HASHED,
             "0.45.0",
             "0.46.0",
             None,
@@ -1358,6 +1396,7 @@ mod tests {
             &host,
             Path::new("/usr/bin/pkexec"),
             Path::new("/s/x.deb"),
+            NOT_HASHED,
             "0.45.0",
             "0.46.0",
             None,
@@ -1676,6 +1715,7 @@ mod tests {
             &host,
             Path::new(PKEXEC),
             Path::new("/s/x.deb"),
+            NOT_HASHED,
             "0.45.0",
             "0.46.0",
             None,
@@ -2083,6 +2123,68 @@ mod tests {
 
     const PKEXEC: &str = "/usr/bin/pkexec";
 
+    /// The digest passed for a `.deb` that a test's install never looks at
+    /// again (it succeeds, its prompt fails, or it may still be running).
+    const NOT_HASHED: &str = "not-hashed";
+
+    const DPKG_QUERY_STATE: &str =
+        "/usr/bin/dpkg-query -W -f=${Version} ${db:Status-Abbrev} agent-deck";
+
+    /// A staged `.deb` in a temp dir, and its digest.
+    fn staged_deb() -> (tempfile::TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let deb = dir.path().join("x.deb");
+        std::fs::write(&deb, b"a verified package").unwrap();
+        let sha = verify::sha256_hex(b"a verified package");
+        (dir, deb, sha)
+    }
+
+    /// What `dpkg-deb -f <deb> Version` is asked as, on [`FakeHost`].
+    fn dpkg_deb_version(deb: &Path) -> String {
+        format!("/usr/bin/dpkg-deb -f {} Version", deb.display())
+    }
+
+    /// A `.deb` install that fails once past the prompt, on a host whose
+    /// `dpkg-query` reports `state` and whose `dpkg-deb` answers the staged
+    /// file's version with `declared` (`None`: it cannot read the file).
+    fn failed_deb_install(
+        deb: &Path,
+        sha: &str,
+        state: Option<&str>,
+        declared: Option<&str>,
+        version: &str,
+        install: &str,
+    ) -> UpgradeError {
+        let host = FakeHost::new()
+            .exe(PKEXEC)
+            .exe("/usr/bin/dpkg-query")
+            .exe("/usr/bin/dpkg-deb")
+            .handle(PKEXEC, |_| {
+                fail("E: Sub-process /usr/bin/dpkg returned an error code (1)")
+            });
+        let host = match state {
+            Some(state) => host.answer(DPKG_QUERY_STATE, ok(state)),
+            None => host,
+        };
+        let host = match declared {
+            Some(declared) => host.answer(&dpkg_deb_version(deb), ok(&format!("{declared}\n"))),
+            None => host.answer(
+                &dpkg_deb_version(deb),
+                fail("dpkg-deb: error: 'x.deb' is not a Debian format archive"),
+            ),
+        };
+        install_deb(
+            &host,
+            Path::new(PKEXEC),
+            deb,
+            sha,
+            "0.45.0",
+            version,
+            Some(install.into()),
+        )
+        .unwrap_err()
+    }
+
     /// A staged binary and the target it is installed over, in a temp dir.
     fn staged_install(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -2415,6 +2517,7 @@ mod tests {
             &host,
             Path::new(PKEXEC),
             Path::new("/s/x.deb"),
+            NOT_HASHED,
             "0.45.0",
             "0.46.0",
             Some("sudo apt install /s/x.deb".into()),
@@ -2506,28 +2609,10 @@ mod tests {
     /// to check with `dpkg -s`.
     #[test]
     fn execute_029_a_stopped_package_install_reports_the_package_state() {
-        const QUERY: &str = "/usr/bin/dpkg-query -W -f=${Version} ${db:Status-Abbrev} agent-deck";
         const INSTALL: &str = "sudo apt install /s/x.deb";
+        let (_dir, deb, sha) = staged_deb();
         let run = |state: Option<&str>| {
-            let host = FakeHost::new()
-                .exe(PKEXEC)
-                .exe("/usr/bin/dpkg-query")
-                .handle(PKEXEC, |_| {
-                    fail("E: Sub-process /usr/bin/dpkg returned an error code (1)")
-                });
-            let host = match state {
-                Some(state) => host.answer(QUERY, ok(state)),
-                None => host,
-            };
-            install_deb(
-                &host,
-                Path::new(PKEXEC),
-                Path::new("/s/x.deb"),
-                "0.45.0",
-                "0.46.0",
-                Some(INSTALL.into()),
-            )
-            .unwrap_err()
+            failed_deb_install(&deb, &sha, state, Some("0.46.0"), "0.46.0", INSTALL)
         };
         let partly = PlanLine::Text(
             "The install did not complete, so the agent-deck package may be partly installed."
@@ -2573,6 +2658,54 @@ mod tests {
         );
         assert_eq!(unfinished(&unanswered).install, None);
         assert_eq!(unanswered.fallback().last(), Some(&check));
+    }
+
+    /// Scenario: a prerelease `.deb` install fails once past the prompt, and
+    /// `dpkg-query` reports the package installed at `0.47.0~beta.1`, the
+    /// Debian spelling of release `0.47.0-beta.1`. The version the staged
+    /// `.deb` declares decides: the same one is the new version (no install
+    /// command), another one is neither (the command again), and a `.deb`
+    /// whose version cannot be read, or that changed since it was verified,
+    /// leaves the state unknown with no command, never a guess from the
+    /// release's spelling.
+    #[test]
+    fn execute_032_a_stopped_prerelease_package_install_reads_the_debian_version() {
+        const INSTALL: &str = "sudo apt install /s/x.deb";
+        const RELEASE: &str = "0.47.0-beta.1";
+        let (_dir, deb, sha) = staged_deb();
+        let state = Some("0.47.0~beta.1 ii ");
+
+        let err = failed_deb_install(&deb, &sha, state, Some("0.47.0~beta.1"), RELEASE, INSTALL);
+        assert_eq!(unfinished(&err).found, plan::Found::New, "{err:?}");
+        assert_eq!(unfinished(&err).install, None);
+
+        let err = failed_deb_install(&deb, &sha, state, Some("0.47.0~beta.2"), RELEASE, INSTALL);
+        assert_eq!(unfinished(&err).found, plan::Found::Neither, "{err:?}");
+        assert_eq!(unfinished(&err).install.as_deref(), Some(INSTALL));
+
+        let err = failed_deb_install(&deb, &sha, state, None, RELEASE, INSTALL);
+        assert_eq!(
+            unfinished(&err).found,
+            plan::Found::Unreadable(
+                "dpkg-deb: error: 'x.deb' is not a Debian format archive".into()
+            ),
+            "{err:?}"
+        );
+        assert_eq!(unfinished(&err).install, None);
+
+        let err = failed_deb_install(
+            &deb,
+            &"0".repeat(64),
+            state,
+            Some("0.47.0~beta.1"),
+            RELEASE,
+            INSTALL,
+        );
+        assert!(
+            matches!(&unfinished(&err).found, plan::Found::Unreadable(why) if why.contains("changed after it was checked")),
+            "{err:?}"
+        );
+        assert_eq!(unfinished(&err).install, None);
     }
 
     // Used only by Unix-gated tests: native Windows is unsupported (#164).
