@@ -30,6 +30,10 @@ mod secrets;
 // nothing to a normal build.
 #[cfg(test)]
 mod selection_capture;
+mod selection_saves;
+// Issue #1635: noticing a newer release and upgrading this machine's copies
+// (the app and the CLI beside it) on the root crate's shared core.
+mod self_upgrade;
 mod settings;
 mod terminal;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
@@ -2596,6 +2600,9 @@ async fn desktop_set_settings(
     })?;
     let failure = match saved {
         Ok(written) => {
+            // Issue #1620: published while `order` is still held, so the
+            // newest deck list `apply_selection` can find is the newest write.
+            state.saved_selections.publish(&written);
             voice_state
                 .put_saved_in_force(
                     order,
@@ -2607,7 +2614,7 @@ async fn desktop_set_settings(
                             emit_reading_consent_off(&app)
                         }
                     },
-                    apply_selection(&app, &state, &written),
+                    apply_selection(&app, &state),
                 )
                 .await;
             return Ok(written);
@@ -2632,6 +2639,7 @@ async fn desktop_set_settings(
     else {
         return Err(message.into());
     };
+    state.saved_selections.publish(&disk);
     voice_state
         .put_saved_in_force(
             order,
@@ -2643,7 +2651,7 @@ async fn desktop_set_settings(
                     emit_reading_consent_off(&app)
                 }
             },
-            apply_selection(&app, &state, &disk),
+            apply_selection(&app, &state),
         )
         .await;
     Err(crate::dto::DesktopSettingsSaveError::Partial(
@@ -2683,6 +2691,7 @@ async fn desktop_rename_deck(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
+    voice_state: State<'_, VoiceState>,
     deck: crate::settings::RemoteEndpointSettings,
     name: String,
 ) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
@@ -2696,6 +2705,11 @@ async fn desktop_rename_deck(
         .to_string()
         .into());
     }
+    // Issue #1620: a rename writes the deck list too, so it takes the order
+    // settings saves write in, and publishes what it read back before letting
+    // go — otherwise a save that wrote before it could publish after it, and
+    // put the deck names from before the rename back into force.
+    let order = voice_state.saves.lock().await;
     let renamed = tauri::async_runtime::spawn_blocking(move || {
         crate::decks::rename(&crate::decks::remotes_path(), &deck, &name)?;
         Ok::<_, RenameDeckError>(crate::settings::load_snapshot().settings)
@@ -2715,7 +2729,9 @@ async fn desktop_rename_deck(
             else {
                 return Err(message.into());
             };
-            apply_selection(&app, &state, &disk).await;
+            state.saved_selections.publish(&disk);
+            drop(order);
+            apply_selection(&app, &state).await;
             return Err(crate::dto::DesktopSettingsSaveError::Partial(
                 crate::dto::DesktopPartialSettingsSave {
                     message,
@@ -2725,7 +2741,9 @@ async fn desktop_rename_deck(
         }
         Err(error) => return Err(rename_error_message(error).into()),
     };
-    apply_selection(&app, &state, &written).await;
+    state.saved_selections.publish(&written);
+    drop(order);
+    apply_selection(&app, &state).await;
     refresh_and_emit(&app, &state.daemon).await;
     Ok(written)
 }
@@ -2975,7 +2993,9 @@ pub(crate) struct VoiceState {
     /// requests in flight so a save that no longer permits one cancels it.
     speech: voice::speech::SpeechRevocation,
     /// PRD #1497 — orders settings saves until their voice settings are in
-    /// force ([`Self::put_saved_in_force`]).
+    /// force ([`Self::put_saved_in_force`]). Since issue #1620 it is also the
+    /// order their deck lists are published in, which a deck rename takes too
+    /// (`DesktopState::saved_selections`).
     saves: tokio::sync::Mutex<()>,
 }
 
@@ -4573,8 +4593,17 @@ async fn desktop_voice_commands(
     ))
 }
 
-/// Put a saved document's deck selection into force (PRD #741 M7, completed at
-/// M9).
+/// Put the newest saved document's deck selection into force (PRD #741 M7,
+/// completed at M9).
+///
+/// # The newest saved document, not the caller's (issue #1620)
+///
+/// The caller publishes what it wrote to [`DesktopState::saved_selections`]
+/// first, while it still holds the order its write was made in, and this
+/// applies whatever is newest there, one save at a time. Two saves in quick
+/// succession therefore end with the second one's deck list in force however
+/// their deck work interleaves: see [`retarget_to_published`] and the
+/// `selection_saves` module docs.
 ///
 /// # Every settings save reaches here, and most of them changed no deck
 ///
@@ -4627,8 +4656,13 @@ async fn desktop_voice_commands(
 /// are released, so a detach frame still has a transport to travel over; and the
 /// links are dropped before the tunnels, so a link cannot be re-established
 /// against a transport that is on its way out.
-async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &DesktopSettings) {
-    let moved = retarget_selection(state, settings).await;
+async fn apply_selection(app: &AppHandle, state: &DesktopState) {
+    let mut applied = state.saved_selections.in_order().await;
+    let Some(moved) = retarget_to_published(state, &mut applied).await else {
+        // A pass that held the order before this one already put the newest
+        // saved list into force, and started its watchers and emitted for it.
+        return;
+    };
     // PRD #742 M3: OUTSIDE the `moved` gate, and that is the point of putting it
     // here rather than inside `retarget_selection`. Watchers follow the OBSERVED
     // SET, and adding a deck to a fleet grows that set without moving the deck
@@ -4637,6 +4671,10 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
     // the departed decks' watchers; this starts the arrived ones', and does
     // nothing at all for a save that changed neither.
     ensure_snapshot_watchers(app, state);
+    // Released before the emit, which can wait out a connect timeout against
+    // an unreachable deck: the next save's deck work need not wait on it, and
+    // the snapshot is of whatever deck is selected when it is taken.
+    drop(applied);
     if !moved {
         return;
     }
@@ -5373,17 +5411,82 @@ async fn target_deck_snapshot(
     Some(snapshot)
 }
 
-/// [`apply_selection`] minus the emit, reporting whether the deck moved.
+/// Put the newest saved deck list into force, one pass at a time (issue
+/// #1620), reporting whether the deck moved — `None` when there was nothing
+/// newer than what is already in force.
+///
+/// `applied` is the guard [`crate::selection_saves::SavedSelections::in_order`]
+/// hands out, held by the caller so the watchers it starts afterwards follow
+/// the same order. Each pass applies the newest published settings, not the
+/// ones the calling save wrote, so a save that reaches here after a newer one
+/// can never put its older deck list back. A pass that a newer save overtakes
+/// stops before the rest of its teardown, and the loop applies the newer list.
+/// The module docs have the race this closes.
+async fn retarget_to_published(state: &DesktopState, applied: &mut u64) -> Option<bool> {
+    let saves = &state.saved_selections;
+    let mut moved = None;
+    while let Some((ticket, settings)) = saves.newer_than(*applied) {
+        let pass = retarget_selection_unless(state, &settings, || saves.superseded(ticket)).await;
+        moved = Some(moved.unwrap_or(false) || pass.moved);
+        if !pass.superseded {
+            *applied = ticket;
+        }
+    }
+    moved
+}
+
+/// One pass of [`retarget_selection_unless`].
+struct RetargetPass {
+    /// The resolved deck changed. Reported even by a pass that stopped early,
+    /// because it had already put the new selection into force.
+    moved: bool,
+    /// A newer save was published while this pass ran, so it stopped before
+    /// the rest of its teardown, which read a deck list no longer current.
+    superseded: bool,
+}
+
+/// [`retarget_selection_unless`] for a pass nothing can overtake — the tests'
+/// way to put one document into force without publishing it.
+#[cfg(test)]
+async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) -> bool {
+    retarget_selection_unless(state, settings, || false)
+        .await
+        .moved
+}
+
+/// [`apply_selection`] minus the order and the emit, reporting whether the deck
+/// moved.
 ///
 /// Split out because everything above the emit is testable and the emit is not —
 /// it needs an `AppHandle`, which means a running Tauri app. The one thing worth
 /// pinning here is exactly the thing a running app makes hard to observe: that an
 /// ordinary settings save does **not** take the switch path.
-async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) -> bool {
+///
+/// `superseded` is asked before each terminal is detached, and once more under
+/// the tunnel map's lock before the transports are released; a pass that a
+/// newer save overtook stops there, so it does not tear down what the newer
+/// list keeps (issue #1620). Once the transports are released, the watchers of
+/// the same decks are ended too, so the two never disagree.
+async fn retarget_selection_unless(
+    state: &DesktopState,
+    settings: &DesktopSettings,
+    superseded: impl Fn() -> bool,
+) -> RetargetPass {
     let previous = crate::dto::selected_endpoint().identity();
     let deck = crate::dto::apply_settings_selection(settings);
     let key = deck.endpoint.identity();
     let moved = selection_moved(&previous, &key);
+    // The selection is already in force, so the watchers hear of a move even
+    // from a pass that stops early.
+    let stop = || {
+        if moved {
+            state.selection_changed();
+        }
+        RetargetPass {
+            moved,
+            superseded: true,
+        }
+    };
     let observed = observed_keys(settings);
     // PRD #1105 — the sessions on decks that LEFT the observed set, and no
     // others. This was `detach_all` gated on `moved`; see
@@ -5391,9 +5494,18 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
     // reason to tear a terminal down, and why this one is not gated.
     //
     // Before the tunnels are released, so a DETACH frame still has a transport.
-    terminal::detach_decks_outside(state, &observed).await;
+    terminal::detach_decks_outside(state, &observed, &superseded).await;
     state.daemon.invalidate_all().await;
-    state.tunnels.retain(&observed).await;
+    // Asked again under the tunnel map's lock, so a save published while this
+    // waits for it is still seen.
+    if !state.tunnels.retain_unless(&observed, &superseded).await {
+        return stop();
+    }
+    // Not asked again here: the transports just released and the watchers
+    // ended below come from one deck list, so a newer pass that keeps one of
+    // those decks finds neither — its watcher is started again after the pass,
+    // and its transport is opened again on first use.
+    //
     // PRD #742 M3: the watcher half of the same teardown, and the natural
     // sibling of the `retain` above it — a deck that left the observed set must
     // stop being watched as well as stop holding a transport, or it goes on
@@ -5406,7 +5518,10 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
     if moved {
         state.selection_changed();
     }
-    moved
+    RetargetPass {
+        moved,
+        superseded: false,
+    }
 }
 
 /// Every deck key the app must keep a transport for under `settings` — PRD
@@ -5698,6 +5813,7 @@ async fn desktop_upgrade_daemon(
                             reason,
                             installed_version: None,
                             old_daemon_gone: false,
+                            installed_binary: None,
                         };
                     }
                 };
@@ -6163,6 +6279,8 @@ pub fn run() {
         .manage(VoiceState::default())
         // PRD #1487 M5: the running upgrades and the restart questions they wait on.
         .manage(upgrade::UpgradeState::default())
+        // Issue #1635: the plans last shown and the one upgrade of this app's own copies.
+        .manage(self_upgrade::SelfUpgradeState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -6306,6 +6424,9 @@ pub fn run() {
             desktop_run_action,
             desktop_upgrade_daemon,
             desktop_upgrade_decide,
+            self_upgrade::desktop_self_upgrade_check,
+            self_upgrade::desktop_self_upgrade_run,
+            self_upgrade::desktop_self_upgrade_relaunch,
             desktop_secret_status,
             desktop_store_secret,
             desktop_forget_secret,

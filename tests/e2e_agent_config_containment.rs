@@ -185,3 +185,44 @@ fn containment_003_wrapper_rejects_codex_home_symlink_escape() {
         "refused writer must not leave a temporary file or backup"
     );
 }
+
+/// Scenario: Point the real wrapper's CODEX_HOME at a fake operator directory outside its owned root whose `hooks.json` is a symlink into the root. The install is refused: the symlink stays in place with its target unchanged, and no temporary file or backup appears beside it.
+#[spec("hooks/containment/004")]
+#[test]
+fn containment_004_wrapper_refuses_an_outside_symlink_pointing_into_the_root() {
+    let fixture = test_temp::tempdir().unwrap();
+    let sandbox = fixture.path().join("sandbox-home");
+    seed_executable(&sandbox.join(".local/bin/dot-agent-deck"));
+    let target = sandbox.join("hooks-target.json");
+    std::fs::write(&target, b"{\"hooks\":{},\"operatorSentinel\":true}\n").unwrap();
+    let target_before = fingerprint(&target);
+    let codex = fixture.path().join("fake-operator-home/.codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    let link = codex.join("hooks.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link_before = std::fs::symlink_metadata(&link).unwrap().ino();
+
+    wrap(fixture.path(), &sandbox, &codex, Some(&sandbox));
+
+    let link_after = std::fs::symlink_metadata(&link).unwrap();
+    assert!(
+        link_after.file_type().is_symlink() && link_after.ino() == link_before,
+        "the publish replaced the outside-root symlink {}",
+        link.display()
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    assert_eq!(
+        fingerprint(&target),
+        target_before,
+        "a refused install must not write through the symlink either"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&codex)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        [std::ffi::OsString::from("hooks.json")],
+        "refused writer must not leave a temporary file, backup or lock beside the symlink"
+    );
+}

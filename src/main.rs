@@ -269,6 +269,17 @@ enum Commands {
         #[arg(long, conflicts_with = "topic")]
         all: bool,
     },
+    /// Check for a newer release and upgrade this machine's dot-agent-deck
+    /// and Agent Deck desktop app, each through the way it was installed.
+    /// Prints what it would do and asks before each upgrade (issue #1635).
+    Upgrade {
+        /// Only report what is installed and what an upgrade would do.
+        #[arg(long)]
+        check: bool,
+        /// Upgrade without asking for confirmation.
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+    },
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -556,8 +567,13 @@ enum DaemonCmd {
         #[arg(long)]
         expect_version: Option<String>,
         /// The confirmed stop set, as hex-encoded JSON.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "confirm_stdin")]
         confirm_hex: Option<String>,
+        /// Read the confirmed stop set's JSON from stdin, to EOF: for a set
+        /// too large for the command line (issue #1619). `daemon probe --json`
+        /// reports `confirm_stdin: true` for a build that accepts it.
+        #[arg(long)]
+        confirm_stdin: bool,
     },
 }
 
@@ -1629,6 +1645,12 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Upgrade { check, yes }) => {
+            dot_agent_deck::self_upgrade::cli::main(dot_agent_deck::self_upgrade::cli::Args {
+                check,
+                yes,
+            })
+        }
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1979,7 +2001,8 @@ fn main() -> ExitCode {
                 json,
                 expect_version,
                 confirm_hex,
-            } => run_daemon_restart_installed_cli(json, expect_version, confirm_hex),
+                confirm_stdin,
+            } => run_daemon_restart_installed_cli(json, expect_version, confirm_hex, confirm_stdin),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -2465,12 +2488,10 @@ async fn run_tui_session() -> ExitCode {
     // the TUI's `AppState` mirrors live agent activity.
     spawn_event_subscriber(attach_path.clone(), state.clone());
 
-    let version_state = state.clone();
-    tokio::spawn(async move {
-        if let Some(latest) = dot_agent_deck::version::check_for_update().await {
-            version_state.write().await.update_available = Some(latest);
-        }
-    });
+    // Issue #1635: check for a newer release at start and every re-check
+    // interval, and plan this machine's copies, for the footer badge and the
+    // upgrade dialog.
+    tokio::spawn(dot_agent_deck::upgrade_dialog::run_checker(state.clone()));
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 
@@ -3043,6 +3064,7 @@ async fn run_daemon_probe_cli(json: bool) -> ExitCode {
     let probe = DaemonProbe {
         running: hello.is_some(),
         hello,
+        confirm_stdin: true,
     };
     if json {
         match serde_json::to_string(&probe) {
@@ -3067,11 +3089,11 @@ async fn run_daemon_probe_cli(json: bool) -> ExitCode {
 }
 
 /// `dot-agent-deck daemon restart-installed [--json] [--expect-version V]
-/// [--confirm-hex H]` (PRD #1487, hidden plumbing). Asks the running daemon at
-/// this host's endpoint to restart onto the build installed at its own path,
-/// through [`DaemonClient::restart_daemon`] — the verb's only sender, which
-/// withholds it from a daemon that does not advertise it. Prints one
-/// [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
+/// [--confirm-hex H | --confirm-stdin]` (PRD #1487, hidden plumbing). Asks the
+/// running daemon at this host's endpoint to restart onto the build installed
+/// at its own path, through [`DaemonClient::restart_daemon`] — the verb's only
+/// sender, which withholds it from a daemon that does not advertise it.
+/// Prints one [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
 /// the daemon too old for the verb, or the daemon's reply (accepted, needs
 /// confirmation, refused) — all exit 0, because each is an answer. A failure
 /// is on stderr, and its exit code says whether the request had been sent:
@@ -3082,17 +3104,45 @@ async fn run_daemon_restart_installed_cli(
     json: bool,
     expect_version: Option<String>,
     confirm_hex: Option<String>,
+    confirm_stdin: bool,
 ) -> ExitCode {
     use dot_agent_deck::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
     use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
     use dot_agent_deck::daemon_restart::{
-        RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport, decode_stop_set_hex,
+        CONFIRM_STDIN_TIMEOUT, RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport,
+        decode_stop_set_hex, read_stop_set,
     };
 
-    let confirm = match confirm_hex.as_deref().map(decode_stop_set_hex).transpose() {
+    // Read before the daemon is asked anything, so a malformed set is refused
+    // with nothing sent. The read blocks until stdin closes, so it runs on a
+    // plain thread, not a runtime worker, under a bound of its own; a thread
+    // still blocked when the bound passes ends with the process (Qodo
+    // 4236427318).
+    let confirm = if confirm_stdin {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_stop_set(std::io::stdin().lock()));
+        });
+        match tokio::time::timeout(CONFIRM_STDIN_TIMEOUT, rx).await {
+            Ok(Ok(read)) => read.map(Some),
+            Ok(Err(_)) => Err("the stdin reader stopped without an answer".to_string()),
+            Err(_) => Err(format!(
+                "stdin did not close within {}s",
+                CONFIRM_STDIN_TIMEOUT.as_secs()
+            )),
+        }
+        .map_err(|e| format!("--confirm-stdin: {e}"))
+    } else {
+        confirm_hex
+            .as_deref()
+            .map(decode_stop_set_hex)
+            .transpose()
+            .map_err(|e| format!("--confirm-hex: {e}"))
+    };
+    let confirm = match confirm {
         Ok(confirm) => confirm,
         Err(e) => {
-            eprintln!("daemon restart-installed: --confirm-hex: {e}");
+            eprintln!("daemon restart-installed: {e}");
             return ExitCode::from(RESTART_NOT_SENT_EXIT);
         }
     };

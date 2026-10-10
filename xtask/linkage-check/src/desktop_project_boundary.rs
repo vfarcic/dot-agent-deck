@@ -206,6 +206,18 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // "root-crate wrapper with an innocuous name" residual this file's header
     // already admits: nothing here would catch it.
     "features",
+    // Issue #1635, argued rather than added quietly, with `self_upgrade`
+    // below. The desktop names ONE item here, `capture_login_shell_path`: a
+    // GUI app's own `PATH` usually lacks the user's shell setup, so finding the
+    // `dot-agent-deck` CLI installed beside the app, and the `brew`, `gh` and
+    // `pkexec` an upgrade uses, needs the login shell's `PATH`. It is the same
+    // capture the daemon runs at start; a desktop-side copy would be a second
+    // copy of the `-ilc` sentinel parsing. It runs the user's `$SHELL`, which
+    // reads the user's own dotfiles and no project's. Checked against this
+    // rule's lines: it resolves no project, reads no project state file, names
+    // no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "login_shell",
     "platform",
     "prompt_delivery",
     // PRD #1497, argued rather than added quietly. Reading mode names ONE item
@@ -263,6 +275,19 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // all zero for it.
     "remote_daemon",
     "remote_doctor",
+    // Issue #1635, argued rather than added quietly. `self_upgrade` is the ONE
+    // implementation of upgrading this machine's own copies — install
+    // detection, the plan and every sentence a client shows about it,
+    // verification and execution — so the TUI, `dot-agent-deck upgrade` and
+    // the desktop's upgrade dialog say the same thing in the same words
+    // (CLAUDE.md rule 22). A desktop-side copy would be the second copy of a
+    // policy about replacing executables, which is exactly what the module
+    // exists to prevent. It reads the running executable's path, the release
+    // checksum manifests and the files it stages under the deck's state
+    // directory; it resolves no project. Checked against this rule's lines: it
+    // reads no project state file, names no FORBIDDEN_SYMBOL or project-state
+    // literal, and contains no `std::env::current_dir` — all zero for it.
+    "self_upgrade",
     "state",
     "ui",
     // PRD #741 M7, argued rather than added quietly.

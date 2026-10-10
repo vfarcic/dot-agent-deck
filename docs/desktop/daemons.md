@@ -118,7 +118,7 @@ When a remote daemon runs an older release than the app, the app offers **Upgrad
 - On the Dashboard, on the daemon's section header, when the daemon is connected. Hovering it shows both versions.
 - In the **Incompatible daemon** note, when the app has refused the daemon because it is older, beside the note's other buttons.
 
-It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (update the app instead; upgrading the app is not done from here), or when the app could not learn the daemon's version. For the daemon on this machine, **Upgrade** installs nothing: it restarts the daemon onto the app's own version, and the app does that by itself when it finds an older one. See [Upgrade the daemon on this machine](#upgrade-the-daemon-on-this-machine).
+It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (upgrade the app instead, with its own upgrade button; see [Desktop App → Upgrade the app](index.md#upgrade-the-app)), or when the app could not learn the daemon's version. For the daemon on this machine, **Upgrade** installs nothing: it restarts the daemon onto the app's own version, and the app does that by itself when it finds an older one. See [Upgrade the daemon on this machine](#upgrade-the-daemon-on-this-machine).
 
 **What happens when you press it:**
 
@@ -183,7 +183,7 @@ The dialog ends with one of the titles in the [remote table above](#upgrade-a-re
 
 **Check it worked:** the **Local daemon** section of the Dashboard lists its agents (or **No agents are running yet**) and no longer offers **Upgrade**.
 
-**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)).
+**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)). The app's upgrade dialog offers to upgrade the CLI as well ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
 
 ## Rename a remote daemon
 

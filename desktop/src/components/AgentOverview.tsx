@@ -814,7 +814,7 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, notice }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -843,6 +843,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * voice surface reads the first and this screen serves the second.
    */
   newAgentVoice?: NewAgentVoiceChannel;
+  /** Issue #1635 — the app's newer-release banner, shown at the top of the dashboard. */
+  notice?: ReactNode;
 }) {
   const { fleet, snapshot, mode } = runtime;
   /*
@@ -1233,7 +1235,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
-     digit, and a field or terminal keeps its own. */
+     digit, and a field or terminal keeps its own. A modal over the dashboard —
+     this screen's own confirmations, or one the app opens, such as the
+     newer-release dialog (issue #1635) — keeps them, as it keeps the scroll
+     keys above. */
   useEffect(() => {
     if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1486,6 +1491,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
 
         {/* Focusable (issue #1492): it is the dashboard's scroll region, and a region the keyboard cannot reach cannot be scrolled from it. */}
         <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef} tabIndex={0}>
+          {notice}
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>

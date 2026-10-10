@@ -6,6 +6,8 @@ import type { UpgradeOutcome } from "../lib/upgrade";
 import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { AgentOverview } from "./AgentOverview";
+import { SelfUpgradeDialog } from "./SelfUpgradeDialog";
+import type { SelfUpgradeCheck } from "../lib/selfUpgrade";
 
 /**
  * PRD #1487 M5 — Upgrade on a deck's card on the agent dashboard (D9). The
@@ -120,5 +122,46 @@ describe("the dashboard's Upgrade action", () => {
     render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"), { upgradeDaemon: undefined })} onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("daemon-upgrade")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-upgrade")).not.toBeInTheDocument();
+  });
+});
+
+describe("the newer-release dialog over the dashboard", () => {
+  const headline = "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)";
+  const check: SelfUpgradeCheck = {
+    checkId: 1,
+    latest: "0.47.0",
+    updateAvailable: true,
+    notice: headline,
+    installed: null,
+    app: { copy: "app", label: "Agent Deck (desktop app)", headline, current: "0.46.0", latest: "0.47.0", action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?", provenance: { checked: true, reason: null }, lines: [{ text: headline, command: null }] },
+    cli: null,
+    recheckAfterSecs: 21600,
+  };
+  const api = { check: vi.fn(), run: vi.fn(), relaunch: vi.fn() };
+
+  /** Scenario: With voice on, the dashboard's rows are numbered. While the app's newer-release dialog is open over it — with Cancel or Upgrade focused — pressing a row's number opens nothing behind the dialog; once it is closed, the same digit opens the row. */
+  it("self_upgrade_modal_001 keeps the dashboard's number keys off while the dialog is open", () => {
+    const onNavigate = vi.fn();
+    const { rerender } = render(
+      <VoiceOn.Provider value={true}>
+        <AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} />
+        <SelfUpgradeDialog check={check} api={api} onClose={vi.fn()} />
+      </VoiceOn.Provider>,
+    );
+    expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "1" });
+    screen.getByTestId("self-upgrade-start").focus();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "2" });
+    expect(onNavigate).not.toHaveBeenCalled();
+    expect(api.run).not.toHaveBeenCalled();
+
+    // The control: the same digit with the dialog closed opens the first row.
+    rerender(
+      <VoiceOn.Provider value={true}>
+        <AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} />
+      </VoiceOn.Provider>,
+    );
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(onNavigate).toHaveBeenCalled();
   });
 });

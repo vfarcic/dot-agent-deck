@@ -148,30 +148,54 @@ mod tests {
 
     /// Issue #367's core regression: output must reach the pane while the
     /// command is still running, not only once it exits.
+    ///
+    /// What this asserts is an order: the bytes arrive before `run_once`
+    /// returns. So the wait ends when either happens, not at a start-up
+    /// deadline. Issue #1632: a 10 s deadline for the first byte went red on
+    /// a Windows runner where the shell spawns that sibling tests started at
+    /// the same moment took 16 s, against the usual ~20-80 ms there.
     #[test]
     fn streams_output_before_a_long_running_command_exits() {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&sink);
         // Prints immediately, then stays alive far longer than this test.
-        std::thread::spawn(move || {
-            run_once("printf 'EARLY_OUTPUT\\n'; sleep 30", &writer);
+        // `&&`, not `;`: Windows runs this through `cmd.exe /C`, which does
+        // not split on `;`, so `; sleep 30` reached `printf` as excess
+        // arguments and the command exited right after printing (measured on
+        // a Windows runner for #1632). Both shells split on `&&`.
+        let running = std::thread::spawn(move || {
+            run_once("printf 'EARLY_OUTPUT\\n' && sleep 30", &writer);
         });
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if captured(&sink).contains("EARLY_OUTPUT") {
-                // The clear must precede the bytes it clears for.
-                assert!(
-                    captured(&sink).starts_with(&String::from_utf8_lossy(CLEAR).into_owned()),
-                    "screen must be cleared ahead of the first streamed byte, got {:?}",
-                    captured(&sink)
-                );
-                return;
-            }
+        // Only for a shell that never starts at all; nextest kills the test
+        // at 180 s.
+        let ceiling = Instant::now() + Duration::from_secs(120);
+        while !captured(&sink).contains("EARLY_OUTPUT") {
+            assert!(
+                !running.is_finished(),
+                "command exited without its output having streamed; got {:?}",
+                captured(&sink)
+            );
+            assert!(
+                Instant::now() < ceiling,
+                "no output within 120 s of starting the command; got {:?}",
+                captured(&sink)
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!(
-            "output of a still-running command never arrived; got {:?}",
+        // The output came from `printf`, so `sleep 30` is still holding the
+        // pipes open. A `run_once` that only wrote on exit returns
+        // microseconds after its write, so the grace makes catching it
+        // independent of when the poll above happened to land.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            !running.is_finished(),
+            "output arrived only once the command exited, not while it ran"
+        );
+        // The clear must precede the bytes it clears for.
+        assert!(
+            captured(&sink).starts_with(&String::from_utf8_lossy(CLEAR).into_owned()),
+            "screen must be cleared ahead of the first streamed byte, got {:?}",
             captured(&sink)
         );
     }
