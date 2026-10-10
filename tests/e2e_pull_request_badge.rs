@@ -318,8 +318,9 @@ fn pr_001_daemon_resolves_branch_pull_request() {
 }
 
 /// Scenario: Start agents on the remote default branch and on branches with
-/// unavailable PR data, then repeatedly list them. They stay available without
-/// a PR badge, including detached, non-git and non-GitHub working directories.
+/// unavailable PR data, then repeatedly list them after completed git probes.
+/// Switching away from a PR branch clears its badge even if the new lookup
+/// fails, while a same-branch transient failure preserves the known PR.
 #[spec("session/pr/002")]
 #[test]
 fn pr_002_absent_pull_request_keeps_daemon_healthy() {
@@ -332,6 +333,11 @@ fn pr_002_absent_pull_request_keeps_daemon_healthy() {
         "non-git",
     ] {
         let fixture = Fixture::new(if case == "default" { "main" } else { "feat/x" });
+        if case == "default" {
+            // Record completion, not just launch. Seeing a second default-
+            // branch probe proves the monitor got through its first pass.
+            fixture.executable("git", "#!/bin/sh\n/usr/bin/git \"$@\"\nresult=$?\nprintf '%s\\n' \"$*\" >> \"$PR_STUB_DIR/git-probes\"\nexit \"$result\"\n");
+        }
         match case {
             "gh-failure" => std::fs::write(fixture.scratch.path().join("fail"), "fail").unwrap(),
             "empty" => fixture.set_reply(json!([])),
@@ -366,9 +372,148 @@ fn pr_002_absent_pull_request_keeps_daemon_healthy() {
         );
         if case == "default" {
             assert!(
+                common::wait_until(WAIT, || {
+                    std::fs::read_to_string(fixture.scratch.path().join("git-probes"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter(|line| {
+                            *line == "symbolic-ref --quiet --short refs/remotes/origin/HEAD"
+                        })
+                        .count()
+                        >= 2
+                }),
+                "two completed default-branch probes must precede the no-gh assertion"
+            );
+            assert!(
                 !fixture.scratch.path().join("calls").exists(),
                 "default branch must not query gh"
             );
+        }
+    }
+
+    for case in [
+        "same-key-failure",
+        "default",
+        "detached",
+        "other-branch-failure",
+    ] {
+        let fixture = Fixture::new("feat/x");
+        let daemon = fixture.daemon();
+        fixture.start(&daemon);
+        let open = PullRequestInfo {
+            number: 1234,
+            url: PR_URL.into(),
+            state: PullRequestState::Open,
+            review: Some(PullRequestReview::ReviewRequired),
+        };
+        expect_pr(&daemon, &open);
+        let calls_before = std::fs::read_to_string(fixture.scratch.path().join("calls"))
+            .unwrap()
+            .lines()
+            .count();
+        std::fs::write(fixture.scratch.path().join("fail"), "fail").unwrap();
+        match case {
+            "default" => fixture.git(&["checkout", "main"]),
+            "detached" => fixture.git(&["checkout", "--detach"]),
+            "other-branch-failure" => fixture.git(&["checkout", "-b", "feat/y"]),
+            _ => {}
+        }
+        if matches!(case, "same-key-failure" | "other-branch-failure") {
+            assert!(
+                common::wait_until(WAIT, || {
+                    let calls = std::fs::read_to_string(fixture.scratch.path().join("calls"))
+                        .unwrap_or_default();
+                    if case == "other-branch-failure" {
+                        calls.lines().any(|line| line.contains("--head feat/y "))
+                    } else {
+                        calls.lines().count() > calls_before
+                    }
+                }),
+                "resolver must attempt the failing lookup for {case}"
+            );
+        }
+        if case == "same-key-failure" {
+            assert!(
+                !common::wait_until(Duration::from_secs(2), || {
+                    let records = daemon.agent_records();
+                    records.len() != 1
+                        || records[0]
+                            .live
+                            .as_ref()
+                            .and_then(|live| live.pull_request.as_ref())
+                            != Some(&open)
+                }),
+                "same-key transient failure must preserve the known PR"
+            );
+        } else {
+            assert!(
+                daemon
+                    .wait_for_agent_where(
+                        |record| {
+                            record
+                                .live
+                                .as_ref()
+                                .is_some_and(|live| live.pull_request.is_none())
+                        },
+                        WAIT
+                    )
+                    .is_some(),
+                "switching away from feat/x must clear its old PR for {case}; got {:?}",
+                daemon.agent_records()
+            );
+        }
+    }
+}
+
+// Join on unwinding too: a failing assertion must stop its synthetic producer.
+struct ToolTraffic {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ToolTraffic {
+    fn start(daemon: &DaemonProc, agent: &AgentRecord) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let socket = daemon.hook_socket.clone();
+        let id = agent.id.clone();
+        let thread = std::thread::spawn(move || {
+            loop {
+                common::write_hook_line(
+                    &socket,
+                    &json!({
+                        "session_id": "pr-fixture-session",
+                        "agent_type": "claude_code",
+                        "event_type": "tool_start",
+                        "tool_name": "Read",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "agent_id": id,
+                        "pane_id": "pr-fixture-pane"
+                    })
+                    .to_string(),
+                )
+                .expect("synthetic non-trigger tool event");
+                // This timeout generates arrivals at a deliberate cadence;
+                // all assertions wait on observable state, not elapsed time.
+                if !matches!(
+                    stopped.recv_timeout(Duration::from_millis(20)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for ToolTraffic {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("tool traffic producer stopped");
         }
     }
 }
@@ -416,15 +561,16 @@ fn contains_pr(value: &Value, expected: &PullRequestInfo) -> bool {
 }
 
 /// Scenario: Keep a headless client subscribed while an open PR becomes merged
-/// and approved behind the gh stub. Both ListAgents and that same attached
-/// connection receive the new PR within the shortened poll interval.
+/// and approved behind the gh stub, with continuous non-trigger tool events.
+/// Both ListAgents and that same attached connection receive the new PR within
+/// a bounded number of shortened poll intervals despite the broadcast traffic.
 #[spec("session/pr/003")]
 #[test]
 fn pr_003_refresh_reaches_attached_client_without_reconnect() {
     let fixture = Fixture::new("feat/x");
     let daemon = fixture.daemon();
     let mut client = subscribe(&daemon.attach_socket);
-    fixture.start(&daemon);
+    let agent = fixture.start(&daemon);
     expect_pr(
         &daemon,
         &PullRequestInfo {
@@ -433,6 +579,20 @@ fn pr_003_refresh_reaches_attached_client_without_reconnect() {
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
         },
+    );
+    let _traffic = ToolTraffic::start(&daemon, &agent);
+    assert!(
+        daemon
+            .wait_for_agent_where(
+                |record| record.live.as_ref().is_some_and(|live| {
+                    live.active_tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.name == "Read")
+                }),
+                WAIT,
+            )
+            .is_some(),
+        "non-trigger tool traffic must reach the live session before changing the gh reply"
     );
     fixture.set_reply(json!([pr_json(
         1234,
@@ -447,7 +607,21 @@ fn pr_003_refresh_reaches_attached_client_without_reconnect() {
         state: PullRequestState::Merged,
         review: Some(PullRequestReview::Approved),
     };
-    expect_pr(&daemon, &expected);
+    assert!(
+        daemon
+            .wait_for_agent_where(
+                |record| record
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.pull_request.as_ref())
+                    == Some(&expected),
+                WAIT,
+            )
+            .is_some(),
+        "continuous tool traffic must not starve periodic PR refresh; gh calls: {}; agents: {:?}",
+        std::fs::read_to_string(fixture.scratch.path().join("calls")).unwrap_or_default(),
+        daemon.agent_records()
+    );
     let deadline = Instant::now() + WAIT;
     let mut observed = Vec::new();
     let mut received = false;

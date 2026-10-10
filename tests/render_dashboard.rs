@@ -60,9 +60,9 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-/// Scenario: Render an agent with an open, review-required PR at roomy and
-/// narrow card widths. The number remains discoverable and snapshots pin the
-/// state/review glyphs and shortening.
+/// Scenario: Render a PR card at the widths where review, lifecycle, stats and
+/// the entire badge stop fitting. Snapshot the rendered boundaries and every
+/// lifecycle/review value, including unknown values displayed as question marks.
 #[spec("dashboard/pane/016")]
 #[test]
 fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
@@ -91,6 +91,89 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
         );
         insta::assert_snapshot!(format!("pull_request_badge_width_{width}"), rendered);
     }
+    let mut boundaries = String::new();
+    for (width, badge, stats) in [
+        (22, "#1234 ⊙ ◐", true),
+        (21, "#1234 ⊙", true),
+        (20, "#1234 ⊙", true),
+        (19, "#1234", true),
+        (18, "#1234", true),
+        (17, "#1234 ⊙ ◐", false),
+        (13, "#1234 ⊙ ◐", false),
+        (12, "#1234 ⊙", false),
+        (11, "#1234 ⊙", false),
+        (10, "#1234", false),
+        (9, "#1234", false),
+        (8, "", false),
+    ] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        let border = rendered.lines().last().unwrap();
+        assert_eq!(
+            border.contains("#1234"),
+            !badge.is_empty(),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('⊙'),
+            badge.contains('⊙'),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('◐'),
+            badge.contains('◐'),
+            "width {width}: {border}"
+        );
+        assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
+        boundaries.push_str(&format!("width {width}\n{rendered}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_boundaries", boundaries);
+
+    let mut values = String::new();
+    for (state, state_glyph) in [
+        (PullRequestState::Open, "⊙"),
+        (PullRequestState::Draft, "◌"),
+        (PullRequestState::Merged, "◆"),
+        (PullRequestState::Closed, "⊘"),
+        (PullRequestState::Unknown, "?"),
+    ] {
+        for (review, review_glyph) in [
+            (None, ""),
+            (Some(PullRequestReview::Approved), " ✓"),
+            (Some(PullRequestReview::ChangesRequested), " ✗"),
+            (Some(PullRequestReview::ReviewRequired), " ◐"),
+            (Some(PullRequestReview::Unknown), " ?"),
+        ] {
+            let pr = session.pull_request.as_mut().unwrap();
+            pr.state = state;
+            pr.review = review;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &session,
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                render_now(),
+                true,
+                80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            let border = rendered.lines().last().unwrap();
+            let badge = format!(" #1234 {state_glyph}{review_glyph} ");
+            assert!(border.contains(&badge), "{state:?}/{review:?}: {border}");
+            values.push_str(&format!("{state:?}/{review:?}\n{border}\n"));
+        }
+    }
+    insta::assert_snapshot!("pull_request_badge_states_and_reviews", values);
 }
 
 /// Scenario: Render a single dashboard card for a Working agent with a Read

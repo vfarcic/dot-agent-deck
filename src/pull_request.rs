@@ -991,6 +991,70 @@ mod tests {
         assert_eq!(state.sessions["s1"].pull_request, None);
     }
 
+    fn apply_pr_report_then_stale_snapshot(next: Option<PullRequestInfo>) {
+        let mut daemon = crate::state::AppState::default();
+        let mut session = sample_session();
+        session.pull_request = pr_in(PullRequestState::Open).flatten();
+        let stale = session.live_snapshot();
+        daemon.sessions.insert("s1".into(), session.clone());
+        let mut client = crate::state::AppState::default();
+        client.register_pane("pane-1".into());
+        client.sessions.insert("s1".into(), session);
+        let events = daemon.set_pull_requests(&HashMap::from([("s1".into(), next.clone())]));
+        assert_eq!(events.len(), 1);
+        client.apply_event(events[0].clone());
+        assert_eq!(client.sessions["s1"].pull_request, next, "report applied");
+        client.seed_hydrated_session(
+            "pane-1".into(),
+            Some("/work/repo".into()),
+            Some(crate::event::AgentType::ClaudeCode),
+            Some("agent-1".into()),
+            Some(&stale),
+        );
+        assert_eq!(
+            client.sessions["s1"].pull_request, next,
+            "a delayed ListAgents snapshot must not overwrite the newer PR report"
+        );
+    }
+
+    /// Scenario: Deliver a merged PR event before an older open-PR ListAgents
+    /// reply. Hydrating that delayed reply must leave the card merged.
+    #[test]
+    fn a_stale_snapshot_cannot_reopen_a_merged_pull_request() {
+        apply_pr_report_then_stale_snapshot(pr_in(PullRequestState::Merged).flatten());
+    }
+
+    /// Scenario: Clear a card's PR by event, then hydrate an older snapshot
+    /// containing its former PR. The card must remain without a PR.
+    #[test]
+    fn a_stale_snapshot_cannot_restore_a_cleared_pull_request() {
+        apply_pr_report_then_stale_snapshot(None);
+    }
+
+    /// Scenario: Hydrate a card from a current merged-PR snapshot without
+    /// receiving a PR event. The current reply must still update its badge.
+    #[test]
+    fn a_current_snapshot_can_update_a_pull_request_without_a_report() {
+        let mut daemon = crate::state::AppState::default();
+        let mut session = sample_session();
+        session.pull_request = pr_in(PullRequestState::Open).flatten();
+        daemon.sessions.insert("s1".into(), session.clone());
+        let mut client = crate::state::AppState::default();
+        client.register_pane("pane-1".into());
+        client.sessions.insert("s1".into(), session);
+        let merged = pr_in(PullRequestState::Merged).flatten();
+        daemon.set_pull_requests(&HashMap::from([("s1".into(), merged.clone())]));
+        let current = daemon.sessions["s1"].live_snapshot();
+        client.seed_hydrated_session(
+            "pane-1".into(),
+            Some("/work/repo".into()),
+            Some(crate::event::AgentType::ClaudeCode),
+            Some("agent-1".into()),
+            Some(&current),
+        );
+        assert_eq!(client.sessions["s1"].pull_request, merged);
+    }
+
     /// The report moves nothing else on the card — not status, not activity,
     /// not the journal — and never creates a card.
     #[test]

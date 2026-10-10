@@ -32,14 +32,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### session/pr/002 — Missing PR data leaves the daemon healthy and the agent without a badge.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, offline gh stub).
-- **Asserts:** default branch, failed gh query, empty response, detached HEAD, non-GitHub origin and non-git directory keep a live agent served with no PR; the default branch makes no gh call.
+- **Asserts:** default branch, failed gh query, empty response, detached HEAD, non-GitHub origin and non-git directory keep a live agent served with no PR; two completed default-branch probes precede the no-gh assertion. Switching from a resolved PR branch to the default branch, detached HEAD or a new branch whose query fails clears the old PR; a same-key transient failure preserves it.
 - **Does not assert:** missing gh executable, real authentication or network failures.
 - **Platform coverage:** mac+linux.
 
 ##### session/pr/003 — PR polling updates an already-attached client without reconnecting.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, mutable offline gh stub).
-- **Asserts:** with DOT_AGENT_DECK_PR_REFRESH_SECS=1, switching an open PR to merged/approved updates ListAgents and sends the full PR to one continuously held event subscription.
+- **Asserts:** with DOT_AGENT_DECK_PR_REFRESH_SECS=1, switching an open PR to merged/approved updates ListAgents and sends the full PR to one continuously held event subscription even during continuous non-trigger tool traffic.
 - **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
 - **Platform coverage:** mac+linux.
 
@@ -170,7 +170,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
 - **Layer:** L1 (ratatui TestBackend + insta).
 - **Agent:** none (synthetic SessionState).
-- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin the glyphs and layout.
+- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
 - **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
 - **Platform coverage:** mac+linux+windows.
 

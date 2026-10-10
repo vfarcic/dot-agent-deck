@@ -365,6 +365,29 @@ mod tests {
         );
     }
 
+    /// Scenario: Configure BROWSER as a direct executable that exits with
+    /// status 1. The status line must report failure and retain the PR URL.
+    #[cfg(unix)]
+    #[test]
+    fn a_browser_exiting_nonzero_shows_failure_and_the_url() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser");
+        crate::test_isolation::write_script(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = BrowserEnv {
+            browser: Some(script.display().to_string()),
+            display: false,
+        };
+        let msg = open_pull_request("https://github.com/o/r/pull/3", &env);
+        assert!(
+            msg.starts_with(
+                "Pull request: https://github.com/o/r/pull/3 (could not open a browser:"
+            ),
+            "a browser that exits 1 must report failure, not Opened; got {msg}"
+        );
+    }
+
     /// When the browser cannot be launched, the status line carries the URL so
     /// the user can copy it.
     #[test]
