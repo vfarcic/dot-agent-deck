@@ -26,11 +26,13 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | See every agent on one or more daemons, with its status | **Dashboard** | [Dashboard](dashboard.md) |
 | Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
+| Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
+| Sign out of GitHub in the app's pull request page | **Settings → GitHub** | [Settings → GitHub](settings.md#github) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
 
 ## What the TUI has and the desktop app does not

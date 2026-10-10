@@ -92,7 +92,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `r` | Rename the selected agent |
 | `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
-| `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set); does nothing when the card shows no pull request. The desktop app opens it inside the app instead |
+| `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set); on a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input** |
 | `?` | Toggle the help overlay |
 

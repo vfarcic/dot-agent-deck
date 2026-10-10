@@ -96,6 +96,33 @@ What can go wrong in the pane:
 - **"Terminal input unavailable — <reason>."**: the daemon refused input to this pane, and the reason says why. What you type is not sent.
 - **"Delivery was not confirmed — <reason>."**: the input may or may not have reached the agent. Check the terminal before typing it again.
 
+## Pull requests
+
+When an agent works on a branch that has a pull request on GitHub, the app shows a badge for it on the agent's row on the Dashboard and in the header of its pane. The badge is the pull request's number between an icon for its state (open, draft, merged or closed) and an icon for its review (approved, changes requested or review required). Hover it to read the same in words, for example `Pull request #1234: open, review required`.
+
+The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+
+### Read a pull request in the app
+
+1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.
+2. Read, comment and review on the page as you would on github.com.
+3. Use the toolbar above the page: **Back** goes back one page, **Open in browser** opens the page you are on in your system browser and closes it in the app, and **Close** closes it.
+4. Press `Escape` to close the page and return to where you were. When you are typing in the page or a menu or dialog of GitHub's is open, `Escape` closes that first, as it does on github.com.
+
+A link to a site other than GitHub opens in your system browser, and the page stays where it was. While one of the app's own dialogs is open, for example Settings, the page is hidden, and it comes back when the dialog closes.
+
+### Signing in to GitHub in the app
+
+The page has its own GitHub sign-in, separate from your system browser's. The first time you open a pull request that needs it, sign in on the page; the app remembers the sign-in, also after you restart it.
+
+A sign-in that leaves GitHub cannot finish in the app: if your organisation signs you in through SAML single sign-on, or you sign in to GitHub with Google or Apple, that step opens in your system browser instead. Use **Open in browser** to work on the pull request there.
+
+To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github).
+
+### In the TUI
+
+The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR" instead.
+
 ## Closing agents and orchestrations
 
 - **Stop one agent:** press the stop control on its row (`Close <name> agent`). The confirmation, `Close <name>?`, names the daemon the stop request goes to. Press **Close agent**.

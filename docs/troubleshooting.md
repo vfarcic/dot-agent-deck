@@ -480,6 +480,17 @@ If a pane stays smaller than its box with no other client open, check for a `dot
 
 When an agent's size changes, the daemon discards the output history it keeps for clients that attach later, because that output was drawn for the old size and would replay garbled. Only a client that attaches or re-attaches after the change is affected: it gets the correct live screen with no history behind it. A client that was already attached keeps its own scrollback. In practice you see this when you open an agent's pane in the desktop app after the agent was resized, or when a pane reconnects. Switching between two clients whose panes differ in size resizes the agent, so each switch discards the history again (switches within about a quarter of a second count as one). The history fills back in as the agent keeps working.
 
+### An agent has a pull request but no badge
+
+The pull request badge, on a TUI card and on the desktop app's rows and panes, comes from GitHub's `gh` command, run by the deck on the machine where the agent runs. For a [remote environment](remote-environments.md) that is the remote host, not your laptop. Check, on that machine and in the agent's working directory:
+
+1. **`gh` is installed and signed in:** `gh auth status` says you are logged in to github.com. Install it from [cli.github.com](https://cli.github.com) and run `gh auth login` if not. On a remote host, run both there, for example `ssh <host> gh auth status`.
+2. **The repository is on GitHub:** `git remote get-url origin` is a github.com address. A repository whose `origin` is elsewhere, or that has no `origin`, gets no badge.
+3. **The agent is on the pull request's branch:** `git branch --show-current` names the branch the pull request was opened from. The repository's default branch (usually `main`), and a checkout of a commit rather than a branch, get no badge.
+4. **GitHub has a pull request for that branch:** `gh pr list --head "$(git branch --show-current)" --state all` lists it.
+
+When all four hold, the badge appears without restarting anything: the deck looks again when the agent finishes its next turn, and otherwise every few minutes. If a lookup fails, the daemon's log says `pull request lookup failed` with the reason (see [Enabling Debug Logs](#enabling-debug-logs) for where the log is), and the deck tries again a few minutes later.
+
 ### Card borders or right edges look misaligned in the TUI
 
 If card and pane borders are broken or shifted, a card's bottom-right corner is painted over, or text in card titles runs into the border, check whether your terminal is set to draw "ambiguous-width" characters two columns wide. The lines the deck draws borders with, and the `·`, `…` and `—` it uses in card titles and messages, are such characters, and the TUI expects them to be one column wide. That setting is not supported, so turn it off:

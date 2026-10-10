@@ -36,7 +36,8 @@ What you can do by voice, by screen:
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
 | Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
-| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that) |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [open its pull request](#pull-requests) |
+| A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
 
 Say a daemon's name the way you would say it. The app picks the daemon you meant from the ones the **Daemon** selector lists, even when the transcription spells it differently: "Select mini PC, demon" reaches a daemon named `minipc`, and "Switch to InMotionDeck" one named `inmotion`. The same goes for directories, Mode chips and orchestrations. With **Send on-screen names** set to **Off**, the app cannot pick a daemon, directory, mode, agent or orchestration from what you say: a command that needs one is refused, and the app says why; say its number (see [Choosing by number](#choosing-by-number)) or click it instead.
 
@@ -131,6 +132,18 @@ The dashboard looks the same with voice on as with voice off: nothing is left ou
 - **Saying the number of a row you have scrolled past**, such as "open agent 12" or "twelve", opens that agent as usual and scrolls its row back into view behind the pane, so it is in front of you when you close the pane.
 
 Scrolling by voice works on the dashboard itself, not while the New agent dialog or an agent's pane is open over it.
+
+## Pull requests
+
+When an agent has a [pull request badge](dashboard.md#pull-requests), say **"open the PR"** or **"show the pull request"** while its pane is open, and the pull request opens [inside the app](dashboard.md#read-a-pull-request-in-the-app). When the agent has no pull request, nothing opens and the app says so.
+
+While the pull request page is open:
+
+- **"scroll down"**, **"scroll up"**, **"scroll to the top"** and **"scroll to the bottom"** scroll the page, as they scroll the dashboard.
+- **"open it in the browser"** opens the page you are on in your system browser and closes it in the app.
+- **"close"** closes the page and returns to the screen under it.
+
+Typing into the agent does not work while the page is open over its pane: close the page first.
 
 ## Long lists are shown in pages
 
