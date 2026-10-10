@@ -5011,10 +5011,24 @@ fn delegate_no_event_window(
 /// what is already there rather than send the pointer again. Only the wording
 /// changes; delivery, the identity gate and the fenced pane capture are the
 /// silence report's own.
+#[cfg(test)]
 fn compose_delegate_silence_notice(
     window: std::time::Duration,
     pane_text: Option<&str>,
     redeliveries: crate::delegate_retry::RedeliveryTally,
+) -> String {
+    compose_delegate_silence_notice_with(window, pane_text, redeliveries, false)
+}
+
+/// [`compose_delegate_silence_notice`], saying instead, when `fragment` is set,
+/// that the worker's agent submitted only part of its task pointer (issue
+/// #1650) — it did emit events, for a turn on that part, so "emitted no agent
+/// event" would be false.
+fn compose_delegate_silence_notice_with(
+    window: std::time::Duration,
+    pane_text: Option<&str>,
+    redeliveries: crate::delegate_retry::RedeliveryTally,
+    fragment: bool,
 ) -> String {
     let window = if window < std::time::Duration::from_secs(1) {
         format!("{} ms", window.as_millis())
@@ -5040,18 +5054,32 @@ fn compose_delegate_silence_notice(
         enters,
         retypes,
     } = redeliveries;
+    let outcome = if fragment {
+        "started a turn on the whole pointer"
+    } else {
+        "produced an event"
+    };
     let retried = match attempts {
         0 => String::new(),
         n => format!(
             " The deck tried {n} more times to get the task into the same process (pressed Enter \
-             {enters} times, typed the pointer again {retypes} times) and none of them produced \
-             an event."
+             {enters} times, typed the pointer again {retypes} times) and none of them {outcome}."
         ),
+    };
+    let what = if fragment {
+        format!(
+            "a delegated worker's agent submitted only part of its task pointer, so it never got \
+             its task, and no turn on the whole pointer followed within {window}"
+        )
+    } else {
+        format!(
+            "a delegated worker received its task pointer but then emitted no agent event within \
+             {window}"
+        )
     };
     compose_delegate_prompt(&format!(
         "⚠ delegated worker went quiet (dot-agent-deck daemon report) - a report from the \
-         dot-agent-deck daemon, not a message from a person or an agent: a delegated worker \
-         received its task pointer but then emitted no agent event within {window}.{retried} {evidence} \
+         dot-agent-deck daemon, not a message from a person or an agent: {what}.{retried} {evidence} \
          Check its pane and decide how to proceed - if this needs the user, notify the user; \
          otherwise keep waiting, re-delegate, or reassign. The daemon log names the worker pane \
          and role (RUST_LOG=pane_write=trace also has the delivered bytes)."
@@ -5372,11 +5400,16 @@ pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
 /// that accuses the daemon of losing a prompt is to stay quiet, exactly as
 /// `Closed` does. (`Closed` only fires on daemon shutdown, where a notice would
 /// be noise at best and a write into a tearing-down PTY at worst.)
+///
+/// Issue #1650: `turns` sets aside a turn the worker's agent began on a
+/// fragment of the pointer, so a worker that got only part of its task is not
+/// taken to have spoken about it.
 async fn wait_for_worker_event(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
     window: std::time::Duration,
+    turns: &mut crate::delegate_retry::PointerTurnFilter,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + window;
     loop {
@@ -5387,7 +5420,7 @@ async fn wait_for_worker_event(
             Ok(Ok(BroadcastMsg::Event(event))) => {
                 if event.pane_id.as_deref() == Some(pane_id)
                     && event.agent_id.as_deref() == Some(agent_id)
-                    && worker_event_proves_delivery(&event)
+                    && turns.proves(&event, worker_event_proves_delivery(&event))
                 {
                     return true;
                 }
@@ -5560,6 +5593,10 @@ struct SilenceWatch {
 /// consumed here by a seq-conditional take immediately before reporting: if it
 /// is already gone, one of the three outcomes above won the race with the
 /// window's expiry and the notice is suppressed.
+// Issue #1650 added `pointer`, the eighth: the watch reads the worker's events
+// against the pointer it was armed for, and every other argument is already
+// one the dispatch passes separately.
+#[allow(clippy::too_many_arguments)]
 fn arm_delegate_silence_watch(
     registry: Arc<AgentPtyRegistry>,
     mut event_rx: broadcast::Receiver<BroadcastMsg>,
@@ -5568,6 +5605,7 @@ fn arm_delegate_silence_watch(
     worker_pane_id: String,
     worker_agent_id: String,
     role: String,
+    pointer: String,
 ) {
     let SilenceWatch {
         window,
@@ -5583,6 +5621,7 @@ fn arm_delegate_silence_watch(
     let crate::agent_pty::ArmedSilenceWatch { seq, mut cancel } = armed;
     tokio::spawn(async move {
         let started = tokio::time::Instant::now();
+        let mut turns = crate::delegate_retry::PointerTurnFilter::new(&pointer);
         // `biased` polls the cancellation first on every wake, so a completion
         // that lands in the same instant as the window's expiry always wins.
         let mut spoke = tokio::select! {
@@ -5602,6 +5641,7 @@ fn arm_delegate_silence_watch(
                 &worker_pane_id,
                 &worker_agent_id,
                 window,
+                &mut turns,
             ) => spoke,
         };
         // Issue #1383: the window passed in silence, but an in-place retry for
@@ -5713,12 +5753,13 @@ fn arm_delegate_silence_watch(
         // orchestrator agent captured when the delegate was ISSUED) and the same
         // revalidation closure. Only the delivery tail moved — the gate that
         // `scheduler/idle-worker/008` and `/014` pin is untouched.
-        let notice = compose_delegate_silence_notice(
+        let notice = compose_delegate_silence_notice_with(
             window,
             pane_text.as_deref(),
             redeliveries
                 .map(|counts| counts.tally())
                 .unwrap_or_default(),
+            turns.saw_fragment(),
         );
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
@@ -6697,6 +6738,191 @@ fn session_start_means_ready(event: &AgentEvent) -> bool {
         crate::agent_registry::spec(&event.agent_type).pre_prompt_readiness,
         crate::agent_registry::PrePromptReadiness::Unknown
     )
+}
+
+/// Issue #1650: whether `event` is a readiness signal the `clear = false` boot
+/// gate ([`await_worker_boot`]) counts — a `SessionStart` that releases
+/// [`wait_for_session_start`] at once. The wrapper's weak "output settled" fact
+/// is left out: the respawn gate only takes it after an upgrade window, and a
+/// record of it would let a launcher that merely went quiet mid-boot pass for
+/// a ready agent.
+pub(crate) fn session_start_opens_boot_gate(event: &AgentEvent) -> bool {
+    event.event_type == EventType::SessionStart
+        && session_start_means_ready(event)
+        && !event.is_wrapper_interface_settled_session_start()
+}
+
+/// Issue #1650: how many successive owners of one worker pane a `clear = false`
+/// delegate gates ([`await_worker_boot`]). A pane that has changed hands again
+/// after the last of them is not written to.
+const MAX_BOOT_GATE_OWNERS: usize = 3;
+
+/// Issue #1650: hold a `clear = false` delegate's pointer until the worker it
+/// is about to be typed into has finished booting.
+///
+/// A `clear = true` delegate respawns its worker and waits for that worker's
+/// readiness signal before typing. A `clear = false` one used to type at once,
+/// which is right for a worker that has been up for a while and wrong for one
+/// the orchestration or a `pane restart` started seconds earlier: the pointer
+/// then lands in an agent that is still starting. Codex 0.160.0 takes the
+/// terminal into a provisional startup composer while it loads its config, and
+/// a pointer typed there was submitted at the hand-over as its last few
+/// characters only (`2b1b]`, `70540b]` in the issue, both read back from
+/// Codex's own log, about six seconds after the Codex process started).
+///
+/// So for a worker this registry forked less than
+/// [`SESSION_START_WAIT_TIMEOUT`] ago, this applies the respawn path's gate,
+/// measured from the worker's own spawn: the readiness signal its hooks or
+/// wrapper sent ([`AgentPtyRegistry::agent_boot`], recorded by the daemon as
+/// it arrived, or awaited here when it has not arrived yet), then the same
+/// buffer the respawn path holds after that signal. A declared-no-signal agent
+/// (OpenCode) waits out the no-signal buffer from its spawn.
+///
+/// Returns at once for a worker that is older than the window, one this
+/// registry did not fork, and one whose agent the deck cannot identify — such a
+/// worker announces nothing the gate could wait for, so waiting would only
+/// delay every delegate to it by the whole window. The wait ends early if the
+/// worker exits or its pane begins closing; the guarded write after it then
+/// refuses as it always has.
+pub(crate) async fn await_worker_boot(
+    registry: &AgentPtyRegistry,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    pane_id: &str,
+    worker_agent_id: &str,
+    agent_type: Option<&AgentType>,
+    role: &str,
+) {
+    let Some(agent_type) = agent_type.filter(|agent_type| **agent_type != AgentType::None) else {
+        return;
+    };
+    // Subscribed before the record is read: a signal landing in between is
+    // then either in the record or on this receiver.
+    let mut event_rx = event_tx.subscribe();
+    let Some(crate::agent_pty::AgentBoot {
+        spawned: Some(spawned),
+        ready,
+    }) = registry.agent_boot(worker_agent_id)
+    else {
+        return;
+    };
+    let age = spawned.elapsed();
+    let mut exited = registry.agent_exit_signal(worker_agent_id);
+    let mut closing = registry.pane_close_signal(pane_id);
+    async fn hold(
+        remaining: std::time::Duration,
+        exited: &mut oneshot::Receiver<()>,
+        closing: &mut oneshot::Receiver<()>,
+    ) {
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = exited => {}
+            _ = closing => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
+    }
+    if !agent_has_pre_prompt_readiness_signal(Some(agent_type)) {
+        let remaining = no_signal_readiness_buffer().saturating_sub(age);
+        if !remaining.is_zero() {
+            tracing::debug!(
+                role = %role,
+                pane_id = %pane_id,
+                worker_agent_id = %worker_agent_id,
+                age_ms = age.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "delegate: the clear=false worker started moments ago and announces nothing \
+                 before its first prompt; holding the task pointer for the rest of the \
+                 no-signal readiness buffer"
+            );
+        }
+        hold(remaining, &mut exited, &mut closing).await;
+        return;
+    }
+    let ready = match ready {
+        Some(ready) => ready,
+        None if age >= SESSION_START_WAIT_TIMEOUT => return,
+        None => {
+            tracing::info!(
+                role = %role,
+                pane_id = %pane_id,
+                worker_agent_id = %worker_agent_id,
+                age_ms = age.as_millis(),
+                "delegate: the clear=false worker is still starting; waiting for its \
+                 readiness signal before typing the task pointer"
+            );
+            // Taken before the wait, as the respawn path takes its own, so a
+            // strong raw-input fact landing after the wait returns still
+            // re-prices the buffer below (issue #724).
+            let mut interface_watch = event_rx.resubscribe();
+            let wait = tokio::select! {
+                biased;
+                _ = &mut exited => return,
+                _ = &mut closing => return,
+                wait = wait_for_session_start(
+                    &mut event_rx,
+                    pane_id,
+                    worker_agent_id,
+                    SESSION_START_WAIT_TIMEOUT - age,
+                    interface_upgrade_window(Some(agent_type)),
+                ) => wait,
+            };
+            if !wait.ready {
+                tracing::debug!(
+                    role = %role,
+                    pane_id = %pane_id,
+                    worker_agent_id = %worker_agent_id,
+                    "delegate: the clear=false worker sent no readiness signal within the \
+                     window; typing the task pointer after the ordinary buffer"
+                );
+            }
+            // The respawn path's pricing of the same outcome, exactly: the
+            // interface buffer for a wrapper host's raw-input fact, the ordinary
+            // one otherwise, re-priced when the strong fact lands during a buffer
+            // the weak "output settled" fact started (`weak_fact_buffer_reprice`;
+            // a timeout is not re-priced, there or here).
+            let wrapper_host = registry.agent_spawned_as_wrapper_host(worker_agent_id);
+            let buffer = if wait.observed_interface && wrapper_host {
+                wrapper_interface_readiness_buffer()
+            } else {
+                delegate_readiness_buffer()
+            };
+            let reprice = weak_fact_buffer_reprice(&wait, wrapper_host);
+            tokio::select! {
+                biased;
+                _ = &mut exited => {}
+                _ = &mut closing => {}
+                _ = hold_readiness_buffer(
+                    Some(&mut interface_watch),
+                    pane_id,
+                    worker_agent_id,
+                    buffer,
+                    reprice,
+                    None,
+                ) => {}
+            }
+            return;
+        }
+    };
+    let buffer = if ready.interface && registry.agent_spawned_as_wrapper_host(worker_agent_id) {
+        wrapper_interface_readiness_buffer()
+    } else {
+        delegate_readiness_buffer()
+    };
+    let remaining = buffer.saturating_sub(ready.at.elapsed());
+    if !remaining.is_zero() {
+        tracing::debug!(
+            role = %role,
+            pane_id = %pane_id,
+            worker_agent_id = %worker_agent_id,
+            interface = ready.interface,
+            remaining_ms = remaining.as_millis(),
+            "delegate: the clear=false worker became ready moments ago; holding the task \
+             pointer for the rest of the readiness buffer"
+        );
+    }
+    hold(remaining, &mut exited, &mut closing).await;
 }
 
 /// Issue #243: does `agent_type` announce ANYTHING a readiness gate could wait
@@ -9659,6 +9885,61 @@ async fn dispatch_one_owned(
             }
         }
     }
+    // Issue #1650: a worker that did not respawn may still be booting — the
+    // orchestration or a `pane restart` started it seconds ago — and a pointer
+    // typed into a booting agent can be lost or cut short. Hold it until the
+    // worker is up, as the respawn path above does for its own replacement.
+    //
+    // The pane can change hands during the wait (a `pane restart`, or a worker
+    // that exited and was replaced), and the write below goes to whoever holds
+    // it then, so a new owner is gated too, up to `MAX_BOOT_GATE_OWNERS`; a
+    // pane still changing hands after that is not written to at all.
+    if expected_worker_agent_id.is_none() {
+        let mut gated: Option<String> = None;
+        for _ in 0..MAX_BOOT_GATE_OWNERS {
+            let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) else {
+                break;
+            };
+            if gated.as_deref() == Some(worker_agent_id.as_str()) {
+                break;
+            }
+            // The worker's own launch identity first: a role edited since it
+            // was spawned does not change which agent is booting in the pane.
+            let worker_agent_type = registry
+                .pre_write_believed_agent_type(&worker_agent_id)
+                .or_else(|| {
+                    role_config
+                        .as_ref()
+                        .and_then(|role| role.resolved_agent_type())
+                });
+            await_worker_boot(
+                &registry,
+                &event_tx,
+                &pane_id,
+                &worker_agent_id,
+                worker_agent_type.as_ref(),
+                &target_role,
+            )
+            .await;
+            gated = Some(worker_agent_id);
+        }
+        // A pane that changed hands again during the last wait is written to
+        // only by the owner that was gated: binding the write to it makes the
+        // guarded send refuse rather than type into a worker nobody waited
+        // for, and the refusal is reported like any other (Qodo, PR #1659).
+        if let Some(gated) = gated
+            && registry.pane_current_agent_id(&pane_id).as_deref() != Some(gated.as_str())
+        {
+            warn!(
+                role = %target_role,
+                pane_id = %pane_id,
+                gated_agent_id = %gated,
+                "delegate: the worker pane changed hands again while the deck waited for its \
+                 worker to start; not typing the task pointer into a worker it did not wait for"
+            );
+            expected_worker_agent_id = Some(gated);
+        }
+    }
     // PRD #249 review (finding B1): on every path that did NOT respawn
     // (`clear = false`, or a role whose config went missing) the pointer is
     // bound to whoever owns the worker pane right now. There is no wait between
@@ -10307,6 +10588,7 @@ async fn dispatch_one_owned(
         pane_id,
         worker_agent_id,
         target_role,
+        one_liner,
     );
 }
 
@@ -21487,6 +21769,33 @@ mod tests {
     /// bytes. It must also stay single-line, or `encode_pane_payload` would
     /// frame it as bracketed paste (#187).
     #[test]
+    fn delegate_silence_notice_names_a_cut_short_pointer() {
+        let notice = compose_delegate_silence_notice_with(
+            std::time::Duration::from_secs(220),
+            None,
+            crate::delegate_retry::RedeliveryTally {
+                attempts: 3,
+                enters: 3,
+                retypes: 1,
+            },
+            true,
+        );
+        assert!(
+            notice.contains("submitted only part of its task pointer, so it never got its task"),
+            "the notice must say the worker got only part of its task: {notice:?}"
+        );
+        assert!(
+            !notice.contains("emitted no agent event"),
+            "a worker that ran a turn on part of its pointer did emit events: {notice:?}"
+        );
+        assert!(
+            notice.contains("none of them started a turn on the whole pointer"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains('\n'), "{notice:?}");
+    }
+
+    #[test]
     fn compose_delegate_silence_notice_carries_no_untrusted_interpolation() {
         let notice = compose_delegate_silence_notice(
             std::time::Duration::from_millis(600),
@@ -22097,6 +22406,8 @@ mod tests {
                 .expect("spawn stand-in")
         };
         let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        // Issue #1650: an established worker, not one still starting.
+        registry.mark_started_long_ago_for_test(&worker);
         let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
         let (event_tx, _event_rx) = broadcast::channel(64);
 
@@ -22247,6 +22558,8 @@ mod tests {
                 .expect("spawn stand-in")
         };
         let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        // Issue #1650: an established worker, not one still starting.
+        registry.mark_started_long_ago_for_test(&worker);
         let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
         let (event_tx, _event_rx) = broadcast::channel(64);
 
@@ -22975,6 +23288,8 @@ while True:
                 .expect("spawn stand-in")
         };
         let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        // Issue #1650: an established worker, not one still starting.
+        registry.mark_started_long_ago_for_test(&worker);
         let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
         // A clone stays here for the whole test: a bus whose last sender is
         // gone reads as closed, which suppresses the report by itself.
@@ -23182,6 +23497,7 @@ while True:
             WORKER_PANE.to_string(),
             worker.clone(),
             "coder".to_string(),
+            POINTER.to_string(),
         );
         let orch_screen = async || {
             String::from_utf8_lossy(
@@ -23347,6 +23663,7 @@ while True:
             WORKER_PANE.to_string(),
             worker.clone(),
             "coder".to_string(),
+            POINTER.to_string(),
         );
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(15), retry)

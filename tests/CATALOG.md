@@ -3861,6 +3861,20 @@ without depending on the config struct API.
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
 
+##### orchestration/delegate/052 — A `clear = false` delegate to a Codex worker that is still starting waits for it, so the worker submits the whole pointer (issue #1650).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_booting_worker.rs`; the REAL binary through the vt100 `TuiDeck` harness and the REAL `delegate` CLI). Synthetic stand-in, so deliberately NOT demo-reel-marked.
+- **Agent:** a Python stand-in declared `agent = "codex"` (so the deck wraps it) that loads in cooked mode for 3 s, then takes the terminal into a 1 s provisional composer on the alternate screen, and submits a prompt confirmed there as its last 5 characters only — codex-cli 0.160.0's start-up as the issue's own Codex logs show it. Every submission is reported through `hook --agent codex` `UserPromptSubmit`, as a trusted real Codex does.
+- **Asserts:** with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000` and the re-send on (`DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=1500,1500`, observed past its end), a delegate sent the moment the worker launched produces exactly one submission, and it is the whole pointer. Red before the fix (`["e988]"]`), and red again with the boot gate (`state::await_worker_boot`) disabled.
+- **Does not assert:** a real Codex (`codex/worker/002`); the re-send of a cut-short pointer (`/053`); the no-signal (OpenCode) branch of the gate.
+- **Platform coverage:** mac+linux (unix PTY, `python3` stand-in).
+
+##### orchestration/delegate/053 — A pointer the worker submitted cut short is not taken as delivered, and is sent again (issue #1650).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_booting_worker.rs`). Synthetic stand-in, so deliberately NOT demo-reel-marked.
+- **Agent:** the `/052` stand-in, with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=0` so the pointer lands in its provisional composer, and `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=1500,3000`.
+- **Asserts:** the worker first submits a cut-short piece, then the whole pointer exactly once. Red before the fix (`["682c]"]`) and with fragment detection (`delegate_retry::PointerTurnFilter`) disabled; green with the boot gate disabled, so this half recovers on its own, including when the pointer's cooked-mode echo had made it read as already submitted. A second case (`…_over_its_own_echo`) runs the stand-in on the main screen without clearing it, so the echo of the first typing stays above the input box; it goes red if the retype step declines over that echo (Greptile, PR #1659).
+- **Does not assert:** the went-quiet report's fragment wording (unit-tested in `src/state.rs`, `delegate_silence_notice_names_a_cut_short_pointer`).
+- **Platform coverage:** mac+linux (unix PTY, `python3` stand-in).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -5587,6 +5601,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** exact model phrasing, token usage, or dashboard rendering (covered by `codex/live/001`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short worker turn.
+
+##### codex/worker/002 — A real Codex `clear = false` worker that is still starting gets the whole task pointer from a single write (issue #1650).
+- **Layer:** L2 headless in-process daemon plus a real interactive Codex PTY, lane 2 (`e2e-live`); runtime-skipped unless `check_codex_available` passes.
+- **Agent:** the `codex/worker/001` Codex, launched through a script that sleeps 4 s before `exec codex` (the `devbox run codex-big` shape) and declared `agent = "codex"`, `clear = false`, delegated the moment it is spawned, with `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=0` so only the first write counts.
+- **Asserts:** Codex creates the sentinel with exact contents and signals work-done. Timed out on the unfixed code (the pointer never became a task); ~33 s with the fix.
+- **Does not assert:** the exact tail truncation, which a real Codex in an isolated HOME did not reproduce (`orchestration/delegate/052` and `/053` pin it with a stand-in).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** as `codex/worker/001`.
 
 #### devin/live
 
