@@ -84,12 +84,20 @@ pub enum UpgradeOutcome {
     /// was never asked, refused, or is known to be the one still answering. A
     /// client holding that daemon's terminal sessions drops them when this is
     /// set, as it does after [`Self::Restarted`] (Qodo 4200693875).
+    ///
+    /// `installed_binary` is the binary the install put `installed_version`
+    /// at, spelled for the machine's shell, when it is known. A step after the
+    /// install (the hooks, the deck list) may have failed before the deck list
+    /// recorded it, so a caller that runs the new build takes the path from
+    /// here rather than from the deck list (issue #1604).
     Failed {
         stage: UpgradeStage,
         reason: String,
         installed_version: Option<String>,
         #[serde(default)]
         old_daemon_gone: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installed_binary: Option<String>,
     },
 }
 
@@ -248,6 +256,7 @@ impl UpgradeOutcome {
                 reason,
                 installed_version,
                 old_daemon_gone,
+                ..
             } => {
                 let doing = match stage {
                     UpgradeStage::Installing => "installing the new build",
@@ -390,6 +399,9 @@ pub struct InstallError {
     /// failed: then it is the version that check read, or
     /// [`crate::remote::UNVERIFIED_BUILD`] when it read none.
     pub installed_version: Option<String>,
+    /// The binary `installed_version` is at, spelled for the machine's shell,
+    /// when the install got far enough to choose it.
+    pub installed_binary: Option<String>,
 }
 
 impl From<String> for InstallError {
@@ -397,6 +409,7 @@ impl From<String> for InstallError {
         Self {
             reason,
             installed_version: None,
+            installed_binary: None,
         }
     }
 }
@@ -658,12 +671,14 @@ fn run_upgrade(
         Err(InstallError {
             reason,
             installed_version,
+            installed_binary,
         }) => {
             return UpgradeOutcome::Failed {
                 stage: UpgradeStage::Installing,
                 reason,
                 installed_version,
                 old_daemon_gone: false,
+                installed_binary,
             };
         }
     };
@@ -674,6 +689,7 @@ fn run_upgrade(
             reason,
             installed_version: Some(installed.version.clone()),
             old_daemon_gone,
+            installed_binary: Some(installed.binary.clone()),
         };
     // Before the daemon accepted: it refused, or was never reached.
     let restarting_failed = |reason: String| failed_at(UpgradeStage::Restarting, reason, false);
@@ -1148,6 +1164,7 @@ impl<E: SshExecutor> Installer for SshInstaller<E> {
         )
         .map_err(|e| InstallError {
             installed_version: e.installed_version().map(str::to_string),
+            installed_binary: e.installed_binary().map(str::to_string),
             reason: e.to_string(),
         })?;
         let method = if entry.install.as_deref() == Some(crate::remote::INSTALL_HOMEBREW) {
@@ -1445,6 +1462,7 @@ impl WireDaemonPort {
         use crate::daemon_stop::{StopError, StopOutcome, run_daemon_stop};
         let version = CLIENT_VERSION.to_string();
         let failed = |stage, reason: String, old_daemon_gone| UpgradeOutcome::Failed {
+            installed_binary: None,
             stage,
             reason,
             installed_version: Some(version.clone()),
@@ -1553,6 +1571,7 @@ mod tests {
                 result: Err(InstallError {
                     reason: reason.into(),
                     installed_version: Some(version.into()),
+                    installed_binary: Some("/opt/homebrew/bin/dot-agent-deck".into()),
                 }),
                 calls: RefCell::new(Vec::new()),
             }
@@ -1770,6 +1789,7 @@ mod tests {
                 reason: "download refused".into(),
                 installed_version: None,
                 old_daemon_gone: false,
+                installed_binary: None,
             }
         );
         assert!(outcome.is_failure());
@@ -1779,8 +1799,8 @@ mod tests {
     }
 
     /// PRD #1487 review: the build landed and a later install step (hooks,
-    /// deck list) failed. The failure keeps the installed version and the
-    /// step, touches no daemon, and its summary says the new build is
+    /// deck list) failed. The failure keeps the installed version, the binary
+    /// it is at (issue #1604) and the step, touches no daemon, and its summary says the new build is
     /// installed and how to finish — never that nothing was changed.
     #[test]
     fn a_partial_install_keeps_its_version_and_says_how_to_finish() {
@@ -1800,6 +1820,7 @@ mod tests {
                 reason: reason.into(),
                 installed_version: Some("0.2.0".into()),
                 old_daemon_gone: false,
+                installed_binary: Some("/opt/homebrew/bin/dot-agent-deck".into()),
             }
         );
         assert_eq!(stages, [UpgradeStage::Installing]);
@@ -1832,6 +1853,7 @@ mod tests {
             reason: "~/.local/bin/dot-agent-deck on the remote was replaced, but the new binary did not pass its version check".into(),
             installed_version: Some(crate::remote::UNVERIFIED_BUILD.into()),
             old_daemon_gone: false,
+            installed_binary: None,
         }
         .summary("box");
         assert!(
@@ -1851,6 +1873,7 @@ mod tests {
             reason: "download refused".into(),
             installed_version: None,
             old_daemon_gone: false,
+            installed_binary: None,
         }
         .summary("box");
         assert!(!failed.contains("is installed"), "{failed}");
@@ -1873,6 +1896,7 @@ mod tests {
                 reason: "the restart reply was lost".into(),
                 installed_version: installed_version.clone(),
                 old_daemon_gone: true,
+                installed_binary: None,
             }
             .summary("box");
             assert!(!gone.contains("keeps running"), "{gone}");
@@ -1895,6 +1919,7 @@ mod tests {
                 reason: "refused".into(),
                 installed_version,
                 old_daemon_gone: false,
+                installed_binary: None,
             }
             .summary("box");
             assert!(
@@ -2109,6 +2134,7 @@ mod tests {
                     reason: format!("refused: {reason:?}"),
                     installed_version: Some("0.2.0".into()),
                     old_daemon_gone: false,
+                    installed_binary: Some("~/.local/bin/dot-agent-deck".into()),
                 }
             );
         }
@@ -2856,6 +2882,7 @@ mod tests {
             reason,
             installed_version,
             old_daemon_gone,
+            ..
         } = &outcome
         else {
             panic!("{outcome:?}");
@@ -3521,6 +3548,7 @@ mod tests {
             reason,
             installed_version,
             old_daemon_gone,
+            ..
         } = &outcome
         else {
             panic!("{outcome:?}");
@@ -4002,6 +4030,7 @@ mod tests {
                 reason: evil_reason.clone(),
                 installed_version: Some(evil_version.into()),
                 old_daemon_gone: false,
+                installed_binary: None,
             },
         ];
         for outcome in outcomes {
@@ -4020,6 +4049,7 @@ mod tests {
             reason: evil_reason,
             installed_version: None,
             old_daemon_gone: false,
+            installed_binary: None,
         }
         .summary("box");
         assert!(failed.contains("refused[31m\n2Jxxx"), "{failed}");
@@ -4076,6 +4106,7 @@ mod tests {
             reason: "download refused".into(),
             installed_version: None,
             old_daemon_gone: false,
+            installed_binary: None,
         }
         .summary("box");
         assert!(failed.contains("failed while installing") && failed.contains("download refused"));
@@ -4098,6 +4129,7 @@ mod tests {
             reason: "x".into(),
             installed_version: None,
             old_daemon_gone: false,
+            installed_binary: None,
         })
         .unwrap();
         assert_eq!(value["outcome"], "failed");

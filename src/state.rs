@@ -9056,6 +9056,31 @@ async fn dispatch_one_owned(
                     // (LF to the submit CR); every guard above is untouched. An
                     // unsubmitted notice here reached nobody in a dispatched
                     // unit, which is exactly the silent stall #584 set out to end.
+                    // Issue #1604's PR (work_done_005 on a quiet macOS runner): the
+                    // ledger is settled BEFORE the report goes out, not after. The
+                    // report is what tells anyone the delegate died, so a `work-done`
+                    // sent in answer to it could otherwise arrive while this
+                    // commission still stood, and be laundered into a solicited one.
+                    // Commission audit exit 3: nothing was delivered and the
+                    // worker is gone, so the debt has to go with it — otherwise
+                    // the next completion on this pane id is laundered into a
+                    // solicited one. See this function's no-delivery invariant.
+                    release_undelivered_commission(
+                        &registry,
+                        &pane_id,
+                        commission_arm_id,
+                        &target_role,
+                        "the clear=true replacement worker never became live",
+                    );
+                    // Issue #1423, idle-worker audit exit 2: the same debt, as
+                    // the PRD #126 watch holds it. The EOF sweep cannot retire
+                    // it: the worker id is bound only after this exit.
+                    retire_undelivered_idle_worker_record(
+                        &registry,
+                        &pane_id,
+                        delegation_seq,
+                        "the clear=true replacement worker never became live",
+                    );
                     let notice = compose_respawn_no_live_worker_notice(&pane_id);
                     let notice_registry = Arc::clone(&registry);
                     let notice_pane = orchestrator_pane_id.clone();
@@ -9134,26 +9159,6 @@ async fn dispatch_one_owned(
                              orchestrator pane"
                         ),
                     }
-                    // Commission audit exit 3: nothing was delivered and the
-                    // worker is gone, so the debt has to go with it — otherwise
-                    // the next completion on this pane id is laundered into a
-                    // solicited one. See this function's no-delivery invariant.
-                    release_undelivered_commission(
-                        &registry,
-                        &pane_id,
-                        commission_arm_id,
-                        &target_role,
-                        "the clear=true replacement worker never became live",
-                    );
-                    // Issue #1423, idle-worker audit exit 2: the same debt, as
-                    // the PRD #126 watch holds it. The EOF sweep cannot retire
-                    // it: the worker id is bound only after this exit.
-                    retire_undelivered_idle_worker_record(
-                        &registry,
-                        &pane_id,
-                        delegation_seq,
-                        "the clear=true replacement worker never became live",
-                    );
                     // Issue #687, silence audit exit 2: the generation this
                     // watch was armed for is not the pane's live agent any more
                     // and will never be handed a pointer, so its record must not
@@ -9523,6 +9528,41 @@ async fn dispatch_one_owned(
                      submitting a report into the orchestrator \
                      pane and skipping the subsequent prompt write"
                 );
+                // Issue #1604's PR (work_done_005 on a quiet macOS runner): the
+                // ledger is settled BEFORE the report goes out, not after. The
+                // report is what tells anyone the delegate died, so a `work-done`
+                // sent in answer to it could otherwise arrive while this
+                // commission still stood, and be laundered into a solicited one.
+                // Issue #448 review (@prageethw, round 2): the respawn
+                // died, so nothing will be delivered on this exit
+                // either — release the commission before taking it.
+                // `respawn_agent_for_pane` disposes of the previous
+                // child BEFORE spawning the replacement, so this arm
+                // leaves the pane with no live agent at all; without
+                // the release the debt outlives the dispatch and the
+                // next completion on that pane id is laundered into a
+                // solicited one. That is the same defect the ledger
+                // exists to remove, arriving through a different door:
+                // the release below covers a refused guarded send but
+                // sits 100+ lines further on, so correctness would
+                // otherwise depend on WHICH arm the dispatch leaves
+                // through.
+                release_undelivered_commission(
+                    &registry,
+                    &pane_id,
+                    commission_arm_id,
+                    &target_role,
+                    "respawn failed for clear=true",
+                );
+                // Issue #1423, idle-worker audit exit 4: and the PRD #126
+                // watch's copy of that debt. No worker id is ever bound on this
+                // exit, so the EOF sweep can never retire it.
+                retire_undelivered_idle_worker_record(
+                    &registry,
+                    &pane_id,
+                    delegation_seq,
+                    "respawn failed for clear=true",
+                );
                 let notice = compose_respawn_failed_notice(&pane_id);
                 // Issue #617: GUARDED, like the dead-replacement arm above. This
                 // arm used to take the unguarded `write_to_pane_notice` on the
@@ -9619,36 +9659,6 @@ async fn dispatch_one_owned(
                          orchestrator pane scrollback"
                     ),
                 }
-                // Issue #448 review (@prageethw, round 2): the respawn
-                // died, so nothing will be delivered on this exit
-                // either — release the commission before taking it.
-                // `respawn_agent_for_pane` disposes of the previous
-                // child BEFORE spawning the replacement, so this arm
-                // leaves the pane with no live agent at all; without
-                // the release the debt outlives the dispatch and the
-                // next completion on that pane id is laundered into a
-                // solicited one. That is the same defect the ledger
-                // exists to remove, arriving through a different door:
-                // the release below covers a refused guarded send but
-                // sits 100+ lines further on, so correctness would
-                // otherwise depend on WHICH arm the dispatch leaves
-                // through.
-                release_undelivered_commission(
-                    &registry,
-                    &pane_id,
-                    commission_arm_id,
-                    &target_role,
-                    "respawn failed for clear=true",
-                );
-                // Issue #1423, idle-worker audit exit 4: and the PRD #126
-                // watch's copy of that debt. No worker id is ever bound on this
-                // exit, so the EOF sweep can never retire it.
-                retire_undelivered_idle_worker_record(
-                    &registry,
-                    &pane_id,
-                    delegation_seq,
-                    "respawn failed for clear=true",
-                );
                 // Skip the post-respawn prompt write — there is
                 // no live worker agent on this pane to receive
                 // it, and the submit-write would just log a
