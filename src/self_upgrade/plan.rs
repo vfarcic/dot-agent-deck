@@ -130,7 +130,66 @@ pub struct UpgradePlan {
     pub action: PlanAction,
     /// Whether build provenance will be checked, as the plan said.
     pub provenance: ProvenanceCheck,
+    /// A newer stable release, without a leading `v`, that this copy's
+    /// formula cannot reach: set only for a copy on the `dot-agent-deck-beta`
+    /// formula, when a stable release is newer than both the copy and the
+    /// prerelease it is offered. The plan says how to switch formulas
+    /// ([`BETA_TO_STABLE_COMMAND`]).
+    pub stable_switch: Option<String>,
 }
+
+/// The releases a client found, which every copy on the machine is planned
+/// against.
+///
+/// The `dot-agent-deck-beta` Homebrew formula only ever receives prereleases
+/// (`release.yml`'s "Detect channel"), so `brew upgrade dot-agent-deck-beta`
+/// cannot reach a stable release: a copy on it is offered [`Self::prerelease`]
+/// in place and told about a newer stable release separately. Every other copy
+/// is offered [`Self::latest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Releases {
+    /// The newest release on the running copy's channel, without a leading
+    /// `v`: the highest version, stable included, on the prerelease channel,
+    /// and the newest stable release on the stable channel.
+    pub latest: String,
+    /// The newest prerelease, without a leading `v`, when the lookup read it;
+    /// `None` when it did not or none is published.
+    pub prerelease: Option<String>,
+}
+
+impl From<&str> for Releases {
+    /// What a lookup that found only `latest` knows: a prerelease `latest` is
+    /// also the newest prerelease known.
+    fn from(latest: &str) -> Self {
+        let latest = latest.strip_prefix('v').unwrap_or(latest).to_string();
+        let prerelease = is_prerelease(&latest).then(|| latest.clone());
+        Self { latest, prerelease }
+    }
+}
+
+/// Whether `version` carries a SemVer prerelease suffix.
+fn is_prerelease(version: &str) -> bool {
+    crate::version::ReleaseChannel::of_version(version)
+        == crate::version::ReleaseChannel::Prerelease
+}
+
+/// Whether `installation` was installed from the `dot-agent-deck-beta`
+/// Homebrew formula.
+pub fn on_beta_formula(installation: &Installation) -> bool {
+    matches!(
+        installation.method,
+        InstallMethod::Homebrew {
+            formula: HomebrewFormula::Beta,
+            ..
+        }
+    )
+}
+
+/// What moves a copy from the `dot-agent-deck-beta` formula to the stable one.
+/// The two formulas conflict (`docs/installation.md`), so the beta one is
+/// uninstalled first.
+pub const BETA_TO_STABLE_COMMAND: &str =
+    "brew uninstall dot-agent-deck-beta && brew install vfarcic/tap/dot-agent-deck";
 
 /// The URL a release asset downloads from in a browser.
 pub fn release_asset_url(version: &str, asset: &str) -> String {
@@ -140,11 +199,44 @@ pub fn release_asset_url(version: &str, asset: &str) -> String {
     )
 }
 
-/// Decide what to offer `installation` for release `latest`. Pure.
-pub fn plan(installation: &Installation, latest: &str, options: &PlanOptions) -> UpgradePlan {
-    let latest = latest.strip_prefix('v').unwrap_or(latest).to_string();
-    let action = if !super::is_newer(&installation.version, &latest) {
+/// Decide what to offer `installation` for `releases`. Pure.
+///
+/// A copy on the `dot-agent-deck-beta` formula is offered `brew upgrade` only
+/// for the newest prerelease newer than it; a stable release newer than both
+/// is noticed with the command that switches formulas, and when no newer
+/// prerelease exists that notice is the whole plan. Every other copy is
+/// offered [`Releases::latest`].
+pub fn plan(
+    installation: &Installation,
+    releases: &Releases,
+    options: &PlanOptions,
+) -> UpgradePlan {
+    let current = installation.version.as_str();
+    let (latest, stable_switch) = if on_beta_formula(installation) {
+        let prerelease = releases
+            .prerelease
+            .clone()
+            .or_else(|| is_prerelease(&releases.latest).then(|| releases.latest.clone()))
+            .filter(|prerelease| super::is_newer(current, prerelease));
+        let stable = Some(releases.latest.clone()).filter(|stable| {
+            !is_prerelease(stable)
+                && super::is_newer(current, stable)
+                && prerelease
+                    .as_deref()
+                    .is_none_or(|prerelease| super::is_newer(prerelease, stable))
+        });
+        match (prerelease, stable) {
+            (Some(prerelease), stable) => (prerelease, stable),
+            (None, Some(stable)) => (stable.clone(), Some(stable)),
+            (None, None) => (releases.latest.clone(), None),
+        }
+    } else {
+        (releases.latest.clone(), None)
+    };
+    let action = if !super::is_newer(current, &latest) {
         PlanAction::UpToDate
+    } else if stable_switch.as_deref() == Some(latest.as_str()) {
+        PlanAction::NotifyOnly
     } else {
         action_for(installation, &latest, options)
     };
@@ -153,6 +245,7 @@ pub fn plan(installation: &Installation, latest: &str, options: &PlanOptions) ->
         latest,
         action,
         provenance: options.provenance.clone(),
+        stable_switch,
     }
 }
 
@@ -411,9 +504,16 @@ impl UpgradePlan {
                 lines.push(PlanLine::Command(command.clone()));
             }
             (_, PlanAction::BrewUpgrade { formula, .. }) => lines.push(text(format!(
-                "Installed with Homebrew ({exe}). Upgrading runs `brew upgrade {}`, which installs the tap's latest release.",
+                "Installed with Homebrew ({exe}). Upgrading runs `brew upgrade {}`, which installs the formula's latest release.",
                 formula.name()
             ))),
+            (InstallMethod::Homebrew { formula, .. }, PlanAction::NotifyOnly) => {
+                lines.push(text(format!(
+                    "Installed with Homebrew from the `{}` formula ({exe}), which does not carry stable releases, so `brew upgrade` cannot install v{latest}. Switch to the stable formula with:",
+                    formula.name()
+                )));
+                lines.push(PlanLine::Command(BETA_TO_STABLE_COMMAND.to_string()));
+            }
             (_, PlanAction::ReplaceBinary { target, asset }) => {
                 lines.push(text(format!(
                     "Downloaded binary at {}. Upgrading downloads `{asset}` from release v{latest}, checks it, and replaces {}.",
@@ -469,6 +569,17 @@ impl UpgradePlan {
                 "No release v{latest} build exists for this platform. See {}/releases.",
                 crate::repo_identity::URL
             ))),
+        }
+        if let Some(stable) = self
+            .stable_switch
+            .as_ref()
+            .filter(|_| self.action != PlanAction::NotifyOnly)
+        {
+            lines.push(text(format!(
+                "Stable release v{stable} is newer still, and the `{}` formula does not carry stable releases. To move to it, switch to the stable formula with:",
+                HomebrewFormula::Beta.name()
+            )));
+            lines.push(PlanLine::Command(BETA_TO_STABLE_COMMAND.to_string()));
         }
         lines
     }
@@ -544,7 +655,11 @@ mod tests {
 
     #[test]
     fn plan_001_linux_homebrew_runs_brew_upgrade_for_its_formula() {
-        for formula in [HomebrewFormula::Stable, HomebrewFormula::Beta] {
+        // The beta formula only ever carries prereleases (plan_022-024).
+        for (formula, latest) in [
+            (HomebrewFormula::Stable, "v0.46.0"),
+            (HomebrewFormula::Beta, "v0.46.0-beta.1"),
+        ] {
             let mut found = cli(
                 "/home/linuxbrew/.linuxbrew/Cellar/x/0.45.0/bin/dot-agent-deck",
                 InstallMethod::Homebrew {
@@ -553,7 +668,7 @@ mod tests {
                 },
             );
             found.tools.brew = Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"));
-            let plan = plan(&found, "v0.46.0", &options());
+            let plan = plan(&found, &latest.into(), &options());
             assert_eq!(
                 plan.action,
                 PlanAction::BrewUpgrade {
@@ -578,7 +693,7 @@ mod tests {
                 prefix: PathBuf::from("/opt/homebrew"),
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(
             plan.action,
             PlanAction::ShowCommand {
@@ -600,7 +715,7 @@ mod tests {
                     binary: PathBuf::from(exe),
                 },
             );
-            let plan = plan(&found, "0.46.0", &options());
+            let plan = plan(&found, &"0.46.0".into(), &options());
             assert_eq!(
                 plan.action,
                 PlanAction::ReplaceBinary {
@@ -623,7 +738,7 @@ mod tests {
                 binary: PathBuf::from(exe),
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(
             plan.action,
             PlanAction::StagedInstall {
@@ -659,14 +774,14 @@ mod tests {
             },
         );
         found.tools.pkexec = Some(PathBuf::from("/usr/bin/pkexec"));
-        let terminal = plan(&found, "0.46.0", &options());
+        let terminal = plan(&found, &"0.46.0".into(), &options());
         assert!(matches!(
             terminal.action,
             PlanAction::StagedInstall { pkexec: None, .. }
         ));
         let desktop = plan(
             &found,
-            "0.46.0",
+            &"0.46.0".into(),
             &PlanOptions {
                 can_prompt_for_privilege: true,
                 ..options()
@@ -688,7 +803,7 @@ mod tests {
             "/nix/store/x-dot-agent-deck/bin/dot-agent-deck",
             InstallMethod::Nix,
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(plan.action, PlanAction::NotifyOnly);
         assert!(plan.text().contains("Update your flake input"));
         assert!(plan.confirm_question().is_none());
@@ -702,7 +817,7 @@ mod tests {
                 reason: SourceReason::BuildTree,
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(plan.action, PlanAction::NotifyOnly);
         assert!(plan.text().contains("Built from source"));
     }
@@ -715,7 +830,7 @@ mod tests {
             Platform::LinuxAmd64,
             InstallMethod::DesktopDeb,
         );
-        let terminal = plan(&found, "0.46.0", &options());
+        let terminal = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(
             terminal.action,
             PlanAction::InstallDeb {
@@ -726,7 +841,7 @@ mod tests {
         found.tools.pkexec = Some(PathBuf::from("/usr/bin/pkexec"));
         let desktop = plan(
             &found,
-            "0.46.0",
+            &"0.46.0".into(),
             &PlanOptions {
                 can_prompt_for_privilege: true,
                 ..options()
@@ -753,7 +868,7 @@ mod tests {
                 team_id: Some("TEAM123".into()),
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert_eq!(
             plan.action,
             PlanAction::SwapApp {
@@ -777,7 +892,7 @@ mod tests {
                 team_id: Some("TEAM123".into()),
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         let url = release_asset_url("0.46.0", "dot-agent-deck-desktop-alpha-macos-arm64.dmg");
         assert_eq!(plan.action, PlanAction::ManualDownload { url: url.clone() });
         let text = plan.text();
@@ -801,7 +916,7 @@ mod tests {
                 team_id: None,
             },
         );
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert!(matches!(plan.action, PlanAction::ManualDownload { .. }));
         assert!(plan.text().contains("not signed"));
     }
@@ -821,7 +936,7 @@ mod tests {
                 },
             );
             assert_eq!(
-                plan(&found, "0.46.0", &options()).action,
+                plan(&found, &"0.46.0".into(), &options()).action,
                 PlanAction::ReplaceBinary {
                     target: PathBuf::from(exe),
                     asset: platform.cli_asset().into(),
@@ -840,7 +955,7 @@ mod tests {
             },
         );
         for latest in ["0.45.0", "v0.44.9", "garbage"] {
-            let plan = plan(&found, latest, &options());
+            let plan = plan(&found, &latest.into(), &options());
             assert_eq!(plan.action, PlanAction::UpToDate);
             assert_eq!(plan.lines().len(), 1);
         }
@@ -857,7 +972,7 @@ mod tests {
         );
         let plan = plan(
             &found,
-            "0.46.0",
+            &"0.46.0".into(),
             &PlanOptions {
                 provenance: ProvenanceCheck::Available {
                     gh: PathBuf::from("/usr/bin/gh"),
@@ -1051,7 +1166,7 @@ mod tests {
         let reason = "`gh auth status` failed: Timeout trying to log in";
         let plan = plan(
             &found,
-            "0.46.0",
+            &"0.46.0".into(),
             &PlanOptions {
                 provenance: ProvenanceCheck::Unavailable {
                     reason: reason.into(),
@@ -1086,7 +1201,7 @@ mod tests {
         brew_beta.version = "0.47.0-beta.1".into();
         brew_beta.tools.brew = Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"));
         assert_eq!(release_channel(&brew_beta), ReleaseChannel::Prerelease);
-        let plan_beta = plan(&brew_beta, "v0.47.0-beta.2", &options());
+        let plan_beta = plan(&brew_beta, &"v0.47.0-beta.2".into(), &options());
         assert_eq!(plan_beta.latest, "0.47.0-beta.2");
         assert!(
             matches!(
@@ -1111,7 +1226,7 @@ mod tests {
         downloaded.version = "0.47.0-beta.1".into();
         assert_eq!(release_channel(&downloaded), ReleaseChannel::Prerelease);
         assert!(matches!(
-            plan(&downloaded, "0.47.0-beta.2", &options()).action,
+            plan(&downloaded, &"0.47.0-beta.2".into(), &options()).action,
             PlanAction::ReplaceBinary { .. }
         ));
         // Even the beta formula pinned to a stable-looking version follows
@@ -1139,5 +1254,210 @@ mod tests {
             },
         );
         assert_eq!(release_channel(&brew_stable), ReleaseChannel::Stable);
+    }
+
+    // ── The beta formula is offered only what it can reach ──
+
+    const BREW: &str = "/home/linuxbrew/.linuxbrew/bin/brew";
+
+    /// A copy on the `dot-agent-deck-beta` formula at `version`, with `brew`
+    /// found or not.
+    fn brew_beta(version: &str, brew: bool) -> Installation {
+        let mut found = cli(
+            &format!(
+                "/home/linuxbrew/.linuxbrew/Cellar/dot-agent-deck-beta/{version}/bin/dot-agent-deck"
+            ),
+            InstallMethod::Homebrew {
+                formula: HomebrewFormula::Beta,
+                prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+            },
+        );
+        found.version = version.into();
+        found.tools.brew = brew.then(|| PathBuf::from(BREW));
+        found
+    }
+
+    fn releases(latest: &str, prerelease: Option<&str>) -> Releases {
+        Releases {
+            latest: latest.into(),
+            prerelease: prerelease.map(str::to_string),
+        }
+    }
+
+    fn commands(plan: &UpgradePlan) -> Vec<String> {
+        plan.items()
+            .into_iter()
+            .filter_map(|line| match line {
+                PlanLine::Command(command) => Some(command),
+                PlanLine::Text(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_022_a_beta_formula_with_only_a_newer_stable_is_told_to_switch_formulas() {
+        // No newer prerelease, whether the lookup listed one, listed an older
+        // one, or (on the stable channel) did not read the list at all.
+        for (version, releases) in [
+            ("0.47.0-beta.2", releases("0.47.0", Some("0.47.0-beta.2"))),
+            ("0.47.0-beta.2", releases("0.47.0", Some("0.46.0-beta.1"))),
+            ("0.47.0-beta.2", releases("0.47.0", None)),
+            ("0.46.0-beta.1", releases("0.47.0", Some("0.46.0-beta.1"))),
+        ] {
+            for brew in [true, false] {
+                let plan = plan(&brew_beta(version, brew), &releases, &options());
+                assert_eq!(plan.action, PlanAction::NotifyOnly, "{releases:?}");
+                assert!(!plan.is_actionable());
+                assert!(plan.confirm_question().is_none());
+                assert_eq!(plan.latest, "0.47.0");
+                assert_eq!(plan.stable_switch.as_deref(), Some("0.47.0"));
+                assert_eq!(
+                    plan.headline(),
+                    format!("dot-agent-deck: update available: v0.47.0 (current: v{version})")
+                );
+                let text = plan.text();
+                assert!(
+                    text.contains("`dot-agent-deck-beta` formula")
+                        && text.contains("does not carry stable releases"),
+                    "{text}"
+                );
+                assert!(!text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
+                assert_eq!(
+                    commands(&plan),
+                    vec![
+                        "brew uninstall dot-agent-deck-beta && brew install vfarcic/tap/dot-agent-deck"
+                            .to_string()
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_023_a_beta_formula_with_a_newer_prerelease_and_no_newer_stable_is_brew_upgraded() {
+        // The prerelease channel's lookup: the highest version is the
+        // prerelease, and a stable below it (or below the copy) is not
+        // mentioned.
+        for (version, releases) in [
+            (
+                "0.47.0-beta.1",
+                releases("0.47.0-beta.3", Some("0.47.0-beta.3")),
+            ),
+            ("0.47.0-beta.1", "v0.47.0-beta.3".into()),
+            (
+                "0.46.0-beta.1",
+                releases("0.47.0-beta.3", Some("0.47.0-beta.3")),
+            ),
+        ] {
+            let plan = plan(&brew_beta(version, true), &releases, &options());
+            assert_eq!(
+                plan.action,
+                PlanAction::BrewUpgrade {
+                    brew: PathBuf::from(BREW),
+                    formula: HomebrewFormula::Beta,
+                },
+                "{releases:?}"
+            );
+            assert_eq!(plan.latest, "0.47.0-beta.3");
+            assert_eq!(plan.stable_switch, None);
+            assert_eq!(
+                plan.confirm_question().as_deref(),
+                Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+            );
+            let text = plan.text();
+            assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
+            assert!(!text.contains("stable formula"), "{text}");
+            assert!(commands(&plan).is_empty(), "{text}");
+        }
+        // Nothing newer at all: up to date.
+        let plan = plan(
+            &brew_beta("0.47.0-beta.3", true),
+            &releases("0.47.0-beta.3", Some("0.47.0-beta.3")),
+            &options(),
+        );
+        assert_eq!(plan.action, PlanAction::UpToDate);
+        assert_eq!(plan.stable_switch, None);
+    }
+
+    #[test]
+    fn plan_024_a_beta_formula_with_a_newer_prerelease_and_a_higher_stable_gets_both() {
+        let plan = plan(
+            &brew_beta("0.47.0-beta.1", true),
+            &releases("0.47.0", Some("0.47.0-beta.3")),
+            &options(),
+        );
+        assert_eq!(
+            plan.action,
+            PlanAction::BrewUpgrade {
+                brew: PathBuf::from(BREW),
+                formula: HomebrewFormula::Beta,
+            }
+        );
+        assert_eq!(plan.latest, "0.47.0-beta.3");
+        assert_eq!(plan.stable_switch.as_deref(), Some("0.47.0"));
+        assert_eq!(
+            plan.confirm_question().as_deref(),
+            Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+        );
+        let text = plan.text();
+        assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
+        assert!(
+            text.contains("Stable release v0.47.0 is newer still")
+                && text.contains("does not carry stable releases"),
+            "{text}"
+        );
+        assert_eq!(
+            commands(&plan),
+            vec![BETA_TO_STABLE_COMMAND.to_string()],
+            "{text}"
+        );
+
+        // Without `brew`, the same: the upgrade command, then the switch.
+        let without_brew = super::plan(
+            &brew_beta("0.47.0-beta.1", false),
+            &releases("0.47.0", Some("0.47.0-beta.3")),
+            &options(),
+        );
+        assert_eq!(
+            commands(&without_brew),
+            vec![
+                "brew upgrade dot-agent-deck-beta".to_string(),
+                BETA_TO_STABLE_COMMAND.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_025_a_prerelease_copy_not_on_the_beta_formula_is_offered_the_highest_release() {
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let mut downloaded = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        downloaded.version = "0.47.0-beta.1".into();
+        let plan = plan(
+            &downloaded,
+            &releases("0.47.0", Some("0.47.0-beta.3")),
+            &options(),
+        );
+        assert_eq!(plan.latest, "0.47.0");
+        assert_eq!(plan.stable_switch, None);
+        assert!(matches!(plan.action, PlanAction::ReplaceBinary { .. }));
+        assert!(!plan.text().contains("stable formula"));
+    }
+
+    #[test]
+    fn plan_026_the_switch_command_uninstalls_the_beta_formula_before_installing_stable() {
+        // The formulas conflict (`docs/installation.md`), so uninstall first.
+        assert_eq!(
+            BETA_TO_STABLE_COMMAND,
+            format!(
+                "brew uninstall {} && brew install vfarcic/tap/{}",
+                HomebrewFormula::Beta.name(),
+                HomebrewFormula::Stable.name()
+            )
+        );
     }
 }

@@ -243,7 +243,7 @@ mod tests {
         };
         assert_eq!(found.copy, CopyKind::Desktop);
         assert!(matches!(
-            plan(&found, "0.46.0", &options()).action,
+            plan(&found, &"0.46.0".into(), &options()).action,
             PlanAction::SwapApp { .. }
         ));
     }
@@ -293,7 +293,7 @@ mod tests {
             panic!("the .deb should be found");
         };
         assert_eq!(found.method, InstallMethod::DesktopDeb);
-        let plan = plan(&found, "0.46.0", &options());
+        let plan = plan(&found, &"0.46.0".into(), &options());
         assert!(
             plan.text()
                 .contains("from release v0.46.0 and checks it. The command to install it"),
@@ -341,7 +341,7 @@ mod tests {
         };
         assert_eq!(found.copy, CopyKind::Cli);
         assert_eq!(
-            plan(&found, "0.46.0", &options()).action,
+            plan(&found, &"0.46.0".into(), &options()).action,
             PlanAction::BrewUpgrade {
                 brew: PathBuf::from("/opt/homebrew/bin/brew"),
                 formula: HomebrewFormula::Stable,
@@ -425,7 +425,7 @@ mod tests {
             panic!("~/.local/bin should be searched");
         };
         assert!(matches!(
-            plan(&found, "0.46.0", &options()).action,
+            plan(&found, &"0.46.0".into(), &options()).action,
             PlanAction::ReplaceBinary { .. }
         ));
     }

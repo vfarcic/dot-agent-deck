@@ -15,12 +15,12 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::plan::{self, PlanAction, PlanLine, UpgradePlan};
+use super::detect::Installation;
+use super::plan::{self, PlanAction, PlanLine, Releases, UpgradePlan};
 use super::verify::{self, Provenance, ProvenanceCheck};
 use super::{
     CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, UpgradeError, run_checked,
 };
-use crate::version::ReleaseChannel;
 
 /// The largest asset accepted (the desktop disk image is the largest, at tens
 /// of megabytes).
@@ -32,7 +32,8 @@ pub struct ReleaseSource {
     /// A GitHub `releases/latest` API endpoint: the stable channel's lookup.
     pub api_url: String,
     /// A GitHub `releases` list API endpoint: the prerelease channel's lookup
-    /// ([`ReleaseChannel`]).
+    /// ([`crate::version::ReleaseChannel`]), and where the newest prerelease
+    /// is read for a copy on the `dot-agent-deck-beta` formula.
     pub list_url: String,
     /// The base release assets hang off: `<base>/v<version>/<asset>`.
     pub download_base: String,
@@ -71,19 +72,32 @@ impl ReleaseSource {
         source
     }
 
-    /// The newest release's version on `channel`, without a leading `v`. A
-    /// client looks it up on the running copy's channel
-    /// ([`super::release_channel`]) and plans the other copy on the machine
-    /// against the same release, so the two follow one channel.
-    pub async fn latest_version(&self, channel: ReleaseChannel) -> Result<String, UpgradeError> {
-        let tag = crate::version::fetch_release_tag(channel, &self.api_url, &self.list_url)
-            .await
-            .map_err(UpgradeError::ReleaseLookup)?;
-        let version = tag.strip_prefix('v').unwrap_or(&tag);
-        semver::Version::parse(version).map_err(|_| {
-            UpgradeError::ReleaseLookup(format!("`{tag}` is not a release version"))
-        })?;
-        Ok(version.to_string())
+    /// The releases to plan this machine's copies against: the newest release
+    /// on the running copy's channel ([`super::release_channel`]), which the
+    /// other copy is planned against too so the two follow one channel, and
+    /// the newest prerelease whenever either copy is on the
+    /// `dot-agent-deck-beta` formula, which can only reach a prerelease
+    /// ([`Releases`]).
+    pub async fn releases_for(
+        &self,
+        running: &Installation,
+        other: Option<&Installation>,
+    ) -> Result<Releases, UpgradeError> {
+        let with_prerelease = std::iter::once(running)
+            .chain(other)
+            .any(plan::on_beta_formula);
+        let (latest, prerelease) = crate::version::fetch_release_tags(
+            super::release_channel(running),
+            &self.api_url,
+            &self.list_url,
+            with_prerelease,
+        )
+        .await
+        .map_err(UpgradeError::ReleaseLookup)?;
+        Ok(Releases {
+            latest: release_version(&latest)?,
+            prerelease: prerelease.as_deref().map(release_version).transpose()?,
+        })
     }
 
     pub fn asset_url(&self, version: &str, asset: &str) -> String {
@@ -92,6 +106,14 @@ impl ReleaseSource {
             self.download_base.trim_end_matches('/')
         )
     }
+}
+
+/// `tag` without its leading `v`, refused unless it is a version.
+fn release_version(tag: &str) -> Result<String, UpgradeError> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    semver::Version::parse(version)
+        .map_err(|_| UpgradeError::ReleaseLookup(format!("`{tag}` is not a release version")))?;
+    Ok(version.to_string())
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>, UpgradeError> {

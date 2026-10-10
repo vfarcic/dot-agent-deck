@@ -44,20 +44,21 @@ pub async fn run(
             return false;
         }
     };
-    let latest = match source
-        .latest_version(super::release_channel(&running))
-        .await
-    {
-        Ok(latest) => latest,
+    let other = match discover::other_copy(host, &running, None) {
+        OtherCopy::Found(other) => Some(*other),
+        OtherCopy::NotFound | OtherCopy::NotOffered => None,
+    };
+    let releases = match source.releases_for(&running, other.as_ref()).await {
+        Ok(releases) => releases,
         Err(e) => {
             let _ = writeln!(out, "{e}");
             return false;
         }
     };
-    let mut plans = vec![plan::plan(&running, &latest, options)];
-    if let OtherCopy::Found(other) = discover::other_copy(host, &running, None) {
-        plans.push(plan::plan(&other, &latest, options));
-    }
+    let plans: Vec<UpgradePlan> = std::iter::once(&running)
+        .chain(other.as_ref())
+        .map(|copy| plan::plan(copy, &releases, options))
+        .collect();
 
     for (i, plan) in plans.iter().enumerate() {
         if i > 0 {
@@ -182,7 +183,7 @@ mod tests {
         };
         plan::plan(
             &installation,
-            "0.46.0",
+            &"0.46.0".into(),
             &PlanOptions {
                 staging_root: PathBuf::from("/stage"),
                 can_prompt_for_privilege: false,

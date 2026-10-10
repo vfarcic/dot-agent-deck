@@ -45,7 +45,7 @@ pub use detect::{CopyKind, HomebrewFormula, InstallMethod, Installation, Platfor
 pub use discover::OtherCopy;
 pub use execute::{Outcome, ReleaseSource};
 pub use plan::PlanLine;
-pub use plan::{PlanAction, PlanOptions, UpgradePlan};
+pub use plan::{PlanAction, PlanOptions, Releases, UpgradePlan};
 pub use verify::{Provenance, ProvenanceCheck};
 
 pub use crate::version::ReleaseChannel;
@@ -374,7 +374,9 @@ pub fn reported_version(host: &dyn Host, binary: &Path) -> Option<String> {
 /// `dot-agent-deck-beta` Homebrew formula, which only ever receives
 /// prereleases, or for any copy whose own version is a prerelease; `Stable`
 /// otherwise. A client looks the newest release up on its running copy's
-/// channel and plans the other copy on the machine against that same release.
+/// channel and plans the other copy on the machine against that same release,
+/// except that a copy on the beta formula is offered only a prerelease
+/// ([`plan::Releases`]).
 pub fn release_channel(installation: &Installation) -> ReleaseChannel {
     match installation.method {
         InstallMethod::Homebrew {

@@ -71,17 +71,44 @@ async fn fetch_latest_version(channel: ReleaseChannel) -> Option<String> {
 
 /// The tag of the newest release on `channel`, or why it could not be read:
 /// `latest_url` (a GitHub `releases/latest` endpoint) answers for `Stable`,
-/// `list_url` (a GitHub `releases` list endpoint) for `Prerelease`. Shared by
-/// the startup nudge, which ignores the error, and `dot-agent-deck upgrade`
-/// (`crate::self_upgrade`), which reports it.
+/// `list_url` (a GitHub `releases` list endpoint) for `Prerelease`. The
+/// startup nudge uses it and ignores the error.
 pub(crate) async fn fetch_release_tag(
     channel: ReleaseChannel,
     latest_url: &str,
     list_url: &str,
 ) -> Result<String, String> {
+    fetch_release_tags(channel, latest_url, list_url, false)
+        .await
+        .map(|(latest, _)| latest)
+}
+
+/// The tag of the newest release on `channel`, as [`fetch_release_tag`]
+/// reads it, and the tag of the newest prerelease ([`newest_prerelease_tag`]).
+/// The prerelease channel reads the list anyway; the stable channel reads it
+/// as well only with `with_prerelease`, and otherwise answers `None` for it.
+/// `dot-agent-deck upgrade` and the desktop app (`crate::self_upgrade`) use it
+/// and report the error.
+pub(crate) async fn fetch_release_tags(
+    channel: ReleaseChannel,
+    latest_url: &str,
+    list_url: &str,
+    with_prerelease: bool,
+) -> Result<(String, Option<String>), String> {
     match channel {
-        ReleaseChannel::Stable => stable_tag(get_json(latest_url).await?),
-        ReleaseChannel::Prerelease => newest_tag(&get_json::<Vec<GitHubRelease>>(list_url).await?),
+        ReleaseChannel::Stable => {
+            let latest = stable_tag(get_json(latest_url).await?)?;
+            let prerelease = if with_prerelease {
+                newest_prerelease_tag(&get_json::<Vec<GitHubRelease>>(list_url).await?)
+            } else {
+                None
+            };
+            Ok((latest, prerelease))
+        }
+        ReleaseChannel::Prerelease => {
+            let releases = get_json::<Vec<GitHubRelease>>(list_url).await?;
+            Ok((newest_tag(&releases)?, newest_prerelease_tag(&releases)))
+        }
     }
 }
 
@@ -128,6 +155,20 @@ fn newest_tag(releases: &[GitHubRelease]) -> Result<String, String> {
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, tag)| tag.clone())
         .ok_or_else(|| "no published release names a version".to_string())
+}
+
+/// The tag with the highest version among `releases` that carries a SemVer
+/// prerelease suffix, drafts skipped: what the `dot-agent-deck-beta` Homebrew
+/// formula receives (`release.yml`'s "Detect channel" routes a version with a
+/// `-` in it there). `None` when no such release is listed.
+fn newest_prerelease_tag(releases: &[GitHubRelease]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .filter(|(version, _)| !version.pre.is_empty())
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
 }
 
 /// Returns the latest version string if a newer release exists, `None` otherwise.
@@ -264,6 +305,28 @@ mod tests {
         list.push(release("v0.47.0", false, false));
         assert_eq!(newest_tag(&list).unwrap(), "v0.47.0", "a newer stable wins");
         assert!(newest_tag(&[release("v0.49.0", true, false)]).is_err());
+    }
+
+    #[test]
+    fn test_newest_prerelease_tag_ignores_stables_and_drafts() {
+        assert_eq!(
+            newest_prerelease_tag(&release_list()).as_deref(),
+            Some("v0.47.0-beta.10")
+        );
+        let mut list = release_list();
+        list.push(release("v0.47.0", false, false));
+        assert_eq!(
+            newest_prerelease_tag(&list).as_deref(),
+            Some("v0.47.0-beta.10"),
+            "a newer stable is not a prerelease"
+        );
+        assert_eq!(
+            newest_prerelease_tag(&[
+                release("v0.46.0", false, false),
+                release("v0.48.0-beta.1", true, true)
+            ]),
+            None
+        );
     }
 
     #[test]

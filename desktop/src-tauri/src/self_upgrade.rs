@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use dot_agent_deck::self_upgrade::{
     CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
-    ProvenanceCheck, ReleaseSource, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError, UpgradePlan,
-    detect, discover, execute, plan, release_channel,
+    ProvenanceCheck, ReleaseSource, Releases, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError,
+    UpgradePlan, detect, discover, execute, plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
@@ -230,23 +230,46 @@ pub(crate) fn options(provenance: ProvenanceCheck) -> PlanOptions {
     }
 }
 
-/// Plan the running app and, when one is installed, the CLI beside it, each
-/// through its own install method, both against `latest`: the newest release
-/// on the app's channel ([`release_channel`]). `path` is the `PATH` the CLI is
-/// looked for on.
+/// The CLI installed beside the running app, when there is one the app
+/// offers to upgrade. `path` is the `PATH` it is looked for on.
+pub(crate) fn cli_beside(
+    host: &dyn Host,
+    running: &Installation,
+    path: Option<&OsStr>,
+) -> Option<Installation> {
+    match discover::other_copy(host, running, path) {
+        OtherCopy::Found(other) => Some(*other),
+        OtherCopy::NotFound | OtherCopy::NotOffered => None,
+    }
+}
+
+/// Plan the running app and `cli`, the CLI beside it when one is installed,
+/// each through its own install method, both against `releases`: the newest
+/// release on the app's channel, and the newest prerelease for a CLI on the
+/// beta formula ([`ReleaseSource::releases_for`]).
+pub(crate) fn plan_copies(
+    running: &Installation,
+    cli: Option<&Installation>,
+    releases: &Releases,
+    options: &PlanOptions,
+) -> Checked {
+    Checked {
+        app: plan::plan(running, releases, options),
+        cli: cli.map(|cli| plan::plan(cli, releases, options)),
+    }
+}
+
+/// [`plan_copies`] for the CLI [`cli_beside`] finds.
+#[cfg(test)]
 pub(crate) fn check_plans(
     host: &dyn Host,
     running: &Installation,
-    latest: &str,
+    releases: &Releases,
     options: &PlanOptions,
     path: Option<&OsStr>,
 ) -> Checked {
-    let app = plan::plan(running, latest, options);
-    let cli = match discover::other_copy(host, running, path) {
-        OtherCopy::Found(other) => Some(plan::plan(&other, latest, options)),
-        OtherCopy::NotFound | OtherCopy::NotOffered => None,
-    };
-    Checked { app, cli }
+    let cli = cli_beside(host, running, path);
+    plan_copies(running, cli.as_ref(), releases, options)
 }
 
 fn action_name(action: &PlanAction) -> &'static str {
@@ -367,25 +390,27 @@ pub(crate) async fn desktop_self_upgrade_check(
     crate::ensure_main_webview(&webview)?;
     let state = state.inner().clone();
     let detect_state = state.clone();
-    let (path, running) = tauri::async_runtime::spawn_blocking(move || {
+    let (path, running, cli) = tauri::async_runtime::spawn_blocking(move || {
         let path = detect_state.login_path();
         let host = SystemHost { path: path.clone() };
         let running = detect::running(&host, CopyKind::Desktop).map_err(|e| e.to_string())?;
-        Ok::<_, String>((path, running))
+        let cli = cli_beside(&host, &running, path.as_deref());
+        Ok::<_, String>((path, running, cli))
     })
     .await
     .map_err(|e| safe_message(e.to_string()))?
     .map_err(safe_message)?;
     // The CLI beside the app is planned against the same release, so both
-    // copies follow the app's channel.
-    let latest = ReleaseSource::from_build()
-        .latest_version(release_channel(&running))
+    // copies follow the app's channel; a CLI on the beta formula also gets
+    // the newest prerelease, the only kind its formula can reach.
+    let releases = ReleaseSource::from_build()
+        .releases_for(&running, cli.as_ref())
         .await
         .map_err(|e| safe_message(e.to_string()))?;
     let checked = tauri::async_runtime::spawn_blocking(move || {
-        let host = SystemHost { path: path.clone() };
+        let host = SystemHost { path };
         let options = options(ProvenanceCheck::detect(&host));
-        let checked = check_plans(&host, &running, &latest, &options, path.as_deref());
+        let checked = plan_copies(&running, cli.as_ref(), &releases, &options);
         state.store(checked.clone());
         checked
     })
@@ -659,7 +684,7 @@ mod tests {
         check_dto(&check_plans(
             host,
             &running,
-            LATEST,
+            &LATEST.into(),
             &test_options(),
             Some(&path),
         ))
@@ -758,7 +783,7 @@ mod tests {
         let dto = check_dto(&check_plans(
             &host,
             &running,
-            LATEST,
+            &LATEST.into(),
             &test_options(),
             Some(&path),
         ));
@@ -902,7 +927,7 @@ mod tests {
         let dto = check_dto(&check_plans(
             &host,
             &app,
-            LATEST,
+            &LATEST.into(),
             &test_options(),
             Some(&path),
         ));
@@ -1035,7 +1060,7 @@ mod tests {
                 .exe("/usr/bin/pkexec");
             let path = host.login_path();
             let app = running(&host, DEB_APP, Platform::LinuxAmd64, CURRENT);
-            check_plans(&host, &app, LATEST, &test_options(), Some(&path))
+            check_plans(&host, &app, &LATEST.into(), &test_options(), Some(&path))
         };
         state.store(notify_only.clone());
         assert_eq!(state.plan_for(SelfCopy::App).unwrap(), notify_only.app);
@@ -1157,7 +1182,7 @@ mod tests {
         let dto = check_dto(&check_plans(
             &host,
             &running,
-            LATEST,
+            &LATEST.into(),
             &logged_out,
             Some(&path),
         ));
@@ -1174,7 +1199,7 @@ mod tests {
         let dto = check_dto(&check_plans(
             &host,
             &running,
-            LATEST,
+            &LATEST.into(),
             &available,
             Some(&path),
         ));
@@ -1185,5 +1210,63 @@ mod tests {
                 reason: None
             }
         );
+    }
+
+    #[test]
+    fn self_upgrade_027_a_beta_formula_cli_is_offered_only_a_prerelease_and_told_to_switch() {
+        const SWITCH: &str =
+            "brew uninstall dot-agent-deck-beta && brew install vfarcic/tap/dot-agent-deck";
+        let keg = "/opt/homebrew/Cellar/dot-agent-deck-beta/0.47.0-beta.1/bin/dot-agent-deck";
+        let host = dmg_machine(true, Some("ABCDE12345"))
+            .on_path("/opt/homebrew/bin")
+            .exe("/opt/homebrew/bin/brew")
+            .link("/opt/homebrew/bin/dot-agent-deck", keg)
+            .deck(keg, "0.47.0-beta.1");
+        let path = host.login_path();
+        let app = running(&host, DMG_APP, Platform::MacosArm64, CURRENT);
+        let check = |releases: Releases| {
+            check_dto(&check_plans(
+                &host,
+                &app,
+                &releases,
+                &test_options(),
+                Some(&path),
+            ))
+        };
+
+        // Only a newer stable: the app is offered it, the CLI is told its
+        // formula cannot reach it and how to switch, with nothing to confirm.
+        let dto = check(Releases {
+            latest: "0.47.0".into(),
+            prerelease: Some("0.47.0-beta.1".into()),
+        });
+        assert_eq!(dto.app.action, "swap-app");
+        let cli = dto.cli.expect("the Homebrew CLI is found");
+        assert_eq!(cli.action, "notify-only");
+        assert!(!cli.actionable);
+        assert_eq!(cli.confirm_question, None);
+        assert_eq!(cli.latest, "0.47.0");
+        let text = texts(&cli.lines).join("\n");
+        assert!(text.contains("does not carry stable releases"), "{text}");
+        assert!(!text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
+        assert_eq!(commands(&cli.lines), vec![SWITCH.to_string()]);
+
+        // A newer prerelease and a higher stable: the prerelease is brew
+        // upgraded, and the stable switch is still mentioned.
+        let dto = check(Releases {
+            latest: "0.47.0".into(),
+            prerelease: Some("0.47.0-beta.3".into()),
+        });
+        let cli = dto.cli.expect("the Homebrew CLI is found");
+        assert_eq!(cli.action, "brew-upgrade");
+        assert!(cli.actionable);
+        assert_eq!(
+            cli.confirm_question.as_deref(),
+            Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+        );
+        let text = texts(&cli.lines).join("\n");
+        assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
+        assert!(text.contains("Stable release v0.47.0"), "{text}");
+        assert_eq!(commands(&cli.lines), vec![SWITCH.to_string()]);
     }
 }
