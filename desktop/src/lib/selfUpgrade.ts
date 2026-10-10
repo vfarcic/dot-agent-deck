@@ -64,11 +64,15 @@ export interface SelfUpgradePlan {
 
 /** `CheckDto`: `desktop_self_upgrade_check`'s answer. */
 export interface SelfUpgradeCheck {
+  /** Which check this is; ids grow with every check. Upgrade sends it, and the bridge runs exactly that check's plan. */
+  checkId: number;
   latest: string;
-  /** Whether any copy is behind the latest release — the notice shows only then. */
+  /** Whether a copy that can still be offered is behind the latest release. */
   updateAvailable: boolean;
-  /** The notice's text, the same words as the TUI's badge. */
+  /** The notice's text: the TUI badge's words, or, once the app itself was installed and nothing else is behind, the relaunch prompt. */
   notice: string | null;
+  /** The app's own copy, installed this session and waiting for a relaunch: its result. Shown in place of an offer, with Relaunch. */
+  installed: SelfUpgradeResult | null;
   app: SelfUpgradePlan;
   /** The CLI's own plan, when one is installed beside the app. */
   cli: SelfUpgradePlan | null;
@@ -89,8 +93,8 @@ export interface SelfUpgradeResult {
 export interface SelfUpgradeApi {
   /** Ask for the latest release and plan both copies. Rejects when no check could be made. */
   check(): Promise<SelfUpgradeCheck>;
-  /** Carry out the plan for `copy` that the last check returned. */
-  run(copy: SelfCopy): Promise<SelfUpgradeResult>;
+  /** Carry out the plan for `copy` that check `checkId` found: the check the dialog shows. */
+  run(copy: SelfCopy, checkId: number): Promise<SelfUpgradeResult>;
   /** Restart the app onto the bundle an upgrade put in place. */
   relaunch(): Promise<void>;
 }
@@ -112,9 +116,14 @@ export function tauriSelfUpgradeApi(): SelfUpgradeApi | undefined {
   if (!window.__TAURI_INTERNALS__) return undefined;
   return {
     check: () => invoke<SelfUpgradeCheck>("desktop_self_upgrade_check"),
-    run: (copy) => invoke<SelfUpgradeResult>("desktop_self_upgrade_run", { copy }),
+    run: (copy, checkId) => invoke<SelfUpgradeResult>("desktop_self_upgrade_run", { copy, checkId }),
     relaunch: () => invoke<void>("desktop_self_upgrade_relaunch"),
   };
+}
+
+/** `answer`, unless `current` is a newer check: an answer that arrives late never replaces a newer one. */
+export function newerCheck(current: SelfUpgradeCheck | undefined, answer: SelfUpgradeCheck): SelfUpgradeCheck {
+  return current && current.checkId > answer.checkId ? current : answer;
 }
 
 /** The plans the dialog shows, app first. */

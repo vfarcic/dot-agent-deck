@@ -26,8 +26,16 @@ import {
  * upgraded from here (Nix, a source build, an app folder you cannot write)
  * shows what to do instead, with any command copyable, and only Close.
  *
- * Relaunch is offered only once the app itself was replaced (the `.dmg` swap),
- * and the app restarts only when it is pressed.
+ * The dialog keeps the check it opened with, as the TUI's does: a check that
+ * finishes while it is open changes nothing on screen, and Upgrade runs the
+ * plan of the check shown (by its id), never a newer one the user did not
+ * read.
+ *
+ * Relaunch is offered only once the app itself was replaced (the `.dmg` swap,
+ * or the `.deb` installed behind the password prompt), and the app restarts
+ * only when it is pressed. Until it is, the app is not offered again: the
+ * bridge sends its result as `installed`, which the dialog shows in place of
+ * an offer, with Relaunch at the end.
  */
 export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboardText }: {
   check: SelfUpgradeCheck;
@@ -36,19 +44,21 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
   /** Where Copy writes; the system clipboard in the app. */
   copyText?: (text: string) => Promise<void>;
 }) {
-  const [done, setDone] = useState<SelfCopy[]>([]);
-  const [results, setResults] = useState<Partial<Record<SelfCopy, SelfUpgradeResult>>>({});
+  /* The check this dialog shows, for as long as it is open. */
+  const [shown] = useState(check);
+  const [done, setDone] = useState<SelfCopy[]>(shown.installed ? ["app"] : []);
+  const [results, setResults] = useState<Partial<Record<SelfCopy, SelfUpgradeResult>>>(shown.installed ? { app: shown.installed } : {});
   const [running, setRunning] = useState<SelfCopy>();
   const [relaunchError, setRelaunchError] = useState<string>();
 
-  const offer = running ? undefined : nextOffer(check, done);
+  const offer = running ? undefined : nextOffer(shown, done);
   const phase = running ? "running" : offer ? "confirm" : "done";
   const relaunch = Object.values(results).some((result) => result?.relaunch);
   const anyRun = Object.keys(results).length > 0;
 
   const upgrade = (plan: SelfUpgradePlan) => {
     setRunning(plan.copy);
-    api.run(plan.copy).then(
+    api.run(plan.copy, shown.checkId).then(
       (result) => setResults((current) => ({ ...current, [plan.copy]: result })),
       (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
     ).finally(() => {
@@ -86,8 +96,8 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
         }}
       >
         <div className="upgrade-icon"><CircleArrowUp size={20} /></div>
-        <h2 id="self-upgrade-title">Upgrade to v{displayText(check.latest, DISPLAY_LIMITS.name)}</h2>
-        {plansOf(check).map((plan) => (
+        <h2 id="self-upgrade-title">Upgrade to v{displayText(shown.latest, DISPLAY_LIMITS.name)}</h2>
+        {plansOf(shown).map((plan) => (
           <PlanSection key={plan.copy} plan={plan} result={results[plan.copy]} running={running === plan.copy} copyText={copyText} />
         ))}
         {phase === "confirm" && offer && (

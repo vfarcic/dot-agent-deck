@@ -310,6 +310,19 @@ impl Outcome {
         Some(PlanLine::Text(line))
     }
 
+    /// What the desktop app's notice says once its own copy was installed
+    /// with this outcome — the `.dmg` swap, or the `.deb` installed behind the
+    /// password prompt: the running app is still the old build until it is
+    /// relaunched. `None` for any other outcome.
+    pub fn app_relaunch_notice(&self) -> Option<String> {
+        match self {
+            Self::AppReplaced { version, .. } | Self::Installed { version, .. } => Some(format!(
+                "Agent Deck v{version} is installed. Relaunch to run it."
+            )),
+            _ => None,
+        }
+    }
+
     /// What to tell the user, as a terminal prints it ([`Self::items`]).
     pub fn lines(&self) -> Vec<String> {
         plan::render_lines(&self.items())

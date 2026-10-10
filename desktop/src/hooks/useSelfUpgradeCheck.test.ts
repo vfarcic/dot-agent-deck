@@ -5,9 +5,11 @@ import { FALLBACK_RECHECK_SECS, type SelfUpgradeApi, type SelfUpgradeCheck } fro
 import { useSelfUpgradeCheck } from "./useSelfUpgradeCheck";
 
 const CHECK: SelfUpgradeCheck = {
+  checkId: 1,
   latest: "0.47.0",
   updateAvailable: true,
   notice: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)",
+  installed: null,
   app: { copy: "app", label: "Agent Deck (desktop app)", headline: "Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)", current: "0.46.0", latest: "0.47.0", action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?", provenance: { checked: true, reason: null }, lines: [] },
   cli: null,
   recheckAfterSecs: 3600,
@@ -53,6 +55,23 @@ describe("useSelfUpgradeCheck", () => {
     const { result } = renderHook(() => useSelfUpgradeCheck(undefined));
     await settle();
     expect(result.current.check).toBeUndefined();
+  });
+
+  /** Scenario: Two checks are in flight — the periodic one and the one a closed dialog asked for — and the later one's answer arrives first: the earlier one's answer, arriving after it, does not replace it. */
+  it("self_upgrade_check_005 an older answer arriving later never replaces a newer one", async () => {
+    let resolveFirst: (answer: SelfUpgradeCheck) => void = () => undefined;
+    const answers = [
+      new Promise<SelfUpgradeCheck>((resolve) => { resolveFirst = resolve; }),
+      Promise.resolve({ ...CHECK, checkId: 2, latest: "0.48.0" }),
+    ];
+    const api = apiWith(() => answers.shift()!);
+    const { result } = renderHook(() => useSelfUpgradeCheck(api));
+    await act(async () => { result.current.recheck(); });
+    await settle();
+    expect(result.current.check?.checkId).toBe(2);
+    await act(async () => { resolveFirst({ ...CHECK, checkId: 1 }); });
+    expect(result.current.check?.checkId).toBe(2);
+    expect(result.current.check?.latest).toBe("0.48.0");
   });
 
   /** Scenario: Unmounting stops the periodic check. */

@@ -2116,7 +2116,7 @@ export function fixtureSelfUpgradeApi(search: string = window.location.search): 
   const cli = fixtureSelfPlan("cli", "dot-agent-deck", "brew-upgrade", [
     "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the formula's latest release.",
   ]);
-  const check: SelfUpgradeCheck = { latest, updateAvailable: true, notice: app.headline, app, cli, recheckAfterSecs: 6 * 60 * 60 };
+  const check: SelfUpgradeCheck = { checkId: 1, latest, updateAvailable: true, notice: app.headline, installed: null, app, cli, recheckAfterSecs: 6 * 60 * 60 };
   const results: Record<SelfCopy, SelfUpgradeResult> = {
     app: {
       copy: "app",

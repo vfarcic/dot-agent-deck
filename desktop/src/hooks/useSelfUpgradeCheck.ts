@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { FALLBACK_RECHECK_SECS, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
+import { FALLBACK_RECHECK_SECS, newerCheck, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 
 /**
  * Issue #1635 — ask whether a newer release exists when the app starts, and
@@ -8,8 +8,9 @@ import { FALLBACK_RECHECK_SECS, type SelfUpgradeApi, type SelfUpgradeCheck } fro
  * it runs.
  *
  * A check that could not be made — no network, GitHub refusing — leaves the
- * last answer in place and is tried again after the fallback interval. Nothing
- * is checked without an `api` (outside the app).
+ * last answer in place and is tried again after the fallback interval. An
+ * answer older than the one held (two checks in flight, the later finishing
+ * first) is dropped. Nothing is checked without an `api` (outside the app).
  */
 export function useSelfUpgradeCheck(api: SelfUpgradeApi | undefined): { check?: SelfUpgradeCheck; recheck: () => void } {
   const [check, setCheck] = useState<SelfUpgradeCheck>();
@@ -26,7 +27,7 @@ export function useSelfUpgradeCheck(api: SelfUpgradeApi | undefined): { check?: 
     api.check().then(
       (answer) => {
         if (!live.current) return;
-        setCheck(answer);
+        setCheck((current) => newerCheck(current, answer));
         schedule(answer.recheckAfterSecs);
       },
       () => schedule(FALLBACK_RECHECK_SECS),

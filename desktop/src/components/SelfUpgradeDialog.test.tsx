@@ -84,10 +84,11 @@ const CLI_SHOW_COMMAND: SelfUpgradePlan = {
   ],
 };
 
-function checkOf(app: SelfUpgradePlan, cli: SelfUpgradePlan | null = null): SelfUpgradeCheck {
-  return { latest: "0.47.0", updateAvailable: true, notice: app.headline, app, cli, recheckAfterSecs: 21600 };
+function checkOf(app: SelfUpgradePlan, cli: SelfUpgradePlan | null = null, checkId = 1): SelfUpgradeCheck {
+  return { checkId, latest: "0.47.0", updateAvailable: true, notice: app.headline, installed: null, app, cli, recheckAfterSecs: 21600 };
 }
 
+const INSTALL_DEB_PLACEHOLDER = "sudo apt install /stage/v0.47.0-1f2e/x.deb";
 const INSTALL_DEB = "echo '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /stage/v0.47.0-1f2e/x.deb' | sha256sum -c - && sudo apt install /stage/v0.47.0-1f2e/x.deb";
 
 /** A staged CLI install the bridge reported, with `command` as the crate built it. */
@@ -113,11 +114,25 @@ const SWAPPED: SelfUpgradeResult = {
   ],
 };
 
+/* The `.deb` installed behind the password prompt replaces the running app's
+   files, so the bridge offers Relaunch for it as for the `.dmg` swap. */
 const DEB_INSTALLED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
-  relaunch: false,
+  relaunch: true,
   lines: [{ text: "Installed v0.47.0.", command: null }],
+};
+
+/* The `.deb` downloaded and checked, with the command to install it: nothing
+   was installed over the running app, so no Relaunch. */
+const DEB_STAGED: SelfUpgradeResult = {
+  copy: "app",
+  ok: true,
+  relaunch: false,
+  lines: [
+    { text: "Downloaded and checked. Install it with:", command: null },
+    { text: INSTALL_DEB_PLACEHOLDER, command: INSTALL_DEB_PLACEHOLDER },
+  ],
 };
 
 const BREWED: SelfUpgradeResult = {
@@ -144,7 +159,7 @@ function controlledApi() {
 }
 
 describe("SelfUpgradeDialog", () => {
-  /** Scenario: The dialog shows the app's plan and the Homebrew CLI's own plan; Upgrade upgrades the app, and only then is the CLI offered with its own question; Close ends it with no Relaunch, as nothing replaced the app bundle. */
+  /** Scenario: The dialog shows the app's plan and the Homebrew CLI's own plan; Upgrade upgrades the app, and only then is the CLI offered with its own question; the end offers Relaunch, because the `.deb` install replaced the running app. */
   it("self_upgrade_dialog_001 upgrades the app, then offers the CLI under a separate confirm", async () => {
     const { api, finish } = controlledApi();
     const onClose = vi.fn();
@@ -156,7 +171,7 @@ describe("SelfUpgradeDialog", () => {
     expect(api.run).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByTestId("self-upgrade-start"));
-    expect(api.run).toHaveBeenCalledWith("app");
+    expect(api.run).toHaveBeenCalledWith("app", 1);
     expect(screen.getByTestId("self-upgrade-running-app")).toBeInTheDocument();
     await finish(DEB_INSTALLED);
     expect(screen.getByTestId("self-upgrade-result-app")).toHaveTextContent("Installed v0.47.0.");
@@ -165,11 +180,11 @@ describe("SelfUpgradeDialog", () => {
     expect(screen.getByTestId("self-upgrade-question")).toHaveTextContent("Upgrade dot-agent-deck to v0.47.0?");
     expect(api.run).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByTestId("self-upgrade-start"));
-    expect(api.run).toHaveBeenLastCalledWith("cli");
+    expect(api.run).toHaveBeenLastCalledWith("cli", 1);
     await finish(BREWED);
 
     expect(screen.getByTestId("self-upgrade-result-cli")).toHaveTextContent("it now reports v0.47.0");
-    expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
+    expect(screen.getByTestId("self-upgrade-relaunch")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
     expect(onClose).toHaveBeenCalled();
     expect(api.relaunch).not.toHaveBeenCalled();
@@ -192,12 +207,12 @@ describe("SelfUpgradeDialog", () => {
     expect(api.relaunch).toHaveBeenCalledTimes(1);
   });
 
-  /** Scenario: A `.deb` install behind the password prompt succeeds; the dialog ends with Close alone, since only a replaced app bundle is relaunched. */
-  it("self_upgrade_dialog_003 offers no Relaunch when the app was not swapped", async () => {
+  /** Scenario: The `.deb` is downloaded and checked but not installed (no password prompt here), so the result shows the command to install it and the dialog ends with Close alone: nothing replaced the running app. */
+  it("self_upgrade_dialog_003 offers no Relaunch when the app was not replaced", async () => {
     const { api, finish } = controlledApi();
     render(<SelfUpgradeDialog check={checkOf(APP_DEB)} api={api} onClose={vi.fn()} />);
     fireEvent.click(screen.getByTestId("self-upgrade-start"));
-    await finish(DEB_INSTALLED);
+    await finish(DEB_STAGED);
     expect(screen.getByTestId("self-upgrade-done")).toBeInTheDocument();
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
   });
@@ -329,5 +344,60 @@ describe("SelfUpgradeDialog", () => {
     expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "cli");
     expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
     expect(api.run).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: A background check finds a newer release while the dialog is open: the dialog keeps showing the plan it opened with, and Upgrade runs that plan, by its check id, never the newer one the user has not read. */
+  it("self_upgrade_dialog_012 keeps the plan it opened with and runs exactly that one", () => {
+    const { api } = controlledApi();
+    const opened = checkOf(APP_SWAP, CLI_BREW, 4);
+    const newer: SelfUpgradeCheck = {
+      ...checkOf({ ...APP_SWAP, latest: "0.48.0", headline: "Agent Deck (desktop app): update available: v0.48.0 (current: v0.46.0)", confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.48.0?" }, CLI_BREW, 5),
+      latest: "0.48.0",
+    };
+    const { rerender } = render(<SelfUpgradeDialog check={opened} api={api} onClose={vi.fn()} />);
+    rerender(<SelfUpgradeDialog check={newer} api={api} onClose={vi.fn()} />);
+
+    expect(screen.getByRole("heading", { level: 2 })).toHaveTextContent("Upgrade to v0.47.0");
+    expect(screen.getByTestId("self-upgrade-question")).toHaveTextContent("Upgrade Agent Deck (desktop app) to v0.47.0?");
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    expect(api.run).toHaveBeenCalledWith("app", 4);
+  });
+
+  /** Scenario: The app itself was upgraded earlier and has not relaunched: reopening the dialog shows that result in place of an offer, offers the CLI that is still behind, and after Cancel ends with Relaunch; with no CLI it opens straight at Relaunch. */
+  it("self_upgrade_dialog_013 shows an installed app's result and keeps Relaunch reachable", () => {
+    const { api } = controlledApi();
+    const installed = (cli: SelfUpgradePlan | null): SelfUpgradeCheck => ({
+      ...checkOf({ ...APP_SWAP, actionable: false, confirmQuestion: null }, cli, 7),
+      installed: SWAPPED,
+    });
+    const { unmount } = render(<SelfUpgradeDialog check={installed(CLI_BREW)} api={api} onClose={vi.fn()} />);
+    expect(screen.getByTestId("self-upgrade-result-app")).toHaveTextContent("Replaced /Applications/Agent Deck.app with v0.47.0.");
+    expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "cli");
+    fireEvent.click(screen.getByTestId("self-upgrade-cancel"));
+    fireEvent.click(screen.getByTestId("self-upgrade-relaunch"));
+    expect(api.relaunch).toHaveBeenCalledTimes(1);
+    expect(api.run).not.toHaveBeenCalled();
+    unmount();
+
+    render(<SelfUpgradeDialog check={installed(null)} api={api} onClose={vi.fn()} />);
+    expect(screen.queryByTestId("self-upgrade-start")).not.toBeInTheDocument();
+    expect(screen.getByTestId("self-upgrade-relaunch")).toHaveFocus();
+  });
+
+  /** Scenario: Homebrew's tap does not carry the release yet: the CLI's result is a failure in the crate's words, and no Relaunch is offered. */
+  it("self_upgrade_dialog_014 shows a brew upgrade that did not reach the release as a failure", async () => {
+    const { api, finish } = controlledApi();
+    render(<SelfUpgradeDialog check={checkOf(APP_NOT_WRITABLE, CLI_BREW)} api={api} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await finish({
+      copy: "cli",
+      ok: false,
+      relaunch: false,
+      lines: [{ text: "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later.", command: null }],
+    });
+    const result = screen.getByTestId("self-upgrade-result-cli");
+    expect(result).toHaveAttribute("data-ok", "false");
+    expect(result).toHaveTextContent("Homebrew does not offer v0.47.0 yet");
+    expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
   });
 });

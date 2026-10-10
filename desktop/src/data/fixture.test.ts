@@ -355,6 +355,8 @@ describe("fixtureSelfUpgradeApi", () => {
   it("plays a .dmg app and a Homebrew CLI one release behind, the app's headline as the notice", async () => {
     const check = await fixtureSelfUpgradeApi("?selfupgrade=1")!.check();
     expect(check.updateAvailable).toBe(true);
+    expect(check.installed).toBeNull();
+    expect(check.checkId).toBeGreaterThan(0);
     expect(check.notice).toBe("Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)");
     expect(check.app).toMatchObject({ action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?" });
     expect(check.cli).toMatchObject({ action: "brew-upgrade", actionable: true, confirmQuestion: "Upgrade dot-agent-deck to v0.47.0?" });

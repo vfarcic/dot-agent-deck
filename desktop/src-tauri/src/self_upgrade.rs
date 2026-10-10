@@ -11,8 +11,12 @@
 //!   login-shell `PATH` (captured once, the way the daemon captures it), since
 //!   an app started from the Dock or a desktop launcher has a `PATH` that often
 //!   lacks Homebrew and `~/.local/bin`;
-//! - the plans the user was shown, kept so an Upgrade carries out exactly what
-//!   the dialog said rather than whatever a second look would find;
+//! - the plans the user was shown, kept by check id so an Upgrade carries out
+//!   exactly the plan the dialog said, never one a later check found, and an
+//!   older check never replacing a newer one;
+//! - the app's own copy once an upgrade installed it, so it is not offered
+//!   again from the same old build and Relaunch stays reachable until the app
+//!   restarts;
 //! - one upgrade at a time, run on a blocking thread because it waits on
 //!   subprocesses (`brew`, `pkexec`, `hdiutil`) for as long as they take;
 //! - the relaunch, offered only once the app bundle was actually replaced;
@@ -22,8 +26,9 @@
 //! plans with `can_prompt_for_privilege`; when that prompt is dismissed or
 //! fails, the result names the exact command instead.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dot_agent_deck::self_upgrade::{
@@ -92,13 +97,23 @@ pub(crate) struct PlanDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CheckDto {
+    /// Which check this is. Ids grow with every check; the dialog sends the
+    /// one it shows with Upgrade, and exactly that check's plan is run.
+    pub check_id: u64,
     /// The latest release, without a leading `v`.
     pub latest: String,
-    /// Whether any copy is behind it. The notice shows only then.
+    /// Whether any copy is behind it and can still be offered. The notice
+    /// shows then, and while a relaunch is pending.
     pub update_available: bool,
     /// The notice's text: the headline of the first copy that is behind — the
-    /// app's, else the CLI's. The same words as the TUI's badge.
+    /// app's, else the CLI's, the same words as the TUI's badge — or, once
+    /// the app's own copy was installed and nothing else is behind, the
+    /// core's relaunch line.
     pub notice: Option<String>,
+    /// The app's own copy was installed this session and the app still runs
+    /// the old build: its result, which the dialog shows in place of an
+    /// offer, with Relaunch. `None` otherwise.
+    pub installed: Option<RunDto>,
     pub app: PlanDto,
     /// The CLI's own plan, when one is installed beside the app.
     pub cli: Option<PlanDto>,
@@ -117,7 +132,7 @@ pub(crate) struct RunDto {
     pub relaunch: bool,
 }
 
-/// The plans the user was last shown.
+/// The plans one check found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Checked {
     pub app: UpgradePlan,
@@ -143,10 +158,30 @@ pub(crate) struct SelfUpgradeState {
 struct Inner {
     /// The login shell's `PATH`; `Some(None)` once a capture failed.
     login_path: OnceLock<Option<OsString>>,
-    checked: Mutex<Option<Checked>>,
+    /// The last check id handed out.
+    last_check_id: AtomicU64,
+    /// The newest checks, oldest first, at most [`KEPT_CHECKS`]: what a
+    /// dialog showing one of them runs.
+    checks: Mutex<VecDeque<(u64, Checked)>>,
     running: AtomicBool,
-    relaunch_ready: AtomicBool,
+    /// The app's own copy, once an upgrade installed it.
+    installed: Mutex<Option<Installed>>,
 }
+
+/// The app's own copy, installed this session and waiting for a relaunch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Installed {
+    /// The upgrade's result, as the dialog showed it.
+    pub result: RunDto,
+    /// The notice's text while nothing else is behind
+    /// ([`Outcome::app_relaunch_notice`]).
+    pub notice: String,
+}
+
+/// How many checks are kept for a dialog that is still showing one. A check
+/// runs at start, every [`UPDATE_RECHECK_INTERVAL`] and when a dialog closes,
+/// so a dialog would have to stay open for days to outlive this many.
+pub(crate) const KEPT_CHECKS: usize = 8;
 
 /// The running upgrade's slot; released on drop, including on a panic or an
 /// early return, so a failed run never leaves Upgrade refusing forever.
@@ -172,6 +207,11 @@ pub(crate) const ALREADY_RUNNING: &str = "An upgrade is already running.";
 /// What it reads when it asks to relaunch before the app was replaced.
 pub(crate) const NOTHING_TO_RELAUNCH: &str =
     "Agent Deck was not replaced, so there is nothing new to relaunch into.";
+/// What it reads when the check its dialog shows is no longer kept.
+pub(crate) const PLAN_GONE: &str = "The upgrade plan this dialog shows is no longer current, so nothing was changed. Close the dialog and open it again to see the current plan.";
+/// What it reads when it asks to upgrade the app again before relaunching.
+pub(crate) const APP_ALREADY_INSTALLED: &str =
+    "Agent Deck was already upgraded. Relaunch it to run the new version.";
 
 impl SelfUpgradeState {
     /// The login shell's `PATH`, captured on first use. Blocking.
@@ -184,18 +224,41 @@ impl SelfUpgradeState {
             .clone()
     }
 
-    fn store(&self, checked: Checked) {
-        *lock(&self.inner.checked) = Some(checked);
+    /// The id of a check about to start: higher than every one before it.
+    pub(crate) fn next_check_id(&self) -> u64 {
+        self.inner.last_check_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// The plan for `copy` the user was last shown, when it can be carried
-    /// out.
-    pub(crate) fn plan_for(&self, copy: SelfCopy) -> Result<UpgradePlan, String> {
-        let checked = lock(&self.inner.checked);
-        let plan = checked
-            .as_ref()
-            .and_then(|checked| checked.plan(copy))
-            .ok_or_else(|| NOT_CHECKED.to_string())?;
+    /// Keep check `id`'s plans, unless a newer check is already kept: a
+    /// check that started earlier but finished later is dropped. Returns the
+    /// newest check kept, which is what the webview is answered with.
+    pub(crate) fn store(&self, id: u64, checked: Checked) -> (u64, Checked) {
+        let mut checks = lock(&self.inner.checks);
+        if checks.back().is_none_or(|(newest, _)| *newest < id) {
+            checks.push_back((id, checked));
+            while checks.len() > KEPT_CHECKS {
+                checks.pop_front();
+            }
+        }
+        checks.back().cloned().expect("a check was just kept")
+    }
+
+    /// The plan for `copy` that check `check_id` found — the check the dialog
+    /// asking to carry it out shows — when it can be carried out.
+    pub(crate) fn plan_for(&self, copy: SelfCopy, check_id: u64) -> Result<UpgradePlan, String> {
+        if copy == SelfCopy::App && self.installed().is_some() {
+            return Err(APP_ALREADY_INSTALLED.to_string());
+        }
+        let checks = lock(&self.inner.checks);
+        if checks.is_empty() {
+            return Err(NOT_CHECKED.to_string());
+        }
+        let checked = checks
+            .iter()
+            .find(|(id, _)| *id == check_id)
+            .map(|(_, checked)| checked)
+            .ok_or_else(|| PLAN_GONE.to_string())?;
+        let plan = checked.plan(copy).ok_or_else(|| NOT_CHECKED.to_string())?;
         if !plan.is_actionable() {
             return Err(safe_message(plan.text()));
         }
@@ -210,12 +273,27 @@ impl SelfUpgradeState {
         Ok(Running(self.inner.clone()))
     }
 
-    fn mark_relaunch_ready(&self) {
-        self.inner.relaunch_ready.store(true, Ordering::SeqCst);
+    /// Remember that the app's own copy was installed with `outcome`, shown
+    /// as `result`. An outcome that installed nothing over the running app,
+    /// or another copy's, is not remembered.
+    pub(crate) fn mark_installed(&self, copy: SelfCopy, outcome: &Outcome, result: &RunDto) {
+        if copy != SelfCopy::App {
+            return;
+        }
+        if let Some(notice) = outcome.app_relaunch_notice() {
+            *lock(&self.inner.installed) = Some(Installed {
+                result: result.clone(),
+                notice: safe_message(notice),
+            });
+        }
+    }
+
+    pub(crate) fn installed(&self) -> Option<Installed> {
+        lock(&self.inner.installed).clone()
     }
 
     pub(crate) fn relaunch_ready(&self) -> bool {
-        self.inner.relaunch_ready.load(Ordering::SeqCst)
+        self.installed().is_some()
     }
 }
 
@@ -336,28 +414,51 @@ pub(crate) fn plan_dto(copy: SelfCopy, plan: &UpgradePlan) -> PlanDto {
     }
 }
 
-pub(crate) fn check_dto(checked: &Checked) -> CheckDto {
+/// Check `check_id`'s plans for the webview. Once the app's own copy is
+/// `installed`, it is no longer offered — the running build is still the old
+/// one, so a check would offer it again — and the notice names the next copy
+/// that is behind, or, when none is, says to relaunch.
+pub(crate) fn check_dto(
+    check_id: u64,
+    checked: &Checked,
+    installed: Option<&Installed>,
+) -> CheckDto {
     let behind = |plan: &UpgradePlan| plan.action != PlanAction::UpToDate;
-    let notice = std::iter::once(&checked.app)
-        .chain(checked.cli.as_ref())
-        .find(|plan| behind(plan))
-        .map(|plan| safe_message(plan.headline()));
+    let offered = |copy: SelfCopy| !(copy == SelfCopy::App && installed.is_some());
+    let headline = [
+        (SelfCopy::App, Some(&checked.app)),
+        (SelfCopy::Cli, checked.cli.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(copy, plan)| Some((copy, plan?)))
+    .find(|(copy, plan)| offered(*copy) && behind(plan))
+    .map(|(_, plan)| safe_message(plan.headline()));
+    let mut app = plan_dto(SelfCopy::App, &checked.app);
+    if installed.is_some() {
+        app.actionable = false;
+        app.confirm_question = None;
+    }
     CheckDto {
+        check_id,
         latest: safe_message(&checked.app.latest),
-        update_available: notice.is_some(),
-        notice,
-        app: plan_dto(SelfCopy::App, &checked.app),
+        update_available: headline.is_some(),
+        notice: headline.or_else(|| installed.map(|installed| installed.notice.clone())),
+        installed: installed.map(|installed| installed.result.clone()),
+        app,
         cli: checked.cli.as_ref().map(|cli| plan_dto(SelfCopy::Cli, cli)),
         recheck_after_secs: UPDATE_RECHECK_INTERVAL.as_secs(),
     }
 }
 
+/// What an upgrade of `copy` did, for the webview. Relaunch is offered when
+/// the app's own copy was installed: the `.dmg` swap, or the `.deb` installed
+/// behind the password prompt, which replaces the running app's files.
 pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
     RunDto {
         copy,
         ok: outcome.upgraded(),
         lines: line_dtos(outcome.items()),
-        relaunch: matches!(outcome, Outcome::AppReplaced { .. }),
+        relaunch: copy == SelfCopy::App && outcome.app_relaunch_notice().is_some(),
     }
 }
 
@@ -388,6 +489,10 @@ pub(crate) async fn desktop_self_upgrade_check(
 ) -> Result<CheckDto, String> {
     crate::ensure_main_webview(&webview)?;
     let state = state.inner().clone();
+    // Taken before anything is looked at, so a check that started later is
+    // the newer one even when it finishes first.
+    let check_id = state.next_check_id();
+    let installed_state = state.clone();
     let detect_state = state.clone();
     let (path, running, cli) = tauri::async_runtime::spawn_blocking(move || {
         let path = detect_state.login_path();
@@ -406,29 +511,36 @@ pub(crate) async fn desktop_self_upgrade_check(
         .releases_for(&running, cli.as_ref())
         .await
         .map_err(|e| safe_message(e.to_string()))?;
-    let checked = tauri::async_runtime::spawn_blocking(move || {
+    let (check_id, checked) = tauri::async_runtime::spawn_blocking(move || {
         let host = SystemHost { path };
         let options = options(ProvenanceCheck::detect(&host));
-        let checked = plan_copies(&running, cli.as_ref(), &releases, &options);
-        state.store(checked.clone());
-        checked
+        state.store(
+            check_id,
+            plan_copies(&running, cli.as_ref(), &releases, &options),
+        )
     })
     .await
     .map_err(|e| safe_message(e.to_string()))?;
-    Ok(check_dto(&checked))
+    Ok(check_dto(
+        check_id,
+        &checked,
+        installed_state.installed().as_ref(),
+    ))
 }
 
-/// Carry out the plan for `copy` the user was shown, after they pressed
-/// Upgrade. A failure is an `ok: false` result in the core's words, not an
-/// error: it is what the dialog shows.
+/// Carry out the plan for `copy` that check `check_id` found — the check the
+/// dialog shows, so what runs is what the user read, whatever a later check
+/// found — after they pressed Upgrade. A failure is an `ok: false` result in
+/// the core's words, not an error: it is what the dialog shows.
 #[tauri::command]
 pub(crate) async fn desktop_self_upgrade_run(
     webview: Webview,
     state: State<'_, SelfUpgradeState>,
     copy: SelfCopy,
+    check_id: u64,
 ) -> Result<RunDto, String> {
     crate::ensure_main_webview(&webview)?;
-    let plan = state.plan_for(copy)?;
+    let plan = state.plan_for(copy, check_id)?;
     let _running = state.begin()?;
     let state = state.inner().clone();
     let handle = tokio::runtime::Handle::current();
@@ -449,10 +561,9 @@ pub(crate) async fn desktop_self_upgrade_run(
     .map_err(|e| safe_message(e.to_string()))?;
     Ok(match result {
         Ok(outcome) => {
-            if matches!(outcome, Outcome::AppReplaced { .. }) {
-                state.mark_relaunch_ready();
-            }
-            outcome_dto(copy, &outcome)
+            let dto = outcome_dto(copy, &outcome);
+            state.mark_installed(copy, &outcome, &dto);
+            dto
         }
         Err(error) => failure_dto(copy, &error),
     })
@@ -685,13 +796,51 @@ mod tests {
     fn check(host: &Fake, exe: &str, platform: Platform) -> CheckDto {
         let path = host.login_path();
         let running = running(host, exe, platform, CURRENT);
-        check_dto(&check_plans(
+        first_check(&check_plans(
             host,
             &running,
             &LATEST.into(),
             &test_options(),
             Some(&path),
         ))
+    }
+
+    /// The webview's answer for `checked`, as the first check, with nothing
+    /// installed yet.
+    fn first_check(checked: &Checked) -> CheckDto {
+        check_dto(1, checked, None)
+    }
+
+    /// What a check finds on a Linux machine whose app came from the `.deb`
+    /// (with `pkexec`) and whose CLI sits in a writable `~/.local/bin`, both
+    /// at [`CURRENT`], against `latest`. Built from the install methods
+    /// directly, so no machine is inspected.
+    fn checked_against(latest: &str) -> Checked {
+        let install = |copy, exe: &str, method| Installation {
+            copy,
+            executable: PathBuf::from(exe),
+            version: CURRENT.into(),
+            platform: Some(Platform::LinuxAmd64),
+            method,
+            tools: dot_agent_deck::self_upgrade::detect::Tools {
+                pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+                ..Default::default()
+            },
+        };
+        let app = install(
+            CopyKind::Desktop,
+            DEB_APP,
+            dot_agent_deck::self_upgrade::InstallMethod::DesktopDeb,
+        );
+        let cli_exe = "/home/u/.local/bin/dot-agent-deck";
+        let cli = install(
+            CopyKind::Cli,
+            cli_exe,
+            dot_agent_deck::self_upgrade::InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(cli_exe),
+            },
+        );
+        plan_copies(&app, Some(&cli), &latest.into(), &test_options())
     }
 
     fn texts(lines: &[LineDto]) -> Vec<String> {
@@ -788,7 +937,7 @@ mod tests {
         let host = deb_machine();
         let path = host.login_path();
         let running = running(&host, DEB_APP, Platform::LinuxAmd64, LATEST);
-        let dto = check_dto(&check_plans(
+        let dto = first_check(&check_plans(
             &host,
             &running,
             &LATEST.into(),
@@ -946,7 +1095,7 @@ mod tests {
             .writable("/home/u/.local/bin");
         let path = host.login_path();
         let app = running(&host, DEB_APP, Platform::LinuxAmd64, LATEST);
-        let dto = check_dto(&check_plans(
+        let dto = first_check(&check_plans(
             &host,
             &app,
             &LATEST.into(),
@@ -968,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn self_upgrade_016_only_an_app_replacement_offers_relaunch() {
+    fn self_upgrade_016_only_installing_the_app_itself_offers_relaunch() {
         let replaced = outcome_dto(
             SelfCopy::App,
             &Outcome::AppReplaced {
@@ -985,10 +1134,20 @@ mod tests {
             "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it."
         );
 
+        // The `.deb` installed behind the password prompt replaces the
+        // running app's files too; the CLI's own install is not the app's.
+        let deb = Outcome::Installed {
+            version: LATEST.into(),
+            provenance: provenance(),
+        };
+        assert!(outcome_dto(SelfCopy::App, &deb).relaunch);
+        assert!(!outcome_dto(SelfCopy::Cli, &deb).relaunch);
+
         let others = [
-            Outcome::Installed {
-                version: LATEST.into(),
-                provenance: provenance(),
+            Outcome::BrewNotUpgraded {
+                formula: "dot-agent-deck",
+                reported: Some(CURRENT.into()),
+                offered: LATEST.into(),
             },
             Outcome::Replaced {
                 path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
@@ -1008,7 +1167,7 @@ mod tests {
         ];
         for outcome in &others {
             let dto = outcome_dto(SelfCopy::App, outcome);
-            assert!(dto.ok);
+            assert_eq!(dto.ok, outcome.upgraded());
             assert!(!dto.relaunch, "{outcome:?}");
         }
         let staged = outcome_dto(SelfCopy::App, &others[3]);
@@ -1094,7 +1253,7 @@ mod tests {
     #[test]
     fn self_upgrade_020_upgrade_carries_out_only_a_checked_actionable_plan() {
         let state = SelfUpgradeState::default();
-        assert_eq!(state.plan_for(SelfCopy::App).unwrap_err(), NOT_CHECKED);
+        assert_eq!(state.plan_for(SelfCopy::App, 1).unwrap_err(), NOT_CHECKED);
 
         let notify_only = {
             let host = deb_machine()
@@ -1109,9 +1268,10 @@ mod tests {
             let app = running(&host, DEB_APP, Platform::LinuxAmd64, CURRENT);
             check_plans(&host, &app, &LATEST.into(), &test_options(), Some(&path))
         };
-        state.store(notify_only.clone());
-        assert_eq!(state.plan_for(SelfCopy::App).unwrap(), notify_only.app);
-        let refused = state.plan_for(SelfCopy::Cli).unwrap_err();
+        let id = state.next_check_id();
+        state.store(id, notify_only.clone());
+        assert_eq!(state.plan_for(SelfCopy::App, id).unwrap(), notify_only.app);
+        let refused = state.plan_for(SelfCopy::Cli, id).unwrap_err();
         assert!(refused.contains("Installed with Nix"), "{refused}");
     }
 
@@ -1124,8 +1284,120 @@ mod tests {
         assert!(state.begin().is_ok());
 
         assert!(!state.relaunch_ready());
-        state.mark_relaunch_ready();
+        let replaced = Outcome::AppReplaced {
+            app: PathBuf::from("/Applications/Agent Deck.app"),
+            version: LATEST.into(),
+            provenance: provenance(),
+            mount_left: None,
+        };
+        // Another copy's outcome is not the app's.
+        state.mark_installed(
+            SelfCopy::Cli,
+            &replaced,
+            &outcome_dto(SelfCopy::Cli, &replaced),
+        );
+        assert!(!state.relaunch_ready());
+        state.mark_installed(
+            SelfCopy::App,
+            &replaced,
+            &outcome_dto(SelfCopy::App, &replaced),
+        );
         assert!(state.relaunch_ready());
+    }
+
+    #[test]
+    fn self_upgrade_029_an_older_check_never_replaces_a_newer_one() {
+        let state = SelfUpgradeState::default();
+        let older = state.next_check_id();
+        let newer = state.next_check_id();
+        assert!(newer > older);
+        // The newer check finishes first; the older one, finishing later, is
+        // dropped, and its caller is answered with the newer one.
+        let (kept, checked) = state.store(newer, checked_against("0.48.0"));
+        assert_eq!((kept, checked.app.latest.as_str()), (newer, "0.48.0"));
+        let (kept, checked) = state.store(older, checked_against(LATEST));
+        assert_eq!((kept, checked.app.latest.as_str()), (newer, "0.48.0"));
+        let answer = check_dto(kept, &checked, None);
+        assert_eq!(answer.check_id, newer);
+        assert_eq!(answer.latest, "0.48.0");
+        assert!(state.plan_for(SelfCopy::App, older).is_err());
+    }
+
+    #[test]
+    fn self_upgrade_030_upgrade_runs_the_plan_the_dialog_shows() {
+        let state = SelfUpgradeState::default();
+        let shown = state.next_check_id();
+        state.store(shown, checked_against(LATEST));
+        // A background check finds a newer release while the dialog is open.
+        let later = state.next_check_id();
+        state.store(later, checked_against("0.48.0"));
+        assert_eq!(state.plan_for(SelfCopy::App, shown).unwrap().latest, LATEST);
+        assert_eq!(state.plan_for(SelfCopy::Cli, shown).unwrap().latest, LATEST);
+        assert_eq!(
+            state.plan_for(SelfCopy::App, later).unwrap().latest,
+            "0.48.0"
+        );
+
+        // A dialog left open across more checks than are kept is refused,
+        // never handed another plan.
+        for _ in 0..KEPT_CHECKS {
+            let id = state.next_check_id();
+            state.store(id, checked_against("0.49.0"));
+        }
+        assert_eq!(state.plan_for(SelfCopy::App, shown).unwrap_err(), PLAN_GONE);
+        assert_eq!(state.plan_for(SelfCopy::App, 999).unwrap_err(), PLAN_GONE);
+        let json = serde_json::to_value(check_dto(shown, &checked_against(LATEST), None)).unwrap();
+        assert_eq!(json["checkId"], shown);
+    }
+
+    #[test]
+    fn self_upgrade_031_an_installed_app_is_not_offered_again_and_the_notice_says_relaunch() {
+        let state = SelfUpgradeState::default();
+        let id = state.next_check_id();
+        let checked = state.store(id, checked_against(LATEST)).1;
+        // The `.deb` installed behind the password prompt replaces the running
+        // app's files, as the `.dmg` swap does.
+        let installed = Outcome::Installed {
+            version: LATEST.into(),
+            provenance: provenance(),
+        };
+        let result = outcome_dto(SelfCopy::App, &installed);
+        assert!(result.ok && result.relaunch);
+        state.mark_installed(SelfCopy::App, &installed, &result);
+
+        // The next check still sees the old build running, so it plans the
+        // app again; the app is not offered, the CLI behind it is.
+        let answer = check_dto(id, &checked, state.installed().as_ref());
+        assert!(!answer.app.actionable);
+        assert_eq!(answer.app.confirm_question, None);
+        assert_eq!(answer.installed.as_ref(), Some(&result));
+        assert!(answer.update_available);
+        assert_eq!(
+            answer.notice.as_deref(),
+            Some("dot-agent-deck: update available: v0.47.0 (current: v0.46.0)")
+        );
+        assert_eq!(
+            state.plan_for(SelfCopy::App, id).unwrap_err(),
+            APP_ALREADY_INSTALLED
+        );
+        assert!(state.plan_for(SelfCopy::Cli, id).is_ok());
+
+        // With nothing else behind, the notice is the relaunch prompt.
+        let mut app_only = checked.clone();
+        app_only.cli = None;
+        let answer = check_dto(id, &app_only, state.installed().as_ref());
+        assert!(!answer.update_available);
+        assert_eq!(
+            answer.notice.as_deref(),
+            Some("Agent Deck v0.47.0 is installed. Relaunch to run it.")
+        );
+        assert!(state.relaunch_ready());
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(json["installed"]["relaunch"], true);
+
+        // The CLI's own install is not the app's.
+        let cli_installed = outcome_dto(SelfCopy::Cli, &installed);
+        assert!(cli_installed.ok && !cli_installed.relaunch);
     }
 
     #[test]
@@ -1226,7 +1498,7 @@ mod tests {
             },
             ..test_options()
         };
-        let dto = check_dto(&check_plans(
+        let dto = first_check(&check_plans(
             &host,
             &running,
             &LATEST.into(),
@@ -1243,7 +1515,7 @@ mod tests {
             },
             ..test_options()
         };
-        let dto = check_dto(&check_plans(
+        let dto = first_check(&check_plans(
             &host,
             &running,
             &LATEST.into(),
@@ -1274,7 +1546,7 @@ mod tests {
         let path = host.login_path();
         let app = running(&host, DMG_APP, Platform::MacosArm64, CURRENT);
         let check = |releases: Releases| {
-            check_dto(&check_plans(
+            first_check(&check_plans(
                 &host,
                 &app,
                 &releases,
