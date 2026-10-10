@@ -5314,6 +5314,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a download that answers no version at all (core unit tests).
 - **Platform coverage:** mac+linux.
 
+##### upgrade/cli-upgrade/005 — The other copy is looked for inside the test's own system folder, and found there.
+- **Layer:** L2 (lane 1, real subprocess, fake release server, the `e2e`-only `DOT_AGENT_DECK_TEST_SYSTEM_ROOT` seam and a sandbox `dpkg-query`).
+- **Agent:** none.
+- **Asserts:** exit 0, and a second section headed `Agent Deck (desktop app): update available: …` saying it was installed from the `.deb`, for a bundled CLI the test put under the re-rooted `/usr/bin`.
+- **Does not assert:** the macOS `/Applications` lookup (core unit tests), upgrading the desktop copy.
+- **Platform coverage:** linux amd64 (prints `SKIP:` elsewhere: the `.deb` ships for Linux amd64 only).
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor

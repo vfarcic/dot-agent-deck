@@ -17,6 +17,10 @@ Everything lives in one root-crate module, `src/self_upgrade/`, which both clien
 
 Every subprocess and filesystem question the detection and planning steps ask goes through the `Host` trait, so a unit test fakes the machine; `SystemHost` is the real one. The staged downloads are real files, so the execute tests use temporary directories.
 
+Every subprocess has a time limit (`Host::run_within`). A probe — `--version`, `dpkg-query`, `brew --prefix`, `gh auth status`, `codesign -dv`, `hdiutil detach` — gets `PROBE_TIMEOUT` (15 s). A check that asks a service — `gh attestation verify`, and the new app's `codesign --verify --deep` and `spctl --assess`, which can consult Apple's notarization service — gets `VERIFY_TIMEOUT` (60 s). A command that carries the upgrade out — `brew upgrade`, the `pkexec` installs, which wait for the user at the password prompt, `hdiutil attach` and `ditto` — gets `INSTALL_TIMEOUT` (15 minutes): long enough for a slow `brew` download or a user who steps away from the prompt, and still an end, so a stuck command cannot leave a dialog on Upgrading for good. A command past its limit is killed and the error names it. What `pkexec` started runs as root and cannot be signalled by the user, so for it the error says it may still be running.
+
+The L2 tests (`tests/e2e_self_upgrade.rs`) isolate the binary from the machine they run on. Each runs with a `PATH` holding only a stand-in `dpkg-query`, and with `DOT_AGENT_DECK_TEST_SYSTEM_ROOT` (`e2e` feature only) re-rooting the system folders `discover.rs` looks in for the other copy (`/Applications`, the `.deb`'s `/usr/bin/dot-agent-deck`, the well-known CLI folders) into the test's own folder. A `gh`, a desktop app or a `.deb` installed on the host therefore cannot change what a test sees.
+
 ## Detection
 
 `detect::detect` decides the install method from the canonical executable path and a few facts about it, in this order, first match wins:

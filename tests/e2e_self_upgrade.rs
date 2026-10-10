@@ -13,6 +13,13 @@
 //! `DOT_AGENT_DECK_TEST_RELEASE_DOWNLOAD_BASE`). The "release binary" it
 //! downloads is a small script that answers `--version`, and nothing else
 //! ([`release_script`]).
+//!
+//! Every test runs isolated from the machine it runs on ([`sandbox_env`]): a
+//! `PATH` holding only a stand-in `dpkg-query` that reports nothing installed,
+//! and the system folders where the other copy is looked for
+//! (`/Applications`, `/usr/bin`) re-rooted into the test's own folder through
+//! the `e2e`-only `DOT_AGENT_DECK_TEST_SYSTEM_ROOT`. So a desktop app, a
+//! `gh` or a `.deb` installed on the host cannot change what a test sees.
 
 mod common;
 #[path = "support/fake_releases.rs"]
@@ -64,14 +71,45 @@ fn writable_install(dir: &Path) -> PathBuf {
     exe
 }
 
+/// The environment that keeps a test from seeing the host's installs: `PATH`
+/// is one folder under `dir` holding only a `dpkg-query` that reports nothing
+/// installed, and the system folders the other copy is looked for in are
+/// re-rooted under `dir`, where the test puts nothing.
+fn sandbox_env(dir: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("sandbox-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let dpkg_query = bin.join("dpkg-query");
+    std::fs::write(
+        &dpkg_query,
+        "#!/bin/sh\necho 'dpkg-query: no packages found matching' \"$@\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&dpkg_query, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let system = dir.join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    vec![
+        ("PATH".into(), bin.to_str().expect("UTF-8 path").into()),
+        (
+            "DOT_AGENT_DECK_TEST_SYSTEM_ROOT".into(),
+            system.to_str().expect("UTF-8 path").into(),
+        ),
+    ]
+}
+
 fn wait_for_file(path: &Path, want: &[u8], timeout: Duration) -> bool {
     common::wait_until(timeout, || {
         std::fs::read(path).is_ok_and(|bytes| bytes == want)
     })
 }
 
-fn deck(server: &FakeReleases, exe: &Path, extra: &[(&str, &str)]) -> TuiDeck {
+/// The TUI as a copy at `exe`, against `server`, isolated by [`sandbox_env`]
+/// under `sandbox`.
+fn deck(server: &FakeReleases, exe: &Path, sandbox: &Path, extra: &[(&str, &str)]) -> TuiDeck {
     let mut builder = TuiDeck::builder().with_pty_size(200, 50);
+    for (key, value) in sandbox_env(sandbox) {
+        builder = builder.with_env(key, value);
+    }
     for (key, value) in server.env(exe, OLD_VERSION) {
         builder = builder.with_env(key, value);
     }
@@ -81,13 +119,12 @@ fn deck(server: &FakeReleases, exe: &Path, extra: &[(&str, &str)]) -> TuiDeck {
     builder.launch_with_fixture("minimal")
 }
 
-/// Run `dot-agent-deck upgrade <args>` against `server`, as a copy at `exe`.
+/// Run `dot-agent-deck upgrade <args>` against `server`, as a copy at `exe`,
+/// with `home` as its HOME and isolated by [`sandbox_env`] under it.
 fn run_upgrade(server: &FakeReleases, exe: &Path, home: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(bin());
     command.arg("upgrade").args(args).env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+    command.envs(sandbox_env(home));
     command
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -111,7 +148,7 @@ fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
     let exe = writable_install(dir.path());
     let old = std::fs::read(&exe).unwrap();
 
-    let deck = deck(&server, &exe, &[]);
+    let deck = deck(&server, &exe, dir.path(), &[]);
     deck.wait_for_string(&format!(
         "update available: v{version} (current: v{OLD_VERSION})"
     ));
@@ -153,8 +190,9 @@ fn tui_upgrade_002_nix_copy_is_notify_only() {
     let (asset, manifest) = release(true);
     let server = FakeReleases::start(version, asset, manifest);
     let exe = PathBuf::from("/nix/store/0000000000000000-dot-agent-deck-0.0.1/bin/dot-agent-deck");
+    let dir = common::harness_tempdir().expect("tempdir");
 
-    let deck = deck(&server, &exe, &[]);
+    let deck = deck(&server, &exe, dir.path(), &[]);
     deck.wait_for_string(&format!("update available: v{version}"));
     deck.send_keys(b"u");
     deck.wait_for_string("Installed with Nix");
@@ -183,6 +221,7 @@ fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
     let deck = deck(
         &server,
         &exe,
+        dir.path(),
         &[("DOT_AGENT_DECK_TEST_UPDATE_RECHECK_SECS", "1")],
     );
     deck.wait_for_string("No active agents");
@@ -232,8 +271,14 @@ fn cli_upgrade_001_check_prints_the_plan_and_changes_nothing() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("Build provenance will NOT be checked"),
-        "{stdout}"
+        stdout.contains(
+            "Build provenance will NOT be checked: the GitHub CLI (`gh`) is not installed."
+        ),
+        "the sandbox PATH holds no gh, whatever the host has\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Agent Deck (desktop app)"),
+        "no desktop app is found outside the sandbox\n{stdout}"
     );
     assert_eq!(std::fs::read(&exe).unwrap(), old, "--check changes nothing");
 }
@@ -317,5 +362,64 @@ fn cli_upgrade_004_a_download_reporting_the_wrong_version_leaves_the_old_binary(
         std::fs::read(&exe).unwrap(),
         old,
         "the old binary stays byte for byte"
+    );
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --check` on Linux amd64 with a desktop `.deb` "installed" inside the test's own re-rooted system folder: a bundled CLI at `<root>/usr/bin/dot-agent-deck` that answers `--version`, and a sandbox `dpkg-query` that reports the package installed and owning it. The plan shows a second section for the desktop app, found there and nowhere else.
+#[spec("upgrade/cli-upgrade/005")]
+#[test]
+fn cli_upgrade_005_the_other_copy_is_looked_for_inside_the_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    if fake_releases::platform() != Some(dot_agent_deck::self_upgrade::Platform::LinuxAmd64) {
+        eprintln!("SKIP: the desktop .deb ships for Linux amd64 only");
+        return;
+    }
+    let version = RELEASE;
+    let (asset, manifest) = release(true);
+    let server = FakeReleases::start(version, asset, manifest);
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+
+    // `sandbox_env` writes its `dpkg-query`; this one replaces it after.
+    let env = sandbox_env(dir.path());
+    let bundled = dir.path().join("system/usr/bin/dot-agent-deck");
+    std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+    std::fs::write(&bundled, release_script(OLD_VERSION)).unwrap();
+    std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dpkg_query = dir.path().join("sandbox-bin/dpkg-query");
+    std::fs::write(
+        &dpkg_query,
+        "#!/bin/sh\ncase \"$1\" in\n  -W) printf 'ii ' ;;\n  -S) echo \"agent-deck: $2\" ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&dpkg_query, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut command = Command::new(bin());
+    command
+        .args(["upgrade", "--check"])
+        .env_clear()
+        .envs(env)
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join(".config"))
+        .env("DOT_AGENT_DECK_STATE_DIR", dir.path().join("state"));
+    for (key, value) in server.env(&exe, OLD_VERSION) {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run dot-agent-deck upgrade");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Agent Deck (desktop app): update available: v{version} (current: v{OLD_VERSION})"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Installed from the Agent Deck `.deb`"),
+        "{stdout}"
     );
 }

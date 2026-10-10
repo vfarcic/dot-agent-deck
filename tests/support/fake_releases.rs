@@ -36,6 +36,11 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The platform this test runs on, when releases ship assets for it.
+pub(crate) fn platform() -> Option<Platform> {
+    Platform::current()
+}
+
 /// This platform's CLI release asset, the one file besides `checksums.txt`
 /// the server offers for download.
 pub(crate) fn cli_asset() -> &'static str {

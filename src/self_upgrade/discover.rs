@@ -33,6 +33,23 @@ const WELL_KNOWN_CLI_DIRS: &[&str] = &[
     "/home/linuxbrew/.linuxbrew/bin",
 ];
 
+/// `path`, an absolute system location this module looks in for the other
+/// copy (`/Applications`, the `.deb`'s `/usr/bin/dot-agent-deck`, the
+/// well-known CLI folders). Under the `e2e` feature only,
+/// `DOT_AGENT_DECK_TEST_SYSTEM_ROOT` re-roots it under a folder the test owns,
+/// so an L2 test finds only the copies it put there and never one installed
+/// on the machine running it. Gated on the feature for the reason
+/// `effective_current_exe` in `src/platform/paths.rs` gives.
+fn system_path(path: &str) -> PathBuf {
+    #[cfg(feature = "e2e")]
+    if let Some(root) =
+        std::env::var_os("DOT_AGENT_DECK_TEST_SYSTEM_ROOT").filter(|root| !root.is_empty())
+    {
+        return Path::new(&root).join(path.trim_start_matches('/'));
+    }
+    PathBuf::from(path)
+}
+
 /// Find the copy that is not `running`. `path` is the `PATH` to search for a
 /// CLI (the desktop app passes its login shell's); `None` searches the
 /// host's own.
@@ -52,7 +69,7 @@ pub fn find_desktop(host: &dyn Host, platform: Option<Platform>) -> OtherCopy {
         return OtherCopy::NotOffered;
     }
     let candidates: Vec<PathBuf> = if platform.is_macos() {
-        let mut apps = vec![Path::new("/Applications").join(DESKTOP_APP_BUNDLE)];
+        let mut apps = vec![system_path("/Applications").join(DESKTOP_APP_BUNDLE)];
         if let Some(home) = host.home() {
             apps.push(home.join("Applications").join(DESKTOP_APP_BUNDLE));
         }
@@ -60,7 +77,7 @@ pub fn find_desktop(host: &dyn Host, platform: Option<Platform>) -> OtherCopy {
             .map(|app| app.join("Contents/MacOS").join(CLI_BINARY))
             .collect()
     } else if deb_installed(host) {
-        vec![PathBuf::from(DEB_BUNDLED_CLI)]
+        vec![system_path(DEB_BUNDLED_CLI)]
     } else {
         Vec::new()
     };
@@ -108,7 +125,7 @@ pub fn find_cli(host: &dyn Host, running: &Installation, path: Option<&OsStr>) -
             .iter()
             .filter_map(|dir| match dir.strip_prefix("~/") {
                 Some(rest) => home.as_ref().map(|home| home.join(rest)),
-                None => Some(PathBuf::from(dir)),
+                None => Some(system_path(dir)),
             }),
     );
     let running_app = app_bundle_of(&running.executable);

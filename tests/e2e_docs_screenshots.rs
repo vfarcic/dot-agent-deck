@@ -933,11 +933,18 @@ fn docs_screenshot_self_upgrade() {
         asset,
         format!("{sha}  {}\n", cli_asset()),
     );
+    // The other copy is looked for only inside the scene's folder, where
+    // there is none, so a desktop app installed on the machine generating the
+    // screenshot does not add a section to it.
+    let system_root = install.path().join("system");
     let deck = launch_with(|mut builder| {
         for (key, value) in server.env(&exe, SELF_UPGRADE_RUNNING) {
             builder = builder.with_env(key, value);
         }
-        builder
+        builder.with_env(
+            "DOT_AGENT_DECK_TEST_SYSTEM_ROOT",
+            system_root.to_str().expect("UTF-8 path"),
+        )
     });
     deck.wait_for_string("No active agents");
     deck.wait_for_string("u to upgrade");
