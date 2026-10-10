@@ -100,7 +100,9 @@ pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod schedule_cli;
+// Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;
+pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
 pub mod submit_echo;

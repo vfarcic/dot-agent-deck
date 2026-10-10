@@ -269,6 +269,17 @@ enum Commands {
         #[arg(long, conflicts_with = "topic")]
         all: bool,
     },
+    /// Check for a newer release and upgrade this machine's dot-agent-deck
+    /// and Agent Deck desktop app, each through the way it was installed.
+    /// Prints what it would do and asks before each upgrade (issue #1635).
+    Upgrade {
+        /// Only report what is installed and what an upgrade would do.
+        #[arg(long)]
+        check: bool,
+        /// Upgrade without asking for confirmation.
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+    },
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -1628,6 +1639,12 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some(Commands::Upgrade { check, yes }) => {
+            dot_agent_deck::self_upgrade::cli::main(dot_agent_deck::self_upgrade::cli::Args {
+                check,
+                yes,
+            })
         }
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {

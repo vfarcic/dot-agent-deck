@@ -7,11 +7,11 @@ struct GitHubRelease {
     tag_name: String,
 }
 
-fn current_version() -> semver::Version {
+pub(crate) fn current_version() -> semver::Version {
     semver::Version::parse(env!("DAD_VERSION")).expect("DAD_VERSION is valid semver")
 }
 
-fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
+pub(crate) fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
     let stripped = latest_tag
         .strip_prefix('v')
         .or_else(|| latest_tag.strip_prefix('V'))
@@ -25,23 +25,34 @@ fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> 
 }
 
 async fn fetch_latest_version() -> Option<String> {
+    fetch_latest_tag(repo_identity::RELEASES_API_URL).await.ok()
+}
+
+/// The `tag_name` of the release `api_url` answers with (a GitHub
+/// `releases/latest` endpoint), or why it could not be read. Shared by the
+/// startup nudge, which ignores the error, and `dot-agent-deck upgrade`
+/// (`crate::self_upgrade`), which reports it.
+pub(crate) async fn fetch_latest_tag(api_url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get(repo_identity::RELEASES_API_URL)
+        .get(api_url)
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),
         )
         .send()
         .await
-        .ok()?;
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("{api_url} answered {}", resp.status()));
+    }
 
-    let release: GitHubRelease = resp.json().await.ok()?;
-    Some(release.tag_name)
+    let release: GitHubRelease = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(release.tag_name)
 }
 
 /// Returns the latest version string if a newer release exists, `None` otherwise.
