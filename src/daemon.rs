@@ -1178,8 +1178,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     };
 
     // PRD #1401: unconditional — every agent on a branch with a pull request
-    // gets a badge, and this is the only place that answer comes from. Idle
-    // (no `git`, no `gh`) while no live session works on a non-default branch.
+    // gets a badge, and this is the only place that answer comes from. It runs
+    // `gh` only for a live session on a non-default branch of a GitHub
+    // repository; the `git` probes that find each session's branch still run
+    // for every live session with a working directory, once an interval and
+    // sooner after a turn ends.
     let pull_request_handle = {
         let registry = pty_registry.clone();
         let monitor_state = state.clone();
@@ -2096,6 +2099,9 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::PULL_REQUEST_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::PULL_REQUEST_REVISION_METADATA_KEY);
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,

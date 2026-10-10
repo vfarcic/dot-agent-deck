@@ -34,9 +34,23 @@
 //! [`PULL_REQUEST_METADATA_KEY`], both under one `AppState` write lock. That
 //! orders the daemon's state against its broadcast, not a client's `ListAgents`
 //! reply against its event stream: a reply built before a report can reach a
-//! client after the report did. Clients apply the event in
-//! [`crate::state::AppState::apply_event`] (the TUI and the desktop's fold both
-//! run that), and hydration copies the snapshot field.
+//! client after the report did. So every change also gets a revision
+//! ([`next_revision`]), carried by the event under
+//! [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`] and by the snapshot's
+//! [`crate::state::SessionSnapshot::pull_request_revision`]. Clients apply the
+//! event in [`crate::state::AppState::apply_event`] and the snapshot in
+//! hydration (the TUI and the desktop's fold both run those), and each keeps
+//! whichever value has the higher revision; with no revision on either, as
+//! from a daemon that sends none, the one applied last wins, as before.
+//!
+//! A revision is the daemon's wall clock in microseconds, raised past the
+//! previous one when the clock has not moved on, so it increases within one
+//! daemon, and across a restart unless the clock stepped backwards. A session
+//! the daemon has reported no change for carries revision `0`. So a client
+//! that keeps a card across a daemon being replaced, holding a revision from
+//! the old one, refuses the new daemon's replies about that card until the new
+//! daemon reports a change for it: always while the new daemon has reported
+//! none (its replies carry `0`), and after one too if the clock stepped back.
 //!
 //! An older client decodes the event type as `Unknown`. That is not a no-op
 //! there: the event is still journalled on the card and still runs the
@@ -50,13 +64,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::agent_pty::AgentPtyRegistry;
-use crate::event::{AgentEvent, BroadcastMsg, EventType, PULL_REQUEST_METADATA_KEY};
+use crate::event::{
+    AgentEvent, BroadcastMsg, EventType, PULL_REQUEST_METADATA_KEY,
+    PULL_REQUEST_REVISION_METADATA_KEY,
+};
 use crate::git_env::git_at;
 use crate::state::{SessionState, SharedState};
 use crate::untrusted_text::escape_control_and_bidi;
@@ -347,6 +365,10 @@ pub(crate) fn report_event(session: &SessionState) -> AgentEvent {
     {
         metadata.insert(PULL_REQUEST_METADATA_KEY.to_string(), json);
     }
+    metadata.insert(
+        PULL_REQUEST_REVISION_METADATA_KEY.to_string(),
+        session.pull_request_revision.to_string(),
+    );
     AgentEvent {
         session_id: session.session_id.clone(),
         // `None`, like the shell-activity monitor's events: this is the
@@ -366,6 +388,26 @@ pub(crate) fn report_event(session: &SessionState) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+    }
+}
+
+/// The revision for a pull request change the daemon is about to report —
+/// see the module docs. Never `0`, which a session that has had no change
+/// reports.
+pub(crate) fn next_revision() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        });
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
     }
 }
 
@@ -505,13 +547,22 @@ pub async fn run_pull_request_monitor(
     let mut probes: JobPool<PathBuf, Option<PrKey>> = JobPool::new(permits.clone());
     let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, String>> =
         JobPool::new(permits);
-    let tick = interval.min(Duration::from_secs(5));
+    // One timer for the monitor's life: a sleep rebuilt on every pass would
+    // start over at each broadcast message, so steady unrelated traffic could
+    // keep it from ever firing. A tick missed while a pass runs is delayed,
+    // not burst.
+    let mut ticker = tokio::time::interval(interval.min(Duration::from_secs(5)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cwds: HashMap<PathBuf, CwdEntry> = HashMap::new();
     let mut keys: HashMap<PrKey, KeyEntry> = HashMap::new();
     let mut kicked_sessions: HashSet<String> = HashSet::new();
+    // The key each session's current value was resolved under (`None`: no
+    // key), so a session that moved to another branch drops the old branch's
+    // PR before the new branch has an answer.
+    let mut shown_keys: HashMap<String, Option<PrKey>> = HashMap::new();
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(tick) => {}
+            _ = ticker.tick() => {}
             msg = events.recv() => match msg {
                 Ok(BroadcastMsg::Event(event)) => {
                     if is_refresh_trigger(&event.event_type) {
@@ -647,20 +698,32 @@ pub async fn run_pull_request_monitor(
             lookups.spawn(key.clone(), async move { query_gh(cwd, job_key).await });
         }
 
-        // What each session should show now. A session whose directory or key
-        // has no answer yet keeps what it has.
-        let want: HashMap<String, Option<PullRequestInfo>> = sessions
-            .iter()
-            .filter_map(|(session_id, cwd)| {
-                let entry = cwds.get(cwd.as_ref()?)?;
-                entry.resolved_at?;
-                let value = match &entry.key {
+        // What each session should show now. A session whose directory has no
+        // answer yet keeps what it has, and so does one whose key has none yet
+        // while that key is the one its value came from — a failed re-read
+        // keeps the last answer. A session whose key changed drops the old
+        // key's PR at once and shows the new key's when that resolves.
+        let live_sessions: HashSet<&String> = sessions.iter().map(|(id, _)| id).collect();
+        shown_keys.retain(|id, _| live_sessions.contains(id));
+        let mut want: HashMap<String, Option<PullRequestInfo>> = HashMap::new();
+        for (session_id, cwd) in &sessions {
+            let Some(entry) = cwd.as_ref().and_then(|cwd| cwds.get(cwd)) else {
+                continue;
+            };
+            if entry.resolved_at.is_none() {
+                continue;
+            }
+            let value = match &entry.key {
+                None => None,
+                Some(key) => match keys.get(key).and_then(|k| k.value.clone()) {
+                    Some(value) => value,
+                    None if shown_keys.get(session_id) == Some(&entry.key) => continue,
                     None => None,
-                    Some(key) => keys.get(key)?.value.clone()?,
-                };
-                Some((session_id.clone(), value))
-            })
-            .collect();
+                },
+            };
+            shown_keys.insert(session_id.clone(), entry.key.clone());
+            want.insert(session_id.clone(), value);
+        }
         let needs_write = {
             let state = state.read().await;
             want.iter().any(|(id, value)| {
@@ -1341,6 +1404,7 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pull_request: None,
+            pull_request_revision: 0,
         }
     }
 

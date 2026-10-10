@@ -222,6 +222,7 @@ fn pane_004_card_title_row() {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -274,6 +275,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -420,6 +422,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             blocked: None,
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());
@@ -759,6 +762,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -955,6 +959,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1023,6 +1028,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1284,6 +1290,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -2174,6 +2181,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2380,6 +2388,7 @@ fn filled_session() -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -3145,6 +3154,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3494,6 +3504,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
         pull_request: None,
+        pull_request_revision: 0,
     }
 }
 

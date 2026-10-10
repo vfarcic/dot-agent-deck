@@ -9880,6 +9880,7 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 pull_request: None,
+                pull_request_revision: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -9920,6 +9921,7 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 pull_request: None,
+                pull_request_revision: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -10002,6 +10004,7 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pull_request: None,
+            pull_request_revision: 0,
         };
         let snap = session.live_snapshot();
         assert_eq!(

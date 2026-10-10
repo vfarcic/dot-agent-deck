@@ -21,6 +21,13 @@
 //! user can copy it ([`open_pull_request`]).
 
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long [`open_pull_request`] watches a launched browser or opener for a
+/// failing exit before reporting how the launch went. A browser that is still
+/// running then — one that stays in the foreground — counts as launched, and
+/// is reaped off the caller's thread.
+pub const LAUNCH_GRACE: Duration = Duration::from_millis(500);
 
 /// The `https://github.com/<owner>/<repo>/pull/<number>` form of `raw`, rebuilt
 /// from its validated parts, or `None` when `raw` is anything else.
@@ -117,8 +124,11 @@ fn is_interpreter(word: &str) -> bool {
 /// Refused: a `%s` in a template that runs an interpreter (see
 /// [`is_interpreter`]), because there the substituted argument is program
 /// text. Such a template without `%s` gets the URL as a trailing positional
-/// argument, which an interpreter reads as data (`$0`/`$1`, `sys.argv`), never
-/// as source.
+/// argument. With the template's own source before it (`sh -c open-it`) an
+/// interpreter reads that argument as data (`$0`/`$1`, `sys.argv`); without
+/// (`sh -c`) the URL itself becomes the source. Either way it is the URL
+/// [`canonical_pull_request_url`] rebuilt, which carries no character a shell
+/// treats specially.
 pub fn browser_command(browser: &str, url: &str) -> Result<Option<(String, Vec<String>)>, String> {
     let command = browser.split(':').next().unwrap_or("").trim();
     let mut words = command.split_whitespace();
@@ -143,13 +153,72 @@ pub fn browser_command(browser: &str, url: &str) -> Result<Option<(String, Vec<S
 
 /// Spawn `program` with `args`, detached from the terminal's stdio.
 pub fn spawn_browser(program: &str, args: &[String]) -> Result<Child, String> {
-    Command::new(program)
-        .args(args)
+    spawn_detached(Command::new(program).args(args)).map_err(|e| format!("{program}: {e}"))
+}
+
+/// Spawn `command` with no stdio and, on Unix, in a process group of its own,
+/// so a signal the terminal sends the deck's foreground group does not reach
+/// the browser. Still this process's child, so [`watch_launch`] can read its
+/// exit status.
+fn spawn_detached(command: &mut Command) -> std::io::Result<Child> {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{program}: {e}"))
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    command.spawn()
+}
+
+/// How a launch that did not fail went: the program exited successfully, or it
+/// was still running when the watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launched {
+    /// Exited with status 0 within the grace period.
+    Exited,
+    /// Still running when the grace period ended.
+    Running,
+}
+
+/// Watch `child`, launched as `program`, for up to `grace`: a non-zero exit in
+/// that time is a failure, an exit of 0 or a child still running is a launch.
+/// A child still running is handed to a thread that reaps it, so a browser
+/// that stays in the foreground neither blocks the caller past `grace` nor
+/// lingers as a zombie.
+pub fn watch_launch(mut child: Child, program: &str, grace: Duration) -> Result<Launched, String> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(Launched::Exited),
+            Ok(Some(status)) => return Err(format!("{program} failed ({status})")),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Still running, or its status cannot be read: nothing says it
+            // failed, so it counts as launched.
+            Ok(None) | Err(_) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(Launched::Running);
+            }
+        }
+    }
+}
+
+/// Open `url` with the platform's opener (`xdg-open` and its fallbacks,
+/// `open`, `start`), the first one that can be started, watched like a
+/// `BROWSER` program ([`watch_launch`]).
+pub fn open_with_platform_opener(url: &str, grace: Duration) -> Result<Launched, String> {
+    let mut last_error = None;
+    for mut command in open::commands(url) {
+        let program = command.get_program().to_string_lossy().into_owned();
+        match spawn_detached(&mut command) {
+            Ok(child) => return watch_launch(child, &program, grace),
+            Err(e) => last_error = Some(format!("{program}: {e}")),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "no opener for this platform".to_string()))
 }
 
 /// What [`open_pull_request`] needs to know about the host.
@@ -178,29 +247,30 @@ impl BrowserEnv {
     }
 }
 
-/// Open the pull request at `raw_url` without blocking the caller, and return
-/// the status-line message for how that went. Whenever no browser opens, the
-/// message leads with the URL, so a user on a host with no browser can copy it.
+/// Open the pull request at `raw_url` and return the status-line message for
+/// how that went. The caller waits at most [`LAUNCH_GRACE`], and only that
+/// long when the browser keeps running. Whenever no browser opens, the message
+/// leads with the URL, so a user on a host with no browser can copy it.
+///
+/// A program that exited successfully reports "Opened"; one still running
+/// when the watch ended reports "Opening … in the browser", since a browser
+/// that stays in the foreground never says whether the page loaded.
 pub fn open_pull_request(raw_url: &str, env: &BrowserEnv) -> String {
     let Some(url) = canonical_pull_request_url(raw_url) else {
         return "Could not open the pull request: not a GitHub pull request URL".to_string();
     };
     let launched = match env.browser.as_deref().map(|b| browser_command(b, &url)) {
-        Some(Ok(Some((program, args)))) => spawn_browser(&program, &args).map(|mut child| {
-            // Reaped off the render thread, so a browser that stays in the
-            // foreground neither blocks the deck nor lingers as a zombie.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }),
+        Some(Ok(Some((program, args)))) => spawn_browser(&program, &args)
+            .and_then(|child| watch_launch(child, &program, LAUNCH_GRACE)),
         Some(Err(e)) => Err(e),
         None | Some(Ok(None)) if !env.display => {
             return format!("Pull request: {url} (no display here to open a browser on)");
         }
-        None | Some(Ok(None)) => open::that_detached(&url).map_err(|e| e.to_string()),
+        None | Some(Ok(None)) => open_with_platform_opener(&url, LAUNCH_GRACE),
     };
     match launched {
-        Ok(()) => format!("Opened {url}"),
+        Ok(Launched::Exited) => format!("Opened {url}"),
+        Ok(Launched::Running) => format!("Opening {url} in the browser"),
         Err(e) => format!("Pull request: {url} (could not open a browser: {e})"),
     }
 }

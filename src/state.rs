@@ -949,6 +949,16 @@ pub struct SessionSnapshot {
     /// daemon may add, so an unknown one never fails the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    /// PRD #1401: the revision of [`Self::pull_request`]
+    /// ([`SessionState::pull_request_revision`]). A daemon that reports pull
+    /// requests always sends it, `Some(0)` for a session it has never reported
+    /// one for, so a client can refuse a reply older than a report it already
+    /// applied ([`AppState::seed_hydrated_session`]). Additive optional, like
+    /// the field it orders: an older daemon omits it and the client takes the
+    /// reply's value as before, and an older client ignores it, so no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_revision: Option<u64>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1072,6 +1082,14 @@ pub struct SessionState {
     /// daemon knows of one. Carried to clients by
     /// [`SessionSnapshot::pull_request`].
     pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    /// PRD #1401: which daemon report [`Self::pull_request`] came from. On the
+    /// daemon, the [`crate::pull_request::next_revision`] stamped when it last
+    /// changed, `0` before the first change; on a client, the highest revision
+    /// it has applied, from a report or a reply. Carried by
+    /// [`SessionSnapshot::pull_request_revision`] and by the report's
+    /// [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`]. Not an activity
+    /// clock: it orders the pull request alone and moves nothing else.
+    pub pull_request_revision: u64,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -1148,6 +1166,7 @@ impl SessionState {
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
             pull_request: self.pull_request.clone(),
+            pull_request_revision: Some(self.pull_request_revision),
         }
     }
 
@@ -10393,13 +10412,10 @@ fn overlay_snapshot_onto_kept_card(
     observed: Option<DateTime<Utc>>,
 ) {
     // PRD #1401: the pull request is the daemon's alone and its report moves
-    // no `last_activity`, so the activity clock below cannot order it and the
-    // reply's value is taken whatever its stamp. The daemon sets a session's
-    // value and broadcasts its report under one write lock, which orders the
-    // daemon's own state, not this client's two streams: a reply built before
-    // a report can still be applied after that report's event arrived, and the
-    // card then shows the older value until the next report or reply.
-    session.pull_request = snap.pull_request.clone();
+    // no `last_activity`, so the activity clock below cannot order it. Its own
+    // revision does, whatever the snapshot's stamp: see
+    // `adopt_snapshot_pull_request`.
+    adopt_snapshot_pull_request(session, snap);
     if let Some(observed) = observed
         && observed > session.last_activity
         && observed <= Utc::now()
@@ -10428,6 +10444,28 @@ fn overlay_snapshot_onto_kept_card(
         // The carrier is stamped at the card's `last_activity`, which is
         // the snapshot's instant too, so it moves no watermark.
         push_live_target_carrier(session, live_target);
+    }
+}
+
+/// PRD #1401: take a `ListAgents` snapshot's pull request onto `session`
+/// unless the card already holds a newer one.
+///
+/// The daemon sets a session's value and broadcasts its report under one write
+/// lock, which orders the daemon's own state, not a client's two streams: a
+/// reply built before a report can arrive after that report's event did. Each
+/// change carries a daemon-assigned revision on both the snapshot and the
+/// event, so a snapshot whose revision is lower than the one the card last
+/// applied is the older answer and is ignored; a clear carries a revision like
+/// any other value. A snapshot with no revision comes from a daemon that sends
+/// none, and is taken as it always was.
+fn adopt_snapshot_pull_request(session: &mut SessionState, snap: &SessionSnapshot) {
+    match snap.pull_request_revision {
+        Some(revision) if revision < session.pull_request_revision => {}
+        Some(revision) => {
+            session.pull_request = snap.pull_request.clone();
+            session.pull_request_revision = revision;
+        }
+        None => session.pull_request = snap.pull_request.clone(),
     }
 }
 
@@ -10469,8 +10507,9 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     };
     session.active_tool = snap.active_tool.clone();
     session.tool_count = snap.tool_count;
-    // PRD #1401: the daemon's pull request for the card's branch.
-    session.pull_request = snap.pull_request.clone();
+    // PRD #1401: the daemon's pull request for the card's branch, unless the
+    // card already holds a newer report.
+    adopt_snapshot_pull_request(session, snap);
     session.first_prompts = snap.first_prompts.clone();
     session.last_user_prompt = snap.last_user_prompt.clone();
     // PRD #20 blocker-4: restore the durable live-target so a history-only /
@@ -11536,18 +11575,32 @@ impl AppState {
     /// card is ever created for one: a report about a card the client does not
     /// hold has nothing to land on, and the next `ListAgents` carries the
     /// field anyway.
+    ///
+    /// A report carrying a revision lower than the one the card holds is older
+    /// than a reply the card already took, and is ignored; one with no revision
+    /// comes from a daemon that sends none and is applied as it always was. See
+    /// [`SessionState::pull_request_revision`].
     fn apply_pull_request_report(
         &mut self,
         event: &AgentEvent,
         pull_request: Option<crate::pull_request_info::PullRequestInfo>,
     ) {
+        let revision = event.pull_request_revision();
         for (id, session) in self.sessions.iter_mut() {
             let same_card = *id == event.session_id
                 || (event.pane_id.is_some()
                     && session.pane_id == event.pane_id
                     && session.agent_id == event.agent_id);
-            if same_card {
-                session.pull_request = pull_request.clone();
+            if !same_card {
+                continue;
+            }
+            match revision {
+                Some(revision) if revision < session.pull_request_revision => {}
+                Some(revision) => {
+                    session.pull_request = pull_request.clone();
+                    session.pull_request_revision = revision;
+                }
+                None => session.pull_request = pull_request.clone(),
             }
         }
     }
@@ -11570,6 +11623,7 @@ impl AppState {
                 continue;
             }
             session.pull_request = next.clone();
+            session.pull_request_revision = crate::pull_request::next_revision();
             changed.push(crate::pull_request::report_event(session));
         }
         changed
@@ -11719,6 +11773,7 @@ impl AppState {
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pull_request: None,
+                pull_request_revision: 0,
             },
         );
         session_id
@@ -16203,6 +16258,7 @@ impl AppState {
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pull_request: None,
+                pull_request_revision: 0,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -24582,6 +24638,7 @@ while True:
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pull_request: None,
+                pull_request_revision: 0,
             },
         );
 
@@ -26385,6 +26442,7 @@ while True:
             }),
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -26451,6 +26509,7 @@ while True:
             }),
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

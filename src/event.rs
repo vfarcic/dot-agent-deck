@@ -565,6 +565,13 @@ pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 /// socket cannot put a URL of its choosing behind a card's badge.
 pub const PULL_REQUEST_METADATA_KEY: &str = "pull_request";
 
+/// `AgentEvent.metadata` key carrying, in decimal, the revision of the pull
+/// request an [`EventType::PullRequest`] reports — present on a report of none
+/// too (PRD #1401). It orders the report against a `ListAgents` reply, see
+/// [`crate::state::SessionState::pull_request_revision`]. Daemon-authoritative
+/// like [`PULL_REQUEST_METADATA_KEY`], and removed from producer frames with it.
+pub const PULL_REQUEST_REVISION_METADATA_KEY: &str = "pull_request_revision";
+
 /// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
@@ -1227,6 +1234,18 @@ impl AgentEvent {
                 .get(PULL_REQUEST_METADATA_KEY)
                 .and_then(|json| serde_json::from_str(json).ok()),
         )
+    }
+
+    /// PRD #1401: the revision an [`EventType::PullRequest`] carries under
+    /// [`PULL_REQUEST_REVISION_METADATA_KEY`], or `None` when it carries none
+    /// that decodes — a daemon that sends none, or a different event.
+    pub fn pull_request_revision(&self) -> Option<u64> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        self.metadata
+            .get(PULL_REQUEST_REVISION_METADATA_KEY)
+            .and_then(|revision| revision.parse().ok())
     }
 
     /// Issue #601: does this event carry the daemon's UNPROVEN marker (see

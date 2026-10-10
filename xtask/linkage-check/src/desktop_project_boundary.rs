@@ -275,6 +275,16 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "remote_daemon",
     "remote_doctor",
     "state",
+    // PRD #1401, argued rather than added quietly. The desktop's Open in
+    // browser hands the page to `system_browser::open_with_platform_opener`,
+    // the same watched launch the TUI's `o` uses, so a platform opener that
+    // exits non-zero is a failure in both clients rather than a success in
+    // one of them (CLAUDE.md rule 22). Checked against this rule's lines: the
+    // module validates a URL and spawns a browser or the platform opener on
+    // it; it resolves no project, reads no file outside its tests, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "system_browser",
     "ui",
     // PRD #741 M7, argued rather than added quietly.
     // `untrusted_text::strip_control_and_bidi` is the policy the connection

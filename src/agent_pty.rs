@@ -20872,6 +20872,7 @@ mod spawn_tests {
                 blocked: None,
                 hook_generation: None,
                 pull_request: None,
+                pull_request_revision: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

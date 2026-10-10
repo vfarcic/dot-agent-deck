@@ -708,6 +708,7 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -752,6 +753,7 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -793,6 +795,7 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pull_request: None,
+            pull_request_revision: None,
         });
 
         let mut view = AgentView::default();

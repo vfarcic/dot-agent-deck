@@ -110,6 +110,18 @@ pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 /// precisely what a 2 s ceiling did on a 16-core box at load average 44.
 pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
 
+/// PRD #1401: the base ceiling, before [`load_scaled`], on a
+/// [`spawn_daemon_serve_with_env`] subprocess binding its attach socket.
+///
+/// A BOOT, not a behaviour, for [`CHILD_BOOT_BASE`]'s reason: the wait returns
+/// the instant the socket exists. It was a flat 10 s, and `session/pr/001`,
+/// which starts five of these daemons, failed at it in a module run and passed
+/// on an isolated retry. Kept at 10 s rather than the shared 8 s base because
+/// this boot is the debug deck binary loading its schedules file before
+/// it binds, heavier than the bare `sh` that base was sized against, so an idle
+/// box keeps exactly the bound it had.
+pub const DAEMON_SERVE_BOOT_BASE: Duration = Duration::from_secs(10);
+
 /// Issue #701: base ceiling, before [`load_scaled`], on the whole of
 /// [`TuiDeck::submit_claude_prompt`] — the typed prompt reaching the screen
 /// and then Claude Code's `UserPromptSubmit` hook firing, under one deadline. On a healthy run the
@@ -9515,9 +9527,10 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding) or a bounded timeout elapses.
+    /// binding) or [`load_scaled`]`(`[`DAEMON_SERVE_BOOT_BASE`]`)` elapses.
     fn wait_for_attach_socket(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let budget = load_scaled(DAEMON_SERVE_BOOT_BASE);
+        let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
                 return;
@@ -9525,7 +9538,7 @@ impl DaemonProc {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "daemon never bound its attach socket at {} within 10s",
+            "daemon never bound its attach socket at {} within {budget:?}",
             self.attach_socket.display()
         );
     }

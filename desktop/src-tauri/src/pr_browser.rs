@@ -604,12 +604,20 @@ fn hand_off(url: &Url) {
 }
 
 /// Hands `url` to the operating system's default browser. Only `http(s)`
-/// ever reaches it — the callers classify first.
+/// ever reaches it — the callers classify first. The opener is watched the
+/// way the TUI's `o` watches it: one that exits non-zero within
+/// [`LAUNCH_GRACE`] is a failure, one that exits 0 or is still running is a
+/// launch. A function only Rust calls, rather than `tauri-plugin-opener`,
+/// whose commands the page could be granted.
+///
+/// [`LAUNCH_GRACE`]: dot_agent_deck::system_browser::LAUNCH_GRACE
 fn system_browser(url: &Url) -> Result<(), String> {
+    use dot_agent_deck::system_browser::{LAUNCH_GRACE, open_with_platform_opener};
     if !matches!(url.scheme(), "https" | "http") {
         return Err("The page on screen has no address the system browser can open.".into());
     }
-    open::that_detached(url.as_str())
+    open_with_platform_opener(url.as_str(), LAUNCH_GRACE)
+        .map(|_| ())
         .map_err(|error| format!("The system browser did not open: {error}"))
 }
 

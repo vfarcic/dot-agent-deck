@@ -1028,6 +1028,7 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
         blocked: None,
         hook_generation: None,
         pull_request: None,
+        pull_request_revision: None,
     };
     let early_key = "zz-early-session";
 
@@ -1312,6 +1313,7 @@ fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_car
         blocked: None,
         hook_generation: None,
         pull_request: None,
+        pull_request_revision: None,
     };
     let mut tui = AppState::default();
     let before_seed = Utc::now();
