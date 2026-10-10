@@ -2532,14 +2532,14 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
 - **Layer:** L2 PTY-attached, lane 1.
 - **Agent:** none; old executable stub and synthetic Claude hook.
-- **Asserts:** the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, and a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, and a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
 - **Does not assert:** a real Claude emitting hooks, desktop rendering, or takeover from an eligible binary; the built target binary and separate HOME keep takeover ineligible.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
 - **Layer:** L2 headless daemon, lane 1.
 - **Agent:** none; old executable stub and synthetic Claude hooks.
-- **Asserts:** Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
 - **Does not assert:** TUI rendering or real-agent work.
 - **Platform coverage:** mac+linux.
 

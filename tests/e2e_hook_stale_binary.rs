@@ -22,16 +22,19 @@ fn event(event_type: &str) -> serde_json::Value {
 
 /// Scenario: Start the real dashboard with Claude hooks pinned to an older
 /// stub. Its startup notice names the pin and version; a stamp-less hook then
-/// updates the same visible row live to explain that version reporting is missing.
+/// updates the same visible row live to explain that version reporting is missing,
+/// even when the host has no deck installed on PATH.
 #[spec("hooks/stale/002")]
 #[test]
 fn hooks_stale_002_startup_notice_updates_live_for_an_unreported_hook() {
     let fixture = StaleHome::new();
-    // The harness launches target/debug directly. This HOME has no installed
-    // symlink to it, so it cannot take over the existing stub pin.
+    // Keep the host's installed deck and login-shell profile out of the
+    // scenario; the fixture supplies its own installed link to the cargo build.
     let deck = TuiDeck::builder()
         .with_pty_size(420, 28)
         .with_env("HOME", fixture.home.to_string_lossy())
+        .with_env("PATH", fixture.home.to_string_lossy())
+        .with_env("SHELL", "")
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
@@ -75,17 +78,20 @@ fn hooks_stale_002_startup_notice_updates_live_for_an_unreported_hook() {
 
 /// Scenario: Start a headless daemon with an old stub pin and send several
 /// identical stamp-less hooks. Hello reports the updated notice, while the log
-/// warns once for the startup reason and once for missing version reporting.
+/// warns once for each reason, without relying on a deck installed on the host PATH.
 #[spec("hooks/stale/003")]
 #[test]
 fn hooks_stale_003_hello_reports_notices_and_warnings_are_deduplicated() {
     let fixture = StaleHome::new();
     let log = fixture.home.join("deck.log");
+    // Match a CI runner without any host deck or login-shell PATH to fall back to.
     let daemon = common::spawn_daemon_serve_with_env(
         None,
         "0",
         &[
             ("HOME", fixture.home.to_str().unwrap()),
+            ("PATH", fixture.home.to_str().unwrap()),
+            ("SHELL", ""),
             ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
         ],
     );
@@ -95,7 +101,8 @@ fn hooks_stale_003_hello_reports_notices_and_warnings_are_deduplicated() {
             .iter()
             .any(|n| n.binary == fixture.pin.to_string_lossy()
                 && n.reason == HookBinaryReason::Older),
-        "startup Hello: {initial:?}"
+        "startup Hello: {initial:?}\ndaemon log:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
     let events = daemon.subscribe_events();
     write_hook_line(&daemon.hook_socket, &event("session_start").to_string()).unwrap();

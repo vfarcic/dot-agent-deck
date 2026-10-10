@@ -19,6 +19,17 @@ impl StaleHome {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(&pin, "#!/bin/sh\nprintf 'dot-agent-deck 0.0.1\\n'\n").unwrap();
         std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Overriding the harness HOME also replaces its installed-binary link.
+        // Supply one here so startup reads the old pin even on a machine with
+        // no deck on PATH. The target remains a cargo artifact, so this link
+        // resolves the installer without making the running build takeover-eligible.
+        let bin_dir = home.join(".local/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_dot-agent-deck"),
+            bin_dir.join("dot-agent-deck"),
+        )
+        .unwrap();
         let fixture = Self {
             home,
             pin,
