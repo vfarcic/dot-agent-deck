@@ -19,6 +19,11 @@ use upgrade_fixture::{DECK, NEW_BUILD, OLD_BUILD, Remote, pid_file, quoted, scri
 const PANE: &str = "upgrade-live-haiku";
 const LABEL: &str = "upgrade proof Haiku";
 const AGENT_WAIT: Duration = Duration::from_secs(120);
+/// How long Haiku gets to read a fixture and report it. A model round trip on
+/// a loaded box outlasts [`AGENT_WAIT`]: measured 2026-10-10, this step timed
+/// out at 120s under a load average of 53-71 and took 24s for the whole test
+/// alone. Matches `REPORT_WAIT` in `e2e_new_agent_live.rs`.
+const REPORT_WAIT: Duration = Duration::from_secs(240);
 
 /// A per-run hex token, so a sentinel can only reach the pane by being read.
 fn unique_token() -> String {
@@ -51,7 +56,7 @@ fn report_file(
     .expect("submit the fixture-reading task");
     assert_eq!(sent.send_result, Some(SendResult::Applied));
     assert!(
-        common::wait_for_pane_text_on(&remote.attach, agent, expected, AGENT_WAIT),
+        common::wait_for_pane_text_on(&remote.attach, agent, expected, REPORT_WAIT),
         "interactive Haiku must read {file}; pane: {}",
         common::pane_search_key_on(&remote.attach, agent)
     );
