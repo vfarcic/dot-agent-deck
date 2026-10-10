@@ -2946,6 +2946,9 @@ pub enum RemoteUpgradeError {
     #[error("{installed_version} was installed, but {step} failed: {source}")]
     AfterInstall {
         installed_version: String,
+        /// The binary the build was installed at — what the deck list would
+        /// have recorded had this step not failed (issue #1604).
+        binary: String,
         step: &'static str,
         #[source]
         source: Box<RemoteUpgradeError>,
@@ -2963,6 +2966,19 @@ impl RemoteUpgradeError {
                 installed_version, ..
             } => Some(installed_version),
             Self::Inner(RemoteAddError::ReplacedButUnverified { on_disk, .. }) => Some(on_disk),
+            _ => None,
+        }
+    }
+
+    /// The binary [`Self::installed_version`] is at, whenever that is set.
+    /// The deck list may still name the binary from before the upgrade — a
+    /// legacy `~/.local/bin` copy beside the Homebrew install that was just
+    /// upgraded — because the step that records the new one is what failed
+    /// (issue #1604).
+    pub fn installed_binary(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall { binary, .. } => Some(binary),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { binary, .. }) => Some(binary),
             _ => None,
         }
     }
@@ -3079,8 +3095,10 @@ pub fn upgrade_entry_reporting_to(
     //    already in place by now, so a failure from here on says so.
     let after_install = |step: &'static str| {
         let installed_version = installed.version.clone();
+        let binary = installed.remote_binary().to_string();
         move |source: RemoteUpgradeError| RemoteUpgradeError::AfterInstall {
             installed_version,
+            binary,
             step,
             source: Box::new(source),
         }
@@ -4008,6 +4026,7 @@ mod tests {
         );
         let upgrade_err = RemoteUpgradeError::Inner(err);
         assert_eq!(upgrade_err.installed_version(), Some(UNVERIFIED_BUILD));
+        assert_eq!(upgrade_err.installed_binary(), Some(REMOTE_INSTALL_PATH));
         let msg = upgrade_err.to_string();
         assert!(msg.contains("cannot execute binary file"), "{msg}");
         assert!(msg.contains("an unverified build"), "{msg}");
@@ -4379,13 +4398,13 @@ mod tests {
 /// None of this reaches a real remote, a real `ssh` or a real Homebrew; what
 /// it pins is the remote-side behaviour of the commands themselves.
 #[cfg(all(test, unix))]
-mod homebrew_remote_tests {
+pub(crate) mod homebrew_remote_tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     /// Where the remote's `brew` can be found.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum BrewAt {
+    pub(crate) enum BrewAt {
         /// On the `PATH` of the non-interactive shell.
         OnPath,
         /// Only at its prefix — the usual macOS case, where Homebrew puts
@@ -4400,7 +4419,7 @@ mod homebrew_remote_tests {
     /// `rewrites` points each of the production [`HOMEBREW_PREFIXES`] at a
     /// sandbox path, so neither a Homebrew on the machine running the tests
     /// nor its absence can change an answer.
-    struct SandboxShell {
+    pub(crate) struct SandboxShell {
         home: PathBuf,
         path: String,
         rewrites: Vec<(String, String)>,
@@ -4453,28 +4472,28 @@ mod homebrew_remote_tests {
     }
 
     /// What the remote has installed before the flow under test runs.
-    struct Fixture {
+    pub(crate) struct Fixture {
         /// Version Homebrew has installed, if any.
-        brew: Option<&'static str>,
+        pub(crate) brew: Option<&'static str>,
         /// Version of a copy at `~/.local/bin`, if any.
-        local_bin: Option<&'static str>,
+        pub(crate) local_bin: Option<&'static str>,
         /// What `brew upgrade` lands, and what the release download writes.
-        tap: &'static str,
+        pub(crate) tap: &'static str,
         /// `brew upgrade` exits non-zero without changing anything.
-        brew_upgrade_fails: bool,
+        pub(crate) brew_upgrade_fails: bool,
     }
 
-    struct Remote {
+    pub(crate) struct Remote {
         _dir: tempfile::TempDir,
         root: PathBuf,
         home: PathBuf,
         brew_prefix: PathBuf,
         log: PathBuf,
-        registry: PathBuf,
+        pub(crate) registry: PathBuf,
     }
 
     impl Remote {
-        fn new(fixture: Fixture) -> Self {
+        pub(crate) fn new(fixture: Fixture) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let root = dir.path().canonicalize().unwrap();
             let home = root.join("home");
@@ -4537,7 +4556,7 @@ mod homebrew_remote_tests {
             }
         }
 
-        fn shell(&self, brew_at: BrewAt) -> SandboxShell {
+        pub(crate) fn shell(&self, brew_at: BrewAt) -> SandboxShell {
             let mut path = format!("{}:/usr/bin:/bin", self.root.join("stubs").display());
             if brew_at == BrewAt::OnPath {
                 path = format!("{}:{path}", self.brew_prefix.join("bin").display());
@@ -4566,22 +4585,22 @@ mod homebrew_remote_tests {
             std::fs::read_to_string(&self.log).unwrap()
         }
 
-        fn local_bin_copy(&self) -> PathBuf {
+        pub(crate) fn local_bin_copy(&self) -> PathBuf {
             self.home.join(".local/bin/dot-agent-deck")
         }
 
-        fn brew_binary(&self) -> PathBuf {
+        pub(crate) fn brew_binary(&self) -> PathBuf {
             self.brew_prefix.join("bin/dot-agent-deck")
         }
 
-        fn version_of(&self, binary: &Path) -> String {
+        pub(crate) fn version_of(&self, binary: &Path) -> String {
             let out = Command::new(binary).arg("--version").output().unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
         /// Register the remote as an entry written before #1372: no install
         /// method recorded.
-        fn register_legacy_entry(&self, version: &str) {
+        pub(crate) fn register_legacy_entry(&self, version: &str) {
             RemotesFile {
                 remotes: vec![RemoteEntry {
                     name: "mac".to_string(),
@@ -4605,7 +4624,7 @@ mod homebrew_remote_tests {
             .unwrap();
         }
 
-        fn entry(&self) -> RemoteEntry {
+        pub(crate) fn entry(&self) -> RemoteEntry {
             RemotesFile::load(&self.registry).unwrap().remotes[0].clone()
         }
 
@@ -4777,6 +4796,7 @@ mod homebrew_remote_tests {
         let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
         let err = result.expect_err("a failed hook install must fail the upgrade");
         assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert_eq!(err.installed_binary(), Some(REMOTE_INSTALL_PATH));
         assert!(
             matches!(
                 &err,
@@ -4799,10 +4819,9 @@ mod homebrew_remote_tests {
 
         // A failure before anything landed carries no installed version.
         let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
-        assert_eq!(
-            result.expect_err("version mismatch").installed_version(),
-            None
-        );
+        let err = result.expect_err("version mismatch");
+        assert_eq!(err.installed_version(), None);
+        assert_eq!(err.installed_binary(), None);
     }
 
     /// Control: a remote with no Homebrew install keeps today's behaviour —
@@ -4907,6 +4926,7 @@ mod homebrew_remote_tests {
             "got {error:?}"
         );
         assert_eq!(error.installed_version(), Some("0.43.0"));
+        assert_eq!(error.installed_binary(), Some(REMOTE_INSTALL_PATH));
         let message = error.to_string();
         assert!(
             message.contains("was changed to reach a different machine"),
