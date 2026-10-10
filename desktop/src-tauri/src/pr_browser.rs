@@ -25,8 +25,11 @@
 //!   scoped to the main WEBVIEW by label, not to the main window (which the PR
 //!   webview is a child of), and no capability is `remote`. A plugin or core
 //!   command from this webview therefore resolves to no permission and is
-//!   refused, from any origin. `capability_files_grant_nothing_to_the_pr_webview`
-//!   pins the files; `the_pr_webview_cannot_invoke_commands` drives Tauri's IPC.
+//!   refused, from any origin — all but `plugin:__TAURI_CHANNEL__|fetch`,
+//!   which Tauri exempts from the ACL and answers only for a channel made for
+//!   the asking webview, of which this one has none.
+//!   `capability_files_grant_nothing_to_the_pr_webview` pins the files;
+//!   `the_pr_webview_cannot_invoke_commands` drives Tauri's IPC.
 //! - **The app's own commands refuse a remote origin.** Tauri checks an app
 //!   command against the ACL only when the request is remote (this app has no
 //!   app manifest), and with no `remote` capability a remote request is always
@@ -50,10 +53,14 @@
 //! default store, which is still persistent.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tauri::webview::{NewWindowResponse, WebviewBuilder};
+use tauri::webview::{NewWindowResponse, PageLoadEvent, PlatformWebview, WebviewBuilder};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Url, WebviewUrl};
+use tokio::sync::oneshot;
 
 /// The PR webview's label. No capability may name it.
 pub const PR_WEBVIEW_LABEL: &str = "pr-browser";
@@ -92,9 +99,23 @@ pub const PROFILE_DIR: &str = "pr-browser";
 /// the value is recognisable in a debugger; it is an identifier, not a secret.
 pub const DATA_STORE_ID: [u8; 16] = *b"dad-pr-browser-1";
 
-/// How long the hidden sign-out window lives after asking for the clear, so
-/// the platform's asynchronous delete runs before its webview goes away.
-const SIGN_OUT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// The least time between two pages handed to the system browser by the
+/// navigation hooks. A page can ask for any number of navigations by script;
+/// this is what keeps that from becoming any number of browser windows.
+pub const HAND_OFF_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// How long sign-out waits for the GitHub page to be replaced by an empty one
+/// before it clears the profile. Waiting is all it is: running out is a
+/// failure, reported as one.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long sign-out waits for the platform to confirm the profile is
+/// cleared. An answer that never comes is reported as a failure — elapsed time
+/// is never taken as proof that the delete ran.
+const CLEAR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Said when the platform did not confirm the clear in [`CLEAR_TIMEOUT`].
+const CLEAR_UNCONFIRMED: &str = "the system did not confirm that the sign-in was cleared. Try again; if it keeps failing, sign out on GitHub's page instead: your avatar, then Sign out.";
 
 /// The webview's storage, as [`profile`] decides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +266,93 @@ pub fn decide_new_window(url: &Url, effects: &impl Effects) {
     }
 }
 
+/// The `on_navigation` hook while sign-out is clearing the profile: nothing
+/// loads but the empty page sign-out put there — not the toolbar's Back, not a
+/// script the old page left running — and nothing is handed off or closed.
+pub fn decide_navigation_while_clearing(url: &Url) -> bool {
+    url.as_str() == BLANK
+}
+
+/// The empty page sign-out puts in the browser before it clears the profile.
+const BLANK: &str = "about:blank";
+
+/// What [`HandOffGate::admit`] says about one request for the system browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Open it.
+    Launch,
+    /// Drop it. `report` is true for the first one dropped since the last
+    /// launch, so a burst is logged once rather than once per request.
+    Drop { report: bool },
+}
+
+#[derive(Debug)]
+struct GateState {
+    last: Option<Instant>,
+    in_flight: bool,
+    reported: bool,
+}
+
+/// The bound on the navigation hooks' hand-offs to the system browser: one
+/// launch at a time, and at most one per `interval`; every other request is
+/// dropped. A page's script can navigate in a loop, and the hooks cannot tell
+/// a click from a script, nor on every platform a frame from the page
+/// (`docs/develop/desktop-gui.md` says which), so the bound is here rather than
+/// in the page. The clock is a parameter so the bound is tested without time
+/// passing.
+#[derive(Debug)]
+pub struct HandOffGate {
+    interval: Duration,
+    state: Mutex<GateState>,
+}
+
+impl HandOffGate {
+    pub const fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(GateState {
+                last: None,
+                in_flight: false,
+                reported: false,
+            }),
+        }
+    }
+
+    /// Whether a request made at `now` may open the system browser. A
+    /// [`Admission::Launch`] must be followed by [`HandOffGate::finished`]
+    /// once the launch returns.
+    pub fn admit(&self, now: Instant) -> Admission {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rested = state
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.interval);
+        if !state.in_flight && rested {
+            state.last = Some(now);
+            state.in_flight = true;
+            state.reported = false;
+            Admission::Launch
+        } else {
+            let report = !state.reported;
+            state.reported = true;
+            Admission::Drop { report }
+        }
+    }
+
+    /// The launch [`HandOffGate::admit`] allowed has returned.
+    pub fn finished(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight = false;
+    }
+}
+
+/// The app's one gate: every hand-off from the navigation hooks goes through it.
+static HAND_OFF: HandOffGate = HandOffGate::new(HAND_OFF_INTERVAL);
+
 /// Injected into the page's main frame. An Escape the page did not use
 /// becomes a navigation to [`CLOSE_URL`] — data-free, and invoking nothing.
 ///
@@ -389,7 +497,7 @@ struct AppEffects<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> Effects for AppEffects<R> {
     fn open_external(&self, url: &Url) {
-        open_in_system_browser(url);
+        hand_off(url);
     }
 
     fn close(&self) {
@@ -411,6 +519,26 @@ impl<R: Runtime> Effects for AppEffects<R> {
                 let _ = webview.navigate(url);
             }
         });
+    }
+}
+
+/// A navigation hook's hand-off to the system browser, through [`HAND_OFF`].
+/// The launch runs on a thread of its own, so the hook returns at once and
+/// the gate stays closed until the launch has returned.
+fn hand_off(url: &Url) {
+    match HAND_OFF.admit(Instant::now()) {
+        Admission::Launch => {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                open_in_system_browser(&url);
+                HAND_OFF.finished();
+            });
+        }
+        Admission::Drop { report: true } => eprintln!(
+            "dot-agent-deck-desktop: the pull request page asked for more pages in the system browser than one every {} ms; dropping the rest until it pauses",
+            HAND_OFF_INTERVAL.as_millis()
+        ),
+        Admission::Drop { report: false } => {}
     }
 }
 
@@ -452,10 +580,26 @@ fn builder<R: Runtime>(
     let on_new_window = AppEffects(app.clone());
     WebviewBuilder::new(label, url)
         .initialization_script(ESCAPE_SCRIPT)
-        .on_navigation(move |url| decide_navigation(url, &on_navigation))
+        .on_navigation(move |url| {
+            if CLEARING.load(Ordering::SeqCst) {
+                decide_navigation_while_clearing(url)
+            } else {
+                decide_navigation(url, &on_navigation)
+            }
+        })
         .on_new_window(move |url, _features| {
-            decide_new_window(&url, &on_new_window);
+            if !CLEARING.load(Ordering::SeqCst) {
+                decide_new_window(&url, &on_new_window);
+            }
             NewWindowResponse::Deny
+        })
+        .on_page_load(|webview, payload| {
+            if webview.label() == PR_WEBVIEW_LABEL
+                && payload.event() == PageLoadEvent::Finished
+                && payload.url().as_str() == BLANK
+            {
+                left_page();
+            }
         })
         .incognito(profile.incognito)
         .data_directory(profile.data_directory.clone())
@@ -463,12 +607,15 @@ fn builder<R: Runtime>(
 }
 
 /// Opens the browser on `url` over `bounds`, or moves an open one there.
+/// Waits while a sign-out is clearing the profile, so a page never loads into
+/// a profile that is half deleted.
 pub async fn open<R: Runtime>(app: &AppHandle<R>, url: &str, bounds: Bounds) -> Result<(), String> {
     let bounds = bounds.checked()?;
     let url = Url::parse(url).map_err(|_| "That pull request address is not a URL.".to_string())?;
     if !is_pull_request_url(&url) {
         return Err("Only a pull request on github.com opens in the app.".into());
     }
+    let _session = SESSION.lock().await;
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
         webview.navigate(url).map_err(|error| error.to_string())?;
         place(&webview, bounds)?;
@@ -578,13 +725,21 @@ pub fn close<R: Runtime>(app: &AppHandle<R>) {
     close_browser(app);
 }
 
+/// Held by [`open`] and [`sign_out`] for their whole run, so a pull request
+/// never opens while the profile is being cleared and a clear never starts
+/// under a page that is opening.
+static SESSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Raised while sign-out clears the profile; the navigation hook then lets
+/// nothing load but [`BLANK`] ([`decide_navigation_while_clearing`]).
+static CLEARING: AtomicBool = AtomicBool::new(false);
+
 /// Settings → Sign out of GitHub: clears the PR browser's profile — cookies,
 /// storage and cache — so the next PR opens signed out. Refused on macOS
 /// before 14, where that profile is the app's own (`MACOS_SHARED_STORE`).
 ///
-/// With a PR open, its own webview clears the store and reloads. With none
-/// open, a hidden window is opened on the same profile only to clear it, and
-/// closed again once the platform's asynchronous delete has had time to run.
+/// Answers only once the platform has confirmed the delete, or with the
+/// reason it could not; [`sign_out_with`] has the order of the steps.
 /// Deleting the data directory instead was rejected: on Linux Tauri keeps a
 /// profile's web context alive for the life of the app, so its cookies would
 /// survive in memory and be written back.
@@ -595,32 +750,394 @@ pub async fn sign_out<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if !macos_has_own_data_store() {
         return Err(MACOS_SHARED_STORE.into());
     }
-    if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-        webview
-            .clear_all_browsing_data()
-            .map_err(|error| error.to_string())?;
-        let _ = webview.reload();
-        return Ok(());
+    let host = AppSignOut {
+        app: app.clone(),
+        scratch: Mutex::new(None),
+    };
+    sign_out_with(
+        &host,
+        &SESSION,
+        &CLEARING,
+        SignOutTimeouts {
+            leave: LEAVE_TIMEOUT,
+            clear: CLEAR_TIMEOUT,
+        },
+    )
+    .await
+}
+
+/// Whether a browser is open when sign-out starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Browser {
+    Closed,
+    /// Open, on `resume` — the GitHub page to put back once the profile is
+    /// cleared (`None` when the page on screen is not one).
+    Open {
+        resume: Option<Url>,
+    },
+}
+
+/// Which webview clears the profile: the open browser's own, or a hidden one
+/// opened on the same profile only for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearWith {
+    Browser,
+    Scratch,
+}
+
+/// A step's answer, when it comes.
+pub type Answer = oneshot::Receiver<Result<(), String>>;
+
+/// What sign-out does to the platform. A trait so the ORDER of the steps is
+/// tested with a fake whose answers come late, rather than through a webview.
+pub trait SignOutHost {
+    fn browser(&self) -> Browser;
+    /// Replace the open browser's page with [`BLANK`]; answers once the empty
+    /// page has finished loading, so the GitHub page and its scripts are gone.
+    fn leave_page(&self) -> Answer;
+    /// Open the hidden webview on the profile.
+    fn open_scratch(&self) -> Result<(), String>;
+    /// Ask the platform to delete the profile's data; answers when the
+    /// platform says the delete is done, or that it failed.
+    fn clear(&self, with: ClearWith) -> Answer;
+    fn close_scratch(&self);
+    /// Put the GitHub page back in the open browser.
+    fn resume(&self, url: Url);
+    /// Close the open browser and tell the app — what a failed sign-out does
+    /// instead of putting a page back on a profile it may not have cleared.
+    fn close_browser(&self);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SignOutTimeouts {
+    pub leave: Duration,
+    pub clear: Duration,
+}
+
+/// Lowers [`CLEARING`] however sign-out ends.
+struct Raised<'a>(&'a AtomicBool);
+
+impl<'a> Raised<'a> {
+    fn raise(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
     }
-    let profile = app_profile(app)?;
-    let blank = WebviewUrl::External(Url::parse("about:blank").expect("a constant URL"));
-    let window = tauri::window::WindowBuilder::new(app, SIGN_OUT_WEBVIEW_LABEL)
-        .visible(false)
-        .build()
-        .map_err(|error| format!("Could not open the sign-in profile: {error}"))?;
-    let webview = window
-        .add_child(
-            builder(app, SIGN_OUT_WEBVIEW_LABEL, blank, &profile),
+}
+
+impl Drop for Raised<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `answer` within `limit`, or why not. Running out of time is a failure.
+async fn awaited(answer: Answer, limit: Duration, late: &str) -> Result<(), String> {
+    match tokio::time::timeout(limit, answer).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the system gave no answer.".into()),
+        Err(_) => Err(late.into()),
+    }
+}
+
+/// Sign-out, in order:
+///
+/// 1. Hold `session`, so no pull request opens until this returns, and raise
+///    `clearing`, so the browser loads nothing but [`BLANK`].
+/// 2. With a browser open: replace its page with [`BLANK`] and wait until it
+///    has loaded, so the signed-in page is gone before its data is; then
+///    clear with the browser's own webview. With none open: open the hidden
+///    webview and clear with that.
+/// 3. Wait for the platform to confirm the delete. Only then is the GitHub
+///    page put back (signed out) or the hidden webview closed. A delete the
+///    platform reports as failed, or does not confirm in time, is an error,
+///    and the open browser is closed rather than reloaded.
+pub async fn sign_out_with(
+    host: &impl SignOutHost,
+    session: &tokio::sync::Mutex<()>,
+    clearing: &AtomicBool,
+    timeouts: SignOutTimeouts,
+) -> Result<(), String> {
+    let _session = session.lock().await;
+    let raised = Raised::raise(clearing);
+    match host.browser() {
+        Browser::Open { resume } => {
+            let cleared = match awaited(
+                host.leave_page(),
+                timeouts.leave,
+                "the pull request page did not close in time.",
+            )
+            .await
+            {
+                Ok(()) => {
+                    awaited(
+                        host.clear(ClearWith::Browser),
+                        timeouts.clear,
+                        CLEAR_UNCONFIRMED,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            drop(raised);
+            match cleared {
+                Ok(()) => {
+                    if let Some(url) = resume {
+                        host.resume(url);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    host.close_browser();
+                    Err(error)
+                }
+            }
+        }
+        Browser::Closed => {
+            host.open_scratch()?;
+            let cleared = awaited(
+                host.clear(ClearWith::Scratch),
+                timeouts.clear,
+                CLEAR_UNCONFIRMED,
+            )
+            .await;
+            host.close_scratch();
+            cleared
+        }
+    }
+}
+
+/// One answer, sent from whichever native callback gets there first; later
+/// ones are ignored. Clone it into each callback that may answer.
+#[derive(Clone)]
+struct Reply(Arc<Mutex<Option<Sender>>>);
+
+/// The sending half of an [`Answer`].
+type Sender = oneshot::Sender<Result<(), String>>;
+
+impl Reply {
+    fn new() -> (Self, Answer) {
+        let (sender, answer) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some(sender)))), answer)
+    }
+
+    fn send(&self, result: Result<(), String>) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+/// The waiter [`leave_page`](SignOutHost::leave_page) arms, answered by the
+/// page-load hook when [`BLANK`] finishes loading in the browser.
+static LEAVING: Mutex<Option<Reply>> = Mutex::new(None);
+
+fn left_page() {
+    let waiter = LEAVING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(waiter) = waiter {
+        waiter.send(Ok(()));
+    }
+}
+
+struct AppSignOut<R: Runtime> {
+    app: AppHandle<R>,
+    scratch: Mutex<Option<(tauri::Window<R>, tauri::Webview<R>)>>,
+}
+
+impl<R: Runtime> SignOutHost for AppSignOut<R> {
+    fn browser(&self) -> Browser {
+        match self.app.get_webview(PR_WEBVIEW_LABEL) {
+            None => Browser::Closed,
+            Some(webview) => Browser::Open {
+                resume: webview.url().ok().filter(|url| {
+                    url.scheme() == "https" && matches!(classify(url), Navigation::Stay)
+                }),
+            },
+        }
+    }
+
+    fn leave_page(&self) -> Answer {
+        let (reply, answer) = Reply::new();
+        *LEAVING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reply.clone());
+        let navigated = open_webview(&self.app).and_then(|webview| {
+            webview
+                .navigate(Url::parse(BLANK).expect("a constant URL"))
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = navigated {
+            reply.send(Err(error));
+        }
+        answer
+    }
+
+    fn open_scratch(&self) -> Result<(), String> {
+        let profile = app_profile(&self.app)?;
+        let blank = WebviewUrl::External(Url::parse(BLANK).expect("a constant URL"));
+        let window = tauri::window::WindowBuilder::new(&self.app, SIGN_OUT_WEBVIEW_LABEL)
+            .visible(false)
+            .build()
+            .map_err(|error| format!("Could not open the sign-in profile: {error}"))?;
+        let webview = match window.add_child(
+            builder(&self.app, SIGN_OUT_WEBVIEW_LABEL, blank, &profile),
             LogicalPosition::new(0.0, 0.0),
             LogicalSize::new(1.0, 1.0),
-        )
-        .map_err(|error| format!("Could not open the sign-in profile: {error}"))?;
-    let cleared = webview
-        .clear_all_browsing_data()
-        .map_err(|error| error.to_string());
-    tokio::time::sleep(SIGN_OUT_GRACE).await;
-    let _ = window.close();
-    cleared
+        ) {
+            Ok(webview) => webview,
+            Err(error) => {
+                let _ = window.close();
+                return Err(format!("Could not open the sign-in profile: {error}"));
+            }
+        };
+        *self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((window, webview));
+        Ok(())
+    }
+
+    fn clear(&self, with: ClearWith) -> Answer {
+        let (reply, answer) = Reply::new();
+        let webview = match with {
+            ClearWith::Browser => open_webview(&self.app).ok(),
+            ClearWith::Scratch => self
+                .scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .map(|(_, webview)| webview.clone()),
+        };
+        let Some(webview) = webview else {
+            reply.send(Err(
+                "the pull request browser closed during sign-out.".into()
+            ));
+            return answer;
+        };
+        let native = reply.clone();
+        if let Err(error) = webview.with_webview(move |platform| clear_profile(platform, native)) {
+            reply.send(Err(error.to_string()));
+        }
+        answer
+    }
+
+    fn close_scratch(&self) {
+        let scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((window, _)) = scratch {
+            let _ = window.close();
+        }
+    }
+
+    fn resume(&self, url: Url) {
+        if let Ok(webview) = open_webview(&self.app) {
+            let _ = webview.navigate(url);
+        }
+    }
+
+    fn close_browser(&self) {
+        close_browser(&self.app);
+        let _ = self.app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, ());
+    }
+}
+
+/// Deletes every kind of data in `platform`'s profile and answers `reply`
+/// from the platform's own completion callback — the step wry's
+/// `clear_all_browsing_data` starts but never reports the end of.
+/// Runs on the main thread (`with_webview`).
+#[cfg(target_os = "linux")]
+fn clear_profile(platform: PlatformWebview, reply: Reply) {
+    use webkit2gtk::{WebContextExt, WebViewExt, WebsiteDataManagerExtManual, WebsiteDataTypes};
+
+    let Some(manager) = platform
+        .inner()
+        .context()
+        .and_then(|context| context.website_data_manager())
+    else {
+        reply.send(Err(
+            "the pull request browser has no storage to clear.".into()
+        ));
+        return;
+    };
+    // `webkit_website_data_manager_clear`; a zero time span means all of it.
+    manager.clear(
+        WebsiteDataTypes::ALL,
+        gtk::glib::TimeSpan::from_seconds(0),
+        None::<&gtk::gio::Cancellable>,
+        move |result| reply.send(result.map_err(|error| error.to_string())),
+    );
+}
+
+/// macOS: `-[WKWebsiteDataStore removeDataOfTypes:modifiedSince:completionHandler:]`
+/// on the webview's own store, from the start of time.
+#[cfg(target_os = "macos")]
+fn clear_profile(platform: PlatformWebview, reply: Reply) {
+    use objc2_foundation::NSDate;
+    use objc2_web_kit::{WKWebView, WKWebsiteDataStore};
+
+    let Some(main_thread) = objc2::MainThreadMarker::new() else {
+        reply.send(Err("the profile was not cleared on the main thread.".into()));
+        return;
+    };
+    // SAFETY: Tauri's `PlatformWebview::inner` is the `WKWebView` it created
+    // for this webview, alive for the duration of the `with_webview` closure,
+    // which runs on the main thread (checked above).
+    unsafe {
+        let webview: &WKWebView = &*platform.inner().cast::<WKWebView>();
+        let store = webview.configuration().websiteDataStore();
+        let types = WKWebsiteDataStore::allWebsiteDataTypes(main_thread);
+        let since = NSDate::dateWithTimeIntervalSince1970(0.0);
+        let done = block2::RcBlock::new(move || reply.send(Ok(())));
+        store.removeDataOfTypes_modifiedSince_completionHandler(&types, &since, &done);
+    }
+}
+
+/// Windows: `ICoreWebView2Profile2::ClearBrowsingDataAll` on the webview's
+/// profile, answered with the status its completion handler reports.
+#[cfg(windows)]
+fn clear_profile(platform: PlatformWebview, reply: Reply) {
+    use webview2_com::ClearBrowsingDataCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_13, ICoreWebView2Profile2};
+    use windows_core::Interface;
+
+    let done = reply.clone();
+    // SAFETY: COM calls on the controller Tauri created for this webview, on
+    // the thread that owns it (`with_webview` runs there).
+    let started = unsafe {
+        platform
+            .controller()
+            .CoreWebView2()
+            .and_then(|core| core.cast::<ICoreWebView2_13>())
+            .and_then(|core| core.Profile())
+            .and_then(|profile| profile.cast::<ICoreWebView2Profile2>())
+            .and_then(|profile| {
+                profile.ClearBrowsingDataAll(&ClearBrowsingDataCompletedHandler::create(Box::new(
+                    move |status| {
+                        done.send(status.map_err(|error| error.to_string()));
+                        Ok(())
+                    },
+                )))
+            })
+    };
+    if let Err(error) = started {
+        reply.send(Err(error.to_string()));
+    }
+}
+
+/// Any other platform: nothing to clear with, said as a failure.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn clear_profile(_platform: PlatformWebview, reply: Reply) {
+    reply.send(Err("signing out is not supported on this platform.".into()));
 }
 
 /// What sign-out answers on macOS before 14, where the profile is the app's own.
@@ -1210,21 +1727,29 @@ mod tests {
     }
 
     /// Decision 4, driven through Tauri's own IPC: a request from the PR
-    /// webview is refused for an app command at a GitHub origin, and for a
-    /// core command at ANY origin — while the same requests from the main
-    /// webview are answered, which is what shows the refusals are the ACL's and
-    /// not the harness failing everything. (An app command from the PR webview
-    /// at a LOCAL origin is the one request Tauri's ACL does not check; that
-    /// origin never loads there — `the_apps_own_origins_never_load_in_the_browser`
-    /// — and every app command refuses a caller other than the main webview
-    /// anyway — `every_app_command_refuses_a_webview_other_than_main`.)
+    /// webview is refused BY THE ACL for an app command at a GitHub origin,
+    /// and for a core or plugin command at ANY origin — while the same
+    /// requests from the main webview pass the ACL and are answered, which is
+    /// what shows the refusals are the ACL's and not the harness failing
+    /// everything. Each refusal is matched on the ACL's own message, so a
+    /// command that failed for another reason (a plugin not installed, a body
+    /// it could not read) cannot pass for one. (An app command from the PR
+    /// webview at a LOCAL origin is the one request Tauri's ACL does not check
+    /// for an app command; that origin never loads there —
+    /// `the_apps_own_origins_never_load_in_the_browser` — and every app
+    /// command refuses a caller other than the main webview anyway —
+    /// `every_app_command_refuses_a_webview_other_than_main`.)
+    ///
+    /// The clipboard plugin is a stand-in under the real one's name and
+    /// command: the ACL decides by those names before any plugin code runs,
+    /// and the real plugin would write the developer's clipboard on every run.
     ///
     /// Not on Windows, for the reason `Cargo.toml` gives for the `test` feature.
     #[cfg(not(windows))]
     #[test]
     fn the_pr_webview_cannot_invoke_commands() {
         use tauri::ipc::{CallbackFn, InvokeBody};
-        use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+        use tauri::test::{INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder};
         use tauri::webview::InvokeRequest;
 
         /// Stands in for every app command: the ACL decides before any
@@ -1234,7 +1759,17 @@ mod tests {
             "reached"
         }
 
+        /// The clipboard plugin's `write_text`, writing nothing.
+        #[tauri::command]
+        fn write_text(text: String) -> usize {
+            text.len()
+        }
+
+        let clipboard = tauri::plugin::Builder::<MockRuntime>::new("clipboard-manager")
+            .invoke_handler(tauri::generate_handler![write_text])
+            .build();
         let app = mock_builder()
+            .plugin(clipboard)
             .invoke_handler(tauri::generate_handler![probe])
             .build(tauri::generate_context!())
             .expect("a mock app");
@@ -1255,12 +1790,12 @@ mod tests {
             )
             .expect("the PR webview");
 
-        let request = |cmd: &str, origin: &str| InvokeRequest {
+        let request = |cmd: &str, origin: &str, body: serde_json::Value| InvokeRequest {
             cmd: cmd.into(),
             callback: CallbackFn(0),
             error: CallbackFn(1),
             url: url(origin),
-            body: InvokeBody::default(),
+            body: InvokeBody::Json(body),
             headers: Default::default(),
             invoke_key: INVOKE_KEY.to_string(),
         };
@@ -1271,38 +1806,114 @@ mod tests {
         };
         // `get_ipc_response` takes anything that is `AsRef<Webview>`, which a
         // window's webview is and a child webview is not.
-        struct Child<'a>(&'a tauri::Webview<tauri::test::MockRuntime>);
-        impl AsRef<tauri::Webview<tauri::test::MockRuntime>> for Child<'_> {
-            fn as_ref(&self) -> &tauri::Webview<tauri::test::MockRuntime> {
+        struct Child<'a>(&'a tauri::Webview<MockRuntime>);
+        impl AsRef<tauri::Webview<MockRuntime>> for Child<'_> {
+            fn as_ref(&self) -> &tauri::Webview<MockRuntime> {
                 self.0
             }
         }
         let pr = Child(&pr);
 
-        // The control: the main webview reaches both.
-        assert!(get_ipc_response(&main, request("plugin:app|version", local)).is_ok());
-        assert!(get_ipc_response(&main, request("probe", local)).is_ok());
+        let none = serde_json::json!({});
+        let clipboard_text = serde_json::json!({ "text": "from a test" });
+        let listen = serde_json::json!({
+            "event": "pr-browser-test",
+            "target": { "kind": "Any" },
+            "handler": 7,
+        });
+        let emit = serde_json::json!({ "event": "pr-browser-test", "payload": null });
+        let calls = [
+            ("probe", &none),
+            ("plugin:app|version", &none),
+            ("plugin:clipboard-manager|write_text", &clipboard_text),
+            ("plugin:event|listen", &listen),
+            ("plugin:event|emit", &emit),
+        ];
 
-        // The PR webview at GitHub's origin reaches neither.
+        /// The ACL's refusal: Tauri's `resolve_access_message` in a debug
+        /// build ("… not allowed on …" / "… not allowed. …") and "Command …
+        /// not allowed by ACL" in a release one.
+        fn refused_by_acl<T>(answer: &Result<T, serde_json::Value>) -> bool {
+            matches!(answer, Err(serde_json::Value::String(message)) if message.contains("not allowed"))
+        }
+
+        // The control: the main webview, at the app's own origin, reaches
+        // every one of them and each is answered.
+        for (cmd, body) in calls {
+            let answer = get_ipc_response(&main, request(cmd, local, body.clone()));
+            assert!(answer.is_ok(), "main webview, {cmd}: {answer:?}");
+        }
+
+        // The PR webview at GitHub's origin reaches none of them.
         let github = "https://github.com/o/r/pull/7";
-        assert!(get_ipc_response(&pr, request("probe", github)).is_err());
-        assert!(get_ipc_response(&pr, request("plugin:app|version", github)).is_err());
-        assert!(
-            get_ipc_response(&pr, request("plugin:clipboard-manager|write_text", github)).is_err()
-        );
-        assert!(get_ipc_response(&pr, request("plugin:event|listen", github)).is_err());
+        for (cmd, body) in calls {
+            let answer = get_ipc_response(&pr, request(cmd, github, body.clone()));
+            assert!(
+                refused_by_acl(&answer),
+                "PR webview at GitHub, {cmd}: {answer:?}"
+            );
+        }
 
-        // Nor a core command at the app's own origin: no capability names this
-        // webview, which is what scoping to the main WEBVIEW rather than the
-        // main window buys.
-        assert!(get_ipc_response(&pr, request("plugin:app|version", local)).is_err());
+        // Nor a core or plugin command at the app's own origin: no capability
+        // names this webview, which is what scoping to the main WEBVIEW rather
+        // than the main window buys. (`probe` at this origin is the case the
+        // ACL does not check, so it is not in this list — see above.)
+        for (cmd, body) in &calls[1..] {
+            let answer = get_ipc_response(&pr, request(cmd, local, (*body).clone()));
+            assert!(
+                refused_by_acl(&answer),
+                "PR webview at the app's origin, {cmd}: {answer:?}"
+            );
+        }
+
+        // The one internal command Tauri exempts from the ACL is the channel
+        // fetch (`plugin:__TAURI_CHANNEL__|fetch`), answered for whichever
+        // webview the channel was made for; the PR webview has none, so it
+        // gets the command's own error, and the ACL does not refuse it. Pinned
+        // here so a Tauri that closes or widens the exemption is noticed.
+        let fetch = get_ipc_response(
+            &pr,
+            request("plugin:__TAURI_CHANNEL__|fetch", github, none.clone()),
+        );
+        assert!(fetch.is_err() && !refused_by_acl(&fetch), "{fetch:?}");
+    }
+
+    /// A function body's first statement: past blank lines, comments and
+    /// `use` items, which run nothing.
+    fn first_statement(body: &str) -> &str {
+        let mut rest = body;
+        loop {
+            rest = rest.trim_start();
+            if rest.starts_with("//") {
+                rest = rest.split_once('\n').map_or("", |(_, tail)| tail);
+            } else if rest.starts_with("use ") {
+                rest = rest.split_once(';').map_or("", |(_, tail)| tail);
+            } else {
+                return rest;
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_statement_skips_only_what_runs_nothing() {
+        assert_eq!(
+            first_statement(
+                "\n    // why\n    use a::b;\n    use c::{d, e};\n    ensure_main_webview(&webview)?;\n    go()"
+            ),
+            "ensure_main_webview(&webview)?;\n    go()"
+        );
+        assert!(
+            !first_statement("\n    let x = run();\n    ensure_main_webview(&webview)?;")
+                .starts_with("ensure_main_webview")
+        );
     }
 
     /// The app's own commands carry a check of their own: each one refuses a
-    /// caller that is not the main webview, so even the request the ACL does
-    /// not check (an app command at a local origin) is refused from the PR
-    /// webview. A text scan of every `#[tauri::command]` in `lib.rs`, so a new
-    /// command without the check fails here.
+    /// caller that is not the main webview, as its first statement (after
+    /// `use` items), so nothing a command does runs for the PR webview — even
+    /// the request the ACL does not check (an app command at a local origin).
+    /// A text scan of every `#[tauri::command]` in `lib.rs`, so a new command
+    /// without the check, or with work before it, fails here.
     #[test]
     fn every_app_command_refuses_a_webview_other_than_main() {
         let source = include_str!("lib.rs");
@@ -1322,10 +1933,10 @@ mod tests {
                 .find("\n}\n")
                 .map(|end| open + end)
                 .unwrap_or(rest.len());
-            let body = &rest[open..body_end];
+            let body = &rest[open + 1..body_end];
             assert!(
-                body.contains("ensure_main_webview(&webview)"),
-                "`{name}` does not refuse a webview other than the main one"
+                first_statement(body).starts_with("ensure_main_webview(&webview)"),
+                "`{name}` does not refuse a webview other than the main one as its first statement"
             );
             commands += 1;
         }
@@ -1333,5 +1944,362 @@ mod tests {
             commands > 30,
             "the scan found only {commands} commands; it is not reading lib.rs as written"
         );
+    }
+
+    /// A recorder whose hand-offs go through a gate, on a clock the test sets.
+    struct Gated<'a> {
+        gate: &'a HandOffGate,
+        now: std::cell::Cell<Instant>,
+        launched: RefCell<Vec<String>>,
+    }
+
+    impl Effects for Gated<'_> {
+        fn open_external(&self, url: &Url) {
+            if self.gate.admit(self.now.get()) == Admission::Launch {
+                self.launched.borrow_mut().push(url.to_string());
+                self.gate.finished();
+            }
+        }
+        fn close(&self) {}
+        fn navigate(&self, _url: &Url) {}
+    }
+
+    /// Scenario: a page's script navigates off GitHub twenty times in a
+    /// second, by navigation and by new-window requests; the system browser
+    /// opens once. Two seconds later the user clicks a link off GitHub, and
+    /// that one opens.
+    #[test]
+    fn a_burst_of_hand_offs_opens_the_system_browser_once() {
+        let gate = HandOffGate::new(HAND_OFF_INTERVAL);
+        let start = Instant::now();
+        let effects = Gated {
+            gate: &gate,
+            now: std::cell::Cell::new(start),
+            launched: RefCell::new(Vec::new()),
+        };
+        for step in 0..20u64 {
+            effects.now.set(start + Duration::from_millis(step * 50));
+            let target = url(&format!("https://example.com/{step}"));
+            if step % 2 == 0 {
+                assert!(!decide_navigation(&target, &effects));
+            } else {
+                decide_new_window(&target, &effects);
+            }
+        }
+        assert_eq!(*effects.launched.borrow(), vec!["https://example.com/0"]);
+
+        effects.now.set(start + Duration::from_secs(3));
+        assert!(!decide_navigation(&url("https://docs.rs/tauri"), &effects));
+        assert_eq!(
+            *effects.launched.borrow(),
+            vec!["https://example.com/0", "https://docs.rs/tauri"]
+        );
+    }
+
+    #[test]
+    fn the_gate_is_single_flight_and_reports_a_burst_once() {
+        let gate = HandOffGate::new(Duration::from_millis(1500));
+        let start = Instant::now();
+        assert_eq!(gate.admit(start), Admission::Launch);
+        // Still launching, however long that takes: nothing else goes.
+        assert_eq!(
+            gate.admit(start + Duration::from_secs(10)),
+            Admission::Drop { report: true }
+        );
+        assert_eq!(
+            gate.admit(start + Duration::from_secs(11)),
+            Admission::Drop { report: false }
+        );
+        gate.finished();
+        let later = start + Duration::from_secs(12);
+        assert_eq!(gate.admit(later), Admission::Launch);
+        gate.finished();
+        // Within the interval of the last launch: dropped, and reported again
+        // because a launch happened since the last report.
+        assert_eq!(
+            gate.admit(later + Duration::from_millis(1499)),
+            Admission::Drop { report: true }
+        );
+        assert_eq!(
+            gate.admit(later + Duration::from_millis(1500)),
+            Admission::Launch
+        );
+    }
+
+    #[test]
+    fn while_clearing_nothing_loads_but_the_empty_page() {
+        assert!(decide_navigation_while_clearing(&url("about:blank")));
+        for refused in [
+            "https://github.com/o/r/pull/7",
+            "https://example.com/",
+            CLOSE_URL,
+            "about:srcdoc",
+        ] {
+            assert!(
+                !decide_navigation_while_clearing(&url(refused)),
+                "{refused}"
+            );
+        }
+    }
+
+    /// How a fake step answers.
+    #[derive(Clone)]
+    enum FakeAnswer {
+        After(Duration, Result<(), String>),
+        Never,
+        Dropped,
+    }
+
+    /// The sign-out host, recording each step in order. Its answers come from
+    /// tasks on tokio's paused clock, so "late" costs no wall time.
+    struct FakeSignOut {
+        browser: Browser,
+        leave: FakeAnswer,
+        clear: FakeAnswer,
+        clearing: &'static AtomicBool,
+        log: Arc<Mutex<Vec<String>>>,
+        kept: Mutex<Vec<oneshot::Sender<Result<(), String>>>>,
+    }
+
+    impl FakeSignOut {
+        fn new(browser: Browser, leave: FakeAnswer, clear: FakeAnswer) -> Self {
+            Self {
+                browser,
+                leave,
+                clear,
+                clearing: Box::leak(Box::new(AtomicBool::new(false))),
+                log: Arc::new(Mutex::new(Vec::new())),
+                kept: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn note(&self, step: impl Into<String>) {
+            self.log.lock().unwrap().push(step.into());
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn answer(&self, how: &FakeAnswer, done: &'static str) -> Answer {
+            let (sender, answer) = oneshot::channel();
+            match how.clone() {
+                FakeAnswer::After(delay, result) => {
+                    let log = self.log.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        log.lock().unwrap().push(done.to_string());
+                        let _ = sender.send(result);
+                    });
+                }
+                FakeAnswer::Never => self.kept.lock().unwrap().push(sender),
+                FakeAnswer::Dropped => drop(sender),
+            }
+            answer
+        }
+    }
+
+    impl SignOutHost for FakeSignOut {
+        fn browser(&self) -> Browser {
+            self.browser.clone()
+        }
+        fn leave_page(&self) -> Answer {
+            assert!(
+                self.clearing.load(Ordering::SeqCst),
+                "left the page before raising the flag"
+            );
+            self.note("leave");
+            self.answer(&self.leave, "left")
+        }
+        fn open_scratch(&self) -> Result<(), String> {
+            self.note("scratch:open");
+            Ok(())
+        }
+        fn clear(&self, with: ClearWith) -> Answer {
+            assert!(
+                self.clearing.load(Ordering::SeqCst),
+                "cleared without raising the flag"
+            );
+            self.note(format!("clear:{with:?}"));
+            self.answer(&self.clear, "cleared")
+        }
+        fn close_scratch(&self) {
+            self.note("scratch:close");
+        }
+        fn resume(&self, url: Url) {
+            assert!(
+                !self.clearing.load(Ordering::SeqCst),
+                "resumed with the flag still raised"
+            );
+            self.note(format!("resume:{url}"));
+        }
+        fn close_browser(&self) {
+            self.note("browser:close");
+        }
+    }
+
+    const PR: &str = "https://github.com/o/r/pull/7";
+    const TIMEOUTS: SignOutTimeouts = SignOutTimeouts {
+        leave: LEAVE_TIMEOUT,
+        clear: CLEAR_TIMEOUT,
+    };
+
+    fn open_browser() -> Browser {
+        Browser::Open {
+            resume: Some(url(PR)),
+        }
+    }
+
+    /// Runs sign-out as its own task and looks at it one second in, while the
+    /// platform has not yet confirmed a clear it was asked for five seconds
+    /// ago: returns what the log held then, whether the session was free
+    /// (an `open` would not have waited) and the final result.
+    async fn run_with_a_look(
+        host: Arc<FakeSignOut>,
+    ) -> (Vec<String>, bool, Result<(), String>, Vec<String>) {
+        let session: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
+        let running = {
+            let host = host.clone();
+            tokio::spawn(
+                async move { sign_out_with(&*host, session, host.clearing, TIMEOUTS).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let midway = host.log();
+        let session_free = session.try_lock().is_ok();
+        let result = running.await.expect("sign-out ran");
+        assert!(
+            !host.clearing.load(Ordering::SeqCst),
+            "the flag stayed raised"
+        );
+        assert!(session.try_lock().is_ok(), "the session stayed held");
+        (midway, session_free, result, host.log())
+    }
+
+    /// Scenario: with a pull request open, the user signs out; the platform
+    /// takes five seconds to confirm the delete. The page is emptied first,
+    /// nothing reopens and no pull request can open until the confirmation,
+    /// and only then does the page come back — signed out.
+    #[tokio::test(start_paused = true)]
+    async fn sign_out_with_a_browser_open_reopens_only_after_the_clear_completes() {
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::After(Duration::from_millis(100), Ok(())),
+            FakeAnswer::After(Duration::from_secs(5), Ok(())),
+        ));
+        let (midway, session_free, result, log) = run_with_a_look(host).await;
+        assert_eq!(midway, ["leave", "left", "clear:Browser"]);
+        assert!(!session_free, "a pull request could open mid-clear");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            log,
+            [
+                "leave",
+                "left",
+                "clear:Browser",
+                "cleared",
+                &format!("resume:{PR}")
+            ]
+        );
+    }
+
+    /// Scenario: with no pull request open, the user signs out; the hidden
+    /// webview stays open until the platform confirms the delete five seconds
+    /// later, and only then is "signed out" answered.
+    #[tokio::test(start_paused = true)]
+    async fn sign_out_with_no_browser_closes_the_hidden_webview_only_after_the_clear_completes() {
+        let host = Arc::new(FakeSignOut::new(
+            Browser::Closed,
+            FakeAnswer::Never,
+            FakeAnswer::After(Duration::from_secs(5), Ok(())),
+        ));
+        let (midway, session_free, result, log) = run_with_a_look(host).await;
+        assert_eq!(midway, ["scratch:open", "clear:Scratch"]);
+        assert!(!session_free, "a pull request could open mid-clear");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            log,
+            ["scratch:open", "clear:Scratch", "cleared", "scratch:close"]
+        );
+    }
+
+    /// A delete the platform reports as failed is an error, and the open
+    /// browser is closed rather than put back on a profile that may still
+    /// hold the sign-in.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_clear_is_reported_and_nothing_reopens() {
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::After(Duration::ZERO, Ok(())),
+            FakeAnswer::After(Duration::from_secs(2), Err("disk full".into())),
+        ));
+        let (_, _, result, log) = run_with_a_look(host).await;
+        assert_eq!(result, Err("disk full".into()));
+        assert_eq!(
+            log,
+            ["leave", "left", "clear:Browser", "cleared", "browser:close"]
+        );
+
+        let host = Arc::new(FakeSignOut::new(
+            Browser::Closed,
+            FakeAnswer::Never,
+            FakeAnswer::After(Duration::from_secs(2), Err("disk full".into())),
+        ));
+        let (_, _, result, log) = run_with_a_look(host).await;
+        assert_eq!(result, Err("disk full".into()));
+        assert_eq!(
+            log,
+            ["scratch:open", "clear:Scratch", "cleared", "scratch:close"]
+        );
+    }
+
+    /// Time passing is never taken as the delete having run: a platform that
+    /// never confirms makes sign-out fail, on either path.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_that_is_never_confirmed_is_a_failure_not_a_success() {
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::After(Duration::ZERO, Ok(())),
+            FakeAnswer::Never,
+        ));
+        let (_, _, result, log) = run_with_a_look(host).await;
+        assert_eq!(result, Err(CLEAR_UNCONFIRMED.into()));
+        assert_eq!(log, ["leave", "left", "clear:Browser", "browser:close"]);
+
+        let host = Arc::new(FakeSignOut::new(
+            Browser::Closed,
+            FakeAnswer::Never,
+            FakeAnswer::Never,
+        ));
+        let (_, _, result, log) = run_with_a_look(host).await;
+        assert_eq!(result, Err(CLEAR_UNCONFIRMED.into()));
+        assert_eq!(log, ["scratch:open", "clear:Scratch", "scratch:close"]);
+
+        // A platform that drops its callback without calling it is no answer either.
+        let host = Arc::new(FakeSignOut::new(
+            Browser::Closed,
+            FakeAnswer::Never,
+            FakeAnswer::Dropped,
+        ));
+        let (_, _, result, _) = run_with_a_look(host).await;
+        assert_eq!(result, Err("the system gave no answer.".into()));
+    }
+
+    /// A page that does not empty in time is never cleared under: sign-out
+    /// fails, closes the browser and asks the platform for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_that_does_not_leave_is_never_cleared_under() {
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::Never,
+            FakeAnswer::After(Duration::ZERO, Ok(())),
+        ));
+        let (_, _, result, log) = run_with_a_look(host).await;
+        assert_eq!(
+            result,
+            Err("the pull request page did not close in time.".into())
+        );
+        assert_eq!(log, ["leave", "browser:close"]);
     }
 }

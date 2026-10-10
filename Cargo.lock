@@ -1404,6 +1404,7 @@ dependencies = [
 name = "dot-agent-deck-desktop"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "chrono",
  "cpal",
  "dot-agent-deck",
@@ -1413,6 +1414,9 @@ dependencies = [
  "http",
  "keyring",
  "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-web-kit",
  "open",
  "reqwest",
  "serde",
@@ -1423,6 +1427,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
+ "webkit2gtk",
+ "webview2-com",
+ "windows-core",
  "windows-sys 0.61.2",
  "zbus",
 ]
