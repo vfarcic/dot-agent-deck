@@ -689,7 +689,12 @@ mod tests {
         let hello = running.then(|| {
             crate::daemon_protocol::AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
         });
-        let line = serde_json::to_string(&DaemonProbe { running, hello }).unwrap();
+        let line = serde_json::to_string(&DaemonProbe {
+            running,
+            hello,
+            confirm_stdin: false,
+        })
+        .unwrap();
         out(0, &line, "")
     }
 

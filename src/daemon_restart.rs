@@ -20,7 +20,6 @@
 //!
 //! [`AttachRequest::RestartDaemon`]: crate::daemon_protocol::AttachRequest::RestartDaemon
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -41,7 +40,7 @@ pub const RESTART_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most of `<target> --version`'s stdout the daemon keeps. One short line
 /// is the honest answer; this bounds a binary that never stops printing.
-const VERSION_OUTPUT_CAP: u64 = 8 * 1024;
+const VERSION_OUTPUT_CAP: usize = 8 * 1024;
 
 /// What the daemon recorded about its own binary when it started.
 ///
@@ -421,7 +420,20 @@ fn strip_v(v: &str) -> &str {
 }
 
 /// Run `<target> --version` with a wall-clock bound and a byte cap on stdout.
+///
+/// The reader never outlives the call (issue #1615). A descendant of the target
+/// that inherited its stdout keeps the pipe open after the target exits or is
+/// killed, so a reader blocked in `read` would wait on that descendant, not on
+/// the target. The pipe is drained by [`PipeReader`] instead, which on Unix
+/// reads non-blocking and is cancelled on every path that returns before the
+/// pipe closed: a target past the deadline, a failed wait, an unsuccessful exit,
+/// and output still open after a successful one. A cancelled reader stops within
+/// a poll tick and closes its end of the pipe, so the descendant's next write
+/// fails rather than reaching a thread nobody is waiting for. Elsewhere the read
+/// blocks, and a reader still running after the cancel's grace is abandoned, as
+/// [`crate::remote::run_local_bounded`] abandons one.
 pub(crate) fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, String> {
+    use crate::remote::PipeReader;
     use std::process::{Command, Stdio};
     let deadline = Instant::now() + timeout;
     // A file written moments ago can still be held open for writing by a
@@ -445,38 +457,43 @@ pub(crate) fn run_version_bounded(target: &Path, timeout: Duration) -> Result<St
             Err(e) => return Err(format!("it could not be started ({e})")),
         }
     };
-    let stdout = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(out) = stdout {
-            let _ = out.take(VERSION_OUTPUT_CAP).read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
+    let Some(stdout) = child.stdout.take() else {
+        stop_without_waiting(child);
+        return Err("its output could not be read".to_string());
+    };
+    let reader = PipeReader::spawn(stdout, Some(VERSION_OUTPUT_CAP));
+    let stop_reader = || PipeReader::stop_all(&[&reader]);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
                 stop_without_waiting(child);
+                stop_reader();
                 return Err(format!("it did not exit within {}s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("waiting for it failed ({e})")),
+            Err(e) => {
+                stop_without_waiting(child);
+                stop_reader();
+                return Err(format!("waiting for it failed ({e})"));
+            }
         }
     };
     if !status.success() {
+        stop_reader();
         return Err(format!("it exited with {status}"));
     }
     // A grandchild holding the pipe open must not hang the daemon: wait for the
     // reader only until the same deadline (plus a moment for the final read).
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(200));
-    let buf = rx
-        .recv_timeout(remaining)
-        .map_err(|_| "its output did not close".to_string())?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let until = deadline.max(Instant::now() + Duration::from_millis(200));
+    while !reader.is_done() {
+        if Instant::now() >= until {
+            stop_reader();
+            return Err("its output did not close".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(String::from_utf8_lossy(&reader.take()).into_owned())
 }
 
 /// The part of a child process [`stop_without_waiting`] uses, so a test can
@@ -1005,6 +1022,12 @@ pub struct DaemonProbe {
     pub running: bool,
     #[serde(default)]
     pub hello: Option<AttachResponse>,
+    /// Whether this binary's `daemon restart-installed` reads the confirmed
+    /// stop set from stdin (`--confirm-stdin`, issue #1619). A build that
+    /// predates it omits the field, which reads as `false`, so a caller never
+    /// sends the flag to a binary that would refuse it as a usage error.
+    #[serde(default)]
+    pub confirm_stdin: bool,
 }
 
 /// What `dot-agent-deck daemon restart-installed --json` prints.
@@ -1033,9 +1056,45 @@ pub const RESTART_NOT_SENT_EXIT: u8 = 1;
 /// (and clap's usage error) the same way, a crash after the send included.
 pub const RESTART_UNANSWERED_EXIT: u8 = 3;
 
+/// The longest `--confirm-hex` argument a caller passes (issue #1619). The ssh
+/// route runs one remote command string, which the remote shell receives as
+/// one argument, and Linux refuses any single argument over `MAX_ARG_STRLEN`
+/// (128 KiB) — on the laptop's `ssh` spawn and again on the remote's exec. This
+/// leaves the rest of the command well clear of that limit.
+pub const MAX_CONFIRM_HEX_LEN: usize = 96 * 1024;
+
+/// The most `restart-installed --confirm-stdin` reads from stdin. Far above
+/// any stop set a daemon could ask to confirm, and below the attach protocol's
+/// frame limit, so a stop set this command accepts can always be sent on.
+pub const MAX_CONFIRM_STDIN_LEN: u64 = 4 * 1024 * 1024;
+
+const _: () = assert!(MAX_CONFIRM_STDIN_LEN < crate::daemon_protocol::MAX_FRAME_LEN as u64);
+
+/// Read the confirmed stop set `restart-installed --confirm-stdin` was given:
+/// the [`RestartStopSet`]'s JSON, to EOF, refused past
+/// [`MAX_CONFIRM_STDIN_LEN`]. The ssh route writes it there when the set is
+/// too large for the command line (issue #1619).
+///
+/// Empty input is named as such: it is what an ssh client configured with
+/// `StdinNull yes` delivers in place of the set.
+pub fn read_stop_set(reader: impl std::io::Read) -> Result<RestartStopSet, String> {
+    let json = crate::bounded_read::read_capped(reader, MAX_CONFIRM_STDIN_LEN, "stdin")?;
+    if json.trim().is_empty() {
+        return Err("stdin was empty (an ssh client set to `StdinNull yes` sends nothing)".into());
+    }
+    serde_json::from_str(&json).map_err(|e| format!("not a stop set: {e}"))
+}
+
+/// How long `restart-installed --confirm-stdin` waits for its stdin to close
+/// before it gives up with nothing sent. The ssh route writes the set and
+/// closes stdin at once; this bounds a caller that leaves the pipe open.
+pub const CONFIRM_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Hex-encode a [`RestartStopSet`]'s JSON for `restart-installed
-/// --confirm-hex`. Hex keeps the argument free of shell metacharacters,
-/// because the ssh route takes one command string and no stdin.
+/// --confirm-hex`. Hex keeps the argument free of shell metacharacters on the
+/// ssh route's one command string. A build that reads `--confirm-stdin`
+/// ([`DaemonProbe::confirm_stdin`]) is sent the JSON on stdin instead, and an
+/// older one only a set whose encoding fits [`MAX_CONFIRM_HEX_LEN`].
 pub fn encode_stop_set_hex(set: &RestartStopSet) -> String {
     let json = serde_json::to_vec(set).unwrap_or_default();
     let mut out = String::with_capacity(json.len() * 2);
@@ -1060,6 +1119,27 @@ pub fn decode_stop_set_hex(hex: &str) -> Result<RestartStopSet, String> {
         })
         .collect::<Result<Vec<u8>, String>>()?;
     serde_json::from_slice(&bytes).map_err(|e| format!("not a stop set: {e}"))
+}
+
+/// A stop set whose `--confirm-hex` encoding is longer than Linux's 128 KiB
+/// per-argument limit (`MAX_ARG_STRLEN`), shaped like a daemon's: one
+/// agent per pane with a label and a working directory (issue #1619).
+#[cfg(test)]
+pub(crate) fn stop_set_over_the_argument_limit() -> RestartStopSet {
+    let agents = (0..600)
+        .map(|i| RestartAgent {
+            id: format!("agent-{i:04}-0123456789abcdef"),
+            label: format!("claude: refactor the module at index {i}"),
+            pane_id: Some(format!("pane-{i}")),
+            cwd: Some(format!("/home/someone/work/repository-{i}/worktree")),
+        })
+        .collect();
+    let set = RestartStopSet {
+        agents,
+        roles: Vec::new(),
+    };
+    assert!(encode_stop_set_hex(&set).len() > 128 * 1024);
+    set
 }
 
 #[cfg(test)]
@@ -1205,6 +1285,34 @@ mod tests {
         assert!(decode_stop_set_hex("7b").is_err());
     }
 
+    /// Scenario: `restart-installed --confirm-stdin` is given a stop set whose
+    /// hex form would exceed the 128 KiB argument limit. It reads the whole
+    /// set from stdin; garbage, and input past the stdin cap, are refused
+    /// (issue #1619).
+    #[test]
+    fn confirm_stdin_reads_a_set_too_large_for_the_command_line() {
+        let s = stop_set_over_the_argument_limit();
+        assert!(encode_stop_set_hex(&s).len() > MAX_CONFIRM_HEX_LEN);
+        let json = serde_json::to_vec(&s).unwrap();
+        assert_eq!(read_stop_set(json.as_slice()).unwrap(), s);
+        assert!(read_stop_set(&b"not json"[..]).is_err());
+        let err = read_stop_set(&b"\n"[..]).unwrap_err();
+        assert!(err.contains("stdin was empty"), "{err}");
+        use std::io::Read as _;
+        let endless = std::io::repeat(b' ').take(MAX_CONFIRM_STDIN_LEN + 1);
+        let err = read_stop_set(endless).unwrap_err();
+        assert!(err.contains("stdin"), "{err}");
+    }
+
+    /// Scenario: `daemon probe --json` from a build that predates
+    /// `--confirm-stdin` has no `confirm_stdin` field, which reads as `false`,
+    /// so the caller keeps sending such a build `--confirm-hex` (issue #1619).
+    #[test]
+    fn a_probe_without_the_stdin_field_reads_as_hex_only() {
+        let probe: DaemonProbe = serde_json::from_str(r#"{"running":false,"hello":null}"#).unwrap();
+        assert!(!probe.confirm_stdin);
+    }
+
     // ---- resolve_restart_target ----
 
     #[cfg(unix)]
@@ -1331,6 +1439,57 @@ mod tests {
             "the bound must hold: {:?}",
             started.elapsed()
         );
+    }
+
+    /// Scenario: the target leaves a child behind that keeps its stdout open
+    /// and writes to it every 50ms — and the target itself exits with a failure,
+    /// exits successfully, or hangs past the deadline. Each check is refused
+    /// within its bound, and the reader has closed its end of the pipe: the
+    /// child's next write fails with `EPIPE` and it records that in a marker
+    /// file. A reader still blocked in `read` would keep taking those writes,
+    /// so the marker would never appear (issue #1615).
+    #[cfg(unix)]
+    #[test]
+    fn the_version_reader_is_stopped_when_a_child_keeps_stdout_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, ending, timeout) in [
+            ("fails", "exit 3", RESTART_VERIFY_TIMEOUT),
+            (
+                "succeeds",
+                "echo 'dot-agent-deck 0.46.0'; exit 0",
+                Duration::from_millis(500),
+            ),
+            ("hangs", "exec sleep 30", Duration::from_millis(500)),
+        ] {
+            let marker = dir.path().join(format!("{name}.epipe"));
+            // The writer ignores SIGPIPE so a closed pipe is an error status
+            // it can act on, and gives up after ~20s so a regression leaves no
+            // process behind for long.
+            let body = format!(
+                "(trap '' PIPE; i=0; while [ $i -lt 400 ]; do \
+                   echo tick || {{ : > '{}'; exit 0; }}; \
+                   i=$((i+1)); sleep 0.05; done) &\n{ending}",
+                marker.display()
+            );
+            let p = script(dir.path(), name, &body, 0o755);
+            let started = Instant::now();
+            let err = verify_restart_target(&p, None, timeout).unwrap_err();
+            assert_eq!(err.0, RestartRefusalReason::TargetDidNotAnswer, "{name}");
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "{name}: the bound must hold: {:?}",
+                started.elapsed()
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                marker.exists(),
+                "{name}: the reader must close the pipe once the check returns ({})",
+                err.1
+            );
+        }
     }
 
     /// A child that ignores the kill and blocks in `wait` until released.
