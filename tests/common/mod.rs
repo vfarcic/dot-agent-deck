@@ -11305,7 +11305,7 @@ pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Resul
 /// prefer it over [`wait_for_path_async`] + an immediate read: a shell
 /// redirect creates the file before the write lands (issue #244).
 #[allow(dead_code)]
-async fn wait_for_file_matching_async(
+pub async fn wait_for_file_matching_async(
     path: &Path,
     timeout: Duration,
     matches: impl Fn(&str) -> bool,
