@@ -3169,9 +3169,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     stopAnswerForSpeech();
     setPhase("transcribing");
     /* PRD #1497 D8 — the segment ends here, and the next one starts. */
-    overlappedRef.current = reader.takeSegment();
+    const segment = reader.takeSegment();
+    overlappedRef.current = segment.overlapped();
     try {
-      const transcription = await voiceStop();
+      let transcription;
+      try {
+        transcription = await voiceStop();
+      } finally {
+        /* PRD #1631 — the backend splits the recording somewhere inside
+           `voiceStop`, so the app's speech that starts before it resolves
+           may be in this utterance and counts against it. */
+        const overlapped = segment.close();
+        if (ours()) overlappedRef.current = overlapped;
+      }
       if (!ours()) return;
       /* PR #1451's hand test — a segment with no words in it says NOTHING.
          With voice on, most of these are a keyboard, a breath or the room

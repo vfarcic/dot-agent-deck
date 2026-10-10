@@ -7,7 +7,10 @@
  * recording overlaps the work on the previous utterance (PR #1451), so a
  * segment runs from one `voiceStop` to the next — {@link UseReadingMode.takeSegment}
  * is called at each — and the queue's `speaking` going true marks the open
- * segment as overlapped. "Is it speaking now" would be the wrong question: a
+ * segment as overlapped. Where the backend splits the recording inside
+ * `voiceStop` is not known here, so speech that starts at any time before
+ * `voiceStop` resolves also marks the segment it stopped (PRD #1631): it may
+ * be in that segment's buffer. It marks the next one too, which may hold it. "Is it speaking now" would be the wrong question: a
  * recording of the app's own voice ends after the voice does. Nor does the
  * next `voiceStart` begin a segment when it carries on with the kept device:
  * that recording began at the `voiceStop`, so speech that started and ended
@@ -25,11 +28,27 @@ import type { DeckRuntimeState } from "../types";
 /** Said when this build's runtime has no reading seam at all (the bare preview harness). */
 export const READING_NOT_IN_THIS_RUNTIME = "Reading is not available: this app cannot read an agent's turns here.";
 
+/** A recording segment {@link UseReadingMode.takeSegment} ended, while its `voiceStop` is pending. */
+export interface StoppedSegment {
+  /** Whether the app spoke during the segment so far. */
+  overlapped: () => boolean;
+  /**
+   * `voiceStop` settled: the app's speech no longer reaches this segment.
+   * Answers whether the app spoke during it, speech that started while
+   * `voiceStop` was pending included.
+   */
+  close: () => boolean;
+}
+
 export interface UseReadingMode {
   reader: DeckReader;
   queue: SpeechQueue;
-  /** End the current recording segment: answers whether the app spoke during it, and starts the next. */
-  takeSegment: () => boolean;
+  /**
+   * End the current recording segment, called as its `voiceStop` begins, and
+   * start the next. The stopped segment keeps being marked by the app's speech
+   * until its {@link StoppedSegment.close}.
+   */
+  takeSegment: () => StoppedSegment;
   /**
    * The microphone is recording again. `carried` says whether it carried on
    * with the device kept open since the last {@link takeSegment} (PR #1451),
@@ -96,8 +115,12 @@ export function useReadingMode(
   }, []);
 
   const spoke = useRef(false);
+  /* The segment whose `voiceStop` is pending, if any. */
+  const stopping = useRef<{ spoke: boolean } | null>(null);
   useEffect(() => queue.subscribe((speaking) => {
-    if (speaking) spoke.current = true;
+    if (!speaking) return;
+    spoke.current = true;
+    if (stopping.current) stopping.current.spoke = true;
   }), [queue]);
   /* A save from any window that turned reading's switch off ends reading
      here too — a start in progress included, which the Rust side has no
@@ -139,9 +162,16 @@ export function useReadingMode(
     reader,
     queue,
     takeSegment: () => {
-      const overlapped = spoke.current || queue.speaking;
+      const stopped = { spoke: spoke.current || queue.speaking };
+      stopping.current = stopped;
       spoke.current = queue.speaking;
-      return overlapped;
+      return {
+        overlapped: () => stopped.spoke,
+        close: () => {
+          if (stopping.current === stopped) stopping.current = null;
+          return stopped.spoke;
+        },
+      };
     },
     startSegment: (carried) => {
       spoke.current = carried ? spoke.current || queue.speaking : queue.speaking;
