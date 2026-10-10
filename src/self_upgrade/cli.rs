@@ -295,6 +295,8 @@ mod tests {
         assert!(out.contains("dot-agent-deck upgrade --yes"), "{out}");
     }
 
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn cli_004_the_upgrade_runs_off_the_runtime_thread() {
         use crate::self_upgrade::HomebrewFormula;

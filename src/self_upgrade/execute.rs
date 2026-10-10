@@ -1244,6 +1244,8 @@ mod tests {
         })
     }
 
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn execute_023_an_image_that_will_not_detach_is_named_in_the_outcome() {
         let root = tempfile::tempdir().unwrap();
@@ -1607,6 +1609,8 @@ mod tests {
         runtime.block_on(execute(&host, &brew_plan(), &source, Path::new("/stage")))
     }
 
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
     #[test]
     fn execute_022_a_brew_upgrade_is_upgraded_only_once_it_reports_the_offered_version() {
         let reached = brew_upgrade_reporting(Some("0.47.0")).unwrap();
