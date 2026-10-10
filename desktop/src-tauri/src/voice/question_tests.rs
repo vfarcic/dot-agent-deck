@@ -200,6 +200,105 @@ async fn question_desktop_007_grounding_drops_a_textless_selection_borrowing_ano
     }
 }
 
+fn assert_incomplete_form(
+    verdict: QuestionVerdict,
+    question: &DesktopPendingQuestion,
+    expected: Vec<Selection>,
+) {
+    match verdict {
+        QuestionVerdict::Answered {
+            form,
+            complete,
+            always,
+            ..
+        } => {
+            let send_refused = check_form("tester", question, "q-form", &form, false).is_err();
+            assert_eq!(
+                (form, complete, always.is_none(), send_refused),
+                (expected, false, true, true),
+                "a dropped question must stay unanswered, incomplete and unsendable"
+            );
+        }
+        other => panic!("the independently grounded answer should remain: {other:?}"),
+    }
+}
+
+/// Scenario: Sizes has a grounded Large selection as well as a textless
+/// selection borrowing Colour's free text. Dropping the latter leaves Sizes
+/// unanswered even with an earlier answer, so the form cannot arm or send.
+#[tokio::test]
+async fn question_desktop_007_borrowed_drop_cannot_be_refilled_by_a_kept_duplicate() {
+    let question = map_pending_question(&captured_form_question());
+    let said = "type my own colour: a hamster named Bob; large for sizes";
+    let answer = ModelAnswer::answer(0, &[4])
+        .with_text("a hamster named Bob")
+        .citing("type my own colour: a hamster named Bob")
+        .and(1, &[3])
+        .citing("large for sizes")
+        .and(1, &[4])
+        .citing("a hamster named Bob");
+    let resolver = StubResolver::new().answering_question(said, answer);
+    let mut colour = pick(0, &[4]);
+    colour.text = Some("a hamster named Bob".into());
+    for previous in [vec![], vec![pick(1, &[1])]] {
+        assert_incomplete_form(
+            say(&resolver, &question, &previous, said).await,
+            &question,
+            vec![colour.clone()],
+        );
+    }
+}
+
+/// Scenario: Colour has a grounded Red selection and a textless selection
+/// citing only part of Sizes' evidence. Dropping the contained evidence leaves
+/// Colour unanswered instead of refilling it from Red or an earlier choice.
+#[tokio::test]
+async fn question_desktop_007_contained_drop_cannot_be_refilled_by_a_kept_duplicate() {
+    let question = map_pending_question(&captured_form_question());
+    let said = "red for colour and small and large";
+    let answer = ModelAnswer::answer(0, &[1])
+        .citing("red for colour")
+        .and(1, &[1, 3])
+        .citing("small and large")
+        .and(0, &[4])
+        .citing("small");
+    let resolver = StubResolver::new().answering_question(said, answer);
+    for previous in [vec![], vec![pick(0, &[2])]] {
+        assert_incomplete_form(
+            say(&resolver, &question, &previous, said).await,
+            &question,
+            vec![pick(1, &[1, 3])],
+        );
+    }
+}
+
+/// Scenario: A grounded Sizes choice precedes a later Sizes free-text
+/// selection copying Colour's words. Dropping that copy clears Sizes rather
+/// than sending either its earlier choice or its current grounded duplicate.
+#[tokio::test]
+async fn question_desktop_007_copied_text_drop_cannot_be_refilled_by_a_kept_duplicate() {
+    let question = map_pending_question(&captured_form_question());
+    let said = "large for sizes; type my own colour: a hamster named Bob";
+    let answer = ModelAnswer::answer(1, &[3])
+        .citing("large for sizes")
+        .and(0, &[4])
+        .with_text("a hamster named Bob")
+        .citing("type my own colour: a hamster named Bob")
+        .and(1, &[4])
+        .with_text("a hamster named Bob")
+        .citing("a hamster named Bob");
+    let resolver = StubResolver::new().answering_question(said, answer);
+    let mut colour = pick(0, &[4]);
+    colour.text = Some("a hamster named Bob".into());
+    for previous in [vec![], vec![pick(1, &[1])]] {
+        assert_incomplete_form(
+            say(&resolver, &question, &previous, said).await,
+            &question,
+            vec![colour.clone()],
+        );
+    }
+}
+
 /// Scenario: A model supplies an invalid selection borrowing another
 /// question's free text or a strict subset of its evidence. Validation
 /// refuses the entire answer before dropping could make it sendable.

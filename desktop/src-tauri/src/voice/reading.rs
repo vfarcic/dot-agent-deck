@@ -1582,6 +1582,56 @@ mod tests {
         );
     }
 
+    /// Scenario: After a permission hook at 10 seconds is announced, a notice
+    /// stamped at 5 seconds is announced despite backward clock skew. It leaves
+    /// the hook's debt unpaid, so the later notice at 16 seconds is absorbed.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_notice_before_its_hook_does_not_pay_the_debt() {
+        let mut skewed = delayed_permission_notice();
+        skewed.user_prompt = Some("clock-skewed notice".into());
+        let mut later = delayed_permission_notice();
+        later.user_prompt = Some("later duplicate".into());
+        let sentences = question_reading_script(vec![
+            (
+                question_event_at(held_permission_prompt("q1"), 10),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(skewed, 5), Duration::from_secs(6)),
+            (question_event_at(later, 16), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "The tester is asking for permission: Bash: touch x.",
+                "The tester is asking for permission: clock-skewed notice.",
+            ],
+            "a negative timestamp gap announces the notice without paying the hook's debt"
+        );
+    }
+
+    /// Scenario: A notice stamped six seconds after its announced permission
+    /// hook pays that hook's debt and does not repeat its announcement.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_notice_six_seconds_after_its_hook_is_absorbed() {
+        let sentences = question_reading_script(vec![
+            (
+                question_event_at(held_permission_prompt("q1"), 10),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(delayed_permission_notice(), 16), SHORT),
+        ])
+        .await;
+        assert_eq!(sentences.len(), 1, "the +6 second notice is absorbed");
+        assert_eq!(
+            sentences[0]["text"],
+            "The tester is asking for permission: Bash: touch x."
+        );
+    }
+
     /// Scenario: A hook prompt receives no notification before an answer or
     /// turn progress. Its late notice within 30 seconds is still absorbed,
     /// but a notification-only prompt after that event-timestamp window speaks.

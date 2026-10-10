@@ -2713,7 +2713,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * Reading switch the settings document starts with; `notice` whether its
    * one-time notice was shown.
    */
-  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, holdStart, question }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; holdStart?: Promise<void>; question?: PendingQuestionDto } = {}) {
+  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, holdStart, question, questionBridge }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; holdStart?: Promise<void>; question?: PendingQuestionDto; questionBridge?: Pick<DeckRuntimeState, "resolveVoiceQuestion" | "sendVoiceAnswer" | "cancelVoiceAnswer"> } = {}) {
     const finished: string[] = [];
     const spoken = synth(silent, finished);
     const steps: Parameters<typeof sequencedVoice>[0] = [];
@@ -2727,6 +2727,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     }
     const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
     const deck = runtime(resolveVoice, voice);
+    Object.assign(deck, questionBridge);
     if (typing) {
       const snapshot = {
         ...deck.snapshot,
@@ -3048,6 +3049,66 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await h.say("yes, go ahead");
     expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
+  });
+
+  /** Scenario: With a permission answer in the recording, hold voiceStop pending and start then finish a permission announcement before releasing it. That answer must not resolve, arm or send; as a control, speech starting only after voiceStop resolves must leave the old answer eligible. */
+  it.each(["before", "after"] as const)("question/desktop/017: speech starting %s voiceStop resolves belongs to the correct segment", async (when) => {
+    const question: PendingQuestionDto = {
+      id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
+      tool: { name: "Bash", detail: "touch x" },
+      questions: [{ prompt: "Allow Bash?", multiSelect: false, options: [
+        { index: 1, label: "Yes", role: "allow_once", answerable: true },
+        { index: 3, label: "No", role: "deny", answerable: true },
+      ] }],
+    };
+    const resolveVoiceQuestion = vi.fn(async (): Promise<QuestionResultDto> => ({
+      verdict: { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary: "Allow once — touch x" },
+      resolveMs: 1, backend: "stub",
+    }));
+    const sendVoiceAnswer = vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" }));
+    const h = await mount({
+      reading: "on", notice: "shown", openPane: true, silent: false, question,
+      questionBridge: { resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer: vi.fn(async () => undefined) },
+    });
+    h.deck.resolveVoice.mockImplementation(async (said) => result({ kind: "no_match", transcript: said, sentence: "Heard while the app was speaking — nothing dispatched." }));
+    let release: () => void = () => undefined;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const stop = h.voice.voiceStop.getMockImplementation()!;
+    h.voice.voiceStop.mockImplementationOnce(async () => {
+      await pending;
+      return stop();
+    });
+    expect(h.spoken).toEqual([]);
+    h.steps.push({ outcome: heard("yes") });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+
+    const prompt = "Permission needed: say yes to allow Bash.";
+    const announce = async () => {
+      await act(async () => { h.sinks.get("planner")!({ kind: "permission", text: prompt }); });
+      await h.drain();
+      expect(h.spoken).toEqual([prompt]);
+      expect(h.finished).toEqual([prompt]);
+    };
+    if (when === "before") await announce();
+    await act(async () => { release(); });
+    await flush();
+    await flush();
+    if (when === "after") await announce();
+
+    if (when === "before") {
+      expect(resolveVoiceQuestion, "speech before voiceStop resolves is still in the stopped buffer and must not answer").not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "Always allow?" })).toBeNull();
+      expect(screen.queryByTestId("voice-question")).toBeNull();
+      expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+      expect(sendVoiceAnswer).not.toHaveBeenCalled();
+      expect(h.deck.sendTerminalInput).not.toHaveBeenCalled();
+    } else {
+      expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
+    }
   });
 
   /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */
