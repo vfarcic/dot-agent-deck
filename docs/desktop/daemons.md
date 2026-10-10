@@ -183,7 +183,7 @@ The dialog ends with one of the titles in the [remote table above](#upgrade-a-re
 
 **Check it worked:** the **Local daemon** section of the Dashboard lists its agents (or **No agents are running yet**) and no longer offers **Upgrade**.
 
-**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)). The app's upgrade dialog offers to upgrade the CLI as well ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
+**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)). When a newer release is out, the app's upgrade dialog has a section for the CLI too: it upgrades it where the CLI's install method allows, and otherwise says how to update it ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
 
 ## Rename a remote daemon
 
