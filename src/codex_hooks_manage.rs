@@ -2378,7 +2378,9 @@ mod tests {
         assert!(!path.exists(), "a read-back creates nothing");
         std::fs::write(&path, b"[").unwrap();
         assert_eq!(configured_pins_in(home.path()), None);
-        let (old, current) = ("/opt/old/dot-agent-deck", "/opt/current/dot-agent-deck");
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let current = crate::test_paths::abs("/opt/current/dot-agent-deck");
+        let (old, current) = (old.as_str(), current.as_str());
         let rule = |binary: &str| serde_json::json!([{"hooks": [{"type": "command", "command": expected_hook_command(binary)}]}]);
         let root = serde_json::json!({
             "hooks": {

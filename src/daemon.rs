@@ -12179,7 +12179,7 @@ mod hook_pin_refresh_tests {
             &[HookPin {
                 agent: AgentType::Codex,
                 config: std::path::PathBuf::from("/cfg/hooks.json"),
-                binary: "/nonexistent/dad-1637/dot-agent-deck".into(),
+                binary: crate::test_paths::abs("/nonexistent/dad-1637/dot-agent-deck"),
             }],
             None,
         );

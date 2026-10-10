@@ -1478,7 +1478,8 @@ mod tests {
         });
         std::fs::write(&path, user_only.to_string()).unwrap();
         assert_eq!(configured_pins_in(&path), Some(Vec::new()));
-        let old = "/opt/old/dot-agent-deck";
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
         let pinned = serde_json::json!({
             "hooks": {
                 "Stop": [{"hooks": [{"type": "command", "command": hook_command(old)}]}],

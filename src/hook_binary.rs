@@ -1979,17 +1979,7 @@ fn posix_word(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `path`, written Unix-style, as an absolute path on this platform:
-    /// unchanged on Unix, and under `C:\` with backslashes on Windows, where
-    /// `/home/u/…` is not absolute and so is not a `deck_exe` the daemon reads.
-    fn abs(path: &str) -> String {
-        if cfg!(windows) {
-            format!("C:{}", path.replace('/', "\\"))
-        } else {
-            path.to_string()
-        }
-    }
+    use crate::test_paths::abs;
 
     #[test]
     fn release_of_build_strips_the_build_stamp() {
@@ -2266,7 +2256,7 @@ mod tests {
     fn a_malicious_deck_exe_never_reaches_a_remedy_or_a_command() {
         let line = serde_json::json!({
             "deck_build": "0.0.1-gabc1234",
-            "deck_exe": "/opt/old/dot-agent-deck\n touch /tmp/hook-notice-marker #",
+            "deck_exe": format!("{}\n touch /tmp/hook-notice-marker #", abs("/opt/old/dot-agent-deck")),
         })
         .to_string();
         let sender = HookLineSender::from_line(&line);
@@ -2362,7 +2352,7 @@ mod tests {
     /// absent (audit A1).
     #[test]
     fn over_budget_or_malformed_stamps_are_dropped_at_ingest() {
-        let huge_path = format!("/{}", "a".repeat(8 * 1024 * 1024));
+        let huge_path = format!("{}{}", abs("/"), "a".repeat(8 * 1024 * 1024));
         let line = serde_json::json!({
             "deck_build": "0.0.1-gabc1234",
             "deck_exe": huge_path,
@@ -2456,7 +2446,7 @@ mod tests {
         state.pins.insert(
             AgentType::Pi,
             vec![TrustedPin {
-                binary: format!("/{}", "p".repeat(100_000)),
+                binary: format!("{}{}", abs("/"), "p".repeat(100_000)),
                 resolved: None,
                 is_self: false,
                 homebrew: false,
@@ -3025,7 +3015,7 @@ mod tests {
         state.pins.insert(
             AgentType::ClaudeCode,
             vec![TrustedPin {
-                binary: "/opt/old".into(),
+                binary: abs("/opt/old"),
                 resolved: None,
                 is_self: false,
                 homebrew: false,
@@ -3038,7 +3028,7 @@ mod tests {
         assert!(
             state
                 .warned
-                .contains(&("/opt/old".to_string(), HookBinaryReason::Unreported))
+                .contains(&(abs("/opt/old"), HookBinaryReason::Unreported))
         );
     }
 
@@ -3574,7 +3564,7 @@ mod tests {
         state.pins.insert(
             AgentType::Codex,
             vec![TrustedPin {
-                binary: "/opt/\x1b[2Jold\u{202E}/dot-agent-deck".into(),
+                binary: abs("/opt/\x1b[2Jold\u{202E}/dot-agent-deck"),
                 resolved: None,
                 is_self: false,
                 homebrew: false,
@@ -3583,7 +3573,7 @@ mod tests {
         assert!(state.observe(&AgentType::Codex, &HookLineSender::default()));
         let notices = state.notices();
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].binary, "/opt/[2Jold/dot-agent-deck");
+        assert_eq!(notices[0].binary, abs("/opt/[2Jold/dot-agent-deck"));
     }
 
     /// Scenario: the same stamp sent again records nothing and needs no write

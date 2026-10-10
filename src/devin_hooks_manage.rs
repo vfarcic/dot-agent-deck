@@ -746,7 +746,8 @@ mod tests {
         std::fs::write(&config, b"{ // a comment\n}").unwrap();
         assert_eq!(configured_pins_in(dir.path()), None);
         assert!(!dir.path().join("config.json.bak").exists());
-        let old = "/opt/old/dot-agent-deck";
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
         let command = crate::agent_hook_config::build_command(old, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
         let root = serde_json::json!({
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}

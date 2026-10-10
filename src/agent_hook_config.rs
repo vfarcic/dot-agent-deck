@@ -1843,11 +1843,8 @@ mod tests {
     #[test]
     fn relative_commands_do_not_crowd_out_an_absolute_pin() {
         use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
-        let old = if cfg!(windows) {
-            r"C:\opt\old\dot-agent-deck"
-        } else {
-            "/opt/old/dot-agent-deck"
-        };
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
         let long = "x".repeat(MAX_RELATIVE_PIN_BYTES + 1);
         let mut commands: Vec<Value> = vec![json!({"command": format!("{long} hook")})];
         commands.extend(
@@ -1871,9 +1868,10 @@ mod tests {
     /// [`MAX_CONFIGURED_EXECUTABLES`], in file order, with no duplicates.
     #[test]
     fn a_config_with_many_distinct_pins_is_capped_and_deduped() {
+        let deck = |n: usize| crate::test_paths::abs(&format!("/opt/deck-{n}/dot-agent-deck"));
         let commands: Vec<Value> = (0..MAX_CONFIGURED_EXECUTABLES * 4)
             .flat_map(|n| {
-                let command = format!("/opt/deck-{n}/dot-agent-deck hook");
+                let command = format!("{} hook", deck(n));
                 [
                     json!({"command": command.clone()}),
                     json!({"command": command}),
@@ -1887,13 +1885,10 @@ mod tests {
         assert_eq!(found.len(), MAX_CONFIGURED_EXECUTABLES);
         let distinct: std::collections::HashSet<&String> = found.iter().collect();
         assert_eq!(distinct.len(), found.len(), "no duplicates");
-        assert_eq!(found[0], "/opt/deck-0/dot-agent-deck");
+        assert_eq!(found[0], deck(0));
         assert_eq!(
             found[MAX_CONFIGURED_EXECUTABLES - 1],
-            format!(
-                "/opt/deck-{}/dot-agent-deck",
-                MAX_CONFIGURED_EXECUTABLES - 1
-            )
+            deck(MAX_CONFIGURED_EXECUTABLES - 1)
         );
     }
 

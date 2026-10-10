@@ -1315,7 +1315,8 @@ pub(crate) mod tests {
         assert_eq!(configured_pins_in(&roots), None, "no root, as at startup");
         std::fs::create_dir_all(&roots[0]).unwrap();
         assert_eq!(configured_pins_in(&roots), Some(Vec::new()));
-        let old = "/opt/old/dot-agent-deck";
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
         for root in &roots {
             std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
         }
