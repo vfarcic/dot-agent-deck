@@ -19900,14 +19900,19 @@ fn format_gib(bytes: u64) -> String {
     format!("{text} GiB")
 }
 
+/// PRD #1258 M3: the width of the host overlay's label column.
+const HOST_METRICS_LABEL_WIDTH: usize = 18;
+
 /// PRD #1258 M3: the label both clients give a watched role. A role a newer
-/// daemon added shows under its own name rather than being dropped.
+/// daemon added shows under its own name rather than being dropped — scrubbed
+/// of control and bidi characters and clamped to the label column, because the
+/// daemon chose it and its figures have to stay on the row (audit A2).
 fn host_metrics_role_label(role: &str) -> String {
     match role {
         crate::host_metrics::ROLE_WORKING_ROOT => "Working root".to_string(),
         crate::host_metrics::ROLE_WORKTREE_PARENT => "Worktree parent".to_string(),
         crate::host_metrics::ROLE_TEMP_ROOT => "Temp root".to_string(),
-        other => other.to_string(),
+        other => crate::untrusted_text::display_line(other, HOST_METRICS_LABEL_WIDTH),
     }
 }
 
@@ -19916,7 +19921,12 @@ fn host_metrics_role_label(role: &str) -> String {
 fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
     use crate::daemon_client::HostMetricsReport;
     const UNKNOWN: &str = "unknown";
-    let row = |label: &str, value: String| Line::from(format!("  {label:<18} {value}"));
+    let row = |label: &str, value: String| {
+        Line::from(format!(
+            "  {label:<width$} {value}",
+            width = HOST_METRICS_LABEL_WIDTH
+        ))
+    };
     let mut lines = vec![Line::styled(
         "  Host of this deck",
         Style::default()
@@ -19932,7 +19942,13 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
         HostMetricsView::Loading => lines.push(Line::from("  Reading…")),
         HostMetricsView::Failed(error) => {
             lines.push(Line::from("  Could not read this deck's host:"));
-            lines.push(Line::from(format!("  {error}")));
+            lines.push(Line::from(format!(
+                "  {}",
+                crate::untrusted_text::display_line(
+                    error,
+                    crate::untrusted_text::REMOTE_MESSAGE_MAX_BYTES
+                )
+            )));
         }
         HostMetricsView::Report(HostMetricsReport::NotAvailable) => {
             lines.push(Line::from(
@@ -19944,7 +19960,13 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
         }
         HostMetricsView::Report(HostMetricsReport::Available(metrics)) => {
             let gib = |bytes: Option<u64>| bytes.map_or_else(|| UNKNOWN.to_string(), format_gib);
-            for disk in &metrics.disks {
+            // The client refuses a reply over the bound; this keeps the render
+            // bounded even for a report that did not come through it.
+            for disk in metrics
+                .disks
+                .iter()
+                .take(crate::host_metrics::MAX_DISK_ROLES)
+            {
                 lines.push(row(
                     &host_metrics_role_label(&disk.role),
                     format!(
@@ -19976,7 +19998,12 @@ fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(2));
     // Body, then a blank row, the button row and the hint: plus the border.
-    let popup_height = (lines.len() as u16 + 3 + 2).min(area.height.saturating_sub(2));
+    // Counted in `usize` and clamped before narrowing, so no line count can
+    // overflow the `u16` (audit A2).
+    let popup_height = lines
+        .len()
+        .saturating_add(3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);

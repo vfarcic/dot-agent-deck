@@ -156,6 +156,11 @@ pub const SCENARIOS: &[Scenario] = &[
         description: "The TUI keyboard shortcut help overlay.",
         clients: &[Client::Tui],
     },
+    Scenario {
+        name: "host-metrics",
+        description: "The host of a deck: the TUI's Host of this deck overlay and the desktop Dashboard's panel, for one fixed sample.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
 ];
 
 /// Look a scenario up by name.

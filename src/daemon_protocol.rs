@@ -3741,20 +3741,22 @@ pub async fn run_attach_server_with_counter(
 
 /// PRD #1258: answer [`AttachRequest::HostMetrics`] from `cache`.
 ///
-/// The age is read here, on Tokio's clock, and the sample (blocking syscalls)
-/// is taken on a blocking thread, so a slow filesystem stalls this connection
-/// and not a runtime worker.
+/// The cache decides on the async side whether any blocking work starts, and
+/// starts at most one sample at a time, so a hung filesystem cannot pile
+/// blocking jobs up behind this verb (audit A1; see
+/// [`crate::host_metrics::HostMetricsCache`]). With no sample to answer from
+/// within [`crate::host_metrics::HOST_METRICS_SAMPLE_WAIT`], the reply is a
+/// generic error the clients show as a failed read.
 #[cfg(unix)]
 async fn host_metrics_response(
     cache: Arc<crate::host_metrics::HostMetricsCache>,
 ) -> AttachResponse {
-    let now = tokio::time::Instant::now();
-    match tokio::task::spawn_blocking(move || cache.read_at(now)).await {
-        Ok(metrics) => AttachResponse {
+    match cache.read().await {
+        Some(metrics) => AttachResponse {
             host_metrics: Some(metrics),
             ..AttachResponse::ok()
         },
-        Err(e) => AttachResponse::err(format!("host-metrics: the sampler failed: {e}")),
+        None => AttachResponse::err("host-metrics: no host sample is available yet"),
     }
 }
 

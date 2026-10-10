@@ -42,6 +42,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `voice-pages` | desktop | New agent dialog with voice on over the crowded `voice-pages` fixture's 30-directory home: the rows fill the dialog in numbered columns, one page at a time, with "Page 1 of N" beside the Directory heading. The state's microphone is silent unless scripted, so nothing moves the page. |
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
+| `host-metrics` | TUI, desktop | The TUI's **Host of this deck** overlay (`m`) and the desktop Dashboard's host panel, both for one fixed sample: the daemon reports `HOST_SAMPLE` from `tests/e2e_docs_screenshots.rs` through the `e2e`-only `DOT_AGENT_DECK_E2E_HOST_SAMPLE` seam, and the desktop's `docs` fixture carries the same figures. |
 
 The docs-only fleet fixture lives in `desktop/src/data/fixture.ts` and is selected by `/?fixture=1&state=docs-fleet`.
 

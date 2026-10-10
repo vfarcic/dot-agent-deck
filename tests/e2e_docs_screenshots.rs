@@ -861,6 +861,45 @@ fn docs_screenshot_schedules() {
     });
 }
 
+/// The host the `host-metrics` capture reports: the desktop fixture's local
+/// deck (`fixtureHostMetrics("local")` in `desktop/src/data/fixture.ts`), so
+/// the TUI and desktop images show the same machine. Change the two together.
+const HOST_SAMPLE: &str = r#"{
+    "disks": [
+        {"role": "working_root", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "worktree_parent", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "temp_root", "free_bytes": 51539607552, "total_bytes": 68719476736}
+    ],
+    "load_per_cpu": 0.42,
+    "cpu_count": 16,
+    "memory_used_bytes": 19864223744,
+    "memory_available_bytes": 46707769344,
+    "sampled_at_ms": 1700000000000,
+    "sample_age_ms": 0
+}"#;
+
+/// Scenario: Press `m` on the empty dashboard, with the daemon reporting a
+/// fixed host sample, so the Host of this deck overlay shows per-role disk,
+/// load per core, memory and a sample age of 0 ms.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_host_metrics() {
+    html_dir();
+    let deck =
+        launch_with(|builder| builder.with_env("DOT_AGENT_DECK_E2E_HOST_SAMPLE", HOST_SAMPLE));
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"m");
+    // The age is the cache's, measured when the reply is written: wait for a
+    // frame that says 0 ms, which a fresh sample does, so the image is stable.
+    capture(&deck, "host-metrics", |grid| {
+        grid.contains("Host of this deck")
+            && grid.contains("0.42 across 16 cores")
+            && grid
+                .lines()
+                .any(|line| line.contains("Sample age") && line.trim_end().ends_with(" 0 ms"))
+    });
+}
+
 /// Scenario: Open the dashboard's question-mark help overlay so the keyboard
 /// shortcuts and their plain-English actions are visible.
 #[test]

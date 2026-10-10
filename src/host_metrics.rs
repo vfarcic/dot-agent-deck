@@ -131,59 +131,211 @@ pub struct HostMetrics {
     pub sample_age_ms: u64,
 }
 
+/// The longest a request waits for a sample being taken before it answers
+/// without one.
+///
+/// A sample is normally a few hundred microseconds, but a `statvfs` on a hung
+/// NFS or FUSE mount does not return, and no timeout cancels a syscall already
+/// running. One second sits under the desktop's two-second reply timeout, so a
+/// request that gives up here still reaches its client as an answer.
+pub const HOST_METRICS_SAMPLE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most disk roles a client accepts in one reply. The daemon names three;
+/// the headroom lets a newer daemon add roles without an older client refusing
+/// the reply, while a hostile or broken one cannot make a client allocate and
+/// render an unbounded list (PRD #1258 audit A2).
+pub const MAX_DISK_ROLES: usize = 16;
+
+/// The longest role name, in bytes, a client accepts. The daemon's are under
+/// twenty; a role is an identifier, not text.
+pub const MAX_ROLE_BYTES: usize = 64;
+
+impl HostMetrics {
+    /// Whether a reply is within [`MAX_DISK_ROLES`] and [`MAX_ROLE_BYTES`]. The
+    /// client refuses one that is not, rather than handing its renderers work
+    /// whose size the peer chose.
+    pub fn within_reply_bounds(&self) -> bool {
+        self.disks.len() <= MAX_DISK_ROLES
+            && self.disks.iter().all(|d| d.role.len() <= MAX_ROLE_BYTES)
+    }
+}
+
+/// A sample being taken: resolves to the sample, or `None` if taking it failed.
+type SampleFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<HostMetrics>> + Send>>;
+
+/// Starts one sample. Production runs [`sample_host`] on Tokio's blocking pool;
+/// tests inject one they can hold open.
+type Sampler = std::sync::Arc<dyn Fn() -> SampleFuture + Send + Sync>;
+
 /// The daemon's one host sample, reused for [`HOST_METRICS_MAX_AGE`].
+///
+/// **Sampling is single-flight, decided on the async side** (PRD #1258 audit
+/// A1). The blocking work is a `statvfs` per role, and a hung filesystem makes
+/// that call never return. So:
+///
+/// - a request inside the max age is answered from the cache with no blocking
+///   job at all;
+/// - a request that finds the sample stale starts **one** refresh, unless one
+///   is already in flight, and that is the only place blocking work is spawned;
+/// - a request that finds a refresh already in flight answers at once from the
+///   last sample, stating its true age, which may be past the max age;
+/// - a request with no sample to fall back on waits for the refresh for at most
+///   [`HOST_METRICS_SAMPLE_WAIT`] and then answers without one.
+///
+/// A refresh that never finishes therefore holds one blocking thread and no
+/// more, however many requests arrive, and every request still gets an answer
+/// in bounded time. The lock guards two fields and is never held across an
+/// `await`, a spawn or a syscall.
 ///
 /// Ages are measured on Tokio's clock, not `std`'s, so a paused-clock test can
 /// sequence a cache hit and an expiry without sleeping (#1237's pattern). One
 /// cache per attach server, so every connection to a daemon shares it.
-#[derive(Debug, Default)]
 pub struct HostMetricsCache {
-    sample: std::sync::Mutex<Option<(tokio::time::Instant, HostMetrics)>>,
+    state: std::sync::Mutex<CacheState>,
+    sampler: Sampler,
+    wait: std::time::Duration,
+}
+
+#[derive(Default)]
+struct CacheState {
+    /// The last sample taken, and when it landed.
+    sample: Option<(tokio::time::Instant, HostMetrics)>,
+    /// Becomes `true` when the refresh in flight has finished, either way.
+    in_flight: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl CacheState {
+    /// The last sample as of `now`, with its age, however old it is.
+    fn aged(&self, now: tokio::time::Instant) -> Option<HostMetrics> {
+        self.sample.as_ref().map(|(taken, metrics)| HostMetrics {
+            sample_age_ms: u64::try_from(now.saturating_duration_since(*taken).as_millis())
+                .unwrap_or(u64::MAX),
+            ..metrics.clone()
+        })
+    }
+
+    fn fresh(&self, now: tokio::time::Instant) -> Option<HostMetrics> {
+        let (taken, _) = self.sample.as_ref()?;
+        (now.saturating_duration_since(*taken) <= HOST_METRICS_MAX_AGE)
+            .then(|| self.aged(now))
+            .flatten()
+    }
+}
+
+impl std::fmt::Debug for HostMetricsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostMetricsCache")
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for HostMetricsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Clears the in-flight marker and wakes the waiters when a refresh ends,
+/// including by panic or by its task being dropped, so a failed refresh never
+/// leaves the cache unable to start the next one.
+struct RefreshDone {
+    cache: std::sync::Arc<HostMetricsCache>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for RefreshDone {
+    fn drop(&mut self) {
+        self.cache.lock().in_flight = None;
+        let _ = self.done.send(true);
+    }
 }
 
 impl HostMetricsCache {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_sampler(
+            std::sync::Arc::new(|| -> SampleFuture {
+                Box::pin(async { tokio::task::spawn_blocking(sample_host).await.ok() })
+            }),
+            HOST_METRICS_SAMPLE_WAIT,
+        )
     }
 
-    /// The cached sample with its age as of `now`, or a fresh one if the cache
-    /// is empty or older than [`HOST_METRICS_MAX_AGE`]. `now` is the caller's
-    /// so it can be read on the async side, where Tokio's clock lives, while
-    /// this runs on a blocking thread.
-    ///
-    /// The lock is held while sampling, so concurrent requests on a cold cache
-    /// take one sample between them rather than one each.
-    pub fn read_at(&self, now: tokio::time::Instant) -> HostMetrics {
-        self.read_with(now, sample_host)
-    }
-
-    fn read_with(
-        &self,
-        now: tokio::time::Instant,
-        sample: impl FnOnce() -> HostMetrics,
-    ) -> HostMetrics {
-        let mut cached = self.sample.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((taken, metrics)) = cached.as_ref() {
-            let age = now.saturating_duration_since(*taken);
-            if age <= HOST_METRICS_MAX_AGE {
-                return HostMetrics {
-                    sample_age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
-                    ..metrics.clone()
-                };
-            }
+    fn with_sampler(sampler: Sampler, wait: std::time::Duration) -> Self {
+        Self {
+            state: std::sync::Mutex::default(),
+            sampler,
+            wait,
         }
-        let fresh = HostMetrics {
-            sample_age_ms: 0,
-            ..sample()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The host sample with its age: the cached one while it is inside
+    /// [`HOST_METRICS_MAX_AGE`], else a fresh one, else — while a refresh is in
+    /// flight or has failed — the last one at its true age. `None` only when no
+    /// sample has ever been taken and none arrived within
+    /// [`HOST_METRICS_SAMPLE_WAIT`]. See the type's doc for why.
+    pub async fn read(self: &std::sync::Arc<Self>) -> Option<HostMetrics> {
+        let started = tokio::time::Instant::now();
+        let (mut done, start_refresh) = {
+            let mut state = self.lock();
+            if let Some(hit) = state.fresh(started) {
+                return Some(hit);
+            }
+            match &state.in_flight {
+                Some(in_flight) => {
+                    if let Some(last) = state.aged(started) {
+                        return Some(last);
+                    }
+                    (in_flight.clone(), None)
+                }
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    state.in_flight = Some(rx.clone());
+                    (rx, Some(tx))
+                }
+            }
         };
-        *cached = Some((now, fresh.clone()));
-        fresh
+        if let Some(tx) = start_refresh {
+            let guard = RefreshDone {
+                cache: std::sync::Arc::clone(self),
+                done: tx,
+            };
+            let sample = (self.sampler)();
+            tokio::spawn(async move {
+                if let Some(fresh) = sample.await {
+                    // Aged from when it landed: a sample that took long to
+                    // take describes the host closer to its end than its start.
+                    guard.cache.lock().sample = Some((
+                        tokio::time::Instant::now(),
+                        HostMetrics {
+                            sample_age_ms: 0,
+                            ..fresh
+                        },
+                    ));
+                }
+                drop(guard);
+            });
+        }
+        // An `Err` here is the refresh's sender dropped without a send, which
+        // the guard rules out; either way the answer is what the cache holds.
+        let _ = tokio::time::timeout(self.wait, done.wait_for(|finished| *finished)).await;
+        self.lock().aged(tokio::time::Instant::now())
     }
 }
 
 /// Take one sample of this host, now. Blocking: a `statvfs` per role and two
-/// small file reads. Callers go through [`HostMetricsCache`].
+/// small file reads. Callers go through [`HostMetricsCache`], which runs it on
+/// Tokio's blocking pool, one at a time.
 pub fn sample_host() -> HostMetrics {
+    #[cfg(feature = "e2e")]
+    if let Some(fixed) = e2e_fixed_sample() {
+        return fixed;
+    }
     let (memory_used_bytes, memory_available_bytes) = read_memory();
     HostMetrics {
         disks: watched_roles()
@@ -213,6 +365,17 @@ pub fn sample_host() -> HostMetrics {
             .unwrap_or(0),
         sample_age_ms: 0,
     }
+}
+
+/// e2e seam for the docs screenshots: with the `e2e` feature, a sample given
+/// as JSON in `DOT_AGENT_DECK_E2E_HOST_SAMPLE` replaces this host's, so the
+/// `host-metrics` capture shows the same figures on every machine. Gated on
+/// the feature rather than only on the variable, for the reason
+/// `effective_current_exe` is (`src/platform/paths.rs`): a release build has
+/// no way to be told to report a host it is not on.
+#[cfg(feature = "e2e")]
+fn e2e_fixed_sample() -> Option<HostMetrics> {
+    serde_json::from_str(&std::env::var("DOT_AGENT_DECK_E2E_HOST_SAMPLE").ok()?).ok()
 }
 
 /// The three watched roles and the path each resolves to on this host.
@@ -273,6 +436,8 @@ fn nearest_existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBu
 }
 
 /// `(free, total)` bytes of the filesystem holding `path`, via `statvfs(3)`.
+// The field widths differ by platform (`fsblkcnt_t` is 32-bit on macOS).
+#[allow(clippy::unnecessary_cast)]
 #[cfg(unix)]
 fn disk_usage(path: &std::path::Path) -> (Option<u64>, Option<u64>) {
     use std::os::unix::ffi::OsStrExt;
@@ -285,17 +450,23 @@ fn disk_usage(path: &std::path::Path) -> (Option<u64>, Option<u64>) {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return (None, None);
     }
-    // The field widths differ by platform (`fsblkcnt_t` is 32-bit on macOS).
-    #[allow(clippy::unnecessary_cast)]
-    let (fragment, available, blocks) = (
+    disk_figures(
         stat.f_frsize as u64,
         stat.f_bavail as u64,
         stat.f_blocks as u64,
-    );
+    )
+}
+
+/// `(free, total)` bytes from `statvfs`'s fragment size, available blocks and
+/// total blocks.
+#[cfg(any(unix, test))]
+fn disk_figures(fragment: u64, available: u64, blocks: u64) -> (Option<u64>, Option<u64>) {
     let total = blocks.checked_mul(fragment).filter(|&t| t > 0);
-    // A free figure without a total to bound it is still a reading, but one
-    // that overflowed is not.
-    let free = available.checked_mul(fragment);
+    // Free is only a reading beside a total: with a zero fragment size both
+    // products are zero, and a zero free figure there would be the "zero where
+    // it is unknown" this module exists to avoid. An overflowed one is not a
+    // reading either.
+    let free = total.and(available.checked_mul(fragment));
     (free, total)
 }
 
@@ -362,5 +533,154 @@ mod tests {
             load.is_some_and(|l| l.is_finite() && l >= 0.0),
             "machine_load_per_cpu() must measure the load here, got {load:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::*;
+    use spec::spec;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, oneshot};
+
+    type Gate = Arc<Mutex<Option<oneshot::Receiver<HostMetrics>>>>;
+
+    /// A cache whose sampler stands in for the blocking job: each start is
+    /// reported on the returned channel, and the sample resolves only when the
+    /// test sends through the gate it installed — or never, while the test
+    /// holds the sender.
+    fn stalled_cache() -> (Arc<HostMetricsCache>, mpsc::UnboundedReceiver<()>, Gate) {
+        let (started_tx, started_rx) = mpsc::unbounded_channel();
+        let gate: Gate = Arc::default();
+        let sampler_gate = Arc::clone(&gate);
+        let sampler: Sampler = Arc::new(move || -> SampleFuture {
+            started_tx.send(()).unwrap();
+            let gate = sampler_gate.lock().unwrap().take();
+            Box::pin(async move { gate?.await.ok() })
+        });
+        (
+            Arc::new(HostMetricsCache::with_sampler(
+                sampler,
+                HOST_METRICS_SAMPLE_WAIT,
+            )),
+            started_rx,
+            gate,
+        )
+    }
+
+    fn hold(gate: &Gate) -> oneshot::Sender<HostMetrics> {
+        let (tx, rx) = oneshot::channel();
+        *gate.lock().unwrap() = Some(rx);
+        tx
+    }
+
+    fn sample(sampled_at_ms: u64) -> HostMetrics {
+        HostMetrics {
+            disks: Vec::new(),
+            load_per_cpu: Some(0.5),
+            cpu_count: Some(4),
+            memory_used_bytes: None,
+            memory_available_bytes: None,
+            sampled_at_ms,
+            sample_age_ms: 0,
+        }
+    }
+
+    fn starts(started: &mut mpsc::UnboundedReceiver<()>) -> usize {
+        std::iter::from_fn(|| started.try_recv().ok()).count()
+    }
+
+    /// Scenario: Eight requests reach a cold cache whose one sample never
+    /// finishes; exactly one sample is started and every request answers
+    /// without a sample once the bounded wait passes. After a sample lands and
+    /// expires, eight more requests during a second stuck sample start one more
+    /// and all answer with the last sample at its true age, while a fresh cache
+    /// hit starts none.
+    #[spec("protocol/host-metrics/005")]
+    #[tokio::test(start_paused = true)]
+    async fn host_metrics_proto_005_stuck_sample_spawns_one_job_and_requests_return() {
+        let (cache, mut started, gate) = stalled_cache();
+
+        // Cold and stuck: one sample, and every request answers within the wait.
+        let stuck = hold(&gate);
+        let before = tokio::time::Instant::now();
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            requests.spawn(async move { cache.read().await });
+        }
+        while let Some(reply) = requests.join_next().await {
+            assert_eq!(reply.unwrap(), None, "no sample exists to answer with");
+        }
+        assert_eq!(starts(&mut started), 1, "one sample for eight requests");
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            HOST_METRICS_SAMPLE_WAIT,
+            "every request answered once the bounded wait passed"
+        );
+
+        // The stuck sample finally lands; the request waiting on it gets it.
+        let waiting = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.read().await })
+        };
+        tokio::task::yield_now().await;
+        stuck.send(sample(1)).unwrap();
+        let landed = waiting.await.unwrap().expect("the landed sample");
+        assert_eq!((landed.sampled_at_ms, landed.sample_age_ms), (1, 0));
+        assert_eq!(starts(&mut started), 0, "joining the refresh started none");
+
+        // A cache hit inside the max age is served without starting a sample.
+        assert_eq!(cache.read().await.map(|m| m.sampled_at_ms), Some(1));
+        assert_eq!(starts(&mut started), 0, "a warm hit starts no sample");
+
+        // Expired, and the refresh sticks: one start, and every other request
+        // answers at once with the last sample at its true age.
+        let expired = HOST_METRICS_MAX_AGE + std::time::Duration::from_millis(1);
+        tokio::time::advance(expired).await;
+        let _stuck_again = hold(&gate);
+        let initiator = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.read().await })
+        };
+        started.recv().await.expect("the refresh started");
+        let joined_at = tokio::time::Instant::now();
+        for _ in 0..7 {
+            let last = cache.read().await.expect("the last sample");
+            assert_eq!(last.sampled_at_ms, 1);
+            assert_eq!(last.sample_age_ms, expired.as_millis() as u64);
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            joined_at,
+            "requests during a refresh do not wait for it"
+        );
+        let last = initiator.await.unwrap().expect("the last sample");
+        assert_eq!(last.sampled_at_ms, 1);
+        assert_eq!(
+            last.sample_age_ms,
+            (expired + HOST_METRICS_SAMPLE_WAIT).as_millis() as u64,
+            "the initiator gave up after the bounded wait and said how old its answer is"
+        );
+        assert_eq!(
+            starts(&mut started),
+            0,
+            "one sample for eight more requests"
+        );
+    }
+
+    /// Scenario: A statvfs result with a zero fragment size yields neither a
+    /// free nor a total figure, rather than a zero free figure beside an
+    /// unknown total; ordinary figures multiply out.
+    #[spec("protocol/host-metrics/006")]
+    #[test]
+    fn host_metrics_proto_006_zero_fragment_size_leaves_free_absent() {
+        assert_eq!(disk_figures(0, 10, 20), (None, None));
+        assert_eq!(disk_figures(4096, 0, 20), (Some(0), Some(20 * 4096)));
+        assert_eq!(
+            disk_figures(4096, 10, 20),
+            (Some(10 * 4096), Some(20 * 4096))
+        );
+        assert_eq!(disk_figures(u64::MAX, 10, 20), (None, None));
     }
 }

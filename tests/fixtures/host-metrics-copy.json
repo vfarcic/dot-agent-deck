@@ -1,0 +1,50 @@
+{
+  "description": "PRD #1258: the words and formats both clients use for a deck's host (CLAUDE.md rule 22). Read by the TUI's `host_metrics_overlay_008_*` (tests/render_host_metrics_copy.rs), which renders the host overlay, and by the desktop's HostMetricsPanel.copy.test.tsx, which renders the deck card's host panel, so a word or format changed on one side fails the other. Each sample is the daemon's wire shape (snake_case); `rows` is every label/value row the client draws for it, in order. `notAvailable` is the text for a deck that does not report host metrics.",
+  "title": "Host of this deck",
+  "subtitle": "The machine this deck's daemon runs on",
+  "notAvailable": [
+    "Host metrics are not available from this deck.",
+    "Its daemon is an older version, or runs on Windows."
+  ],
+  "samples": [
+    {
+      "sample": {
+        "disks": [
+          { "role": "working_root", "free_bytes": 137438953472, "total_bytes": 549755813888 },
+          { "role": "worktree_parent", "free_bytes": 8053063680, "total_bytes": 274877906944 },
+          { "role": "temp_root", "total_bytes": 17179869184 },
+          { "role": "scratch" }
+        ],
+        "load_per_cpu": 0.75,
+        "cpu_count": 8,
+        "memory_available_bytes": 21474836480,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 1500
+      },
+      "rows": [
+        ["Working root", "128 GiB free of 512 GiB total"],
+        ["Worktree parent", "7.5 GiB free of 256 GiB total"],
+        ["Temp root", "unknown free of 16 GiB total"],
+        ["scratch", "unknown free of unknown total"],
+        ["Load per core", "0.75 across 8 cores"],
+        ["Memory used", "unknown"],
+        ["Memory available", "20 GiB"],
+        ["Sample age", "1500 ms"]
+      ]
+    },
+    {
+      "sample": {
+        "disks": [],
+        "memory_used_bytes": 1610612736,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 0
+      },
+      "rows": [
+        ["Load per core", "unknown across unknown cores"],
+        ["Memory used", "1.5 GiB"],
+        ["Memory available", "unknown"],
+        ["Sample age", "0 ms"]
+      ]
+    }
+  ]
+}

@@ -215,11 +215,18 @@ impl HostMetricsReportDto {
             HostMetricsReport::NotAvailable => Self::NotAvailable,
             HostMetricsReport::Available(metrics) => Self::Available {
                 metrics: HostMetricsDto {
+                    // `DaemonClient::host_metrics` already refuses a reply
+                    // over these bounds; bounding again here keeps the
+                    // webview's work bounded for any report (audit A2).
                     disks: metrics
                         .disks
                         .iter()
+                        .take(dot_agent_deck::host_metrics::MAX_DISK_ROLES)
                         .map(|disk| DiskUsageDto {
-                            role: disk.role.clone(),
+                            role: dot_agent_deck::prompt_delivery::truncate_on_char_boundary(
+                                &disk.role,
+                                dot_agent_deck::host_metrics::MAX_ROLE_BYTES,
+                            ),
                             free_bytes: disk.free_bytes,
                             total_bytes: disk.total_bytes,
                         })
@@ -2943,6 +2950,51 @@ mod tests {
             .unwrap(),
             serde_json::json!({"status": "not-available"})
         );
+    }
+
+    /// Scenario (PRD #1258 audit A2): a report carrying more roles than the
+    /// client's bound, one of them far longer than a role may be, reaches the
+    /// webview as at most the bound's number of roles, each clamped on a
+    /// character boundary.
+    #[test]
+    fn host_metrics_dto_bounds_a_hostile_report() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        use dot_agent_deck::host_metrics::{
+            DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES,
+        };
+        let mut disks = vec![DiskUsage {
+            role: "é".repeat(10_000),
+            free_bytes: None,
+            total_bytes: None,
+        }];
+        disks.extend((0..1000).map(|i| DiskUsage {
+            role: format!("role{i}"),
+            free_bytes: None,
+            total_bytes: None,
+        }));
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(HostMetrics {
+                disks,
+                load_per_cpu: None,
+                cpu_count: None,
+                memory_used_bytes: None,
+                memory_available_bytes: None,
+                sampled_at_ms: 1,
+                sample_age_ms: 0,
+            }),
+            std::time::Duration::ZERO,
+        );
+        let HostMetricsReportDto::Available { metrics } = dto else {
+            panic!("available");
+        };
+        assert_eq!(metrics.disks.len(), MAX_DISK_ROLES);
+        let first = &metrics.disks[0].role;
+        assert!(
+            first.len() <= MAX_ROLE_BYTES + '…'.len_utf8(),
+            "{}",
+            first.len()
+        );
+        assert!(first.ends_with('…'));
     }
 
     use super::*;

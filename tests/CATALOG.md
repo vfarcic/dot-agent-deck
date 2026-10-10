@@ -581,6 +581,34 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
 - **Platform coverage:** mac+linux.
 
+##### dashboard/host-metrics/005 — A role carrying control characters and a bidi override renders scrubbed.
+- **Layer:** L1 (ratatui `TestBackend` via `render_host_metrics_overlay_to_buffer`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a clear-screen CSI sequence, a newline and a `U+202E` override renders on one row as its scrubbed text beside its disk figures, and no buffer cell holds a control character or bidi override (PRD #1258 audit A2).
+- **Does not assert:** the client's size bounds (covered by `protocol/host-metrics/007`–`009`); the desktop panel's scrubbing.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/006 — An oversized role count renders a bounded overlay without panicking.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a report of 65,525 roles, the count that overflowed the overlay's `u16` height arithmetic, renders without panicking and draws exactly `MAX_DISK_ROLES` role rows, with the rows after the roles still drawn (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/007 — An oversized role name is clamped to the label column.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a 100 KiB role renders clamped below `MAX_ROLE_BYTES` with a trailing `…`, and its disk figures stay on the same row (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/008 — The overlay's words match the copy the desktop panel is tested against.
+- **Layer:** L1 (ratatui `TestBackend` reading `tests/fixtures/host-metrics-copy.json`).
+- **Agent:** none.
+- **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
+- **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/config-gen
 
 ##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
@@ -1175,6 +1203,41 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Asserts:** an unreadable source produces absent readings; valid fixture values convert kB to bytes; malformed total memory leaves used memory absent while preserving available memory.
 - **Does not assert:** macOS memory sampling; disk/load failures; UI placeholders.
 - **Platform coverage:** linux.
+
+##### protocol/host-metrics/005 — A stuck sample starts one blocking job and every request still answers.
+- **Layer:** unit (the daemon's `HostMetricsCache` with an injected sampler that never finishes, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** eight concurrent requests on a cold cache whose sample never finishes start exactly one sample and all answer without one exactly `HOST_METRICS_SAMPLE_WAIT` later; a request waiting when the sample lands gets it at age 0 and starts none; a cache hit inside the max age starts none; after expiry, eight more requests during a second stuck sample start one more, the seven that did not start it answer at once with the last sample at its true age, and the one that did answers after the wait with the age that includes it (PRD #1258 audit A1).
+- **Does not assert:** a real hung filesystem; the production sampler's `spawn_blocking` (counted by construction: one per sampler start); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/006 — A zero fragment size leaves free disk absent rather than zero.
+- **Layer:** unit (`statvfs` figure arithmetic).
+- **Agent:** none.
+- **Asserts:** a zero fragment size yields neither a free nor a total figure; a zero available-block count beside a real total is a real `0`; ordinary figures multiply out; an overflowing product is absent.
+- **Does not assert:** a real `statvfs` call (covered by `protocol/host-metrics/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/007 — The client refuses a reply with more disk roles than its bound.
+- **Layer:** unit (client library against a synthetic socket peer advertising `host-metrics`).
+- **Agent:** none.
+- **Asserts:** a reply of `MAX_DISK_ROLES + 1` roles is `ClientError::Malformed` with a message naming no count; a reply of exactly `MAX_DISK_ROLES` decodes (PRD #1258 audit A2).
+- **Does not assert:** the renderers' own bounds (covered by `dashboard/host-metrics/006`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/008 — The client refuses a reply whose role name is longer than its bound.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role one byte over `MAX_ROLE_BYTES`, made of two-byte characters so the bound is measured in bytes, is `ClientError::Malformed` with a message that does not echo it; a role exactly at the bound decodes unchanged (PRD #1258 audit A2).
+- **Does not assert:** the renderers' clamp (covered by `dashboard/host-metrics/007`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/009 — Role text within the bounds reaches the renderer unchanged.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a CSI sequence, a newline and a `U+202E` override decodes unchanged: the client bounds size and leaves scrubbing to each renderer.
+- **Does not assert:** the TUI's scrub (covered by `dashboard/host-metrics/005`).
+- **Platform coverage:** mac+linux.
 
 #### protocol/live-target
 

@@ -30,22 +30,39 @@ A role whose path does not exist is measured at its nearest existing ancestor, w
 
 ## Cache, max age and cost
 
-There is no timer. `HostMetricsCache` samples **on demand** and reuses a sample for `HOST_METRICS_MAX_AGE` (2 s). There is one cache per attach server (`serve_attach_with_restart`), passed to `handle_connection`. The sample runs in `spawn_blocking` and the age is read on Tokio's clock, so the caching test (`protocol/host-metrics/002`) is event-sequenced with a paused clock rather than sleep-based. Every reply carries `sampled_at_ms` (wall clock) and `sample_age_ms`, so a client never has to guess how stale a cache hit is.
+There is no timer. `HostMetricsCache` samples **on demand** and reuses a sample for `HOST_METRICS_MAX_AGE` (2 s). There is one cache per attach server (`serve_attach_with_restart`), passed to `handle_connection`. Ages are read on Tokio's clock, so the caching test (`protocol/host-metrics/002`) is event-sequenced with a paused clock rather than sleep-based. Every reply carries `sampled_at_ms` (wall clock) and `sample_age_ms`, so a client never has to guess how stale a cache hit is.
+
+**Sampling is single-flight, and decided on the async side** (security audit A1). A `statvfs` on a hung NFS or FUSE mount never returns, and no timeout cancels a syscall that is already running. The first version started a `spawn_blocking` job per request and took a synchronous mutex inside it, held across the `statvfs` calls, so a hung mount left one job stuck in the syscall and every later one stuck on the mutex, until Tokio's shared blocking pool was full and unrelated spawn, close and shutdown work queued behind it. `HostMetricsCache::read` now:
+
+- answers a request inside the max age from the cache, with no blocking job;
+- starts a refresh only when the sample is stale **and** none is in flight; that refresh is the only `spawn_blocking` the verb ever makes;
+- answers a request that finds a refresh in flight at once from the last sample, at its true age, which may be past the max age;
+- makes a request with no last sample wait for the refresh for at most `HOST_METRICS_SAMPLE_WAIT` (1 s, under the desktop's 2 s reply timeout), then answer with what the cache holds: the generic error `host-metrics: no host sample is available yet` if that is nothing.
+
+A refresh that never finishes therefore holds one blocking thread, however many requests arrive, and every request still gets an answer within the wait. Its in-flight marker is cleared by a drop guard, so a refresh that panics or fails leaves the cache able to start the next one; a failed refresh keeps the last sample, which keeps aging honestly. The cache's own lock guards two fields and is never held across an `await`, a spawn or a syscall. A landed sample is aged from when it landed, not from when its refresh started. The sampler is injected (`with_sampler`), and `protocol/host-metrics/005` drives it with a sample that never finishes: eight requests on a cold cache start one sample and all answer once the wait passes; after a sample lands and expires, eight more start one more and the seven that did not start it answer without waiting, with the last sample's true age.
+
+Fixing this with a timeout on the client or the server alone would not have worked, for the reason above: the job keeps running. Bounding a hung sampler's *lifetime*, rather than how many there are, would need the probes in a separately managed worker or process outside Tokio's pool. One stuck thread was judged an acceptable cost for not doing that.
 
 Measured for M1 in a debug build on the 16-core dev box at load average ~25–29, 200 iterations each:
 
 | | median | p95 | max |
 |---|---|---|---|
 | cold sample (three `statvfs` plus `/proc/loadavg` and `/proc/meminfo`) | 105 µs | 262 µs | 71.7 ms (one scheduling outlier under load) |
-| cache hit (`read_at` within the max age) | 221 ns | 250 ns | |
+| cache hit (within the max age; measured before audit A1 moved the hit to the async side) | 221 ns | 250 ns | |
 
 ## The verb and its gate
 
 `AttachRequest::HostMetrics` (a unit variant) answers with the additive optional `AttachResponse::host_metrics`. It is gated on `CAP_HOST_METRICS = "host-metrics"`, which is on the Unix `DAEMON_CAPABILITIES` list only: a Windows daemon does not advertise it and refuses the verb if a raw sender skips the check. The check lives in the client library, `DaemonClient::host_metrics()`, which answers `HostMetricsReport::NotAvailable` without sending a frame when the capability is absent (`protocol/host-metrics/003`). That is rule 18's gated-variant rung, so there is no `PROTOCOL_VERSION` bump and no `CONTRACT_BREAKS` entry. The residual case is a cached capability set that outlives a daemon replaced by an older build. It fails closed: the older daemon refuses the unknown variant and the client returns `ClientError::Server`.
 
+**The client bounds the reply's size** (security audit A2). The attach frame ceiling is 16 MiB, so a hostile or broken daemon could send tens of thousands of roles: 65,525 one-letter roles fit in 852 KB, and the TUI's overlay height (`lines.len() as u16 + 5`) then overflowed `u16`. `DaemonClient::host_metrics()` returns `ClientError::Malformed("host-metrics reply exceeded its size bounds")` for a reply with more than `MAX_DISK_ROLES` (16) roles or a role longer than `MAX_ROLE_BYTES` (64 bytes); the daemon sends three roles of under twenty bytes, so the headroom is for roles a newer daemon adds. The message names neither figure, because the peer chose both. Role text inside the bounds passes through unchanged (`protocol/host-metrics/007`–`009`). The renderers then bound their own work as defence in depth: the TUI draws at most `MAX_DISK_ROLES` rows, computes the overlay height in `usize` with saturating arithmetic and clamps it before narrowing, and shows a role it does not know through `untrusted_text::display_line` (control and bidi characters stripped, clamped to the 18-column label) (`dashboard/host-metrics/005`–`007`); the desktop's `HostMetricsReportDto::from_report` keeps at most `MAX_DISK_ROLES` roles, each clamped to `MAX_ROLE_BYTES`, and the panel's React keys go through `domIdentity`.
+
 `NotAvailable` is an outcome, not an error. Both clients show it as "Host metrics are not available from this deck" (rule 22: same words), never as zeros.
 
 **For M5:** the tests pin `AttachRequest::HostMetrics` as a unit variant. M5's optional footprint argument will make it a struct variant with `#[serde(default)]` fields, and that means updating the tests' `AttachRequest::HostMetrics` expressions.
+
+## The same words in both clients
+
+The overlay and the desktop panel use the same title, subtitle, row labels, role labels and formats (rule 22). `tests/fixtures/host-metrics-copy.json` holds them once: samples in the daemon's wire shape with the label/value rows each must render as, plus the not-available sentences. The TUI's `host_metrics_overlay_008_words_match_the_shared_copy` (`tests/render_host_metrics_copy.rs`) renders the overlay for each sample, and the desktop's `HostMetricsPanel.copy.test.tsx` renders the panel, so a word changed in one client alone fails the other's test, the pattern `tests/fixtures/editing-shortcuts.json` set for PR #1429.
 
 ## How each client refreshes
 

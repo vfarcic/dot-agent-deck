@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
 
@@ -765,6 +765,35 @@ const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
+const FIXTURE_GIB = 1024 ** 3;
+
+/**
+ * PRD #1258 M4 — a deck's host as its daemon reports it, so fixture-mode
+ * screens (and the docs screenshots taken from them) show the host panel. The
+ * numbers are fixed: a screenshot must not change between runs. `local` is
+ * this machine's deck, `remote` a smaller build box.
+ */
+export function fixtureHostMetrics(host: "local" | "remote"): HostMetricsReport {
+  const local = host === "local";
+  const disk = (role: string, free: number, total: number) => ({ role, freeBytes: free * FIXTURE_GIB, totalBytes: total * FIXTURE_GIB });
+  return {
+    status: "available",
+    metrics: {
+      disks: local
+        ? [disk("working_root", 128, 512), disk("worktree_parent", 128, 512), disk("temp_root", 48, 64)]
+        : [disk("working_root", 37.5, 256), disk("worktree_parent", 37.5, 256), disk("temp_root", 9.5, 32)],
+      loadPerCpu: local ? 0.42 : 1.35,
+      cpuCount: local ? 16 : 8,
+      memoryUsedBytes: (local ? 18.5 : 12) * FIXTURE_GIB,
+      memoryAvailableBytes: (local ? 43.5 : 4) * FIXTURE_GIB,
+      sampledAtMs: 1_700_000_000_000,
+      // The local deck's figures are the TUI `host-metrics` capture's
+      // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`): change the two together.
+      sampleAgeMs: local ? 0 : 1200,
+    },
+  };
+}
+
 /** Two answering daemons with synthetic projects and no demo-run paths. */
 function docsFleet(): DeckSnapshot[] {
   const local = createFixtureSnapshot("docs");
@@ -774,6 +803,7 @@ function docsFleet(): DeckSnapshot[] {
     repo: "service-api",
     worktree: "/home/dev/service-api",
     connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    hostMetrics: fixtureHostMetrics("remote"),
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
       crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "waiting", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
@@ -923,6 +953,8 @@ function fleetDeck(
     stages: connection.status === "connected" ? base.stages : [],
     evidence: connection.status === "connected" ? base.evidence : [],
     handoffs: connection.status === "connected" ? base.handoffs : [],
+    // Only an answering deck reports its host, as in live mode.
+    ...(connection.status === "connected" ? { hostMetrics: fixtureHostMetrics(connection.deckKind === "remote" ? "remote" : "local") } : {}),
   };
 }
 
@@ -1091,6 +1123,9 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     ],
     evidence: state === "empty" || docs ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
+    // The docs scenarios show the host panel the dashboard now carries; the
+    // other single-deck states stay as the unit tests were written against.
+    ...(docs ? { hostMetrics: fixtureHostMetrics("local") } : {}),
   };
 }
 

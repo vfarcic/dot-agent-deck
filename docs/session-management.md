@@ -96,6 +96,8 @@ Before you start more agents on a deck, you can check how much room its machine 
 - **TUI:** in command mode, press `m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
 - **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a **Host of this deck** panel under its header. With several daemons shown, you see every machine at once. The panel refreshes at least every five seconds, and whenever the dashboard re-reads that daemon.
 
+![The desktop app's dashboard with the Host of this deck panel under the daemon's header, showing the same figures](/img/host-metrics-desktop.png)
+
 What it shows:
 
 | Row | What it means |

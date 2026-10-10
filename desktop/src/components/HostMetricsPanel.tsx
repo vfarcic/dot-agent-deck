@@ -1,6 +1,6 @@
 import type { HostMetricsReport } from "../types";
 import { formatDisk, formatGib, formatLoad, formatSampleAge, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostRoleLabel } from "../lib/hostMetrics";
-import { displayText, DISPLAY_LIMITS } from "../lib/displayText";
+import { displayText, DISPLAY_LIMITS, domIdentity } from "../lib/displayText";
 
 /**
  * PRD #1258 M4 — one deck's host on its overview card: disk per watched role,
@@ -18,8 +18,10 @@ export function HostMetricsPanel({ report }: { report: HostMetricsReport }) {
         <p className="host-metrics-unavailable">{HOST_NOT_AVAILABLE} {HOST_NOT_AVAILABLE_WHY}</p>
       ) : (
         <dl className="host-metrics-rows">
-          {report.metrics.disks.map((disk) => (
-            <div className="host-metrics-row" key={disk.role}>
+          {report.metrics.disks.map((disk, index) => (
+            // The role is the daemon's text: the key gets its bounded copy, and
+            // the index keeps two equal roles from sharing one.
+            <div className="host-metrics-row" key={`${index}:${domIdentity(disk.role)}`}>
               <dt>{displayText(hostRoleLabel(disk.role), DISPLAY_LIMITS.message)}</dt>
               <dd>{formatDisk(disk.freeBytes, disk.totalBytes)}</dd>
             </div>

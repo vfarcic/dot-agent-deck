@@ -53,6 +53,14 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
 });
 
+// PRD #1258 — the same fixed host the TUI `host-metrics` image shows
+// (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
+desktopScenario("host-metrics", async (page) => {
+  await overview(page, "docs");
+  await expect(page.getByTestId("host-metrics")).toContainText("0.42 across 16 cores");
+  await expect(page.getByTestId("host-metrics")).toContainText("0 ms");
+});
+
 /** Select the fixture project's directory in the shared New agent form. */
 async function projectInNewAgent(page: Page): Promise<void> {
   await overview(page, "docs");
