@@ -390,6 +390,9 @@ mod tests {
                 "scroll_up".to_string(),
                 "scroll_to_top".to_string(),
                 "scroll_to_bottom".to_string(),
+                // PRD #1401: the pull request browser.
+                "open_pr".to_string(),
+                "open_pr_in_browser".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -480,6 +483,9 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
+                // PRD #1401: the pull request browser.
+                "open_pr",
+                "open_pr_in_browser",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -685,6 +691,9 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
+                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), false),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -739,6 +748,9 @@ mod tests {
                 ("scroll_up".to_string(), true),
                 ("scroll_to_top".to_string(), true),
                 ("scroll_to_bottom".to_string(), true),
+                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), false),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -792,6 +804,9 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
+                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), true),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

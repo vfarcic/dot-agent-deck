@@ -732,6 +732,9 @@ pub(crate) mod tests {
                 "scroll_up".to_string(),
                 "scroll_to_top".to_string(),
                 "scroll_to_bottom".to_string(),
+                // PRD #1401: the pull request browser.
+                "open_pr".to_string(),
+                "open_pr_in_browser".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),

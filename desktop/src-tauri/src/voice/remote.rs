@@ -707,6 +707,9 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
+                // PRD #1401: the pull request browser.
+                "open_pr",
+                "open_pr_in_browser",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",

@@ -43,6 +43,8 @@ import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
+import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
+import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
@@ -67,7 +69,7 @@ import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, typ
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -132,6 +134,12 @@ const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
 const PROJECT_STALE_TOKEN_CODE = "stale-token: ";
 const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
 const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
+/** PRD #1401 — what opening a pull request answers when its agent is no longer listed. */
+export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
+/** PRD #1401 — "open it in the browser" with no pull request open. */
+export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
+/** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
+export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -245,7 +253,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * settings state instead of taking this one would re-create the bug.
    */
   const settings = useDesktopSettings(runtime);
-  useZoom(runtime, settings);
+  /* PRD #1401 reads the level: a zoom change moves the pull request browser's
+     frame, which it then reports again. */
+  const zoom = useZoom(runtime, settings);
   /**
    * PRD #1195 — the settings as of the LATEST render, for a voice dispatch
    * that writes them. `VoiceControlPanel` captures `dispatchVoice` when an
@@ -343,10 +353,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * Reader restored on close would answer the next `Escape` instead of the
    * deck.
    */
+  /* PRD #1401 — not while the pull request browser is open over the pane: the
+     browser takes `Escape` first, and while one of the app's dialogs covers the
+     browser the key is that dialog's, never the pane's under both. */
+  const prBrowserOpen = useRef(false);
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeAgentView();
+      if (event.key === "Escape" && !prBrowserOpen.current) closeAgentView();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -602,6 +616,50 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
+  /**
+   * PRD #1401 — the in-app pull request browser: whose pull request is open,
+   * and the view it was opened over.
+   *
+   * Held HERE because it opens over the deck's pane and the overview's alike,
+   * and this is the one component mounted for both. It does not outlive what
+   * it was opened over: leaving that view, or the agent leaving a deck that is
+   * answering, closes it (the effect below), the way the agent's pane closes
+   * when its own subject goes.
+   */
+  const prBrowserHost = useContext(PrBrowserHostContext);
+  const [prBrowser, setPrBrowser] = useState<(PullRequestBrowserSession & { over: DeckView }) | undefined>(undefined);
+  prBrowserOpen.current = prBrowser !== undefined;
+  const pullRequestContext = useMemo<PullRequestContext>(() => ({
+    openPullRequest: (target) => {
+      const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
+      const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+      if (!agent) return PULL_REQUEST_AGENT_GONE;
+      const name = displayText(agent.displayName, DISPLAY_LIMITS.name);
+      const pullRequest = agent.pullRequest;
+      if (!pullRequest) return `${name} has no pull request.`;
+      if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
+      setPrBrowser({ deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view });
+      return undefined;
+    },
+    openPullRequestInBrowser: () => {
+      if (!prBrowser) return PULL_REQUEST_NONE_OPEN;
+      void prBrowserHost.openExternal().catch(() => undefined);
+      setPrBrowser(undefined);
+      return undefined;
+    },
+    closePullRequest: () => setPrBrowser(undefined),
+    pullRequestBack: () => { void prBrowserHost.back().catch(() => undefined); },
+  }), [prBrowser, prBrowserHost, runtime.fleet, view]);
+  const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
+  const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
+  /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
+     at all, which is not evidence the agent ended (see `paneAgentRetired`). */
+  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId);
+  const prBrowserViewLeft = prBrowser !== undefined && JSON.stringify(prBrowser.over) !== JSON.stringify(view);
+  useEffect(() => {
+    // voice-registry-exempt: the browser's subject went away (its agent ended, or the view it was opened over was left), an invariant rather than something anybody asked for
+    if (prBrowserAgentGone || prBrowserViewLeft) setPrBrowser(undefined);
+  }, [prBrowserAgentGone, prBrowserViewLeft]);
   /**
    * PRD #1260 — the pane on screen as the voice panel's dictation mode sees
    * it: whose it is, what the deck calls it, and why it cannot take input if
@@ -891,10 +949,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          front of it: a dialog layer (the open Daemon selector's menu), the
          Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
          and a dashboard moved behind an overlay is somewhere unexpected when
-         the overlay closes. */
-      ...(overviewVoiceContext.current?.scrollDashboard
-        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
-        : {}),
+         the overlay closes.
+
+         PRD #1401 — while the pull request browser is open it is what is in
+         front, so the four scrolls move its PAGE instead, from outside it (a
+         fixed script per direction, and nothing read back), unless one of the
+         app's own dialogs is over the browser. */
+      ...(prBrowser
+        ? { scrollDashboard: (move: DashboardScroll) => {
+          if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
+          void prBrowserHost.scroll(move).catch(() => undefined);
+          return undefined;
+        } }
+        : overviewVoiceContext.current?.scrollDashboard
+          ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+          : {}),
+      /* PRD #1401 — the browser's members; `closePullRequest` only while the
+         browser is open and nothing is drawn over it, so `close` reads its
+         presence as "the browser is on top". */
+      openPullRequest: pullRequestContext.openPullRequest,
+      openPullRequestInBrowser: pullRequestContext.openPullRequestInBrowser,
+      pullRequestBack: pullRequestContext.pullRequestBack,
+      ...(prBrowser && !pullRequestBrowserCovered() ? { closePullRequest: pullRequestContext.closePullRequest } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
       /* The page of whichever list on screen pages (PR #1451 round 3, change 4).
@@ -931,7 +1007,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1048,6 +1124,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     or re-created by a navigation.
   */
   return (
+    <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
       <VoiceNumberingContext.Provider value={numbering}>
       <VoicePagingContext.Provider value={paging}>
@@ -1057,14 +1134,29 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
+        <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
+        {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
+        {prBrowser && (
+          <PullRequestBrowser
+            session={prBrowser}
+            host={prBrowserHost}
+            zoom={zoom.level}
+            onClose={() => VOICE_ACTIONS.closePullRequest.run(pullRequestContext)}
+            onBack={() => VOICE_ACTIONS.pullRequestBack.run(pullRequestContext)}
+            onOpenExternal={() => VOICE_ACTIONS.openPullRequestInBrowser.run(pullRequestContext)}
+            // voice-registry-exempt: the page closed itself (its own Escape) and Rust has already closed it; this only forgets it
+            onClosedByPage={() => setPrBrowser(undefined)}
+          />
+        )}
       </KeyboardInput.Provider>
       </VoiceChoiceOpen.Provider>
       </DialogNumbered.Provider>
       </VoicePagingContext.Provider>
       </VoiceNumberingContext.Provider>
     </VoiceOn.Provider>
+    </OpenPullRequest.Provider>
   );
 }
 

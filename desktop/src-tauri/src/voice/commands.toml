@@ -14,7 +14,10 @@
 #                    is written for a model and reviewed as an interface.
 #   invoke           the registry entry to dispatch. M3's guard resolves it.
 #   screens          where the command can run: `deck`, `overview`, `agent` —
-#                    the three `DeckView` kinds (`desktop/src/types.ts`).
+#                    the three `DeckView` kinds (`desktop/src/types.ts`) — and
+#                    `pull_request`, the in-app pull request browser open over
+#                    any of them (PRD #1401), which the webview declares
+#                    instead of the view under it while the browser is open.
 #                    Absent or empty means available everywhere.
 #   requires         what else must hold, from the closed set in `table.rs`'s
 #                    `Requirement`: `directory_listing` (the New agent dialog
@@ -444,8 +447,9 @@ heard_as_whole_while.new_agent_dialog = [
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
-underneath. That is the list of spoken commands if it is showing, then the New agent dialog if it
-is open, then one agent's open pane, and otherwise the Settings sheet if it is open. Use for close, close this, close it, close the
+underneath. That is the pull request page open in the app if one is, then the list of spoken
+commands if it is showing, then the New agent dialog if it is open, then one agent's open pane, and
+otherwise the Settings sheet if it is open. Use for close, close this, close it, close the
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
@@ -1299,11 +1303,11 @@ and agents below what is on screen. Use for scroll down, scroll down a bit, go d
 show what is below; "page down" is next page, which scrolls the dashboard the same way. A request to
 scroll down is THIS one even while the New agent dialog is open and it is `callable: false`: pick it
 anyway rather than `next_page`, and the app says to close the dialog. It changes which part of the dashboard is showing and nothing else: it
-opens, chooses, starts and stops nothing."""
+opens, chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way."""
 invoke      = "scrollDown"
-screens     = ["overview"]
+screens     = ["overview", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
 report      = "Scrolling down."
 asks_to     = "scroll the dashboard down"
 try_saying  = "scroll down"
@@ -1316,11 +1320,11 @@ and agents above what is on screen. Use for scroll up, scroll up a bit, go up, m
 is above; "page up" is previous page, which scrolls the dashboard the same way. With the New agent
 dialog closed a bare "go up" is THIS one, never `go_to_parent`: there is no directory browser to
 leave. It changes which part of the dashboard is showing and nothing else: it opens,
-chooses, starts and stops nothing."""
+chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way."""
 invoke      = "scrollUp"
-screens     = ["overview"]
+screens     = ["overview", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
 report      = "Scrolling up."
 asks_to     = "scroll the dashboard up"
 try_saying  = "scroll up"
@@ -1331,11 +1335,11 @@ id          = "scroll_to_top"
 description = """Scroll the agent dashboard all the way to its top, where the first daemon is. Use for
 scroll to the top, go to the top, back to the top, the top of the dashboard, or the beginning. It
 changes which part of the dashboard is showing and nothing else: it opens, chooses, starts and stops
-nothing."""
+nothing. While a pull request is open in the app it scrolls that page to its top instead."""
 invoke      = "scrollToTop"
-screens     = ["overview"]
+screens     = ["overview", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
 report      = "Scrolled to the top."
 asks_to     = "scroll to the top of the dashboard"
 try_saying  = "scroll to the top"
@@ -1345,15 +1349,57 @@ heard_as    = ["top", "beginning"]
 id          = "scroll_to_bottom"
 description = """Scroll the agent dashboard all the way to its bottom, where the last daemon is. Use
 for scroll to the bottom, go to the bottom, the bottom of the dashboard, or the end. It changes which
-part of the dashboard is showing and nothing else: it opens, chooses, starts and stops nothing."""
+part of the dashboard is showing and nothing else: it opens, chooses, starts and stops nothing. While
+a pull request is open in the app it scrolls that page to its bottom instead."""
 invoke      = "scrollToBottom"
-screens     = ["overview"]
+screens     = ["overview", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
 report      = "Scrolled to the bottom."
 asks_to     = "scroll to the bottom of the dashboard"
 try_saying  = "scroll to the bottom"
 heard_as    = ["bottom", "the end"]
+
+# PRD #1401 — an agent's pull request, in the app's own browser: GitHub's page
+# over the agent's screen. `open_pr` is the agent screen's, because the PR it
+# opens is the open pane's agent's; whether that agent HAS one is the
+# frontend's to answer (`openPullRequest`), in a sentence, the way the New
+# agent dialog answers for its own form. `open_pr_in_browser` is the browser's
+# own screen's (`pull_request`, which the webview declares while the browser is
+# open). "close" is `close`, whose precedence puts the browser first; the four
+# scrolls above scroll the page while it is open. None of them acts on the pull
+# request: the page is GitHub's, and what is done there is done by hand.
+#
+# `heard_as` holds `pr`, the id's own word: speech-to-text writes "PR" or
+# "P.R.", and a word split across adjacent words still grounds.
+[[commands]]
+id          = "open_pr"
+description = """Open the pull request of the agent whose pane is open: GitHub's page for it, inside the
+app, over the agent's screen. Use for open the PR, show the PR, open the pull request, show the pull
+request, show me its pull request, or look at the pull request. It opens a page to read and nothing
+else: it does not merge, approve, comment on or change the pull request. An agent with no pull
+request has none to open, and the app says so."""
+invoke      = "openPullRequest"
+screens     = ["agent"]
+unavailable_hint = "a pull request opens from its agent's own screen, so open the agent first"
+report      = "Opening the pull request."
+asks_to     = "open the pull request"
+try_saying  = "open the PR"
+heard_as    = ["pull request", "pr"]
+
+[[commands]]
+id          = "open_pr_in_browser"
+description = """Hand the pull request page that is open in the app to the system's own web browser, and
+close it in the app. Use for open it in the browser, open in browser, open this in my browser, or
+show it in the browser. It opens the same page somewhere else and nothing more: it does not merge,
+approve or change the pull request."""
+invoke      = "openPullRequestInBrowser"
+screens     = ["pull_request"]
+unavailable_hint = "this works while a pull request is open in the app"
+report      = "Opened it in your browser."
+asks_to     = "open the pull request in your browser"
+try_saying  = "open it in the browser"
+heard_as    = ["browser"]
 
 # PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
 # command, and Name — and since PR #1451 round 4 (decision D8), Command itself.

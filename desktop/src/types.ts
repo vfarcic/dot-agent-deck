@@ -655,6 +655,18 @@ export interface PromptKeys {
   deleteChar: { bytes: string; maxLiteralWriteChars?: number };
 }
 
+/**
+ * PRD #1401 — what the badge shows and opens. `url` is present only when it is
+ * a github.com pull request page (`pullRequestFromDto`), so a badge without it
+ * opens nothing.
+ */
+export interface AgentPullRequest {
+  number: number;
+  url?: string;
+  state: import("./lib/bridge").PullRequestState;
+  review?: import("./lib/bridge").PullRequestReview;
+}
+
 export interface AgentSession {
   /** HONEST. Per-daemon monotonic integer, so it is unique only within a daemon. */
   id: string;
@@ -817,6 +829,13 @@ export interface AgentSession {
   authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
+  /**
+   * HONEST. PRD #1401 — the pull request the daemon found for the branch this
+   * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.
+   * Absent when the daemon knows of none, has no `gh` login, or predates the
+   * field; never filled in by this app.
+   */
+  pullRequest?: AgentPullRequest;
   /** HONEST. */
   rows: number;
   /** HONEST. */

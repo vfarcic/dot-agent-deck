@@ -2520,3 +2520,78 @@ utterance = "show the dashboard"
 screen = "deck"
 action = "open_overview"
 outcome = "dispatch"
+
+# PRD #1401 — an agent's pull request in the app's own browser. `open_pr` is
+# the agent screen's; `open_pr_in_browser` and the page's scrolls are the
+# browser's own screen's (`pull_request`); `close` closes the browser first.
+# The negatives: the PR does not open from the dashboard (it is an agent's),
+# and the hand-off has nothing to hand off with no PR open.
+[[fixtures]]
+name = "open-pr"
+utterance = "open the PR"
+screen = "agent"
+action = "open_pr"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-show-the-pull-request"
+utterance = "show the pull request"
+screen = "agent"
+action = "open_pr"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-unavailable-on-the-dashboard"
+utterance = "open the PR"
+screen = "overview"
+action = "open_pr"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "open-pr-in-browser"
+utterance = "open it in the browser"
+screen = "pull_request"
+action = "open_pr_in_browser"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-in-browser-unavailable-on-an-agent-pane"
+utterance = "open it in the browser"
+screen = "agent"
+action = "open_pr_in_browser"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "close-the-pull-request"
+utterance = "close"
+screen = "pull_request"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-the-pull-request"
+utterance = "scroll down"
+screen = "pull_request"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-the-pull-request"
+utterance = "scroll up"
+screen = "pull_request"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-of-the-pull-request"
+utterance = "scroll to the top"
+screen = "pull_request"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-of-the-pull-request"
+utterance = "scroll to the bottom"
+screen = "pull_request"
+action = "scroll_to_bottom"
+outcome = "dispatch"

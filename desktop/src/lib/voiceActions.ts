@@ -422,6 +422,32 @@ export type VoiceActionContext = {
    */
   confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
   confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #1401 — open GitHub's page for one agent's pull request in the app's
+   * own browser, over the screen. Answers `undefined` when it opened, or the
+   * sentence saying why not (the agent has no pull request, or none the app
+   * can open). The badge's click and the `open_pr` row.
+   *
+   * **Served by the SHELL**, which owns the browser: it opens over the deck's
+   * pane and the overview's alike.
+   */
+  openPullRequest: (target: { deckId: string; agentId: string }) => string | undefined;
+  /**
+   * PRD #1401 — hand the page the browser is showing to the system browser,
+   * and close the in-app one: the toolbar's Open in browser and the
+   * `open_pr_in_browser` row. Answers the sentence when no pull request is open.
+   */
+  openPullRequestInBrowser: () => string | undefined;
+  /**
+   * PRD #1401 — close the in-app browser, back to exactly the screen under it.
+   *
+   * **Published only while the browser is open and nothing of the app's is
+   * over it**, for {@link dismissVoiceOverlay}'s reason: {@link closeTopmost}
+   * reads its presence, and the browser is at the TOP of that order.
+   */
+  closePullRequest: () => void;
+  /** PRD #1401 — the browser toolbar's Back: one step back in the page's history. */
+  pullRequestBack: () => void;
 };
 
 /**
@@ -600,6 +626,12 @@ export const VOICE_ACTIONS = {
      * top of everything, so closing what is underneath it would leave the
      * thing the user was looking at still on screen.
      *
+     * **The pull request browser is checked FIRST** (PRD #1401). It is the top
+     * of the order whenever it is published: the shell publishes
+     * `closePullRequest` only while nothing of the app's is drawn over the
+     * browser, so when the voice overlay or a dialog IS over it, that member is
+     * absent and the thing on top closes first, as it should.
+     *
      * The dialog may REFUSE: while a start is in flight it cannot be closed by
      * any route (PRD #1223 audit F5), and `close` says so in the dialog's own
      * sentence rather than falling through to the pane or answering "nothing
@@ -621,9 +653,10 @@ export const VOICE_ACTIONS = {
      * at all, and `close` with it open answered "nothing to close".
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closePullRequest">>,
       target: VoiceDispatchTarget,
     ) => {
+      if (context.closePullRequest) return context.closePullRequest();
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
       if (context.closeNewAgent) {
         const refused = context.closeNewAgent();
@@ -1070,6 +1103,46 @@ export const VOICE_ACTIONS = {
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
+
+  /* PRD #1401 — an agent's pull request, in the app's own browser. Opening,
+     handing off and closing change what is on screen and nothing else; the
+     page itself is GitHub's, and nothing here acts on the pull request. */
+  openPullRequest: {
+    label: "Open an agent's pull request in the app",
+    voice: true,
+    /* `reportRefused` is read through `?.`, for `switchDeck`'s reason: the
+       badge offers itself only for a pull request the app can open, so its
+       click never produces a refusal and serves no voice surface. */
+    needs: ["openPullRequest"],
+    run: (context: Pick<VoiceActionContext, "openPullRequest"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckId" | "agentId">) => {
+      const refused = context.openPullRequest({ deckId: target.deckId, agentId: target.agentId });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openPullRequestInBrowser: {
+    label: "Open the pull request on screen in the system browser",
+    voice: true,
+    needs: ["openPullRequestInBrowser"],
+    run: (context: Pick<VoiceActionContext, "openPullRequestInBrowser"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.openPullRequestInBrowser();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  closePullRequest: {
+    label: "Close the pull request browser",
+    no_voice: "the browser toolbar's Close and the app's `Escape`, and what `closeTopmost` calls first while the browser is the top of the screen — a row naming this one directly would close the browser out from under the voice overlay or a dialog drawn over it, which is the precedence `close` exists to get right. It is voice-reachable through that entry",
+    needs: ["closePullRequest"],
+    run: (context: Pick<VoiceActionContext, "closePullRequest">) => context.closePullRequest(),
+  },
+
+  pullRequestBack: {
+    label: "Go back one page in the pull request browser",
+    no_voice: "a step through the page's own history, which the user steers with the mouse and keyboard inside the page; PRD #1401 asks voice for the four scrolls, `close` and the hand-off to the system browser there, and a spoken \"back\" would be one more reading of a word `close` already answers",
+    needs: ["pullRequestBack"],
+    run: (context: Pick<VoiceActionContext, "pullRequestBack">) => context.pullRequestBack(),
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -1342,7 +1415,13 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
  * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage" | keyof PullRequestContext>;
+
+/**
+ * PRD #1401 — the pull request browser's members, which the SHELL serves: the
+ * browser opens over the deck's pane and the overview's alike.
+ */
+export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

@@ -1737,3 +1737,40 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    Daemons screen's tiles, and the New agent dialog's daemons, directories and
    modes. Tabular figures, so 9 and 10 take the same width down a list. */
 .voice-number { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; min-width: 20px; height: 16px; padding: 0 4px; border-radius: 3px; color: var(--teal-deep); background: var(--teal-soft); font-family: "JetBrains Mono", monospace; font-size: 10px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }
+
+/* PRD #1401 — an agent's pull request: its badge, and GitHub's page over the
+   agent's screen. */
+
+/* The badge: the number between a state icon and a review icon, compact
+   enough to sit in the tile's title line beside the status. Colour repeats
+   what the accessible name already says; it never says it alone. */
+.pr-badge { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--ink-soft); background: var(--paper-sunken); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+button.pr-badge { cursor: pointer; }
+button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-focus); background: var(--teal-soft); }
+.pr-state-open .pr-badge-state { color: var(--green); }
+.pr-state-draft .pr-badge-state { color: var(--muted); }
+.pr-state-merged .pr-badge-state { color: var(--teal); }
+.pr-state-closed .pr-badge-state { color: var(--red); }
+.pr-state-unknown .pr-badge-state { color: var(--faint); }
+.pr-review-approved .pr-badge-review { color: var(--green); }
+.pr-review-changes_requested .pr-badge-review { color: var(--red); }
+.pr-review-review_required .pr-badge-review { color: var(--amber); }
+.pr-review-unknown .pr-badge-review { color: var(--faint); }
+
+/* The browser. Over the agent's pane (90) and below the voice row (95) and
+   every modal (100): the page is drawn by a native webview in `.pr-browser-frame`,
+   which sits above everything this document renders, so the frame stops at the
+   voice row's top edge (`--voice-reserved`) the way the pane does, and the page
+   is hidden while a modal is open over it. */
+.pr-browser-overlay { position: fixed; z-index: 92; inset: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+.pr-browser-panel { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--teal-focus); border-radius: 6px; overflow: hidden; background: var(--paper); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+.pr-browser-toolbar { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 40px; padding: 0 10px; border-bottom: 1px solid var(--line-strong); background: var(--paper-strong); }
+.pr-browser-title { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 12px; }
+.pr-browser-title strong { flex: 0 0 auto; font-weight: 720; }
+.pr-browser-title span { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.pr-browser-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+.pr-browser-control { min-height: 26px; padding: 0 9px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 11px; font-weight: 600; }
+.pr-browser-control:hover, .pr-browser-control:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.pr-browser-frame { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; background: var(--paper-sunken); }
+.pr-browser-notice { max-width: 420px; margin: 0; padding: 0 16px; color: var(--muted); font-size: 12px; text-align: center; }
+@media (max-width: 680px) { .pr-browser-control span { display: none; } }

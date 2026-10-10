@@ -24,9 +24,10 @@
  * having two rows, so a later PRD removing one does not silently delete the
  * coverage.
  */
-import { Mic, Palette, Server, ZoomIn } from "lucide-react";
+import { GitPullRequest, Mic, Palette, Server, ZoomIn } from "lucide-react";
 import { AppearancePanel } from "../components/AppearancePanel";
 import { EndpointsPanel } from "../components/EndpointsPanel";
+import { GitHubPanel } from "../components/GitHubPanel";
 import { VoicePanel } from "../components/VoicePanel";
 import { ZoomPanel } from "../components/ZoomPanel";
 import type { SettingsSection } from "./settingsContract";
@@ -42,4 +43,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   // was not opened.
   { id: "voice", label: "Voice", icon: Mic, component: VoicePanel },
   { id: "zoom", label: "Zoom", icon: ZoomIn, component: ZoomPanel },
+  // PRD #1401: Sign out of GitHub, for the in-app pull request browser.
+  { id: "github", label: "GitHub", icon: GitPullRequest, component: GitHubPanel },
 ];

@@ -198,6 +198,12 @@ export function TerminalViewport({
       webglAddon.onContextLoss(() => {
         webglAddon?.dispose();
         webglAddon = undefined;
+        // The DOM renderer that takes over draws nothing until something
+        // asks it to, so a pane whose context was lost mid-session would stay
+        // blank until its next output. Repaint what is already in the buffer.
+        // PRD #1401 is why this came up: on Linux the in-app pull request
+        // browser moves the app's webview between GTK containers.
+        terminal.refresh(0, terminal.rows - 1);
       });
       terminal.loadAddon(webglAddon);
     } catch {

@@ -1217,19 +1217,20 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
-    // this row, because the two are one word apart in speech. Callable on all
-    // three screens for `voice_off`'s reason: the real row has no `screens`
+    // this row, because the two are one word apart in speech. Callable on every
+    // screen (the pull request browser's too, PRD #1401) for `voice_off`'s reason: the real row has no `screens`
     // column, because the overlay it dismisses can be up over any of them.
     phrases: ["close this", "close", "close the agent view", "stop looking at this one"],
     action: "close",
     invoke: "closeTopmost",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "closing what is on top works anywhere",
     report: "Closed.",
   },
   {
-    // The only entry listing all three screens, because the real row lists
-    // NONE — an absent `screens` column means "everywhere". The fixture's own
+    // One of the entries listing every screen — the three views and the pull
+    // request browser (PRD #1401) — because the real row lists NONE: an absent
+    // `screens` column means "everywhere". The fixture's own
     // matcher is `screens.includes(screen)`, so an empty array here would mean
     // the opposite of what an empty column means in `commands.toml`; spelling
     // the three out is what keeps the preview and the table agreeing.
@@ -1239,7 +1240,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["voice off", "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"],
     action: "voice_off",
     invoke: "stopVoice",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning voice off works anywhere",
     report: "Voice control off.",
   },
@@ -1252,7 +1253,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["what can i say?", "what can i say", "what can you do?", "help"],
     action: "list_commands",
     invoke: "showVoiceCommands",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "the list of commands opens anywhere",
     report: "Here is what you can say.",
   },
@@ -1371,7 +1372,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     action: "reading_on",
     invoke: "startReading",
     // Every screen (decision 2 of 2026-10-09): the switch is not tied to a pane.
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning reading on works anywhere",
     report: "Reading on.",
   },
@@ -1379,7 +1380,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["reading off", "stop reading", "reading mode off", "done reading"],
     action: "reading_off",
     invoke: "stopReading",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning reading off works anywhere",
     report: "Reading off.",
   },
@@ -1387,7 +1388,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["quiet", "be quiet", "silence", "hush", "shush"],
     action: "hush_reading",
     invoke: "quietSpeech",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "silencing the app's speech works anywhere",
     report: "Quiet.",
   },
@@ -1457,37 +1458,54 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
     action: "scroll_down",
     invoke: "scrollDown",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolling down.",
   },
   {
     phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
     action: "scroll_up",
     invoke: "scrollUp",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolling up.",
   },
   {
     phrases: ["scroll to the top", "go to the top", "back to the top"],
     action: "scroll_to_top",
     invoke: "scrollToTop",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolled to the top.",
   },
   {
     phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
     action: "scroll_to_bottom",
     invoke: "scrollToBottom",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolled to the bottom.",
+  },
+  {
+    // PRD #1401 — an agent's pull request, in the app's own browser.
+    phrases: ["open the pr", "show the pull request", "open the pull request"],
+    action: "open_pr",
+    invoke: "openPullRequest",
+    screens: ["agent"],
+    unavailableHint: "a pull request opens from its agent's own screen, so open the agent first",
+    report: "Opening the pull request.",
+  },
+  {
+    phrases: ["open it in the browser", "open in browser"],
+    action: "open_pr_in_browser",
+    invoke: "openPullRequestInBrowser",
+    screens: ["pull_request"],
+    unavailableHint: "this works while a pull request is open in the app",
+    report: "Opened it in your browser.",
   },
 ];
 

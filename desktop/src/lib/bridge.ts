@@ -14,6 +14,7 @@ import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, 
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { speechAudioError } from "./speech";
+import { pullRequestFromDto } from "./pullRequest";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -836,7 +837,8 @@ export interface SecretStatusDto {
  * by `xtask/linkage-check`'s rule 13, which reads the union in `types.ts` so the
  * table and the app's own type stay in step without a second list.
  */
-export type VoiceScreen = "deck" | "overview" | "agent";
+/** PRD #1401 adds `pull_request`: the in-app pull request browser is open over the screen, which voice treats as a screen of its own (`voice::table::Screen`). */
+export type VoiceScreen = "deck" | "overview" | "agent" | "pull_request";
 
 /**
  * What the New agent dialog's directory browser is showing, declared with an
@@ -2220,6 +2222,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
+  const pullRequest = pullRequestFromDto(agent.pullRequest);
   return {
     id: agent.id,
     daemonId,
@@ -2276,6 +2279,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
+    ...(pullRequest ? { pullRequest } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
