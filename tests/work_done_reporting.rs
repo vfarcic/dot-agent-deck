@@ -455,6 +455,12 @@ fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
         .collect()
 }
 
+/// How long work_done_005 waits for each report it expects. Every wait returns
+/// as soon as its report lands (0.7s for the whole test on a quiet box); 5s
+/// expired once in a full `cargo test-fast` run on a loaded box (2026-10-10,
+/// issue #1604's PR), so the budget is the 20s this file gives deliveries.
+const RESPAWN_FAILED_WAIT: Duration = Duration::from_secs(20);
+
 /// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be handed a SUBMITTED respawn-failure report that names no role, and must then report the completion as one it never commissioned, never pointing at a summary file. After the user types into the orchestrator, a second delegate must produce a second, identical report that is still submitted.
 #[spec("orchestration/work-done/005")]
 #[test]
@@ -491,7 +497,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let after_delegate = harness
             .wait_for_orchestrator(
                 |snapshot| snapshot.contains(RESPAWN_FAILED_NEEDLE),
-                Duration::from_secs(5),
+                RESPAWN_FAILED_WAIT,
             )
             .await;
         assert!(
@@ -510,7 +516,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let after_delegate = harness
             .wait_for_orchestrator(
                 |snapshot| matches!(respawn_failed_terminators(snapshot).first(), Some(Some(_))),
-                Duration::from_secs(5),
+                RESPAWN_FAILED_WAIT,
             )
             .await;
         let report = respawn_failed_reports(&after_delegate)
@@ -545,7 +551,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let snapshot = harness
             .wait_for_orchestrator(
                 |snapshot| snapshot.contains(UNSOLICITED_NEEDLE),
-                Duration::from_secs(5),
+                RESPAWN_FAILED_WAIT,
             )
             .await;
         assert!(
@@ -578,7 +584,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
                     let terminators = respawn_failed_terminators(snapshot);
                     terminators.len() >= 2 && terminators[1].is_some()
                 },
-                Duration::from_secs(5),
+                RESPAWN_FAILED_WAIT,
             )
             .await;
         let terminators = respawn_failed_terminators(&after_second);
