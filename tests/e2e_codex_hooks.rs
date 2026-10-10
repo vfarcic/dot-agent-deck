@@ -46,6 +46,7 @@ const DECK_HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostCompact", "post_compact"),
     ("SubagentStart", "subagent_start"),
     ("SubagentStop", "subagent_stop"),
+    ("Interrupt", "interrupt"),
 ];
 
 fn path_with_binary_dir() -> String {

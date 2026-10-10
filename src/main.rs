@@ -257,6 +257,24 @@ enum Commands {
     /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
     /// request, exactly like `agent-event`.
     GetSeed,
+    /// Report a question an agent is asking and wait for the deck's answer
+    /// (PRD #1542). Run by the deck's OpenCode plugin and Pi extension, not by
+    /// hand: prints one line — what the producer should answer the agent with —
+    /// or nothing, and always exits 0.
+    #[command(hide = true)]
+    AwaitAnswer {
+        /// The producer: `opencode` (the question on stdin) or `pi`.
+        #[arg(long)]
+        agent: String,
+        /// The question, for a producer that cannot write stdin (Pi).
+        #[arg(long)]
+        question: Option<String>,
+        /// After printing the answer, read one line from stdin — whether the
+        /// agent took it — and pass it to the deck (the OpenCode plugin). The
+        /// question is then the first line of stdin rather than all of it.
+        #[arg(long)]
+        ack: bool,
+    },
     /// Print the user documentation for this version, embedded in the binary
     /// (no network, no daemon). With no topic, list the topics; with a topic
     /// (e.g. `orchestration`, `desktop/voice`), print that page's Markdown;
@@ -1629,6 +1647,11 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::AwaitAnswer {
+            agent,
+            question,
+            ack,
+        }) => dot_agent_deck::hook::handle_await_answer(&agent, question.as_deref(), ack),
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,

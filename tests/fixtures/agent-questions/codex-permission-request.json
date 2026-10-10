@@ -1,0 +1,12 @@
+{
+  "session_id": "01a10439-d77d-7583-965a-8a42375bf7b7",
+  "turn_id": "01a1043c-5f68-7623-9cbb-f6f44a2a451a",
+  "hook_event_name": "PermissionRequest",
+  "model": "gpt-5.6-luna",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch codex_b.txt",
+    "description": "Create codex_b.txt"
+  }
+}

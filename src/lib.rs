@@ -92,6 +92,7 @@ pub mod project_config;
 // selected over the attach socket.
 pub mod project_resolve;
 pub mod prompt_delivery;
+pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
 pub mod remote;

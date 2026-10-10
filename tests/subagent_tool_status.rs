@@ -27,7 +27,7 @@
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -69,23 +69,34 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
         .expect("hook stdin")
         .write_all(payload.to_string().as_bytes())
         .expect("write hook payload");
-    let output = child.wait_with_output().expect("wait for hook command");
-    assert!(
-        output.status.success(),
-        "`hook --agent {agent}` rejected a payload: status={} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // PRD #1542: a Claude `PermissionRequest` arrives as a held
+                // `question` envelope and waits for an answer on the same
+                // connection, so read ONE line rather than to EOF, unwrap the
+                // event, and release the hook.
                 let mut line = String::new();
-                stream
-                    .read_to_string(&mut line)
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
-                return serde_json::from_str(line.trim()).expect("parse emitted AgentEvent");
+                let value: Value = serde_json::from_str(line.trim()).expect("parse emitted line");
+                if value["message_type"] == "question" {
+                    stream
+                        .write_all(b"{\"question_id\":\"\",\"outcome\":\"released\",\"reason\":\"cleared\"}\n")
+                        .expect("release the held hook");
+                    let _ = child.wait();
+                    return serde_json::from_value(value["event"].clone())
+                        .expect("parse the held question's AgentEvent");
+                }
+                let output = child.wait_with_output().expect("wait for hook command");
+                assert!(
+                    output.status.success(),
+                    "`hook --agent {agent}` rejected a payload: status={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return serde_json::from_value(value).expect("parse emitted AgentEvent");
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(

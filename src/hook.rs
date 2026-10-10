@@ -91,6 +91,16 @@ pub(crate) struct OpenCodeHookInput {
     response_markers: Option<Value>,
     #[serde(default, deserialize_with = "lenient_string_map")]
     response_headers: HashMap<String, String>,
+    // PRD #1542: the request id `permission.replied`, `question.replied` and
+    // `question.rejected` name, so the deck clears exactly that question.
+    #[serde(default, deserialize_with = "lenient_string")]
+    request_id: Option<String>,
+    // PRD #1542: the raw `properties` of a `permission.asked` or
+    // `question.asked`, which the plugin hands to `await-answer` so the same
+    // builder that makes the status event makes the question from them
+    // ([`build_opencode_event_with_question`]).
+    #[serde(default, deserialize_with = "lenient_object")]
+    properties: Option<Value>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -114,18 +124,19 @@ fn lenient_string_map<'de, D: Deserializer<'de>>(
     })
 }
 
-pub fn handle_hook(agent: &str) -> ExitCode {
-    let input = match read_stdin() {
-        Some(s) if !s.is_empty() => s,
-        _ => return ExitCode::SUCCESS,
-    };
-
-    let event = match agent {
+/// The one parser for a hook payload (PRD #1631): `input`, the JSON `agent`'s
+/// hook or plugin wrote, as the [`AgentEvent`] the deck ingests — its status,
+/// tool and detail, and, where the payload raises one, the question
+/// ([`AgentEvent::question`]). Every reader of a prompt reads what this
+/// returns: the card's Needs Input, reading mode's permission announcement
+/// (which keys on the event's type, tool and detail) and the snapshot's
+/// `pending_question` all come from this one parse, never from a second parse
+/// of the same payload. `None` for a payload that does not parse or maps to no
+/// event.
+pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent> {
+    match agent {
         "opencode" => {
-            let hook_input: OpenCodeHookInput = match serde_json::from_str(&input) {
-                Ok(v) => v,
-                Err(_) => return ExitCode::SUCCESS,
-            };
+            let hook_input: OpenCodeHookInput = serde_json::from_str(input).ok()?;
             build_opencode_event(hook_input)
         }
         // PRD #20 W1: Codex ships a Claude-Code-compatible hooks engine, so its
@@ -134,10 +145,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         // stamping [`AgentType::Codex`] and letting the Codex-aware
         // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
         "codex" => {
-            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
-                Ok(v) => v,
-                Err(_) => return ExitCode::SUCCESS,
-            };
+            let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
             build_event_typed(hook_input, AgentType::Codex)
         }
         // Devin CLI ships a Claude-Code-compatible hooks engine too, so its
@@ -146,25 +154,55 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         // [`AgentType::Devin`]. Its `exec` tool carries a plain-string
         // `command`, which the `extract_tool_detail` `"exec"` arm sharpens.
         "devin" => {
-            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
-                Ok(v) => v,
-                Err(_) => return ExitCode::SUCCESS,
-            };
+            let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
             build_event_typed(hook_input, AgentType::Devin)
         }
         _ => {
-            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
-                Ok(v) => v,
-                Err(_) => return ExitCode::SUCCESS,
-            };
+            let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
             build_event_typed(hook_input, AgentType::ClaudeCode)
         }
+    }
+}
+
+pub fn handle_hook(agent: &str) -> ExitCode {
+    let input = match read_stdin() {
+        Some(s) if !s.is_empty() => s,
+        _ => return ExitCode::SUCCESS,
     };
 
-    let event = match event {
-        Some(e) => e,
-        None => return ExitCode::SUCCESS,
+    let Some(event) = hook_payload_event(agent, &input) else {
+        return ExitCode::SUCCESS;
     };
+
+    // PRD #1542: a Claude Code question the deck can answer through this hook
+    // is HELD — the hook waits for the daemon's decision and prints it.
+    if !matches!(agent, "opencode" | "codex" | "devin")
+        && let Some(held) = claude_held_question(&event, &input)
+    {
+        let reply = hold_question(&event, CLAUDE_HOLD_DEADLINE);
+        if let Some(decision) = reply.as_ref().and_then(|reply| {
+            crate::question::claude_decision(
+                &held.question,
+                held.tool_input.as_ref(),
+                held.permission_suggestions.as_ref(),
+                reply,
+            )
+        }) {
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "{decision}");
+            let _ = out.flush();
+        }
+        send_plain_if_refused(event, reply.as_ref());
+        return ExitCode::SUCCESS;
+    }
+
+    // PRD #1542 (audit A9): a frame that raises or clears a question goes
+    // through the daemon's provenance gate as an unheld `question` message —
+    // a bare event carrying either is applied as a plain status.
+    if carries_question_metadata(&event) {
+        send_question_unheld_at(&client_socket_path(), event, UNHELD_QUESTION_WAIT);
+        return ExitCode::SUCCESS;
+    }
 
     // PRD #1497: the turn's final reply, for the daemon's reading
     // subscribers. Read from the raw payload, so a reply of a strange shape
@@ -295,6 +333,394 @@ pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_prot
     ))
 }
 
+/// How long a hook waits for the daemon to acknowledge an unheld question. A
+/// daemon that knows the message answers as soon as it has applied it; this
+/// bound is what an OLDER daemon, which logs the message malformed and never
+/// answers, costs before the hook falls back to a plain event. Kept short
+/// because Codex draws its approval prompt only after its `PermissionRequest`
+/// hook exits [observed on 0.160.0].
+const UNHELD_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `event` raises a question or reports one answered — the metadata
+/// the daemon accepts only from a message its provenance gate attested.
+fn carries_question_metadata(event: &AgentEvent) -> bool {
+    event
+        .metadata
+        .contains_key(crate::event::QUESTION_METADATA_KEY)
+        || event
+            .metadata
+            .contains_key(crate::event::QUESTION_RESOLVED_METADATA_KEY)
+}
+
+/// What [`send_question_unheld_at`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum UnheldSend {
+    /// The daemon applied it through the provenance gate.
+    Attested,
+    /// Refused by the gate, or no daemon answered (an older daemon, or none):
+    /// sent again as a plain event without its question metadata, so the
+    /// status still lands exactly as it did before the deck knew questions.
+    Plain,
+}
+
+/// PRD #1542 (audit A9): send `event` — a question the deck answers by keys
+/// (Codex, Devin, Claude Code's plan approval) or an agent's own "answered"
+/// report (OpenCode's `permission.replied` / `question.replied` /
+/// `question.rejected`) — as an unheld `question` message carrying this pane's
+/// hook token, and wait up to `wait` for the daemon's one reply line.
+fn send_question_unheld_at(
+    path: &std::path::Path,
+    mut event: AgentEvent,
+    wait: std::time::Duration,
+) -> UnheldSend {
+    if let Some(pane_id) = event.pane_id.clone() {
+        let signal = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+            pane_id,
+            token: crate::hook_provenance::token_from_env(),
+            event: event.clone(),
+            hold: false,
+            ack: false,
+        });
+        if let Ok(json) = serde_json::to_string(&signal)
+            && let (SocketReply::Line(line), _) =
+                request_from_socket_at_detailed_with(path, &json, Some(wait), true)
+            && let Ok(reply) = serde_json::from_str::<crate::question::QuestionReply>(&line)
+            && !reply.refused()
+        {
+            return UnheldSend::Attested;
+        }
+    }
+    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
+    send_plain_at(path, &event);
+    UnheldSend::Plain
+}
+
+/// PRD #1542: how long a held Claude Code `PermissionRequest` hook waits for
+/// the daemon — 3570 s, ending 30 s BEFORE the 3600 s `timeout` the deck
+/// installs the hook with
+/// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`]), so the hook
+/// exits on its own before Claude Code cancels it. Either way Claude Code then
+/// behaves as if there were no hook, and its dialog, on screen all along, is
+/// still answerable by keyboard [observed on 2.1.289].
+pub const CLAUDE_HOLD_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS - 30);
+
+/// How long an `await-answer` child waits. The plugin and the extension stop it
+/// as soon as the agent reports the question answered another way, so this is
+/// only a backstop.
+pub const AWAIT_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// What a held Claude Code hook needs to turn the daemon's answer into its
+/// decision: the question, and the payload fields the decision echoes back.
+struct HeldClaudeQuestion {
+    question: crate::question::PendingQuestion,
+    tool_input: Option<Value>,
+    permission_suggestions: Option<Value>,
+}
+
+/// The held question this Claude Code hook event carries, if any: a
+/// `PermissionRequest` whose question is answered through this hook (not a
+/// plan approval, which is answered by keys), from a deck pane.
+fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuestion> {
+    if event.event_type != EventType::PermissionRequest || event.pane_id.is_none() {
+        return None;
+    }
+    let question = event.question()?;
+    if question.channel != crate::question::AnswerChannel::Held {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(raw).ok()?;
+    Some(HeldClaudeQuestion {
+        question,
+        tool_input: payload.get("tool_input").cloned(),
+        permission_suggestions: payload.get("permission_suggestions").cloned(),
+    })
+}
+
+/// PRD #1542: send `event` as a held [`crate::event::DaemonMessage::Question`]
+/// and wait up to `deadline` for the daemon's one reply line. `None` on an
+/// unreachable or older daemon (which answers nothing, and closes the
+/// connection only once its own idle bound passes), a closed connection or an
+/// unparseable line. A caller acts on the reply only through
+/// [`crate::question::QuestionReply::answers_for`], which also refuses a reply
+/// naming another question.
+fn hold_question(
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+) -> Option<crate::question::QuestionReply> {
+    hold_question_at(&client_socket_path(), event, deadline)
+}
+
+/// PRD #1542: when the daemon's provenance gate refused the held question, the
+/// event it carried was not applied — send it again as a plain event, without
+/// the question, so the card still reads Needs Input, exactly as it would have
+/// before the deck could answer questions.
+fn send_plain_if_refused(event: AgentEvent, reply: Option<&crate::question::QuestionReply>) {
+    send_plain_if_refused_at(&client_socket_path(), event, reply);
+}
+
+fn send_plain_if_refused_at(
+    path: &std::path::Path,
+    mut event: AgentEvent,
+    reply: Option<&crate::question::QuestionReply>,
+) {
+    if reply.is_some_and(crate::question::QuestionReply::refused) {
+        event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        send_plain_at(path, &event);
+    }
+}
+
+/// A question's fallback: `event` as the plain status line every other hook
+/// event is, this pane's hook token included (issue #318), so the daemon's
+/// provenance gate treats it as this pane's own report.
+fn send_plain_at(path: &std::path::Path, event: &AgentEvent) {
+    let token = crate::hook_provenance::token_from_env();
+    if let Ok(json) = crate::event::agent_event_line(event, token.as_deref()) {
+        let _ = send_to_socket_at(path, &json);
+    }
+}
+
+fn hold_question_at(
+    path: &std::path::Path,
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+) -> Option<crate::question::QuestionReply> {
+    let signal = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+        pane_id: event.pane_id.clone()?,
+        token: crate::hook_provenance::token_from_env(),
+        event: event.clone(),
+        hold: true,
+        ack: false,
+    });
+    let json = serde_json::to_string(&signal).ok()?;
+    let SocketReply::Line(line) = request_held_at(path, &json, deadline) else {
+        return None;
+    };
+    serde_json::from_str(&line).ok()
+}
+
+/// PRD #1542: the `await-answer` verb, for producers that are not a hook
+/// process of their own — the OpenCode plugin and the Pi extension. Builds the
+/// question from what the producer passed (`stdin` for OpenCode, `--question`
+/// for Pi, whose exec helper has no stdin), holds it with the daemon, and
+/// prints ONE line: what the producer should do with the answer
+/// ([`crate::question::opencode_reply`], [`crate::question::pi_value`]).
+/// Prints nothing — the producer then leaves the agent's own prompt alone — on
+/// every other outcome, and always exits 0.
+///
+/// With `ack` (the OpenCode plugin) the question is the FIRST line of stdin,
+/// and the answer is acknowledged: see [`opencode_await_answer_acked_at`].
+pub fn handle_await_answer(agent: &str, question_arg: Option<&str>, ack: bool) -> ExitCode {
+    if ack && agent == "opencode" && question_arg.is_none() {
+        let mut first = String::new();
+        if std::io::stdin().read_line(&mut first).is_ok() && !first.trim().is_empty() {
+            opencode_await_answer_acked_at(
+                &client_socket_path(),
+                first.trim(),
+                &mut std::io::stdout(),
+                || read_stdin_line_within(AWAIT_ANSWER_ACK_WAIT),
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+    let raw = match question_arg {
+        Some(arg) => arg.to_string(),
+        None => match read_stdin() {
+            Some(s) if !s.is_empty() => s,
+            _ => return ExitCode::SUCCESS,
+        },
+    };
+    let line = match agent {
+        "opencode" => opencode_await_answer(&raw),
+        "pi" => pi_await_answer(&raw),
+        _ => None,
+    };
+    if let Some(line) = line {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+    ExitCode::SUCCESS
+}
+
+/// The OpenCode `await-answer` event and question for `raw` — the plugin's
+/// description of a question: the event's type and its raw `properties`, plus
+/// the session the plugin normalised — or `None` when it describes neither a
+/// permission nor a question.
+///
+/// PRD #1631: built by [`build_opencode_event_with_question`], the one parser
+/// for OpenCode's events, so the status event every client reads (reading
+/// mode's permission announcement included) and the question the snapshot
+/// carries come from the same parse of the same payload.
+fn opencode_question_event(
+    raw: &str,
+) -> Option<(AgentEvent, crate::question::PendingQuestion, Value)> {
+    let input: OpenCodeHookInput = serde_json::from_str(raw).ok()?;
+    if !matches!(input.event.as_str(), "permission.asked" | "question.asked") {
+        return None;
+    }
+    let properties = input.properties.clone()?;
+    let (event, question) = build_opencode_event_with_question(input)?;
+    Some((event, question?, properties))
+}
+
+fn opencode_await_answer(raw: &str) -> Option<Value> {
+    let (event, question, properties) = opencode_question_event(raw)?;
+    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
+    send_plain_if_refused(event, reply.as_ref());
+    crate::question::opencode_reply(&question, &properties, &reply?)
+}
+
+/// PRD #1542: how long an acknowledging `await-answer` child waits for the
+/// OpenCode plugin to say what OpenCode's reply API made of the answer —
+/// shorter than the daemon's [`crate::daemon::HELD_REPLY_ACK_WAIT`], so the
+/// daemon hears the plugin's report rather than timing out first.
+pub const AWAIT_ANSWER_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// One line of stdin, if one arrives within `wait`. The read runs on a thread
+/// of its own, left behind when the wait ends: the process exits right after.
+fn read_stdin_line_within(wait: std::time::Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = std::io::stdin().read_line(&mut line);
+        let _ = tx.send(read.ok().filter(|n| *n > 0).map(|_| line));
+    });
+    rx.recv_timeout(wait).ok().flatten()
+}
+
+/// [`hold_question_at`] for a producer that acknowledges: the held message
+/// carries `ack`, and the connection is handed back with the reply so the
+/// acknowledgement can follow on it.
+fn hold_question_acked_at(
+    path: &std::path::Path,
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+) -> Option<(
+    crate::question::QuestionReply,
+    crate::platform::ipc::IpcClient,
+)> {
+    let signal = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+        pane_id: event.pane_id.clone()?,
+        token: crate::hook_provenance::token_from_env(),
+        event: event.clone(),
+        hold: true,
+        ack: true,
+    });
+    let json = serde_json::to_string(&signal).ok()?;
+    let until = std::time::Instant::now() + deadline;
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, deadline).ok()?;
+    stream.set_timeouts(deadline).ok()?;
+    if !matches!(
+        write_request_line(&mut stream, format!("{json}\n").as_bytes()),
+        RequestWrite::Written
+    ) {
+        return None;
+    }
+    let line = read_reply_line(&mut stream, Some(until)).ok()?;
+    Some((serde_json::from_str(&line).ok()?, stream))
+}
+
+/// PRD #1542: the OpenCode plugin's `await-answer --ack`. Holds the question
+/// like [`opencode_await_answer`] and prints the reply OpenCode should get;
+/// then reads ONE line — `ack_line`, the plugin's
+/// [`crate::question::ReplyAck`] for what OpenCode's reply API said — and
+/// passes it to the daemon on the held connection, which reports the deck's
+/// answer only once it has it. An answer that cannot be turned into OpenCode's
+/// reply is acknowledged as not taken, and nothing is printed. A missing or
+/// unreadable acknowledgement is passed on as nothing, which the daemon
+/// reports as unconfirmed.
+fn opencode_await_answer_acked_at(
+    path: &std::path::Path,
+    raw: &str,
+    out: &mut dyn std::io::Write,
+    ack_line: impl FnOnce() -> Option<String>,
+) {
+    if let Some((event, question, properties)) = opencode_question_event(raw) {
+        opencode_hold_acked_at(path, event, &question, &properties, out, ack_line);
+    }
+}
+
+/// [`opencode_await_answer_acked_at`] once the question is built.
+fn opencode_hold_acked_at(
+    path: &std::path::Path,
+    event: AgentEvent,
+    question: &crate::question::PendingQuestion,
+    properties: &Value,
+    out: &mut dyn std::io::Write,
+    ack_line: impl FnOnce() -> Option<String>,
+) {
+    let held = hold_question_acked_at(path, &event, AWAIT_ANSWER_DEADLINE);
+    send_plain_if_refused_at(path, event, held.as_ref().map(|(reply, _)| reply));
+    let Some((reply, mut stream)) = held else {
+        return;
+    };
+    if reply.answers_for(&question.id).is_none() {
+        return;
+    }
+    let ack = match crate::question::opencode_reply(question, properties, &reply) {
+        Some(line) => {
+            let printed = writeln!(out, "{line}").and_then(|()| out.flush()).is_ok();
+            printed.then(ack_line).flatten().and_then(|line| {
+                serde_json::from_str::<crate::question::ReplyAck>(line.trim()).ok()
+            })
+        }
+        None => Some(crate::question::ReplyAck {
+            delivered: false,
+            detail: Some("the answer could not be turned into OpenCode's reply".to_string()),
+        }),
+    };
+    if let Some(json) = ack.and_then(|ack| serde_json::to_string(&ack).ok()) {
+        let _ = write_request_line(&mut stream, format!("{json}\n").as_bytes());
+    }
+}
+
+fn pi_await_answer(raw: &str) -> Option<Value> {
+    let dialog: crate::question::PiDialog = serde_json::from_str(raw).ok()?;
+    let question = crate::question::pi_dialog(&dialog, Utc::now().timestamp_millis())?;
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok()?;
+    // The session the `agent-event` verb reports Pi's status under, so the
+    // question lands on the same card.
+    let mut event = producer_event(
+        format!("{pane_id}-session"),
+        AgentType::Pi,
+        EventType::WaitingForInput,
+        None,
+    );
+    event.set_question(&question);
+    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
+    send_plain_if_refused(event, reply.as_ref());
+    crate::question::pi_value(&dialog, &question, &reply?)
+}
+
+/// A bare event from this pane, as every producer here stamps one.
+fn producer_event(
+    session_id: String,
+    agent_type: AgentType,
+    event_type: EventType,
+    cwd: Option<String>,
+) -> AgentEvent {
+    AgentEvent {
+        session_id,
+        agent_type,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: std::env::var(DOT_AGENT_DECK_PANE_ID).ok(),
+        agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID).ok(),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
+}
+
 fn read_stdin() -> Option<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).ok()?;
@@ -330,6 +756,11 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "PostCompaction" => Some(EventType::Thinking),
         "SubagentStart" => Some(EventType::SubagentStart),
         "SubagentStop" => Some(EventType::SubagentStop),
+        // PRD #1542: Codex fires `Interrupt` when a turn is interrupted — after
+        // a keyboard "No" on its approval prompt [observed on 0.160.0], which
+        // otherwise leaves the card on Needs Input. An interrupted turn has
+        // ended, so it reads as `Stop` does.
+        "Interrupt" => Some(EventType::Idle),
         _ => None,
     }
 }
@@ -603,6 +1034,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // OLD agent that fires within the subscribe→kill window.
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
+    let subagent_id_for_question = subagent_id.clone();
     let mut metadata = HashMap::new();
     if let Some(tool_use_id) = tool_use_id {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
@@ -768,7 +1200,19 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         }
     }
 
-    Some(AgentEvent {
+    // PRD #1542: the question this event raises, built from the payload and
+    // the agent's option table.
+    let question = hook_question(
+        &agent_type,
+        &hook_event_name,
+        tool_name.as_deref(),
+        tool_input.as_ref(),
+        tool_detail.clone(),
+        metadata.get("tool_use_id").map(String::as_str),
+        extra.get("permission_suggestions"),
+    );
+
+    let mut event = AgentEvent {
         session_id,
         agent_type,
         event_type,
@@ -783,7 +1227,75 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
-    })
+    };
+    if let Some(mut question) = question {
+        question.subagent_id = subagent_id_for_question;
+        event.set_question(&question);
+    }
+    Some(event)
+}
+
+/// PRD #1542: the question a Claude-shaped hook payload raises, if any.
+///
+/// - Claude Code `PermissionRequest` → [`crate::question::claude_permission_request`].
+/// - Codex `PermissionRequest` → [`crate::question::codex_permission_request`];
+///   Codex `PreToolUse` of `request_user_input` →
+///   [`crate::question::codex_request_user_input`].
+/// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
+///
+/// The agent's version is not in any of these payloads, so the tables are used
+/// as verified (`None`).
+fn hook_question(
+    agent_type: &AgentType,
+    hook_event_name: &str,
+    tool_name: Option<&str>,
+    tool_input: Option<&Value>,
+    tool_detail: Option<String>,
+    tool_use_id: Option<&str>,
+    permission_suggestions: Option<&Value>,
+) -> Option<crate::question::PendingQuestion> {
+    let now = Utc::now().timestamp_millis();
+    let id = crate::question::mint_question_id;
+    match (agent_type, hook_event_name) {
+        (AgentType::ClaudeCode, "PermissionRequest") => Some(
+            crate::question::claude_permission_request(
+                id(),
+                tool_name?,
+                tool_input,
+                tool_detail,
+                permission_suggestions,
+                now,
+                None,
+            )
+            .question,
+        ),
+        (AgentType::Codex, "PermissionRequest") => {
+            // The whole command, for the "don't ask again" confirmation:
+            // `tool_detail` is its first line, cut at 120 bytes.
+            let command = tool_input
+                .and_then(|input| input.get("command"))
+                .and_then(codex_shell_command);
+            Some(crate::question::codex_permission_request(
+                id(),
+                tool_name?,
+                tool_detail,
+                command.as_deref(),
+                now,
+                None,
+            ))
+        }
+        (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
+            crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
+        }
+        (AgentType::Devin, "PermissionRequest") => Some(crate::question::devin_permission_request(
+            id(),
+            tool_name?,
+            tool_detail,
+            now,
+            None,
+        )),
+        _ => None,
+    }
 }
 
 /// Issue #714: how many times, after the first read, the Claude `StopFailure`
@@ -876,11 +1388,52 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::PermissionRequest),
         "permission.replied" => Some(EventType::Thinking),
+        // PRD #1542: OpenCode's `question` tool. The plugin forwards the ask
+        // through `await-answer`, which builds the event itself; this arm is
+        // for a plugin that forwards it as a plain event.
+        "question.asked" => Some(EventType::WaitingForInput),
+        "question.replied" | "question.rejected" => Some(EventType::Thinking),
         _ => None,
     }
 }
 
 pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
+    build_opencode_event_with_question(input).map(|(event, _)| event)
+}
+
+/// PRD #1542 / #1631: the question an OpenCode event raises, from its raw
+/// `properties` — a `permission.asked` (`crate::question::opencode_permission_asked`)
+/// or a `question.asked` (`crate::question::opencode_question_asked`). `None`
+/// for every other event, and for one that arrived without `properties` (an
+/// older plugin, which forwards the status only).
+fn opencode_question(
+    event: &str,
+    properties: Option<&Value>,
+    raised_at_ms: i64,
+) -> Option<crate::question::PendingQuestion> {
+    let properties = properties?;
+    match event {
+        "permission.asked" => crate::question::opencode_permission_asked(properties, raised_at_ms),
+        "question.asked" => crate::question::opencode_question_asked(properties, raised_at_ms),
+        _ => None,
+    }
+}
+
+/// [`build_opencode_event`], plus the question the event raises (PRD #1631):
+/// ONE parse of the payload yields both the status event — `permission.asked`
+/// is `PermissionRequest`, which reading mode announces — and the
+/// `pending_question` it carries ([`crate::event::AgentEvent::set_question`]).
+/// A permission's tool fills the event's `tool_name` / `tool_detail` when the
+/// payload named none, so what reading mode says the agent wants is what the
+/// question asks.
+pub(crate) fn build_opencode_event_with_question(
+    input: OpenCodeHookInput,
+) -> Option<(AgentEvent, Option<crate::question::PendingQuestion>)> {
+    let question = opencode_question(
+        &input.event,
+        input.properties.as_ref(),
+        Utc::now().timestamp_millis(),
+    );
     let mut event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
@@ -897,6 +1450,21 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
                 input.session_id,
                 Utc::now().timestamp_millis()
             ),
+        );
+    }
+
+    // PRD #1542: OpenCode reports the question answered, by its request id.
+    if matches!(
+        input.event.as_str(),
+        "permission.replied" | "question.replied" | "question.rejected"
+    ) && let Some(request_id) = input
+        .request_id
+        .as_deref()
+        .filter(|id| crate::question::is_valid_question_id(id))
+    {
+        metadata.insert(
+            crate::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+            request_id.to_string(),
         );
     }
 
@@ -940,7 +1508,7 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         }
     }
 
-    Some(AgentEvent {
+    let mut event = AgentEvent {
         session_id: input.session_id,
         agent_type: AgentType::OpenCode,
         event_type,
@@ -955,7 +1523,17 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         agent_version: None,
         schema_version: None,
         live_target: None,
-    })
+    };
+    if let Some(question) = &question {
+        if event.tool_name.is_none()
+            && let Some(tool) = &question.tool
+        {
+            event.tool_name = Some(tool.name.clone());
+            event.tool_detail = tool.detail.clone();
+        }
+        event.set_question(question);
+    }
+    Some((event, question))
 }
 
 /// The optional card detail `dot-agent-deck agent-event` carries beside its
@@ -1519,6 +2097,28 @@ fn request_from_socket_at_detailed(
     json: &str,
     timeout: Option<std::time::Duration>,
 ) -> (SocketReply, Option<NoReplyCause>) {
+    request_from_socket_at_detailed_with(path, json, timeout, true)
+}
+
+/// PRD #1542: a held request — [`request_from_socket_at`] WITHOUT the
+/// half-close after the write. The daemon reads the held connection for EOF to
+/// learn that the producer stopped waiting (Claude Code kills the hook when the
+/// keyboard answers No [observed]), so a half-close would read as exactly that
+/// the moment the request landed.
+fn request_held_at(
+    path: &std::path::Path,
+    json: &str,
+    timeout: std::time::Duration,
+) -> SocketReply {
+    request_from_socket_at_detailed_with(path, json, Some(timeout), false).0
+}
+
+fn request_from_socket_at_detailed_with(
+    path: &std::path::Path,
+    json: &str,
+    timeout: Option<std::time::Duration>,
+    half_close: bool,
+) -> (SocketReply, Option<NoReplyCause>) {
     // The total-operation deadline starts here, before connect, rather than
     // being re-armed with a fresh full budget once the connection is
     // established and the request written below. Connect and the write are
@@ -1596,7 +2196,12 @@ fn request_from_socket_at_detailed(
     // single request and doesn't block waiting for more (it reads in a loop).
     // Best-effort: on a transport without a half-close primitive (Windows named
     // pipes) this is a no-op, which is why the read below must not depend on EOF.
-    let _ = stream.shutdown_write();
+    //
+    // PRD #1542: except for a held request, whose connection the daemon reads
+    // for EOF to learn that the producer stopped waiting.
+    if half_close {
+        let _ = stream.shutdown_write();
+    }
     // Read exactly the ONE reply line the daemon writes, rather than to EOF.
     //
     // PRD #163 M4: reading to EOF made this a deadlock on Windows. The daemon
@@ -4327,5 +4932,749 @@ mod tests {
             build_event(main).unwrap().event_type,
             EventType::QuotaBlocked
         );
+    }
+}
+
+/// PRD #1542: the questions the hook CLI builds from real agent payloads
+/// (`tests/fixtures/agent-questions/`), and the held hook's exchange with the
+/// daemon.
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use crate::question::{
+        AnswerChannel, OptionRole, PendingQuestion, QuestionKind, QuestionReply, ReleaseReason,
+        ResolvedAnswer,
+    };
+    use spec::spec;
+
+    fn fixture(name: &str) -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agent-questions")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture"))
+            .expect("parse fixture")
+    }
+
+    fn event_for(agent: AgentType, payload: &Value) -> AgentEvent {
+        let input: ClaudeCodeHookInput =
+            serde_json::from_value(payload.clone()).expect("a Claude-shaped payload");
+        build_event_typed(input, agent).expect("the payload maps to an event")
+    }
+
+    fn question_for(agent: AgentType, payload: &Value) -> PendingQuestion {
+        event_for(agent, payload)
+            .question()
+            .expect("the event carries a question")
+    }
+
+    fn labels(question: &PendingQuestion, index: usize) -> Vec<&str> {
+        question.questions[index]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect()
+    }
+
+    /// Scenario: Claude Code 2.1.289's captured `PermissionRequest` for a Bash
+    /// command, whose first suggestion is `addDirectories`, becomes a held
+    /// Permission question: Yes, "Yes, and always allow access to <dir> from
+    /// this project" with the directory as its scope, and No.
+    #[spec("question/detect/001")]
+    #[test]
+    fn question_detect_001_claude_bash_permission_request() {
+        let event = event_for(
+            AgentType::ClaudeCode,
+            &fixture("claude-permission-bash.json"),
+        );
+        assert_eq!(event.event_type, EventType::PermissionRequest);
+        let q = event.question().unwrap();
+        assert_eq!(q.kind, QuestionKind::Permission);
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert!(q.id.starts_with("q-") && crate::question::is_valid_question_id(&q.id));
+        assert_eq!(
+            labels(&q, 0),
+            vec![
+                "Yes",
+                "Yes, and always allow access to /work/proj from this project",
+                "No"
+            ]
+        );
+        let roles: Vec<OptionRole> = q.questions[0].options.iter().map(|o| o.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                OptionRole::AllowOnce,
+                OptionRole::AllowAlways,
+                OptionRole::Deny
+            ]
+        );
+        // The confirmation says what is sent: the suggestion's destination
+        // is `session`, whatever Claude's own label says.
+        assert_eq!(
+            q.questions[0].options[1].scope.as_deref(),
+            Some("access to /work/proj for the rest of this session")
+        );
+        let tool = q.tool.as_ref().unwrap();
+        assert_eq!(tool.name, "Bash");
+        assert_eq!(tool.detail.as_deref(), Some("touch created_m1.txt"));
+        assert!(
+            claude_held_question(&event, &fixture("claude-permission-bash.json").to_string())
+                .is_none(),
+            "no pane id in a unit test, so nothing to hold for"
+        );
+    }
+
+    /// Scenario: Claude Code's captured `PermissionRequest` for a Write, whose
+    /// suggestion is `setMode acceptEdits`, names option 2 "Yes, and switch to
+    /// accept edits for this session".
+    #[spec("question/detect/002")]
+    #[test]
+    fn question_detect_002_claude_write_permission_names_accept_edits() {
+        let q = question_for(
+            AgentType::ClaudeCode,
+            &fixture("claude-permission-write.json"),
+        );
+        assert_eq!(
+            labels(&q, 0),
+            vec![
+                "Yes",
+                "Yes, and switch to accept edits for this session",
+                "No"
+            ]
+        );
+        assert_eq!(q.questions[0].options[1].role, OptionRole::AllowAlways);
+        assert!(q.questions[0].options[1].scope.is_some());
+    }
+
+    /// Scenario: A two-question `AskUserQuestion` form, the second
+    /// multi-select, becomes a held Choice question with both questions, each
+    /// followed by Claude Code's own "Type something." (free text) and "Chat
+    /// about this" (keyboard-only).
+    #[spec("question/detect/003")]
+    #[test]
+    fn question_detect_003_claude_ask_user_question_form() {
+        let q = question_for(
+            AgentType::ClaudeCode,
+            &fixture("claude-ask-user-question-form.json"),
+        );
+        assert_eq!(q.kind, QuestionKind::Choice);
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert_eq!(q.questions.len(), 2);
+        assert_eq!(q.questions[0].prompt, "Which colour?");
+        assert_eq!(q.questions[0].header.as_deref(), Some("Colour"));
+        assert!(!q.questions[0].multi_select);
+        assert!(q.questions[1].multi_select);
+        assert_eq!(
+            labels(&q, 0),
+            vec!["Red", "Green", "Blue", "Type something.", "Chat about this"]
+        );
+        let appended = &q.questions[1].options[3..];
+        assert_eq!(appended[0].role, OptionRole::FreeText);
+        assert!(!appended[0].keyboard_only);
+        assert!(appended[1].keyboard_only);
+        assert_eq!(q.tool.as_ref().unwrap().name, "AskUserQuestion");
+    }
+
+    /// Scenario: Claude Code's plan approval is a Plan question answered by
+    /// keys, not held — a hook decision does not dismiss the plan dialog — with
+    /// its third option keyboard-only.
+    #[spec("question/detect/004")]
+    #[test]
+    fn question_detect_004_claude_plan_is_keys_and_not_held() {
+        let payload = fixture("claude-permission-plan.json");
+        let mut event = event_for(AgentType::ClaudeCode, &payload);
+        event.pane_id = Some("pane-plan".into());
+        let q = event.question().unwrap();
+        assert_eq!(q.kind, QuestionKind::Plan);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        assert_eq!(q.questions[0].options.len(), 3);
+        assert!(q.questions[0].options[2].keyboard_only);
+        assert!(
+            claude_held_question(&event, &payload.to_string()).is_none(),
+            "a plan approval must not be held"
+        );
+        let keys = crate::question::answer_keys(
+            &AgentType::ClaudeCode,
+            &q,
+            &q.validate(
+                &[crate::question::QuestionAnswer {
+                    question_index: 0,
+                    option_indices: vec![2],
+                    text: None,
+                }],
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(keys, vec!["2"]);
+    }
+
+    /// Scenario: Codex 0.160.0's captured `PreToolUse` for a two-question
+    /// `request_user_input` stays a ToolStart but carries a Choice question
+    /// whose id is the call's `tool_use_id`, answered by keys, each question
+    /// ending in a keyboard-only "None of the above".
+    #[spec("question/detect/005")]
+    #[test]
+    fn question_detect_005_codex_request_user_input_form() {
+        let event = event_for(AgentType::Codex, &fixture("codex-request-user-input.json"));
+        assert_eq!(event.event_type, EventType::ToolStart);
+        let q = event.question().unwrap();
+        assert_eq!(q.id, "call_3X65ZJFbHuMzyWg4gOyBg1vK");
+        assert_eq!(
+            q.tool.as_ref().unwrap().use_id.as_deref(),
+            Some("call_3X65ZJFbHuMzyWg4gOyBg1vK")
+        );
+        assert_eq!(q.kind, QuestionKind::Choice);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        assert_eq!(
+            labels(&q, 0),
+            vec!["Red", "Green", "Blue", "None of the above"]
+        );
+        assert_eq!(labels(&q, 1), vec!["Small", "Large", "None of the above"]);
+        assert!(q.questions[1].options[2].keyboard_only);
+        assert!(q.questions.iter().all(|q| !q.multi_select));
+    }
+
+    /// Scenario: A Codex `PermissionRequest` becomes a Permission question
+    /// answered by the keys `1`, `p` and `3`, and Codex's `Interrupt` hook — what
+    /// fires after a keyboard "No" — reads as Idle.
+    #[spec("question/detect/006")]
+    #[test]
+    fn question_detect_006_codex_permission_keys_and_interrupt() {
+        let q = question_for(AgentType::Codex, &fixture("codex-permission-request.json"));
+        assert_eq!(q.kind, QuestionKind::Permission);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        assert_eq!(
+            q.tool.as_ref().unwrap().detail.as_deref(),
+            Some("touch codex_b.txt")
+        );
+        let keys: Vec<String> = (1..=3)
+            .map(|index| {
+                let resolved = q
+                    .validate(
+                        &[crate::question::QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![index],
+                            text: None,
+                        }],
+                        true,
+                    )
+                    .unwrap();
+                crate::question::answer_keys(&AgentType::Codex, &q, &resolved)
+                    .unwrap()
+                    .join("")
+            })
+            .collect();
+        assert_eq!(keys, vec!["1", "p", "3"]);
+        assert!(
+            q.questions[0].options[1]
+                .scope
+                .as_deref()
+                .is_some_and(|s| s.contains("touch codex_b.txt"))
+        );
+        assert_eq!(map_event_type("Interrupt"), Some(EventType::Idle));
+    }
+
+    /// Scenario: A Devin `PermissionRequest` becomes a Permission question
+    /// from the docs-derived table in which only Allow once and Deny are
+    /// answerable; the four "allow for …" scopes and the two edit options are
+    /// keyboard-only.
+    #[spec("question/detect/009")]
+    #[test]
+    fn question_detect_009_devin_permission_is_docs_derived() {
+        let payload = serde_json::json!({
+            "session_id": "devin-1",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "exec",
+            "tool_input": {"command": "rm -rf build"},
+        });
+        let q = question_for(AgentType::Devin, &payload);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        let answerable: Vec<&str> = q.questions[0]
+            .options
+            .iter()
+            .filter(|o| o.answerable())
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(answerable, vec!["Allow once", "Deny"]);
+        assert_eq!(q.questions[0].options.len(), 8);
+    }
+
+    /// Scenario: A Pi extension's `select`, `confirm` and `input` dialogs, as
+    /// the deck's Pi extension describes them to `await-answer`, become held
+    /// questions, and each answer maps back to the value the asking extension
+    /// receives — the option string from the dialog's own list, true or false,
+    /// or the typed text. The wrapper around Pi's `ctx.ui` that produces those
+    /// descriptions is covered by `pi-extension/test/questions.test.ts`, run
+    /// here when Node can strip TypeScript types.
+    #[spec("question/detect/008")]
+    #[test]
+    fn question_detect_008_pi_dialogs_map_both_ways() {
+        use crate::question::{PiDialog, pi_dialog, pi_value};
+        let dialog = |kind: &str| PiDialog {
+            id: "q-pi1".into(),
+            kind: kind.into(),
+            title: "Pick a colour".into(),
+            message: Some("for the bikeshed".into()),
+            options: vec!["Red".into(), "Green".into(), "Blue".into()],
+            placeholder: Some("colour".into()),
+        };
+        let reply = |q: &PendingQuestion, index: u32, text: Option<&str>| {
+            let resolved = q
+                .validate(
+                    &[crate::question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![index],
+                        text: text.map(str::to_string),
+                    }],
+                    false,
+                )
+                .unwrap();
+            QuestionReply::answered(&q.id, resolved)
+        };
+
+        let select = dialog("select");
+        let q = pi_dialog(&select, 1).unwrap();
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert_eq!(labels(&q, 0), vec!["Red", "Green", "Blue"]);
+        assert_eq!(
+            pi_value(&select, &q, &reply(&q, 3, None)),
+            Some(serde_json::json!({"value": "Blue"}))
+        );
+
+        let confirm = dialog("confirm");
+        let q = pi_dialog(&confirm, 1).unwrap();
+        assert_eq!(q.kind, QuestionKind::Confirm);
+        assert_eq!(q.questions[0].prompt, "Pick a colour\nfor the bikeshed");
+        assert_eq!(
+            pi_value(&confirm, &q, &reply(&q, 1, None)),
+            Some(serde_json::json!({"value": true}))
+        );
+        assert_eq!(
+            pi_value(&confirm, &q, &reply(&q, 2, None)),
+            Some(serde_json::json!({"value": false}))
+        );
+
+        let input = dialog("input");
+        let q = pi_dialog(&input, 1).unwrap();
+        assert_eq!(q.questions[0].options[0].role, OptionRole::FreeText);
+        assert_eq!(q.questions[0].options[0].label, "colour");
+        assert_eq!(
+            pi_value(&input, &q, &reply(&q, 1, Some("teal"))),
+            Some(serde_json::json!({"value": "teal"}))
+        );
+        assert_eq!(pi_dialog(&dialog("editor"), 1), None);
+        assert_eq!(
+            pi_value(
+                &select,
+                &q,
+                &QuestionReply::released(&q.id, ReleaseReason::Cleared)
+            ),
+            None
+        );
+
+        // The JS half, when this Node can run TypeScript directly (23.6+).
+        let node = std::process::Command::new("node").arg("--version").output();
+        let Ok(node) = node else {
+            eprintln!("SKIP: node is not available for pi-extension/test/questions.test.ts");
+            return;
+        };
+        let version = String::from_utf8_lossy(&node.stdout);
+        let mut parts = version.trim().trim_start_matches('v').split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        if (major, minor) < (23, 6) {
+            eprintln!("SKIP: node {version} cannot strip TypeScript types");
+            return;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pi-extension");
+        let out = std::process::Command::new("node")
+            .args(["--test", "test/questions.test.ts"])
+            .current_dir(&dir)
+            .output()
+            .expect("run node --test");
+        assert!(
+            out.status.success(),
+            "pi-extension/test/questions.test.ts failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The OpenCode half of `await-answer`: OpenCode's captured `question.asked`
+    /// and `permission.asked` become held questions on the plugin's session,
+    /// and an answer maps back onto OpenCode's reply bodies by index.
+    #[test]
+    fn opencode_await_answer_builds_and_maps_both_questions() {
+        let raw = serde_json::json!({
+            "session_id": "ses_1",
+            "event": "question.asked",
+            "properties": fixture("opencode-question-asked.json"),
+            "cwd": "/work",
+        });
+        let (event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+        assert_eq!(event.event_type, EventType::WaitingForInput);
+        assert_eq!(event.agent_type, AgentType::OpenCode);
+        assert_eq!(q.id, "que_1043ff915001MjL9vryfDO6HZX");
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert_eq!(
+            labels(&q, 0),
+            vec!["Red", "Green", "Blue", "Type your own answer"]
+        );
+        assert!(q.questions[1].multi_select);
+        let reply = QuestionReply::answered(
+            &q.id,
+            resolved(&q, &[(0, &[4], Some("teal")), (1, &[1, 3], None)]),
+        );
+        assert_eq!(
+            crate::question::opencode_reply(&q, &props, &reply),
+            Some(serde_json::json!({
+                "kind": "question",
+                "request_id": "que_1043ff915001MjL9vryfDO6HZX",
+                "body": {"answers": [["teal"], ["Small", "Large"]]}
+            }))
+        );
+
+        let raw = serde_json::json!({
+            "session_id": "ses_1",
+            "event": "permission.asked",
+            "properties": fixture("opencode-permission-asked.json"),
+        });
+        let (event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+        assert_eq!(event.event_type, EventType::PermissionRequest);
+        assert_eq!(event.tool_detail.as_deref(), Some("touch oc_a.txt"));
+        assert_eq!(labels(&q, 0), vec!["Allow once", "Allow always", "Reject"]);
+        assert_eq!(
+            q.questions[0].options[1].scope.as_deref(),
+            Some("requests matching touch *")
+        );
+        for (index, expected) in [(1, "once"), (2, "always"), (3, "reject")] {
+            let reply = QuestionReply::answered(&q.id, resolved(&q, &[(0, &[index], None)]));
+            assert_eq!(
+                crate::question::opencode_reply(&q, &props, &reply).unwrap()["body"]["reply"],
+                expected
+            );
+        }
+        assert!(opencode_question_event(r#"{"session_id":"s","event":"session.idle"}"#).is_none());
+    }
+
+    /// A one-shot stand-in daemon: accepts one connection, reads one line,
+    /// answers with `reply` (or closes without one), and hands back the line.
+    #[cfg(unix)]
+    fn stub_daemon(
+        reply: Option<String>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::thread::JoinHandle<String>,
+    ) {
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if let Some(reply) = reply {
+                let mut stream = reader.into_inner();
+                let _ = writeln!(stream, "{reply}");
+            }
+            line
+        });
+        (dir, path, handle)
+    }
+
+    /// Scenario: A Codex approval — answered by keys, so the hook does not
+    /// wait for it — leaves the hook as a `question` message that is not held,
+    /// carrying the pane's hook token, and the daemon's acknowledgement ends
+    /// it. When the daemon answers nothing (an older daemon) or refuses the
+    /// token, the hook sends the event again as a plain one with no question
+    /// in it, so the card still reads Needs Input.
+    #[cfg(unix)]
+    #[spec("question/detect/010")]
+    #[test]
+    fn question_detect_010_unheld_questions_go_through_the_provenance_gate() {
+        let mut event = event_for(AgentType::Codex, &fixture("codex-permission-request.json"));
+        event.pane_id = Some("pane-unheld".into());
+        assert!(carries_question_metadata(&event));
+        let ack =
+            crate::question::QuestionReply::released("x", crate::question::ReleaseReason::NotHeld);
+        let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&ack).unwrap()));
+        assert_eq!(
+            send_question_unheld_at(&path, event.clone(), std::time::Duration::from_secs(10)),
+            UnheldSend::Attested
+        );
+        let sent: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(sent["message_type"], "question");
+        assert_eq!(sent["hold"], false);
+        assert_eq!(sent["pane_id"], "pane-unheld");
+        assert!(sent["event"]["metadata"][crate::event::QUESTION_METADATA_KEY].is_string());
+
+        // An older daemon: it reads the line and answers nothing. The fallback
+        // is a plain event on a second connection, without the question.
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                lines.push(line);
+            }
+            lines
+        });
+        assert_eq!(
+            send_question_unheld_at(&path, event.clone(), std::time::Duration::from_millis(300)),
+            UnheldSend::Plain
+        );
+        let lines = server.join().unwrap();
+        let plain: AgentEvent = serde_json::from_str(lines[1].trim()).unwrap();
+        assert_eq!(plain.event_type, EventType::PermissionRequest);
+        assert!(!carries_question_metadata(&plain));
+
+        // A refusal from the provenance gate: the same fallback.
+        let refused =
+            crate::question::QuestionReply::released("x", crate::question::ReleaseReason::Refused);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let reply = serde_json::to_string(&refused).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for i in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if i == 0 {
+                    let _ = writeln!(reader.into_inner(), "{reply}");
+                }
+                lines.push(line);
+            }
+            lines
+        });
+        assert_eq!(
+            send_question_unheld_at(&path, event, std::time::Duration::from_secs(10)),
+            UnheldSend::Plain
+        );
+        let lines = server.join().unwrap();
+        let plain: AgentEvent = serde_json::from_str(lines[1].trim()).unwrap();
+        assert!(!carries_question_metadata(&plain));
+    }
+
+    fn held_event(payload: &Value) -> (AgentEvent, PendingQuestion) {
+        let mut event = event_for(AgentType::ClaudeCode, payload);
+        event.pane_id = Some("pane-held".into());
+        let q = event.question().unwrap();
+        (event, q)
+    }
+
+    fn resolved(
+        q: &PendingQuestion,
+        answers: &[(u32, &[u32], Option<&str>)],
+    ) -> Vec<ResolvedAnswer> {
+        q.validate(
+            &answers
+                .iter()
+                .map(|(qi, oi, text)| crate::question::QuestionAnswer {
+                    question_index: *qi,
+                    option_indices: oi.to_vec(),
+                    text: text.map(str::to_string),
+                })
+                .collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap()
+    }
+
+    /// Scenario: The OpenCode plugin's `await-answer --ack` child holds a
+    /// permission with a stand-in daemon, asking to acknowledge. The daemon
+    /// answers Allow once; the child prints OpenCode's `once` reply for the
+    /// plugin, reads the plugin's report that OpenCode refused it, and passes
+    /// that report on to the daemon on the same connection. A report that
+    /// never comes, or does not parse, is passed on as nothing.
+    #[cfg(unix)]
+    #[spec("question/hold/016")]
+    #[test]
+    fn question_hold_016_the_opencode_child_passes_on_what_opencode_made_of_the_reply() {
+        use std::io::BufRead as _;
+        let raw = serde_json::json!({
+            "session_id": "ses_1",
+            "event": "permission.asked",
+            "properties": fixture("opencode-permission-asked.json"),
+        });
+        let run = |ack: Option<&str>| -> (Value, Option<String>, String) {
+            let (mut event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+            event.pane_id = Some("pane-oc".into());
+            let reply = QuestionReply::answered(&q.id, resolved(&q, &[(0, &[1], None)]));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let reply_line = serde_json::to_string(&reply).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut held = String::new();
+                reader.read_line(&mut held).unwrap();
+                writeln!(reader.get_mut(), "{reply_line}").unwrap();
+                let mut acked = String::new();
+                let n = reader.read_line(&mut acked).unwrap();
+                (
+                    serde_json::from_str::<Value>(&held).unwrap(),
+                    (n > 0).then(|| acked.trim().to_string()),
+                )
+            });
+            let mut out = Vec::new();
+            let ack = ack.map(str::to_string);
+            opencode_hold_acked_at(&path, event, &q, &props, &mut out, || ack);
+            let (held, acked) = server.join().unwrap();
+            (held, acked, String::from_utf8(out).unwrap())
+        };
+
+        let (held, acked, printed) = run(Some(
+            r#"{"delivered":false,"detail":"OpenCode answered 500"}"#,
+        ));
+        assert_eq!(held["hold"], true);
+        assert_eq!(held["ack"], true, "the child asks to acknowledge");
+        let printed: Value = serde_json::from_str(printed.trim()).unwrap();
+        assert_eq!(printed["body"]["reply"], "once");
+        assert_eq!(
+            serde_json::from_str::<crate::question::ReplyAck>(&acked.unwrap()).unwrap(),
+            crate::question::ReplyAck {
+                delivered: false,
+                detail: Some("OpenCode answered 500".into()),
+            }
+        );
+
+        for silent in [None, Some("not json")] {
+            let (_, acked, printed) = run(silent);
+            assert!(!printed.is_empty(), "the reply is still printed");
+            assert_eq!(acked, None, "{silent:?}: nothing passed on");
+        }
+    }
+
+    /// Scenario: A held Claude Code permission hook sends its question to a
+    /// stand-in daemon as a held `question` message and turns each answer into
+    /// exactly the decision Claude Code takes: allow; allow with the payload's
+    /// first suggestion as `updatedPermissions`; deny; and, for a form, allow
+    /// with `updatedInput` carrying the payload's questions unchanged plus the
+    /// answers — a label, an array of labels for the multi-select question, or
+    /// the typed text.
+    #[cfg(unix)]
+    #[spec("question/hold/001")]
+    #[test]
+    fn question_hold_001_held_hook_prints_the_decision_for_its_own_question() {
+        let payload = fixture("claude-permission-bash.json");
+        let (event, q) = held_event(&payload);
+        let decision = |answers: &[(u32, &[u32], Option<&str>)]| {
+            let reply = QuestionReply::answered(&q.id, resolved(&q, answers));
+            let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
+            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            let sent: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+            assert_eq!(sent["message_type"], "question");
+            assert_eq!(sent["hold"], true);
+            assert_eq!(sent["pane_id"], "pane-held");
+            crate::question::claude_decision(
+                &q,
+                payload.get("tool_input"),
+                payload.get("permission_suggestions"),
+                &got.expect("a reply line"),
+            )
+            .expect("a decision")
+        };
+        let allow = decision(&[(0, &[1], None)]);
+        assert_eq!(
+            allow,
+            serde_json::json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"}}})
+        );
+        let always = decision(&[(0, &[2], None)]);
+        assert_eq!(
+            always["hookSpecificOutput"]["decision"]["updatedPermissions"],
+            serde_json::json!([payload["permission_suggestions"][0]]),
+            "only the update the option stands for"
+        );
+        let deny = decision(&[(0, &[3], None)]);
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+
+        let form = fixture("claude-ask-user-question-form.json");
+        let (event, q) = held_event(&form);
+        let reply =
+            QuestionReply::answered(&q.id, resolved(&q, &[(0, &[2], None), (1, &[1, 3], None)]));
+        let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
+        let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10)).unwrap();
+        server.join().unwrap();
+        let decision =
+            crate::question::claude_decision(&q, form.get("tool_input"), None, &got).unwrap();
+        let input = &decision["hookSpecificOutput"]["decision"]["updatedInput"];
+        assert_eq!(input["questions"], form["tool_input"]["questions"]);
+        assert_eq!(
+            input["answers"],
+            serde_json::json!({"Which colour?": "Green", "Which sizes?": ["Small", "Large"]})
+        );
+        let typed = QuestionReply::answered(
+            &q.id,
+            resolved(
+                &q,
+                &[(0, &[4], Some("A hamster named Bob")), (1, &[2], None)],
+            ),
+        );
+        let decision =
+            crate::question::claude_decision(&q, form.get("tool_input"), None, &typed).unwrap();
+        assert_eq!(
+            decision["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["Which colour?"],
+            "A hamster named Bob"
+        );
+    }
+
+    /// Scenario: The held hook decides nothing — Claude Code then shows its own
+    /// dialog as if there were no hook — when the daemon closes without a
+    /// reply, releases the question, cannot be reached, or answers a different
+    /// question; and a provenance refusal is recognised, so the hook re-sends
+    /// the event as a plain one.
+    #[cfg(unix)]
+    #[spec("question/hold/002")]
+    #[test]
+    fn question_hold_002_held_hook_prints_nothing_without_its_own_answer() {
+        let payload = fixture("claude-permission-bash.json");
+        let (event, q) = held_event(&payload);
+        let decide = |reply: Option<String>| {
+            let (_dir, path, server) = stub_daemon(reply);
+            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            server.join().unwrap();
+            got.and_then(|reply| {
+                crate::question::claude_decision(&q, payload.get("tool_input"), None, &reply)
+            })
+        };
+        assert_eq!(decide(None), None, "EOF");
+        let released = QuestionReply::released(&q.id, ReleaseReason::Cleared);
+        assert_eq!(
+            decide(Some(serde_json::to_string(&released).unwrap())),
+            None
+        );
+        let other = QuestionReply::answered("q-someone-else", resolved(&q, &[(0, &[1], None)]));
+        assert_eq!(decide(Some(serde_json::to_string(&other).unwrap())), None);
+        assert_eq!(decide(Some("not json".into())), None);
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(
+            hold_question_at(
+                &missing.path().join("absent.sock"),
+                &event,
+                std::time::Duration::from_secs(2)
+            )
+            .is_none()
+        );
+
+        assert!(QuestionReply::released(&q.id, ReleaseReason::Refused).refused());
+        assert!(!released.refused());
     }
 }

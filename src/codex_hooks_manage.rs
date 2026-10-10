@@ -124,6 +124,13 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "PostCompact",
     "SubagentStart",
     "SubagentStop",
+    // PRD #1542: fires when a turn is interrupted — after a keyboard "No" on
+    // Codex's approval prompt [observed on 0.160.0] — so the deck can clear
+    // the question that prompt raised. Adding it changes the installed hook
+    // set; the install trusts it with the deck's other hooks
+    // (`trust_deck_hooks_in`). Whether a Codex session already running when
+    // the set changes asks the user to review it was not measured.
+    "Interrupt",
 ];
 
 /// Resolve the active Codex home the way Codex itself does: `$CODEX_HOME` when
@@ -2372,6 +2379,31 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Scenario: Installing the deck's Codex hooks into a fresh Codex home
+    /// writes a command rule for `Interrupt` — the event Codex fires after a
+    /// keyboard "No" on its approval prompt — alongside the existing set, and
+    /// a payload naming it reads as Idle, which clears the prompt's question.
+    #[spec("codex/hooks/013")]
+    #[test]
+    fn codex_hooks_013_interrupt_is_installed() {
+        assert!(CODEX_HOOK_EVENTS.contains(&"Interrupt"));
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        install_to(dir.path(), "/abs/dot-agent-deck").expect("install hooks.json");
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("hooks.json")).expect("read hooks.json"),
+        )
+        .expect("parse hooks.json");
+        let interrupt = root["hooks"]["Interrupt"]
+            .as_array()
+            .expect("an Interrupt rule");
+        assert!(
+            interrupt.iter().any(|rule| rule["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.ends_with(HOOK_COMMAND_SUFFIX))),
+            "{interrupt:?}"
         );
     }
 

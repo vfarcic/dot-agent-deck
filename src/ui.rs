@@ -22197,6 +22197,7 @@ pub fn render_orchestration_frame_to_buffer(
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22992,6 +22993,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
             },
         );
     }
@@ -25251,6 +25253,7 @@ mod tests {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
             },
         );
         state
@@ -28778,6 +28781,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31574,6 +31578,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32368,6 +32373,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         }
     }
 
@@ -32802,6 +32808,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         };
 
         // Spacious: get all 3
@@ -32843,6 +32850,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32875,6 +32883,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
