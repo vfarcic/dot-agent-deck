@@ -5518,8 +5518,13 @@ pub struct RespawnsInFlight;
 /// lifts the old record out until the replacement is published (or the
 /// respawn fails); dropping it un-counts it and, at zero, wakes a waiting
 /// [`AgentPtyRegistry::freeze_admission`].
+///
+/// Issue #1612: it also holds the old generation's entry in
+/// `RegistryInner::respawning_dirs`, so a removal sees the pane's working
+/// directory as in use for the whole window, and drops it with the count.
 struct RespawnTicket<'a> {
     registry: &'a AgentPtyRegistry,
+    agent_id: String,
 }
 
 impl Drop for RespawnTicket<'_> {
@@ -5530,6 +5535,7 @@ impl Drop for RespawnTicket<'_> {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
+        inner.respawning_dirs.remove(&self.agent_id);
         if inner.respawns_in_flight == 0 {
             self.registry.respawns_settled.notify_waiters();
         }
@@ -6877,6 +6883,15 @@ struct RegistryInner {
     /// deletion. A list rather than a set so two holds on one directory each
     /// release only their own entry. See [`DirRemovalHold`].
     removal_holds: Vec<PathBuf>,
+    /// Issue #1612: the working directories of every pane in its respawn
+    /// window — between `respawn_agent_for_pane` lifting the old record out of
+    /// `agents` and the replacement reserving its spawn — keyed by the old
+    /// generation's agent id. In that window the pane has neither a record nor
+    /// a reservation, so without this a removal would read its directory as
+    /// unused and the replacement would be refused or start in a deleted one.
+    /// Inserted under the lock that removes the record and released by
+    /// [`RespawnTicket`], which outlives the replacement's publication.
+    respawning_dirs: HashMap<String, Vec<PathBuf>>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -7037,6 +7052,15 @@ fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
 /// Issue #1612: the working directories a spawn with these options roots
 /// itself in — its `cwd`, and an orchestration role's orchestration cwd, which
 /// is the worktree every role of an issue-dispatched orchestration shares.
+///
+/// A relative one is resolved against the daemon's working directory, which is
+/// what the child's `chdir` resolves it against, so it matches a hold on the
+/// absolute path it names (Greptile on PR #1642). A spawn with no `cwd`
+/// records nothing for it: portable-pty starts it in its `HOME` on Unix, and in
+/// its `USERPROFILE` on Windows, or the daemon's own working directory when that
+/// is not a directory. The only directories held for removal are abandoned
+/// issue-dispatch worktrees inside the daemon's clones, which are none of those
+/// unless the daemon or its environment was pointed into one.
 fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<PathBuf> {
     let orchestration_cwd = match tab_membership {
         Some(TabMembership::Orchestration {
@@ -7044,9 +7068,19 @@ fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<
         }) => orchestration_cwd.as_deref(),
         _ => None,
     };
+    let mut base = None;
     cwd.into_iter()
         .chain(orchestration_cwd)
-        .map(PathBuf::from)
+        .map(|dir| {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                return dir;
+            }
+            match base.get_or_insert_with(|| std::env::current_dir().ok()) {
+                Some(base) => base.join(dir),
+                None => dir,
+            }
+        })
         .collect()
 }
 
@@ -7301,6 +7335,7 @@ impl AgentPtyRegistry {
                 pending_hook_tokens: HashMap::new(),
                 pending_spawn_dirs: HashMap::new(),
                 removal_holds: Vec::new(),
+                respawning_dirs: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
             }),
@@ -12597,7 +12632,7 @@ impl AgentPtyRegistry {
         const OCCUPANT_CHECKS: usize = 3;
         let mut checks = 0;
         #[allow(unused_variables)]
-        let (removed, verified_dir) = loop {
+        let (removed, verified_dir, agent_id) = loop {
             checks += 1;
             let checked = self
                 .inner
@@ -12699,6 +12734,10 @@ impl AgentPtyRegistry {
             // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
             removed.pane_retired.store(true, Ordering::SeqCst);
+            // Issue #1612: the pane keeps its working directory in use while it
+            // has neither a record nor a reservation. Released with the ticket.
+            let dirs = spawn_dirs(removed.cwd.as_deref(), removed.tab_membership.as_ref());
+            inner.respawning_dirs.insert(agent_id.clone(), dirs);
             // LAST in this lock hold, and nothing that can fail comes between
             // it and the ticket below (PRD #1487 final audit F3): a panic after
             // the increment and before the ticket exists would leak the count,
@@ -12707,12 +12746,15 @@ impl AgentPtyRegistry {
             // this same lock, so an unwind with the guard still held would
             // deadlock on it.
             inner.respawns_in_flight += 1;
-            break (removed, verified_dir);
+            break (removed, verified_dir, agent_id);
         };
         // Counted in flight from the lock hold above until this function
         // returns — the replacement published, or the respawn failed — so a
         // restart's reservation waits for the pane to be refilled.
-        let in_flight = RespawnTicket { registry: self };
+        let in_flight = RespawnTicket {
+            registry: self,
+            agent_id,
+        };
         #[cfg(test)]
         {
             let pause = self.respawn_pause.lock().unwrap().take();
@@ -15676,8 +15718,9 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1612: whether anything this registry runs or is starting is
-    /// rooted in `dir` — a live agent, or a reserved spawn not yet published,
-    /// whose working directory or orchestration cwd is `dir` or lies inside it.
+    /// rooted in `dir` — a live agent, a reserved spawn not yet published, or a
+    /// pane in its respawn window, whose working directory or orchestration cwd
+    /// is `dir` or lies inside it.
     /// Exited agents do not count, matching [`Self::agent_records`].
     fn dir_in_use_locked(inner: &RegistryInner, dir: &std::path::Path) -> bool {
         let agent_in_dir = inner.agents.values().any(|a| {
@@ -15690,6 +15733,7 @@ impl AgentPtyRegistry {
             || inner
                 .pending_spawn_dirs
                 .values()
+                .chain(inner.respawning_dirs.values())
                 .flatten()
                 .any(|d| path_within(d, dir))
     }
@@ -18424,6 +18468,86 @@ mod spawn_tests {
             .expect("a released hold refuses nothing");
         registry.close_agent(&after).unwrap();
         registry.shutdown_all();
+    }
+
+    /// Issue #1612 (Qodo on PR #1642): a pane being respawned has, for a
+    /// moment, neither a record nor a reservation. Its working directory still
+    /// reads as in use for that whole window, so no removal hold is granted on
+    /// it and the replacement starts. The directory is released once the
+    /// replacement has closed.
+    #[tokio::test]
+    async fn a_pane_in_its_respawn_window_keeps_its_directory_in_use() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let wt = tmp.path().join("issue-7");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&wt_str),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "respawn-1612".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane's first generation");
+        let (reached, release) = registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = registry.clone();
+            tokio::spawn(
+                async move { registry.respawn_agent_for_pane("respawn-1612", "cat").await },
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("the respawn reached its window")
+            .unwrap();
+        assert!(
+            registry.agent_records().is_empty(),
+            "precondition: mid-window the pane has no record"
+        );
+        assert!(registry.dir_in_use(&wt));
+        assert!(
+            registry.hold_dir_for_removal(&wt).is_none(),
+            "no removal may begin while the pane is being respawned there"
+        );
+
+        release.send(()).unwrap();
+        let id = respawn
+            .await
+            .unwrap()
+            .expect("the replacement starts in its directory");
+        assert!(registry.dir_in_use(&wt), "the replacement now holds it");
+        registry.close_agent(&id).unwrap();
+        assert!(
+            registry.inner.lock().unwrap().respawning_dirs.is_empty(),
+            "the respawn window's entry ends with it"
+        );
+        assert!(registry.hold_dir_for_removal(&wt).is_some());
+        registry.shutdown_all();
+    }
+
+    /// Issue #1612 (Greptile on PR #1642): a relative working directory is
+    /// resolved against the daemon's own, which is what the child enters, so
+    /// it matches a hold on the absolute path it names.
+    #[test]
+    fn a_relative_spawn_dir_is_resolved_against_the_daemons_working_directory() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            spawn_dirs(Some("repo-issue-7"), None),
+            vec![here.join("repo-issue-7")]
+        );
+        assert_eq!(
+            spawn_dirs(Some("/abs/wt"), None),
+            vec![PathBuf::from("/abs/wt")]
+        );
+        assert!(path_within(
+            &spawn_dirs(Some("repo-issue-7/src"), None)[0],
+            &here.join("repo-issue-7")
+        ));
+        assert!(spawn_dirs(None, None).is_empty());
     }
 
     /// Round-2 reviewer, blocker B — the half round 1 got backwards.
