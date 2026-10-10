@@ -5321,6 +5321,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the macOS `/Applications` lookup (core unit tests), upgrading the desktop copy.
 - **Platform coverage:** linux amd64 (prints `SKIP:` elsewhere: the `.deb` ships for Linux amd64 only).
 
+##### upgrade/cli-upgrade/006 — Ctrl+C while `upgrade --yes` runs a command stops that command and says it was cancelled.
+- **Layer:** L2 (lane 1, real subprocess, fake release server, a Homebrew keg in the test folder and a stand-in `brew` whose `upgrade` waits on a long `sleep`; `SIGINT` sent to the CLI).
+- **Agent:** none.
+- **Asserts:** the stand-in `brew` and its `sleep` are gone after the signal; non-zero exit; `failed: it was cancelled and stopped`, then `Cancelled.` as the last line.
+- **Does not assert:** `SIGTERM` (same handler), a command that cannot be stopped (`self_upgrade` unit tests), Ctrl+C at the confirmation question.
+- **Platform coverage:** mac+linux.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor

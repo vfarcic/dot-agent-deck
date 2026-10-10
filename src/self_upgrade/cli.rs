@@ -3,8 +3,11 @@
 //! user confirms. It is also the command the clients show where they cannot
 //! act themselves ([`super::UPGRADE_COMMAND`]).
 
+use std::ffi::OsStr;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::detect::{self, CopyKind};
 use super::discover::{self, OtherCopy};
@@ -64,6 +67,146 @@ fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
     }
 }
 
+/// What the CLI prints when the user interrupted it while it ran a command.
+pub const CANCELLED: &str = "Cancelled.";
+
+/// The CLI's [`Host`]: [`super::SystemHost`], with a Ctrl+C (`SIGINT`) or
+/// `SIGTERM` the CLI receives while it runs a command forwarded to that
+/// command as a cancellation ([`super::SystemHost::run_within_cancellable`]).
+///
+/// The command runs in a session of its own, so the terminal's `^C` reaches
+/// only the CLI; without this, the CLI would die and leave the command
+/// running with nothing left to bound it. While a command runs, the two
+/// signals only set a flag; the run then stops the command's group, waits up
+/// to its grace for it to exit, and says it was cancelled. Between commands
+/// the signals keep their dispositions, so `^C` at a question still ends the
+/// CLI. `interrupted` stays set once a command was cancelled, which
+/// [`run`] reads to stop.
+pub struct CliHost {
+    pub inner: super::SystemHost,
+    pub interrupted: Arc<AtomicBool>,
+}
+
+impl Host for CliHost {
+    fn run_within(
+        &self,
+        program: &Path,
+        args: &[&OsStr],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<super::CommandOutput> {
+        #[cfg(unix)]
+        {
+            let forwarding = forward::Forwarding::install();
+            let result = self
+                .inner
+                .run_within_cancellable(program, args, timeout, &|| forward::received());
+            if forward::received() {
+                self.interrupted.store(true, Ordering::SeqCst);
+            }
+            drop(forwarding);
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            self.inner.run_within(program, args, timeout)
+        }
+    }
+    fn find_program(&self, name: &str) -> Option<PathBuf> {
+        self.inner.find_program(name)
+    }
+    fn is_executable(&self, path: &Path) -> bool {
+        self.inner.is_executable(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        self.inner.canonicalize(path)
+    }
+    fn dir_writable(&self, dir: &Path) -> bool {
+        self.inner.dir_writable(dir)
+    }
+    fn home(&self) -> Option<PathBuf> {
+        self.inner.home()
+    }
+    fn is_wsl(&self) -> bool {
+        self.inner.is_wsl()
+    }
+}
+
+/// The CLI's `SIGINT`/`SIGTERM` handling while it runs a command.
+#[cfg(unix)]
+mod forward {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set by the handler: a signal arrived while a command ran. A handler
+    /// can do little more than store to an atomic, so the flag is a static.
+    static RECEIVED: AtomicBool = AtomicBool::new(false);
+
+    /// Held while the handler is installed, so two runs never interleave
+    /// their saving and restoring of the dispositions.
+    static INSTALLED: Mutex<()> = Mutex::new(());
+
+    const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+    extern "C" fn on_signal(_: libc::c_int) {
+        RECEIVED.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a signal arrived since the current [`Forwarding`] was
+    /// installed.
+    pub(super) fn received() -> bool {
+        RECEIVED.load(Ordering::SeqCst)
+    }
+
+    /// The handler, installed for as long as this lives; dropping it puts
+    /// back the dispositions it replaced.
+    pub(super) struct Forwarding {
+        previous: Vec<(libc::c_int, libc::sigaction)>,
+        _installed: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Forwarding {
+        pub(super) fn install() -> Self {
+            let installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+            RECEIVED.store(false, Ordering::SeqCst);
+            let mut previous = Vec::new();
+            for signal in SIGNALS {
+                // SAFETY: a zeroed sigaction is a valid empty one; the handler
+                // only stores to an atomic, which is async-signal-safe, and
+                // `old` receives the disposition it replaces, restored on drop.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                    action.sa_flags = libc::SA_RESTART;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(signal, &action, &mut old) == 0 {
+                        previous.push((signal, old));
+                    }
+                }
+            }
+            Self {
+                previous,
+                _installed: installed,
+            }
+        }
+    }
+
+    impl Drop for Forwarding {
+        fn drop(&mut self) {
+            for (signal, old) in &self.previous {
+                // SAFETY: `old` is the disposition sigaction(2) returned for
+                // this signal when the handler was installed.
+                unsafe {
+                    libc::sigaction(*signal, old, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
 /// Run the subcommand. Returns whether everything it attempted succeeded.
 ///
 /// Detection, planning's probes and the upgrade itself wait on subprocesses
@@ -71,14 +214,25 @@ fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
 /// ([`tokio::task::spawn_blocking`]), never on the runtime driving the
 /// downloads; the downloads inside an upgrade are driven from there through
 /// the runtime's handle, as the TUI does.
+///
+/// Once `interrupted` is set (a command was cancelled, [`CliHost`]), it says
+/// [`CANCELLED`] and stops, attempting nothing further.
 pub async fn run(
     host: Arc<dyn Host>,
     source: &ReleaseSource,
     options: &PlanOptions,
     args: Args,
     mut answers: Answers<'_>,
+    interrupted: &AtomicBool,
     out: &mut dyn Write,
 ) -> bool {
+    let stop_if_interrupted = |out: &mut dyn Write| {
+        let stop = interrupted.load(Ordering::SeqCst);
+        if stop {
+            say(out, CANCELLED);
+        }
+        stop
+    };
     let found = {
         let host = host.clone();
         tokio::task::spawn_blocking(move || {
@@ -92,6 +246,9 @@ pub async fn run(
         .await
         .unwrap_or_else(|e| Err(UpgradeError::Io(e.to_string())))
     };
+    if stop_if_interrupted(out) {
+        return false;
+    }
     let (running, other) = match found {
         Ok(found) => found,
         Err(e) => {
@@ -143,6 +300,9 @@ pub async fn run(
                 say_items(out, &e.fallback());
                 ok = false;
             }
+        }
+        if stop_if_interrupted(out) {
+            return false;
         }
     }
     ok
@@ -220,7 +380,11 @@ pub fn main(args: Args) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let host = Arc::new(super::SystemHost::default());
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let host = Arc::new(CliHost {
+        inner: super::SystemHost::default(),
+        interrupted: interrupted.clone(),
+    });
     let source = ReleaseSource::from_build();
     let options = PlanOptions::terminal(&*host);
     let stdin = std::io::stdin();
@@ -231,7 +395,15 @@ pub fn main(args: Args) -> std::process::ExitCode {
         Answers::None
     };
     let mut stdout = std::io::stdout();
-    let ok = runtime.block_on(run(host, &source, &options, args, answers, &mut stdout));
+    let ok = runtime.block_on(run(
+        host,
+        &source,
+        &options,
+        args,
+        answers,
+        &interrupted,
+        &mut stdout,
+    ));
     if ok {
         std::process::ExitCode::SUCCESS
     } else {

@@ -423,3 +423,116 @@ fn cli_upgrade_005_the_other_copy_is_looked_for_inside_the_sandbox() {
         "{stdout}"
     );
 }
+
+/// Whether `pid` is gone: no process holds it, or only a zombie does.
+fn gone(pid: i32) -> bool {
+    // SAFETY: signal 0 checks only that the pid exists; nothing is sent.
+    let missing = unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    missing
+        || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.split_whitespace().next().map(|state| state == "Z")
+            })
+            .unwrap_or(false)
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy installed by Homebrew, with a stand-in `brew` whose `upgrade` starts a long `sleep` and waits on it. Once the stand-in is running, the CLI is sent `SIGINT`, as Ctrl+C on its terminal sends it. The CLI stops the stand-in and what it started, says the command was cancelled, and exits non-zero, rather than dying and leaving `brew` running.
+#[spec("upgrade/cli-upgrade/006")]
+#[test]
+fn cli_upgrade_006_ctrl_c_stops_the_running_command_and_says_cancelled() {
+    use std::os::unix::fs::PermissionsExt;
+    let version = RELEASE;
+    let (asset, manifest) = release(true);
+    let server = FakeReleases::start(version, asset, manifest);
+    let dir = common::harness_tempdir().expect("tempdir");
+    let home = dir.path();
+
+    let prefix = home.join("homebrew");
+    let exe = prefix.join(format!(
+        "Cellar/dot-agent-deck/{OLD_VERSION}/bin/dot-agent-deck"
+    ));
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, release_script(OLD_VERSION)).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let brew_pid = home.join("brew.pid");
+    let sleep_pid = home.join("sleep.pid");
+    let brew = prefix.join("bin/brew");
+    std::fs::create_dir_all(brew.parent().unwrap()).unwrap();
+    std::fs::write(
+        &brew,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --prefix) echo '{prefix}' ;;\n  upgrade) /bin/sleep 60 & echo $! > '{sleep}'; echo $$ > '{brew}'; wait ;;\n  *) exit 1 ;;\nesac\n",
+            prefix = prefix.display(),
+            sleep = sleep_pid.display(),
+            brew = brew_pid.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut env = sandbox_env(home);
+    let path = env.iter_mut().find(|(key, _)| key == "PATH").unwrap();
+    path.1 = format!("{}:{}", path.1, brew.parent().unwrap().display());
+    let mut command = Command::new(bin());
+    command
+        .args(["upgrade", "--yes"])
+        .env_clear()
+        .envs(env)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("DOT_AGENT_DECK_STATE_DIR", home.join("state"))
+        .env("DOT_AGENT_DECK_SOCKET", home.join("hook.sock"))
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", home.join("attach.sock"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in server.env(&exe, OLD_VERSION) {
+        command.env(key, value);
+    }
+    let cli = command.spawn().expect("run dot-agent-deck upgrade");
+    let pid_of = |file: &Path| -> Option<i32> {
+        std::fs::read_to_string(file)
+            .ok()
+            .filter(|s| s.ends_with('\n'))
+            .and_then(|s| s.trim().parse().ok())
+    };
+    let started = common::wait_until(Duration::from_secs(60), || pid_of(&brew_pid).is_some());
+    let cli_pid = i32::try_from(cli.id()).unwrap();
+    if started {
+        // SAFETY: the pid is the CLI this test spawned and has not reaped.
+        unsafe { libc::kill(cli_pid, libc::SIGINT) };
+    } else {
+        // SAFETY: as above; the stand-in never ran, so end the CLI.
+        unsafe { libc::kill(cli_pid, libc::SIGKILL) };
+    }
+    let out = cli.wait_with_output().expect("wait for the CLI");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(started, "the stand-in brew never ran\n{stdout}\n{stderr}");
+    let (brew, sleep) = (pid_of(&brew_pid).unwrap(), pid_of(&sleep_pid).unwrap());
+    let all_gone = common::wait_until(Duration::from_secs(10), || gone(brew) && gone(sleep));
+    for pid in [brew, sleep] {
+        if !gone(pid) {
+            // SAFETY: the pid was just read from the stand-in itself.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    assert!(
+        all_gone,
+        "the stand-in brew or its sleep kept running after Ctrl+C\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "a cancelled upgrade exits non-zero\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("failed: it was cancelled and stopped"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.trim_end().ends_with("Cancelled."),
+        "{stdout}\n{stderr}"
+    );
+}
