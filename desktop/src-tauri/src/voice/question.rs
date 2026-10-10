@@ -548,11 +548,12 @@ fn fast_path(question: &DesktopPendingQuestion, words: &[String]) -> Option<Mode
 /// A model's (or the fast path's) answer, validated and merged into `form`.
 ///
 /// `dropped` are the selections [`ground`] took out for borrowing another
-/// question's words. They are validated with the rest first — an invalid one
-/// refuses the answer exactly as if nothing had been dropped — and then leave
-/// their questions unanswered: an earlier answer to such a question is
-/// cleared from `form`, and so is any kept selection for it in this answer, so
-/// a drop can never make the form more sendable.
+/// question's words or citing a fragment of its evidence. They are validated
+/// with the rest first — an invalid one refuses the answer exactly as if
+/// nothing had been dropped — and then leave their questions unanswered: an
+/// earlier answer to such a question is cleared from `form`, and so is any
+/// selection this answer kept for it, so the form that results answers none
+/// of the questions a selection was dropped from.
 fn judge(
     agent: &str,
     question: &DesktopPendingQuestion,

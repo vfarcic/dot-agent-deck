@@ -41,9 +41,11 @@ export default defineConfig({
     // timeouts). Testing Library's own wait budget is raised beside this, in
     // `src/test/setup.ts`.
     testTimeout: 30_000,
-    // `vmForks`, not the default `forks`: it keeps per-file isolation (each
-    // file runs in a fresh VM context) but starts one worker per lane instead
-    // of one per file. The reason is a start timeout this config cannot
+    // `vmForks`, not the default `forks`: it starts one worker process per
+    // lane instead of one per file. That is a weaker isolation boundary than
+    // `forks` — the files a worker runs share its process, each in a separate
+    // VM context, so module-level globals are per file but anything held by
+    // the process (native modules, `process` state, leaked timers) is not. The reason is a start timeout this config cannot
     // raise: vitest 5.0.3 fails a worker that does not report "started"
     // within a hard-coded 60s (`START_TIMEOUT` in its `PoolRunner`), and
     // under `forks` that window covers importing jsdom and creating its
