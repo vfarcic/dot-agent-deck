@@ -23,7 +23,8 @@ use thiserror::Error;
 use crate::daemon_client::RemoteEndpoint;
 use crate::daemon_protocol::RestartStopSet;
 use crate::daemon_restart::{
-    DaemonProbe, MAX_CONFIRM_HEX_LEN, RemoteRestartReport, encode_stop_set_hex,
+    DaemonProbe, MAX_CONFIRM_HEX_LEN, MAX_CONFIRM_STDIN_LEN, RemoteRestartReport,
+    encode_stop_set_hex,
 };
 use crate::remote::{
     RemoteBinaryPath, RemoteDeckBinary, RemoteEntry, SshError, SshExecutor, SshTarget,
@@ -259,13 +260,12 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// daemon to restart onto the build installed at its own path.
     /// `expected_version` and `confirm` are passed through to the daemon.
     ///
-    /// The confirmed stop set goes on the remote command's stdin when the last
-    /// [`Self::probe`] reported that the binary reads it there, so its size is
-    /// not bound by the command line (issue #1619). An older binary is sent it
-    /// as `--confirm-hex`, which every build reads, and a set whose encoding
-    /// exceeds [`MAX_CONFIRM_HEX_LEN`] is refused here as
-    /// [`RemoteDaemonError::NotSent`] rather than sent as a command the remote
-    /// could not start.
+    /// The confirmed stop set goes as `--confirm-hex`, which every build reads,
+    /// whenever its encoding fits [`MAX_CONFIRM_HEX_LEN`]. A larger one goes on
+    /// the remote command's stdin when the last [`Self::probe`] reported that
+    /// the binary reads it there and the executor can write it (issue #1619).
+    /// Otherwise it is refused here as [`RemoteDaemonError::NotSent`] rather
+    /// than sent as a command the remote could not start.
     pub fn restart_installed(
         &self,
         expected_version: Option<&str>,
@@ -278,26 +278,33 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         }
         let mut input = None;
         if let Some(set) = confirm {
-            if self.confirm_stdin.get() {
-                args.push_str(" --confirm-stdin");
-                input = Some(serde_json::to_vec(set).map_err(|e| {
-                    RemoteDaemonError::NotSent(format!("the stop set could not be encoded: {e}"))
-                })?);
-            } else {
-                // Hex: no shell metacharacter can appear in it.
-                let hex = encode_stop_set_hex(set);
-                if hex.len() > MAX_CONFIRM_HEX_LEN {
-                    return Err(RemoteDaemonError::NotSent(format!(
-                        "the work to stop is too large to pass to the installed build at {} \
-                         ({} bytes encoded, over the {MAX_CONFIRM_HEX_LEN}-byte limit), and that \
-                         build is too old to read it another way, so the daemon was not asked to \
-                         restart; restart it on that machine with `dot-agent-deck daemon restart`",
-                        self.binary(),
-                        hex.len()
-                    )));
-                }
+            // Hex: no shell metacharacter can appear in it, and every build
+            // reads it, so it is used whenever it fits. Stdin is only for a set
+            // that does not: a host whose ssh configuration sets `StdinNull`
+            // drops what is written there, and the remote then refuses the
+            // empty input with nothing sent (Greptile 4236434468).
+            let hex = encode_stop_set_hex(set);
+            if hex.len() <= MAX_CONFIRM_HEX_LEN {
                 args.push_str(" --confirm-hex ");
                 args.push_str(&hex);
+            } else if self.confirm_stdin.get() && self.executor.writes_stdin() {
+                let json = serde_json::to_vec(set).map_err(|e| {
+                    RemoteDaemonError::NotSent(format!("the stop set could not be encoded: {e}"))
+                })?;
+                if json.len() as u64 > MAX_CONFIRM_STDIN_LEN {
+                    return Err(self.too_large(&format!(
+                        "{} bytes, over the {MAX_CONFIRM_STDIN_LEN}-byte limit the installed build reads",
+                        json.len()
+                    )));
+                }
+                args.push_str(" --confirm-stdin");
+                input = Some(json);
+            } else {
+                return Err(self.too_large(&format!(
+                    "{} bytes encoded, over the {MAX_CONFIRM_HEX_LEN}-byte limit of the command \
+                     line, and the installed build is too old to read it another way",
+                    hex.len()
+                )));
             }
         }
         let output = self.run_bounded_command_with(
@@ -306,6 +313,17 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             self.restart_deadline,
         )?;
         parse_json_reply(output)
+    }
+
+    /// The refusal for a confirmed stop set that cannot be passed to the
+    /// installed build: nothing ran on the remote, so the daemon was not asked.
+    fn too_large(&self, why: &str) -> RemoteDaemonError {
+        RemoteDaemonError::NotSent(format!(
+            "the work to stop is too large to pass to the installed build at {} ({why}), so the \
+             daemon was not asked to restart; restart it on that machine with \
+             `dot-agent-deck daemon restart`",
+            self.binary()
+        ))
     }
 
     /// `<binary> --version` on the remote, classified exactly as `connect`'s
@@ -526,6 +544,10 @@ mod tests {
             self.inputs.borrow_mut().push(input.to_vec());
             self.run_capped(target, command, max_capture_bytes)
         }
+
+        fn writes_stdin(&self) -> bool {
+            true
+        }
     }
 
     fn port(status: i32, stdout: &str, stderr: &str) -> SshDaemonPort<Scripted> {
@@ -733,12 +755,35 @@ mod tests {
                 "~/.local/bin/dot-agent-deck daemon restart-installed --json --expect-version 0.46.0 --confirm-stdin"
             ]
         );
-        let inputs = p.executor.inputs.borrow();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(
-            crate::daemon_restart::read_stop_set(inputs[0].as_slice()).unwrap(),
-            set
+        {
+            let inputs = p.executor.inputs.borrow();
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(
+                crate::daemon_restart::read_stop_set(inputs[0].as_slice()).unwrap(),
+                set
+            );
+        }
+        drop(commands);
+
+        // A set that fits the command line still goes there, so an ordinary
+        // confirmation never depends on stdin (Greptile 4236434468).
+        let small = RestartStopSet {
+            agents: vec![RestartAgent {
+                id: "a1".into(),
+                label: "one".into(),
+                pane_id: None,
+                cwd: None,
+            }],
+            roles: vec![],
+        };
+        p.restart_installed(Some("0.46.0"), Some(&small)).unwrap();
+        assert!(
+            p.executor.commands.borrow()[1]
+                .ends_with(&format!("--confirm-hex {}", encode_stop_set_hex(&small))),
+            "{:?}",
+            p.executor.commands.borrow()
         );
+        assert_eq!(p.executor.inputs.borrow().len(), 1, "nothing more on stdin");
     }
 
     /// Scenario: the installed build never said it reads `--confirm-stdin` —
@@ -891,7 +936,8 @@ mod tests {
                  case \"$last\" in\n\
                  *'daemon probe'*) cat \"$dir/probe.json\" ;;\n\
                  *restart-installed*) cat > \"$dir/stdin\"; \
-                 printf '%s' \"$last\" > \"$dir/command\"; cat \"$dir/report.json\" ;;\n\
+                 printf '%s' \"$last\" > \"$dir/command\"; \
+                 printf '%s\\n' \"$@\" > \"$dir/args\"; cat \"$dir/report.json\" ;;\n\
                  esac",
                 d.display()
             );
@@ -910,6 +956,11 @@ mod tests {
             assert_eq!(
                 command,
                 "~/.local/bin/dot-agent-deck daemon restart-installed --json --expect-version 0.46.0 --confirm-stdin"
+            );
+            let args = std::fs::read_to_string(d.join("args")).unwrap();
+            assert!(
+                args.lines().any(|arg| arg == "-T"),
+                "a session carrying input asks for no terminal: {args}"
             );
             let stdin = std::fs::read(d.join("stdin")).unwrap();
             assert!(stdin.len() > 64 * 1024, "{} bytes", stdin.len());

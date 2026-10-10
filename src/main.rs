@@ -3094,16 +3094,29 @@ async fn run_daemon_restart_installed_cli(
     use dot_agent_deck::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
     use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
     use dot_agent_deck::daemon_restart::{
-        RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport, decode_stop_set_hex,
-        read_stop_set,
+        CONFIRM_STDIN_TIMEOUT, RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport,
+        decode_stop_set_hex, read_stop_set,
     };
 
     // Read before the daemon is asked anything, so a malformed set is refused
-    // with nothing sent.
+    // with nothing sent. The read blocks until stdin closes, so it runs on a
+    // plain thread, not a runtime worker, under a bound of its own; a thread
+    // still blocked when the bound passes ends with the process (Qodo
+    // 4236427318).
     let confirm = if confirm_stdin {
-        read_stop_set(std::io::stdin().lock())
-            .map(Some)
-            .map_err(|e| format!("--confirm-stdin: {e}"))
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_stop_set(std::io::stdin().lock()));
+        });
+        match tokio::time::timeout(CONFIRM_STDIN_TIMEOUT, rx).await {
+            Ok(Ok(read)) => read.map(Some),
+            Ok(Err(_)) => Err("the stdin reader stopped without an answer".to_string()),
+            Err(_) => Err(format!(
+                "stdin did not close within {}s",
+                CONFIRM_STDIN_TIMEOUT.as_secs()
+            )),
+        }
+        .map_err(|e| format!("--confirm-stdin: {e}"))
     } else {
         confirm_hex
             .as_deref()

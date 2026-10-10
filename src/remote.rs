@@ -432,13 +432,17 @@ pub trait SshExecutor {
     /// For a payload too large for the command line: the ssh route runs one
     /// remote command string, which the remote shell receives as one argument,
     /// so anything carried in it shares Linux's per-argument limit
-    /// (`MAX_ARG_STRLEN`, 128 KiB). Bounded exactly as `run_capped_within` is,
-    /// and the writer stops when the call returns, so a remote that never reads
-    /// its stdin costs nothing past the deadline.
+    /// (`MAX_ARG_STRLEN`, 128 KiB). Bounded exactly as `run_capped_within` is.
+    /// On Unix the writer stops when the call returns, so a remote that never
+    /// reads its stdin costs nothing past the deadline; elsewhere a write
+    /// blocked on a full pipe is abandoned and ends when the pipe's last
+    /// reader closes.
     ///
     /// The default refuses without running anything: an executor that cannot
     /// deliver the input must not run a command that expects it. The
-    /// production [`SystemSshExecutor`] overrides it.
+    /// production [`SystemSshExecutor`] overrides it. Callers check
+    /// [`writes_stdin`](Self::writes_stdin) first, so the refusal is a
+    /// backstop rather than a path.
     fn run_capped_within_input(
         &self,
         target: &SshTarget,
@@ -452,6 +456,12 @@ pub trait SshExecutor {
             target: target.user_host(),
             detail: "this ssh executor cannot write to a remote command's stdin".to_string(),
         })
+    }
+
+    /// Whether [`run_capped_within_input`](Self::run_capped_within_input)
+    /// delivers its input. `false` for this default, which refuses.
+    fn writes_stdin(&self) -> bool {
+        false
     }
 
     /// The shortest `deadline` [`run_capped_within`](Self::run_capped_within)
@@ -679,7 +689,17 @@ impl SystemSshExecutor {
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
     pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
+        self.build_command_with(target, remote_command, false)
+    }
+
+    /// [`Self::build_command`], with `-T` when the session carries input on
+    /// stdin: a terminal the user's `RequestTTY` asked for would echo and
+    /// rewrite that input instead of passing it through (Greptile 4236434468).
+    fn build_command_with(&self, target: &SshTarget, remote_command: &str, input: bool) -> Command {
         let mut cmd = Command::new(&self.program);
+        if input {
+            cmd.arg("-T");
+        }
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
@@ -978,6 +998,10 @@ impl SshExecutor for SystemSshExecutor {
         self.run_bounded_session(target, command, Some(input), max_capture_bytes, deadline)
     }
 
+    fn writes_stdin(&self) -> bool {
+        true
+    }
+
     fn min_bounded_run(&self) -> std::time::Duration {
         MIN_BOUNDED_REMOTE_RUN
     }
@@ -1012,7 +1036,7 @@ impl SystemSshExecutor {
                 ),
             });
         }
-        let mut cmd = self.build_command(target, command);
+        let mut cmd = self.build_command_with(target, command, input.is_some());
         // Its own process group: a `ProxyCommand` or jump-route helper that
         // outlives the session is killed with it (PRD #1487 re-check R1).
         let capture = run_local_bounded_in(&mut cmd, secs, max_capture_bytes, true, input)
@@ -1176,8 +1200,11 @@ pub fn run_local_bounded_owning_group(
 
 /// `input`, when given, is written to the child's stdin by a [`PipeWriter`],
 /// which then closes it; otherwise stdin is null. The writer is cancelled when
-/// the call returns, however it returns, so a child (or a descendant holding
-/// its stdin) that never reads costs nothing past the call (issue #1619).
+/// the call returns, however it returns (issue #1619). On Unix that stops it
+/// within a poll tick, so a child (or a descendant holding its stdin) that
+/// never reads costs nothing past the call; elsewhere a write blocked on a full
+/// pipe is abandoned, as a blocked reader is, and ends when the pipe's last
+/// reader closes.
 fn run_local_bounded_in(
     cmd: &mut Command,
     secs: u64,

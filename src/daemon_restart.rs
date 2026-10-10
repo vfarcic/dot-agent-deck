@@ -1074,10 +1074,21 @@ const _: () = assert!(MAX_CONFIRM_STDIN_LEN < crate::daemon_protocol::MAX_FRAME_
 /// the [`RestartStopSet`]'s JSON, to EOF, refused past
 /// [`MAX_CONFIRM_STDIN_LEN`]. The ssh route writes it there when the set is
 /// too large for the command line (issue #1619).
+///
+/// Empty input is named as such: it is what an ssh client configured with
+/// `StdinNull yes` delivers in place of the set.
 pub fn read_stop_set(reader: impl std::io::Read) -> Result<RestartStopSet, String> {
     let json = crate::bounded_read::read_capped(reader, MAX_CONFIRM_STDIN_LEN, "stdin")?;
+    if json.trim().is_empty() {
+        return Err("stdin was empty (an ssh client set to `StdinNull yes` sends nothing)".into());
+    }
     serde_json::from_str(&json).map_err(|e| format!("not a stop set: {e}"))
 }
+
+/// How long `restart-installed --confirm-stdin` waits for its stdin to close
+/// before it gives up with nothing sent. The ssh route writes the set and
+/// closes stdin at once; this bounds a caller that leaves the pipe open.
+pub const CONFIRM_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hex-encode a [`RestartStopSet`]'s JSON for `restart-installed
 /// --confirm-hex`. Hex keeps the argument free of shell metacharacters on the
@@ -1285,7 +1296,8 @@ mod tests {
         let json = serde_json::to_vec(&s).unwrap();
         assert_eq!(read_stop_set(json.as_slice()).unwrap(), s);
         assert!(read_stop_set(&b"not json"[..]).is_err());
-        assert!(read_stop_set(&b""[..]).is_err());
+        let err = read_stop_set(&b"\n"[..]).unwrap_err();
+        assert!(err.contains("stdin was empty"), "{err}");
         use std::io::Read as _;
         let endless = std::io::repeat(b' ').take(MAX_CONFIRM_STDIN_LEN + 1);
         let err = read_stop_set(endless).unwrap_err();
