@@ -261,7 +261,7 @@ pub fn verify_provenance(
         version.strip_prefix('v').unwrap_or(version)
     );
     let output = host
-        .run(
+        .run_within(
             gh,
             &[
                 OsStr::new("attestation"),
@@ -276,6 +276,7 @@ pub fn verify_provenance(
                 OsStr::new("--format"),
                 OsStr::new("json"),
             ],
+            super::VERIFY_TIMEOUT,
         )
         .map_err(|e| failed(e.to_string()))?;
     if !output.success {
@@ -528,6 +529,14 @@ mod tests {
                 "v0.46.0"
             ),
             Ok(Provenance::Verified)
+        );
+        assert_eq!(
+            host.bound_of("/usr/bin/gh attestation"),
+            Some(crate::self_upgrade::VERIFY_TIMEOUT)
+        );
+        assert_eq!(
+            host.bound_of("/usr/bin/gh auth"),
+            Some(crate::self_upgrade::PROBE_TIMEOUT)
         );
 
         let host = FakeHost::new()

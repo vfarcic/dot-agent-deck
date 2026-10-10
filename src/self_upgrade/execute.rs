@@ -19,7 +19,8 @@ use super::detect::Installation;
 use super::plan::{self, PlanAction, PlanLine, Releases, UpgradePlan};
 use super::verify::{self, Provenance, ProvenanceCheck};
 use super::{
-    CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, UpgradeError, run_checked,
+    CLI_BINARY, CLI_MANIFEST, DESKTOP_APP_BUNDLE, DESKTOP_MANIFEST, Host, INSTALL_TIMEOUT,
+    UpgradeError, VERIFY_TIMEOUT, run_checked,
 };
 
 /// The largest asset accepted (the desktop disk image is the largest, at tens
@@ -335,6 +336,7 @@ pub async fn execute(
                 host,
                 brew,
                 &[OsStr::new("upgrade"), OsStr::new(formula.name())],
+                INSTALL_TIMEOUT,
             )?;
             let reported = brew
                 .parent()
@@ -500,6 +502,7 @@ pub fn install_binary_privileged(
             staged.as_os_str(),
             target.as_os_str(),
         ],
+        INSTALL_TIMEOUT,
     )
     .map_err(|e| privilege_failed(e, fallback, version))?;
     let actual = verify::file_sha256(target).unwrap_or_else(|e| format!("unreadable: {e}"));
@@ -732,6 +735,7 @@ pub fn install_deb(host: &dyn Host, pkexec: &Path, deb: &Path) -> Result<(), Upg
             OsStr::new("-y"),
             deb.as_os_str(),
         ],
+        INSTALL_TIMEOUT,
     )
     .map(|_| ())
 }
@@ -755,6 +759,7 @@ fn check_app(host: &dyn Host, app: &Path, team_id: &str, assess: bool) -> Result
             OsStr::new("--strict"),
             app.as_os_str(),
         ],
+        VERIFY_TIMEOUT,
     )
     .map_err(failed)?;
     match super::detect::team_id(host, app) {
@@ -776,6 +781,7 @@ fn check_app(host: &dyn Host, app: &Path, team_id: &str, assess: bool) -> Result
                 OsStr::new("execute"),
                 app.as_os_str(),
             ],
+            VERIFY_TIMEOUT,
         )
         .map_err(failed)?;
     }
@@ -810,6 +816,7 @@ pub fn swap_app(
             mount.as_os_str(),
             dmg.as_os_str(),
         ],
+        INSTALL_TIMEOUT,
     )?;
     let result = swap_from_mount(host, &mount, app, team_id, version);
     let detach = |extra: &[&OsStr]| {
@@ -857,6 +864,7 @@ fn swap_from_mount(
         host,
         Path::new(DITTO),
         &[new_app.as_os_str(), incoming.as_os_str()],
+        INSTALL_TIMEOUT,
     )
     .and_then(|_| check_app(host, &incoming, team_id, false));
     if let Err(e) = copied {
@@ -1066,6 +1074,47 @@ mod tests {
             b"old"
         );
         assert!(host.ran().iter().any(|line| line.contains("detach")));
+    }
+
+    #[test]
+    fn execute_020_each_command_gets_its_bound() {
+        use crate::self_upgrade::PROBE_TIMEOUT;
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let host = with_version_answer(fake_mac("TEAM123", true), &work.join("mount"));
+        swap_app(
+            &host,
+            Path::new("/s/x.dmg"),
+            &app,
+            "TEAM123",
+            "0.46.0",
+            &work,
+        )
+        .unwrap();
+        for (prefix, bound) in [
+            (format!("{HDIUTIL} attach"), INSTALL_TIMEOUT),
+            (format!("{CODESIGN} --verify"), VERIFY_TIMEOUT),
+            (format!("{CODESIGN} -dv"), PROBE_TIMEOUT),
+            (format!("{SPCTL} --assess"), VERIFY_TIMEOUT),
+            (format!("{DITTO} "), INSTALL_TIMEOUT),
+            (format!("{HDIUTIL} detach"), PROBE_TIMEOUT),
+        ] {
+            assert_eq!(host.bound_of(&prefix), Some(bound), "{prefix}");
+        }
+        let bundled = work
+            .join("mount")
+            .join(DESKTOP_APP_BUNDLE)
+            .join("Contents/MacOS")
+            .join(CLI_BINARY);
+        assert_eq!(
+            host.bound_of(&format!("{} --version", bundled.display())),
+            Some(PROBE_TIMEOUT)
+        );
+
+        let host = FakeHost::new().exe(PKEXEC).handle(PKEXEC, |_| ok(""));
+        install_deb(&host, Path::new(PKEXEC), Path::new("/s/x.deb")).unwrap();
+        assert_eq!(host.bound_of(PKEXEC), Some(INSTALL_TIMEOUT));
     }
 
     #[test]

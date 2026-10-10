@@ -560,7 +560,12 @@ mod tests {
     }
 
     impl Host for Fake {
-        fn run(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+        fn run_within(
+            &self,
+            program: &Path,
+            args: &[&OsStr],
+            _timeout: std::time::Duration,
+        ) -> std::io::Result<CommandOutput> {
             let line = std::iter::once(program.as_os_str())
                 .chain(args.iter().copied())
                 .map(|w| w.to_string_lossy().into_owned())

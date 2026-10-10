@@ -97,11 +97,43 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+/// How long a probe may take: a question asked of the machine while looking
+/// at an install or checking a download (`--version`, `dpkg-query`,
+/// `brew --prefix`, `gh auth status`, `codesign -dv`, `hdiutil detach`). Each
+/// answers in well under a second when it works; one that hangs (a wrapper
+/// script waiting on something) must not hold a release check or a dialog.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a check of a download may take when it asks a service: `gh
+/// attestation verify` (GitHub's attestation API and Sigstore), and the new
+/// app's `codesign --verify --deep` and `spctl --assess`, which can consult
+/// Apple's notarization service.
+pub const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a command that carries an upgrade out may take: `brew upgrade`,
+/// `pkexec … install` and `pkexec … apt-get install` (which wait for the user
+/// to answer the password prompt), `hdiutil attach` and `ditto`. Long enough
+/// for a slow download inside `brew` or a user who steps away from the
+/// prompt, and still an end: a stuck command is stopped and named rather
+/// than leaving the dialog on Upgrading for good.
+pub const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// The machine, as far as upgrading needs to ask about it. [`SystemHost`] is
 /// the real one; tests implement it to fake an install.
 pub trait Host: Send + Sync {
-    /// Run `program` with `args` and wait for it.
-    fn run(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput>;
+    /// Run `program` with `args` as a probe, bounded by [`PROBE_TIMEOUT`].
+    fn run(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+        self.run_within(program, args, PROBE_TIMEOUT)
+    }
+    /// Run `program` with `args` and wait for it for at most `timeout`. One
+    /// still running then is stopped, and the error says so
+    /// ([`std::io::ErrorKind::TimedOut`]).
+    fn run_within(
+        &self,
+        program: &Path,
+        args: &[&OsStr],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<CommandOutput>;
     /// The first executable called `name` on `PATH`.
     fn find_program(&self, name: &str) -> Option<PathBuf>;
     /// Whether `path` is an executable regular file.
@@ -127,19 +159,18 @@ pub struct SystemHost {
 }
 
 impl Host for SystemHost {
-    fn run(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+    fn run_within(
+        &self,
+        program: &Path,
+        args: &[&OsStr],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<CommandOutput> {
         let mut command = std::process::Command::new(program);
-        command.args(args).stdin(std::process::Stdio::null());
+        command.args(args);
         if let Some(path) = &self.path {
             command.env("PATH", path);
         }
-        let output = command.output()?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        run_bounded(&mut command, timeout)
     }
 
     fn find_program(&self, name: &str) -> Option<PathBuf> {
@@ -207,6 +238,112 @@ impl Host for SystemHost {
         std::env::var_os("WSL_DISTRO_NAME").is_some()
             || std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+    }
+}
+
+/// Run `command` (stdin closed, stdout and stderr captured) for at most
+/// `timeout`. A command still running then is killed, and the error says how
+/// long it was given and whether it could be stopped: a command `pkexec`
+/// started runs as root, which this user cannot signal, so it may still be
+/// running. Its output is read on two threads so a chatty command cannot fill
+/// a pipe and stall; after a timeout they are left to finish on their own, as
+/// a grandchild may hold the pipes open.
+fn run_bounded(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<CommandOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (stream, pipe) in [
+        (
+            0,
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+        (
+            1,
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = tx.send((stream, bytes));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let stopped = child.kill().is_ok();
+            if stopped {
+                let _ = child.wait();
+            }
+            return Err(timed_out(timeout, stopped));
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left.max(Duration::from_millis(100))) {
+            Ok((0, bytes)) => stdout = bytes,
+            Ok((_, bytes)) => stderr = bytes,
+            Err(_) => break,
+        }
+    }
+    Ok(CommandOutput {
+        success: status.success(),
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+/// A command that outlived `timeout`, in words for the user.
+fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error {
+    let within = describe_duration(timeout);
+    let what = if stopped {
+        format!("it did not finish within {within} and was stopped")
+    } else {
+        format!(
+            "it did not finish within {within} and could not be stopped, so it may still be running"
+        )
+    };
+    std::io::Error::new(std::io::ErrorKind::TimedOut, what)
+}
+
+/// `duration` in the largest whole unit that fits: "15 minutes", "60
+/// seconds", "200 milliseconds".
+fn describe_duration(duration: std::time::Duration) -> String {
+    let plural = |n: u128, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    let ms = duration.as_millis();
+    if ms % 60_000 == 0 && ms > 0 {
+        plural(ms / 60_000, "minute")
+    } else if ms % 1000 == 0 && ms > 0 {
+        plural(ms / 1000, "second")
+    } else {
+        plural(ms, "millisecond")
     }
 }
 
@@ -317,20 +454,22 @@ impl From<std::io::Error> for UpgradeError {
     }
 }
 
-/// Run `program args` through `host`, mapping a failure to
-/// [`UpgradeError::CommandFailed`] named after the command line.
+/// Run `program args` through `host` for at most `timeout`, mapping a
+/// failure, a timeout included, to [`UpgradeError::CommandFailed`] named
+/// after the command line.
 pub(crate) fn run_checked(
     host: &dyn Host,
     program: &Path,
     args: &[&OsStr],
+    timeout: std::time::Duration,
 ) -> Result<CommandOutput, UpgradeError> {
     let command = display_command(program, args);
-    let output = host
-        .run(program, args)
-        .map_err(|e| UpgradeError::CommandFailed {
-            command: command.clone(),
-            detail: e.to_string(),
-        })?;
+    let output =
+        host.run_within(program, args, timeout)
+            .map_err(|e| UpgradeError::CommandFailed {
+                command: command.clone(),
+                detail: e.to_string(),
+            })?;
     if output.success {
         Ok(output)
     } else {
@@ -396,6 +535,85 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
     crate::version::should_notify(&current, latest).is_some()
 }
 
+// Real subprocesses through `/bin/sh`: native Windows is unsupported (#164).
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const SH: &str = "/bin/sh";
+
+    #[test]
+    fn host_001_a_command_past_its_bound_is_stopped_and_named() {
+        let started = Instant::now();
+        let err = SystemHost::default()
+            .run_within(
+                Path::new(SH),
+                &[OsStr::new("-c"), OsStr::new("sleep 30")],
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "it did not finish within 200 milliseconds and was stopped"
+        );
+
+        // As an upgrade step, the error names the command that timed out.
+        let err = run_checked(
+            &SystemHost::default(),
+            Path::new(SH),
+            &[OsStr::new("-c"), OsStr::new("sleep 30")],
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`/bin/sh -c 'sleep 30'` failed: it did not finish within 200 milliseconds and was stopped"
+        );
+    }
+
+    #[test]
+    fn host_002_a_command_inside_its_bound_answers_in_full() {
+        let output = SystemHost::default()
+            .run_within(
+                Path::new(SH),
+                &[
+                    OsStr::new("-c"),
+                    OsStr::new("echo out; echo err >&2; exit 3"),
+                ],
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(
+            output,
+            CommandOutput {
+                success: false,
+                code: Some(3),
+                stdout: "out\n".into(),
+                stderr: "err\n".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn host_003_the_bounds_are_ordered_and_described() {
+        assert!(PROBE_TIMEOUT < VERIFY_TIMEOUT && VERIFY_TIMEOUT < INSTALL_TIMEOUT);
+        assert_eq!(describe_duration(INSTALL_TIMEOUT), "15 minutes");
+        assert_eq!(describe_duration(VERIFY_TIMEOUT), "1 minute");
+        assert_eq!(describe_duration(PROBE_TIMEOUT), "15 seconds");
+        assert_eq!(
+            timed_out(INSTALL_TIMEOUT, false).to_string(),
+            "it did not finish within 15 minutes and could not be stopped, so it may still be running"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_host {
     //! A fake [`Host`]: a set of files, a table of command answers, and a log
@@ -419,6 +637,8 @@ pub(crate) mod test_host {
         pub answers: HashMap<String, CommandOutput>,
         pub handlers: HashMap<String, Handler>,
         pub log: Mutex<Vec<String>>,
+        /// Each command line run, with the bound it was given.
+        pub bounds: Mutex<Vec<(String, std::time::Duration)>>,
     }
 
     pub fn ok(stdout: &str) -> CommandOutput {
@@ -504,16 +724,32 @@ pub(crate) mod test_host {
         pub fn ran(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
         }
+
+        /// The bound the command line starting with `prefix` was run with.
+        pub fn bound_of(&self, prefix: &str) -> Option<std::time::Duration> {
+            self.bounds
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(line, _)| line.starts_with(prefix))
+                .map(|(_, bound)| *bound)
+        }
     }
 
     impl Host for FakeHost {
-        fn run(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+        fn run_within(
+            &self,
+            program: &Path,
+            args: &[&OsStr],
+            timeout: std::time::Duration,
+        ) -> std::io::Result<CommandOutput> {
             let words: Vec<String> = std::iter::once(program.as_os_str())
                 .chain(args.iter().copied())
                 .map(|w| w.to_string_lossy().into_owned())
                 .collect();
             let line = words.join(" ");
             self.log.lock().unwrap().push(line.clone());
+            self.bounds.lock().unwrap().push((line.clone(), timeout));
             if let Some(handler) = self.handlers.get(&words[0]) {
                 return Ok(handler(&words[1..]));
             }
