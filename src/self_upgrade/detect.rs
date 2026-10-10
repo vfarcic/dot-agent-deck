@@ -325,9 +325,12 @@ pub fn inspect(
     build_id: Option<&str>,
     platform: Option<Platform>,
 ) -> Installation {
-    let tools = Tools::find(host);
+    let mut tools = Tools::find(host);
     let inputs = gather_inputs(host, &tools, executable, build_id, platform);
     let method = detect(&inputs);
+    if let InstallMethod::Homebrew { prefix, .. } = &method {
+        tools.brew = formula_brew(host, tools.brew.take(), prefix);
+    }
     Installation {
         copy: method.implied_copy().unwrap_or(copy),
         executable: executable.to_path_buf(),
@@ -335,6 +338,23 @@ pub fn inspect(
         platform,
         method,
         tools,
+    }
+}
+
+/// The `brew` that upgrades a formula installed under `prefix`: `found`
+/// when it is that prefix's own, else `<prefix>/bin/brew` when it exists and
+/// is executable (a machine with two Homebrew prefixes finds the other one on
+/// `PATH`). Otherwise `found` is kept as it was, and the plan, which runs only
+/// a `brew` inside the prefix, shows the command instead.
+fn formula_brew(host: &dyn Host, found: Option<PathBuf>, prefix: &Path) -> Option<PathBuf> {
+    if found.as_ref().is_some_and(|brew| brew.starts_with(prefix)) {
+        return found;
+    }
+    let own = prefix.join("bin/brew");
+    if host.is_executable(&own) {
+        Some(own)
+    } else {
+        found
     }
 }
 
@@ -726,6 +746,45 @@ mod tests {
         );
         assert_eq!(found.method, InstallMethod::DesktopDeb);
         assert_eq!(found.copy, CopyKind::Desktop);
+    }
+
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn inspect_004_the_formulas_own_brew_is_used_only_when_it_exists() {
+        // Two Homebrew prefixes: the `brew` on PATH is /opt/homebrew's, the
+        // keg is in /home/linuxbrew/.linuxbrew.
+        let keg = "/home/linuxbrew/.linuxbrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck";
+        let machine = || {
+            FakeHost::new()
+                .on_path("/opt/homebrew/bin")
+                .exe("/opt/homebrew/bin/brew")
+                .deck(keg, "0.46.0")
+        };
+        let inspect_on = |host: &FakeHost| {
+            inspect(
+                host,
+                CopyKind::Cli,
+                Path::new(keg),
+                "0.46.0",
+                None,
+                Some(Platform::LinuxAmd64),
+            )
+        };
+
+        let without = inspect_on(&machine());
+        assert!(matches!(without.method, InstallMethod::Homebrew { .. }));
+        assert_eq!(
+            without.tools.brew,
+            Some(PathBuf::from("/opt/homebrew/bin/brew")),
+            "the prefix's own brew does not exist, so none is substituted"
+        );
+
+        let with = inspect_on(&machine().exe("/home/linuxbrew/.linuxbrew/bin/brew"));
+        assert_eq!(
+            with.tools.brew,
+            Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"))
+        );
     }
 
     #[test]

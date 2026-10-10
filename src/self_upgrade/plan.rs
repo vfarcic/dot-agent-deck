@@ -265,23 +265,19 @@ fn action_for(installation: &Installation, latest: &str, options: &PlanOptions) 
         InstallMethod::Nix | InstallMethod::Source { .. } | InstallMethod::SystemPackage { .. } => {
             PlanAction::NotifyOnly
         }
-        InstallMethod::Homebrew { formula, prefix } => {
-            let brew = installation
-                .tools
-                .brew
-                .clone()
-                .filter(|brew| brew.starts_with(prefix))
-                .unwrap_or_else(|| prefix.join("bin/brew"));
-            match installation.tools.brew {
-                Some(_) => PlanAction::BrewUpgrade {
-                    brew,
-                    formula: *formula,
-                },
-                None => PlanAction::ShowCommand {
-                    command: format!("brew upgrade {}", formula.name()),
-                },
-            }
-        }
+        // Only a `brew` inside the formula's own prefix upgrades it, and
+        // detection put that one in `tools.brew` when it exists
+        // ([`super::detect::inspect`]). Any other `brew` — none, or another
+        // prefix's — leaves the command for the user.
+        InstallMethod::Homebrew { formula, prefix } => match &installation.tools.brew {
+            Some(brew) if brew.starts_with(prefix) => PlanAction::BrewUpgrade {
+                brew: brew.clone(),
+                formula: *formula,
+            },
+            _ => PlanAction::ShowCommand {
+                command: format!("brew upgrade {}", formula.name()),
+            },
+        },
         InstallMethod::DownloadedWritable { binary } => match cli_asset {
             Some(asset) => PlanAction::ReplaceBinary {
                 target: binary.clone(),
@@ -1459,6 +1455,30 @@ mod tests {
                 HomebrewFormula::Stable.name()
             )
         );
+    }
+
+    #[test]
+    fn plan_028_a_brew_outside_the_formulas_prefix_is_never_run() {
+        // `brew` on PATH belongs to another Homebrew prefix. The plan runs only
+        // a `brew` inside the formula's own prefix, which detection resolves
+        // and checks (`inspect_004`); one it could not find leaves the command
+        // for the user.
+        let mut found = cli(
+            "/home/linuxbrew/.linuxbrew/Cellar/dot-agent-deck/0.45.0/bin/dot-agent-deck",
+            InstallMethod::Homebrew {
+                formula: HomebrewFormula::Stable,
+                prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+            },
+        );
+        found.tools.brew = Some(PathBuf::from("/opt/homebrew/bin/brew"));
+        let plan = plan(&found, &"0.46.0".into(), &options());
+        assert_eq!(
+            plan.action,
+            PlanAction::ShowCommand {
+                command: "brew upgrade dot-agent-deck".into()
+            }
+        );
+        assert!(!plan.is_actionable());
     }
 
     #[test]
