@@ -2680,13 +2680,16 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * one, so the app stays "speaking"; otherwise each ends on the next tick, so
    * everything queued is heard in turn.
    */
-  function synth(silent: boolean) {
+  function synth(silent: boolean, finished: string[]) {
     const spoken: string[] = [];
     vi.stubGlobal("SpeechSynthesisUtterance", class { onend: (() => void) | null = null; onerror: (() => void) | null = null; constructor(public text: string) {} });
     vi.stubGlobal("speechSynthesis", {
       speak: vi.fn((utterance: { text: string; onend: (() => void) | null }) => {
         spoken.push(utterance.text);
-        if (!silent) setTimeout(() => utterance.onend?.(), 0);
+        if (!silent) setTimeout(() => {
+          finished.push(utterance.text);
+          utterance.onend?.();
+        }, 0);
       }),
       cancel: vi.fn(),
     });
@@ -2709,7 +2712,8 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * one-time notice was shown.
    */
   async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, question }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; question?: PendingQuestionDto } = {}) {
-    const spoken = synth(silent);
+    const finished: string[] = [];
+    const spoken = synth(silent, finished);
     const steps: Parameters<typeof sequencedVoice>[0] = [];
     const voice = sequencedVoice(steps);
     const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
@@ -2795,7 +2799,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
       }
     };
     const agents = deck.snapshot.agents.map((agent) => agent.id);
-    return { deck, reader, spoken, stopped, sinks, say, drain, saved, agents, document: () => document, releaseNotice: () => releaseNotice(), sessions: () => sessions };
+    return { deck, voice, steps, reader, spoken, finished, stopped, sinks, say, drain, saved, agents, document: () => document, releaseNotice: () => releaseNotice(), sessions: () => sessions };
   }
 
   /** Scenario (decisions 1–3): on the deck with no pane open, saying "reading on" turns the Settings switch on through the settings save, reads every agent on the deck, says "Reading on.", and shows the reading indicator. */
@@ -2970,6 +2974,64 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
 
     await h.say("yes");
+    expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
+  });
+
+  /** Scenario: with Voice and Reading on, hold a transcription open while the open agent's held permission prompt is read aloud and finishes. When recording resumes with that audio in its kept buffer, the app's own "yes, go ahead" must not resolve the question, open a confirmation, start a countdown or send an answer. The same words in a later quiet recording still start the answer countdown. */
+  it("question/desktop/017: speech finished during transcription still overlaps the kept recording", async () => {
+    const question: PendingQuestionDto = {
+      id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
+      tool: { name: "Bash", detail: "touch x" },
+      questions: [{ prompt: "Allow Bash?", multiSelect: false, options: [
+        { index: 1, label: "Yes", role: "allow_once", answerable: true },
+        { index: 3, label: "No", role: "deny", answerable: true },
+      ] }],
+    };
+    const h = await mount({ reading: "on", notice: "shown", openPane: true, silent: false, question });
+    const resolveVoiceQuestion = vi.fn(async (): Promise<QuestionResultDto> => ({
+      verdict: { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary: "Allow once — touch x" },
+      resolveMs: 1, backend: "stub",
+    }));
+    const sendVoiceAnswer = vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" }));
+    Object.assign(h.deck, { resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer: vi.fn(async () => undefined) });
+    h.deck.resolveVoice.mockImplementation(async (said) => result({ kind: "no_match", transcript: said, sentence: "Heard while the app was speaking — nothing dispatched." }));
+
+    let releaseTranscription: () => void = () => undefined;
+    const pending = new Promise<void>((resolve) => { releaseTranscription = resolve; });
+    const stop = h.voice.voiceStop.getMockImplementation()!;
+    h.voice.voiceStop.mockImplementationOnce(async () => {
+      const captured = await stop();
+      await pending;
+      return captured;
+    });
+    h.steps.push({ outcome: SILENT });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
+    expect(h.voice.voiceStart).toHaveBeenCalledTimes(1);
+
+    const prompt = "Permission needed: say yes, go ahead to allow Bash.";
+    await act(async () => { h.sinks.get("planner")!({ kind: "permission", text: prompt }); });
+    await h.drain();
+    expect(h.spoken).toEqual([prompt]);
+    expect(h.finished).toEqual([prompt]);
+    // The speech ended while the previous transcription was still pending.
+    expect(h.voice.voiceStart).toHaveBeenCalledTimes(1);
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+    await act(async () => { releaseTranscription(); });
+    await flush();
+    expect(h.voice.voiceStart).toHaveBeenCalledTimes(2);
+
+    await h.say("yes, go ahead");
+    expect(resolveVoiceQuestion, "Reading's finished speech is still in the kept recording and must not answer the question").not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Always allow?" })).toBeNull();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    expect(h.deck.sendTerminalInput).not.toHaveBeenCalled();
+
+    await h.say("yes, go ahead");
     expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
   });
