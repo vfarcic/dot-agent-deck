@@ -8,7 +8,10 @@
  * segment runs from one `voiceStop` to the next — {@link UseReadingMode.takeSegment}
  * is called at each — and the queue's `speaking` going true marks the open
  * segment as overlapped. "Is it speaking now" would be the wrong question: a
- * recording of the app's own voice ends after the voice does.
+ * recording of the app's own voice ends after the voice does. Nor does the
+ * next `voiceStart` begin a segment when it carries on with the kept device:
+ * that recording began at the `voiceStop`, so speech that started and ended
+ * while the previous utterance was worked on is in it.
  */
 
 import { useEffect, useMemo, useRef } from "react";
@@ -24,8 +27,15 @@ export interface UseReadingMode {
   queue: SpeechQueue;
   /** End the current recording segment: answers whether the app spoke during it, and starts the next. */
   takeSegment: () => boolean;
-  /** The microphone opened afresh: a new segment starts now. */
-  startSegment: () => void;
+  /**
+   * The microphone is recording again. `carried` says whether it carried on
+   * with the device kept open since the last {@link takeSegment} (PR #1451),
+   * whose buffer already holds whatever was heard while that utterance was
+   * transcribed and resolved: the app's speech in that interval stays marked
+   * on the segment. Otherwise the device opened afresh and a new segment
+   * starts now.
+   */
+  startSegment: (carried: boolean) => void;
 }
 
 export function useReadingMode(
@@ -129,8 +139,8 @@ export function useReadingMode(
       spoke.current = queue.speaking;
       return overlapped;
     },
-    startSegment: () => {
-      spoke.current = queue.speaking;
+    startSegment: (carried) => {
+      spoke.current = carried ? spoke.current || queue.speaking : queue.speaking;
     },
   };
 }

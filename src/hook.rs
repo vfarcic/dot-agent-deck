@@ -1429,11 +1429,12 @@ fn opencode_question(
 pub(crate) fn build_opencode_event_with_question(
     input: OpenCodeHookInput,
 ) -> Option<(AgentEvent, Option<crate::question::PendingQuestion>)> {
-    let question = opencode_question(
-        &input.event,
-        input.properties.as_ref(),
-        Utc::now().timestamp_millis(),
-    );
+    // One parse is one instant: the question's `raised_at_ms`, the permission's
+    // `tool_use_id`, the quota reset's reference point and the event's
+    // `timestamp` all read this one clock reading.
+    let now = Utc::now();
+    let now_ms = now.timestamp_millis();
+    let question = opencode_question(&input.event, input.properties.as_ref(), now_ms);
     let mut event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
@@ -1445,15 +1446,14 @@ pub(crate) fn build_opencode_event_with_question(
         metadata.insert("permission_state".to_string(), "pending".to_string());
         metadata.insert(
             "tool_use_id".to_string(),
-            format!(
-                "perm-{}-{}",
-                input.session_id,
-                Utc::now().timestamp_millis()
-            ),
+            format!("perm-{}-{}", input.session_id, now_ms),
         );
     }
 
     // PRD #1631: OpenCode reports the question answered, by its request id.
+    // A reply whose id is absent or malformed clears nothing — never an
+    // arbitrary question — so that question stays until its deadline or a
+    // superseding frame (`docs/develop/agent-questions.md`).
     if matches!(
         input.event.as_str(),
         "permission.replied" | "question.replied" | "question.rejected"
@@ -1496,7 +1496,7 @@ pub(crate) fn build_opencode_event_with_question(
             response_headers: input.response_headers,
         };
         if let crate::quota_signals::FailureOutcome::Blocked { kind, resets_at_ms } =
-            crate::quota_signals::classify_opencode_error(&fields, Utc::now().timestamp_millis())
+            crate::quota_signals::classify_opencode_error(&fields, now_ms)
         {
             event_type = EventType::QuotaBlocked;
             insert_quota_blocked_metadata(
@@ -1515,7 +1515,7 @@ pub(crate) fn build_opencode_event_with_question(
         tool_name: input.tool_name,
         tool_detail,
         cwd: input.cwd,
-        timestamp: Utc::now(),
+        timestamp: now,
         user_prompt,
         metadata,
         pane_id,

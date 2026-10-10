@@ -2938,15 +2938,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * finished, which is what *continuous* means here: the cycle ends by starting
    * again, and only the button ends it for good. A refusal at this point turns
    * voice visibly off rather than leaving a control that says it is on over a
-   * device that is not.
+   * device that is not. `carried` is true after a `voiceStop`, whose device
+   * stays open into this recording (PR #1451).
    */
-  const listen = useCallback(async (ours: () => boolean) => {
+  const listen = useCallback(async (ours: () => boolean, carried = false) => {
     if (!voiceStart) return;
     setPhase("opening");
     try {
       await voiceStart();
       if (!ours()) return;
-      reader.startSegment();
+      /* PRD #1631 — after a `voiceStop` the device was kept open, so this
+         recording already holds what was heard since that stop, the app's
+         own speech included: the segment keeps it marked. */
+      reader.startSegment(carried);
       hearNumbers();
       setPhase("listening");
     } catch (cause) {
@@ -3183,7 +3187,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setCapture({ sentence: heardSentence(joined), transcript: joined });
         await resolveOne(joined, ours, transcription.outcome.transcript);
         if (!ours()) return;
-        await listen(ours);
+        await listen(ours, true);
         return;
       }
       if (waiting && transcription.outcome.kind === "silent") {
@@ -3212,7 +3216,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(sentenceOf(cause));
     }
     if (!ours()) return;
-    await listen(ours);
+    await listen(ours, true);
   }, [cancelPendingSend, claim, clearHeld, forget, listen, reportHeld, resolveOne, setPhase, stopAnswerForSpeech, voiceStop]);
 
   /**
