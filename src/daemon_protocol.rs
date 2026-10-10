@@ -120,7 +120,8 @@ pub use crate::agent_pty::TabMembership;
 // names them through the protocol module rather than `hook_binary`, which also
 // holds the daemon's probing and install-time logic.
 pub use crate::hook_binary::{
-    HookBinaryNotice, HookBinaryNotices, HookBinaryReason, MAX_NOTICE_COMMAND_BYTES,
+    HookBinaryNotice, HookBinaryNotices, HookBinaryReason, MAX_NOTICE_COMMAND_BYTES, REMEDY_RUN,
+    REMEDY_UPGRADE_OR_REINSTALL,
 };
 
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};

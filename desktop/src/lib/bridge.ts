@@ -17,6 +17,7 @@ import { speechAudioError } from "./speech";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
+  HookBinaryNotice,
   AuthoringKind,
   AgentSession,
   AgentTarget,
@@ -113,6 +114,8 @@ export interface DesktopSnapshotDto {
     upgradeOffer?: UpgradeOffer;
     /** Issue #1490 — why the deck is not connected and which control to offer; present when `status` is `"disconnected"`. */
     disconnectedReason?: DisconnectedReason;
+    /** Issue #1637 — the daemon's hook-binary notices; omitted by the crate when there are none. */
+    hookBinaryNotices?: HookBinaryNotice[];
   };
   agents: DesktopAgentDto[];
   /*
@@ -2491,6 +2494,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       listingOptions: dto.connection.listingOptions === true,
       ...(dto.connection.upgradeOffer === undefined ? {} : { upgradeOffer: dto.connection.upgradeOffer }),
       ...(dto.connection.disconnectedReason === undefined ? {} : { disconnectedReason: dto.connection.disconnectedReason }),
+      // Issue #1637: without this the live app never shows a notice, whatever
+      // the daemon reported — only the fixture, which skips this mapping, did.
+      ...(dto.connection.hookBinaryNotices?.length ? { hookBinaryNotices: dto.connection.hookBinaryNotices } : {}),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.

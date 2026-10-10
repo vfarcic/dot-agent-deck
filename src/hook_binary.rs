@@ -1025,18 +1025,60 @@ struct AgentStatus {
     homebrew: bool,
 }
 
+/// One binary an agent's hooks were seen to run, and when its lines last
+/// arrived.
+#[derive(Debug, Clone)]
+struct Tracked {
+    status: AgentStatus,
+    last_seen: Instant,
+}
+
 /// What startup learned about one trusted pin, through the filesystem and
 /// outside any lock, so a hook line naming the same path is classified from
 /// this rather than by resolving the path again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedPin {
     binary: String,
+    /// `binary` resolved at startup, which is how the pinned binary spells
+    /// itself in its own hook lines' `deck_exe`.
+    resolved: Option<String>,
     is_self: bool,
     homebrew: bool,
 }
 
-/// The daemon's record of which binary each agent's hooks run, and the
-/// notices that follows from it.
+impl TrustedPin {
+    /// Whether a hook line's `deck_exe` names this pin. Lexical.
+    fn names(&self, exe: &str) -> bool {
+        self.binary == exe || self.resolved.as_deref() == Some(exe)
+    }
+}
+
+/// The most binaries the daemon tracks for one agent's hooks, pins included.
+/// An agent's hooks can run more than one copy at once (Codex pins per event,
+/// OpenCode per root), but a handful; a sender naming a new path on every line
+/// replaces the longest-unseen one rather than growing the state.
+pub const MAX_BINARIES_PER_AGENT: usize = 8;
+
+/// How long a binary's hook lines may stop before a line for the same agent
+/// from another binary clears that binary's notice. Lines from two binaries
+/// for one agent are normal — Codex's own `wrap` beside its hooks, or hooks
+/// pinned to different copies per event — so another binary's line alone
+/// never clears a notice; a notice whose binary has gone quiet this long is
+/// one the user has fixed, by reinstalling the hooks or upgrading in place.
+pub const HOOK_BINARY_QUIET_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// How often a steady stream of lines from one binary refreshes when it was
+/// last seen, which takes the daemon's write lock; every other line from it is
+/// settled under the read lock.
+const SEEN_REFRESH: Duration = Duration::from_secs(30);
+
+/// The daemon's record of which binaries each agent's hooks run, and the
+/// notices that follow from it.
+///
+/// Statuses are kept per agent AND binary, so two binaries sending lines for
+/// one agent each keep their own status: a line from one never clears the
+/// other's notice while the other is still sending (see
+/// [`HOOK_BINARY_QUIET_AFTER`]).
 ///
 /// Only [`Self::from_startup`] touches the filesystem. [`Self::observe`] runs
 /// under the daemon's state lock on producer-asserted data and
@@ -1046,8 +1088,8 @@ struct TrustedPin {
 #[derive(Debug, Clone, Default)]
 pub struct HookBinaryState {
     deck: DeckIdentity,
-    pins: HashMap<AgentType, TrustedPin>,
-    statuses: HashMap<AgentType, AgentStatus>,
+    pins: HashMap<AgentType, Vec<TrustedPin>>,
+    statuses: HashMap<AgentType, Vec<Tracked>>,
     ephemeral: Option<String>,
     warned: BTreeSet<(String, HookBinaryReason)>,
     warnings_suppressed: bool,
@@ -1055,6 +1097,10 @@ pub struct HookBinaryState {
 
 /// What agents share to be listed in one notice: binary, reason, version.
 type NoticeKey = (String, HookBinaryReason, Option<String>);
+
+/// Everything [`HookBinaryState::notices`] reads from the statuses, so a
+/// caller can tell whether a change moved the notices without composing them.
+type NoticeInputs = Vec<(usize, String, HookBinaryReason, Option<String>, bool)>;
 
 /// The order agents are listed in a notice.
 fn agent_order(agent: &AgentType) -> usize {
@@ -1065,7 +1111,8 @@ fn agent_order(agent: &AgentType) -> usize {
 }
 
 impl HookBinaryState {
-    /// The state a daemon starts with: the installers' `pins`, each pinned
+    /// The state a daemon starts with: the installers' `pins` (every distinct
+    /// binary for an agent, up to [`MAX_BINARIES_PER_AGENT`]), each pinned
     /// binary that is not the daemon probed with `--version`, and
     /// `ephemeral_exe` when this deck runs from a location it refused to pin
     /// (issue #1157).
@@ -1078,16 +1125,26 @@ impl HookBinaryState {
             deck,
             ..Self::default()
         };
+        let now = Instant::now();
         for pin in pins {
+            let known = state.pins.entry(pin.agent.clone()).or_default();
+            if known.len() >= MAX_BINARIES_PER_AGENT
+                || known.iter().any(|known| known.binary == pin.binary)
+            {
+                continue;
+            }
             let resolved = resolve(Path::new(&pin.binary));
             let trusted = TrustedPin {
                 binary: pin.binary.clone(),
+                resolved: resolved
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned()),
                 is_self: state.deck.exe.is_some() && resolved.as_ref() == state.deck.exe.as_ref(),
                 homebrew: is_homebrew_spelling(&pin.binary)
                     || resolved.as_deref().is_some_and(has_cellar_component),
             };
             let (is_self, homebrew) = (trusted.is_self, trusted.homebrew);
-            state.pins.insert(pin.agent.clone(), trusted);
+            known.push(trusted);
             if is_self {
                 continue;
             }
@@ -1098,14 +1155,15 @@ impl HookBinaryState {
                 Ok(version) => (Some(version), None),
                 Err(_) => (None, Some(HookBinaryReason::Unprobeable)),
             };
-            state.set_status(
-                pin.agent.clone(),
+            state.record(
+                &pin.agent,
                 AgentStatus {
                     binary: pin.binary.clone(),
                     version,
                     reason,
                     homebrew,
                 },
+                now,
             );
         }
         if let Some(exe) = ephemeral_exe {
@@ -1121,85 +1179,133 @@ impl HookBinaryState {
     /// Pure: no filesystem call, whatever path the line names. A stamp that
     /// fails validation ([`is_valid_deck_build`], [`is_valid_deck_exe`]) is
     /// ignored — an unusable build changes nothing, an unusable path reads as
-    /// absent — and the caller still applies the event. The notices are
-    /// composed only when the agent's recorded status changes in a way that can
-    /// move them, so a steady stream of lines from one binary costs a compare.
+    /// absent — and the caller still applies the event. The line updates only
+    /// its own binary's status; another binary's notice for the same agent is
+    /// cleared only once that binary has sent nothing for
+    /// [`HOOK_BINARY_QUIET_AFTER`].
     pub fn observe(&mut self, agent: &AgentType, sender: &HookLineSender) -> bool {
-        let Some(next) = self.next_status(agent, sender) else {
-            return false;
-        };
-        let previous = self.statuses.get(agent);
-        if previous == Some(&next) {
-            return false;
-        }
-        // A status with no reason is in no notice, so replacing one such status
-        // with another (or recording a first one) cannot move the notices.
-        if next.reason.is_none() && previous.is_none_or(|status| status.reason.is_none()) {
-            self.statuses.insert(agent.clone(), next);
-            return false;
-        }
-        let before = self.notices();
-        self.set_status(agent.clone(), next);
-        self.notices() != before
+        self.observe_at(agent, sender, Instant::now())
     }
 
     /// Whether [`Self::observe`] would record anything for this line, so a
     /// caller can skip taking a write lock for a line that changes nothing —
     /// the steady state, where an agent's hooks keep sending the same stamp.
     pub fn would_change(&self, agent: &AgentType, sender: &HookLineSender) -> bool {
-        self.next_status(agent, sender)
-            .is_some_and(|next| self.statuses.get(agent) != Some(&next))
+        self.would_change_at(agent, sender, Instant::now())
     }
 
-    /// The status a hook line from `agent` implies, or `None` when the line
-    /// says nothing about it. Pure.
-    fn next_status(&self, agent: &AgentType, sender: &HookLineSender) -> Option<AgentStatus> {
+    fn observe_at(&mut self, agent: &AgentType, sender: &HookLineSender, now: Instant) -> bool {
+        let next = self.next_statuses(agent, sender);
+        if next.is_empty() {
+            return false;
+        }
+        let before = self.notice_inputs();
+        let seen: Vec<String> = next.iter().map(|status| status.binary.clone()).collect();
+        for status in next {
+            self.record(agent, status, now);
+        }
+        if let Some(tracked) = self.statuses.get_mut(agent) {
+            tracked.retain(|tracked| !Self::cleared_by(tracked, &seen, now));
+        }
+        self.notice_inputs() != before
+    }
+
+    fn would_change_at(&self, agent: &AgentType, sender: &HookLineSender, now: Instant) -> bool {
+        let next = self.next_statuses(agent, sender);
+        if next.is_empty() {
+            return false;
+        }
+        let tracked = self.statuses.get(agent).map_or(&[][..], Vec::as_slice);
+        let seen: Vec<String> = next.iter().map(|status| status.binary.clone()).collect();
+        next.iter().any(|status| {
+            tracked
+                .iter()
+                .find(|tracked| tracked.status.binary == status.binary)
+                .is_none_or(|tracked| {
+                    tracked.status != *status
+                        || now.saturating_duration_since(tracked.last_seen) >= SEEN_REFRESH
+                })
+        }) || tracked
+            .iter()
+            .any(|tracked| Self::cleared_by(tracked, &seen, now))
+    }
+
+    /// Whether a line for the same agent from `seen` clears `tracked`: it
+    /// raised a notice, is another binary, and has been quiet for
+    /// [`HOOK_BINARY_QUIET_AFTER`].
+    fn cleared_by(tracked: &Tracked, seen: &[String], now: Instant) -> bool {
+        tracked.status.reason.is_some()
+            && !seen.contains(&tracked.status.binary)
+            && now.saturating_duration_since(tracked.last_seen) >= HOOK_BINARY_QUIET_AFTER
+    }
+
+    /// The statuses a hook line from `agent` implies, one per binary it is
+    /// about, or none when the line says nothing. Pure.
+    fn next_statuses(&self, agent: &AgentType, sender: &HookLineSender) -> Vec<AgentStatus> {
+        let pins = self.pins.get(agent).map_or(&[][..], Vec::as_slice);
+        let tracked = self.statuses.get(agent).map_or(&[][..], Vec::as_slice);
         if let Some(build) = sender.deck_build.as_deref() {
             if !is_valid_deck_build(build) {
-                return None;
+                return Vec::new();
             }
             let exe = sender
                 .deck_exe
                 .as_deref()
                 .filter(|exe| is_valid_deck_exe(exe));
-            let binary = exe
-                .map(str::to_string)
-                .or_else(|| self.pins.get(agent).map(|pin| pin.binary.clone()))
-                .unwrap_or_default();
+            // A pinned binary's line is recorded under the pin's spelling, so
+            // startup's probe and the binary's own lines are one status.
+            let binary = match exe {
+                Some(exe) => pins
+                    .iter()
+                    .find(|pin| pin.names(exe))
+                    .map_or(exe, |pin| pin.binary.as_str())
+                    .to_string(),
+                None => match pins {
+                    [pin] => pin.binary.clone(),
+                    _ => String::new(),
+                },
+            };
             let version = release_of_build(build).to_string();
             let is_self = exe.is_some_and(|exe| self.is_self_spelling(exe));
             let reason = (!is_self && is_newer_release(&self.deck.version, &version))
                 .then_some(HookBinaryReason::Older);
             let homebrew = self.is_homebrew(&binary);
-            Some(AgentStatus {
+            vec![AgentStatus {
                 binary,
                 version: Some(version),
                 reason,
                 homebrew,
-            })
+            }]
         } else {
-            // A stamp-less line names nobody, so it is read against the pin:
+            // A stamp-less line names nobody, so it is read against the pins:
             // only an agent pinned to another binary is affected, and a line
             // sent by something other than its hook (a test, a script) leaves a
-            // deck-pinned agent alone.
+            // deck-pinned agent alone. With several such pins, the line is
+            // from one of them, but which is unknown, so it is every one not
+            // already known to be current.
             //
             // This assumes every current sender stamps its lines: `hook`,
             // `agent-event` and `wrap` all build them through
             // `agent_event_line`, which calls [`stamp_hook_line`]. A stamp-less
             // line injected by hand for an agent pinned to a current install at
             // another path would therefore raise a spurious `Unreported`.
-            let pin = self.pins.get(agent).filter(|pin| !pin.is_self)?;
-            let version = self
-                .statuses
-                .get(agent)
-                .filter(|status| status.binary == pin.binary)
-                .and_then(|status| status.version.clone());
-            Some(AgentStatus {
-                binary: pin.binary.clone(),
-                version,
-                reason: Some(HookBinaryReason::Unreported),
-                homebrew: pin.homebrew,
-            })
+            pins.iter()
+                .filter(|pin| !pin.is_self)
+                .filter_map(|pin| {
+                    let known = tracked
+                        .iter()
+                        .find(|tracked| tracked.status.binary == pin.binary);
+                    if known.is_some_and(|tracked| tracked.status.reason.is_none()) {
+                        return None;
+                    }
+                    Some(AgentStatus {
+                        binary: pin.binary.clone(),
+                        version: known.and_then(|tracked| tracked.status.version.clone()),
+                        reason: Some(HookBinaryReason::Unreported),
+                        homebrew: pin.homebrew,
+                    })
+                })
+                .collect()
         }
     }
 
@@ -1210,7 +1316,8 @@ impl HookBinaryState {
             || self
                 .pins
                 .values()
-                .any(|pin| pin.is_self && pin.binary == binary)
+                .flatten()
+                .any(|pin| pin.is_self && pin.names(binary))
     }
 
     /// Whether `binary` is a Homebrew install: what startup decided for a
@@ -1218,16 +1325,46 @@ impl HookBinaryState {
     fn is_homebrew(&self, binary: &str) -> bool {
         self.pins
             .values()
-            .find(|pin| pin.binary == binary)
+            .flatten()
+            .find(|pin| pin.names(binary))
             .map_or_else(|| is_homebrew_spelling(binary), |pin| pin.homebrew)
     }
 
-    fn set_status(&mut self, agent: AgentType, status: AgentStatus) {
-        if let Some(reason) = status.reason {
-            let name = agent_display_name(&agent);
-            self.warn_once(&status.binary, reason, &[name]);
+    /// Record `status` as the status of its binary for `agent`, seen at `now`.
+    /// A binary not yet tracked replaces the agent's longest-unseen one once
+    /// the agent has [`MAX_BINARIES_PER_AGENT`].
+    fn record(&mut self, agent: &AgentType, status: AgentStatus, now: Instant) {
+        let tracked = self.statuses.entry(agent.clone()).or_default();
+        let warn = match tracked
+            .iter_mut()
+            .find(|tracked| tracked.status.binary == status.binary)
+        {
+            Some(existing) => {
+                existing.last_seen = now;
+                let changed = existing.status != status;
+                existing.status = status.clone();
+                changed
+            }
+            None => {
+                if tracked.len() >= MAX_BINARIES_PER_AGENT
+                    && let Some(oldest) = tracked
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, tracked)| tracked.last_seen)
+                        .map(|(index, _)| index)
+                {
+                    tracked.remove(oldest);
+                }
+                tracked.push(Tracked {
+                    status: status.clone(),
+                    last_seen: now,
+                });
+                true
+            }
+        };
+        if let (true, Some(reason)) = (warn, status.reason) {
+            self.warn_once(&status.binary, reason, &[agent_display_name(agent)]);
         }
-        self.statuses.insert(agent, status);
     }
 
     fn warn_once(&mut self, binary: &str, reason: HookBinaryReason, agents: &[&str]) {
@@ -1258,22 +1395,52 @@ impl HookBinaryState {
         );
     }
 
+    /// The statuses that raise a notice, in the order [`Self::notices`] lists
+    /// them.
+    fn reasoned(&self) -> Vec<(&AgentType, &AgentStatus, HookBinaryReason)> {
+        let mut agents: Vec<(&AgentType, &Vec<Tracked>)> = self.statuses.iter().collect();
+        agents.sort_by_key(|(agent, _)| agent_order(agent));
+        agents
+            .into_iter()
+            .flat_map(|(agent, tracked)| {
+                tracked.iter().filter_map(move |tracked| {
+                    tracked
+                        .status
+                        .reason
+                        .map(|reason| (agent, &tracked.status, reason))
+                })
+            })
+            .collect()
+    }
+
+    fn notice_inputs(&self) -> NoticeInputs {
+        self.reasoned()
+            .into_iter()
+            .map(|(agent, status, reason)| {
+                (
+                    agent_order(agent),
+                    status.binary.clone(),
+                    reason,
+                    status.version.clone(),
+                    status.homebrew,
+                )
+            })
+            .collect()
+    }
+
     /// The notices both clients show, grouped by binary, reason and version,
     /// at most [`MAX_NOTICES`]. Pure: everything it needs was decided when the
     /// status was recorded.
     pub fn notices(&self) -> Vec<HookBinaryNotice> {
         let mut groups: Vec<(NoticeKey, bool, Vec<AgentType>)> = Vec::new();
-        let mut agents: Vec<(&AgentType, &AgentStatus)> = self.statuses.iter().collect();
-        agents.sort_by_key(|(agent, _)| agent_order(agent));
-        for (agent, status) in agents {
-            let Some(reason) = status.reason else {
-                continue;
-            };
+        for (agent, status, reason) in self.reasoned() {
             let key = (status.binary.clone(), reason, status.version.clone());
             match groups.iter_mut().find(|(k, _, _)| *k == key) {
                 Some((_, homebrew, members)) => {
                     *homebrew |= status.homebrew;
-                    members.push(agent.clone());
+                    if !members.contains(agent) {
+                        members.push(agent.clone());
+                    }
                 }
                 None => groups.push((key, status.homebrew, vec![agent.clone()])),
             }
@@ -1352,8 +1519,18 @@ pub const REMEDY_UPGRADE_OR_REINSTALL: &str = "Upgrade the dot-agent-deck the ho
 /// run `hooks install` from this deck when this deck would pin itself, else
 /// upgrade the copy the hooks run, through Homebrew when that is where it came
 /// from (`homebrew`). The command is composed only from this deck's own
-/// install path and fixed text, never from anything a hook line sent.
+/// install path and fixed text, never from anything a hook line sent, for this
+/// platform's default shell ([`Shell::CURRENT`]).
 pub fn remedy_for(deck: &DeckIdentity, homebrew: bool, agents: &[AgentType]) -> Remedy {
+    remedy_for_shell(deck, homebrew, agents, Shell::CURRENT)
+}
+
+fn remedy_for_shell(
+    deck: &DeckIdentity,
+    homebrew: bool,
+    agents: &[AgentType],
+    shell: Shell,
+) -> Remedy {
     let run = |command: String| Remedy {
         text: REMEDY_RUN.to_string(),
         command: Some(command),
@@ -1366,9 +1543,9 @@ pub fn remedy_for(deck: &DeckIdentity, homebrew: bool, agents: &[AgentType]) -> 
         let commands: Vec<String> = agents
             .iter()
             .filter_map(agent_cli_name)
-            .map(|agent| format!("{} hooks install --agent {agent}", shell_word(own)))
+            .map(|agent| format!("{} hooks install --agent {agent}", shell.program(own)))
             .collect();
-        let command = commands.join(" && ");
+        let command = commands.join(shell.separator());
         if !command.is_empty() && command.len() <= MAX_NOTICE_COMMAND_BYTES {
             return run(command);
         }
@@ -1382,9 +1559,59 @@ pub fn remedy_for(deck: &DeckIdentity, homebrew: bool, agents: &[AgentType]) -> 
     }
 }
 
-/// `path` as one shell word: unchanged when it needs no quoting, else in
+/// The shell a notice's command is written for: the one a user pastes it into
+/// by default on this platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    /// `sh` and its relatives: a path in single quotes when it needs any, and
+    /// commands chained with `&&`.
+    Posix,
+    /// Windows PowerShell: a quoted program runs only through the call
+    /// operator `&`, a single quote (typographic ones included) inside single
+    /// quotes is doubled, and
+    /// commands are separated with `;`, since Windows PowerShell 5.1 (the one
+    /// Windows ships) has no `&&`.
+    PowerShell,
+}
+
+impl Shell {
+    const CURRENT: Shell = if cfg!(windows) {
+        Shell::PowerShell
+    } else {
+        Shell::Posix
+    };
+
+    /// `path` as the program word(s) of a command in this shell.
+    fn program(self, path: &str) -> String {
+        match self {
+            Shell::Posix => posix_word(path),
+            Shell::PowerShell => {
+                // PowerShell reads the typographic single quotes as `'` too.
+                let mut quoted = String::from("& '");
+                for c in path.chars() {
+                    quoted.push(c);
+                    if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                        quoted.push(c);
+                    }
+                }
+                quoted.push('\'');
+                quoted
+            }
+        }
+    }
+
+    /// What joins two commands.
+    fn separator(self) -> &'static str {
+        match self {
+            Shell::Posix => " && ",
+            Shell::PowerShell => "; ",
+        }
+    }
+}
+
+/// `path` as one POSIX shell word: unchanged when it needs no quoting, else in
 /// single quotes.
-fn shell_word(path: &str) -> String {
+fn posix_word(path: &str) -> String {
     if !path.is_empty()
         && path
             .chars()
@@ -1399,6 +1626,17 @@ fn shell_word(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `path`, written Unix-style, as an absolute path on this platform:
+    /// unchanged on Unix, and under `C:\` with backslashes on Windows, where
+    /// `/home/u/…` is not absolute and so is not a `deck_exe` the daemon reads.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_string()
+        }
+    }
 
     #[test]
     fn release_of_build_strips_the_build_stamp() {
@@ -1540,20 +1778,23 @@ mod tests {
 
     #[test]
     fn the_remedy_depends_on_where_this_deck_and_the_hook_binary_are() {
+        let own_path = abs("/home/u/.local/bin/dot-agent-deck");
         let own = DeckIdentity {
-            exe: Some(PathBuf::from("/home/u/.local/bin/dot-agent-deck")),
+            exe: Some(PathBuf::from(&own_path)),
             version: "0.47.0".into(),
-            self_install_path: Some("/home/u/.local/bin/dot-agent-deck".into()),
+            self_install_path: Some(own_path.clone()),
         };
+        #[cfg(unix)]
+        let expected = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code && \
+                        /home/u/.local/bin/dot-agent-deck hooks install --agent codex";
+        #[cfg(windows)]
+        let expected = "& 'C:\\home\\u\\.local\\bin\\dot-agent-deck' hooks install --agent claude-code; \
+                        & 'C:\\home\\u\\.local\\bin\\dot-agent-deck' hooks install --agent codex";
         assert_eq!(
             remedy_for(&own, false, &[AgentType::ClaudeCode, AgentType::Codex]),
             Remedy {
                 text: "Run:".into(),
-                command: Some(
-                    "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code && \
-                     /home/u/.local/bin/dot-agent-deck hooks install --agent codex"
-                        .into()
-                ),
+                command: Some(expected.into()),
             }
         );
         let other = DeckIdentity {
@@ -1578,17 +1819,90 @@ mod tests {
         );
         // This deck's own path is quoted as one shell word.
         let spaced = DeckIdentity {
-            self_install_path: Some("/Applications/Agent Deck.app/x/dot-agent-deck".into()),
+            self_install_path: Some(abs("/Applications/Agent Deck.app/x/dot-agent-deck")),
             ..own
         };
+        #[cfg(unix)]
+        let expected =
+            "'/Applications/Agent Deck.app/x/dot-agent-deck' hooks install --agent codex";
+        #[cfg(windows)]
+        let expected =
+            "& 'C:\\Applications\\Agent Deck.app\\x\\dot-agent-deck' hooks install --agent codex";
         assert_eq!(
             remedy_for(&spaced, false, &[AgentType::Codex])
                 .command
                 .as_deref(),
-            Some("'/Applications/Agent Deck.app/x/dot-agent-deck' hooks install --agent codex")
+            Some(expected)
         );
-        assert_eq!(shell_word("/a b/x"), "'/a b/x'");
-        assert_eq!(shell_word("/a'b"), r"'/a'\''b'");
+    }
+
+    /// Scenario (Greptile on #1656): the command a notice offers is written
+    /// for the platform's default shell. In a POSIX shell a path that needs
+    /// quoting is single-quoted with `'\''` for a quote, and two commands are
+    /// chained with `&&`; in Windows PowerShell the path is single-quoted with
+    /// every quote doubled (typographic ones too), run through the call
+    /// operator `&`, and two commands are separated with `;`.
+    #[test]
+    fn the_command_is_quoted_for_the_platform_shell() {
+        assert_eq!(Shell::Posix.program("/a/b"), "/a/b");
+        assert_eq!(Shell::Posix.program("/a b/x"), "'/a b/x'");
+        assert_eq!(Shell::Posix.program("/a'b"), r"'/a'\''b'");
+        assert_eq!(Shell::Posix.separator(), " && ");
+        assert_eq!(
+            Shell::PowerShell.program(r"C:\Program Files\Agent Deck\dot-agent-deck.exe"),
+            r"& 'C:\Program Files\Agent Deck\dot-agent-deck.exe'"
+        );
+        assert_eq!(
+            Shell::PowerShell.program(r"C:\Users\o'brien\dot-agent-deck.exe"),
+            r"& 'C:\Users\o''brien\dot-agent-deck.exe'"
+        );
+        assert_eq!(
+            Shell::PowerShell.program("C:\\a\u{2019}b\\x.exe"),
+            "& 'C:\\a\u{2019}\u{2019}b\\x.exe'"
+        );
+        assert_eq!(Shell::PowerShell.separator(), "; ");
+        assert_eq!(
+            Shell::CURRENT,
+            if cfg!(windows) {
+                Shell::PowerShell
+            } else {
+                Shell::Posix
+            }
+        );
+
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.47.0".into(),
+            self_install_path: Some(abs("/x/dot-agent-deck")),
+        };
+        let agents = [AgentType::ClaudeCode, AgentType::Codex];
+        let own = abs("/x/dot-agent-deck");
+        assert_eq!(
+            remedy_for_shell(&deck, false, &agents, Shell::PowerShell).command,
+            Some(format!(
+                "& '{own}' hooks install --agent claude-code; & '{own}' hooks install --agent codex"
+            ))
+        );
+    }
+
+    /// Scenario (Greptile on #1656): on Windows, the command a notice offers
+    /// for this deck's own install pastes into PowerShell as is.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_command_runs_in_powershell() {
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.47.0".into(),
+            self_install_path: Some(r"C:\Users\o'brien\AppData\Local\dot-agent-deck.exe".into()),
+        };
+        assert_eq!(
+            remedy_for(&deck, false, &[AgentType::Codex])
+                .command
+                .as_deref(),
+            Some(
+                r"& 'C:\Users\o''brien\AppData\Local\dot-agent-deck.exe' hooks install --agent codex"
+            )
+        );
     }
 
     /// Scenario: a hook line claims an old release and a `deck_exe` that tries
@@ -1650,33 +1964,40 @@ mod tests {
             deck: deck("0.46.0"),
             ..HookBinaryState::default()
         };
+        let old = abs("/opt/old/dot-agent-deck");
         state.observe(
             &AgentType::Codex,
             &HookLineSender {
                 deck_build: Some("0.45.0-gabc1234".into()),
-                deck_exe: Some("/opt/old/dot-agent-deck".into()),
+                deck_exe: Some(old.clone()),
             },
         );
         let notices = state.notices();
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].binary, "/opt/old/dot-agent-deck");
+        assert_eq!(notices[0].binary, old);
         assert_eq!(notices[0].remedy, REMEDY_UPGRADE_OR_REINSTALL);
         assert_eq!(notices[0].command, None);
 
-        // A Homebrew spelling offers the fixed `brew` command.
-        state.observe(
-            &AgentType::Codex,
-            &HookLineSender {
-                deck_build: Some("0.45.0-gabc1234".into()),
-                deck_exe: Some("/opt/homebrew/bin/dot-agent-deck".into()),
-            },
-        );
-        let notices = state.notices();
-        assert_eq!(notices[0].remedy, "Run:");
-        assert_eq!(
-            notices[0].command.as_deref(),
-            Some("brew upgrade dot-agent-deck")
-        );
+        // A Homebrew spelling offers the fixed `brew` command. Homebrew's
+        // prefixes are Unix paths.
+        #[cfg(unix)]
+        {
+            let homebrew = "/opt/homebrew/bin/dot-agent-deck";
+            state.observe(
+                &AgentType::Codex,
+                &HookLineSender {
+                    deck_build: Some("0.45.0-gabc1234".into()),
+                    deck_exe: Some(homebrew.into()),
+                },
+            );
+            let notices = state.notices();
+            let brew = notices
+                .iter()
+                .find(|notice| notice.binary == homebrew)
+                .expect("the Homebrew copy's notice");
+            assert_eq!(brew.remedy, "Run:");
+            assert_eq!(brew.command.as_deref(), Some("brew upgrade dot-agent-deck"));
+        }
     }
 
     /// Scenario: stamp validation at ingest. A build id or a path over budget,
@@ -1715,19 +2036,21 @@ mod tests {
             assert!(!state.observe(&AgentType::ClaudeCode, &direct), "{build:?}");
         }
 
+        let root = abs("/");
         assert!(is_valid_deck_exe(&format!(
-            "/{}",
-            "a".repeat(MAX_DECK_EXE_BYTES - 1)
+            "{root}{}",
+            "a".repeat(MAX_DECK_EXE_BYTES - root.len())
         )));
         assert!(!is_valid_deck_exe(&format!(
-            "/{}",
-            "a".repeat(MAX_DECK_EXE_BYTES)
+            "{root}{}",
+            "a".repeat(MAX_DECK_EXE_BYTES - root.len() + 1)
         )));
         assert!(is_valid_deck_build("0.46.0-g1a8e0de3-dirty"));
     }
 
     /// Scenario: a sender names a new path on every hook line. The warned
-    /// history stops at its cap, and the state keeps one status per agent,
+    /// history stops at its cap, and the state keeps at most
+    /// `MAX_BINARIES_PER_AGENT` statuses for the agent, the latest among them,
     /// however many paths arrive (audit A1).
     #[test]
     fn repeated_unique_sender_paths_stay_bounded() {
@@ -1740,19 +2063,26 @@ mod tests {
                 &AgentType::ClaudeCode,
                 &HookLineSender {
                     deck_build: Some("0.0.1-gabc1234".into()),
-                    deck_exe: Some(format!("/opt/old-{i}/dot-agent-deck")),
+                    deck_exe: Some(abs(&format!("/opt/old-{i}/dot-agent-deck"))),
                 },
             );
         }
         assert_eq!(state.warned.len(), MAX_WARNED_BINARIES);
         assert!(state.warnings_suppressed);
         assert_eq!(state.statuses.len(), 1);
-        let notices = state.notices();
-        assert_eq!(notices.len(), 1);
         assert_eq!(
-            notices[0].binary,
-            format!("/opt/old-{}/dot-agent-deck", MAX_WARNED_BINARIES * 4 - 1),
-            "the notice shows the latest path"
+            state.statuses[&AgentType::ClaudeCode].len(),
+            MAX_BINARIES_PER_AGENT
+        );
+        let notices = state.notices();
+        assert_eq!(notices.len(), MAX_BINARIES_PER_AGENT);
+        let latest = abs(&format!(
+            "/opt/old-{}/dot-agent-deck",
+            MAX_WARNED_BINARIES * 4 - 1
+        ));
+        assert!(
+            notices.iter().any(|notice| notice.binary == latest),
+            "the notices show the latest path"
         );
     }
 
@@ -1769,11 +2099,12 @@ mod tests {
         );
         state.pins.insert(
             AgentType::Pi,
-            TrustedPin {
+            vec![TrustedPin {
                 binary: format!("/{}", "p".repeat(100_000)),
+                resolved: None,
                 is_self: false,
                 homebrew: false,
-            },
+            }],
         );
         state.observe(&AgentType::Pi, &HookLineSender::default());
         for (i, agent) in [
@@ -1786,7 +2117,11 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let path = format!("/{i}{}", "x".repeat(MAX_DECK_EXE_BYTES - 3));
+            let root = abs("/");
+            let path = format!(
+                "{root}{i}{}",
+                "x".repeat(MAX_DECK_EXE_BYTES - root.len() - 2)
+            );
             assert!(is_valid_deck_exe(&path));
             state.observe(
                 &agent,
@@ -1914,8 +2249,9 @@ mod tests {
 
     /// Scenario: at startup an older pin raises `Older`, an unprobeable pin
     /// `Unprobeable`, and an equal pin nothing; a later stamp-less line from an
-    /// agent pinned to another binary turns its notice into `Unreported`, and a
-    /// stamped current line clears it.
+    /// agent pinned to another binary turns its notice into `Unreported`. A
+    /// current line from another binary leaves that notice, and a current line
+    /// from the pinned binary itself — upgraded in place — clears it.
     #[cfg(unix)]
     #[test]
     fn notices_follow_the_startup_probe_and_the_hook_line_stamp() {
@@ -1968,10 +2304,23 @@ mod tests {
         // Repeating it changes nothing.
         assert!(!state.observe(&AgentType::ClaudeCode, &HookLineSender::default()));
 
-        // A current stamp clears the agent; an older stamp raises `Older`.
-        let current = HookLineSender {
+        // A current stamp from another binary leaves the agent's notice, since
+        // the pinned binary is still sending; one from the pinned binary
+        // clears it. An older stamp raises `Older`.
+        let elsewhere = HookLineSender {
             deck_build: Some("0.46.0-gabc1234".into()),
             deck_exe: Some("/somewhere/dot-agent-deck".into()),
+        };
+        assert!(!state.observe(&AgentType::ClaudeCode, &elsewhere));
+        assert!(
+            state
+                .notices()
+                .iter()
+                .any(|n| n.agents.contains(&"Claude Code".to_string()))
+        );
+        let current = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(old.clone()),
         };
         assert!(state.observe(&AgentType::ClaudeCode, &current));
         assert!(
@@ -1999,6 +2348,198 @@ mod tests {
         assert!(!state.observe(&AgentType::Pi, &HookLineSender::default()));
     }
 
+    fn codex_pinned_to(binary: &str) -> HookBinaryState {
+        let mut state = HookBinaryState {
+            deck: DeckIdentity {
+                exe: Some(PathBuf::from(abs("/home/u/.local/bin/dot-agent-deck"))),
+                ..deck("0.46.0")
+            },
+            ..HookBinaryState::default()
+        };
+        state.pins.insert(
+            AgentType::Codex,
+            vec![TrustedPin {
+                binary: binary.to_string(),
+                resolved: None,
+                is_self: false,
+                homebrew: false,
+            }],
+        );
+        state
+    }
+
+    /// Scenario (Qodo on #1656): Codex's hooks run an older copy while its
+    /// pane's own `dot-agent-deck wrap` — this deck — sends lines stamped with
+    /// the current build, the two alternating on every event. The notice is
+    /// raised once and stays: the wrap's lines never clear it, nothing
+    /// changes after the first older line, and the binary is warned about
+    /// once per reason.
+    #[test]
+    fn wrap_lines_beside_an_older_hook_do_not_flicker() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let wrap = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
+        };
+        for hook in [
+            HookLineSender {
+                deck_build: Some("0.45.0-gabc1234".into()),
+                deck_exe: Some(old.clone()),
+            },
+            HookLineSender::default(),
+        ] {
+            let mut state = codex_pinned_to(&old);
+            let start = Instant::now();
+            let mut changes = 0;
+            let mut shown = None;
+            for i in 0..20u64 {
+                let now = start + Duration::from_secs(i);
+                let sender = if i % 2 == 0 { &hook } else { &wrap };
+                if state.observe_at(&AgentType::Codex, sender, now) {
+                    changes += 1;
+                }
+                let notices = state.notices();
+                assert_eq!(notices.len(), 1, "{i}: {notices:?}");
+                assert_eq!(notices[0].binary, old);
+                if let Some(shown) = &shown {
+                    assert_eq!(&notices, shown, "{i}");
+                }
+                shown = Some(notices);
+            }
+            assert_eq!(changes, 1, "{hook:?}");
+            assert_eq!(state.warned.len(), 1, "{:?}", state.warned);
+            // The steady state needs no write.
+            let later = start + Duration::from_secs(20);
+            assert!(!state.would_change_at(&AgentType::Codex, &wrap, later));
+            assert!(!state.would_change_at(&AgentType::Codex, &hook, later));
+        }
+    }
+
+    /// Scenario: the user fixes the hooks, and only this deck's lines arrive
+    /// for Codex from then on. The older copy's notice stays while that copy
+    /// was seen recently, and clears with the first line once it has sent
+    /// nothing for `HOOK_BINARY_QUIET_AFTER`.
+    #[test]
+    fn a_notice_clears_once_its_binary_has_gone_quiet() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let mut state = codex_pinned_to(&old);
+        let start = Instant::now();
+        let older = HookLineSender {
+            deck_build: Some("0.45.0-gabc1234".into()),
+            deck_exe: Some(old.clone()),
+        };
+        assert!(state.observe_at(&AgentType::Codex, &older, start));
+        let fixed = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
+        };
+        let almost = start + HOOK_BINARY_QUIET_AFTER - Duration::from_secs(1);
+        assert!(!state.observe_at(&AgentType::Codex, &fixed, almost));
+        assert_eq!(state.notices().len(), 1);
+        let quiet = start + HOOK_BINARY_QUIET_AFTER;
+        assert!(state.would_change_at(&AgentType::Codex, &fixed, quiet));
+        assert!(state.observe_at(&AgentType::Codex, &fixed, quiet));
+        assert!(state.notices().is_empty());
+    }
+
+    /// Scenario (Qodo and Greptile on #1656): Codex's hooks are pinned to two
+    /// older copies, one per event. Lines from each are tracked apart, so both
+    /// notices show however the lines interleave, and a stamp-less line — from
+    /// one of the two, but which is unknown — marks both.
+    #[test]
+    fn two_pins_for_one_agent_are_both_tracked() {
+        let first = abs("/opt/first/dot-agent-deck");
+        let second = abs("/opt/second/dot-agent-deck");
+        let mut state = codex_pinned_to(&first);
+        state
+            .pins
+            .get_mut(&AgentType::Codex)
+            .unwrap()
+            .push(TrustedPin {
+                binary: second.clone(),
+                resolved: None,
+                is_self: false,
+                homebrew: false,
+            });
+        let line = |build: &str, exe: &str| HookLineSender {
+            deck_build: Some(build.into()),
+            deck_exe: Some(exe.into()),
+        };
+        for _ in 0..3 {
+            state.observe(&AgentType::Codex, &line("0.44.0-gabc1234", &first));
+            state.observe(&AgentType::Codex, &line("0.45.0-gabc1234", &second));
+        }
+        let mut binaries: Vec<(String, Option<String>)> = state
+            .notices()
+            .into_iter()
+            .map(|n| (n.binary, n.version))
+            .collect();
+        binaries.sort();
+        assert_eq!(
+            binaries,
+            vec![
+                (first.clone(), Some("0.44.0".into())),
+                (second.clone(), Some("0.45.0".into())),
+            ]
+        );
+        state.observe(&AgentType::Codex, &HookLineSender::default());
+        let notices = state.notices();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices
+                .iter()
+                .all(|n| n.reason == HookBinaryReason::Unreported),
+            "{notices:?}"
+        );
+    }
+
+    /// Scenario (Qodo on #1656): startup sees two Codex pins, one an older
+    /// copy and one this deck, in either order. The older copy's notice is the
+    /// same both ways, and a stamp-less line marks only the older copy.
+    #[cfg(unix)]
+    #[test]
+    fn startup_notices_do_not_depend_on_pin_order() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let old = version_stub(
+            dir.path(),
+            "old",
+            "#!/bin/sh\necho 'dot-agent-deck 0.0.1'\n",
+        );
+        let me = version_stub(
+            dir.path(),
+            "me",
+            "#!/bin/sh\necho 'dot-agent-deck 0.46.0'\n",
+        );
+        let identity = DeckIdentity {
+            exe: Some(std::fs::canonicalize(&me).unwrap()),
+            ..deck("0.46.0")
+        };
+        let pin = |binary: &str| HookPin {
+            agent: AgentType::Codex,
+            config: PathBuf::from("/cfg"),
+            binary: binary.to_string(),
+        };
+        let mut seen = Vec::new();
+        for order in [[&old, &me], [&me, &old]] {
+            let mut state = HookBinaryState::from_startup(
+                identity.clone(),
+                &[pin(order[0]), pin(order[1])],
+                None,
+            );
+            let notices = state.notices();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert_eq!(notices[0].binary, old);
+            assert_eq!(notices[0].reason, HookBinaryReason::Older);
+            seen.push(notices);
+            assert!(state.observe(&AgentType::Codex, &HookLineSender::default()));
+            let notices = state.notices();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert_eq!(notices[0].binary, old);
+            assert_eq!(notices[0].reason, HookBinaryReason::Unreported);
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+
     /// Scenario: one warning per (binary, reason), however many lines say it.
     #[test]
     fn a_warning_is_recorded_once_per_binary_and_reason() {
@@ -2008,11 +2549,12 @@ mod tests {
         };
         state.pins.insert(
             AgentType::ClaudeCode,
-            TrustedPin {
+            vec![TrustedPin {
                 binary: "/opt/old".into(),
+                resolved: None,
                 is_self: false,
                 homebrew: false,
-            },
+            }],
         );
         for _ in 0..3 {
             state.observe(&AgentType::ClaudeCode, &HookLineSender::default());
@@ -2498,11 +3040,12 @@ mod tests {
         };
         state.pins.insert(
             AgentType::Codex,
-            TrustedPin {
+            vec![TrustedPin {
                 binary: "/opt/\x1b[2Jold\u{202E}/dot-agent-deck".into(),
+                resolved: None,
                 is_self: false,
                 homebrew: false,
-            },
+            }],
         );
         assert!(state.observe(&AgentType::Codex, &HookLineSender::default()));
         let notices = state.notices();

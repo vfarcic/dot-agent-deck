@@ -51,4 +51,51 @@ test.describe("Hook binary notice", () => {
     await page.getByTestId("open-overview").click();
     await expect(page.getByTestId("daemon-group")).toHaveCount(2);
   });
+
+  /**
+   * Scenario: the real live bridge, with Tauri's IPC mocked, receives a
+   * connected snapshot whose daemon reports stale hooks. The deck's dashboard
+   * card shows the notice, so the snapshot mapping carries it (the fixture
+   * scenarios above skip that mapping).
+   */
+  test("is shown from a live daemon snapshot", async ({ page }) => {
+    const deckId = "deck-0000000000001637";
+    const snapshot = {
+      connection: {
+        status: "connected", deckKind: "local", deckId, socketPath: "/tmp/hook-notice-live.sock",
+        clientProtocolVersion: 10, serverProtocolVersion: 10, clientBuildVersion: "0.46.0", daemonBuildVersion: "0.46.0",
+        runningAgentCount: 0,
+        hookBinaryNotices: [{
+          binary: "/opt/homebrew/bin/dot-agent-deck", agents: ["Claude Code", "Codex"], version: "0.45.1",
+          daemonVersion: "0.46.0", reason: "older", remedy: "Run:", command: "brew upgrade dot-agent-deck",
+        }],
+      },
+      agents: [], protocolVersion: 10, source: "daemon", fleet: [deckId],
+    };
+    // Same IPC callback/event contract as @tauri-apps/api/mocks.mockIPC,
+    // installed before the bundle loads so the real live bridge is driven.
+    await page.addInitScript((initial) => {
+      const callbacks = new Map<number, (event: unknown) => void>();
+      let next = 0;
+      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
+        transformCallback: (callback: (event: unknown) => void) => { const id = ++next; callbacks.set(id, callback); return id; },
+        unregisterCallback: (id: number) => callbacks.delete(id),
+        invoke: async (command: string, args: Record<string, unknown> = {}) => {
+          if (command === "plugin:event|listen") return args.handler;
+          if (command === "plugin:event|unlisten") return;
+          if (command === "desktop_bootstrap") return initial;
+          if (command === "desktop_features") return {};
+          if (command === "desktop_get_settings") return { settings: { version: 1, appearance: { mode: "system" }, zoom: { level: 1 } } };
+          if (command === "desktop_set_zoom") return args.level;
+          return { ok: true };
+        },
+      } });
+      Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", { value: { unregisterListener: (_event: string, id: number) => callbacks.delete(id) } });
+    }, snapshot);
+    await page.goto("/?live=1");
+    const notice = page.getByTestId("daemon-group").getByTestId("hook-binary-notice");
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText("Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0");
+    await expect(notice.getByTestId("hook-binary-notice-command")).toHaveText("brew upgrade dot-agent-deck");
+  });
 });

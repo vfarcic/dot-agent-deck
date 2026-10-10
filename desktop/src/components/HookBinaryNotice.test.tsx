@@ -6,7 +6,7 @@ import type { HookBinaryNotice } from "../types";
 const writeClipboardText = vi.fn(async (_text: string) => undefined);
 vi.mock("../lib/clipboard", () => ({ writeClipboardText }));
 
-const { HookBinaryNotices, hookNoticeCopyText, hookNoticeSentence } = await import("./HookBinaryNotice");
+const { HookBinaryNotices, hookNoticeCopyText, hookNoticeRemedy, hookNoticeSentence, MAX_NOTICE_COMMAND_BYTES, REMEDY_RUN, REMEDY_UPGRADE_OR_REINSTALL } = await import("./HookBinaryNotice");
 
 const OLDER: HookBinaryNotice = {
   binary: "/opt/homebrew/bin/dot-agent-deck",
@@ -139,5 +139,43 @@ describe("HookBinaryNotices (issue #1637)", () => {
     });
     expect(writeClipboardText).toHaveBeenCalledWith(shown);
     expect(shown).toBe(own.command);
+  });
+
+  /**
+   * Scenario: a notice groups four agents, so the daemon's command repeats the
+   * app's path four times and runs well past a message's 240 characters. The
+   * strip shows the whole command after `Run:`, and Copy copies exactly it.
+   */
+  it("shows a long command whole rather than a bare Run:", async () => {
+    writeClipboardText.mockClear();
+    const exe = "'/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck'";
+    const command = ["claude-code", "opencode", "codex", "devin"].map((agent) => `${exe} hooks install --agent ${agent}`).join(" && ");
+    expect(command.length).toBeGreaterThan(240);
+    const long: HookBinaryNotice = { ...OLDER, agents: ["Claude Code", "OpenCode", "Codex", "Devin"], remedy: "Run:", command };
+    render(<HookBinaryNotices notices={[long]} />);
+    expect(screen.getByTestId("hook-binary-notice-command").textContent).toBe(command);
+    expect(screen.getByTestId("hook-binary-notice-remedy").textContent).toBe(`Run: ${command}`);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("hook-binary-notice-copy"));
+    });
+    expect(writeClipboardText).toHaveBeenCalledWith(command);
+  });
+
+  /**
+   * Scenario: a notice from a daemon whose command is over the cap the strip
+   * shows. The strip drops the command and shows the upgrade-or-reinstall
+   * advice in place of `Run:`, never a bare `Run:`.
+   */
+  it("falls back to the advice when it cannot show the command", () => {
+    const tooLong: HookBinaryNotice = { ...OLDER, remedy: REMEDY_RUN, command: `/${"a".repeat(MAX_NOTICE_COMMAND_BYTES)} hooks install` };
+    expect(hookNoticeCopyText(tooLong)).toBeUndefined();
+    expect(hookNoticeRemedy(tooLong)).toBe(REMEDY_UPGRADE_OR_REINSTALL);
+    render(<HookBinaryNotices notices={[tooLong]} />);
+    expect(screen.getByTestId("hook-binary-notice-remedy").textContent).toBe(REMEDY_UPGRADE_OR_REINSTALL);
+    expect(screen.queryByTestId("hook-binary-notice-command")).toBeNull();
+    expect(screen.queryByTestId("hook-binary-notice-copy")).toBeNull();
+    // A `Run:` that arrives with no command at all reads the same.
+    expect(hookNoticeRemedy({ ...OLDER, command: undefined })).toBe(REMEDY_UPGRADE_OR_REINSTALL);
+    expect(hookNoticeRemedy(OLDER)).toBe(REMEDY_RUN);
   });
 });

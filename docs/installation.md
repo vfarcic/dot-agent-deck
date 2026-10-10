@@ -210,16 +210,16 @@ An agent that was already running when the hooks were installed may need a resta
 
 If an agent's hooks call a `dot-agent-deck` older than the deck you are running, for example after you upgrade the desktop app but not the Homebrew copy the hooks call, the deck tells you which agents, which copy, both versions and what to do:
 
-- **TUI:** a line at the bottom of the dashboard, such as `⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck`. When the terminal is narrow, the path is shortened in the middle so the fix stays readable. When there is more than one notice, the line shows the first and how many more there are.
-- **Desktop app:** a strip under that daemon's header, on the dashboard and on the daemon's own screen, with the same words and, when the fix is a command, a **Copy** button that copies exactly the command shown. Only the affected daemon shows it, and it does not block anything.
+- **TUI:** a line at the bottom of the dashboard, such as `⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck`. When the terminal is narrow, the path is shortened in the middle so the fix stays readable. A command is never cut off: when it does not fit the line, the line shows the upgrade-or-reinstall advice below instead, and a wider terminal or the desktop app shows the command. When there is more than one notice, the line shows the first and how many more there are.
+- **Desktop app:** a strip under that daemon's header, on the dashboard and on the daemon's own screen, with the same words and, when the fix is a command, the whole command, wrapped onto more lines when it is long, and a **Copy** button that copies exactly the command shown. Only the affected daemon shows it, and it does not block anything.
 
 The fix is one of:
 
 - `Run: brew upgrade dot-agent-deck`: the hooks call a Homebrew copy. Upgrade it.
-- `Run: <path> hooks install --agent <agent>`: the deck you are running can take the hooks over. Run the command it shows.
+- `Run: <path> hooks install --agent <agent>`: the deck you are running can take the hooks over. Run the command it shows. On Windows it is written for PowerShell, as `& '<path>' hooks install --agent <agent>`, with `;` between the commands for several agents.
 - ``Upgrade the dot-agent-deck the hooks run, or run `hooks install` from the copy you want the hooks to use.``: the deck cannot offer a command for that copy. Upgrade or replace the copy the notice names, or run `hooks install` from the copy you want the hooks to call.
 
-A copy so old that it does not report its version is named as one that "predates version reporting", and a copy that did not answer when asked its version as one that "did not report its version". The fix is the same. The notice goes away once the agent's hooks run a current copy: after the next event they send, or when the daemon restarts.
+A copy so old that it does not report its version is named as one that "predates version reporting", and a copy that did not answer when asked its version as one that "did not report its version". The fix is the same. When an agent's hooks call more than one copy, for example a different copy for some of Codex's events, each older copy has its own notice. A notice goes away when the copy it names sends an event as a current release, after you upgrade it in place; when the hooks have moved to another copy, it goes away with the agent's first event after the old copy has sent nothing for five minutes; and it always goes away when the daemon restarts.
 
 If you open the desktop app on macOS straight from its disk image, or before moving it out of Downloads (macOS then runs it from a temporary location), it installs no hooks, and both clients say `Agent hooks are off` with `Move Agent Deck to /Applications and reopen it to turn agent hooks on.` Do that, and the hooks are installed when the app starts again.
 

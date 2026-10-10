@@ -21683,10 +21683,20 @@ fn hook_notice_line(
         n => format!(" (+{} more)", n - 1),
     };
     // The daemon's words and, when the fix is a command, that command after
-    // them — the same two parts the desktop strip shows.
+    // them — the same two parts the desktop strip shows. A command is never
+    // cut: when it does not fit the row, the row shows the daemon's
+    // no-command advice instead, as the desktop does with one it cannot show.
+    let prose = |text: &str| format!(" — {text}{more}");
     let remedy = match &notice.command {
-        Some(command) => format!(" — {} {command}{more}", notice.remedy),
-        None => format!(" — {}{more}", notice.remedy),
+        Some(command) => {
+            let full = format!(" — {} {command}{more}", notice.remedy);
+            if mark.width() + full.width() <= width {
+                full
+            } else {
+                prose(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL)
+            }
+        }
+        None => prose(&notice.remedy),
     };
     let fixed = mark.width() + lead.width() + tail.width() + remedy.width();
     let path_budget = width.saturating_sub(fixed);
@@ -21699,6 +21709,9 @@ fn hook_notice_line(
         // the remedy still fits.
         let room = width.saturating_sub(mark.width() + remedy.width());
         let lead_text = format!("{lead}…{tail}");
+        // Only words reach here when the remedy alone is too wide: a command
+        // that did not fit was replaced above, so cutting this cuts no command.
+        let remedy = truncate_end(&remedy, width.saturating_sub(mark.width()));
         return Some(Line::from(vec![
             Span::styled(mark, Style::default().fg(Color::Yellow)),
             Span::styled(truncate_end(&lead_text, room), text_primary()),
@@ -45674,6 +45687,43 @@ mod hook_notice_tests {
             text.contains(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL),
             "{text}"
         );
+    }
+
+    /// Scenario (Greptile on #1656): at 80 columns, a notice whose command
+    /// is the two-agent `hooks install` for `~/.local/bin`, wider than the row
+    /// on its own. The row shows the upgrade-or-reinstall advice and no part
+    /// of the command, never a cut-off command; at a width the command fits,
+    /// the row shows it whole.
+    #[test]
+    fn a_command_wider_than_the_row_falls_back_to_the_advice() {
+        use unicode_width::UnicodeWidthStr;
+        let command = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code && \
+                       /home/u/.local/bin/dot-agent-deck hooks install --agent codex";
+        assert!(command.width() > 80);
+        let notice = HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into(), "Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: crate::hook_binary::REMEDY_RUN.into(),
+            command: Some(command.into()),
+        };
+        let line = hook_notice_line(std::slice::from_ref(&notice), 80).unwrap();
+        let text = line_text(&line);
+        assert!(text.width() <= 80, "{text}");
+        assert!(!text.contains("hooks install --agent"), "{text}");
+        assert!(!text.contains("Run:"), "{text}");
+        assert!(text.contains("Upgrade the dot-agent-deck"), "{text}");
+        let rendered = buffer_text(&render_hook_notice_to_buffer(
+            std::slice::from_ref(&notice),
+            80,
+            1,
+        ));
+        assert!(!rendered.contains("hooks install --agent"), "{rendered}");
+
+        let wide = line_text(&hook_notice_line(std::slice::from_ref(&notice), 400).unwrap());
+        assert!(wide.contains(&format!("Run: {command}")), "{wide}");
     }
 
     #[test]

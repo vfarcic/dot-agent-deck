@@ -383,6 +383,17 @@ fn is_copyable_command(command: &str) -> bool {
 
 impl HookBinaryNoticeDto {
     pub(crate) fn new(notice: &dot_agent_deck::daemon_protocol::HookBinaryNotice) -> Self {
+        let command = notice
+            .command
+            .as_deref()
+            .filter(|command| is_copyable_command(command))
+            .map(str::to_string);
+        let mut remedy = safe_display_text(&notice.remedy);
+        // A `Run:` whose command is dropped would end the strip with nothing
+        // to run, so it reads as the daemon's no-command advice instead.
+        if command.is_none() && remedy == dot_agent_deck::daemon_protocol::REMEDY_RUN {
+            remedy = dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL.to_string();
+        }
         Self {
             binary: safe_message(notice.binary.clone()),
             agents: notice
@@ -393,12 +404,8 @@ impl HookBinaryNoticeDto {
             version: notice.version.clone().map(safe_message),
             daemon_version: safe_message(notice.daemon_version.clone()),
             reason: notice.reason,
-            remedy: safe_display_text(&notice.remedy),
-            command: notice
-                .command
-                .as_deref()
-                .filter(|command| is_copyable_command(command))
-                .map(str::to_string),
+            remedy,
+            command,
         }
     }
 }
@@ -4891,7 +4898,24 @@ mod tests {
         ] {
             let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(hostile)));
             assert_eq!(dto.command, None, "{hostile:?}");
+            // Never a bare `Run:`: the dropped command's lead-in becomes the
+            // daemon's no-command advice.
+            assert_eq!(
+                dto.remedy,
+                dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL,
+                "{hostile:?}"
+            );
         }
+        let over_cap = format!(
+            "/{} hooks install",
+            "a".repeat(dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES)
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(&over_cap)));
+        assert_eq!(dto.command, None);
+        assert_eq!(
+            dto.remedy,
+            dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL
+        );
         let dto = HookBinaryNoticeDto::new(&notice("Run:\ntouch /tmp/x", None));
         assert!(!dto.remedy.contains('\n'), "{:?}", dto.remedy);
         let dto = HookBinaryNoticeDto::new(&notice("Run:", Some("brew upgrade dot-agent-deck")));

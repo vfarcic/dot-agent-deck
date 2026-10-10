@@ -4134,9 +4134,10 @@ mod tests {
     /// Issue #1157: with nothing installed, a copy running from a mounted disk
     /// image (`/Volumes/<name>/…`) or from App Translocation is refused at step
     /// 3 rather than pinned, and the refusal names `/Applications`. The shapes
-    /// are lexical, so they are checked on every platform; the `/Volumes` one
-    /// need not exist, because the refusal comes before step 3 looks at the
-    /// file.
+    /// are lexical. The translocated one is checked on every platform; the
+    /// `/Volumes` one on Unix, where it is an absolute path (on Windows it is
+    /// relative to the current drive, so no copy runs from it), and it need
+    /// not exist, because the refusal comes before step 3 looks at the file.
     #[test]
     fn step_3_refuses_a_mounted_or_translocated_copy() {
         let dir = crate::test_temp::tempdir().expect("resolver tempdir");
@@ -4144,10 +4145,13 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
 
-        let mounted =
-            PathBuf::from("/Volumes/Agent Deck/Agent Deck.app/Contents/MacOS").join(&name);
-        let err = durable_binary_path_with(Ok(mounted), &home, None).unwrap_err();
-        assert!(err.contains("/Applications"), "{err}");
+        #[cfg(unix)]
+        {
+            let mounted =
+                PathBuf::from("/Volumes/Agent Deck/Agent Deck.app/Contents/MacOS").join(&name);
+            let err = durable_binary_path_with(Ok(mounted), &home, None).unwrap_err();
+            assert!(err.contains("/Applications"), "{err}");
+        }
 
         let translocated = dir
             .path()
