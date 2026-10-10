@@ -1208,25 +1208,8 @@ fn scenario(
     ));
 
     println!("xver (inner): step 3 — Ctrl+D, Ctrl+C, Detach (never Stop)");
-    // Leave PaneInput first: there Ctrl+C goes to the focused PANE and kills a
-    // role. Read off the footer rather than assumed, because Ctrl+D toggles —
-    // from command mode it would enter the pane instead (issue #1392).
-    if !ensure_command_mode(&setup_tui) {
-        return Err(Abort::Scenario(format!(
-            "the {} TUI never showed a COMMAND footer, so Ctrl+C was not sent: in PaneInput it \
-             would kill the focused role.\n=== grid ===\n{}",
-            cast.daemon_side,
-            setup_tui.grid()
-        )));
-    }
-    setup_tui.send(b"\x03"); // Ctrl+C — the quit dialog
-    if !setup_tui.wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT) {
-        return Err(Abort::Scenario(format!(
-            "Ctrl+D then Ctrl+C never opened the quit dialog in the {} TUI.\n=== grid ===\n{}",
-            cast.daemon_side,
-            setup_tui.grid()
-        )));
-    }
+    open_quit_dialog(&setup_tui, &format!("the {} TUI", cast.daemon_side))
+        .map_err(Abort::Scenario)?;
     // Enter takes whichever option is selected, so the selection is read off
     // the screen rather than assumed to be the default: the dialog marks it
     // `> Detach` (`render_quit_confirm`, the same in v0.41.0 and every branch
@@ -2870,6 +2853,9 @@ pub(crate) fn main_ui_drawn(grid: &str) -> bool {
 /// marker below is text the state it confirms draws and the state before it
 /// does not, in `src/ui.rs` of v0.41.0 and of every branch this sweeps: the
 /// setup TUI is the old build forward and the branch in reverse.
+///
+/// Returns only once the deck has finished opening the orchestration — see
+/// [`wait_for_orchestration_open`] for why the next keystroke depends on that.
 fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
     deck.send(b"\x0e"); // Ctrl+N -> directory picker
     // The picker's own footer (`render_dir_picker`); the dashboard draws none
@@ -2914,7 +2900,74 @@ fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
         ));
     }
     deck.send(b"\r"); // submit
-    Ok(())
+    wait_for_orchestration_open(deck)
+}
+
+/// Wait until the deck has finished opening the orchestration it was just
+/// asked for: its footer reads ` TYPING `, on the start role's pane.
+///
+/// **This wait is what keeps step 3's `Ctrl+C` out of the orchestrator pane
+/// (issue #1579).** The deck handles the submit in one pass that redraws
+/// nothing until it ends: it spawns every role pane through the daemon, and
+/// only then focuses the start role and sets `PaneInput` (the orchestration arm
+/// of the new-pane form's submit in `src/ui.rs`). The daemon lists the roles as
+/// they spawn, so `daemon status` can name all of them while the screen still
+/// shows the new-pane form's last frame — and that form draws a ` COMMAND `
+/// chip (`mode_chip_label` gives every mode but `PaneInput` and the two inline
+/// prompts the ` COMMAND ` chip). [`ensure_command_mode`] reading that stale
+/// chip pressed no `Ctrl+D`, the `Ctrl+C` queued behind the busy submit, and
+/// the deck read it in `PaneInput` and wrote it to the orchestrator's pane:
+/// observed at a load average of ~130, where the gap is long. ` TYPING ` is a
+/// state the submit CHANGES, never one that predates it, so once it is on
+/// screen the deck is done changing mode on its own and step 3's `Ctrl+D` is
+/// the toggle that brings it to command mode.
+pub(crate) fn wait_for_orchestration_open(deck: &pty::PtyDeck) -> Result<(), String> {
+    if deck.wait_for_grid(UI_TIMEOUT, |g| footer_mode(g) == Some(FooterMode::Typing)) {
+        return Ok(());
+    }
+    let grid = deck.grid();
+    Err(format!(
+        "the orchestration never finished opening: submitting the form never put the deck in \
+         PaneInput on its start role (the footer reads {:?}, not TYPING).\n=== grid ===\n{grid}",
+        footer_mode(&grid)
+    ))
+}
+
+/// Open the deck's quit dialog with `Ctrl+C`, from command mode proven by the
+/// footer, and return once the dialog is on screen. `who` names the TUI in the
+/// error, e.g. "the old TUI".
+///
+/// PaneInput is left first because there `Ctrl+C` goes to the focused PANE and
+/// kills a role (CLAUDE.md rule 12's third trap). Command mode is read off the
+/// footer rather than assumed, because `Ctrl+D` toggles — from command mode it
+/// would enter the pane instead (issue #1392). The footer is only worth reading
+/// once the deck has stopped changing mode on its own, which is why the
+/// orchestration's open is waited out by [`wait_for_orchestration_open`] before
+/// this is reached (issue #1579).
+pub(crate) fn open_quit_dialog(deck: &pty::PtyDeck, who: &str) -> Result<(), String> {
+    if !ensure_command_mode(deck) {
+        return Err(format!(
+            "{who} never showed a COMMAND footer, so Ctrl+C was not sent: in PaneInput it would \
+             kill the focused role.\n=== grid ===\n{}",
+            deck.grid()
+        ));
+    }
+    deck.send(b"\x03"); // Ctrl+C — the quit dialog
+    if deck.wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT) {
+        return Ok(());
+    }
+    let grid = deck.grid();
+    let reached_pane = if footer_mode(&grid) == Some(FooterMode::Typing) {
+        " The footer reads TYPING, so the deck was in PaneInput when it read the Ctrl+C and \
+         wrote it to the focused pane: it changed mode on its own after the COMMAND footer was \
+         read (the shape of issue #1579)."
+    } else {
+        ""
+    };
+    Err(format!(
+        "Ctrl+D then Ctrl+C never opened the quit dialog in {who}.{reached_pane}\n=== grid \
+         ===\n{grid}"
+    ))
 }
 
 /// Which of its two keyboard modes the deck's footer says it is in.
@@ -4210,6 +4263,275 @@ mod reverse_tests {
         assert_eq!(
             roles(&plan(Direction::Forward, crate::probe::Probe::Generic)).len(),
             3
+        );
+    }
+}
+
+/// Issue #1579: step 3's `Ctrl+C` against a deck that is still busy opening
+/// the orchestration, driven deterministically.
+///
+/// The deck is a fake, this test binary re-executed under a real PTY as
+/// [`fake_tui_child`], drawing the frames the real TUI draws at each step of
+/// the `Ctrl+N` flow with the same footer chips. What makes it a model of the
+/// race and not just a script is the submit: like the real submit handler,
+/// which spawns every role through the daemon before it redraws or reads
+/// another key, the fake reads no input and leaves the form's ` COMMAND `
+/// frame on screen until the test opens a gate file. So the order of events in
+/// the race is the test's to choose, rather than the scheduler's.
+#[cfg(test)]
+mod quit_dialog_race_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    const GATE_ENV: &str = "XVER_FAKE_TUI_GATE";
+    const CHILD_TEST: &str = "inner::quit_dialog_race_tests::fake_tui_child";
+    /// What the fake's orchestrator pane shows when a `Ctrl+C` reached it — the
+    /// `$ ^C` of the #1579 run's final grid.
+    const PANE_GOT_CTRL_C: &str = "$ ^C";
+
+    /// The file the fake writes when it enters the busy submit, beside the gate.
+    fn submitted_marker(gate: &Path) -> PathBuf {
+        gate.with_extension("submitted")
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Screen {
+        Dashboard,
+        Picker,
+        /// The new-pane form; `bool` is whether the orchestration chip is
+        /// selected (which hides the Command field), `Name` whether focus has
+        /// moved on to the Name field.
+        Form(bool),
+        Name,
+        Orchestration,
+        Quit,
+    }
+
+    /// Not a test of its own: the fake deck for the tests below. Without
+    /// [`GATE_ENV`] it returns at once.
+    #[test]
+    fn fake_tui_child() {
+        let Some(gate) = std::env::var_os(GATE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        // Raw mode, as the real TUI sets it: without it the line discipline
+        // turns Ctrl+C into SIGINT and holds every key until a newline.
+        // SAFETY: plain termios calls on this process's own stdin, a PTY slave.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(0, &mut t), 0, "tcgetattr on the PTY");
+            libc::cfmakeraw(&mut t);
+            assert_eq!(libc::tcsetattr(0, libc::TCSANOW, &t), 0, "tcsetattr");
+        }
+        let mut out = std::io::stdout().lock();
+        let mut input = std::io::stdin().lock();
+        let mut screen = Screen::Dashboard;
+        let mut typing = false;
+        let mut pane = String::from("$ ");
+        loop {
+            let (body, footer): (Vec<&str>, &str) = match screen {
+                Screen::Dashboard => (vec!["No active agents"], " COMMAND  [New Agent Ctrl+N]"),
+                Screen::Picker => (vec!["Pick a directory"], " COMMAND  Space: select"),
+                Screen::Form(false) => (
+                    vec!["Mode: [No mode] [Orch: xver]", "Command:"],
+                    " COMMAND  Enter: next",
+                ),
+                Screen::Form(true) => (
+                    vec!["Mode: [No mode] [Orch: xver]"],
+                    " COMMAND  Enter: next",
+                ),
+                Screen::Name => (
+                    vec!["Mode: [No mode] [Orch: xver]", "Name:"],
+                    " COMMAND  Enter: submit",
+                ),
+                Screen::Orchestration if typing => (vec!["┌orchestrator", &pane], " TYPING "),
+                Screen::Orchestration => (
+                    vec!["┌orchestrator", &pane],
+                    " COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N]",
+                ),
+                Screen::Quit => (
+                    vec!["Quit dot-agent-deck?", "> Detach", "  Stop"],
+                    " COMMAND ",
+                ),
+            };
+            let mut frame = String::from("\x1b[2J\x1b[H");
+            for (row, line) in body.iter().enumerate() {
+                frame.push_str(&format!("\x1b[{};1H{line}", row + 1));
+            }
+            frame.push_str(&format!("\x1b[24;1H{footer}"));
+            out.write_all(frame.as_bytes()).unwrap();
+            out.flush().unwrap();
+
+            let mut key = [0u8; 1];
+            if input.read(&mut key).unwrap_or(0) == 0 {
+                return;
+            }
+            screen = match (screen, key[0]) {
+                (Screen::Dashboard, 0x0e) => Screen::Picker,
+                (Screen::Picker, b' ') => Screen::Form(false),
+                (Screen::Form(_), 0x1b) => {
+                    let mut rest = [0u8; 2];
+                    input.read_exact(&mut rest).unwrap();
+                    Screen::Form(rest == *b"[C")
+                }
+                (Screen::Form(true), b'\r') => Screen::Name,
+                (Screen::Name, b'\r') => {
+                    // The submit: busy until the gate opens, reading nothing
+                    // and redrawing nothing, then on the start role in
+                    // PaneInput — the order the real handler does it in. The
+                    // marker tells the test the busy section has begun.
+                    std::fs::write(submitted_marker(&gate), b"").unwrap();
+                    while !gate.exists() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    typing = true;
+                    Screen::Orchestration
+                }
+                (Screen::Orchestration, 0x04) => {
+                    typing = !typing;
+                    Screen::Orchestration
+                }
+                (Screen::Orchestration, 0x03) if typing => {
+                    pane.push_str("^C");
+                    Screen::Orchestration
+                }
+                (Screen::Orchestration, 0x03) => Screen::Quit,
+                (Screen::Quit, b'\r') => return,
+                (s, _) => s,
+            };
+        }
+    }
+
+    struct Fake {
+        deck: pty::PtyDeck,
+        gate: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Fake {
+        fn spawn(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("xver-1579-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let gate = dir.join("spawns-returned");
+            let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+            let env = vec![(GATE_ENV.to_string(), gate.display().to_string())];
+            let deck = pty::PtyDeck::spawn(pty::PtySpec {
+                label: "fake-tui",
+                bin: &exe,
+                args: &[CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"],
+                cwd: &dir,
+                env: &env,
+                cols: 80,
+                rows: 24,
+                stream_log: dir.join("fake-tui.stream.txt"),
+            })
+            .expect("spawn the fake deck under a PTY");
+            assert!(
+                deck.wait_for_grid_string("No active agents", STEP_TIMEOUT),
+                "the fake deck never drew its dashboard:\n{}",
+                deck.grid()
+            );
+            Self { deck, gate, dir }
+        }
+
+        fn open_gate(&self) {
+            std::fs::write(&self.gate, b"").expect("open the gate");
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.deck.shutdown();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The control: the sequence step 3 ran before the fix reproduces the #1579
+    /// run's end state against the fake, on every run. Without this the fix's
+    /// test below could pass against a fake that never models the race.
+    #[test]
+    fn a_ctrl_c_sent_while_the_open_is_still_busy_reaches_the_orchestrator_pane() {
+        let fake = Fake::spawn("control");
+        let deck = &fake.deck;
+        // `open_orchestration` before the fix: every key up to and including
+        // the submit, and no wait after it.
+        deck.send(b"\x0e");
+        assert!(deck.wait_for_grid_string("Space: select", STEP_TIMEOUT));
+        deck.send(b" ");
+        assert!(deck.wait_for_grid_string("No mode", STEP_TIMEOUT));
+        deck.send(b"\x1b[C");
+        assert!(deck.wait_for_grid(STEP_TIMEOUT, |g| !g.contains("Command:")));
+        deck.send(b"\r");
+        assert!(deck.wait_for_grid_string("Enter: submit", STEP_TIMEOUT));
+        deck.send(b"\r");
+        // Step 3 before the fix, while the submit is still busy: the form's
+        // stale COMMAND chip satisfies the check, so no Ctrl+D is sent.
+        assert!(
+            ensure_command_mode(deck),
+            "the form's frame reads COMMAND, which is the whole race:\n{}",
+            deck.grid()
+        );
+        deck.send(b"\x03");
+        fake.open_gate();
+        assert!(
+            deck.wait_for_grid(STEP_TIMEOUT, |g| g.contains(PANE_GOT_CTRL_C)
+                && footer_mode(g) == Some(FooterMode::Typing)),
+            "the Ctrl+C should have reached the orchestrator pane in PaneInput, as in the \
+             #1579 run:\n{}",
+            deck.grid()
+        );
+        assert!(!deck.grid().contains("Quit dot-agent-deck?"));
+    }
+
+    /// The fix: `open_orchestration` returns only once the deck is on the start
+    /// role in PaneInput, so step 3's `Ctrl+D` is pressed and its `Ctrl+C` opens
+    /// the quit dialog — however long the open stays busy.
+    #[test]
+    fn step_three_waits_out_the_open_and_its_ctrl_c_opens_the_quit_dialog() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fake = Fake::spawn("fixed");
+        // The spawns return a while after the submit, from outside the steps
+        // under test — the way the daemon finishes on its own schedule. The
+        // gate opens only once the fake is inside the busy submit, so that
+        // section is exercised on every run however slow the form flow was,
+        // and only after checking `open_orchestration` is still waiting it out:
+        // without the fix it returns as soon as the submit key is sent.
+        let returned = Arc::new(AtomicBool::new(false));
+        let gate = fake.gate.clone();
+        let returned_seen = Arc::clone(&returned);
+        let opener = std::thread::spawn(move || {
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            while !submitted_marker(&gate).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let reached = submitted_marker(&gate).exists();
+            std::thread::sleep(Duration::from_millis(500));
+            let returned_early = returned_seen.load(Ordering::SeqCst);
+            std::fs::write(&gate, b"").expect("open the gate");
+            (reached, returned_early)
+        });
+        let opened = open_orchestration(&fake.deck);
+        returned.store(true, Ordering::SeqCst);
+        let (reached, returned_early) = opener.join().unwrap();
+        opened.expect("the orchestration opens");
+        assert!(reached, "the fake never entered the busy submit");
+        assert!(
+            !returned_early,
+            "open_orchestration returned while the deck was still busy opening the orchestration"
+        );
+        assert_eq!(
+            footer_mode(&fake.deck.grid()),
+            Some(FooterMode::Typing),
+            "open_orchestration returned before the deck left the form"
+        );
+        open_quit_dialog(&fake.deck, "the fake TUI").expect("the quit dialog opens");
+        let grid = fake.deck.grid();
+        assert!(grid.contains("> Detach"), "{grid}");
+        assert!(
+            !fake.deck.stream_text().contains(PANE_GOT_CTRL_C),
+            "the Ctrl+C reached the orchestrator pane:\n{grid}"
         );
     }
 }
