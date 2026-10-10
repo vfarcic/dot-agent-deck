@@ -517,7 +517,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .hook-binary-notice { padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); }
 .hook-binary-notice > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
 .hook-binary-notice span { overflow-wrap: anywhere; }
-.hook-binary-notice code { font-size: 10px; overflow-wrap: anywhere; }
+.hook-binary-notice code { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .connection-detail { font-size: 10px; }
 .connection-detail summary { cursor: pointer; width: fit-content; }
 .connection-detail > span { display: block; margin-top: 2px; overflow-wrap: anywhere; }

@@ -722,7 +722,11 @@ pub fn durable_binary_resolution_with(
     // with `not found` and be rewritten on every launch. Nothing is written,
     // and the daemon tells the user to move the app (`EphemeralLocation`).
     // Temporary directories are NOT refused here: a scratch copy that is the
-    // only deck on the machine is still pinned (`hooks/install/008`).
+    // only deck on the machine is still pinned (`hooks/install/008`). Only this
+    // last resort refuses: an installed `~/.local/bin` or `$PATH` name is
+    // pinned by that name at the steps above even when it points into such a
+    // location, and a pin that dies with it is repaired when another copy
+    // next starts.
     if is_mounted_or_translocated(&absolute) {
         return Err(format!(
             "refusing to write `{}` into agent hook config: it is running from a mounted disk \

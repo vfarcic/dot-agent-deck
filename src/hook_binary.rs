@@ -83,8 +83,9 @@ pub enum HookBinaryReason {
     /// The pinned hook binary did not answer `--version` within
     /// [`HOOK_BINARY_PROBE_TIMEOUT`], or answered something unreadable.
     Unprobeable,
-    /// This deck runs from a mounted disk image or a translocated location, so
-    /// no hooks were installed (issue #1157).
+    /// This deck runs from a mounted disk image or a translocated location and
+    /// found no installed copy to pin instead, so no hooks were installed
+    /// (issue #1157).
     EphemeralLocation,
     #[serde(other)]
     Unknown,
@@ -1069,8 +1070,15 @@ pub const HOOK_BINARY_QUIET_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// How often a steady stream of lines from one binary refreshes when it was
 /// last seen, which takes the daemon's write lock; every other line from it is
-/// settled under the read lock.
+/// settled under the read lock. A recorded `last_seen` can therefore trail the
+/// binary's last line by up to this much, which [`CLEAR_AFTER`] allows for.
 const SEEN_REFRESH: Duration = Duration::from_secs(30);
+
+/// How long after a binary's recorded `last_seen` another binary's line clears
+/// its notice: [`HOOK_BINARY_QUIET_AFTER`] plus the [`SEEN_REFRESH`] a recorded
+/// time can trail the binary's last line by, so a notice never clears before
+/// its binary has actually been quiet for [`HOOK_BINARY_QUIET_AFTER`].
+const CLEAR_AFTER: Duration = HOOK_BINARY_QUIET_AFTER.saturating_add(SEEN_REFRESH);
 
 /// The daemon's record of which binaries each agent's hooks run, and the
 /// notices that follow from it.
@@ -1097,10 +1105,6 @@ pub struct HookBinaryState {
 
 /// What agents share to be listed in one notice: binary, reason, version.
 type NoticeKey = (String, HookBinaryReason, Option<String>);
-
-/// Everything [`HookBinaryState::notices`] reads from the statuses, so a
-/// caller can tell whether a change moved the notices without composing them.
-type NoticeInputs = Vec<(usize, String, HookBinaryReason, Option<String>, bool)>;
 
 /// The order agents are listed in a notice.
 fn agent_order(agent: &AgentType) -> usize {
@@ -1199,7 +1203,9 @@ impl HookBinaryState {
         if next.is_empty() {
             return false;
         }
-        let before = self.notice_inputs();
+        // Compared as clients receive them, capped at MAX_NOTICES, so a change
+        // beyond the cap does not broadcast a list identical to the last one.
+        let before = self.notices();
         let seen: Vec<String> = next.iter().map(|status| status.binary.clone()).collect();
         for status in next {
             self.record(agent, status, now);
@@ -1207,7 +1213,7 @@ impl HookBinaryState {
         if let Some(tracked) = self.statuses.get_mut(agent) {
             tracked.retain(|tracked| !Self::cleared_by(tracked, &seen, now));
         }
-        self.notice_inputs() != before
+        self.notices() != before
     }
 
     fn would_change_at(&self, agent: &AgentType, sender: &HookLineSender, now: Instant) -> bool {
@@ -1231,12 +1237,13 @@ impl HookBinaryState {
     }
 
     /// Whether a line for the same agent from `seen` clears `tracked`: it
-    /// raised a notice, is another binary, and has been quiet for
-    /// [`HOOK_BINARY_QUIET_AFTER`].
+    /// raised a notice, is another binary, and has been quiet for at least
+    /// [`HOOK_BINARY_QUIET_AFTER`] (measured as [`CLEAR_AFTER`] from its
+    /// recorded `last_seen`).
     fn cleared_by(tracked: &Tracked, seen: &[String], now: Instant) -> bool {
         tracked.status.reason.is_some()
             && !seen.contains(&tracked.status.binary)
-            && now.saturating_duration_since(tracked.last_seen) >= HOOK_BINARY_QUIET_AFTER
+            && now.saturating_duration_since(tracked.last_seen) >= CLEAR_AFTER
     }
 
     /// The statuses a hook line from `agent` implies, one per binary it is
@@ -1253,7 +1260,9 @@ impl HookBinaryState {
                 .as_deref()
                 .filter(|exe| is_valid_deck_exe(exe));
             // A pinned binary's line is recorded under the pin's spelling, so
-            // startup's probe and the binary's own lines are one status.
+            // startup's probe and the binary's own lines are one status. A line
+            // with no usable path for an agent without exactly one pin names
+            // no binary, so like an unusable build it says nothing.
             let binary = match exe {
                 Some(exe) => pins
                     .iter()
@@ -1262,7 +1271,7 @@ impl HookBinaryState {
                     .to_string(),
                 None => match pins {
                     [pin] => pin.binary.clone(),
-                    _ => String::new(),
+                    _ => return Vec::new(),
                 },
             };
             let version = release_of_build(build).to_string();
@@ -1409,21 +1418,6 @@ impl HookBinaryState {
                         .reason
                         .map(|reason| (agent, &tracked.status, reason))
                 })
-            })
-            .collect()
-    }
-
-    fn notice_inputs(&self) -> NoticeInputs {
-        self.reasoned()
-            .into_iter()
-            .map(|(agent, status, reason)| {
-                (
-                    agent_order(agent),
-                    status.binary.clone(),
-                    reason,
-                    status.version.clone(),
-                    status.homebrew,
-                )
             })
             .collect()
     }
@@ -2418,7 +2412,8 @@ mod tests {
     /// Scenario: the user fixes the hooks, and only this deck's lines arrive
     /// for Codex from then on. The older copy's notice stays while that copy
     /// was seen recently, and clears with the first line once it has sent
-    /// nothing for `HOOK_BINARY_QUIET_AFTER`.
+    /// nothing for `CLEAR_AFTER` (`HOOK_BINARY_QUIET_AFTER` plus the refresh
+    /// interval a recorded time can trail by).
     #[test]
     fn a_notice_clears_once_its_binary_has_gone_quiet() {
         let old = abs("/opt/old/dot-agent-deck");
@@ -2433,13 +2428,121 @@ mod tests {
             deck_build: Some("0.46.0-gabc1234".into()),
             deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
         };
-        let almost = start + HOOK_BINARY_QUIET_AFTER - Duration::from_secs(1);
+        let almost = start + CLEAR_AFTER - Duration::from_secs(1);
         assert!(!state.observe_at(&AgentType::Codex, &fixed, almost));
         assert_eq!(state.notices().len(), 1);
-        let quiet = start + HOOK_BINARY_QUIET_AFTER;
+        let quiet = start + CLEAR_AFTER;
         assert!(state.would_change_at(&AgentType::Codex, &fixed, quiet));
         assert!(state.observe_at(&AgentType::Codex, &fixed, quiet));
         assert!(state.notices().is_empty());
+    }
+
+    /// Scenario (auditor on #1656): the daemon's own sequence, which records
+    /// a line only when `would_change_at` says so. The older copy's line is
+    /// recorded, its repeat 29 seconds later is skipped as unchanged, and this
+    /// deck's lines then arrive steadily. The notice stays until the older
+    /// copy has really sent nothing for `HOOK_BINARY_QUIET_AFTER`, counted
+    /// from its skipped last line rather than the recorded one.
+    #[test]
+    fn the_quiet_time_counts_from_a_line_the_daemon_skipped() {
+        let old = abs("/opt/old/dot-agent-deck");
+        let mut state = codex_pinned_to(&old);
+        let older = HookLineSender {
+            deck_build: Some("0.45.0-gabc1234".into()),
+            deck_exe: Some(old.clone()),
+        };
+        let fixed = HookLineSender {
+            deck_build: Some("0.46.0-gabc1234".into()),
+            deck_exe: Some(abs("/home/u/.local/bin/dot-agent-deck")),
+        };
+        // What `observe_hook_sender` does with one line.
+        let deliver = |state: &mut HookBinaryState, sender: &HookLineSender, at: Instant| {
+            state.would_change_at(&AgentType::Codex, sender, at)
+                && state.observe_at(&AgentType::Codex, sender, at)
+        };
+        let start = Instant::now();
+        assert!(deliver(&mut state, &older, start));
+        let last_old = start + SEEN_REFRESH - Duration::from_secs(1);
+        assert!(!state.would_change_at(&AgentType::Codex, &older, last_old));
+        assert!(!deliver(&mut state, &older, last_old));
+        let mut at = last_old;
+        while at < last_old + HOOK_BINARY_QUIET_AFTER {
+            assert!(
+                !deliver(&mut state, &fixed, at),
+                "cleared at {:?}",
+                at - last_old
+            );
+            assert_eq!(state.notices().len(), 1, "{:?}", at - last_old);
+            at += Duration::from_secs(1);
+        }
+        let quiet = start + CLEAR_AFTER;
+        assert!(quiet >= last_old + HOOK_BINARY_QUIET_AFTER);
+        assert!(deliver(&mut state, &fixed, quiet));
+        assert!(state.notices().is_empty());
+    }
+
+    /// Scenario (reviewer on #1656): a line stamped with a valid build but an
+    /// unusable path, for an agent with no pin or with two, names no binary,
+    /// so it raises no notice; with exactly one pin it is that pin's line.
+    #[test]
+    fn a_line_with_no_usable_path_names_no_binary() {
+        let line = HookLineSender {
+            deck_build: Some("0.45.0-gabc1234".into()),
+            deck_exe: Some("relative/dot-agent-deck".into()),
+        };
+        let now = Instant::now();
+        let mut unpinned = codex_pinned_to(&abs("/opt/old/dot-agent-deck"));
+        unpinned.pins.clear();
+        let mut two = codex_pinned_to(&abs("/opt/old/dot-agent-deck"));
+        let second = TrustedPin {
+            binary: abs("/opt/other/dot-agent-deck"),
+            ..two.pins[&AgentType::Codex][0].clone()
+        };
+        two.pins.get_mut(&AgentType::Codex).unwrap().push(second);
+        for state in [&mut unpinned, &mut two] {
+            assert!(!state.would_change_at(&AgentType::Codex, &line, now));
+            assert!(!state.observe_at(&AgentType::Codex, &line, now));
+            assert!(state.notices().is_empty(), "{:?}", state.notices());
+            assert!(state.statuses.values().all(Vec::is_empty));
+        }
+        let old = abs("/opt/old/dot-agent-deck");
+        let mut one = codex_pinned_to(&old);
+        assert!(one.observe_at(&AgentType::Codex, &line, now));
+        let notices = one.notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].binary, old);
+    }
+
+    /// Scenario (reviewer on #1656): with more binaries raising notices than a
+    /// client is sent, a change to one beyond the cap leaves the list clients
+    /// receive unchanged, so it is not broadcast; a change inside the cap is.
+    #[test]
+    fn a_change_beyond_the_notice_cap_is_not_broadcast() {
+        let mut state = HookBinaryState {
+            deck: deck("0.46.0"),
+            ..HookBinaryState::default()
+        };
+        let now = Instant::now();
+        let agents = [AgentType::ClaudeCode, AgentType::OpenCode, AgentType::Codex];
+        let line = |n: usize, build: &str| HookLineSender {
+            deck_build: Some(build.into()),
+            deck_exe: Some(abs(&format!("/opt/old{n}/dot-agent-deck"))),
+        };
+        let total = MAX_NOTICES + 1;
+        for n in 0..total {
+            let agent = &agents[n / MAX_BINARIES_PER_AGENT];
+            state.observe_at(agent, &line(n, "0.45.0-gabc1234"), now);
+        }
+        assert_eq!(state.reasoned().len(), total);
+        let before = state.notices();
+        assert_eq!(before.len(), MAX_NOTICES);
+        let last = total - 1;
+        let beyond = &agents[last / MAX_BINARIES_PER_AGENT];
+        assert!(state.would_change_at(beyond, &line(last, "0.44.0-gabc1234"), now));
+        assert!(!state.observe_at(beyond, &line(last, "0.44.0-gabc1234"), now));
+        assert_eq!(state.notices(), before);
+        assert!(state.observe_at(&agents[0], &line(0, "0.44.0-gabc1234"), now));
+        assert_ne!(state.notices(), before);
     }
 
     /// Scenario (Qodo and Greptile on #1656): Codex's hooks are pinned to two

@@ -248,7 +248,8 @@ export interface ConnectionView {
  * - `"unreported"`: the hooks run a copy so old it does not report a version.
  * - `"unprobeable"`: the hooks' copy did not answer when asked its version.
  * - `"ephemeral_location"`: this deck runs from a disk image or a translocated
- *   location, so it installed no hooks; `binary` is its own path.
+ *   location and found no installed copy to pin instead, so it installed no
+ *   hooks; `binary` is its own path.
  * - `"unknown"`: a reason a newer daemon added.
  */
 export interface HookBinaryNotice {
