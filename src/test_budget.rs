@@ -1,10 +1,10 @@
 //! Load-scaled wait ceilings for the lib target's own `#[cfg(test)]` tests —
 //! issue #709's helper, on this side of the wall.
 //!
-//! `tests/common/mod.rs` carries `load_scaled`, `load_factor` and the
-//! measurement behind them, but **the lib target does not link that file** —
-//! the same wall [`crate::test_isolation`] documents, and for the same reason it
-//! cannot share a constant with the harness. So a unit test in `src/` reaching
+//! `tests/common/mod.rs` carries `load_scaled` and `load_factor`, but **the lib
+//! target does not link that file** — the same wall [`crate::test_isolation`]
+//! documents, and for the same reason it cannot share a constant with the
+//! harness. So a unit test in `src/` reaching
 //! for a contention-proof ceiling had nothing to call and wrote a flat
 //! `Duration::from_secs(N)` instead. That is precisely the pre-#709
 //! configuration, and it fails the way #709 measured: a ceiling sized for an
@@ -22,47 +22,20 @@
 //!
 //! Kept deliberately small: the harness's version carries the full rationale and
 //! is the one to read. This is the minimum needed to stop a lib-side test
-//! asserting against an idle box's schedule.
+//! asserting against an idle box's schedule. The load itself is measured by
+//! [`crate::host_metrics::machine_load_per_cpu`], the one implementation both
+//! sides of the wall call (PRD #1258 M2).
 
 use std::time::Duration;
+
+// PRD #1258 M2: the measurement is the crate's one implementation, shared with
+// the test harness, rather than a copy of it.
+use crate::host_metrics::machine_load_per_cpu;
 
 /// The largest factor [`load_scaled`] will multiply a base by. Mirrors
 /// `tests/common/mod.rs`'s `MAX_LOAD_FACTOR`; see there for why it is a clamp
 /// rather than "whatever the load average says".
 const MAX_LOAD_FACTOR: f64 = 6.0;
-
-/// The 1-minute load average per CPU, or `None` where this platform does not
-/// publish one cheaply. Linux (`/proc/loadavg`) and macOS (`getloadavg(3)`),
-/// exactly as the harness's twin, which records why macOS joined; elsewhere
-/// `None`, because an unmeasurable load must widen nothing.
-fn machine_load_per_cpu() -> Option<f64> {
-    let one_minute = one_minute_load_average()?;
-    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
-    if !one_minute.is_finite() || cpus <= 0.0 {
-        return None;
-    }
-    Some(one_minute / cpus)
-}
-
-#[cfg(target_os = "linux")]
-fn one_minute_load_average() -> Option<f64> {
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    raw.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn one_minute_load_average() -> Option<f64> {
-    let mut sample = [0.0_f64; 1];
-    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
-    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
-    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
-    (written == 1).then_some(sample[0])
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn one_minute_load_average() -> Option<f64> {
-    None
-}
 
 /// The multiplier [`load_scaled`] applies, split out so the unmeasurable branch
 /// is testable on Linux and macOS — where [`machine_load_per_cpu`] does not
@@ -120,20 +93,6 @@ mod tests {
             load_factor(Some(99.0)),
             MAX_LOAD_FACTOR,
             "clamped, not unbounded"
-        );
-    }
-
-    /// Issue #1244: macOS used to return `None` here, leaving every lib-side
-    /// ceiling unscaled on `build-macos`. macOS only, because a Linux box with
-    /// no readable `/proc/loadavg` returning `None` is correct — see the
-    /// harness twin's test.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_load_is_measurable_on_macos() {
-        let load = machine_load_per_cpu();
-        assert!(
-            load.is_some_and(|l| l.is_finite() && l >= 0.0),
-            "machine_load_per_cpu() must measure the load here, got {load:?}"
         );
     }
 

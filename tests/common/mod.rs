@@ -121,51 +121,17 @@ pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
 /// after one Enter before pressing it again.
 pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
-/// Issue #709: the 1-minute load average per CPU, or `None` where this platform
-/// does not publish one cheaply.
+/// Issue #709's measurement behind [`load_scaled`]: the 1-minute load average
+/// per CPU, or `None` where this platform does not publish one cheaply (every
+/// target but Linux and macOS). [`load_factor`] says why an unmeasurable load
+/// is not treated as a maximal one.
 ///
-/// Linux reads `/proc/loadavg` and macOS calls `getloadavg(3)`. Elsewhere the
-/// answer is `None`, and [`load_scaled`] then applies NO multiplier at all —
-/// see [`load_factor`] for why an unmeasurable load is not treated as a maximal
-/// one.
-///
-/// **macOS used to be `None` as well, and that was a flake.** This comment said
-/// `getloadavg` was not exposed by the `libc` crate for Apple targets. It is:
-/// `libc` declares it in `unix/bsd/mod.rs`, which `apple` sits under. So
-/// `build-macos` — a 3-core runner under a full `cargo nextest run` — got the
-/// flat [`CHILD_BOOT_BASE`] with no scaling, and `idle_worker_010` failed there
-/// at 8.248 s against that 8 s ceiling with "the pane never entered the closing
-/// state" (PR #1238, run 35747708815): #709's starvation shape, on the one
-/// platform #709 could not scale. [`load_factor`]'s clamp bounds a macOS
-/// reading exactly as it bounds a Linux one.
-pub fn machine_load_per_cpu() -> Option<f64> {
-    let one_minute = one_minute_load_average()?;
-    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
-    if !one_minute.is_finite() || cpus <= 0.0 {
-        return None;
-    }
-    Some(one_minute / cpus)
-}
-
-#[cfg(target_os = "linux")]
-fn one_minute_load_average() -> Option<f64> {
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    raw.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn one_minute_load_average() -> Option<f64> {
-    let mut sample = [0.0_f64; 1];
-    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
-    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
-    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
-    (written == 1).then_some(sample[0])
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn one_minute_load_average() -> Option<f64> {
-    None
-}
+/// PRD #1258 M2: this is the crate's own implementation, re-exported, not a
+/// copy of it — `src/host_metrics.rs` carries the doc, including why macOS
+/// joined (issue #1244). `load_context` reads `one_minute_load_average` from
+/// the same place.
+pub use dot_agent_deck::host_metrics::machine_load_per_cpu;
+use dot_agent_deck::host_metrics::one_minute_load_average;
 
 /// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
 /// by, and therefore the ceiling on how long a starved child is waited for.
