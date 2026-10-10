@@ -427,18 +427,22 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// merged exactly like one with text, so it is announced once, in its turn's
 /// place (audit A2).
 ///
-/// A permission prompt Claude Code reports twice is announced once. It sends
-/// its permission hook (a [`TurnEvent::Permission`]) when the prompt appears,
-/// and its `permission_prompt` notification (a [`TurnEvent::PermissionNotice`])
-/// about six seconds later, which can be after the deck already answered the
-/// prompt or the turn moved on. So each announced permission hook owes one
-/// notification, and a notification pays the oldest debt still owed, unsaid —
-/// a debt lapses [`PERMISSION_NOTICE_WINDOW`] after its hook's event, by the
-/// events' timestamps, not by when they arrive. A notification nothing is owed
-/// for — a Claude Code too old for the permission hook, or a prompt whose
-/// hook's debt lapsed — is announced. Neither an answer nor the turn's progress
-/// pays a debt: the answered prompt's notification still comes. A status with
-/// no event time ([`Incoming::Status`]) owes, and pays, with no lapse.
+/// A permission prompt Claude Code reports twice is announced once when its
+/// two reports arrive as Claude Code sends them. It sends its permission hook
+/// (a [`TurnEvent::Permission`]) when the prompt appears, and its
+/// `permission_prompt` notification (a [`TurnEvent::PermissionNotice`]) about
+/// six seconds later, which can be after the deck already answered the prompt
+/// or the turn moved on. So each announced permission hook owes one
+/// notification, and a notification pays the oldest debt it can, unsaid: one
+/// whose hook's event is stamped no later than the notification's and at most
+/// [`PERMISSION_NOTICE_WINDOW`] before it, by the events' timestamps, not by
+/// when they arrive. A debt lapses once an event is stamped past that window.
+/// A notification nothing is owed for — a Claude Code too old for the
+/// permission hook, a prompt whose hook's debt lapsed, or one stamped before
+/// every hook still owed — is announced. Neither an answer nor the turn's
+/// progress pays a debt: the answered prompt's notification still comes. A
+/// status with no event time ([`Incoming::Status`]) owes, and pays, with no
+/// window.
 ///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
@@ -540,12 +544,15 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     }
                 }
             }
-            // The notification of the oldest prompt already announced.
+            // The notification of the oldest prompt already announced that it
+            // can belong to.
             Some(Some(
                 Incoming::Status(TurnEvent::PermissionNotice { .. })
                 | Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, _),
-            )) if !notices_owed.is_empty() => {
-                notices_owed.pop_front();
+            )) if notices_owed.iter().any(|hook| notice_pays(*hook, at)) => {
+                if let Some(paid) = notices_owed.iter().position(|hook| notice_pays(*hook, at)) {
+                    notices_owed.remove(paid);
+                }
             }
             Some(Some(Incoming::Status(status) | Incoming::StatusAt(status, _))) => {
                 release_held(&mut held, &mut emit, &mut announced);
@@ -565,9 +572,20 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
 
 /// Whether a notification at `notice` comes too late to be the one a permission
 /// hook at `hook` owes ([`PERMISSION_NOTICE_WINDOW`]), both in milliseconds
-/// since the Unix epoch. A notification stamped before its hook is not late.
+/// since the Unix epoch. A notification stamped before its hook is not late,
+/// though it cannot pay that hook's debt either ([`notice_pays`]).
 fn notice_lapsed(hook: i64, notice: i64) -> bool {
     i128::from(notice) - i128::from(hook) > PERMISSION_NOTICE_WINDOW.as_millis() as i128
+}
+
+/// Whether a notification at `notice` can be the one a permission hook at
+/// `hook` owes: stamped no earlier than the hook and within
+/// [`PERMISSION_NOTICE_WINDOW`] of it. Either time unknown pays with no window.
+fn notice_pays(hook: Option<i64>, notice: Option<i64>) -> bool {
+    match (hook, notice) {
+        (Some(hook), Some(notice)) => notice >= hook && !notice_lapsed(hook, notice),
+        _ => true,
+    }
 }
 
 /// What [`coalesce`] last announced of a failed turn.
