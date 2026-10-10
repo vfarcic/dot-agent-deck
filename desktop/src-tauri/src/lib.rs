@@ -5459,10 +5459,11 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
 /// pinning here is exactly the thing a running app makes hard to observe: that an
 /// ordinary settings save does **not** take the switch path.
 ///
-/// `superseded` is asked before releasing the transports and again before
-/// ending the watchers, the two steps that read `settings`' deck list after an
-/// await: a pass that a newer save overtook while it was detaching must not
-/// release what the newer list keeps (issue #1620).
+/// `superseded` is asked before each terminal is detached, and once more under
+/// the tunnel map's lock before the transports are released; a pass that a
+/// newer save overtook stops there, so it does not tear down what the newer
+/// list keeps (issue #1620). Once the transports are released, the watchers of
+/// the same decks are ended too, so the two never disagree.
 async fn retarget_selection_unless(
     state: &DesktopState,
     settings: &DesktopSettings,
@@ -5490,15 +5491,18 @@ async fn retarget_selection_unless(
     // reason to tear a terminal down, and why this one is not gated.
     //
     // Before the tunnels are released, so a DETACH frame still has a transport.
-    terminal::detach_decks_outside(state, &observed).await;
+    terminal::detach_decks_outside(state, &observed, &superseded).await;
     state.daemon.invalidate_all().await;
-    if superseded() {
+    // Asked again under the tunnel map's lock, so a save published while this
+    // waits for it is still seen.
+    if !state.tunnels.retain_unless(&observed, &superseded).await {
         return stop();
     }
-    state.tunnels.retain(&observed).await;
-    if superseded() {
-        return stop();
-    }
+    // Not asked again here: the transports just released and the watchers
+    // ended below come from one deck list, so a newer pass that keeps one of
+    // those decks finds neither — its watcher is started again after the pass,
+    // and its transport is opened again on first use.
+    //
     // PRD #742 M3: the watcher half of the same teardown, and the natural
     // sibling of the `retain` above it — a deck that left the observed set must
     // stop being watched as well as stop holding a transport, or it goes on
