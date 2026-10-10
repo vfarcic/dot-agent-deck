@@ -205,7 +205,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		pi.sendUserMessage(seed, { deliverAs: SEED_DELIVER_AS });
 	};
 
-	// --- PRD #1542: answer other extensions' dialogs from the deck --------
+	// --- PRD #1631: answer other extensions' dialogs from the deck --------
 	// Pi's `ctx.ui` is one object shared by every extension and is rebuilt when
 	// Pi rebinds its UI, so the wrappers are (re)applied on every
 	// session_start. Only inside a deck pane, where `await-answer` has a daemon

@@ -73,7 +73,7 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                // PRD #1542: a Claude `PermissionRequest` arrives as a held
+                // PRD #1631: a Claude `PermissionRequest` arrives as a held
                 // `question` envelope and waits for an answer on the same
                 // connection, so read ONE line rather than to EOF, unwrap the
                 // event, and release the hook.

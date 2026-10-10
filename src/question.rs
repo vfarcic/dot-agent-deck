@@ -1,4 +1,4 @@
-//! PRD #1542: the question an agent is waiting on, and the answer the deck
+//! PRD #1631: the question an agent is waiting on, and the answer the deck
 //! sends back.
 //!
 //! The daemon keeps one [`PendingQuestion`] per agent session
@@ -76,7 +76,7 @@ pub struct PendingQuestion {
     /// ([`crate::event::SUBAGENT_ID_METADATA_KEY`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_id: Option<String>,
-    /// PRD #1542 (audit A4): the daemon's revision of this question — which
+    /// PRD #1631 (audit A4): the daemon's revision of this question — which
     /// registration of it on its pane an answer is bound to. Minted by the
     /// daemon when it ingests the question (a held question's is its hold's
     /// generation) and never taken from a producer, so a question replaced
@@ -304,7 +304,7 @@ pub struct QuestionReply {
     pub reason: Option<ReleaseReason>,
 }
 
-/// PRD #1542: what a producer that asked to acknowledge (`QuestionSignal::ack`)
+/// PRD #1631: what a producer that asked to acknowledge (`QuestionSignal::ack`)
 /// writes back after an answered [`QuestionReply`] — one JSON line saying
 /// whether the agent accepted the answer it was handed (OpenCode's reply API
 /// taking the POST), and if not, why.
@@ -497,7 +497,7 @@ impl PendingQuestion {
         })
     }
 
-    /// PRD #1542 (audit A4): whether `other` is this same question raised
+    /// PRD #1631 (audit A4): whether `other` is this same question raised
     /// again — every field equal except when it was raised, how the deck would
     /// answer it, and its revision, none of which a repeat of one prompt
     /// changes.
@@ -756,7 +756,7 @@ fn claude_suggestion_when(suggestions: Option<&Value>) -> Option<(TableWhen, Val
     Some((when, first))
 }
 
-/// PRD #1542 (audit A2): the ONE permission update Claude Code's "always"
+/// PRD #1631 (audit A2): the ONE permission update Claude Code's "always"
 /// option stands for — the first `permission_suggestions` entry, whose kind
 /// also chooses the option's label. The held hook sends exactly this update
 /// as `updatedPermissions` ([`claude_decision`]), and the confirmation the user
@@ -813,14 +813,14 @@ fn scope_part_is_exact(text: &str) -> bool {
         && crate::untrusted_text::strip_control_and_bidi(text, false) == text
 }
 
-/// PRD #1542 (audit A2): whether an "always" scope reaches the card exactly as
+/// PRD #1631 (audit A2): whether an "always" scope reaches the card exactly as
 /// written — within [`MAX_DESCRIPTION_BYTES`] and unchanged by
 /// [`PendingQuestion::sanitized`] — so the confirmation shows all of it.
 fn scope_shown_whole(scope: &str) -> bool {
     scope.len() <= MAX_DESCRIPTION_BYTES && clean(scope, MAX_DESCRIPTION_BYTES, false) == scope
 }
 
-/// PRD #1542 (audit A2): give each "always" option the scope its producer
+/// PRD #1631 (audit A2): give each "always" option the scope its producer
 /// wrote from what the answer will grant, or — when there is none that can be
 /// shown whole — make it keyboard-only with nothing to confirm.
 fn settle_always_scope(options: &mut [QuestionOption], scope: Option<String>) {
@@ -838,7 +838,7 @@ fn settle_always_scope(options: &mut [QuestionOption], scope: Option<String>) {
     }
 }
 
-/// PRD #1542 (audit A2): what one Claude Code permission update grants, in
+/// PRD #1631 (audit A2): what one Claude Code permission update grants, in
 /// words, for the "always allow" confirmation — written from the update's own
 /// `type`, `mode`, `destination`, `directories` and `rules`, never from a
 /// table. `None` when the update is anything this build cannot describe
@@ -924,7 +924,7 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
     template.replace("{dir}", &dirs).replace("{mode}", mode)
 }
 
-/// PRD #1542: the question a Claude Code `PermissionRequest` hook payload asks.
+/// PRD #1631: the question a Claude Code `PermissionRequest` hook payload asks.
 ///
 /// - `AskUserQuestion` → a [`QuestionKind::Choice`] form, one question per
 ///   `tool_input.questions[]`, the payload's options followed by the options
@@ -1167,7 +1167,7 @@ pub fn claude_decision(
 // Producers: Codex
 // ---------------------------------------------------------------------------
 
-/// PRD #1542: a Codex `PermissionRequest` → a [`QuestionKind::Permission`]
+/// PRD #1631: a Codex `PermissionRequest` → a [`QuestionKind::Permission`]
 /// answered by keys from Codex's command-approval table. Never held: a running
 /// `PermissionRequest` hook hides Codex's prompt from a keyboard user
 /// [observed on 0.160.0].
@@ -1215,7 +1215,7 @@ pub fn codex_permission_request(
     }
 }
 
-/// PRD #1542 (audit A2, Codex): the confirmation for Codex's "don't ask again
+/// PRD #1631 (audit A2, Codex): the confirmation for Codex's "don't ask again
 /// for commands that start with the prefix shown", from the table's scope
 /// template filled with the WHOLE command — the prefix Codex grants is cut
 /// from it. `None` when the command is empty or untrimmed, or the sentence
@@ -1234,7 +1234,7 @@ pub fn codex_prefix_scope(command: &str) -> Option<String> {
     scope_shown_whole(&scope).then_some(scope)
 }
 
-/// PRD #1542: Codex's `request_user_input` tool, from its `PreToolUse` →
+/// PRD #1631: Codex's `request_user_input` tool, from its `PreToolUse` →
 /// a [`QuestionKind::Choice`] form answered by one digit per question. The id
 /// is the call's `tool_use_id`, so its `PostToolUse` clears exactly this form.
 /// Codex reports no multi-select field [observed], so none is single-select.
@@ -1292,7 +1292,7 @@ pub fn codex_request_user_input(
 // Producers: Devin (from its documentation; untested)
 // ---------------------------------------------------------------------------
 
-/// PRD #1542: a Devin `PermissionRequest` → a [`QuestionKind::Permission`]
+/// PRD #1631: a Devin `PermissionRequest` → a [`QuestionKind::Permission`]
 /// whose options come from a table built from Devin's documentation. Only
 /// Allow once and Deny are answerable, by keys that no logged-in Devin has
 /// verified. Not held: whether a running hook hides Devin's prompt is unknown.
@@ -1337,7 +1337,7 @@ pub fn devin_permission_request(
 // Producers: OpenCode (the plugin's `await-answer` child)
 // ---------------------------------------------------------------------------
 
-/// PRD #1542: OpenCode's `permission.asked` properties → a held
+/// PRD #1631: OpenCode's `permission.asked` properties → a held
 /// [`QuestionKind::Permission`] with OpenCode's three fixed replies. The id is
 /// OpenCode's own request id, so its `permission.replied` names it.
 pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
@@ -1391,7 +1391,7 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
     })
 }
 
-/// PRD #1542 (audit A2, OpenCode): what OpenCode's "Allow always" grants —
+/// PRD #1631 (audit A2, OpenCode): what OpenCode's "Allow always" grants —
 /// EVERY pattern in `permission.asked`'s `always`, which the `always` reply
 /// approves together — as the confirmation's sentence, from the table's scope
 /// template with the patterns joined by `, `. `None` when the list is empty, a
@@ -1418,7 +1418,7 @@ pub fn opencode_always_scope(props: &Value) -> Option<String> {
     scope_shown_whole(&scope).then_some(scope)
 }
 
-/// PRD #1542: OpenCode's `question.asked` properties → a held
+/// PRD #1631: OpenCode's `question.asked` properties → a held
 /// [`QuestionKind::Choice`] form. Each question gets OpenCode's own
 /// "Type your own answer" option unless it says `custom: false`.
 pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
@@ -1555,7 +1555,7 @@ pub struct PiDialog {
     pub placeholder: Option<String>,
 }
 
-/// PRD #1542: a Pi dialog → a held question. `select` → a choice of its
+/// PRD #1631: a Pi dialog → a held question. `select` → a choice of its
 /// options; `confirm` → [`QuestionKind::Confirm`] with Yes (allow) and No
 /// (deny); `input` → one free-text option.
 pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion> {

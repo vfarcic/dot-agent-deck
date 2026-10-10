@@ -2485,7 +2485,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/015 — Claude Code's `PermissionRequest` hook is installed only for a Claude Code that is new enough (PRD #1542).
+##### hooks/install/015 — Claude Code's `PermissionRequest` hook is installed only for a Claude Code that is new enough (PRD #1631).
 - **Layer:** L1/fast unit (`src/hooks_manage.rs`, `install_impl_gated` against an in-memory settings object).
 - **Agent:** none (`claude --version` is not run; the version is given).
 - **Asserts:** Claude Code 2.1.136 or newer gets one deck `PermissionRequest` rule with no matcher and the deck's long `timeout`; 2.1.135 and an unknown version get no key at all, because an older Claude Code given an unknown hook key drops every hook in the file (issue #714); a second install leaves the file as it was; a downgrade removes a stale rule and its key; uninstall sweeps it with its emptied key; the held hook's own deadline is inside that timeout.
@@ -5531,7 +5531,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the startup and wrapper paths' warn line (they share `trust_deck_hooks_in` with this one); that Codex itself honours `enabled = false` (measured on codex-cli 0.149.0 in issue #1027's thread, not here).
 - **Platform coverage:** mac+linux.
 
-##### codex/hooks/013 — The deck installs Codex's `Interrupt` hook, which clears a question denied by keyboard (PRD #1542).
+##### codex/hooks/013 — The deck installs Codex's `Interrupt` hook, which clears a question denied by keyboard (PRD #1631).
 - **Layer:** L1/fast unit (`src/codex_hooks_manage.rs`, `install_to` against a temporary Codex home).
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
 - **Asserts:** `Interrupt` is in the installed event set and `hooks.json` carries a deck command rule for it after an install. That the event reads as Idle is `question/detect/006`.
@@ -7440,7 +7440,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
 - **Platform coverage:** mac+linux.
 
-### Agent questions (PRD #1542)
+### Agent questions (PRD #1631)
 
 The question an agent is waiting on — a permission prompt, a menu, a form — as the daemon knows it (`pending_question` on the session's snapshot), and the `answer-question` verb that answers it through the agent's own channel. `question/live/001`–`005` run real agents in lane 2; `006` exercises an offline Pi extension dialog in lane 1.
 
@@ -7742,6 +7742,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **question/desktop/011** — `question_desktop_011_a_cancelled_lease_writes_no_frame` (`voice/lease.rs`) and vitest `question/desktop/011: …` (audit A8): a lease cancelled while the send is stalled writes no frame; a cancel arriving before its send kills it; one after the write is reported too late; a send that times out or breaks after the request was let through is reported `unconfirmed` ("may have been sent — check the agent"), never "nothing was sent", while one that fails before is the plain error; the panel keeps the form with its Cancel while sending, cancels the lease on a pane change, and always reports the outcome; a cancel that fails to reach the app is reported with the outcome rather than swallowed, whether its failure arrives before the outcome or after it (audit R5: the row the outcome wrote is then amended).
 - **question/desktop/012** — vitest `question/desktop/012: …` (audit A1, accepted residual): an Allow once the model ties to words that do not mean it ("what time is it", "no don't run that") is shown in the countdown as exactly what would be sent; Cancel, or speaking, stops it, and nothing is sent.
 - **question/desktop/013** — `question_desktop_013_a_typing_mode_switch_is_not_an_answer`: with a question pending, every typing-mode switch said on its own (each of `DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`, bare and wrapped in "okay … please") is a `not_answer` decided with no model call — with nothing answered, with an answer started, and while a free-text option waits for its words — so it goes on to switch typing mode; the same words inside a sentence ("I was talking on the phone") are still the free-text answer, and an option the agent labelled "Start typing" is still that option when the deck can answer it — said bare or with an edge politeness word ("Start typing, please", "Okay, start typing"), compared as the switch is — while a keyboard-only option with that label, or one on a question the deck cannot answer, leaves the utterance a switch.
+- **question/desktop/014** — vitest `question/desktop/014: an answer heard while the app spoke is not taken` (`desktop/src/components/VoiceControlPanel.test.tsx`, PRD #1631): with reading on and the app speaking, a "yes" recorded over that speech — which may be the app reading the prompt aloud (#1497 D8) — is not offered to the pending question: nothing is resolved against it, no countdown starts and nothing is sent, and it is declared as heard while speaking; the same "yes" once the app is quiet starts the countdown.
 
 #### question/hold
 

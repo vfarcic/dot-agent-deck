@@ -46,7 +46,7 @@ const STOP_FAILURE_HOOK: &str = "StopFailure";
 /// version is treated as older.
 pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 
-/// PRD #1542: the hook Claude Code runs when it is about to ask the user for
+/// PRD #1631: the hook Claude Code runs when it is about to ask the user for
 /// permission — a tool prompt, an `AskUserQuestion` form, a plan approval. Its
 /// payload carries the question, and a decision printed by a hook that is still
 /// running answers it, so the deck HOLDS this hook open until it has an answer
@@ -55,7 +55,7 @@ pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 /// [`PERMISSION_REQUEST_MIN_CLAUDE_VERSION`].
 pub const PERMISSION_REQUEST_HOOK: &str = "PermissionRequest";
 
-/// PRD #1542: the first Claude Code release the deck installs
+/// PRD #1631: the first Claude Code release the deck installs
 /// [`PERMISSION_REQUEST_HOOK`] for.
 ///
 /// The key exists from 2.0.45, but 2.1.136 is the release whose changelog
@@ -67,7 +67,7 @@ pub const PERMISSION_REQUEST_HOOK: &str = "PermissionRequest";
 /// version is treated as older.
 pub const PERMISSION_REQUEST_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 136);
 
-/// PRD #1542: the `timeout`, in seconds, the deck writes on its
+/// PRD #1631: the `timeout`, in seconds, the deck writes on its
 /// `PermissionRequest` hook. Claude Code's default is 600 s, after which it
 /// cancels the hook and goes ahead as if there were none — so a user who
 /// leaves a prompt for longer still answers it by keyboard. An hour is a
@@ -75,7 +75,7 @@ pub const PERMISSION_REQUEST_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 136);
 pub const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS: u64 = 3600;
 
 /// The version-gated hook keys an install writes for one Claude Code (issues
-/// #714 and PRD #1542).
+/// #714 and PRD #1631).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClaudeHookGates {
     pub stop_failure: bool,
@@ -92,7 +92,7 @@ impl ClaudeHookGates {
         }
     }
 
-    /// Only the `StopFailure` gate, as the pre-PRD-#1542 seams take it.
+    /// Only the `StopFailure` gate, as the pre-PRD-#1631 seams take it.
     pub fn stop_failure_only(stop_failure: bool) -> Self {
         Self {
             stop_failure,
@@ -101,7 +101,7 @@ impl ClaudeHookGates {
     }
 }
 
-/// PRD #1542: the gates for the `claude` on `PATH`, from the same
+/// PRD #1631: the gates for the `claude` on `PATH`, from the same
 /// `claude --version` probe as [`installed_claude_accepts_stop_failure`], with
 /// the raw first line for a message.
 pub fn installed_claude_hook_gates() -> (ClaudeHookGates, Option<String>) {
@@ -695,7 +695,7 @@ fn make_rule(binary_path: &str, hook_type: &str) -> Value {
             "hooks": [command_obj]
         })
     } else if hook_type == PERMISSION_REQUEST_HOOK {
-        // PRD #1542: the hook waits for the daemon's answer, so it needs more
+        // PRD #1631: the hook waits for the daemon's answer, so it needs more
         // than Claude Code's default 600 s.
         json!({
             "hooks": [{
@@ -831,7 +831,7 @@ fn install_impl(
     )
 }
 
-/// [`install_impl`] with every version gate given (PRD #1542).
+/// [`install_impl`] with every version gate given (PRD #1631).
 fn install_impl_gated(
     settings: &mut Value,
     binary_path: &str,
@@ -1024,7 +1024,7 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
         }
     }
     // Issue #714: an emptied `StopFailure` key goes too — an older Claude Code
-    // rejects the key itself, empty or not. PRD #1542: so does an emptied
+    // rejects the key itself, empty or not. PRD #1631: so does an emptied
     // `PermissionRequest`, for the same reason.
     for gated in [STOP_FAILURE_HOOK, PERMISSION_REQUEST_HOOK] {
         if hooks
@@ -1494,7 +1494,7 @@ pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> i
     )
 }
 
-/// [`install_to`] with every version gate given (PRD #1542).
+/// [`install_to`] with every version gate given (PRD #1631).
 pub fn install_to_with_gates(
     path: &Path,
     binary_path: &str,

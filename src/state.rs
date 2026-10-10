@@ -941,7 +941,7 @@ pub struct SessionSnapshot {
     /// ignores the key, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_generation: Option<HookGeneration>,
-    /// PRD #1542: the question this session's agent is waiting on —
+    /// PRD #1631: the question this session's agent is waiting on —
     /// [`SessionState::pending_question`]. The one model the desktop's voice
     /// answers and #1497's spoken prompts both read. Additive optional, the
     /// `blocked` precedent: an older reader ignores the key and a newer one
@@ -1068,7 +1068,7 @@ pub struct SessionState {
     /// (trust left by an earlier install) still outranks output. Process-local,
     /// like [`Self::prompt_reports_unavailable`].
     pub output_set_status: bool,
-    /// PRD #1542: the question the agent is waiting on, built by its producer
+    /// PRD #1631: the question the agent is waiting on, built by its producer
     /// and sanitized on arrival. Set by an event carrying one
     /// ([`crate::event::QUESTION_METADATA_KEY`]) and cleared by the first event
     /// that proves the agent moved on — see [`AppState::apply_event`]'s
@@ -4510,7 +4510,7 @@ impl AppState {
         }
     }
 
-    /// PRD #1542 (Qodo #1561): drop the question `event` raises when it comes
+    /// PRD #1631 (Qodo #1561): drop the question `event` raises when it comes
     /// from a hook session its pane has moved past — a late OpenCode
     /// `question.asked` from the conversation before a `/clear`, say. That
     /// conversation is over: applied, its question would be the newest pending
@@ -10502,7 +10502,7 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
         None
     };
     session.active_tool = snap.active_tool.clone();
-    // PRD #1542: the pending question, sanitized again — it is agent-derived
+    // PRD #1631: the pending question, sanitized again — it is agent-derived
     // text arriving over the wire.
     session.pending_question = snap
         .pending_question
@@ -10895,7 +10895,7 @@ impl AppState {
             })
     }
 
-    /// PRD #1542 (audit T2): the pane of the session `session_id`, if it has
+    /// PRD #1631 (audit T2): the pane of the session `session_id`, if it has
     /// one — where an event that names no pane lands, since such an event is
     /// applied to its session by id and the session keeps its pane.
     pub fn session_pane(&self, session_id: &str) -> Option<String> {
@@ -10904,7 +10904,7 @@ impl AppState {
             .and_then(|session| session.pane_id.clone())
     }
 
-    /// PRD #1542: the question pending for `(agent_id, pane_id)` — on the same
+    /// PRD #1631: the question pending for `(agent_id, pane_id)` — on the same
     /// session [`Self::live_session_for`] picks — with that session's id.
     pub fn pending_question_for(
         &self,
@@ -10926,7 +10926,7 @@ impl AppState {
             })
     }
 
-    /// PRD #1542 (Qodo #1561): the session `pane_id` is in now — its newest
+    /// PRD #1631 (Qodo #1561): the session `pane_id` is in now — its newest
     /// card, ties broken on the (unique) `session_id` as
     /// [`Self::live_session_for`] breaks them. The pane's pending question is
     /// this session's or none: a predecessor's question does not outlive the
@@ -10942,14 +10942,14 @@ impl AppState {
             })
     }
 
-    /// PRD #1542: the id of the question pending on `pane_id`'s current
+    /// PRD #1631: the id of the question pending on `pane_id`'s current
     /// session ([`Self::pane_current_session`]) — what the daemon's held
     /// channels for that pane are reconciled against.
     pub fn pending_question_id_on_pane(&self, pane_id: &str) -> Option<String> {
         self.pending_question_on_pane(pane_id).map(|q| q.id)
     }
 
-    /// PRD #1542 (audit A4): the question pending on `pane_id` — the one
+    /// PRD #1631 (audit A4): the question pending on `pane_id` — the one
     /// [`Self::pending_question_id_on_pane`] names — whole, revision included.
     pub fn pending_question_on_pane(
         &self,
@@ -10959,7 +10959,7 @@ impl AppState {
             .and_then(|s| s.pending_question.clone())
     }
 
-    /// PRD #1542: the session on `pane_id` whose pending question is
+    /// PRD #1631: the session on `pane_id` whose pending question is
     /// `question_id` at `revision` — its id, agent type and agent id — which is
     /// what the daemon's own event about that question has to name. A
     /// registration under the same id with another revision is not it (audit
@@ -10988,7 +10988,7 @@ impl AppState {
             })
     }
 
-    /// PRD #1542: drop the question `question_id` wherever it is pending on
+    /// PRD #1631: drop the question `question_id` wherever it is pending on
     /// `pane_id`, leaving the status alone — the next event decides it. The
     /// daemon's fallback when a held channel closes without an answer (Claude
     /// Code kills its hook on a keyboard No or Esc [observed]) and its own
@@ -10998,7 +10998,7 @@ impl AppState {
         self.clear_pending_question_where(pane_id, question_id, |_| true)
     }
 
-    /// PRD #1542 (audit A5): [`Self::clear_pending_question`], only where the
+    /// PRD #1631 (audit A5): [`Self::clear_pending_question`], only where the
     /// pending question is still `revision` — a registration that replaced it
     /// under the same id is left alone. What every daemon path that clears a
     /// question it validated, held or released uses.
@@ -11032,7 +11032,7 @@ impl AppState {
         cleared
     }
 
-    /// PRD #1542 (audit A4): the deck typed part of `question_id`'s answer on
+    /// PRD #1631 (audit A4): the deck typed part of `question_id`'s answer on
     /// `pane_id` and could not finish, so the agent's prompt has moved past
     /// what the stored question describes. It stays pending — the agent is
     /// still waiting — but its channel becomes `Unsupported`, so every client
@@ -16613,7 +16613,7 @@ impl AppState {
         let blocked_hold =
             session.status == SessionStatus::Blocked && !quota_blocked && !quota_lift;
 
-        // PRD #1542: what this frame does to the pending question, decided
+        // PRD #1631: what this frame does to the pending question, decided
         // against the session as it stood BEFORE the frame — see
         // [`question_cleared_by`]. A question the frame itself raises is set
         // after the status arms below, so it is never cleared by its own frame.
@@ -16926,7 +16926,7 @@ impl AppState {
         if session.status != SessionStatus::Blocked {
             session.blocked = None;
         }
-        // PRD #1542: the question rules. A frame that proves the agent moved
+        // PRD #1631: the question rules. A frame that proves the agent moved
         // on clears the pending question; a frame carrying one sets it, and the
         // card reads Needs Input — also when the question rides a `ToolStart`
         // (Codex's `request_user_input`), which on its own would read Working.
@@ -17074,7 +17074,7 @@ impl AppState {
     }
 }
 
-/// PRD #1542: whether `event` proves the agent moved past `question`, so the
+/// PRD #1631: whether `event` proves the agent moved past `question`, so the
 /// pending question must go. The rules, in the design's terms:
 ///
 /// 1. the tool's own `ToolEnd` — matched by `tool_use_id` where the question

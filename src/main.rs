@@ -258,7 +258,7 @@ enum Commands {
     /// request, exactly like `agent-event`.
     GetSeed,
     /// Report a question an agent is asking and wait for the deck's answer
-    /// (PRD #1542). Run by the deck's OpenCode plugin and Pi extension, not by
+    /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
     /// hand: prints one line — what the producer should answer the agent with —
     /// or nothing, and always exits 0.
     #[command(hide = true)]

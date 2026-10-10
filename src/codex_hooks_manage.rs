@@ -124,7 +124,7 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "PostCompact",
     "SubagentStart",
     "SubagentStop",
-    // PRD #1542: fires when a turn is interrupted — after a keyboard "No" on
+    // PRD #1631: fires when a turn is interrupted — after a keyboard "No" on
     // Codex's approval prompt [observed on 0.160.0] — so the deck can clear
     // the question that prompt raised. Adding it changes the installed hook
     // set; the install trusts it with the deck's other hooks

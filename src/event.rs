@@ -994,7 +994,7 @@ pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
 /// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 
-/// PRD #1542: the question an event raises, as a JSON-encoded
+/// PRD #1631: the question an event raises, as a JSON-encoded
 /// [`crate::question::PendingQuestion`] riding the free-form `metadata` map.
 ///
 /// A metadata key rather than a new [`AgentEvent`] field, deliberately: the
@@ -1006,14 +1006,14 @@ pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 /// rewrites it sanitized, or drops it, on arrival.
 pub const QUESTION_METADATA_KEY: &str = "pending_question";
 
-/// PRD #1542: the id of a question the AGENT reports answered — OpenCode's
+/// PRD #1631: the id of a question the AGENT reports answered — OpenCode's
 /// `permission.replied` / `question.replied` / `question.rejected` name their
 /// request id here. An event carrying it clears that question if it is the
 /// pending one. It can only take a question away, never raise one, so a forged
 /// value costs nothing a plain `Idle` would not.
 pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
 
-/// PRD #1542: the daemon's marker on the event it ingests after answering a
+/// PRD #1631: the daemon's marker on the event it ingests after answering a
 /// question itself. The daemon's alone: stripped from every producer frame,
 /// and [`AgentEvent::is_daemon_synthetic`] counts it.
 pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
@@ -1022,7 +1022,7 @@ pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_d
 /// [`QUESTION_RELEASED_BY_DECK_METADATA_KEY`] — only the key is read.
 pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
 
-/// PRD #1542: the daemon's marker on the event it ingests when a held
+/// PRD #1631: the daemon's marker on the event it ingests when a held
 /// question's producer stopped waiting without an answer (Claude Code kills its
 /// hook on a keyboard No or Esc [observed]). The event is an
 /// [`EventType::Unknown`] carrying [`QUESTION_RESOLVED_METADATA_KEY`], so a
@@ -1473,7 +1473,7 @@ impl AgentEvent {
                 .contains_key(QUESTION_RELEASED_BY_DECK_METADATA_KEY)
     }
 
-    /// PRD #1542: the question this event raises, sanitized — `None` when it
+    /// PRD #1631: the question this event raises, sanitized — `None` when it
     /// carries none, or one that does not decode or does not survive
     /// [`crate::question::PendingQuestion::sanitized`].
     pub fn question(&self) -> Option<crate::question::PendingQuestion> {
@@ -1483,7 +1483,7 @@ impl AgentEvent {
             .sanitized()
     }
 
-    /// PRD #1542: put `question` on this event.
+    /// PRD #1631: put `question` on this event.
     pub fn set_question(&mut self, question: &crate::question::PendingQuestion) {
         if let Ok(json) = serde_json::to_string(question) {
             self.metadata
@@ -1491,7 +1491,7 @@ impl AgentEvent {
         }
     }
 
-    /// PRD #1542: the question id this event reports the agent answered, if
+    /// PRD #1631: the question id this event reports the agent answered, if
     /// any ([`QUESTION_RESOLVED_METADATA_KEY`]).
     pub fn resolved_question_id(&self) -> Option<&str> {
         self.metadata
@@ -1615,7 +1615,7 @@ pub enum DaemonMessage {
     /// reports as harmless.
     #[serde(rename = "ack")]
     Ack(AckSignal),
-    /// PRD #1542: a producer reports a question and, with `hold`, keeps this
+    /// PRD #1631: a producer reports a question and, with `hold`, keeps this
     /// connection open for the daemon's answer — the Claude Code
     /// `PermissionRequest` hook, and the `await-answer` child the OpenCode
     /// plugin and the Pi extension start. The daemon applies the event exactly
@@ -2837,7 +2837,7 @@ pub struct AckSignal {
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
-/// PRD #1542: [`DaemonMessage::Question`].
+/// PRD #1631: [`DaemonMessage::Question`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionSignal {
     pub pane_id: String,
@@ -2850,7 +2850,7 @@ pub struct QuestionSignal {
     /// Keep this connection open for the answer.
     #[serde(default)]
     pub hold: bool,
-    /// PRD #1542: after an answered reply this producer writes one
+    /// PRD #1631: after an answered reply this producer writes one
     /// [`crate::question::ReplyAck`] line saying whether the agent took the
     /// answer, and the daemon reports the answer only once it has. Only the
     /// OpenCode plugin's `await-answer` child sets it: it hands the answer to

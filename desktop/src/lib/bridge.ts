@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -14,6 +14,7 @@ import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, 
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { speechAudioError } from "./speech";
+import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -331,6 +332,13 @@ export interface DesktopAgentDto {
    * the voice surface then refuses the command rather than guessing.
    */
   promptKeys?: PromptKeys;
+  /**
+   * PRD #1631: the question this agent is waiting on
+   * (`SessionSnapshot.pending_question`), every text field scrubbed by the
+   * crate and still the agent's own words. Absent when it waits on nothing,
+   * and from a daemon that predates the field.
+   */
+  pendingQuestion?: PendingQuestionDto;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1875,6 +1883,27 @@ export interface DeckBridge {
    */
   answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
+   * PRD #1631 — one utterance said on an agent's own screen while it waits on
+   * a question (`desktop_voice_question`): which options it picks, merged
+   * into `form`, or `not_answer`, which the panel then resolves as a command.
+   * The question is read Rust-side from the deck's snapshot; `target` names
+   * the one the panel saw.
+   */
+  resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto>;
+  /**
+   * PRD #1631 — send a whole answered form once the countdown ran out
+   * (`desktop_voice_answer_question`), under `lease`, which
+   * {@link cancelVoiceAnswer} cancels. Every outcome, a refusal included, is
+   * a sentence for the panel's row.
+   */
+  sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto>;
+  /**
+   * PRD #1631 (audit A8) — the panel no longer wants the answer sent under
+   * `lease` (`desktop_voice_answer_cancel`). Rust holds the request back if it
+   * has not been written yet, and reports "too late" if it has. Never refused.
+   */
+  cancelVoiceAnswer(lease: string): Promise<void>;
+  /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
    *
@@ -2255,6 +2284,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -2518,7 +2548,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "upgrade", "upgrade-error"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "docs-question"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -3040,6 +3070,35 @@ class FixtureDeckBridge implements DeckBridge {
   async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
     await Promise.resolve();
     return answerNumberLocally(utterance, heard, generation);
+  }
+
+  /**
+   * PRD #1631 — the question the agent waits on, answered by the preview's
+   * canned replies (`resolveFixtureQuestion`). Only the `docs-question` state
+   * has an agent waiting on one; everywhere else nothing said is an answer.
+   */
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string): Promise<QuestionResultDto> {
+    await Promise.resolve();
+    return resolveFixtureQuestion(this.pendingQuestionOf(target), utterance);
+  }
+
+  /** PRD #1631 — the preview answers no agent, so it says so rather than pretending it did. */
+  async sendVoiceAnswer(target: VoiceQuestionTarget): Promise<AnswerOutcomeDto> {
+    await Promise.resolve();
+    if (this.pendingQuestionOf(target)?.id !== target.questionId) {
+      return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
+    }
+    return { kind: "refused", code: "unsupported", sentence: "The preview cannot answer an agent — nothing was sent." };
+  }
+
+  /** PRD #1631 — the preview sends no answer, so there is nothing to cancel. */
+  async cancelVoiceAnswer(): Promise<void> {
+    await Promise.resolve();
+  }
+
+  private pendingQuestionOf(target: VoiceQuestionTarget): PendingQuestionDto | undefined {
+    const deck = this.fleet.find((candidate) => candidate.connection.deckId === target.deckId);
+    return deck?.agents.find((agent) => agent.id === target.agentId)?.pendingQuestion;
   }
 
   /**
@@ -4743,6 +4802,21 @@ export class TauriDeckBridge implements DeckBridge {
   async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
     const invoke = await this.getInvoke();
     return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
+  }
+
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto> {
+    const invoke = await this.getInvoke();
+    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null });
+  }
+
+  async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
+    const invoke = await this.getInvoke();
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease, revision: target.revision ?? null });
+  }
+
+  async cancelVoiceAnswer(lease: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<void>("desktop_voice_answer_cancel", { lease });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {

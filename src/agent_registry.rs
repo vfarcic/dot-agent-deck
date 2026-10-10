@@ -387,7 +387,7 @@ pub struct AgentSpec {
     /// where they are unmeasured (Devin) or there is no agent to press them at
     /// (the neutral placeholder). See [`PromptKeys`].
     pub prompt_keys: Option<PromptKeys>,
-    /// PRD #1542: the options this agent draws on screen but never reports in
+    /// PRD #1631: the options this agent draws on screen but never reports in
     /// a payload — its permission and plan menus, and the free-text entries it
     /// appends to a multiple-choice list — with the keys that pick each where
     /// the deck answers by keys. Read by the producers that build a
@@ -397,7 +397,7 @@ pub struct AgentSpec {
     pub questions: Option<&'static QuestionTables>,
 }
 
-/// PRD #1542: one agent's per-version option tables (decision 3). The deck
+/// PRD #1631: one agent's per-version option tables (decision 3). The deck
 /// never reads the screen, so every option an agent draws without reporting it
 /// comes from here, keyed on the versions it was verified on; the lane-2
 /// `question/live/*` tests are what pin them.
@@ -510,7 +510,7 @@ const fn when(mut option: TableOption, when: TableWhen) -> TableOption {
 
 use crate::question::OptionRole::{AllowAlways, AllowOnce, Choice, Deny, FreeText};
 
-/// Claude Code, verified on 2.1.289 (PRD #1542 M1 and follow-up b). The
+/// Claude Code, verified on 2.1.289 (PRD #1631 M1 and follow-up b). The
 /// `PermissionRequest` hook it rests on is installed from 2.1.136
 /// ([`crate::hooks_manage::PERMISSION_REQUEST_MIN_CLAUDE_VERSION`]). Permission
 /// and choice answers go through the held hook, so they name no keys; plan
@@ -533,7 +533,7 @@ pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
                 // on purpose: the `setMode` label drops the two parentheticals
                 // Claude draws ("(auto-approve file edits and common file
                 // commands)" and the "(shift+tab)" key hint) [observed text in
-                // PRD #1542 follow-up b], which are hints rather than what the
+                // PRD #1631 follow-up b], which are hints rather than what the
                 // option is. Claude draws "from this project" beside an
                 // `addDirectories` suggestion whose destination is `session`
                 // [observed]; the label keeps Claude's words and the
@@ -586,7 +586,7 @@ pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
     ],
 };
 
-/// Codex, verified on 0.160.0 (PRD #1542 M1 and follow-up c). Answered by
+/// Codex, verified on 0.160.0 (PRD #1631 M1 and follow-up c). Answered by
 /// keys: each acts without Enter.
 pub static CODEX_QUESTIONS: QuestionTables = QuestionTables {
     verified_from: (0, 160, 0),
@@ -619,7 +619,7 @@ pub static CODEX_QUESTIONS: QuestionTables = QuestionTables {
     ],
 };
 
-/// OpenCode, verified on 1.18.34 (PRD #1542 M1 and follow-up d). Answered
+/// OpenCode, verified on 1.18.34 (PRD #1631 M1 and follow-up d). Answered
 /// through the plugin's reply API, so no keys.
 pub static OPEN_CODE_QUESTIONS: QuestionTables = QuestionTables {
     verified_from: (1, 18, 34),

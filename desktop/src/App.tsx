@@ -640,6 +640,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PRD #1541 — the agent's type, turn and the deck's prompt keys, for
          the interrupt / clear / scratch commands. */
       ...voicePaneAgent(paneShownAgent),
+      /* PRD #1631 — the question the agent is waiting on, which voice answers
+         from this pane, and only from this pane (decision 9). */
+      question: paneShownAgent.pendingQuestion,
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
   /**

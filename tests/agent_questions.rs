@@ -1,4 +1,4 @@
-//! PRD #1542: the pending question on an agent's session — when the deck sets
+//! PRD #1631: the pending question on an agent's session — when the deck sets
 //! it, what clears it, and how it survives a reconnect. Pure state: no daemon,
 //! no PTY, no socket.
 

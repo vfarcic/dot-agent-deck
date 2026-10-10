@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, LABEL_SHARING_HINT, READING_DISCLOSURE, VoicePanel } from "./VoicePanel";
+import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_QUESTION, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, LABEL_SHARING_HINT, READING_DISCLOSURE, VoicePanel } from "./VoicePanel";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
@@ -220,7 +220,12 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
     expect(INTENT_DISCLOSURE).toBe("Each command not decided on this computer sends what you said and this app's command list to the Commands service.");
     expect(INTENT_DISCLOSURE_SHARED).toBe("It also sends the names on screen: agents, daemons, directories, modes and orchestrations.");
-    for (const sentence of [INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, READING_DISCLOSURE]) {
+    // PRD #1631: a pending question goes with what is said, names sent or
+    // not, and for a permission prompt it carries the command — a tool's
+    // arguments.
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_QUESTION);
+    expect(INTENT_DISCLOSURE_QUESTION).toBe("While the agent on screen waits on a question, what you say is sent with that question, usually including the command the agent wants to run, whether the names on screen are sent or not.");
+    for (const sentence of [INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, INTENT_DISCLOSURE_QUESTION, READING_DISCLOSURE]) {
       expect(sentence.match(/[.!?](\s|$)/g), sentence).toHaveLength(1);
     }
     const names = screen.getByRole("radiogroup", { name: "Send on-screen names" });
@@ -243,6 +248,7 @@ describe("VoicePanel", () => {
     // It withholds the names, not the request: the always-sent part stays.
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
     expect(INTENT_DISCLOSURE_WITHHELD).toBe("It sends none of the names on screen.");
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_QUESTION);
     expect(within(screen.getByRole("radiogroup", { name: "Send on-screen names" })).getByLabelText("Off")).toBeChecked();
   });
 

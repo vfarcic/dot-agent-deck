@@ -4041,7 +4041,7 @@ struct PaneInputState {
     /// maps here drop a pane's entry when the pane is closed for good
     /// ([`Self::forget_closed_pane`]), not when it changes hands.
     user_input_at: HashMap<String, Instant>,
-    /// PRD #1542 (audit N1): a sequence number for HUMAN input, ordering it
+    /// PRD #1631 (audit N1): a sequence number for HUMAN input, ordering it
     /// against a question's arrival and the deck's own answer keys without a
     /// clock. [`Self::input_seq`] is the counter, global and monotonic, and
     /// moves only on a human keystroke; [`Self::human_input_seq`] holds, per
@@ -4067,7 +4067,7 @@ fn is_sentinel_pane_id(pane_id_env: &str) -> bool {
 
 impl PaneInputState {
     /// Record that a USER keystroke reached `pane_id_env` — a human's, so it
-    /// also moves the human-input sequence (PRD #1542, audit N1).
+    /// also moves the human-input sequence (PRD #1631, audit N1).
     fn note_user_input(&mut self, pane_id_env: &str) {
         if is_sentinel_pane_id(pane_id_env) {
             return;
@@ -4085,7 +4085,7 @@ impl PaneInputState {
             .insert(pane_id_env.to_string(), Instant::now());
     }
 
-    /// PRD #1542 (audit N1): the counter value of `pane_id_env`'s last human
+    /// PRD #1631 (audit N1): the counter value of `pane_id_env`'s last human
     /// keystroke, `0` when it has had none.
     fn human_input_seq(&self, pane_id_env: &str) -> u64 {
         self.human_input_seq
@@ -4118,7 +4118,7 @@ impl PaneInputState {
     }
 
     /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
-    /// answer's, which leave the human-input sequence alone (PRD #1542).
+    /// answer's, which leave the human-input sequence alone (PRD #1631).
     fn note_user_bytes_as(&mut self, pane_id_env: &str, bytes: &[u8], human: bool) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
@@ -4528,7 +4528,7 @@ impl PaneWriter {
         Ok(())
     }
 
-    /// PRD #1542 (audit N1): write a voice answer's keys, like
+    /// PRD #1631 (audit N1): write a voice answer's keys, like
     /// [`Self::write_user`] but as [`ByteSource::Answer`], and return the
     /// human-input counter as it stood once the PTY took them — read while the
     /// caller still holds this writer, which every human keystroke also needs,
@@ -4587,7 +4587,7 @@ impl PaneWriter {
 enum ByteSource {
     Deck,
     User,
-    /// PRD #1542: a voice answer's keys — recorded as the user's input (they
+    /// PRD #1631: a voice answer's keys — recorded as the user's input (they
     /// are the user's answer) without moving the human-input sequence (audit
     /// N1), so the deck's own keys are never mistaken for a human's.
     Answer,
@@ -4635,7 +4635,7 @@ enum PtyOp {
     /// one round trip to this thread instead of two matters on a starved
     /// machine, where each costs a scheduling delay.
     WriteAll(Vec<u8>, ByteSource, bool),
-    /// PRD #1542 (audit T1): a voice answer's keys — a flushed
+    /// PRD #1631 (audit T1): a voice answer's keys — a flushed
     /// [`Self::WriteAll`] as [`ByteSource::Answer`], written only if its
     /// [`AnswerGate`] still holds when the thread comes to it.
     Answer(Vec<u8>, AnswerGate),
@@ -4945,7 +4945,7 @@ impl PtyWriterThread {
     /// JOB without holding that lock across the write itself. That orders
     /// nothing else: whatever the lock serialises can happen after `queued`
     /// and before the thread reaches the job, which is why a voice answer's
-    /// key re-checks its question on the thread ([`AnswerGate`], PRD #1542
+    /// key re-checks its question on the thread ([`AnswerGate`], PRD #1631
     /// audit T1). A job still queued when the caller is dropped is withdrawn,
     /// as [`Self::run`]'s is, and so never written.
     async fn run_queued(&self, op: PtyOp, queued: impl FnOnce()) -> PtyJobOutcome {
@@ -5397,7 +5397,7 @@ impl Drop for AdmissionFreeze<'_> {
 #[cfg(test)]
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
-/// PRD #1542: the hook-socket connections producers hold open for a
+/// PRD #1631: the hook-socket connections producers hold open for a
 /// question's answer, keyed by the pane that raised it AND its question id.
 ///
 /// A producer — the Claude Code `PermissionRequest` hook, the OpenCode
@@ -5459,7 +5459,7 @@ impl HeldReply {
     }
 }
 
-/// PRD #1542: what became of a held answer once the handler wrote it.
+/// PRD #1631: what became of a held answer once the handler wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyDelivery {
     /// Written to a producer that does not acknowledge (it acts on the line
@@ -5640,7 +5640,7 @@ impl HeldQuestions {
     }
 }
 
-/// PRD #1542 (audit A4): what the daemon's `AnswerQuestion` handler keeps so
+/// PRD #1631 (audit A4): what the daemon's `AnswerQuestion` handler keeps so
 /// two answers can never both reach the agent.
 ///
 /// - **One answer at a time per agent.** [`Self::slot`] is a lock the handler
@@ -5745,7 +5745,7 @@ struct RaisedQuestion {
     input_seq: u64,
 }
 
-/// PRD #1542 (audit T1): what a voice answer's key is written under — the
+/// PRD #1631 (audit T1): what a voice answer's key is written under — the
 /// question pending on its pane must still be the one, at the revision, the
 /// key was checked against. Carried by the key's PTY job and checked by the
 /// pane's PTY thread immediately before it writes the key, against the record
@@ -6065,10 +6065,10 @@ pub struct AgentPtyRegistry {
     /// [`AgentPtyRegistry::pane_dispatch_order_lock`]. Never pruned, for the
     /// same reason `dispatch_mutexes` is not.
     dispatch_order_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    /// PRD #1542: the hook-socket connections a producer holds open for a
+    /// PRD #1631: the hook-socket connections a producer holds open for a
     /// question's answer, by question id — see [`HeldQuestions`].
     question_holds: HeldQuestions,
-    /// PRD #1542 (audit A4): per-agent answer serialization — see
+    /// PRD #1631 (audit A4): per-agent answer serialization — see
     /// [`QuestionAnswers`].
     question_answers: QuestionAnswers,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
@@ -8030,17 +8030,17 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #1542: the held question channels — see [`HeldQuestions`].
+    /// PRD #1631: the held question channels — see [`HeldQuestions`].
     pub fn question_holds(&self) -> &HeldQuestions {
         &self.question_holds
     }
 
-    /// PRD #1542 (audit A4): per-agent answer state — see [`QuestionAnswers`].
+    /// PRD #1631 (audit A4): per-agent answer state — see [`QuestionAnswers`].
     pub fn question_answers(&self) -> &QuestionAnswers {
         &self.question_answers
     }
 
-    /// PRD #1542 (audit A4/N1): whether a HUMAN keystroke reached `pane_id`
+    /// PRD #1631 (audit A4/N1): whether a HUMAN keystroke reached `pane_id`
     /// after the daemon first saw `question_id` at `revision` pending there, and
     /// after `committed` — the human-input sequence number the deck's own last
     /// answer key was written at ([`Self::write_answer_keys`]). Sequence
@@ -8067,13 +8067,13 @@ impl AgentPtyRegistry {
         human > baseline
     }
 
-    /// PRD #1542 (audit N1): the human-input counter now — what a question
+    /// PRD #1631 (audit N1): the human-input counter now — what a question
     /// arriving now is compared against.
     pub fn human_input_counter(&self) -> u64 {
         self.pane_input.lock().unwrap().input_seq
     }
 
-    /// PRD #1542: type `keys` into `agent_id`'s PTY to answer a question, with
+    /// PRD #1631: type `keys` into `agent_id`'s PTY to answer a question, with
     /// no Enter after them, under that agent's writer — the keys channel.
     ///
     /// `revalidate` is asked with the writer held, immediately before the

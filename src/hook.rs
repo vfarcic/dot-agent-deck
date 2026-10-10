@@ -91,11 +91,11 @@ pub(crate) struct OpenCodeHookInput {
     response_markers: Option<Value>,
     #[serde(default, deserialize_with = "lenient_string_map")]
     response_headers: HashMap<String, String>,
-    // PRD #1542: the request id `permission.replied`, `question.replied` and
+    // PRD #1631: the request id `permission.replied`, `question.replied` and
     // `question.rejected` name, so the deck clears exactly that question.
     #[serde(default, deserialize_with = "lenient_string")]
     request_id: Option<String>,
-    // PRD #1542: the raw `properties` of a `permission.asked` or
+    // PRD #1631: the raw `properties` of a `permission.asked` or
     // `question.asked`, which the plugin hands to `await-answer` so the same
     // builder that makes the status event makes the question from them
     // ([`build_opencode_event_with_question`]).
@@ -174,7 +174,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    // PRD #1542: a Claude Code question the deck can answer through this hook
+    // PRD #1631: a Claude Code question the deck can answer through this hook
     // is HELD — the hook waits for the daemon's decision and prints it.
     if !matches!(agent, "opencode" | "codex" | "devin")
         && let Some(held) = claude_held_question(&event, &input)
@@ -196,7 +196,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // PRD #1542 (audit A9): a frame that raises or clears a question goes
+    // PRD #1631 (audit A9): a frame that raises or clears a question goes
     // through the daemon's provenance gate as an unheld `question` message —
     // a bare event carrying either is applied as a plain status.
     if carries_question_metadata(&event) {
@@ -363,7 +363,7 @@ enum UnheldSend {
     Plain,
 }
 
-/// PRD #1542 (audit A9): send `event` — a question the deck answers by keys
+/// PRD #1631 (audit A9): send `event` — a question the deck answers by keys
 /// (Codex, Devin, Claude Code's plan approval) or an agent's own "answered"
 /// report (OpenCode's `permission.replied` / `question.replied` /
 /// `question.rejected`) — as an unheld `question` message carrying this pane's
@@ -398,7 +398,7 @@ fn send_question_unheld_at(
     UnheldSend::Plain
 }
 
-/// PRD #1542: how long a held Claude Code `PermissionRequest` hook waits for
+/// PRD #1631: how long a held Claude Code `PermissionRequest` hook waits for
 /// the daemon — 3570 s, ending 30 s BEFORE the 3600 s `timeout` the deck
 /// installs the hook with
 /// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`]), so the hook
@@ -440,7 +440,7 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
     })
 }
 
-/// PRD #1542: send `event` as a held [`crate::event::DaemonMessage::Question`]
+/// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
 /// and wait up to `deadline` for the daemon's one reply line. `None` on an
 /// unreachable or older daemon (which answers nothing, and closes the
 /// connection only once its own idle bound passes), a closed connection or an
@@ -454,7 +454,7 @@ fn hold_question(
     hold_question_at(&client_socket_path(), event, deadline)
 }
 
-/// PRD #1542: when the daemon's provenance gate refused the held question, the
+/// PRD #1631: when the daemon's provenance gate refused the held question, the
 /// event it carried was not applied — send it again as a plain event, without
 /// the question, so the card still reads Needs Input, exactly as it would have
 /// before the deck could answer questions.
@@ -502,7 +502,7 @@ fn hold_question_at(
     serde_json::from_str(&line).ok()
 }
 
-/// PRD #1542: the `await-answer` verb, for producers that are not a hook
+/// PRD #1631: the `await-answer` verb, for producers that are not a hook
 /// process of their own — the OpenCode plugin and the Pi extension. Builds the
 /// question from what the producer passed (`stdin` for OpenCode, `--question`
 /// for Pi, whose exec helper has no stdin), holds it with the daemon, and
@@ -574,7 +574,7 @@ fn opencode_await_answer(raw: &str) -> Option<Value> {
     crate::question::opencode_reply(&question, &properties, &reply?)
 }
 
-/// PRD #1542: how long an acknowledging `await-answer` child waits for the
+/// PRD #1631: how long an acknowledging `await-answer` child waits for the
 /// OpenCode plugin to say what OpenCode's reply API made of the answer —
 /// shorter than the daemon's [`crate::daemon::HELD_REPLY_ACK_WAIT`], so the
 /// daemon hears the plugin's report rather than timing out first.
@@ -624,7 +624,7 @@ fn hold_question_acked_at(
     Some((serde_json::from_str(&line).ok()?, stream))
 }
 
-/// PRD #1542: the OpenCode plugin's `await-answer --ack`. Holds the question
+/// PRD #1631: the OpenCode plugin's `await-answer --ack`. Holds the question
 /// like [`opencode_await_answer`] and prints the reply OpenCode should get;
 /// then reads ONE line — `ack_line`, the plugin's
 /// [`crate::question::ReplyAck`] for what OpenCode's reply API said — and
@@ -756,7 +756,7 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "PostCompaction" => Some(EventType::Thinking),
         "SubagentStart" => Some(EventType::SubagentStart),
         "SubagentStop" => Some(EventType::SubagentStop),
-        // PRD #1542: Codex fires `Interrupt` when a turn is interrupted — after
+        // PRD #1631: Codex fires `Interrupt` when a turn is interrupted — after
         // a keyboard "No" on its approval prompt [observed on 0.160.0], which
         // otherwise leaves the card on Needs Input. An interrupted turn has
         // ended, so it reads as `Stop` does.
@@ -1200,7 +1200,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         }
     }
 
-    // PRD #1542: the question this event raises, built from the payload and
+    // PRD #1631: the question this event raises, built from the payload and
     // the agent's option table.
     let question = hook_question(
         &agent_type,
@@ -1235,7 +1235,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     Some(event)
 }
 
-/// PRD #1542: the question a Claude-shaped hook payload raises, if any.
+/// PRD #1631: the question a Claude-shaped hook payload raises, if any.
 ///
 /// - Claude Code `PermissionRequest` → [`crate::question::claude_permission_request`].
 /// - Codex `PermissionRequest` → [`crate::question::codex_permission_request`];
@@ -1388,7 +1388,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::PermissionRequest),
         "permission.replied" => Some(EventType::Thinking),
-        // PRD #1542: OpenCode's `question` tool. The plugin forwards the ask
+        // PRD #1631: OpenCode's `question` tool. The plugin forwards the ask
         // through `await-answer`, which builds the event itself; this arm is
         // for a plugin that forwards it as a plain event.
         "question.asked" => Some(EventType::WaitingForInput),
@@ -1401,7 +1401,7 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
     build_opencode_event_with_question(input).map(|(event, _)| event)
 }
 
-/// PRD #1542 / #1631: the question an OpenCode event raises, from its raw
+/// PRD #1631: the question an OpenCode event raises, from its raw
 /// `properties` — a `permission.asked` (`crate::question::opencode_permission_asked`)
 /// or a `question.asked` (`crate::question::opencode_question_asked`). `None`
 /// for every other event, and for one that arrived without `properties` (an
@@ -1453,7 +1453,7 @@ pub(crate) fn build_opencode_event_with_question(
         );
     }
 
-    // PRD #1542: OpenCode reports the question answered, by its request id.
+    // PRD #1631: OpenCode reports the question answered, by its request id.
     if matches!(
         input.event.as_str(),
         "permission.replied" | "question.replied" | "question.rejected"
@@ -2100,7 +2100,7 @@ fn request_from_socket_at_detailed(
     request_from_socket_at_detailed_with(path, json, timeout, true)
 }
 
-/// PRD #1542: a held request — [`request_from_socket_at`] WITHOUT the
+/// PRD #1631: a held request — [`request_from_socket_at`] WITHOUT the
 /// half-close after the write. The daemon reads the held connection for EOF to
 /// learn that the producer stopped waiting (Claude Code kills the hook when the
 /// keyboard answers No [observed]), so a half-close would read as exactly that
@@ -2197,7 +2197,7 @@ fn request_from_socket_at_detailed_with(
     // Best-effort: on a transport without a half-close primitive (Windows named
     // pipes) this is a no-op, which is why the read below must not depend on EOF.
     //
-    // PRD #1542: except for a held request, whose connection the daemon reads
+    // PRD #1631: except for a held request, whose connection the daemon reads
     // for EOF to learn that the producer stopped waiting.
     if half_close {
         let _ = stream.shutdown_write();
@@ -4935,7 +4935,7 @@ mod tests {
     }
 }
 
-/// PRD #1542: the questions the hook CLI builds from real agent payloads
+/// PRD #1631: the questions the hook CLI builds from real agent payloads
 /// (`tests/fixtures/agent-questions/`), and the held hook's exchange with the
 /// daemon.
 #[cfg(test)]

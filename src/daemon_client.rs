@@ -1318,7 +1318,7 @@ pub enum FocusReport {
     Superseded,
 }
 
-/// PRD #1542 — what became of an answer to an agent's question.
+/// PRD #1631 — what became of an answer to an agent's question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnswerReport {
     /// The daemon answered the question through the agent's own channel.
@@ -2633,7 +2633,7 @@ impl DaemonClient {
         Ok(FocusReport::Recorded)
     }
 
-    /// PRD #1542 — answer the question `agent_id` is waiting on.
+    /// PRD #1631 — answer the question `agent_id` is waiting on.
     ///
     /// **Withholds unless the daemon advertises
     /// [`crate::daemon_protocol::CAP_ANSWER_QUESTION`]**, answering

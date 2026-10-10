@@ -13,6 +13,7 @@ import {
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
 import { READING_ALREADY_OFF, READING_ALREADY_ON } from "../lib/reading";
+import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 
 const { terminalInvoke } = vi.hoisted(() => ({ terminalInvoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -43,6 +44,7 @@ import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
+  VOICE_DICTATION_SEND_MS,
   VOICE_INTERRUPT_REPEAT_MS,
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
@@ -2706,7 +2708,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * Reading switch the settings document starts with; `notice` whether its
    * one-time notice was shown.
    */
-  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean } = {}) {
+  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, question }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; question?: PendingQuestionDto } = {}) {
     const spoken = synth(silent);
     const steps: Parameters<typeof sequencedVoice>[0] = [];
     const voice = sequencedVoice(steps);
@@ -2720,6 +2722,15 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
           writeLease: "write" as const, agentType: "codex" as const, turn: "working" as const,
           promptKeys: FIXTURE_PROMPT_KEYS.codex, spawnedAtMs: 100,
         } : agent),
+      };
+      deck.snapshot = snapshot;
+      deck.fleet = [snapshot];
+    }
+    /* PRD #1631 — the open agent waits on `question`, which voice answers. */
+    if (question) {
+      const snapshot = {
+        ...deck.snapshot,
+        agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? { ...agent, status: "waiting" as const, pendingQuestion: question } : agent),
       };
       deck.snapshot = snapshot;
       deck.fleet = [snapshot];
@@ -2923,6 +2934,44 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     const row = screen.getByTestId("voice-indicators");
     expect(within(row).getByTestId("voice-typing-indicator")).toHaveTextContent("Typing to Planner");
     expect(within(row).getByTestId("voice-reading-indicator")).toBeInTheDocument();
+  });
+
+  /**
+   * Scenario (question/desktop/014, PRD #1631): the open agent waits on a
+   * permission prompt and reading is turned on, so the app speaks. A "yes"
+   * recorded while it spoke — which may be the app reading the prompt aloud —
+   * is not offered to the question: nothing is resolved against it, no
+   * countdown starts and nothing is sent, and it goes on declared as heard
+   * while speaking. Said again once the app is quiet, "yes" is the question's
+   * and its countdown starts.
+   */
+  it("question/desktop/014: an answer heard while the app spoke is not taken", async () => {
+    const question: PendingQuestionDto = {
+      id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
+      tool: { name: "Bash", detail: "touch x" },
+      questions: [{ prompt: "Allow Bash?", multiSelect: false, options: [
+        { index: 1, label: "Yes", role: "allow_once", answerable: true },
+        { index: 3, label: "No", role: "deny", answerable: true },
+      ] }],
+    };
+    const h = await mount({ openPane: true, silent: false, question });
+    const resolveVoiceQuestion = vi.fn(async (_target: VoiceQuestionTarget, said: string): Promise<QuestionResultDto> => said === "yes"
+      ? { verdict: { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary: "Allow once — touch x" }, resolveMs: 1, backend: "stub" }
+      : { verdict: { kind: "not_answer" }, resolveMs: 1, backend: "stub" });
+    const sendVoiceAnswer = vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" }));
+    Object.assign(h.deck, { resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer: vi.fn(async () => undefined) });
+    await h.say("reading on");
+    await h.drain();
+    await h.say("yes");
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+
+    await h.say("yes");
+    expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
   });
 
   /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */

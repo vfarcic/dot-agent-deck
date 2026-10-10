@@ -71,7 +71,7 @@ fn invoke_devin_hook(payload: &serde_json::Value) -> AgentEvent {
                 stream
                     .read_to_string(&mut line)
                     .expect("read emitted Devin AgentEvent");
-                // PRD #1542 (audit A9): a frame carrying a question leaves the
+                // PRD #1631 (audit A9): a frame carrying a question leaves the
                 // hook as an unheld `question` message, so it goes through the
                 // daemon's provenance gate; its event is what is asserted.
                 let mut frame: serde_json::Value =

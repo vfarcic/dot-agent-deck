@@ -922,7 +922,7 @@ export function execWithStdin(
 }
 
 // ---------------------------------------------------------------------------
-// PRD #1542: answering another extension's dialog from the deck
+// PRD #1631: answering another extension's dialog from the deck
 // ---------------------------------------------------------------------------
 
 /**
@@ -1084,7 +1084,7 @@ function raceDialog(
 }
 
 /**
- * PRD #1542: replace `select`, `confirm` and `input` on Pi's shared `ctx.ui`
+ * PRD #1631: replace `select`, `confirm` and `input` on Pi's shared `ctx.ui`
  * with wrappers that let the deck answer them. This rests on behaviour Pi does
  * NOT document — the object is shared by every extension and its methods are
  * writable [observed on 0.87.1] — so every step is guarded: anything missing or

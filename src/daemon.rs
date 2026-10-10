@@ -1831,7 +1831,7 @@ async fn ingest_hook_event(
 /// ingested.
 ///
 /// An event is ingested holding the question lifecycle of the pane it lands
-/// on (PRD #1542, audit R1–R3 —
+/// on (PRD #1631, audit R1–R3 —
 /// [`crate::agent_pty::QuestionAnswers::lock_lifecycle`]): any event can
 /// raise, replace or clear the pane's question, so none may land between a
 /// question transition's check and its commit. That is the pane the event
@@ -1962,7 +1962,7 @@ where
     if stale(&state) {
         return Ok(false);
     }
-    // PRD #1542 (audit R1): an event publishing a hold is ingested only while
+    // PRD #1631 (audit R1): an event publishing a hold is ingested only while
     // that registration is still the one held for its pane and question id.
     if let Some(generation) = registration {
         let current = match (event.pane_id.as_deref(), event.question()) {
@@ -2107,7 +2107,7 @@ where
     } else {
         event.metadata.remove(crate::event::UNPROVEN_METADATA_KEY);
     }
-    // PRD #1542 (Qodo #1561): a question from a session the pane has moved
+    // PRD #1631 (Qodo #1561): a question from a session the pane has moved
     // past is neither applied nor fanned out.
     if state.strip_superseded_question(question_pane.as_deref(), &mut event, registry) {
         debug!(
@@ -2115,7 +2115,7 @@ where
             "question: a question from a session the pane has moved past is not applied"
         );
     }
-    // PRD #1542 (audit A4): the question's revision is the daemon's, stamped
+    // PRD #1631 (audit A4): the question's revision is the daemon's, stamped
     // here under the state lock that applies it, before the fan-out — so every
     // client's copy and the snapshot carry the same one.
     stamp_question_revision(
@@ -2138,7 +2138,7 @@ where
     // It also drains announcements a registration queued without
     // broadcasting them (`AppState::register_pane`).
     state.announce_unproven_evictions(event_tx);
-    // PRD #1542: a held question that is no longer the pane's pending one —
+    // PRD #1631: a held question that is no longer the pane's pending one —
     // this event answered, cleared or replaced it — lets its producer go, so
     // the producer prints no decision and the agent's own prompt is the one
     // that counts. Under the state lock, so the verdict and the apply cannot
@@ -2166,7 +2166,7 @@ where
     Ok(true)
 }
 
-/// PRD #1542 (audit A4/N1/T1): record which question is pending on `pane_id`
+/// PRD #1631 (audit A4/N1/T1): record which question is pending on `pane_id`
 /// now, as `state` has it — which registration, and the human-input sequence
 /// when it arrived, for the keys channel's "did a human type into the pane
 /// since?", and what a queued answer key is checked against on the PTY thread
@@ -2187,7 +2187,7 @@ pub(crate) fn note_pending_question(
     pending
 }
 
-/// PRD #1542 (audit A4): stamp the question `event` raises with the daemon's
+/// PRD #1631 (audit A4): stamp the question `event` raises with the daemon's
 /// revision for it, overwriting whatever a producer put there.
 ///
 /// - The event publishing a held question takes `registration`, the generation
@@ -2232,7 +2232,7 @@ fn stamp_question_revision(
     event.set_question(&question);
 }
 
-/// PRD #1542 (audit A6): how long the daemon holds a question for its producer
+/// PRD #1631 (audit A6): how long the daemon holds a question for its producer
 /// before it lets go on its own. Every shipped producer stops waiting first —
 /// Claude Code's hook at [`crate::hook::CLAUDE_HOLD_DEADLINE`] (3570 s) and an
 /// `await-answer` child at [`crate::hook::AWAIT_ANSWER_DEADLINE`] (3600 s) — so
@@ -2241,7 +2241,7 @@ fn stamp_question_revision(
 /// as when a producer's connection closes.
 pub const QUESTION_HOLD_DEADLINE: Duration = Duration::from_secs(3600 + 120);
 
-/// PRD #1542 (audit A6): the most questions the daemon holds at once, across
+/// PRD #1631 (audit A6): the most questions the daemon holds at once, across
 /// every pane. A held question does NOT occupy one of the
 /// [`MAX_CONCURRENT_HOOK_CONNECTIONS`] slots — it gives its slot back once the
 /// hold is registered — so lifecycle and completion hooks (the `PostToolUse`
@@ -2254,7 +2254,7 @@ pub const QUESTION_HOLD_DEADLINE: Duration = Duration::from_secs(3600 + 120);
 /// prompt is answered by keyboard.
 pub const MAX_HELD_QUESTIONS: usize = 64;
 
-/// PRD #1542: how long the daemon waits, after writing an answer to a producer
+/// PRD #1631: how long the daemon waits, after writing an answer to a producer
 /// that acknowledges (`QuestionSignal::ack` — OpenCode's plugin), for its
 /// report of whether the agent took it. The plugin posts to OpenCode's local
 /// reply API, which answers in milliseconds; past this the deck's answer is
@@ -2301,7 +2301,7 @@ struct QuestionConnection<'a, R> {
     hold_deadline: Duration,
 }
 
-/// PRD #1542: apply a producer's [`crate::event::QuestionSignal`] and, for a
+/// PRD #1631: apply a producer's [`crate::event::QuestionSignal`] and, for a
 /// held question, wait for its answer.
 ///
 /// `attested_agent` is the agent the provenance gate attested for the pane
@@ -2419,7 +2419,7 @@ where
     }
 }
 
-/// PRD #1542: write a held connection's one reply line and, for an answer,
+/// PRD #1631: write a held connection's one reply line and, for an answer,
 /// report what became of it to the deck's `AnswerQuestion` handler waiting on
 /// `delivery`. A producer that asked to acknowledge (`ack`, the OpenCode
 /// plugin's child) then writes one [`crate::question::ReplyAck`] line, read
@@ -2472,7 +2472,7 @@ async fn write_held_reply<R, W>(
     let _ = delivery.send(outcome);
 }
 
-/// PRD #1542 (audit R1/R3): register a hold for the question `event` raises on
+/// PRD #1631 (audit R1/R3): register a hold for the question `event` raises on
 /// `pane_id` as `agent_id`'s, and publish it — both under one acquisition of
 /// the pane's question lifecycle, with the event stamped with the generation
 /// this registration captured. Returns the hold when the question is then
@@ -2517,7 +2517,7 @@ pub async fn register_and_publish_held(
     Some(hold)
 }
 
-/// PRD #1542: drop a held question that will not be answered — its producer's
+/// PRD #1631: drop a held question that will not be answered — its producer's
 /// connection closed, or its hold deadline passed — when the hold
 /// `generation` registered is still the one in place. Told to every attached
 /// client, not only applied here: a client still showing the question would
@@ -2587,7 +2587,7 @@ async fn drop_held_question(
     );
 }
 
-/// PRD #1542 (audit A9): remove what a question frame may only carry when the
+/// PRD #1631 (audit A9): remove what a question frame may only carry when the
 /// daemon's provenance gate attested it — the question itself and the
 /// "answered" marker that clears one. Applied to every bare `AgentEvent` on
 /// the hook socket and to a `question` message the gate let through without
@@ -2601,7 +2601,7 @@ fn strip_question_metadata(event: &mut AgentEvent) {
         .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
 }
 
-/// PRD #1542: an event the daemon itself ingests about the question
+/// PRD #1631: an event the daemon itself ingests about the question
 /// `question_id` — its answer (`Thinking`, or `Unknown` for a deny, marked
 /// [`crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY`]) or its release
 /// when the producer stopped waiting (`Unknown`, marked
@@ -2720,7 +2720,7 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
-    // PRD #1542: the deck's own answered marker never comes from a producer,
+    // PRD #1631: the deck's own answered marker never comes from a producer,
     // and a question is rewritten sanitized — or dropped — so every reader of
     // the fan-out sees the question the snapshot will hold.
     event
@@ -4510,7 +4510,7 @@ async fn run_hook_loop_with_idle_timeout(
     .await
 }
 
-/// [`run_hook_loop`] with every bound supplied — the seam the PRD #1542 hold
+/// [`run_hook_loop`] with every bound supplied — the seam the PRD #1631 hold
 /// tests use to reach the connection cap, the hold budget and the hold
 /// deadline without spending their production values.
 #[allow(clippy::too_many_arguments)]
@@ -4530,7 +4530,7 @@ async fn run_hook_loop_with_limits(
     // connections faster than they finished grew the daemon's task set and its
     // per-connection buffers without limit.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
-    // PRD #1542 (audit A6): held questions wait under a budget of their own,
+    // PRD #1631 (audit A6): held questions wait under a budget of their own,
     // not in the connection pool above.
     let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
     // Issue #544: the `work-done` and `dispatch` pane writes handed off by the
@@ -4574,7 +4574,7 @@ async fn run_hook_loop_with_limits(
                     // not the thing that grows.
                     //
                     // An `Option` because a held question gives its slot back
-                    // while it waits (PRD #1542, audit A6).
+                    // while it waits (PRD #1631, audit A6).
                     let mut permit = Some(permit);
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. The write half now
@@ -4780,7 +4780,7 @@ async fn run_hook_loop_with_limits(
                                     }
                                 }
                             }
-                            // PRD #1542 (audit A5/A9): the agent the gate
+                            // PRD #1631 (audit A5/A9): the agent the gate
                             // attested, which owns any question this message
                             // raises. `None` for a message admitted without
                             // one.
@@ -5167,7 +5167,7 @@ async fn run_hook_loop_with_limits(
                                     }
                                 }
                                 DaemonMessage::Question(signal) => {
-                                    // PRD #1542: one line back, always — the
+                                    // PRD #1631: one line back, always — the
                                     // answer, or a release — and for a held
                                     // question not until one of them happens.
                                     // A connection that closes first (the
@@ -5378,7 +5378,7 @@ async fn run_hook_loop_with_limits(
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
                             }
-                            // PRD #1542 (audit A9): a bare frame is unattested,
+                            // PRD #1631 (audit A9): a bare frame is unattested,
                             // so it may report a status but neither raise a
                             // question nor clear one; producers send those as
                             // `question` messages through the provenance gate.
@@ -12715,7 +12715,7 @@ mod hook_provenance_audit_tests {
     }
 }
 
-/// PRD #1542: a producer holding a question on the real hook loop.
+/// PRD #1631: a producer holding a question on the real hook loop.
 #[cfg(all(test, unix))]
 mod question_hold_tests {
     use super::*;

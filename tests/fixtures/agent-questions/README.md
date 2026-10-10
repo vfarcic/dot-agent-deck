@@ -1,6 +1,6 @@
-# Agent question payloads (PRD #1542)
+# Agent question payloads (PRD #1631)
 
-Hook, plugin-bus and extension payloads that raise a question, used by the `question/detect/*` and `question/hold/*` tests. Each was captured from a real agent during PRD #1542's M1 and follow-up measurements unless this list says otherwise; absolute paths are replaced with `/work/…` and transcript paths, working directories and scratch-directory names are dropped.
+Hook, plugin-bus and extension payloads that raise a question, used by the `question/detect/*` and `question/hold/*` tests. Each was captured from a real agent during PRD #1631's M1 and follow-up measurements unless this list says otherwise; absolute paths are replaced with `/work/…` and transcript paths, working directories and scratch-directory names are dropped.
 
 | File | Agent and version | Source |
 | --- | --- | --- |

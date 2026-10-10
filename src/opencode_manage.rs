@@ -222,7 +222,7 @@ const sendEvent = (payload) => {{
   }} catch (_) {{}}
 }};
 
-// PRD #1542: questions the deck may answer. For `permission.asked` and
+// PRD #1631: questions the deck may answer. For `permission.asked` and
 // `question.asked` the plugin starts `await-answer`, which reports the question
 // to the deck and waits for an answer, and replies through OpenCode's own API
 // when one comes. `heldAnswers` maps OpenCode's request id to that child, so
@@ -256,7 +256,7 @@ const noteResolved = (requestId) => {{
 
 // `client._client` is the SDK's underlying HTTP client. The plugin's v1 client
 // has no question-reply method, and posting through it is what was measured to
-// dismiss OpenCode's dialog (PRD #1542 follow-up d). An SDK internal, so it is
+// dismiss OpenCode's dialog (PRD #1631 follow-up d). An SDK internal, so it is
 // used here and nowhere else. Resolves to what OpenCode made of the reply —
 // `{{ delivered: true }}`, or `{{ delivered: false, detail }}` when there is no
 // client to post through, the post throws, or OpenCode answers with an error
@@ -551,7 +551,7 @@ const permissionPayload = (event, directory) => {{
     event: event?.type ?? "permission.unknown",
     prompt,
     cwd,
-    // PRD #1542: the request a `*.replied` / `question.rejected` answers.
+    // PRD #1631: the request a `*.replied` / `question.rejected` answers.
     request_id: props.requestID ?? props.id,
   }};
 }};
@@ -977,7 +977,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         return;
       }}
       if (eventType === "permission.asked" || eventType === "question.asked") {{
-        // PRD #1542: reported through `await-answer`, which also waits for
+        // PRD #1631: reported through `await-answer`, which also waits for
         // the deck's answer.
         const payload = questionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);

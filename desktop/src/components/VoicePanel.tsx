@@ -190,6 +190,17 @@ export const INTENT_DISCLOSURE_SHARED = "It also sends the names on screen: agen
  */
 export const INTENT_DISCLOSURE_WITHHELD = "It sends none of the names on screen.";
 
+/**
+ * PRD #1631 (ported from #1561's audit wording): while the agent on screen
+ * waits on a question, `voice::question` sends the utterance with that
+ * question's text, options and detail — for a permission prompt usually the
+ * command the agent wants to run, which is a tool's arguments — and it does
+ * so whatever the Send on-screen names row says. One sentence, as R3-1 asks;
+ * `docs/desktop/voice.md`'s "What is sent where" has the full list, including
+ * the answers decided on this machine that send nothing.
+ */
+export const INTENT_DISCLOSURE_QUESTION = "While the agent on screen waits on a question, what you say is sent with that question, usually including the command the agent wants to run, whether the names on screen are sent or not.";
+
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";
 
@@ -350,6 +361,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       <p className="settings-hint" data-testid="voice-intent-disclosure">
         {INTENT_DISCLOSURE}
         {" "}{voice.labels === "withheld" ? INTENT_DISCLOSURE_WITHHELD : INTENT_DISCLOSURE_SHARED}
+        {" "}{INTENT_DISCLOSURE_QUESTION}
       </p>
 
       {/* Two short exclusive options, so a segmented control rather than a

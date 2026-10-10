@@ -702,7 +702,7 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
-/// Capability string for [`AttachRequest::AnswerQuestion`] (PRD #1542).
+/// Capability string for [`AttachRequest::AnswerQuestion`] (PRD #1631).
 ///
 /// Same convention as [`CAP_FOCUS_GAINED`]: the string is the variant's `op`,
 /// and a client sends `answer-question` only to a daemon whose `Hello` reply
@@ -2333,7 +2333,7 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
-    /// PRD #1542: answer the question `agent_id` is waiting on
+    /// PRD #1631: answer the question `agent_id` is waiting on
     /// ([`crate::state::SessionSnapshot::pending_question`]).
     ///
     /// The daemon refuses unless `question_id` names the question pending NOW,
@@ -2361,7 +2361,7 @@ pub enum AttachRequest {
         /// otherwise explicitly rather than by omission.
         #[serde(default)]
         confirmed_always: bool,
-        /// PRD #1542 (audit A4): the question's revision as the client saw it
+        /// PRD #1631 (audit A4): the question's revision as the client saw it
         /// ([`crate::question::PendingQuestion::revision`] on the snapshot).
         /// When given, the daemon refuses the answer as stale unless it is the
         /// revision pending now, so a question replaced under the same id
@@ -3220,7 +3220,7 @@ pub struct AttachResponse {
     /// older client ignores the key and an older daemon omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
-    /// PRD #1542: why an [`AttachRequest::AnswerQuestion`] was refused, so a
+    /// PRD #1631: why an [`AttachRequest::AnswerQuestion`] was refused, so a
     /// client never branches on `error` text. `None` on success and on every
     /// other response. Additive + optional, and the request it answers is
     /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
@@ -7043,7 +7043,7 @@ fn validate_task(task: &str) -> Result<(), String> {
 /// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
 const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
 
-/// PRD #1542: [`AttachRequest::AnswerQuestion`]'s handler, for a request that
+/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler, for a request that
 /// names no revision — [`answer_question_at`] with `None`.
 #[cfg(test)]
 pub(crate) async fn answer_question(
@@ -7068,7 +7068,7 @@ pub(crate) async fn answer_question(
     .await
 }
 
-/// PRD #1542: [`AttachRequest::AnswerQuestion`]'s handler.
+/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler.
 ///
 /// Refusal order: the agent, a pending question, the id and the revision the
 /// client named, then the answer itself
@@ -12881,7 +12881,7 @@ mod tests {
     }
 }
 
-/// PRD #1542: [`answer_question`] against a real registry and state — every
+/// PRD #1631: [`answer_question`] against a real registry and state — every
 /// refusal, the held channel and the keys channel.
 #[cfg(all(test, unix))]
 mod question_answer_tests {
@@ -13875,11 +13875,11 @@ mod question_answer_tests {
         );
         resume.send(()).unwrap();
         clearing.await.unwrap();
-        // PRD #1631 port: issue #601 (on `main` since #1559, after PRD #1542's
+        // PRD #1631 port: issue #601 (on `main` since #1559, after PRD #1631's
         // branch point) admits a pane-less report from an agent spawned on a
         // pane only as an outside agent's, and an outside report reaches no
         // proven card — so it cannot clear the pane's question, which is what
-        // this test asserted on PRD #1542's base.
+        // this test asserted on PRD #1631's base.
         assert_eq!(
             fx.pending_question().await.map(|q| q.revision),
             Some(checked),

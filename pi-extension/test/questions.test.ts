@@ -1,5 +1,5 @@
 /**
- * PRD #1542, catalog `question/detect/008`: the deck's wrapper around another
+ * PRD #1631, catalog `question/detect/008`: the deck's wrapper around another
  * Pi extension's `ctx.ui` dialogs.
  *
  * Scenario: a stand-in `ctx.ui` whose `select` / `confirm` / `input` behave like
