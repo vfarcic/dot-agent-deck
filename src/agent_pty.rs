@@ -3072,6 +3072,12 @@ pub struct RunningAgent {
     /// predating this field — wire-format `skip_serializing_if` keeps the
     /// hydration path backwards compatible).
     pub tab_membership: Option<TabMembership>,
+    /// Issue #1612: the working directories this agent was started in — its
+    /// `cwd` and orchestration cwd as [`spawn_dirs`] resolved them before the
+    /// spawn, a relative one against the daemon's working directory. Kept so a
+    /// removal asks which directories an agent is rooted in without resolving
+    /// a path while it holds the registry lock (Qodo on PR #1642).
+    root_dirs: Vec<PathBuf>,
     /// Which AI agent this pane was spawned to run (PRD #76 M2.13).
     /// Captured from [`SpawnOptions::agent_type`] at spawn time and echoed
     /// back via `list_agents` so a TUI reconnect can populate the
@@ -3336,6 +3342,27 @@ pub struct RunningAgent {
 static QUOTA_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 impl RunningAgent {
+    /// Issue #1612: the directories this agent is rooted in, read without
+    /// resolving anything: the ones its spawn resolved ([`Self::root_dirs`]),
+    /// and its current `cwd` and orchestration cwd as recorded — `cwd` can be
+    /// learned after the spawn ([`AgentPtyRegistry::set_agent_label`]), and an
+    /// orchestration cwd is always absolute.
+    fn rooted_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        let orchestration_cwd = match &self.tab_membership {
+            Some(TabMembership::Orchestration {
+                orchestration_cwd, ..
+            }) => orchestration_cwd.as_deref(),
+            _ => None,
+        };
+        self.root_dirs.iter().cloned().chain(
+            self.cwd
+                .as_deref()
+                .into_iter()
+                .chain(orchestration_cwd)
+                .map(PathBuf::from),
+        )
+    }
+
     /// PRD #386 M3: `true` when this pane's PTY child has a transitive
     /// descendant sitting in a **different POSIX session** than the child
     /// itself — i.e. something the agent `setsid`-detached off the pane's
@@ -7055,7 +7082,9 @@ fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
 ///
 /// A relative one is resolved against the daemon's working directory, which is
 /// what the child's `chdir` resolves it against, so it matches a hold on the
-/// absolute path it names (Greptile on PR #1642). A spawn with no `cwd`
+/// absolute path it names (Greptile on PR #1642). Called before the registry
+/// lock is taken, never under it: the result is kept on the reservation and
+/// then on the agent's record (Qodo on PR #1642). A spawn with no `cwd`
 /// records nothing for it: portable-pty starts it in its `HOME` on Unix, and in
 /// its `USERPROFILE` on Windows, or the daemon's own working directory when that
 /// is not a directory. The only directories held for removal are abandoned
@@ -10579,12 +10608,10 @@ impl AgentPtyRegistry {
         // acquisition — so a removal sees this start from here until its record
         // is published, and a start never begins inside a directory a removal
         // has already found unused.
-        let (preallocated_id, reservation) = self.reserve_spawn(
-            &pane_id_env,
-            &hook_token_for_record,
-            dir,
-            spawn_dirs(opts.cwd, tab_membership.as_ref()),
-        )?;
+        // Resolved here, before any lock is taken (Qodo on PR #1642).
+        let root_dirs = spawn_dirs(opts.cwd, tab_membership.as_ref());
+        let (preallocated_id, reservation) =
+            self.reserve_spawn(&pane_id_env, &hook_token_for_record, dir, root_dirs.clone())?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
@@ -10851,6 +10878,7 @@ impl AgentPtyRegistry {
             display_name,
             cwd: cwd_stored,
             tab_membership,
+            root_dirs,
             agent_type,
             spawn_agent_type,
             badge_command: spawn_command.clone(),
@@ -12736,7 +12764,7 @@ impl AgentPtyRegistry {
             removed.pane_retired.store(true, Ordering::SeqCst);
             // Issue #1612: the pane keeps its working directory in use while it
             // has neither a record nor a reservation. Released with the ticket.
-            let dirs = spawn_dirs(removed.cwd.as_deref(), removed.tab_membership.as_ref());
+            let dirs = removed.rooted_dirs().collect();
             inner.respawning_dirs.insert(agent_id.clone(), dirs);
             // LAST in this lock hold, and nothing that can fail comes between
             // it and the ticket below (PRD #1487 final audit F3): a panic after
@@ -12777,6 +12805,9 @@ impl AgentPtyRegistry {
             display_name,
             cwd,
             tab_membership,
+            // Issue #1612: the replacement resolves its own from `cwd` and
+            // `tab_membership` when it is spawned.
+            root_dirs: _,
             // PRD #225 M2: the OBSERVED badge (possibly hook-learned). It is
             // restored onto the fresh entry AFTER the spawn, so it can't reach
             // `spawn`'s wrapper decision — only `spawn_agent_type` does.
@@ -15135,6 +15166,7 @@ impl AgentPtyRegistry {
                 display_name: None,
                 cwd: None,
                 tab_membership: None,
+                root_dirs: Vec::new(),
                 agent_type: None,
                 spawn_agent_type: None,
                 spawn_command: None,
@@ -15724,10 +15756,7 @@ impl AgentPtyRegistry {
     /// Exited agents do not count, matching [`Self::agent_records`].
     fn dir_in_use_locked(inner: &RegistryInner, dir: &std::path::Path) -> bool {
         let agent_in_dir = inner.agents.values().any(|a| {
-            !a.exited.load(Ordering::SeqCst)
-                && spawn_dirs(a.cwd.as_deref(), a.tab_membership.as_ref())
-                    .iter()
-                    .any(|d| path_within(d, dir))
+            !a.exited.load(Ordering::SeqCst) && a.rooted_dirs().any(|d| path_within(&d, dir))
         });
         agent_in_dir
             || inner
@@ -18531,9 +18560,11 @@ mod spawn_tests {
 
     /// Issue #1612 (Greptile on PR #1642): a relative working directory is
     /// resolved against the daemon's own, which is what the child enters, so
-    /// it matches a hold on the absolute path it names.
-    #[test]
-    fn a_relative_spawn_dir_is_resolved_against_the_daemons_working_directory() {
+    /// it matches a hold on the absolute path it names — for a published agent
+    /// too, whose resolved directories are kept on its record so the check
+    /// resolves nothing under the registry lock (Qodo on PR #1642).
+    #[tokio::test]
+    async fn a_relative_spawn_dir_is_resolved_against_the_daemons_working_directory() {
         let here = std::env::current_dir().unwrap();
         assert_eq!(
             spawn_dirs(Some("repo-issue-7"), None),
@@ -18548,6 +18579,20 @@ mod spawn_tests {
             &here.join("repo-issue-7")
         ));
         assert!(spawn_dirs(None, None).is_empty());
+
+        // `src` exists relative to the test's working directory, the crate root.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                cwd: Some("src"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn in a relative directory");
+        assert!(registry.dir_in_use(&here.join("src")));
+        assert!(registry.hold_dir_for_removal(&here.join("src")).is_none());
+        registry.close_agent(&id).unwrap();
+        registry.shutdown_all();
     }
 
     /// Round-2 reviewer, blocker B — the half round 1 got backwards.
