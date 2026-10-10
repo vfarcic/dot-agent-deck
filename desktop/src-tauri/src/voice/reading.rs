@@ -1475,6 +1475,11 @@ mod tests {
         prompt
     }
 
+    fn question_event_at(mut event: AgentEvent, seconds: i64) -> AgentEvent {
+        event.timestamp = chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap();
+        event
+    }
+
     /// Scenario: Claude's permission hook announces a prompt, then its delayed
     /// notification describes that same pending prompt six seconds later.
     /// Reading speaks each prompt once even with two hooks before two notices;
@@ -1491,8 +1496,8 @@ mod tests {
 
         let prompt = held_permission_prompt("held-prompt");
         let sentences = question_reading_script(vec![
-            (prompt, Duration::from_secs(6)),
-            (delayed_permission_notice(), SHORT),
+            (question_event_at(prompt, 0), Duration::from_secs(6)),
+            (question_event_at(delayed_permission_notice(), 6), SHORT),
         ])
         .await;
         assert_eq!(
@@ -1507,10 +1512,16 @@ mod tests {
         let mut second = held_permission_prompt("q2");
         second.tool_detail = Some("touch y".into());
         let sentences = question_reading_script(vec![
-            (held_permission_prompt("q1"), Duration::from_secs(6)),
-            (second, Duration::from_secs(6)),
-            (delayed_permission_notice(), Duration::from_secs(6)),
-            (delayed_permission_notice(), SHORT),
+            (
+                question_event_at(held_permission_prompt("q1"), 0),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(second, 6), Duration::from_secs(6)),
+            (
+                question_event_at(delayed_permission_notice(), 12),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(delayed_permission_notice(), 18), SHORT),
         ])
         .await;
         assert_eq!(
@@ -1526,9 +1537,9 @@ mod tests {
         );
     }
 
-    /// Scenario: A hook prompt receives no notification before the agent
-    /// moves on. A later notification-only prompt must still be announced,
-    /// whether the earlier prompt was answered or work simply resumed.
+    /// Scenario: A hook prompt receives no notification before an answer or
+    /// turn progress. Its late notice within 30 seconds is still absorbed,
+    /// but a notification-only prompt after that event-timestamp window speaks.
     #[tokio::test(start_paused = true)]
     async fn question_desktop_015_a_missing_notice_does_not_silence_the_next_prompt() {
         let mut answered = status("a", EventType::Thinking);
@@ -1551,33 +1562,47 @@ mod tests {
         ];
         let mut failures = Vec::new();
         for (label, boundary) in boundaries {
-            let mut script = vec![(held_permission_prompt("q1"), Duration::from_secs(6))];
-            script.extend(
-                boundary
-                    .into_iter()
-                    .map(|event| (event, Duration::from_secs(6))),
-            );
-            let mut notice = delayed_permission_notice();
-            notice.user_prompt = Some("new Q2".into());
-            script.push((notice, SHORT));
-            let sentences = question_reading_script(script).await;
-            let spoken = sentences
-                .iter()
-                .filter(|s| s["kind"] == "permission")
-                .map(|s| s["text"].as_str().unwrap())
-                .collect::<Vec<_>>();
-            if spoken
-                != [
-                    "The tester is asking for permission: Bash: touch x.",
-                    "The tester is asking for permission: new Q2.",
-                ]
-            {
-                failures.push(format!("after {label}: {spoken:?}"));
+            for notice_seconds in [6, 29, 31] {
+                let mut script = vec![(
+                    question_event_at(held_permission_prompt("q1"), 0),
+                    Duration::from_secs(6),
+                )];
+                script.extend(boundary.iter().cloned().enumerate().map(|(index, event)| {
+                    (
+                        question_event_at(event, index as i64 + 1),
+                        Duration::from_secs(6),
+                    )
+                }));
+                let mut notice = delayed_permission_notice();
+                notice.user_prompt = Some(
+                    if notice_seconds > 30 {
+                        "new Q2"
+                    } else {
+                        "late Q1"
+                    }
+                    .into(),
+                );
+                script.push((question_event_at(notice, notice_seconds), SHORT));
+                let sentences = question_reading_script(script).await;
+                let spoken = sentences
+                    .iter()
+                    .filter(|s| s["kind"] == "permission")
+                    .map(|s| s["text"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                let mut expected = vec!["The tester is asking for permission: Bash: touch x."];
+                if notice_seconds > 30 {
+                    expected.push("The tester is asking for permission: new Q2.");
+                }
+                if spoken != expected {
+                    failures.push(format!(
+                        "after {label}, notice at +{notice_seconds}s: expected {expected:?}, got {spoken:?}"
+                    ));
+                }
             }
         }
         assert!(
             failures.is_empty(),
-            "missing Q1 notice must not swallow Q2 at turn boundaries: {failures:#?}"
+            "Q1 notice debt must survive turn progress and lapse after 30 event-timestamp seconds: {failures:#?}"
         );
     }
 
