@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
+use dot_agent_deck::pull_request::{PullRequestInfo, PullRequestReview, PullRequestState};
 use dot_agent_deck::state::{
     ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
     SessionState, SessionStatus,
@@ -57,6 +58,39 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Scenario: Render an agent with an open, review-required PR at roomy and
+/// narrow card widths. The number remains discoverable and snapshots pin the
+/// state/review glyphs and shortening.
+#[spec("dashboard/pane/016")]
+#[test]
+fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.pull_request = Some(PullRequestInfo {
+        number: 1234,
+        url: "https://github.com/test-org/test-repo/pull/1234".into(),
+        state: PullRequestState::Open,
+        review: Some(PullRequestReview::ReviewRequired),
+    });
+    for width in [80, 30] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        assert!(
+            rendered.contains("#1234 ⊙ ◐"),
+            "card must show its PR number, state and review at width {width}:\n{rendered}"
+        );
+        insta::assert_snapshot!(format!("pull_request_badge_width_{width}"), rendered);
+    }
 }
 
 /// Scenario: Render a single dashboard card for a Working agent with a Read

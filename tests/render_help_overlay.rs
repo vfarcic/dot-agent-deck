@@ -104,3 +104,20 @@ fn help_002_overlay_documents_ctrl_d_toggle() {
         "the stale one-way Ctrl+D description must be removed\n--- rendered overlay ---\n{buf}"
     );
 }
+
+/// Scenario: Render the dashboard help overlay and locate the row for opening
+/// the selected agent's pull request. That row advertises the `o` shortcut.
+#[spec("dashboard/help/003")]
+#[test]
+fn help_003_overlay_documents_open_pull_request() {
+    let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
+    assert!(
+        buf.lines().any(|row| {
+            let words: Vec<_> = row.split_whitespace().collect();
+            words.contains(&"o")
+                && row.contains("open")
+                && (row.contains("pull request") || words.contains(&"pr"))
+        }),
+        "dashboard help must advertise o to open the selected pull request:\n{buf}"
+    );
+}

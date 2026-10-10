@@ -18,6 +18,38 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
 
+### Session pull requests
+
+#### session/pr
+
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, strict offline gh stub).
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/002 — Missing PR data leaves the daemon healthy and the agent without a badge.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub).
+- **Asserts:** default branch, failed gh query, empty response, detached HEAD, non-GitHub origin and non-git directory keep a live agent served with no PR; the default branch makes no gh call.
+- **Does not assert:** missing gh executable, real authentication or network failures.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/003 — PR polling updates an already-attached client without reconnecting.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, mutable offline gh stub).
+- **Asserts:** with DOT_AGENT_DECK_PR_REFRESH_SECS=1, switching an open PR to merged/approved updates ListAgents and sends the full PR to one continuously held event subscription.
+- **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+- **Layer:** L2 PTY-attached, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
+- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
+- **Platform coverage:** mac+linux.
+
 ### Dashboard panes
 
 #### dashboard/pane
@@ -126,6 +158,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (a `SessionState` fixture rendered through `ui::render_card_to_buffer` with a CJK display name, an ASCII control, and a name of VS16 emoji).
 - **Asserts:** a card whose display name is `项目目录管理` — 6 scalars, 12 display columns — rendered 40 columns wide leaves 26 cells for the title, and the title is cut to fit with a trailing `…` inside that budget, the two characters past it dropped, the ` ● Thinking ` badge still whole beside it, and the top border exactly one card wide. Before the fix `ui::truncate_styled_segments` counted `char`s, so the 23-character title measured as fitting the 26-cell budget and was returned whole at 29 columns; ratatui then clipped the overhang at the right edge and the card read `· 项 目 目 录 管  ● Thinking` with no `…` and no border fill. The same card with the ASCII name `abcdef` renders untouched, which is the property that keeps every committed card snapshot from churning. And the same card named with eight `❤️` (U+2764 + VARIATION SELECTOR-16, one column per `char` but a two-cell grapheme cluster as ratatui draws it) is also cut with a `…` and keeps its badge: a per-`char` width budget measured those at 8 columns against 16 drawn, passed the title whole, and the badge was drawn over its tail — the same symptom, on input the char count had handled correctly.
 - **Does not assert:** the eight `ui::truncate_styled_segments` unit tests beside the function, which own the emoji, combining-mark, keycap, halfwidth-dakuten, ZWJ, control-character, mid-wide-glyph, zero-budget and per-segment-style cases, measured against ratatui's own `Line::width` and `Buffer::set_line`; the `Dir:` / `Prmt:` lines, converted by PRD #339 to a per-`char` width sum and covered by `dashboard/pane/006`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin the glyphs and layout.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats
@@ -547,6 +586,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none.
 - **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
 - **Does not assert:** dynamic content (none today).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/help/003 — Dashboard help advertises the shortcut to open the selected pull request.
+- **Layer:** L1 (ratatui TestBackend).
+- **Agent:** none.
+- **Asserts:** one rendered help row names the `o` key and opening a pull request.
+- **Does not assert:** browser invocation, covered by `session/pr/004`.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/config-gen
