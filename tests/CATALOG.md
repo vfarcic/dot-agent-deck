@@ -2427,6 +2427,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** other agents' environment overrides (covered by the shared config-writer unit tests), races replacing symlinks during a write, or a real agent trust dialog.
 - **Platform coverage:** mac+linux.
 
+##### hooks/containment/004 — An outside-root config symlink pointing into the owned root is refused, not renamed over (issue #1614).
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** with `CODEX_HOME` outside the owned root and its `hooks.json` a symlink to a file inside the root, the automatic install leaves the symlink in place (same inode, same target), leaves the target's bytes, inode and mtime unchanged, and creates no temporary file, backup or lock sidecar beside it.
+- **Does not assert:** the other writers (the rule lives in the shared guard, unit-covered in `config_write_guard`'s `mod tests`), races replacing symlinks during a write, or a real agent trust dialog.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install (continued)
 
 ##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
