@@ -1475,9 +1475,7 @@ mod tests {
     ) -> Vec<serde_json::Value> {
         let script = script
             .into_iter()
-            .filter_map(|(event, gap)| {
-                status_turn_event(&event, "a").map(|turn| (Incoming::Status(turn), gap))
-            })
+            .filter_map(|(event, gap)| status_incoming(&event, "a").map(|turn| (turn, gap)))
             .collect();
         let (tx, events) = mpsc::channel(16);
         for event in coalesced(script).await {

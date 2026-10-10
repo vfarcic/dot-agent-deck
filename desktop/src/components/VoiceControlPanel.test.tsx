@@ -1003,7 +1003,9 @@ describe("voice control panel", () => {
         guardedWrite({ ...target, agentId: fresh.id }, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("fresh words ".length)),
       ]);
       expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
-    });
+      // Twelve complete pane lifecycles exceeded the suite's 30s ceiling under
+      // concurrent worker load; retain the full scenario with a bounded budget.
+    }, 90_000);
 
     /// Scenario: queue interrupt for a turn that ends without receiving Escape, then observe fresh work. The cancelled request creates no delivery timestamp and the new interrupt can run immediately.
     it("does not stamp the interrupt repeat floor until Escape is delivered", async () => {

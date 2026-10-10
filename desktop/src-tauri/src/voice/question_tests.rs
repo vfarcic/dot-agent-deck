@@ -130,56 +130,79 @@ fn pick(question_index: u32, options: &[u32]) -> Selection {
     }
 }
 
+fn captured_form_question() -> PendingQuestion {
+    let payload: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/agent-questions/claude-ask-user-question-form.json"
+    ))
+    .unwrap();
+    dot_agent_deck::question::claude_permission_request(
+        "q-form".into(),
+        "AskUserQuestion",
+        payload.get("tool_input"),
+        None,
+        None,
+        1,
+        None,
+    )
+    .question
+}
+
 /// Scenario: The model fills Colour with the spoken free text, but also picks
-/// Sizes' textless free-text option using words already cited for Colour.
+/// Sizes' free-text option, with or without text, using Colour's words.
 /// The final form keeps Colour and leaves Sizes unanswered, even when Sizes
 /// had an earlier answer, so the answer cannot arm a countdown.
 #[tokio::test]
 async fn question_desktop_007_grounding_drops_a_textless_selection_borrowing_another_questions_words()
  {
-    let question = map_pending_question(&form_question());
+    let question = map_pending_question(&captured_form_question());
     let said = "type my own colour: a hamster named Bob";
-    let correct = ModelAnswer::answer(0, &[3])
+    let correct = ModelAnswer::answer(0, &[4])
         .with_text("a hamster named Bob")
         .citing("type my own colour: a hamster named Bob");
     for borrowed in [
         "a hamster named Bob",
         "type my own colour: a hamster named Bob",
     ] {
-        let answer = correct.clone().and(1, &[3]).citing(borrowed);
-        let resolver = StubResolver::new().answering_question(said, answer);
-        for previous in [vec![], vec![pick(1, &[2])]] {
-            let verdict = say(&resolver, &question, &previous, said).await;
-            match verdict {
-                QuestionVerdict::Answered {
-                    form,
-                    complete,
-                    always,
-                    ..
-                } => {
-                    assert!(
-                        !complete,
-                        "a dropped Sizes selection must not leave an earlier answer sendable: {form:?}"
-                    );
-                    assert!(always.is_none());
-                    assert_eq!(form.len(), 1, "Sizes must be unanswered: {form:?}");
-                    assert_eq!(form[0].question_index, 0);
-                    assert_eq!(form[0].option_indices, [3]);
-                    assert_eq!(form[0].text.as_deref(), Some("a hamster named Bob"));
-                    assert!(
-                        check_form("tester", &question, "q-form", &form, false).is_err(),
-                        "the incomplete form cannot be sent"
-                    );
+        for copied_text in [None, Some("a hamster named Bob")] {
+            let answer = correct.clone().and(1, &[4]).citing(borrowed);
+            let answer = match copied_text {
+                Some(text) => answer.with_text(text),
+                None => answer,
+            };
+            let resolver = StubResolver::new().answering_question(said, answer);
+            for previous in [vec![], vec![pick(1, &[3])]] {
+                let verdict = say(&resolver, &question, &previous, said).await;
+                match verdict {
+                    QuestionVerdict::Answered {
+                        form,
+                        complete,
+                        always,
+                        ..
+                    } => {
+                        assert!(
+                            !complete,
+                            "a dropped Sizes selection must not leave an earlier answer sendable: {form:?}"
+                        );
+                        assert!(always.is_none());
+                        assert_eq!(form.len(), 1, "Sizes must be unanswered: {form:?}");
+                        assert_eq!(form[0].question_index, 0);
+                        assert_eq!(form[0].option_indices, [4]);
+                        assert_eq!(form[0].text.as_deref(), Some("a hamster named Bob"));
+                        assert!(
+                            check_form("tester", &question, "q-form", &form, false).is_err(),
+                            "the incomplete form cannot be sent"
+                        );
+                    }
+                    other => panic!("Colour should be filled while Sizes waits: {other:?}"),
                 }
-                other => panic!("Colour should be filled while Sizes waits: {other:?}"),
             }
         }
     }
 }
 
-/// Scenario: A model supplies Colour's spoken free text and an invalid
-/// textless selection borrowing those words. Validation must refuse the
-/// entire answer rather than dropping the invalid selection and arming it.
+/// Scenario: A model supplies an invalid selection borrowing another
+/// question's free text or a strict subset of its evidence. Validation
+/// refuses the entire answer before dropping could make it sendable.
 #[tokio::test]
 async fn question_desktop_007_borrowed_invalid_selections_are_still_refused() {
     let question = map_pending_question(&form_question());
@@ -201,28 +224,166 @@ async fn question_desktop_007_borrowed_invalid_selections_are_still_refused() {
             ));
         }
     }
+    let question = map_pending_question(&captured_form_question());
+    for (at, index) in [(99, 3), (0, 99)] {
+        let said = "small and large";
+        let answer = ModelAnswer::answer(at, &[index])
+            .citing("large")
+            .and(1, &[1, 3])
+            .citing(said);
+        let expected = validate("tester", &question, &answer.selections)
+            .expect_err("the contained selection is invalid");
+        let resolver = StubResolver::new().answering_question(said, answer);
+        let verdict = say(&resolver, &question, &[pick(0, &[1])], said).await;
+        if verdict != (QuestionVerdict::Refused { sentence: expected }) {
+            failures.push(format!(
+                "contained invalid question {at} / option {index} became {verdict:?}"
+            ));
+        }
+    }
     assert!(
         failures.is_empty(),
         "invalid selections must still refuse after grounding: {failures:#?}"
     );
 }
 
-/// Scenario: Colour's free text and Sizes' textless selection each cite their
-/// own spoken words. Grounding keeps both selections, including Sizes' choice.
-#[test]
-fn question_desktop_007_grounding_keeps_a_selection_citing_its_own_words() {
-    let mut answer = ModelAnswer::answer(0, &[4])
+/// Scenario: Colour and Sizes each receive different spoken free text with
+/// their own evidence. Both answers remain filled and the form is sendable.
+#[tokio::test]
+async fn question_desktop_007_grounding_keeps_a_selection_citing_its_own_words() {
+    let question = map_pending_question(&captured_form_question());
+    let said = "type my own colour: a hamster named Bob and type my own sizes: extra tiny";
+    let answer = ModelAnswer::answer(0, &[4])
         .with_text("a hamster named Bob")
         .citing("type my own colour: a hamster named Bob")
         .and(1, &[4])
-        .citing("and type my own sizes");
-    let expected = answer.clone();
-    ground(
-        "type my own colour: a hamster named Bob and type my own sizes",
-        &mut answer,
-    )
-    .expect("each question has its own grounded evidence");
-    assert_eq!(answer, expected);
+        .with_text("extra tiny")
+        .citing("and type my own sizes: extra tiny");
+    let resolver = StubResolver::new().answering_question(said, answer);
+    match say(&resolver, &question, &[], said).await {
+        QuestionVerdict::Answered {
+            form,
+            complete,
+            always,
+            ..
+        } => {
+            assert!(complete, "both questions have their own answer: {form:?}");
+            assert!(always.is_none());
+            let mut colour = pick(0, &[4]);
+            colour.text = Some("a hamster named Bob".into());
+            let mut sizes = pick(1, &[4]);
+            sizes.text = Some("extra tiny".into());
+            assert_eq!(form, [colour, sizes]);
+            assert!(check_form("tester", &question, "q-form", &form, false).is_ok());
+        }
+        other => panic!("both grounded free-text answers should remain: {other:?}"),
+    }
+}
+
+/// Scenario: The model picks Colour using only a fragment of the words cited
+/// for Sizes; Colour stays unanswered, including when it had a prior answer.
+/// The rule also applies when either selection has spoken free text.
+#[tokio::test]
+async fn question_desktop_007_grounding_drops_strictly_contained_evidence() {
+    let pending = captured_form_question();
+    let question = map_pending_question(&pending);
+    let said = "small and large";
+    // Exercise both model orderings: containment does not depend on which
+    // question claimed its evidence first.
+    for (colour_text, sizes_text) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut forward =
+            ModelAnswer::answer(0, &[if colour_text { 4 } else { 3 }]).citing("large");
+        if colour_text {
+            forward = forward.with_text("large");
+        }
+        forward = forward
+            .and(1, if sizes_text { &[4] } else { &[1, 3] })
+            .citing(said);
+        if sizes_text {
+            forward = forward.with_text(said);
+        }
+        let mut reverse = forward.clone();
+        reverse.selections.reverse();
+        let mut expected = pick(1, if sizes_text { &[4] } else { &[1, 3] });
+        if sizes_text {
+            expected.text = Some(said.into());
+        }
+        for answer in [forward, reverse] {
+            let resolver = StubResolver::new().answering_question(said, answer);
+            for previous in [vec![], vec![pick(0, &[1])]] {
+                let verdict = say(&resolver, &question, &previous, said).await;
+                match verdict {
+                    QuestionVerdict::Answered {
+                        form,
+                        complete,
+                        always,
+                        ..
+                    } => {
+                        assert!(
+                            !complete,
+                            "Colour's contained evidence must leave it unanswered, not arm the form: {form:?}"
+                        );
+                        assert!(always.is_none());
+                        assert_eq!(form, [expected.clone()], "only Sizes is answered");
+                        assert!(
+                            check_form("tester", &question, &pending.id, &form, false).is_err()
+                        );
+                    }
+                    other => panic!("Sizes should be filled while Colour waits: {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: Each question cites separate words, or both questions cite
+/// exactly the same words. Both answers stay filled and the form is sendable.
+#[tokio::test]
+async fn question_desktop_007_grounding_keeps_disjoint_or_equal_evidence() {
+    let pending = captured_form_question();
+    let question = map_pending_question(&pending);
+    for (said, answer, expected) in [
+        (
+            "red for colour and large for size",
+            ModelAnswer::answer(0, &[1])
+                .citing("red for colour")
+                .and(1, &[3])
+                .citing("large for size"),
+            vec![pick(0, &[1]), pick(1, &[3])],
+        ),
+        (
+            "choose these for both",
+            ModelAnswer::answer(0, &[3])
+                .citing("choose these for both")
+                .and(1, &[1, 3])
+                .citing("choose these for both"),
+            vec![pick(0, &[3]), pick(1, &[1, 3])],
+        ),
+        (
+            "choose these for both",
+            ModelAnswer::answer(0, &[3])
+                .citing("Choose, these for both!")
+                .and(1, &[1, 3])
+                .citing("choose these for both"),
+            vec![pick(0, &[3]), pick(1, &[1, 3])],
+        ),
+    ] {
+        let resolver = StubResolver::new().answering_question(said, answer);
+        match say(&resolver, &question, &[], said).await {
+            QuestionVerdict::Answered {
+                form,
+                complete,
+                always,
+                ..
+            } => {
+                assert!(complete, "{said}: {form:?}");
+                assert!(always.is_none());
+                assert_eq!(form, expected, "{said}");
+                assert!(check_form("tester", &question, &pending.id, &form, false).is_ok());
+            }
+            other => panic!("{said}: both questions should be answered: {other:?}"),
+        }
+    }
 }
 
 /// Scenario: The daemon reports a Claude Code permission prompt whose text
