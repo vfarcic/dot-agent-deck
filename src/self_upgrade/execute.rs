@@ -1560,6 +1560,8 @@ mod tests {
 
     /// [`fake_mac`] whose `hdiutil detach` succeeds only as the listed kinds:
     /// `plain` without `-force`, `force` with it.
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
     fn fake_mac_detaching(spctl_ok: bool, plain: bool, force: bool) -> FakeHost {
         let mut host = fake_mac("TEAM123", spctl_ok);
         let attach = host.handlers.remove(HDIUTIL).unwrap();
