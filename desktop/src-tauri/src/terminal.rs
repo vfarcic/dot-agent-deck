@@ -322,6 +322,10 @@ pub(crate) struct DesktopState {
     /// one, so a focus-out or a newer focus-in drops a claim not yet sent. An
     /// `Arc` because the claim tasks read it after this call has returned.
     window_focus: Arc<Mutex<WindowFocus>>,
+    /// Issue #1620: the deck lists settings saves wrote, and the order they
+    /// are put into force in, so an older save's deck work cannot undo a newer
+    /// one's. See `selection_saves`'s module docs.
+    pub(crate) saved_selections: crate::selection_saves::SavedSelections,
 }
 
 /// PRD #1105 M11: the window's focus as Tauri last reported it.
@@ -372,6 +376,7 @@ impl Default for DesktopState {
             refetch: Mutex::new(HashMap::new()),
             last_commands: Mutex::new(HashMap::new()),
             window_focus: Arc::new(Mutex::new(WindowFocus::default())),
+            saved_selections: crate::selection_saves::SavedSelections::default(),
         }
     }
 }
@@ -1962,6 +1967,83 @@ mod tests {
             sessions.contains_key("terminal-build-box"),
             "and the deck that stayed keeps its pane"
         );
+    }
+
+    /// What a save's deck work does once the save has published its settings:
+    /// [`crate::apply_selection`] minus the watcher start and the emit, which
+    /// need a running app.
+    #[cfg(unix)]
+    async fn put_published_in_force(state: &DesktopState) -> Option<bool> {
+        let mut applied = state.saved_selections.in_order().await;
+        crate::retarget_to_published(state, &mut applied).await
+    }
+
+    /// Issue #1620. Scenario: the user removes the laptop deck in settings and,
+    /// while that save is still detaching the laptop's terminal, saves again
+    /// with the laptop back. Once both saves are done, the laptop deck is still
+    /// observed: its transport and its watcher survive, as the newer save says.
+    ///
+    /// The older retarget is held inside its detach by holding the session's
+    /// write half, and the clock is paused so the detach's 250 ms bound cannot
+    /// let it go on its own. The newer save is then given every chance to
+    /// finish before the older one resumes, which is the interleaving the issue
+    /// names: without ordering, the older save's stale deck set is applied last
+    /// and tears down what the newer one kept.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_older_save_paused_in_its_detach_does_not_undo_a_newer_save() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let both = ["build-box.example.com", "laptop.example.com"];
+        let laptop = row_endpoint(&both, 1);
+        let newer = fleet_settings(&both);
+        let older = fleet_settings(&both[..1]);
+        let state = DesktopState::default();
+        crate::retarget_selection(&state, &newer).await;
+        for endpoint in newer.connectable_endpoints() {
+            state.tunnels.insert_stand_in(&endpoint).await;
+            assert!(state.start_watcher_once_for(&endpoint.identity()).is_some());
+        }
+        let session = fixture_session_on(laptop, "planner", 1, fixture_lease().await);
+        let writer = Arc::clone(&session.writer);
+        state
+            .insert_unique_session("terminal-laptop".into(), session)
+            .unwrap();
+        let held = writer.lock().await;
+
+        // The first save, which removed the laptop, starts its retarget.
+        state.saved_selections.publish(&older);
+        let first = put_published_in_force(&state);
+        let second = async {
+            // It is inside the laptop session's detach once the session has left
+            // the registry and before the write half is free.
+            while state.sessions().unwrap().contains_key("terminal-laptop") {
+                tokio::task::yield_now().await;
+            }
+            // The second save, which put the laptop back, is written and gets
+            // every chance to finish while the first is still paused.
+            state.saved_selections.publish(&newer);
+            let mut second = std::pin::pin!(put_published_in_force(&state));
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_millis(1), &mut second).await;
+            drop(held);
+            match finished {
+                Ok(moved) => moved,
+                Err(_) => second.await,
+            }
+        };
+        tokio::join!(first, second);
+
+        assert_eq!(
+            state.tunnels.held().await,
+            newer.connectable_endpoints().len(),
+            "every deck the newer save observes keeps its transport"
+        );
+        assert_eq!(
+            state.watched_decks(),
+            crate::observed_keys(&newer),
+            "every deck the newer save observes keeps its watcher"
+        );
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
     }
 
     /// PRD #1105 — a resize reaches the deck the SESSION was attached over,
