@@ -454,7 +454,7 @@ If the orchestrator's own agent was replaced since it delegated, the new orchest
 
 With `clear = true` (the default), the deck stops the worker's agent, starts the role's `command` again in the same pane, waits for the new agent to be ready, and then types the task pointer. The role's card or row stays in place with the same name, but the previous conversation is gone. The wait is about one to eight seconds for `claude`, `codex`, `opencode` or `pi`, depending on the agent, and up to 30 seconds for a Codex, Pi or OpenCode role behind a launcher without an [`agent`](#declaring-the-agent-behind-a-launcher-command) line. A worker whose agent has exited is started again the same way on its next task.
 
-With `clear = false`, the agent keeps running and the task pointer is typed into its current session immediately. The worker keeps what it learned from earlier tasks.
+With `clear = false`, the agent keeps running and the task pointer is typed into its current session. The worker keeps what it learned from earlier tasks. If the worker started only moments ago (the orchestration just opened, or you ran `pane restart`), the deck first waits for it to be ready, the same wait as for `clear = true`; a worker that has been up for a while gets the task immediately.
 
 If the new agent cannot be started, or exits before it takes the task, the task is not delivered and the orchestrator is told; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
@@ -464,12 +464,12 @@ If tasks are lost regularly on your machine because agents are not yet ready whe
 
 When a worker shows no sign of starting its task and has not run `ack`, the deck sends the task again into the same agent; it does not restart the worker to do it. If the task line is sitting unsent in the worker's input box, the deck presses Enter instead of typing it again. With the default schedule it tries three more times, about 20 seconds, 1 minute and 2 minutes 20 seconds after the first attempt. The task file tells the worker that a task line it sees twice is the same task.
 
-If none of the re-sends gets a response, the orchestrator receives the [went-quiet report](idle-workers-and-notifications.md#the-reports), about 3 minutes 40 seconds after the task was first sent with the default schedule, or later if the worker was still starting or the task waited for an unsent draft.
+A turn the worker starts on only part of the task line does not count as a response: the deck keeps re-sending, and if the re-sends run out, the report says the worker got only part of its task. If none of the re-sends gets a response, the orchestrator receives the [went-quiet report](idle-workers-and-notifications.md#the-reports), about 3 minutes 40 seconds after the task was first sent with the default schedule, or later if the worker was still starting or the task waited for an unsent draft.
 
 Which workers are covered:
 
 - Claude Code, OpenCode, Devin and Pi workers: re-sent as described.
-- Codex workers: the deck presses Enter for a task left in the input box, but does not type the task a second time.
+- Codex workers: the deck presses Enter for a task left in the input box, but does not type the task a second time, unless the worker started a turn on only part of the task line (its last few characters, for example). Then the task did not arrive, so the deck types it again.
 - A role whose agent the deck cannot identify (a launcher without an `agent` line): no re-send.
 - A Pi role with `clear = true` fetches its task itself, so there is nothing to re-send.
 

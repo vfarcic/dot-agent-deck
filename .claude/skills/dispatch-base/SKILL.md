@@ -10,7 +10,7 @@ This is where the base step for **every** dispatch in this repo is defined: an a
 
 ## `HEAD` is the base, and nothing else is
 
-**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** (`ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs`), and git resolves an absent start-point to **`HEAD`**. So whatever the dispatcher checkout has checked out at dispatch time is the base every unit inherits, and no flag overrides it.
+**`dispatch` has no base or branch option.** It resolves the caller's **`HEAD`** to a commit once, then runs `git worktree add <dir> -b agent/dispatch-<name> <that sha>` **in the caller's own working directory** (`resolve_dispatch_base` and `create_dispatch_worktree` in `src/dispatch.rs`, feeding `create_worktree_from` in `src/issue_dispatch_run.rs`), and reports that same sha in its `cut from <branch> at <sha>` reply. So whatever the dispatcher checkout has checked out at dispatch time is the base every unit inherits, and no flag overrides it.
 
 **Updating the local `main` ref while another branch is checked out changes nothing for a unit.** `git fetch origin main:main` and `git branch -f main origin/main` move a ref that `dispatch` never reads. Only what `HEAD` points at counts.
 
@@ -66,7 +66,7 @@ When step 3 declines to move, the base is `HEAD` as step 1 left it: record `git 
 
 ## Step 4 — After dispatch, read the base `dispatch` reports
 
-`dispatch`'s success line ends with the base it read just before creating the worktree (`describe_dispatch_base` in `src/dispatch.rs`):
+`dispatch`'s success line ends with the base it cut the worktree from (`resolve_dispatch_base` in `src/dispatch.rs`):
 
 ```text
 dispatch: spawned isolated agent for '<name>' in <dir>, cut from main at c701932
@@ -82,15 +82,17 @@ git rev-list --left-right --count <sha>...origin/main  # "0  0" is origin/main i
 
 - a branch other than `main`, or `detached HEAD at <sha>`;
 - a sha that is not `origin/main`, unless the user chose to dispatch onto an older base after a step 3 refusal, in which case report the distance they chose;
-- **no clause at all**: that is an older build or a probe that failed, never a base that is fine. Fall back to the branch's own record below, and say the clause was missing.
+- **no clause at all**: that is an older build, or a probe of `HEAD` that failed, in which case `dispatch` cut the worktree from `HEAD` without naming it. It is never a base that is fine. Fall back to the branch's own record below, and say the clause was missing.
 
-**The clause is a probe of `HEAD` taken just before `git worktree add` runs, not a reading of the worktree.** It and the unit's real base differ only if something moves the dispatcher checkout's `HEAD` while the dispatch runs, and nothing in this procedure does. When the clause is missing, or you need the authoritative answer, read the commit the unit's branch was created at from its first reflog entry, which later commits in the unit do not change:
+**When the clause is missing, read the commit the unit's branch was created at from its first reflog entry**, which later commits in the unit do not change:
 
 ```bash
-git reflog show --format='%h %gs' agent/dispatch-<name> | tail -1   # "<sha> branch: Created from HEAD"
+git reflog show --format='%h %gs' agent/dispatch-<name> | tail -1   # "<sha> branch: Created from <...>"
 ```
 
-**Use that sha only when the line reads `<sha> branch: Created from HEAD`.** An empty result or any other subject means the reflog cannot answer, because it is disabled, expired or was rewritten. Then say the base could not be verified, and do not report a sha. When it does answer, its sha and the clause's should match; a mismatch means `HEAD` moved mid-dispatch, and the reflog's sha is the base to report.
+**Use that sha only when the subject starts `branch: Created from`.** It reads `Created from HEAD` when `dispatch` cut the worktree with no start-point, which is what a missing clause means, and `Created from <full sha>` when it passed the sha it reported. An empty result or any other subject means the reflog cannot answer, because it is disabled, expired or was rewritten. Then say the base could not be verified, and do not report a sha.
+
+On a build older than the fix for issue #1643, the clause was a probe of `HEAD` read just before a `git worktree add` that read `HEAD` again, so the two could differ if `HEAD` moved in between; the reflog sha is the base there. A current build cuts the worktree from the sha it reports, so the clause is the base.
 
 Catching it here costs one stopped unit, before the unit has spent any time working from the wrong tree.
 
