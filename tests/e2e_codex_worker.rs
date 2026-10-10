@@ -102,14 +102,11 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
             // role declares `agent = "codex"` as this repository's own config
             // does, so the deck still wraps it.
             let launcher = cwd.path().join("start-codex.sh");
-            std::fs::write(&launcher, "#!/bin/sh\nsleep 4\nexec codex \"$@\"\n")
+            std::fs::write(&launcher, "sleep 4\nexec codex \"$@\"\n")
                 .expect("write the Codex launcher");
-            std::fs::set_permissions(
-                &launcher,
-                std::os::unix::fs::PermissionsExt::from_mode(0o755),
-            )
-            .expect("make the Codex launcher executable");
-            format!("{} {codex_args}", launcher.display())
+            // Through `sh`, so the script needs no executable bit — and this
+            // file no Unix-only permissions API (Qodo, PR #1659).
+            format!("sh {} {codex_args}", launcher.display())
         }
     };
 

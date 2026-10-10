@@ -6752,6 +6752,10 @@ pub(crate) fn session_start_opens_boot_gate(event: &AgentEvent) -> bool {
         && !event.is_wrapper_interface_settled_session_start()
 }
 
+/// Issue #1650: how many successive owners of one worker pane a `clear = false`
+/// delegate gates ([`await_worker_boot`]) before it writes regardless.
+const MAX_BOOT_GATE_OWNERS: usize = 3;
+
 /// Issue #1650: hold a `clear = false` delegate's pointer until the worker it
 /// is about to be typed into has finished booting.
 ///
@@ -6847,6 +6851,10 @@ pub(crate) async fn await_worker_boot(
                 "delegate: the clear=false worker is still starting; waiting for its \
                  readiness signal before typing the task pointer"
             );
+            // Taken before the wait, as the respawn path takes its own, so a
+            // strong raw-input fact landing after the wait returns still
+            // re-prices the buffer below (issue #724).
+            let mut interface_watch = event_rx.resubscribe();
             let wait = tokio::select! {
                 biased;
                 _ = &mut exited => return,
@@ -6867,13 +6875,36 @@ pub(crate) async fn await_worker_boot(
                     "delegate: the clear=false worker sent no readiness signal within the \
                      window; typing the task pointer after the ordinary buffer"
                 );
-                hold(delegate_readiness_buffer(), &mut exited, &mut closing).await;
-                return;
             }
-            crate::agent_pty::BootReadiness {
-                at: tokio::time::Instant::now(),
-                interface: wait.observed_interface,
+            // The respawn path's pricing of the same outcome: the interface
+            // buffer for a wrapper host's raw-input fact, the ordinary one
+            // otherwise, re-priced when the strong fact lands during a buffer
+            // the weak "output settled" fact (or the timeout) started.
+            let wrapper_host = registry.agent_spawned_as_wrapper_host(worker_agent_id);
+            let buffer = if wait.observed_interface && wrapper_host {
+                wrapper_interface_readiness_buffer()
+            } else {
+                delegate_readiness_buffer()
+            };
+            let reprice = if wait.ready {
+                weak_fact_buffer_reprice(&wait, wrapper_host)
+            } else {
+                wrapper_host.then(wrapper_interface_readiness_buffer)
+            };
+            tokio::select! {
+                biased;
+                _ = &mut exited => {}
+                _ = &mut closing => {}
+                _ = hold_readiness_buffer(
+                    Some(&mut interface_watch),
+                    pane_id,
+                    worker_agent_id,
+                    buffer,
+                    reprice,
+                    None,
+                ) => {}
             }
+            return;
         }
     };
     let buffer = if ready.interface && registry.agent_spawned_as_wrapper_host(worker_agent_id) {
@@ -9850,22 +9881,35 @@ async fn dispatch_one_owned(
     // orchestration or a `pane restart` started it seconds ago — and a pointer
     // typed into a booting agent can be lost or cut short. Hold it until the
     // worker is up, as the respawn path above does for its own replacement.
-    if expected_worker_agent_id.is_none()
-        && let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id)
-    {
-        let worker_agent_type = role_config
-            .as_ref()
-            .and_then(|role| role.resolved_agent_type())
-            .or_else(|| registry.pre_write_believed_agent_type(&worker_agent_id));
-        await_worker_boot(
-            &registry,
-            &event_tx,
-            &pane_id,
-            &worker_agent_id,
-            worker_agent_type.as_ref(),
-            &target_role,
-        )
-        .await;
+    //
+    // The pane can change hands during the wait (a `pane restart`, or a worker
+    // that exited and was replaced), and the write below goes to whoever holds
+    // it then, so a new owner is gated too. Bounded: a pane replaced over and
+    // over is written to after the last wait, as before this gate existed.
+    if expected_worker_agent_id.is_none() {
+        let mut gated: Option<String> = None;
+        for _ in 0..MAX_BOOT_GATE_OWNERS {
+            let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) else {
+                break;
+            };
+            if gated.as_deref() == Some(worker_agent_id.as_str()) {
+                break;
+            }
+            let worker_agent_type = role_config
+                .as_ref()
+                .and_then(|role| role.resolved_agent_type())
+                .or_else(|| registry.pre_write_believed_agent_type(&worker_agent_id));
+            await_worker_boot(
+                &registry,
+                &event_tx,
+                &pane_id,
+                &worker_agent_id,
+                worker_agent_type.as_ref(),
+                &target_role,
+            )
+            .await;
+            gated = Some(worker_agent_id);
+        }
     }
     // PRD #249 review (finding B1): on every path that did NOT respawn
     // (`clear = false`, or a role whose config went missing) the pointer is

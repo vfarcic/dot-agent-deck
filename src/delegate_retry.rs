@@ -334,23 +334,31 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
 }
 
 /// Issue #1650: whether `reported`, the prompt a worker's agent reports it
-/// submitted, is a FRAGMENT of `pointer` — a non-empty part of it that is not
-/// the pointer itself — which means the pointer reached the agent cut short.
+/// submitted, is a FRAGMENT of `pointer` — its tail, at least
+/// [`MIN_FRAGMENT_CHARS`] long, without the rest — which means the pointer
+/// reached the agent cut short.
 ///
 /// Codex 0.160.0 submitted `2b1b]` and `70540b]`, the last characters of the
 /// pointer, when the pointer was typed while it was still starting. Its turn on
 /// that text is not the task, so it must not count as proof that the task
-/// arrived. Narrow on purpose: a report [`crate::prompt_delivery::prompt_submission_matches`]
-/// accepts (the pointer, or its truncated report) is the pointer, and any
-/// other text — a prompt the user typed, an earlier delegation's pointer — is
-/// not evidence of a cut-short pointer, so it keeps its old meaning.
+/// arrived. Narrow on purpose, because a turn this calls a fragment loses its
+/// standing as proof and lets the pointer be typed again: only a tail matches,
+/// which ends in the delivery id's last characters and `]`, so a prompt
+/// someone types into the worker (`Read`, `task`, a digit) does not; and a
+/// report [`crate::prompt_delivery::prompt_submission_matches`] accepts (the
+/// pointer, or its truncated report) is the pointer itself.
 pub fn is_pointer_fragment(pointer: &str, reported: &str) -> bool {
     let reported = reported.trim();
-    !reported.is_empty()
+    let pointer = pointer.trim();
+    reported.chars().count() >= MIN_FRAGMENT_CHARS
+        && reported.len() < pointer.len()
+        && pointer.ends_with(reported)
         && !crate::prompt_delivery::prompt_submission_matches(pointer, reported)
-        && pointer.trim() != reported
-        && pointer.contains(reported)
 }
+
+/// The shortest tail [`is_pointer_fragment`] reads as a cut-short pointer: the
+/// issue's shortest was 5 characters (`2b1b]`).
+pub const MIN_FRAGMENT_CHARS: usize = 3;
 
 /// Issue #1650: reads a delivered worker's events in order and answers whether
 /// each proves the pointer landed, setting aside the turn an agent began on a
@@ -1441,6 +1449,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
                 Phase::Retype {
                     probe,
                     seen_submitted,
+                    fragment,
                 },
                 attempt,
                 &mut pointer_epoch,
@@ -1552,9 +1561,13 @@ enum Phase {
     /// the input box is never retyped, whatever the screen shows now.
     /// `seen_submitted` is whether any reading of this delivery has seen the
     /// pointer submitted, after which it is never retyped at all.
+    /// `fragment` is whether the worker's agent has submitted only a fragment
+    /// of the pointer (issue #1650): its id on screen is then the echo of the
+    /// typing, not a submitted task, and the pointer is typed again.
     Retype {
         probe: Composer,
         seen_submitted: bool,
+        fragment: bool,
     },
 }
 
@@ -1682,6 +1695,11 @@ async fn redeliver(
         // The unanswered Enter left it in the composer: a copy would double
         // it. Press Enter once more instead (issue #1243, see the loop).
         (Phase::Retype { .. }, Composer::PointerInComposer) => "",
+        // Issue #1650: the agent submitted only part of the pointer, so the task
+        // did not arrive, whatever the screen still shows of the typing.
+        (Phase::Retype { fragment: true, .. }, Composer::PointerInHistory | Composer::Absent) => {
+            pointer
+        }
         // Only in the transcript: the Enter submitted it, so the task landed.
         // The input box holds something else, or nothing, and an Enter there
         // would submit that; a copy would be a second turn for the same task.
@@ -2149,10 +2167,16 @@ mod tests {
             "Read .dot-agent-deck/worker-task-tester.md for your task. [delivery d-6aaf2b1b]";
         assert!(is_pointer_fragment(pointer, "2b1b]"));
         assert!(is_pointer_fragment(pointer, "af2b1b]\n"));
-        assert!(is_pointer_fragment(
+        assert!(is_pointer_fragment(pointer, "task. [delivery d-6aaf2b1b]"));
+        // Qodo, PR #1659: a short prompt someone types is not a fragment, even
+        // where it is a part of the pointer.
+        assert!(!is_pointer_fragment(
             pointer,
             "Read .dot-agent-deck/worker-task"
         ));
+        assert!(!is_pointer_fragment(pointer, "Read"));
+        assert!(!is_pointer_fragment(pointer, "task"));
+        assert!(!is_pointer_fragment(pointer, "b]"));
         assert!(!is_pointer_fragment(pointer, pointer));
         assert!(!is_pointer_fragment(pointer, &format!("  {pointer}\n")));
         assert!(!is_pointer_fragment(pointer, ""));

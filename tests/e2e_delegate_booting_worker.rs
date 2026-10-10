@@ -21,7 +21,8 @@ use spec::spec;
 const POINTER_HEAD: &str = "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-";
 
 /// argv: the deck binary, seconds of cooked-mode loading, seconds the
-/// provisional composer lasts.
+/// provisional composer lasts, and optionally `inline`: draw on the main
+/// screen and never clear it, so the typed pointer's echo stays in view.
 const BOOTING_CODEX_WORKER: &str = r#"import json
 import os
 import select
@@ -32,6 +33,8 @@ import time
 import tty
 
 deck, loading, startup = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+inline = sys.argv[4:] == ['inline']
+clear = b'' if inline else b'\x1b[2J\x1b[H'
 pid = os.getpid()
 
 
@@ -50,7 +53,7 @@ out = sys.stdout.fileno()
 tty.setraw(fd, termios.TCSANOW)
 handoff_at = time.monotonic() + startup
 # Full screen on the alternate screen, as Codex draws.
-os.write(out, b'\x1b[?1049h\x1b[2J\x1b[H\xe2\x80\xba ')
+os.write(out, (b'\r\n' if inline else b'\x1b[?1049h' + clear) + b'\xe2\x80\xba ')
 
 
 def submit(text):
@@ -62,7 +65,8 @@ def submit(text):
     if turn.returncode:
         raise SystemExit(turn.stderr)
     # Redrawn like a full-screen TUI: the transcript, then an empty composer.
-    os.write(out, b'\x1b[2J\x1b[H\xe2\x80\xba ' + text.encode() + b'\r\n\r\n\xe2\x80\xba ')
+    os.write(out, (b'\r\n' if inline else clear) + b'\xe2\x80\xba ' + text.encode()
+        + b'\r\n\r\n\xe2\x80\xba ')
 
 
 line = bytearray()
@@ -121,6 +125,12 @@ fn is_whole_pointer(submission: &str) -> bool {
 /// loading — as the orchestration's first delegate and `pane restart`'s next
 /// one did in the issue.
 fn delegate_into_booting_worker(timings: &[(&str, &str)]) -> (TuiDeck, PathBuf) {
+    delegate_into_booting_worker_drawn(timings, "")
+}
+
+/// [`delegate_into_booting_worker`], with `draw` passed to the stand-in as its
+/// last argument (`inline` or nothing).
+fn delegate_into_booting_worker_drawn(timings: &[(&str, &str)], draw: &str) -> (TuiDeck, PathBuf) {
     let deck = timings
         .iter()
         .fold(
@@ -136,7 +146,7 @@ fn delegate_into_booting_worker(timings: &[(&str, &str)]) -> (TuiDeck, PathBuf) 
     let work = deck.workdir().to_path_buf();
     std::fs::write(work.join("worker.py"), BOOTING_CODEX_WORKER).expect("write booting worker");
     let worker_command = format!(
-        "python3 -u worker.py {} 3 1",
+        "python3 -u worker.py {} 3 1 {draw}",
         env!("CARGO_BIN_EXE_dot-agent-deck")
     );
     std::fs::write(
@@ -215,16 +225,26 @@ fn delegate_052_clear_false_pointer_waits_for_a_booting_codex_worker() {
     // The buffer the deck holds after the worker takes the terminal outlasts
     // the stand-in's one-second provisional composer, as the production 5 s
     // interface buffer outlasted the ~1 s the issue's Codex spent in it.
-    let (deck, work) =
-        delegate_into_booting_worker(&[("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "2000")]);
+    // The re-send on, on a short schedule, so the exactly-once check below
+    // sees a wrongly repeated pointer (Greptile, PR #1659): the harness turns
+    // it off by default.
+    let (deck, work) = delegate_into_booting_worker(&[
+        ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "2000"),
+        ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "1500,1500"),
+    ]);
     assert!(
         common::wait_until(Duration::from_secs(20), || !submissions(&work).is_empty()),
         "the worker never submitted anything; raw={:?}; grid:\n{}",
         String::from_utf8_lossy(&std::fs::read(work.join("worker-raw.log")).unwrap_or_default()),
         deck.snapshot_grid()
     );
-    // Long enough for a retry's re-send to land if the deck thought it owed one.
-    std::thread::sleep(Duration::from_secs(2));
+    // Past the whole schedule (1.5 s, 1.5 s, then 1.5 s more before it is
+    // exhausted), so a re-send the deck wrongly thought it owed has landed.
+    assert!(
+        !common::wait_until(Duration::from_secs(6), || submissions(&work).len() > 1),
+        "the worker submitted again after the whole pointer: {:?}",
+        submissions(&work)
+    );
     let submitted = submissions(&work);
     assert_eq!(
         submitted.len(),
@@ -245,10 +265,28 @@ fn delegate_052_clear_false_pointer_waits_for_a_booting_codex_worker() {
 #[spec("orchestration/delegate/053")]
 #[test]
 fn delegate_053_a_cut_short_pointer_is_sent_again() {
-    let (deck, work) = delegate_into_booting_worker(&[
-        ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
-        ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "1500,3000"),
-    ]);
+    cut_short_pointer_is_sent_again("");
+}
+
+/// Scenario: As the test above, but the stand-in draws on the main screen and
+/// never clears it, so the echo of the first, cut-short typing stays on screen
+/// above its input box. The deck must not read that echo as the task having
+/// been submitted: it sends the pointer again, and the worker then submits the
+/// whole pointer.
+#[spec("orchestration/delegate/053")]
+#[test]
+fn delegate_053_a_cut_short_pointer_is_sent_again_over_its_own_echo() {
+    cut_short_pointer_is_sent_again("inline");
+}
+
+fn cut_short_pointer_is_sent_again(draw: &str) {
+    let (deck, work) = delegate_into_booting_worker_drawn(
+        &[
+            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
+            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "1500,3000"),
+        ],
+        draw,
+    );
     assert!(
         common::wait_until(Duration::from_secs(25), || submissions(&work)
             .iter()
@@ -265,7 +303,17 @@ fn delegate_053_a_cut_short_pointer_is_sent_again() {
          the issue: {submitted:?}"
     );
     // Long enough for one more re-send to land if the deck still owed one.
-    std::thread::sleep(Duration::from_secs(4));
+    let whole = |submitted: &[String]| {
+        submitted
+            .iter()
+            .filter(|submission| is_whole_pointer(submission))
+            .count()
+    };
+    assert!(
+        !common::wait_until(Duration::from_secs(4), || whole(&submissions(&work)) > 1),
+        "the whole pointer reached the worker more than once: {:?}",
+        submissions(&work)
+    );
     let submitted = submissions(&work);
     assert_eq!(
         submitted
