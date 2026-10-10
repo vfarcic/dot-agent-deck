@@ -102,6 +102,14 @@ When an agent works on a branch that has a pull request on GitHub, the app shows
 
 The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
 
+**TUI:**
+
+![TUI card showing open pull request #1234 awaiting review beside the implementation agent's pane](/img/pull-request-badge-tui.png)
+
+**Desktop:**
+
+![Dashboard row showing the implementation agent's open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
+
 ### Read a pull request in the app
 
 1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.

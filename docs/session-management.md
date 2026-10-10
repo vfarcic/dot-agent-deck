@@ -101,6 +101,14 @@ The badge appears by itself: an agent gets one when its working directory is a g
 
 The desktop app shows the same pull request as a badge with icons on the agent's row and in its pane, and opens it inside the app when you click it; see [Desktop app → Dashboard → Pull requests](desktop/dashboard.md#pull-requests).
 
+**TUI:**
+
+![TUI implementation agent with #1234 and its open and review-required glyphs on the card's bottom border](/img/pull-request-badge-tui.png)
+
+**Desktop:**
+
+![Desktop Dashboard implementation agent row with the same open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
+
 ### Diagnostic markers on a card
 
 | Marker | Where | Meaning | What to do |

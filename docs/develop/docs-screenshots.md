@@ -29,6 +29,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | --- | --- | --- |
 | `dashboard` | TUI, desktop | Four agents in mixed states. |
 | `dashboard-empty` | TUI, desktop | First-run empty state. |
+| `pull-request-badge` | TUI, desktop | One implementation agent with open PR #1234 awaiting review. |
 | `dashboard-fleet` | desktop | Agent dashboard with six agents across two connected daemons. |
 | `new-agent` | TUI, desktop | New Agent form with a project directory chosen. |
 | `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |

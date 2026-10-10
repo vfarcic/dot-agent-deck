@@ -45,7 +45,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -1053,6 +1053,21 @@ function upgradeFleet(): DeckSnapshot[] {
 }
 
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  if (state === "docs-pr") {
+    const snapshot = createFixtureSnapshot("docs");
+    return {
+      ...snapshot,
+      agents: [{
+        ...snapshot.agents[1],
+        pullRequest: {
+          number: 1234,
+          url: "https://github.com/test-org/test-repo/pull/1234",
+          state: "open",
+          review: "review_required",
+        },
+      }],
+    };
+  }
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
