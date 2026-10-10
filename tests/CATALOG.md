@@ -5191,10 +5191,38 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the badge drawn in the live footer (`upgrade/tui-upgrade/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/007 — A command too long for the dialog is reached by scrolling, never cut off.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 80×24), a staged outcome whose staging path is long but under `plan::MAX_SHOWN_PATH_CHARS`.
+- **Agent:** none.
+- **Asserts:** the dialog shows `↑ more` / `↓ more` markers and names `PgUp/PgDn` in its hint; paging with PageUp/PageDown reaches every row of the core's install command, its `sha256sum -c -` check included, and every short line of the plan and the outcome.
+- **Does not assert:** the mouse wheel, which calls the same `scroll_by` from the run loop.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/008 — Upgrade waits until the copy's whole plan has been on screen.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 80×15).
+- **Agent:** none.
+- **Asserts:** the view opens at this TUI's plan with `↓ more` and `PageDown to read the whole plan`, without the provenance line; clicking Upgrade and Enter on Upgrade scroll on (`Effect::None`) until the provenance line has been on screen, then run; after that copy finishes, the desktop app's question starts at its own plan with `↑ more` and waits the same way.
+- **Does not assert:** a width change between draws, which resets what was seen (unit-level behaviour of `place`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/009 — A copy installed on disk is not offered again until restart.
+- **Layer:** L1 (pure `badge`, `RunResult::from_outcome`, `UpgradeDialog::with_installed` + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** after the core's `Replaced` outcome for this TUI, the result carries `Outcome::tui_restart_line`; the badge names only the desktop app and the dialog asks only about it, showing this copy's result; with nothing else behind the badge is the restart line and offers no upgrade; a `Staged` outcome and an upgrade of the desktop app keep the offer.
+- **Does not assert:** the live footer and the upgrade key (`ui::upgrade_dialog_tests`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-dialog/010 — Control and bidi characters in a release's version never reach the terminal.
+- **Layer:** L1 (pure `badge`/`badge_text` + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** a version carrying an escape sequence, BEL and U+202E is filtered out of the badge, the dialog's title and its question, as the plan's lines are.
+- **Does not assert:** the desktop app's sanitiser (its own vitest suite).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
-- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers `--version` as the release, `e2e`-only seams for the running version, the running executable's path and the release URLs).
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers only `--version`, as the release, and fails on any other invocation, `e2e`-only seams for the running version, the running executable's path and the release URLs).
 - **Agent:** none.
 - **Asserts:** the footer shows `update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
@@ -5235,6 +5263,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** non-zero exit, `<asset> does not match checksums.txt` and `Nothing was changed.`, and the file is unchanged.
 - **Does not assert:** a missing manifest entry or an ambiguous one (core unit tests).
+- **Platform coverage:** mac+linux.
+
+##### upgrade/cli-upgrade/004 — A download whose `--version` names another release aborts and leaves the old binary.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a correctly checksummed script that answers `--version` as a different version).
+- **Agent:** none.
+- **Asserts:** non-zero exit, the core's `The downloaded binary reports v<other> instead of dot-agent-deck <release>. Nothing was changed.`, and the file is unchanged byte for byte.
+- **Does not assert:** a download that answers no version at all (core unit tests).
 - **Platform coverage:** mac+linux.
 
 ### Remote diagnostics (PRD #345)

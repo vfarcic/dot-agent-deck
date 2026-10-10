@@ -9,8 +9,9 @@
 //! this TUI's own copy first; nothing changes until the user picks Upgrade;
 //! Cancel before anything ran closes the dialog, and after an upgrade it skips
 //! that copy; a copy that cannot be upgraded from here shows what to do and
-//! offers only Close. The one deliberate difference is the default: the TUI's
-//! confirmation starts on Cancel, so Enter alone never upgrades anything.
+//! offers only Close. Both start each question on Cancel, so Enter alone
+//! never upgrades anything. A plan too long for the terminal scrolls, and
+//! Upgrade waits until all of it has been on screen.
 //!
 //! Nothing here touches the network or a subprocess on the render thread:
 //! [`check`] and the upgrade itself run on tokio tasks, and the dialog is a
@@ -45,17 +46,61 @@ impl UpgradeCheck {
     /// same words the desktop app's notice uses. `None` while every copy is
     /// current.
     pub fn notice(&self) -> Option<String> {
+        self.notice_after_install(false)
+    }
+
+    /// As [`Self::notice`], but passing over this TUI's own copy (the first
+    /// plan) when `tui_installed`: its newer build is already on disk and
+    /// only a restart is left.
+    pub fn notice_after_install(&self, tui_installed: bool) -> Option<String> {
         self.plans
             .iter()
-            .find(|plan| plan.action != PlanAction::UpToDate)
-            .map(UpgradePlan::headline)
+            .enumerate()
+            .find(|(i, plan)| !(tui_installed && *i == 0) && plan.action != PlanAction::UpToDate)
+            .map(|(_, plan)| plan.headline())
     }
 }
 
 /// The badge as the footer draws it: the notice and the key that opens the
-/// dialog.
+/// dialog. The notice carries a release's version, which is filtered as the
+/// dialog's lines are.
 pub fn badge_text(notice: &str, key: &str) -> String {
+    let notice = crate::untrusted_text::strip_control_and_bidi(notice, false);
     format!(" {notice} · {key} to upgrade ")
+}
+
+/// The footer's badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Badge {
+    pub text: String,
+    /// Whether it offers an upgrade; `false` for the restart hint.
+    pub offers_upgrade: bool,
+}
+
+/// The badge for the last `check`: the first copy that is behind, and `key`,
+/// the key that opens the dialog. Once this TUI's own copy has been installed
+/// on disk (`installed`, an upgrade with a [`RunResult::tui_restart`] line),
+/// it is no longer offered; when nothing else is behind, the badge is that
+/// restart line instead. `None` when there is nothing to say.
+pub fn badge(
+    check: Option<&UpgradeCheck>,
+    installed: Option<&RunResult>,
+    key: &str,
+) -> Option<Badge> {
+    let restart = installed.and_then(|result| result.tui_restart.as_ref());
+    match check.and_then(|check| check.notice_after_install(restart.is_some())) {
+        Some(notice) => Some(Badge {
+            text: badge_text(&notice, key),
+            offers_upgrade: true,
+        }),
+        None => restart.map(|line| Badge {
+            text: format!(
+                " {} ",
+                crate::untrusted_text::strip_control_and_bidi(line.render().trim(), false)
+            ),
+            offers_upgrade: false,
+        }),
+    }
 }
 
 /// Check for a newer release and plan this machine's copies against it: this
@@ -200,6 +245,11 @@ pub enum Effect {
 pub struct RunResult {
     pub ok: bool,
     pub lines: Vec<PlanLine>,
+    /// Set when this TUI's own copy now has the newer build on disk
+    /// (replaced, installed, or upgraded by Homebrew): the core's line saying
+    /// to restart. `None` for a staged copy, whose command the user has still
+    /// to run, and for the desktop app.
+    pub tui_restart: Option<PlanLine>,
 }
 
 impl RunResult {
@@ -207,17 +257,57 @@ impl RunResult {
     /// from (`this_tui`), the core's restart line follows the outcome.
     pub fn from_outcome(plan: &UpgradePlan, outcome: &Outcome, this_tui: bool) -> Self {
         let mut lines = outcome.items();
-        if this_tui {
-            lines.extend(outcome.tui_restart_line(&plan.latest));
+        let restart = if this_tui {
+            outcome.tui_restart_line(&plan.latest)
+        } else {
+            None
+        };
+        lines.extend(restart.clone());
+        let on_disk = matches!(
+            outcome,
+            Outcome::Replaced { .. } | Outcome::Installed { .. } | Outcome::BrewUpgraded { .. }
+        );
+        Self {
+            ok: true,
+            lines,
+            tui_restart: restart.filter(|_| on_disk),
         }
-        Self { ok: true, lines }
     }
 
     /// A failed upgrade: the error, then what the core says to do instead.
     pub fn from_error(error: &UpgradeError) -> Self {
         let mut lines = vec![PlanLine::Text(error.to_string())];
         lines.extend(error.fallback());
-        Self { ok: false, lines }
+        Self {
+            ok: false,
+            lines,
+            tui_restart: None,
+        }
+    }
+}
+
+/// Where the next draw puts the view, set when the dialog moves to a new step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// The start of a copy's section: its plan's headline.
+    Section(usize),
+    /// The start of a copy's result.
+    Result(usize),
+}
+
+/// How much of one copy's section has been on screen, in rows counted from
+/// the section's first row, at the width the section was laid out for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    width: usize,
+    rows: usize,
+    from: usize,
+    to: usize,
+}
+
+impl Seen {
+    fn whole(&self) -> bool {
+        self.from == 0 && self.to >= self.rows
     }
 }
 
@@ -229,20 +319,55 @@ pub struct UpgradeDialog {
     /// Copies already answered: upgraded, failed or skipped.
     answered: Vec<bool>,
     running: Option<usize>,
+    /// Whether an upgrade was started from this dialog.
+    ran: bool,
     selected: UpgradeChoice,
+    /// The first body row on screen.
+    scroll: usize,
+    /// How far the body scrolls and how many rows a page is, as of the last
+    /// draw. Both zero before the first.
+    max_scroll: usize,
+    page: usize,
+    anchor: Option<Anchor>,
+    /// Per copy, what of its section has been on screen while it was asked
+    /// about. Upgrade waits until all of it has.
+    seen: Vec<Option<Seen>>,
 }
 
 impl UpgradeDialog {
     /// A dialog over `plans`, this TUI's own copy first.
     pub fn new(plans: Vec<UpgradePlan>) -> Self {
         let n = plans.len();
-        Self {
+        let mut dialog = Self {
             plans,
             results: vec![None; n],
             answered: vec![false; n],
             running: None,
+            ran: false,
             selected: UpgradeChoice::Cancel,
+            scroll: 0,
+            max_scroll: 0,
+            page: 0,
+            anchor: None,
+            seen: vec![None; n],
+        };
+        dialog.step(None);
+        dialog
+    }
+
+    /// The dialog for a TUI whose own copy (the plan at `index`) was already
+    /// installed on disk this session: that copy shows `result` and is not
+    /// offered again. A result with no [`RunResult::tui_restart`] line (a
+    /// staged copy) leaves the offer as it is.
+    pub fn with_installed(mut self, index: usize, result: RunResult) -> Self {
+        if result.tui_restart.is_some()
+            && let Some(slot) = self.results.get_mut(index)
+        {
+            *slot = Some(result);
+            self.answered[index] = true;
+            self.step(Some(index));
         }
+        self
     }
 
     pub fn plans(&self) -> &[UpgradePlan] {
@@ -267,14 +392,55 @@ impl UpgradeDialog {
         }
     }
 
+    /// Point the next draw at what the new step is about: the start of the
+    /// copy now asked about, or, at the end, the result of the copy that just
+    /// finished (`finished`).
+    fn step(&mut self, finished: Option<usize>) {
+        match self.phase() {
+            Phase::Confirm(i) => self.anchor = Some(Anchor::Section(i)),
+            Phase::Done => {
+                if let Some(i) = finished {
+                    self.anchor = Some(Anchor::Result(i));
+                }
+            }
+            Phase::Running(_) => {}
+        }
+    }
+
+    /// The first body row on screen.
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll
+    }
+
+    /// Scroll the body by `rows`, up when negative, within what the last draw
+    /// laid out.
+    pub fn scroll_by(&mut self, rows: isize) {
+        self.anchor = None;
+        self.scroll = self.scroll.saturating_add_signed(rows).min(self.max_scroll);
+    }
+
+    fn page_rows(&self) -> isize {
+        isize::try_from(self.page.max(1)).unwrap_or(isize::MAX)
+    }
+
+    /// Whether the whole of copy `index`'s section, its command and its
+    /// provenance line included, has been on screen.
+    fn section_seen(&self, index: usize) -> bool {
+        self.seen
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some_and(|seen| seen.whole())
+    }
+
     /// Whether an upgrade is under way.
     pub fn is_running(&self) -> bool {
         self.running.is_some()
     }
 
-    /// Whether any upgrade has run or is running.
+    /// Whether any upgrade has run or is running in this dialog.
     pub fn ran_any(&self) -> bool {
-        self.running.is_some() || self.results.iter().any(Option::is_some)
+        self.ran || self.running.is_some()
     }
 
     /// The highlighted button.
@@ -286,6 +452,17 @@ impl UpgradeDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        match key.code {
+            KeyCode::PageDown => {
+                self.scroll_by(self.page_rows());
+                return Effect::None;
+            }
+            KeyCode::PageUp => {
+                self.scroll_by(-self.page_rows());
+                return Effect::None;
+            }
+            _ => {}
+        }
         match self.phase() {
             Phase::Running(_) => Effect::None,
             Phase::Confirm(_) => match key.code {
@@ -315,18 +492,25 @@ impl UpgradeDialog {
         }
     }
 
-    /// Press `choice`, by key or by click.
+    /// Press `choice`, by key or by click. Upgrade waits until the whole of
+    /// the copy's plan has been on screen: until then it scrolls on instead.
     pub fn choose(&mut self, choice: UpgradeChoice) -> Effect {
         match self.phase() {
             Phase::Running(_) => Effect::None,
             Phase::Confirm(i) => match choice {
+                UpgradeChoice::Upgrade if !self.section_seen(i) => {
+                    self.scroll_by(self.page_rows());
+                    Effect::None
+                }
                 UpgradeChoice::Upgrade => {
                     self.running = Some(i);
+                    self.ran = true;
                     Effect::Run(i)
                 }
                 UpgradeChoice::Cancel if self.ran_any() => {
                     self.answered[i] = true;
                     self.selected = UpgradeChoice::Cancel;
+                    self.step(None);
                     Effect::None
                 }
                 UpgradeChoice::Cancel | UpgradeChoice::Close => Effect::Close,
@@ -340,6 +524,7 @@ impl UpgradeDialog {
 
     /// The upgrade of the plan at `index` finished with `result`.
     pub fn finish(&mut self, index: usize, result: RunResult) {
+        self.ran = true;
         if let Some(slot) = self.results.get_mut(index) {
             *slot = Some(result);
             self.answered[index] = true;
@@ -348,7 +533,64 @@ impl UpgradeDialog {
             self.running = None;
         }
         self.selected = UpgradeChoice::Cancel;
+        self.step(Some(index));
     }
+
+    /// Record what the last draw put on screen: the body's extent and page,
+    /// where each section starts and ends, and so how much of the section
+    /// being asked about has now been seen.
+    fn place(&mut self, layout: &Layout, room: usize, width: usize) {
+        self.max_scroll = layout.rows.saturating_sub(room);
+        self.page = room.saturating_sub(1).max(1);
+        if let Some(anchor) = self.anchor.take() {
+            self.scroll = match anchor {
+                Anchor::Section(i) => layout.sections.get(i).map_or(0, |s| s.0),
+                Anchor::Result(i) => layout.results.get(i).copied().flatten().unwrap_or(0),
+            };
+        }
+        self.scroll = self.scroll.min(self.max_scroll);
+        let Phase::Confirm(i) = self.phase() else {
+            return;
+        };
+        let Some(&(start, end)) = layout.sections.get(i) else {
+            return;
+        };
+        let rows = end - start;
+        let from = self.scroll.max(start);
+        let to = (self.scroll + room).min(end);
+        if from >= to {
+            return;
+        }
+        let (from, to) = (from - start, to - start);
+        let seen = &mut self.seen[i];
+        *seen = match *seen {
+            Some(was)
+                if was.width == width && was.rows == rows && from <= was.to && to >= was.from =>
+            {
+                Some(Seen {
+                    from: was.from.min(from),
+                    to: was.to.max(to),
+                    ..was
+                })
+            }
+            Some(was) if was.width == width && was.rows == rows => Some(was),
+            _ => Some(Seen {
+                width,
+                rows,
+                from,
+                to,
+            }),
+        };
+    }
+}
+
+/// Where the body's parts fall, in body rows.
+struct Layout {
+    rows: usize,
+    /// Each copy's section: from its headline to its last row.
+    sections: Vec<(usize, usize)>,
+    /// The first row of each copy's result, once it has one.
+    results: Vec<Option<usize>>,
 }
 
 /// The widest the dialog grows: wide enough that the core's longest sentence
@@ -429,7 +671,12 @@ fn push_line(out: &mut Vec<Line<'static>>, line: &PlanLine, width: usize, style:
 
 /// Draw `dialog` centred over the frame. Returns each button's row, for the
 /// mouse.
-pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, Rect)> {
+///
+/// The body scrolls: when it does not fit, a marker above or below it says
+/// there is more, PageUp and PageDown (or the mouse wheel) move through it,
+/// and the question and the buttons stay in view. Nothing is cut off. Drawing
+/// records what reached the screen, which is what lets Upgrade be chosen.
+pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoice, Rect)> {
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(MAX_WIDTH);
     // Inside the border, one column of padding on each side.
@@ -437,10 +684,16 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
     let phase = dialog.phase();
 
     let mut body: Vec<Line<'static>> = Vec::new();
+    let mut layout = Layout {
+        rows: 0,
+        sections: Vec::new(),
+        results: Vec::new(),
+    };
     for (i, plan) in dialog.plans.iter().enumerate() {
         if i > 0 {
             body.push(Line::from(""));
         }
+        let start = body.len();
         let items = plan.items();
         if let Some((headline, rest)) = items.split_first() {
             push_line(&mut body, headline, text_width, bold());
@@ -451,20 +704,27 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
         if phase == Phase::Running(i) {
             body.push(Line::styled("Upgrading…", selected_style()));
         }
+        let mut result_start = None;
         if let Some(result) = &dialog.results[i] {
+            result_start = Some(body.len());
             let style = Style::default().fg(if result.ok { Color::Green } else { Color::Red });
             for line in &result.lines {
                 push_line(&mut body, line, text_width, style);
             }
         }
+        layout.sections.push((start, body.len()));
+        layout.results.push(result_start);
     }
+    layout.rows = body.len();
 
-    // The question and the buttons, always kept in view.
+    // The question and the buttons, always kept in view. The first row is
+    // where the "more below" marker goes.
     let mut footer: Vec<Line<'static>> = vec![Line::from("")];
     let mut buttons: Vec<(UpgradeChoice, String)> = Vec::new();
-    let hint = match phase {
+    match phase {
         Phase::Confirm(i) => {
             let question = dialog.plans[i].confirm_question().unwrap_or_default();
+            let question = crate::untrusted_text::strip_control_and_bidi(&question, false);
             for row in wrap(&question, text_width) {
                 footer.push(Line::styled(row, bold()));
             }
@@ -479,14 +739,10 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
                 UpgradeChoice::Upgrade,
                 "Upgrade  — upgrade it now".to_string(),
             ));
-            "↑/↓ choose · Enter confirms · Esc closes"
         }
-        Phase::Running(_) => "Upgrading… wait for it to finish.",
-        Phase::Done => {
-            buttons.push((UpgradeChoice::Close, "Close".to_string()));
-            "Enter or Esc closes"
-        }
-    };
+        Phase::Running(_) => {}
+        Phase::Done => buttons.push((UpgradeChoice::Close, "Close".to_string())),
+    }
     let first_button_row = footer.len();
     let selected = dialog.selected();
     for (choice, label) in &buttons {
@@ -498,19 +754,42 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
         footer.push(Line::styled(format!("{cursor} {label}"), style));
     }
     footer.push(Line::from(""));
-    footer.push(Line::styled(hint, plain().add_modifier(Modifier::DIM)));
+    // The hint, the last row, is added once the view is placed.
 
-    // Borders and a blank first row; the body gives way to the footer, from
-    // the top, so the newest result and the question stay visible.
+    // Borders and the "more above" row around the body, which gets what the
+    // footer and its hint leave.
     let chrome = 3usize;
     let max_height = usize::from(area.height.saturating_sub(2));
-    let room = max_height.saturating_sub(chrome + footer.len());
-    if body.len() > room {
-        body.drain(..body.len() - room);
+    let room = max_height.saturating_sub(chrome + footer.len() + 1);
+    dialog.place(&layout, room, text_width);
+    let scroll = dialog.scroll;
+    let scrolls = dialog.max_scroll > 0;
+    let hint = match phase {
+        Phase::Confirm(i) if !dialog.section_seen(i) => {
+            "PageDown to read the whole plan · ↑/↓ choose · Esc closes"
+        }
+        Phase::Confirm(_) if scrolls => {
+            "↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc closes"
+        }
+        Phase::Confirm(_) => "↑/↓ choose · Enter confirms · Esc closes",
+        Phase::Running(_) => "Upgrading… wait for it to finish.",
+        Phase::Done if scrolls => "PgUp/PgDn scroll · Enter or Esc closes",
+        Phase::Done => "Enter or Esc closes",
+    };
+    footer.push(Line::styled(hint, plain().add_modifier(Modifier::DIM)));
+    let marker = |text: &'static str| Line::styled(text, Style::default().fg(Color::Yellow));
+    if scroll + room < body.len() {
+        footer[0] = marker("↓ more — PgDn");
     }
-    let mut text = vec![Line::from("")];
-    let body_rows = body.len();
-    text.extend(body);
+
+    let visible: Vec<Line<'static>> = body.into_iter().skip(scroll).take(room).collect();
+    let mut text = vec![if scroll > 0 {
+        marker("↑ more — PgUp")
+    } else {
+        Line::from("")
+    }];
+    let body_rows = visible.len();
+    text.extend(visible);
     text.extend(footer);
     let height = u16::try_from(text.len() + 2)
         .unwrap_or(u16::MAX)
@@ -520,8 +799,9 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
+    let title = crate::untrusted_text::strip_control_and_bidi(dialog.latest(), false);
     let block = Block::default()
-        .title(format!(" Upgrade to v{} ", dialog.latest()))
+        .title(format!(" Upgrade to v{title} "))
         .title_style(selected_style())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
@@ -535,7 +815,7 @@ pub fn render(frame: &mut Frame, dialog: &UpgradeDialog) -> Vec<(UpgradeChoice, 
     );
     frame.render_widget(Paragraph::new(text), padded);
 
-    // Rows of the buttons: the blank first row, the body, then the footer.
+    // Rows of the buttons: the marker row, the body, then the footer.
     let top = 1 + body_rows + first_button_row;
     buttons
         .iter()

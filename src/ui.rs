@@ -2292,6 +2292,10 @@ struct UiState {
     /// if `Ctrl+C` took the deck to the quit dialog, so the upgrade key
     /// reopens it on the same run.
     upgrade_dialog: Option<crate::upgrade_dialog::UpgradeDialog>,
+    /// Issue #1635: the upgrade that put this TUI's own copy's newer build on
+    /// disk, kept until the TUI restarts: that copy is no longer offered, and
+    /// the badge says to restart when nothing else is behind.
+    upgrade_installed: Option<crate::upgrade_dialog::RunResult>,
     /// Issue #1635: where the running upgrade reports back. The upgrade runs
     /// on a tokio task; the render loop drains this each frame.
     upgrade_results: Option<std::sync::mpsc::Receiver<(usize, crate::upgrade_dialog::RunResult)>>,
@@ -2718,6 +2722,7 @@ impl UiState {
             last_bell_status: HashMap::new(),
             upgrade_check: None,
             upgrade_dialog: None,
+            upgrade_installed: None,
             upgrade_results: None,
             upgrade_recheck: false,
             pane_layout: PaneLayout::Stacked,
@@ -8439,34 +8444,35 @@ fn handle_upgrade_key(key: KeyEvent, ui: &mut UiState) -> Action {
 /// Issue #1635: open the upgrade dialog on the last check's plans. A dialog
 /// kept because its upgrade was still running (or finished while the deck
 /// was elsewhere) is reopened instead, so its result is not lost. With no copy
-/// behind, the status bar says so in the core's words.
+/// behind, the status bar says so in the core's words — or, once this TUI's
+/// own copy was installed, says to restart it.
 fn open_upgrade_dialog(ui: &mut UiState) {
     if ui.upgrade_dialog.is_some() {
         ui.mode = UiMode::Upgrade;
         return;
     }
     let check = ui.upgrade_check.clone();
-    match check {
-        Some(check) if check.notice().is_some() => {
-            ui.upgrade_dialog = Some(crate::upgrade_dialog::UpgradeDialog::new(
-                check.plans.clone(),
-            ));
+    let installed = ui.upgrade_installed.clone();
+    let badge = crate::upgrade_dialog::badge(check.as_deref(), installed.as_ref(), "");
+    let message = match (check, badge) {
+        (Some(check), Some(badge)) if badge.offers_upgrade => {
+            let mut dialog = crate::upgrade_dialog::UpgradeDialog::new(check.plans.clone());
+            if let Some(installed) = installed {
+                // The first plan is always this TUI's own copy.
+                dialog = dialog.with_installed(0, installed);
+            }
+            ui.upgrade_dialog = Some(dialog);
             ui.mode = UiMode::Upgrade;
+            return;
         }
-        Some(check) => {
-            let message = check
-                .plans
-                .first()
-                .map_or_else(String::new, |plan| plan.headline());
-            ui.status_message = Some((message, std::time::Instant::now()));
-        }
-        None => {
-            ui.status_message = Some((
-                "No newer release has been found.".to_string(),
-                std::time::Instant::now(),
-            ));
-        }
-    }
+        (_, Some(restart)) => restart.text.trim().to_string(),
+        (Some(check), None) => check
+            .plans
+            .first()
+            .map_or_else(String::new, |plan| plan.headline()),
+        (None, None) => "No newer release has been found.".to_string(),
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
 }
 
 /// Issue #1635: act on what a key or a click did in the upgrade dialog.
@@ -8486,16 +8492,9 @@ fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect)
             ui.mode = UiMode::Normal;
         }
         Effect::Run(index) => {
-            let Some(plan) = ui
-                .upgrade_dialog
-                .as_ref()
-                .and_then(|dialog| dialog.plans().get(index).cloned())
-            else {
+            let Some((plan, this_tui)) = upgrade_job(ui, index) else {
                 return;
             };
-            // The first plan is always this TUI's own copy
-            // (`upgrade_dialog::check`).
-            let this_tui = index == 0;
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -8518,6 +8517,22 @@ fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect)
             }
         }
     }
+}
+
+/// Issue #1635: take the latest release check for the badge, and the result
+/// of an upgrade the dialog started. Once per frame.
+fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState) {
+    ui.upgrade_check = snapshot.upgrade_check.clone();
+    drain_upgrade_results(ui, state);
+}
+
+/// Issue #1635: what `Effect::Run(index)` upgrades: the plan the open dialog
+/// shows — never a newer check that arrived after it opened — and whether it
+/// is this TUI's own copy.
+fn upgrade_job(ui: &UiState, index: usize) -> Option<(crate::self_upgrade::UpgradePlan, bool)> {
+    let plan = ui.upgrade_dialog.as_ref()?.plans().get(index)?.clone();
+    // The first plan is always this TUI's own copy (`upgrade_dialog::check`).
+    Some((plan, index == 0))
 }
 
 /// Issue #1635: hand a finished upgrade's result to its dialog, and start the
@@ -8545,6 +8560,9 @@ fn drain_upgrade_results(ui: &mut UiState, state: &SharedState) {
     };
     if let Some((index, result)) = received {
         ui.upgrade_results = None;
+        if result.tui_restart.is_some() {
+            ui.upgrade_installed = Some(result.clone());
+        }
         if let Some(dialog) = ui.upgrade_dialog.as_mut() {
             dialog.finish(index, result);
         }
@@ -14534,8 +14552,7 @@ pub fn run_tui(
 
         // Issue #1635: the latest release check, and the result of an
         // upgrade the dialog started.
-        ui.upgrade_check = snapshot.upgrade_check.clone();
-        drain_upgrade_results(&mut ui, &state);
+        sync_upgrade_state(&mut ui, &snapshot, &state);
 
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
@@ -15445,6 +15462,19 @@ pub fn run_tui(
                             ui.scheduled_tasks.len(),
                             forward,
                         );
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Issue #1635: the upgrade dialog's body scrolls with the
+                // wheel, one row a notch, as it does with PageUp/PageDown.
+                if is_scroll && ui.mode == UiMode::Upgrade {
+                    if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                        let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                        dialog.scroll_by(if up { -1 } else { 1 });
                     }
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
@@ -17518,7 +17548,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         ui.close_confirm_displayed = true;
     }
     if ui.mode == UiMode::Upgrade
-        && let Some(dialog) = ui.upgrade_dialog.as_ref()
+        && let Some(dialog) = ui.upgrade_dialog.as_mut()
     {
         ui.modal_button_rects = crate::upgrade_dialog::render(frame, dialog)
             .into_iter()
@@ -19054,16 +19084,20 @@ fn render_bottom_bar(
                 // Issue #1635: the update badge, right-aligned after the bar when
                 // a copy on this machine is behind — the same words as the
                 // desktop app's notice, naming the key that opens the upgrade
-                // dialog. A click on it opens the dialog too; it is drawn over
-                // the bar's right end, so its rect is hit-tested first.
+                // dialog — or, once this TUI's own copy was installed, the
+                // core's line saying to restart it. It is drawn over the bar's
+                // right end on cleared cells, so a disabled button beneath
+                // lends it none of its dimming, and its rect is hit-tested
+                // first, so a click on it never presses a covered button.
                 let mut rects = rects;
-                if let Some(notice) = ui.upgrade_check.as_ref().and_then(|check| check.notice()) {
-                    let badge = crate::upgrade_dialog::badge_text(
-                        &notice,
-                        &display_notation(&ui.keybindings, KbAction::OpenUpgrade),
-                    );
-                    let bw = u16::try_from(unicode_width::UnicodeWidthStr::width(badge.as_str()))
-                        .unwrap_or(u16::MAX);
+                if let Some(badge) = crate::upgrade_dialog::badge(
+                    ui.upgrade_check.as_deref(),
+                    ui.upgrade_installed.as_ref(),
+                    &display_notation(&ui.keybindings, KbAction::OpenUpgrade),
+                ) {
+                    let bw =
+                        u16::try_from(unicode_width::UnicodeWidthStr::width(badge.text.as_str()))
+                            .unwrap_or(u16::MAX);
                     if bw < area.width {
                         let badge_area = Rect {
                             x: area.x + area.width - bw,
@@ -19071,9 +19105,10 @@ fn render_bottom_bar(
                             width: bw,
                             height: 1,
                         };
+                        frame.render_widget(Clear, badge_area);
                         frame.render_widget(
                             Paragraph::new(Line::styled(
-                                badge,
+                                badge.text,
                                 Style::default()
                                     .fg(Color::Black)
                                     .bg(Color::Yellow)
@@ -21875,7 +21910,7 @@ pub fn render_stop_confirm_to_buffer(
 /// standalone Buffer through the SAME [`crate::upgrade_dialog::render`] the
 /// live modal draws.
 pub fn render_upgrade_dialog_to_buffer(
-    dialog: &crate::upgrade_dialog::UpgradeDialog,
+    dialog: &mut crate::upgrade_dialog::UpgradeDialog,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -45679,5 +45714,212 @@ mod config_drift_tests {
         let (status, _) = ui.status_message.as_ref().expect("status line set");
         assert!(!status.contains(CONFIG_DRIFT_TAB_MARKER), "{status}");
         assert_eq!(ui.session_warnings, vec!["w".to_string()]);
+    }
+}
+
+/// Issue #1635: the footer badge and the upgrade dialog as the TUI's own
+/// state drives them — the result of an upgrade, a re-check landing while the
+/// dialog is open, and the badge drawn over the button bar.
+#[cfg(test)]
+mod upgrade_dialog_tests {
+    use super::*;
+    use crate::self_upgrade::detect::Tools;
+    use crate::self_upgrade::{
+        CopyKind, InstallMethod, Installation, Outcome, PlanOptions, Platform, Provenance,
+        ProvenanceCheck, UpgradePlan, plan,
+    };
+    use crate::upgrade_dialog::{Effect, Phase, RunResult, UpgradeCheck};
+    use std::path::PathBuf;
+
+    const EXE: &str = "/home/u/.local/bin/dot-agent-deck";
+
+    fn cli_plan(latest: &str) -> UpgradePlan {
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: PathBuf::from(EXE),
+            version: "0.46.0".into(),
+            platform: Some(Platform::LinuxAmd64),
+            method: InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(EXE),
+            },
+            tools: Tools::default(),
+        };
+        let options = PlanOptions {
+            staging_root: PathBuf::from("/home/u/.local/state/dot-agent-deck/upgrade"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "no gh".into(),
+            },
+        };
+        plan::plan(&installation, &latest.into(), &options)
+    }
+
+    fn shared(check: Option<UpgradeCheck>) -> SharedState {
+        let state = SharedState::default();
+        state.blocking_write().upgrade_check = check.map(Arc::new);
+        state
+    }
+
+    /// One frame's worth of what the run loop does with the release check.
+    fn frame_sync(ui: &mut UiState, state: &SharedState) {
+        let snapshot = state.blocking_read().clone();
+        sync_upgrade_state(ui, &snapshot, state);
+    }
+
+    fn draw_dialog(ui: &mut UiState) {
+        let dialog = ui.upgrade_dialog.as_mut().expect("the dialog is open");
+        draw_to_buffer(120, 40, |frame| {
+            crate::upgrade_dialog::render(frame, dialog);
+        });
+    }
+
+    /// The bar as the deck draws it with no agent pane to control, where the
+    /// pane buttons are disabled and so dimmed.
+    fn draw_bar(ui: &mut UiState, width: u16) -> ratatui::buffer::Buffer {
+        draw_to_buffer(width, 1, |frame| {
+            render_bottom_bar(frame, ui, Rect::new(0, 0, width, 1), false, &[]);
+        })
+    }
+
+    /// The columns the badge occupies, found by its text at the bar's right
+    /// end.
+    fn badge_columns(buffer: &ratatui::buffer::Buffer, text: &str) -> std::ops::Range<u16> {
+        let width = buffer.area().width;
+        let len = u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap();
+        let start = width - len;
+        let shown: String = (start..width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(shown, text, "the badge is drawn at the bar's right end");
+        start..width
+    }
+
+    /// Scenario: The dialog is open at its first question for release A when the periodic re-check publishes release B through the usual per-frame sync. The badge follows B, but confirming the open dialog upgrades to A — the plan the user read — because the run takes its plan from the dialog, not from the newer check.
+    #[test]
+    fn upgrade_dialog_recheck_mid_dialog_runs_the_plan_the_user_read() {
+        let plan_a = cli_plan("0.47.0");
+        let plan_b = cli_plan("0.48.0");
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![plan_a.clone()],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Upgrade);
+        draw_dialog(&mut ui);
+        assert_eq!(
+            ui.upgrade_dialog.as_ref().unwrap().phase(),
+            Phase::Confirm(0)
+        );
+
+        state.blocking_write().upgrade_check = Some(Arc::new(UpgradeCheck {
+            plans: vec![plan_b.clone()],
+        }));
+        frame_sync(&mut ui, &state);
+        assert_eq!(
+            ui.upgrade_check.as_ref().map(|check| check.plans.clone()),
+            Some(vec![plan_b]),
+            "the badge follows the newer check"
+        );
+        draw_dialog(&mut ui);
+
+        let dialog = ui.upgrade_dialog.as_mut().unwrap();
+        dialog.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let effect = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(effect, Effect::Run(0));
+        let (plan, this_tui) = upgrade_job(&ui, 0).expect("a plan to run");
+        assert_eq!(plan, plan_a, "the run uses the plan the dialog showed");
+        assert!(this_tui);
+    }
+
+    /// Scenario: An upgrade of this TUI's own copy finishes with the core's "replaced" outcome and the dialog is closed. The badge no longer offers that copy; with nothing else behind it shows the core's restart line instead, and the upgrade key says the same in the status line rather than offering the copy again. A "staged" outcome keeps the offer.
+    #[test]
+    fn upgrade_dialog_installed_copy_turns_the_badge_into_a_restart_hint() {
+        let cli = cli_plan("0.47.0");
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![cli.clone()],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        let offered = draw_bar(&mut ui, 160);
+        let offer = crate::upgrade_dialog::badge_text(&cli.headline(), "u");
+        badge_columns(&offered, &offer);
+
+        let outcome = Outcome::Replaced {
+            path: PathBuf::from(EXE),
+            version: "0.47.0".into(),
+            provenance: Provenance::Skipped {
+                reason: "no gh".into(),
+            },
+        };
+        let restart = outcome.tui_restart_line("0.47.0").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.upgrade_results = Some(rx);
+        tx.send((0, RunResult::from_outcome(&cli, &outcome, true)))
+            .unwrap();
+        frame_sync(&mut ui, &state);
+        ui.status_message = None;
+
+        let bar = draw_bar(&mut ui, 160);
+        let hint = format!(" {} ", restart.render().trim());
+        badge_columns(&bar, &hint);
+        ui.upgrade_dialog = None;
+        ui.mode = UiMode::Normal;
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "nothing is offered");
+        let (status, _) = ui.status_message.clone().expect("the key answers");
+        assert_eq!(status, restart.render().trim());
+
+        // A staged upgrade still leaves the command to run: the offer stays.
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.upgrade_results = Some(rx);
+        let staged = Outcome::Staged {
+            path: PathBuf::from("/tmp/x"),
+            command: Some("sudo install /tmp/x /usr/local/bin/dot-agent-deck".into()),
+            version: "0.47.0".into(),
+            provenance: Provenance::Skipped {
+                reason: "no gh".into(),
+            },
+        };
+        tx.send((0, RunResult::from_outcome(&cli, &staged, true)))
+            .unwrap();
+        frame_sync(&mut ui, &state);
+        ui.status_message = None;
+        badge_columns(&draw_bar(&mut ui, 160), &offer);
+    }
+
+    /// Scenario: Draw the dashboard's button bar with the update badge over its right end, at several widths. No cell of the badge is dimmed by the disabled buttons it covers, and a click on any of its cells opens the upgrade dialog rather than pressing a button underneath.
+    #[test]
+    fn upgrade_dialog_badge_is_never_dimmed_and_clicks_never_reach_a_covered_button() {
+        let cli = cli_plan("0.47.0");
+        let offer = crate::upgrade_dialog::badge_text(&cli.headline(), "u");
+        let mut covered_dim = false;
+        for width in [90u16, 110, 130, 150, 170] {
+            let mut bare = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+            let under = draw_bar(&mut bare, width);
+            let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+            ui.upgrade_check = Some(Arc::new(UpgradeCheck {
+                plans: vec![cli.clone()],
+            }));
+            let bar = draw_bar(&mut ui, width);
+            for x in badge_columns(&bar, &offer) {
+                covered_dim |= under[(x, 0)].modifier.contains(Modifier::DIM);
+                assert!(
+                    !bar[(x, 0)].modifier.contains(Modifier::DIM),
+                    "badge cell {x} at width {width} is dimmed"
+                );
+                assert!(
+                    matches!(
+                        hit_test_button(&ui.button_rects, x, 0),
+                        Some(Action::OpenUpgrade)
+                    ),
+                    "a click on badge cell {x} at width {width} must open the dialog"
+                );
+            }
+        }
+        assert!(
+            covered_dim,
+            "at some width the badge covers a dimmed button, or this test proves nothing"
+        );
     }
 }
