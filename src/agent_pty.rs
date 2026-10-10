@@ -1005,6 +1005,14 @@ pub enum AgentPtyError {
     /// refused before the PTY is opened. The payload is the path as given.
     #[error("working directory {0:?} is not a directory")]
     CwdNotADirectory(String),
+    /// A spawn's working directory lies inside a directory this daemon is
+    /// removing (issue #1612): an abandoned issue-dispatch worktree that
+    /// [`AgentPtyRegistry::hold_dir_for_removal`] found unused and is about to
+    /// delete. Started, the child would have its working directory deleted
+    /// under it, so it is refused before the PTY is opened. The payload is the
+    /// path as given.
+    #[error("working directory {0:?} is being removed")]
+    DirBeingRemoved(String),
     /// Issue #544: a first write given a deadline by
     /// [`AgentPtyRegistry::write_and_submit_guarded_first_write_within`] ran
     /// out of it before writing a byte, doing something OTHER than waiting
@@ -6851,6 +6859,24 @@ struct RegistryInner {
     /// [`SpawnReservation`] on both its release paths — so a token is
     /// resolvable from exactly one of the two maps at every instant.
     pending_hook_tokens: HashMap<String, String>,
+    /// Issue #1612: the working directories of every spawn in
+    /// [`Self::pending_spawns`] — its `cwd` and, for an orchestration role, its
+    /// orchestration cwd — keyed by the same pre-allocated agent id, inserted
+    /// and removed together with that entry.
+    ///
+    /// A spawn's record is published only after its child has entered its
+    /// working directory, so a removal that asked only the published records
+    /// whether a directory is in use could delete it under a child that has
+    /// not been published yet. [`AgentPtyRegistry::hold_dir_for_removal`]
+    /// reads this too, under the same lock.
+    pending_spawn_dirs: HashMap<String, Vec<PathBuf>>,
+    /// Issue #1612: directories a removal is holding — found unused under this
+    /// lock and not yet deleted. [`AgentPtyRegistry::reserve_spawn`] refuses a
+    /// spawn whose working directory lies inside one, so a spawn can never
+    /// start in a directory between the removal's last "unused" check and the
+    /// deletion. A list rather than a set so two holds on one directory each
+    /// release only their own entry. See [`DirRemovalHold`].
+    removal_holds: Vec<PathBuf>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -6941,6 +6967,7 @@ impl<'a> SpawnReservation<'a> {
         if let Some(id) = self.id.take() {
             inner.pending_spawns.remove(&id);
             inner.pending_hook_tokens.remove(&id);
+            inner.pending_spawn_dirs.remove(&id);
         }
         #[cfg(unix)]
         if let Some((pane, prior)) = self.prior_binding.take() {
@@ -6971,6 +6998,56 @@ impl Drop for SpawnReservation<'_> {
             }
         }
     }
+}
+
+/// Issue #1612: RAII holder for a [`RegistryInner::removal_holds`] entry — the
+/// durable form of "nothing this daemon runs or is starting is in this
+/// directory", returned by [`AgentPtyRegistry::hold_dir_for_removal`].
+///
+/// Held from that check through the deletion it authorises and released on
+/// every exit, including a panic. While it is held no spawn can reserve a
+/// working directory inside the held one, so the check cannot go stale under
+/// the deletion that acts on it. Borrows the registry: the deletion it guards
+/// runs in the caller's own task.
+pub struct DirRemovalHold<'a> {
+    registry: &'a AgentPtyRegistry,
+    dir: PathBuf,
+}
+
+impl Drop for DirRemovalHold<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock leaves the hold behind, which refuses spawns into one
+        // directory for the rest of the daemon's life: the fail-safe direction
+        // for a deletion guard, and bounded by one entry per panicking removal.
+        if let Ok(mut inner) = self.registry.inner.lock()
+            && let Some(at) = inner.removal_holds.iter().position(|d| *d == self.dir)
+        {
+            inner.removal_holds.swap_remove(at);
+        }
+    }
+}
+
+/// Issue #1612: whether `path` is `dir` or lies inside it. Compared by path
+/// components, so `/a/bc` is not inside `/a/b`; lexical, so a path that reaches
+/// `dir` through a symlink or a `..` is not recognised as inside it.
+fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    path.starts_with(dir)
+}
+
+/// Issue #1612: the working directories a spawn with these options roots
+/// itself in — its `cwd`, and an orchestration role's orchestration cwd, which
+/// is the worktree every role of an issue-dispatched orchestration shares.
+fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<PathBuf> {
+    let orchestration_cwd = match tab_membership {
+        Some(TabMembership::Orchestration {
+            orchestration_cwd, ..
+        }) => orchestration_cwd.as_deref(),
+        _ => None,
+    };
+    cwd.into_iter()
+        .chain(orchestration_cwd)
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Issue #454 round-3 review (blocker 1): RAII holder for a
@@ -7222,6 +7299,8 @@ impl AgentPtyRegistry {
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 pending_hook_tokens: HashMap::new(),
+                pending_spawn_dirs: HashMap::new(),
+                removal_holds: Vec::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
             }),
@@ -10459,8 +10538,18 @@ impl AgentPtyRegistry {
         // directory its prepared start verified, in that same acquisition, and
         // the reservation it returns undoes the binding if this start never
         // publishes its agent.
-        let (preallocated_id, reservation) =
-            self.reserve_spawn(&pane_id_env, &hook_token_for_record, dir)?;
+        //
+        // Issue #1612: it also records the spawn's working directories, and
+        // refuses one inside a directory a removal is holding, in that same
+        // acquisition — so a removal sees this start from here until its record
+        // is published, and a start never begins inside a directory a removal
+        // has already found unused.
+        let (preallocated_id, reservation) = self.reserve_spawn(
+            &pane_id_env,
+            &hook_token_for_record,
+            dir,
+            spawn_dirs(opts.cwd, tab_membership.as_ref()),
+        )?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
@@ -15386,13 +15475,30 @@ impl AgentPtyRegistry {
     /// requirement is recorded here. The returned reservation undoes the
     /// binding, with the rest of the reservation, if the start never publishes
     /// its agent.
+    ///
+    /// Issue #1612: `spawn_dirs` are the spawn's working directories. One
+    /// inside a directory a removal holds ([`Self::hold_dir_for_removal`])
+    /// refuses the spawn with [`AgentPtyError::DirBeingRemoved`]; otherwise they
+    /// are recorded in [`RegistryInner::pending_spawn_dirs`] with the rest of
+    /// the reservation, so a removal sees the start before its record exists.
     fn reserve_spawn(
         &self,
         pane_id_env: &Option<String>,
         hook_token: &str,
         dir: SpawnDir<'_>,
+        spawn_dirs: Vec<PathBuf>,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
         let mut inner = self.inner.lock().unwrap();
+        if let Some(held) = spawn_dirs.iter().find(|wanted| {
+            inner
+                .removal_holds
+                .iter()
+                .any(|held| path_within(wanted, held))
+        }) {
+            return Err(AgentPtyError::DirBeingRemoved(
+                held.to_string_lossy().into_owned(),
+            ));
+        }
         if let Some(candidate) = pane_id_env
             && (inner.cleanup_holds.contains(candidate.as_str())
                 || inner
@@ -15417,6 +15523,7 @@ impl AgentPtyRegistry {
         inner
             .pending_hook_tokens
             .insert(id.clone(), hook_token.to_string());
+        inner.pending_spawn_dirs.insert(id.clone(), spawn_dirs);
         // Issue #1077: from this instant the pane requires a token, and it
         // keeps requiring one for the life of the daemon — see
         // `RegistryInner::hook_token_panes`. Recorded under the SAME lock
@@ -15534,11 +15641,90 @@ impl AgentPtyRegistry {
     pub fn reserve_spawn_for_test(&self, pane_id: Option<&str>) -> (String, String) {
         let token = crate::hook_provenance::mint();
         let (id, mut reservation) = self
-            .reserve_spawn(&pane_id.map(str::to_string), &token, None)
+            .reserve_spawn(&pane_id.map(str::to_string), &token, None, Vec::new())
             .expect("reserve a spawn");
         // Disarm the guard so the reservation outlives this call.
         reservation.id = None;
         (id, token)
+    }
+
+    /// Test seam for issue #1612: [`Self::reserve_spawn_for_test`] for a
+    /// paneless spawn whose working directory is `cwd` — the state a real
+    /// start into `cwd` is in between its reservation and its record. Returns
+    /// the reservation's id, for [`Self::release_spawn_for_test`], or the
+    /// refusal a real start into `cwd` would get.
+    #[cfg(test)]
+    pub(crate) fn reserve_spawn_in_for_test(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<String, AgentPtyError> {
+        let token = crate::hook_provenance::mint();
+        let (id, mut reservation) =
+            self.reserve_spawn(&None, &token, None, vec![cwd.to_path_buf()])?;
+        reservation.id = None;
+        Ok(id)
+    }
+
+    /// Test seam: release a reservation [`Self::reserve_spawn_in_for_test`]
+    /// left in place, as a start that is refused after its reservation does.
+    #[cfg(test)]
+    pub(crate) fn release_spawn_for_test(&self, id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_spawns.remove(id);
+        inner.pending_hook_tokens.remove(id);
+        inner.pending_spawn_dirs.remove(id);
+    }
+
+    /// Issue #1612: whether anything this registry runs or is starting is
+    /// rooted in `dir` — a live agent, or a reserved spawn not yet published,
+    /// whose working directory or orchestration cwd is `dir` or lies inside it.
+    /// Exited agents do not count, matching [`Self::agent_records`].
+    fn dir_in_use_locked(inner: &RegistryInner, dir: &std::path::Path) -> bool {
+        let agent_in_dir = inner.agents.values().any(|a| {
+            !a.exited.load(Ordering::SeqCst)
+                && spawn_dirs(a.cwd.as_deref(), a.tab_membership.as_ref())
+                    .iter()
+                    .any(|d| path_within(d, dir))
+        });
+        agent_in_dir
+            || inner
+                .pending_spawn_dirs
+                .values()
+                .flatten()
+                .any(|d| path_within(d, dir))
+    }
+
+    /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
+    /// the registry lock. A spawn publishing in between cannot fall between its
+    /// reservation and its record, because its reservation is released under
+    /// the same acquisition that publishes it.
+    pub fn dir_in_use(&self, dir: &std::path::Path) -> bool {
+        Self::dir_in_use_locked(&self.inner.lock().unwrap(), dir)
+    }
+
+    /// Issue #1612: authorise deleting `dir`. `None` when anything this
+    /// registry runs or is starting is rooted in it ([`Self::dir_in_use`]);
+    /// otherwise a hold that, until it is dropped, refuses every spawn whose
+    /// working directory lies inside `dir` ([`AgentPtyError::DirBeingRemoved`]).
+    ///
+    /// The check and the hold are made under one acquisition of the lock that
+    /// reserves spawns, which is what closes the window a check-then-delete
+    /// leaves: a start reserved before the hold is seen by the check, and one
+    /// reserving after it is refused. So nothing this registry starts can have
+    /// its working directory deleted under it by a caller that deletes only
+    /// while it holds this. It says nothing about a process another daemon, or
+    /// no daemon at all, starts in `dir`, and directories are compared by path
+    /// ([`path_within`]).
+    pub fn hold_dir_for_removal(&self, dir: &std::path::Path) -> Option<DirRemovalHold<'_>> {
+        let mut inner = self.inner.lock().unwrap();
+        if Self::dir_in_use_locked(&inner, dir) {
+            return None;
+        }
+        inner.removal_holds.push(dir.to_path_buf());
+        Some(DirRemovalHold {
+            registry: self,
+            dir: dir.to_path_buf(),
+        })
     }
 
     /// Issue #1077: whether this daemon has EVER issued a hook capability token
@@ -18137,6 +18323,106 @@ mod spawn_tests {
             "the pane must be spawnable after the failed attempt released it; \
              got {retry:?}"
         );
+        registry.shutdown_all();
+    }
+
+    /// Issue #1612: a removal hold is refused while anything is rooted in the
+    /// directory — a live agent whose cwd or orchestration cwd lies inside it,
+    /// or a spawn reserved there but not yet published — and, while held,
+    /// refuses every spawn rooted inside the directory, by either path, before
+    /// it forks. A sibling whose name merely starts with the same characters is
+    /// not inside it, and dropping the hold lets spawns in again.
+    #[tokio::test]
+    async fn a_removal_hold_excludes_spawns_rooted_in_its_directory() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let wt = tmp.path().join("issue-7");
+        let inner_dir = wt.join("src");
+        let sibling = tmp.path().join("issue-70");
+        for d in [&inner_dir, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let orchestration_in = |cwd: &std::path::Path| TabMembership::Orchestration {
+            name: "o".into(),
+            role_index: 0,
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+            orchestration_cwd: Some(s(cwd)),
+            display_title: None,
+            orchestration_id: None,
+        };
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        // A reserved, unpublished spawn in a subdirectory keeps the directory.
+        let starting = registry.reserve_spawn_in_for_test(&inner_dir).unwrap();
+        assert!(registry.dir_in_use(&wt));
+        assert!(registry.hold_dir_for_removal(&wt).is_none());
+        registry.release_spawn_for_test(&starting);
+
+        // So does a live agent rooted there through its orchestration cwd only.
+        let role = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                cwd: Some(&s(&sibling)),
+                tab_membership: Some(orchestration_in(&wt)),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a role rooted in the worktree");
+        assert!(registry.hold_dir_for_removal(&wt).is_none());
+        registry.close_agent(&role).unwrap();
+
+        // Unused: the hold is granted, and refuses spawns rooted inside it.
+        let hold = registry
+            .hold_dir_for_removal(&wt)
+            .expect("nothing is in it");
+        let by_cwd = registry.spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            cwd: Some(&s(&inner_dir)),
+            ..SpawnOptions::default()
+        });
+        assert!(
+            matches!(by_cwd, Err(AgentPtyError::DirBeingRemoved(_))),
+            "a start inside a held directory is refused; got {by_cwd:?}"
+        );
+        let by_orchestration = registry.spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            cwd: Some(&s(&sibling)),
+            tab_membership: Some(orchestration_in(&wt)),
+            ..SpawnOptions::default()
+        });
+        assert!(
+            matches!(by_orchestration, Err(AgentPtyError::DirBeingRemoved(_))),
+            "a role whose orchestration cwd is held is refused; got {by_orchestration:?}"
+        );
+        {
+            let inner = registry.inner.lock().unwrap();
+            assert!(
+                inner.agents.is_empty() && inner.pending_spawns.is_empty(),
+                "a refused start forks nothing and leaves no reservation"
+            );
+        }
+        let next_door = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                cwd: Some(&s(&sibling)),
+                ..SpawnOptions::default()
+            })
+            .expect("a sibling directory is not inside the held one");
+        registry.close_agent(&next_door).unwrap();
+
+        drop(hold);
+        assert!(
+            registry.inner.lock().unwrap().removal_holds.is_empty(),
+            "dropping the hold releases it"
+        );
+        let after = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                cwd: Some(&s(&wt)),
+                ..SpawnOptions::default()
+            })
+            .expect("a released hold refuses nothing");
+        registry.close_agent(&after).unwrap();
         registry.shutdown_all();
     }
 
