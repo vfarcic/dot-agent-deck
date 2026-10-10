@@ -67,24 +67,104 @@ fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
     }
 }
 
-/// What the CLI prints when the user interrupted it while it ran a command.
+/// What the CLI prints when the user interrupted an upgrade.
 pub const CANCELLED: &str = "Cancelled.";
 
-/// The CLI's [`Host`]: [`super::SystemHost`], with a Ctrl+C (`SIGINT`) or
-/// `SIGTERM` the CLI receives while it runs a command forwarded to that
-/// command as a cancellation ([`super::SystemHost::run_within_cancellable`]).
+/// The user's interruption of [`run`]: a Ctrl+C (`SIGINT`) or `SIGTERM` the
+/// CLI receives while it upgrades a copy.
+///
+/// Sticky: once set it stays set for the rest of the run, so no command is
+/// started after it ([`CliHost`]) and no further copy is attempted ([`run`]).
+/// Clones share the flag.
+#[derive(Clone, Default)]
+pub struct Interrupt {
+    set: Arc<AtomicBool>,
+    /// Whether [`Self::listen`] catches the two signals: the CLI's does; one
+    /// a test makes with `default()` is set only by the test.
+    signals: bool,
+}
+
+impl Interrupt {
+    /// The CLI's: set by `SIGINT` or `SIGTERM` while a copy is upgraded.
+    pub fn from_signals() -> Self {
+        Self {
+            set: Arc::default(),
+            signals: true,
+        }
+    }
+
+    /// Whether the user interrupted the run, now or earlier.
+    pub fn is_set(&self) -> bool {
+        #[cfg(unix)]
+        if self.signals && forward::received() {
+            self.set.store(true, Ordering::SeqCst);
+        }
+        self.set.load(Ordering::SeqCst)
+    }
+
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(all(test, unix))]
+    fn set(&self) {
+        self.set.store(true, Ordering::SeqCst);
+    }
+
+    /// Catch `SIGINT` and `SIGTERM` (when this catches signals) until the
+    /// returned guard is dropped, which puts the previous dispositions back.
+    /// Read [`Self::is_set`] after dropping it: a signal that arrives while
+    /// the dispositions are put back is caught and only seen then.
+    fn listen(&self) -> Listening {
+        #[cfg(unix)]
+        {
+            Listening {
+                _forwarding: self.signals.then(forward::Forwarding::install),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.signals;
+            Listening {}
+        }
+    }
+
+    /// Resolves once [`Self::is_set`]; asked every 50 ms.
+    async fn until_set(&self) {
+        while !self.is_set() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// [`Interrupt::listen`]'s guard.
+struct Listening {
+    #[cfg(unix)]
+    _forwarding: Option<forward::Forwarding>,
+}
+
+/// The CLI's [`Host`]: [`super::SystemHost`], with the user's interruption
+/// ([`Interrupt`]) forwarded to the command it runs as a cancellation
+/// ([`super::SystemHost::run_within_cancellable`]), and refused afterwards.
 ///
 /// The command runs in a session of its own, so the terminal's `^C` reaches
-/// only the CLI; without this, the CLI would die and leave the command
-/// running with nothing left to bound it. While a command runs, the two
-/// signals only set a flag; the run then stops the command's group, waits up
-/// to its grace for it to exit, and says it was cancelled. Between commands
-/// the signals keep their dispositions, so `^C` at a question still ends the
-/// CLI. `interrupted` stays set once a command was cancelled, which
-/// [`run`] reads to stop.
+/// only the CLI, which [`run`] catches while it upgrades a copy; without
+/// that, the CLI would die and leave the command running with nothing left to
+/// bound it. While a command runs, an interruption stops the command's group,
+/// waits up to its grace for it to exit, and says it was cancelled. Once the
+/// run is interrupted:
+///
+/// - a command is not started at all ([`super::cancelled_before_start`]),
+///   except a cleanup command ([`Host::run_cleanup`]: the disk-image detach,
+///   and the `dpkg-deb`/`dpkg-query` reads of a stopped `.deb` install), which
+///   still runs, bounded but not cancellable;
+/// - a command that exited successfully is reported as cancelled
+///   ([`super::cancelled_after_exit`]) rather than as its success, so the
+///   upgrade never acts on a check whose run the user cancelled, even one
+///   cancelled after the command exited, while its output was still read.
+///
+/// Nothing here signals a command: a cancellation reaches one only through
+/// the runner, before the runner has reaped it.
 pub struct CliHost {
     pub inner: super::SystemHost,
-    pub interrupted: Arc<AtomicBool>,
+    pub interrupt: Interrupt,
 }
 
 impl Host for CliHost {
@@ -94,22 +174,25 @@ impl Host for CliHost {
         args: &[&OsStr],
         timeout: std::time::Duration,
     ) -> std::io::Result<super::CommandOutput> {
-        #[cfg(unix)]
-        {
-            let forwarding = forward::Forwarding::install();
-            let result = self
-                .inner
-                .run_within_cancellable(program, args, timeout, &|| forward::received());
-            if forward::received() {
-                self.interrupted.store(true, Ordering::SeqCst);
+        if self.interrupt.is_set() {
+            return Err(super::cancelled_before_start());
+        }
+        let result = self
+            .inner
+            .run_within_cancellable(program, args, timeout, &|| self.interrupt.is_set());
+        match result {
+            Ok(output) if output.success && self.interrupt.is_set() => {
+                Err(super::cancelled_after_exit())
             }
-            drop(forwarding);
-            result
+            result => result,
         }
-        #[cfg(not(unix))]
-        {
-            self.inner.run_within(program, args, timeout)
-        }
+    }
+    fn run_cleanup(
+        &self,
+        program: &Path,
+        args: &[&OsStr],
+    ) -> std::io::Result<super::CommandOutput> {
+        self.inner.run(program, args)
     }
     fn find_program(&self, name: &str) -> Option<PathBuf> {
         self.inner.find_program(name)
@@ -134,19 +217,29 @@ impl Host for CliHost {
     }
 }
 
-/// The CLI's `SIGINT`/`SIGTERM` handling while it runs a command.
+/// The CLI's `SIGINT`/`SIGTERM` handler, installed while it upgrades a copy.
+///
+/// It owns the two dispositions process-wide for as long as it is installed,
+/// and is not reentrant: one [`Forwarding`] at a time, which `install`
+/// asserts. Only the standalone CLI's [`run`] installs it; it coordinates
+/// with no other user of these signals.
 #[cfg(unix)]
 mod forward {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Set by the handler: a signal arrived while a command ran. A handler
-    /// can do little more than store to an atomic, so the flag is a static.
+    /// Set by the handler. A handler can do little more than store to an
+    /// atomic, so the flag is a static. Never cleared: an interruption ends
+    /// the run.
     static RECEIVED: AtomicBool = AtomicBool::new(false);
 
-    /// Held while the handler is installed, so two runs never interleave
-    /// their saving and restoring of the dispositions.
-    static INSTALLED: Mutex<()> = Mutex::new(());
+    /// Whether a [`Forwarding`] is installed.
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Run while a [`Forwarding`] is dropped, after the last read of
+    /// [`RECEIVED`] inside the operation and before the dispositions are put
+    /// back: where a signal that must not be lost arrives.
+    #[cfg(test)]
+    pub(super) static BEFORE_RESTORE: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
 
     const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
@@ -154,8 +247,7 @@ mod forward {
         RECEIVED.store(true, Ordering::SeqCst);
     }
 
-    /// Whether a signal arrived since the current [`Forwarding`] was
-    /// installed.
+    /// Whether a signal arrived while a [`Forwarding`] was installed.
     pub(super) fn received() -> bool {
         RECEIVED.load(Ordering::SeqCst)
     }
@@ -164,13 +256,14 @@ mod forward {
     /// back the dispositions it replaced.
     pub(super) struct Forwarding {
         previous: Vec<(libc::c_int, libc::sigaction)>,
-        _installed: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Forwarding {
         pub(super) fn install() -> Self {
-            let installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
-            RECEIVED.store(false, Ordering::SeqCst);
+            assert!(
+                !INSTALLED.swap(true, Ordering::SeqCst),
+                "the CLI's signal handler is installed once at a time"
+            );
             let mut previous = Vec::new();
             for signal in SIGNALS {
                 // SAFETY: a zeroed sigaction is a valid empty one; the handler
@@ -187,15 +280,20 @@ mod forward {
                     }
                 }
             }
-            Self {
-                previous,
-                _installed: installed,
-            }
+            Self { previous }
         }
     }
 
     impl Drop for Forwarding {
         fn drop(&mut self) {
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_RESTORE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                hook();
+            }
             for (signal, old) in &self.previous {
                 // SAFETY: `old` is the disposition sigaction(2) returned for
                 // this signal when the handler was installed.
@@ -203,6 +301,7 @@ mod forward {
                     libc::sigaction(*signal, old, std::ptr::null_mut());
                 }
             }
+            INSTALLED.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -215,24 +314,18 @@ mod forward {
 /// downloads; the downloads inside an upgrade are driven from there through
 /// the runtime's handle, as the TUI does.
 ///
-/// Once `interrupted` is set (a command was cancelled, [`CliHost`]), it says
-/// [`CANCELLED`] and stops, attempting nothing further.
+/// The user's interruption is caught from the moment a copy's upgrade is
+/// confirmed to its outcome ([`upgrade_each`]); then it says [`CANCELLED`]
+/// and stops, attempting nothing further.
 pub async fn run(
     host: Arc<dyn Host>,
     source: &ReleaseSource,
     options: &PlanOptions,
     args: Args,
-    mut answers: Answers<'_>,
-    interrupted: &AtomicBool,
+    answers: Answers<'_>,
+    interrupt: &Interrupt,
     out: &mut dyn Write,
 ) -> bool {
-    let stop_if_interrupted = |out: &mut dyn Write| {
-        let stop = interrupted.load(Ordering::SeqCst);
-        if stop {
-            say(out, CANCELLED);
-        }
-        stop
-    };
     let found = {
         let host = host.clone();
         tokio::task::spawn_blocking(move || {
@@ -246,9 +339,6 @@ pub async fn run(
         .await
         .unwrap_or_else(|e| Err(UpgradeError::Io(e.to_string())))
     };
-    if stop_if_interrupted(out) {
-        return false;
-    }
     let (running, other) = match found {
         Ok(found) => found,
         Err(e) => {
@@ -277,20 +367,56 @@ pub async fn run(
     if args.check {
         return true;
     }
+    upgrade_each(
+        host,
+        &plans,
+        source,
+        &options.staging_root,
+        args,
+        answers,
+        interrupt,
+        out,
+    )
+    .await
+}
 
+/// Upgrade each actionable plan the user confirms, in order.
+///
+/// The `SIGINT`/`SIGTERM` handler is installed once a copy is confirmed and
+/// kept until that copy's outcome, then the previous dispositions are put
+/// back. So between copies and at a `[y/N]` question the signals keep them,
+/// and `^C` there still ends the CLI. `interrupt` is read only after the
+/// handler is gone, so a signal that arrived while it was being removed is
+/// not lost; once it is set, this says [`CANCELLED`] and attempts no further
+/// copy.
+#[allow(clippy::too_many_arguments)]
+async fn upgrade_each(
+    host: Arc<dyn Host>,
+    plans: &[UpgradePlan],
+    source: &ReleaseSource,
+    staging_root: &Path,
+    args: Args,
+    mut answers: Answers<'_>,
+    interrupt: &Interrupt,
+    out: &mut dyn Write,
+) -> bool {
     let mut ok = true;
     for plan in plans.iter().filter(|plan| plan.is_actionable()) {
         if !confirmed(plan, args, &mut answers, out) {
             continue;
         }
-        match execute_blocking(
-            host.clone(),
-            plan.clone(),
-            source.clone(),
-            &options.staging_root,
-        )
-        .await
-        {
+        let result = {
+            let _listening = interrupt.listen();
+            execute_blocking(
+                host.clone(),
+                plan.clone(),
+                source.clone(),
+                staging_root,
+                interrupt.clone(),
+            )
+            .await
+        };
+        match result {
             Ok(outcome) => {
                 say_items(out, &outcome.items());
                 ok &= outcome.upgraded();
@@ -301,7 +427,8 @@ pub async fn run(
                 ok = false;
             }
         }
-        if stop_if_interrupted(out) {
+        if interrupt.is_set() {
+            say(out, CANCELLED);
             return false;
         }
     }
@@ -310,17 +437,26 @@ pub async fn run(
 
 /// [`execute::execute`] on a blocking thread: its subprocesses and file work
 /// block there, and its downloads are driven through the current runtime's
-/// handle.
+/// handle. Once `interrupt` is set while it waits on a download, the upgrade
+/// is dropped there, before it changed anything ([`UpgradeError::Cancelled`]);
+/// its commands see the interruption through the host.
 async fn execute_blocking(
     host: Arc<dyn Host>,
     plan: UpgradePlan,
     source: ReleaseSource,
     staging_root: &std::path::Path,
+    interrupt: Interrupt,
 ) -> Result<execute::Outcome, UpgradeError> {
     let handle = tokio::runtime::Handle::current();
     let staging_root = staging_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        handle.block_on(execute::execute(&*host, &plan, &source, &staging_root))
+        handle.block_on(async {
+            tokio::select! {
+                biased;
+                result = execute::execute(&*host, &plan, &source, &staging_root) => result,
+                () = interrupt.until_set() => Err(UpgradeError::Cancelled),
+            }
+        })
     })
     .await
     .unwrap_or_else(|e| Err(UpgradeError::Io(e.to_string())))
@@ -380,10 +516,10 @@ pub fn main(args: Args) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupt = Interrupt::from_signals();
     let host = Arc::new(CliHost {
         inner: super::SystemHost::default(),
-        interrupted: interrupted.clone(),
+        interrupt: interrupt.clone(),
     });
     let source = ReleaseSource::from_build();
     let options = PlanOptions::terminal(&*host);
@@ -401,7 +537,7 @@ pub fn main(args: Args) -> std::process::ExitCode {
         &options,
         args,
         answers,
-        &interrupted,
+        &interrupt,
         &mut stdout,
     ));
     if ok {
@@ -535,6 +671,7 @@ mod tests {
                 plan,
                 source,
                 std::path::Path::new("/stage"),
+                Interrupt::default(),
             ))
             .unwrap();
         assert!(outcome.upgraded(), "{outcome:?}");
@@ -618,5 +755,198 @@ mod tests {
             format!("Detach it with:\n{COMMAND_NOT_SHOWN}\n  {faithful}\n")
         );
         assert!(!printed.contains("/s/mount"), "{printed}");
+    }
+
+    /// Scenario: once the user interrupted the run, the CLI's host starts no
+    /// command: running one returns "cancelled" at once and the command never
+    /// runs. A cleanup command (the disk-image detach, the `.deb` state reads)
+    /// still runs to its end.
+    #[cfg(unix)]
+    #[test]
+    fn cli_007_an_interrupted_host_starts_no_command_but_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let interrupt = Interrupt::default();
+        interrupt.set();
+        let host = CliHost {
+            inner: super::super::SystemHost::default(),
+            interrupt,
+        };
+        let sh = Path::new("/bin/sh");
+        let ran = dir.path().join("ran");
+        let script = format!("echo ran > '{}'", ran.display());
+        let err = host
+            .run(sh, &[OsStr::new("-c"), OsStr::new(&script)])
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "it was not started, because the upgrade was cancelled"
+        );
+        assert!(super::super::was_cancelled(&err));
+        assert!(!ran.exists(), "a command started after the interruption");
+
+        let cleaned = dir.path().join("cleaned");
+        let script = format!("echo cleaned > '{}'", cleaned.display());
+        let output = host
+            .run_cleanup(sh, &[OsStr::new("-c"), OsStr::new(&script)])
+            .expect("a cleanup command runs after the interruption");
+        assert!(output.success, "{output:?}");
+        assert!(cleaned.exists(), "the cleanup command did not run");
+    }
+
+    /// Scenario: a command exits successfully but leaves a descendant holding
+    /// its output open for a second, and the user interrupts the run in that
+    /// second, while the output is still read. The call reports the command
+    /// as cancelled, not as its success, so the upgrade never acts on it.
+    #[cfg(unix)]
+    #[test]
+    fn cli_008_a_command_interrupted_after_it_exited_is_not_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let exited = dir.path().join("exited");
+        let script = format!(
+            "echo 'dot-agent-deck 0.46.0'; /bin/sleep 1 & echo $$ > '{}'; exit 0",
+            exited.display()
+        );
+        let interrupt = Interrupt::default();
+        let host = CliHost {
+            inner: super::super::SystemHost::default(),
+            interrupt: interrupt.clone(),
+        };
+        let canceller = {
+            let exited = exited.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !std::fs::read_to_string(&exited).is_ok_and(|s| s.ends_with('\n')) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the command never ran"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // The command has exited; its descendant holds the output
+                // open for about a second more.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                interrupt.set();
+            })
+        };
+        let result = host.run_within(
+            Path::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            std::time::Duration::from_secs(30),
+        );
+        canceller.join().unwrap();
+        let err = result.expect_err("a run interrupted after the command exited succeeded");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "it finished, but the upgrade was cancelled before its result was used"
+        );
+        assert_eq!(super::super::unfinished_stopped(&err), Some(true));
+    }
+
+    /// A Homebrew copy whose `brew` is at `<prefix>/bin/brew`, offered 0.46.0.
+    #[cfg(unix)]
+    fn brew_plan(prefix: &str) -> UpgradePlan {
+        let mut installation = actionable().installation;
+        installation.executable = PathBuf::from(format!("{prefix}/bin/dot-agent-deck"));
+        installation.method = InstallMethod::Homebrew {
+            formula: crate::self_upgrade::HomebrewFormula::Stable,
+            prefix: PathBuf::from(prefix),
+        };
+        installation.tools.brew = Some(PathBuf::from(format!("{prefix}/bin/brew")));
+        plan::plan(
+            &installation,
+            &"0.46.0".into(),
+            &PlanOptions {
+                staging_root: PathBuf::from("/stage"),
+                can_prompt_for_privilege: false,
+                provenance: crate::self_upgrade::ProvenanceCheck::Unavailable {
+                    reason: "x".into(),
+                },
+            },
+        )
+    }
+
+    /// Scenario: `upgrade --yes` with two copies to upgrade. A `SIGINT`
+    /// arrives once the first copy's upgrade is over, while the CLI puts the
+    /// previous signal dispositions back (a test-only seam raises it there).
+    /// The signal is not lost: the CLI prints the first copy's outcome, then
+    /// `Cancelled.`, reports failure, and never asks about or starts the
+    /// second copy. Afterwards `SIGINT` is back at its default.
+    #[cfg(unix)]
+    #[test]
+    fn cli_009_a_signal_while_the_handler_is_removed_is_not_lost() {
+        use crate::self_upgrade::test_host::{FakeHost, ok};
+        let path =
+            "self_upgrade::cli::tests::cli_009_a_signal_while_the_handler_is_removed_is_not_lost";
+        if !crate::self_upgrade::tests::is_reexec_child() {
+            crate::self_upgrade::tests::reexec(path);
+            return;
+        }
+        let host = Arc::new(
+            FakeHost::new()
+                .exe("/opt/homebrew/bin/brew")
+                .exe("/usr/local/bin/brew")
+                .handle("/opt/homebrew/bin/brew", |_| ok(""))
+                .handle("/usr/local/bin/brew", |_| ok(""))
+                .deck("/opt/homebrew/bin/dot-agent-deck", "0.46.0")
+                .deck("/usr/local/bin/dot-agent-deck", "0.46.0"),
+        );
+        let plans = [brew_plan("/opt/homebrew"), brew_plan("/usr/local")];
+        // SAFETY: raise(3) delivers SIGINT to this thread before it returns;
+        // the hook runs while the CLI's handler is still installed, so the
+        // signal only sets its flag. This process is the re-exec'd half
+        // running this one test, so nothing else sees the signal.
+        *forward::BEFORE_RESTORE.lock().unwrap() = Some(|| unsafe {
+            libc::raise(libc::SIGINT);
+        });
+        let source = ReleaseSource {
+            api_url: String::new(),
+            list_url: String::new(),
+            download_base: String::new(),
+        };
+        let interrupt = Interrupt::from_signals();
+        let mut out = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ok = runtime.block_on(upgrade_each(
+            host.clone(),
+            &plans,
+            &source,
+            Path::new("/stage"),
+            Args {
+                check: false,
+                yes: true,
+            },
+            Answers::None,
+            &interrupt,
+            &mut out,
+        ));
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            forward::BEFORE_RESTORE.lock().unwrap().is_none(),
+            "the seam never ran"
+        );
+        assert!(!ok, "{printed}");
+        assert!(printed.ends_with("Cancelled.\n"), "{printed}");
+        assert_eq!(printed.matches("yes (--yes)").count(), 1, "{printed}");
+        let ran = host.ran();
+        assert!(
+            ran.contains(&"/opt/homebrew/bin/brew upgrade dot-agent-deck".to_string()),
+            "{ran:?}"
+        );
+        assert!(
+            !ran.iter().any(|line| line.starts_with("/usr/local/")),
+            "the second copy was attempted: {ran:?}"
+        );
+        // SAFETY: a null new action only reads the current disposition.
+        let disposition = unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current);
+            current.sa_sigaction
+        };
+        assert_eq!(disposition, libc::SIG_DFL, "SIGINT was not put back");
     }
 }

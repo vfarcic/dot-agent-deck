@@ -141,6 +141,16 @@ pub trait Host: Send + Sync {
         args: &[&OsStr],
         timeout: std::time::Duration,
     ) -> std::io::Result<CommandOutput>;
+    /// Run `program` with `args` as [`Self::run`] does, for a command that
+    /// cleans up after an upgrade or reports what one left: the disk-image
+    /// detach ([`execute`]'s `hdiutil detach`, plain and `-force`), and the
+    /// `dpkg-deb -f … Version` and `dpkg-query -W` that read the package's
+    /// state once a `.deb` install stopped. A client that refuses commands
+    /// once the user cancelled (the CLI's [`cli::CliHost`]) still runs these,
+    /// so a cancelled upgrade is cleaned up and says what it left.
+    fn run_cleanup(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+        self.run(program, args)
+    }
     /// The first executable called `name` on `PATH`.
     fn find_program(&self, name: &str) -> Option<PathBuf>;
     /// Whether `path` is an executable regular file.
@@ -575,6 +585,58 @@ pub fn cancelled_error(stopped: bool) -> std::io::Error {
     )
 }
 
+/// A command a client did not start because the user had already cancelled
+/// the upgrade ([`cli::CliHost`]). Nothing ran, so nothing is left running.
+pub fn cancelled_before_start() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        Unfinished {
+            why: plan::Interruption::Cancelled,
+            stopped: true,
+            message: "it was not started, because the upgrade was cancelled".to_string(),
+        },
+    )
+}
+
+/// A command that exited successfully, but whose run the user cancelled
+/// before its result was used ([`cli::CliHost`]): the upgrade does not act on
+/// it. It is no longer running.
+pub fn cancelled_after_exit() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        Unfinished {
+            why: plan::Interruption::Cancelled,
+            stopped: true,
+            message: "it finished, but the upgrade was cancelled before its result was used"
+                .to_string(),
+        },
+    )
+}
+
+/// Whether `error` says the command was cancelled ([`cancelled_error`],
+/// [`cancelled_before_start`], [`cancelled_after_exit`]).
+pub fn was_cancelled(error: &std::io::Error) -> bool {
+    unfinished(error).is_some_and(|unfinished| unfinished.why == plan::Interruption::Cancelled)
+}
+
+/// A probe's result, unless the user cancelled it: then the error the upgrade
+/// stops with, named after the command, so a cancelled probe reads as
+/// cancelled rather than as a wrong answer (a missing `--version`, a missing
+/// Team ID) by the callers that turn a failed probe into one.
+pub(crate) fn unless_cancelled(
+    result: std::io::Result<CommandOutput>,
+    program: &Path,
+    args: &[&OsStr],
+) -> Result<std::io::Result<CommandOutput>, UpgradeError> {
+    match result {
+        Err(error) if was_cancelled(&error) => Err(UpgradeError::CommandFailed {
+            command: display_command(program, args),
+            detail: error.to_string(),
+        }),
+        result => Ok(result),
+    }
+}
+
 /// A command whose wait failed with `error`: it may have been reaped by
 /// something else, so its pid is no longer known to be its own and it is not
 /// signalled. Whether it finished is not known.
@@ -692,6 +754,10 @@ pub enum UpgradeError {
     Io(String),
     #[error("This install is not upgraded from here: {0}")]
     NotActionable(String),
+    /// The user cancelled the upgrade while it downloaded the release, before
+    /// it changed anything.
+    #[error("The upgrade was cancelled while it downloaded the release. Nothing was changed.")]
+    Cancelled,
     /// `error` stopped the app swap, and the release's disk image could not
     /// be detached afterwards: it is still attached at `mount`.
     #[error("{error}")]
@@ -809,7 +875,22 @@ pub(crate) fn shell_word(word: &str) -> String {
 /// The version `binary --version` reports, without a leading `v`, or `None`
 /// when it does not answer as dot-agent-deck.
 pub fn reported_version(host: &dyn Host, binary: &Path) -> Option<String> {
-    let output = host.run(binary, &[OsStr::new("--version")]).ok()?;
+    reported_version_from(host.run(binary, &[OsStr::new("--version")]))
+}
+
+/// [`reported_version`], except that a cancelled `--version` is the error
+/// the upgrade stops with ([`unless_cancelled`]).
+pub(crate) fn reported_version_unless_cancelled(
+    host: &dyn Host,
+    binary: &Path,
+) -> Result<Option<String>, UpgradeError> {
+    let args = [OsStr::new("--version")];
+    unless_cancelled(host.run(binary, &args), binary, &args).map(reported_version_from)
+}
+
+/// The version a `--version` run reports ([`reported_version`]).
+fn reported_version_from(output: std::io::Result<CommandOutput>) -> Option<String> {
+    let output = output.ok()?;
     if !output.success {
         return None;
     }
@@ -1063,7 +1144,7 @@ mod tests {
     /// own, marked with [`REEXEC_CHILD`], and return its output once it
     /// exits. For a test that changes something process-wide, or needs a
     /// process with a controlling terminal of its own.
-    fn reexec(path: &str) -> std::process::Output {
+    pub(super) fn reexec(path: &str) -> std::process::Output {
         let exe = std::env::current_exe().expect("current_exe: this is a test binary");
         let output = std::process::Command::new(exe)
             .args(["--exact", path, "--nocapture", "--test-threads=1"])
@@ -1087,7 +1168,7 @@ mod tests {
         );
     }
 
-    fn is_reexec_child() -> bool {
+    pub(super) fn is_reexec_child() -> bool {
         std::env::var_os(REEXEC_CHILD).is_some()
     }
 

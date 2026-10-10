@@ -422,16 +422,33 @@ pub(crate) fn parse_dpkg_owner(stdout: &str, path: &Path) -> Option<String> {
 /// The app's Team ID from `codesign -dv`, which writes `TeamIdentifier=<id>`
 /// to stderr; `None` when it is unsigned or ad-hoc signed.
 pub(crate) fn team_id(host: &dyn Host, app: &Path) -> Option<String> {
-    let output = host
-        .run(
-            Path::new("/usr/bin/codesign"),
-            &[
-                OsStr::new("-dv"),
-                OsStr::new("--verbose=2"),
-                app.as_os_str(),
-            ],
-        )
-        .ok()?;
+    team_id_from(host.run(Path::new(CODESIGN), &team_id_args(app)))
+}
+
+/// [`team_id`], except that a cancelled `codesign -dv` is the error the
+/// upgrade stops with ([`super::unless_cancelled`]).
+pub(crate) fn team_id_unless_cancelled(
+    host: &dyn Host,
+    app: &Path,
+) -> Result<Option<String>, super::UpgradeError> {
+    let args = team_id_args(app);
+    let program = Path::new(CODESIGN);
+    super::unless_cancelled(host.run(program, &args), program, &args).map(team_id_from)
+}
+
+const CODESIGN: &str = "/usr/bin/codesign";
+
+fn team_id_args(app: &Path) -> [&OsStr; 3] {
+    [
+        OsStr::new("-dv"),
+        OsStr::new("--verbose=2"),
+        app.as_os_str(),
+    ]
+}
+
+/// The Team ID a `codesign -dv` run reports ([`team_id`]).
+fn team_id_from(output: std::io::Result<super::CommandOutput>) -> Option<String> {
+    let output = output.ok()?;
     if !output.success {
         return None;
     }

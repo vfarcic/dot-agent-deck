@@ -536,3 +536,96 @@ fn cli_upgrade_006_ctrl_c_stops_the_running_command_and_says_cancelled() {
         "{stdout}\n{stderr}"
     );
 }
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder, against a fake release server whose release binary answers `--version` correctly and exits, but leaves a descendant holding its output open for about a second. In that second, after the check's command has exited and while its output is still read, the CLI is sent `SIGINT`. The check counts as cancelled: the installed file is left byte for byte as it was, nothing runs the release binary again, and the CLI ends with `Cancelled.` and exits non-zero.
+#[spec("upgrade/cli-upgrade/007")]
+#[test]
+fn cli_upgrade_007_ctrl_c_after_the_version_check_exits_leaves_the_binary() {
+    let version = RELEASE;
+    let dir = common::harness_tempdir().expect("tempdir");
+    let home = dir.path();
+    let ran = home.join("release-ran.log");
+    let exited = home.join("version-check-exited");
+    let asset = format!(
+        "#!/bin/sh\necho \"$*\" >> '{ran}'\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n  echo 'dot-agent-deck {version}'\n  /bin/sleep 1 &\n  echo $$ > '{exited}'\n  exit 0\nfi\nexit 64\n",
+        ran = ran.display(),
+        exited = exited.display(),
+    )
+    .into_bytes();
+    let manifest = format!("{}  {}\n", sha256_hex(&asset), cli_asset());
+    let server = FakeReleases::start(version, asset, manifest);
+    let exe = writable_install(home);
+    let before = std::fs::read(&exe).unwrap();
+
+    let mut command = Command::new(bin());
+    command
+        .args(["upgrade", "--yes"])
+        .env_clear()
+        .envs(sandbox_env(home))
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("DOT_AGENT_DECK_STATE_DIR", home.join("state"))
+        .env("DOT_AGENT_DECK_SOCKET", home.join("hook.sock"))
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", home.join("attach.sock"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in server.env(&exe, OLD_VERSION) {
+        command.env(key, value);
+    }
+    let cli = command.spawn().expect("run dot-agent-deck upgrade");
+    let cli_pid = i32::try_from(cli.id()).unwrap();
+    let check_pid = || -> Option<i32> {
+        std::fs::read_to_string(&exited)
+            .ok()
+            .filter(|s| s.ends_with('\n'))
+            .and_then(|s| s.trim().parse().ok())
+    };
+    // The check's command has exited once its pid is gone (or a zombie);
+    // its descendant holds the output open for about a second more, while
+    // the CLI still reads it.
+    let checked = common::wait_until(Duration::from_secs(60), || check_pid().is_some_and(gone));
+    if checked {
+        // SAFETY: the pid is the CLI this test spawned and has not reaped.
+        unsafe { libc::kill(cli_pid, libc::SIGINT) };
+    } else {
+        // SAFETY: as above; the check never ran, so end the CLI.
+        unsafe { libc::kill(cli_pid, libc::SIGKILL) };
+    }
+    let out = cli.wait_with_output().expect("wait for the CLI");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        checked,
+        "the release's version check never ran\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&exe).unwrap(),
+        before,
+        "the installed file changed although the check was cancelled\n{stdout}\n{stderr}"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(exe.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "dot-agent-deck")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "--version\n",
+        "the release binary ran again after the cancelled check\n{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("Upgraded"), "{stdout}\n{stderr}");
+    let failed = stdout
+        .lines()
+        .find(|line| line.contains("--version` failed: it"))
+        .unwrap_or_else(|| panic!("no failed version check\n{stdout}\n{stderr}"));
+    assert!(failed.contains("cancelled"), "{stdout}\n{stderr}");
+    assert!(
+        !out.status.success(),
+        "a cancelled upgrade exits non-zero\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.trim_end().ends_with("Cancelled."),
+        "{stdout}\n{stderr}"
+    );
+}

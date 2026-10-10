@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::{Host, UpgradeError, reported_version};
+use super::{Host, UpgradeError, reported_version_unless_cancelled};
 
 /// The SHA-256 the manifest lists for `asset`. The manifest is `shasum -a 256`
 /// output: `<64 hex digits>  <name>`, or `<hex> *<name>` in binary mode.
@@ -148,7 +148,12 @@ impl ProvenanceCheck {
                 reason: GH_NOT_INSTALLED.to_string(),
             };
         };
-        let output = match host.run(gh, &[OsStr::new("auth"), OsStr::new("status")]) {
+        Self::from_auth_status(gh, host.run(gh, &auth_status()))
+    }
+
+    /// [`Self::with_gh`] for what `gh auth status` answered.
+    fn from_auth_status(gh: &Path, output: std::io::Result<super::CommandOutput>) -> Self {
+        let output = match output {
             Ok(output) => output,
             Err(e) => {
                 return Self::Unavailable {
@@ -194,6 +199,11 @@ impl ProvenanceCheck {
     pub fn will_check(&self) -> bool {
         matches!(self, Self::Available { .. })
     }
+}
+
+/// `gh auth status`'s arguments: whether `gh` is logged in.
+fn auth_status() -> [&'static OsStr; 2] {
+    [OsStr::new("auth"), OsStr::new("status")]
 }
 
 /// Whether build provenance was checked.
@@ -247,7 +257,11 @@ pub fn verify_provenance(
         }
         ProvenanceCheck::Available { gh } => gh,
     };
-    if let ProvenanceCheck::Unavailable { reason } = ProvenanceCheck::with_gh(host, Some(gh)) {
+    let args = auth_status();
+    let auth_status = super::unless_cancelled(host.run(gh, &args), gh, &args)?;
+    if let ProvenanceCheck::Unavailable { reason } =
+        ProvenanceCheck::from_auth_status(gh, auth_status)
+    {
         return Err(UpgradeError::ProvenanceUnavailable { reason });
     }
     let failed = |detail: String| UpgradeError::ProvenanceFailed {
@@ -323,7 +337,7 @@ pub fn verify_binary_version(
     expected: &str,
 ) -> Result<(), UpgradeError> {
     let expected = expected.strip_prefix('v').unwrap_or(expected);
-    match reported_version(host, path) {
+    match reported_version_unless_cancelled(host, path)? {
         Some(actual) if actual == expected => Ok(()),
         actual => Err(UpgradeError::VersionMismatch {
             expected: expected.to_string(),
@@ -700,5 +714,45 @@ mod tests {
             Err(UpgradeError::VersionMismatch { .. })
         ));
         assert!(verify_binary_version(&host, Path::new("/t/other"), "0.46.0").is_err());
+    }
+
+    /// Scenario: the user cancels the upgrade while the new binary answers
+    /// `--version`, or while `gh auth status` runs before the provenance
+    /// check. Each check stops the upgrade naming the command and saying it
+    /// was cancelled, rather than reading the cancelled run as a binary with
+    /// no version or a `gh` that cannot be used.
+    #[test]
+    fn verify_014_a_cancelled_probe_reads_as_cancelled() {
+        use crate::self_upgrade::{cancelled_after_exit, cancelled_before_start};
+        let host = FakeHost::new()
+            .handle_io("/t/new", |_| Err(cancelled_after_exit()))
+            .handle_io("/usr/bin/gh", |_| Err(cancelled_before_start()));
+        assert_eq!(
+            verify_binary_version(&host, Path::new("/t/new"), "0.46.0"),
+            Err(UpgradeError::CommandFailed {
+                command: "/t/new --version".into(),
+                detail: "it finished, but the upgrade was cancelled before its result was used"
+                    .into(),
+            })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = verify_provenance(
+            &host,
+            &ProvenanceCheck::Available {
+                gh: PathBuf::from("/usr/bin/gh"),
+            },
+            &dir.path().join("checksums.txt"),
+            b"manifest",
+            "0.46.0",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            UpgradeError::CommandFailed {
+                command: "/usr/bin/gh auth status".into(),
+                detail: "it was not started, because the upgrade was cancelled".into(),
+            }
+        );
+        assert!(!host.ran().iter().any(|line| line.contains("attestation")));
     }
 }

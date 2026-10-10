@@ -5328,6 +5328,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** `SIGTERM` (same handler), a command that cannot be stopped (`self_upgrade` unit tests), Ctrl+C at the confirmation question.
 - **Platform coverage:** mac+linux.
 
+##### upgrade/cli-upgrade/007 — Ctrl+C after the release's `--version` check exited, while its output is still read, leaves the binary.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a correctly checksummed script whose `--version` answers, leaves a descendant holding its output open for about a second, and exits; `SIGINT` sent to the CLI in that second).
+- **Agent:** none.
+- **Asserts:** the installed file is unchanged byte for byte and no temporary file is left beside it; the release script ran once (`--version`) and never again; no `Upgraded`; a `` `…--version` failed: `` line saying it was cancelled; non-zero exit; `Cancelled.` as the last line.
+- **Does not assert:** the refusal to start a command once interrupted and the teardown-window signal (`self_upgrade::cli` unit tests `cli_007`–`cli_009`), the detach of a cancelled app swap (`execute_034`).
+- **Platform coverage:** mac+linux.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor

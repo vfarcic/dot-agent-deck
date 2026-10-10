@@ -411,6 +411,11 @@ impl Outcome {
 /// Carry out `plan`. The caller has shown it and the user confirmed.
 /// `staging_root` is where this upgrade creates its private staging
 /// directory ([`super::plan::PlanOptions::staging_root`]).
+///
+/// Every await in it is a download, before anything is changed, so a client
+/// may drop it at an await to cancel the upgrade (the CLI does,
+/// [`super::cli`]). Keep it so: an await after a change would let a drop
+/// abandon an upgrade half done.
 pub async fn execute(
     host: &dyn Host,
     plan: &UpgradePlan,
@@ -435,10 +440,10 @@ pub async fn execute(
             // `brew upgrade` succeeds when the formula is already at the
             // tap's newest, which lags the GitHub release for a while after
             // it is published. Only the copy's own answer says it moved.
-            let reported = brew
-                .parent()
-                .map(|bin| bin.join(CLI_BINARY))
-                .and_then(|deck| super::reported_version(host, &deck));
+            let reported = match brew.parent().map(|bin| bin.join(CLI_BINARY)) {
+                Some(deck) => super::reported_version_unless_cancelled(host, &deck)?,
+                None => None,
+            };
             if reported.as_deref() == Some(version) {
                 Ok(Outcome::BrewUpgraded {
                     formula: formula.name(),
@@ -698,7 +703,7 @@ fn found_package(host: &dyn Host, deb: &Path, sha256: &str, previous: &str) -> p
         Ok(version) => version,
         Err(why) => return plan::Found::Unreadable(why),
     };
-    let output = host.run(
+    let output = host.run_cleanup(
         Path::new(DPKG_QUERY),
         &[
             OsStr::new("-W"),
@@ -732,7 +737,7 @@ fn found_package(host: &dyn Host, deb: &Path, sha256: &str, previous: &str) -> p
 fn staged_deb_version(host: &dyn Host, deb: &Path, sha256: &str) -> Result<String, String> {
     verify::rehash(deb, sha256).map_err(|e| e.to_string())?;
     let output = host
-        .run(
+        .run_cleanup(
             Path::new(DPKG_DEB),
             &[OsStr::new("-f"), deb.as_os_str(), OsStr::new("Version")],
         )
@@ -1077,7 +1082,7 @@ fn check_app(host: &dyn Host, app: &Path, team_id: &str, assess: bool) -> Result
         VERIFY_TIMEOUT,
     )
     .map_err(failed)?;
-    match super::detect::team_id(host, app) {
+    match super::detect::team_id_unless_cancelled(host, app)? {
         Some(found) if found == team_id => {}
         found => {
             return Err(UpgradeError::AppCheckFailed(format!(
@@ -1210,7 +1215,7 @@ impl<'a> Attached<'a> {
                 let mut args = vec![OsStr::new("detach"), self.mount.as_os_str()];
                 args.extend_from_slice(extra);
                 self.host
-                    .run(Path::new(HDIUTIL), &args)
+                    .run_cleanup(Path::new(HDIUTIL), &args)
                     .is_ok_and(|out| out.success)
             };
             self.attached = !(detach(&[]) || detach(&[OsStr::new("-force")]));
@@ -1650,6 +1655,114 @@ mod tests {
             "{:?}",
             host.ran()
         );
+    }
+
+    /// [`FakeHost`] as the CLI's host behaves once the user cancelled: the
+    /// first command that answers "cancelled" cancels the upgrade, and from
+    /// then on every command is refused unless it is a cleanup command
+    /// ([`Host::run_cleanup`]).
+    struct Cancelling {
+        inner: FakeHost,
+        cancelled: std::sync::atomic::AtomicBool,
+        refused: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Host for Cancelling {
+        fn run_within(
+            &self,
+            program: &Path,
+            args: &[&OsStr],
+            timeout: std::time::Duration,
+        ) -> std::io::Result<CommandOutput> {
+            use std::sync::atomic::Ordering;
+            if self.cancelled.load(Ordering::SeqCst) {
+                self.refused
+                    .lock()
+                    .unwrap()
+                    .push(crate::self_upgrade::display_command(program, args));
+                return Err(crate::self_upgrade::cancelled_before_start());
+            }
+            let result = self.inner.run_within(program, args, timeout);
+            if let Err(error) = &result
+                && crate::self_upgrade::was_cancelled(error)
+            {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+        fn run_cleanup(&self, program: &Path, args: &[&OsStr]) -> std::io::Result<CommandOutput> {
+            self.inner.run(program, args)
+        }
+        fn find_program(&self, name: &str) -> Option<PathBuf> {
+            self.inner.find_program(name)
+        }
+        fn is_executable(&self, path: &Path) -> bool {
+            self.inner.is_executable(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+            self.inner.canonicalize(path)
+        }
+        fn dir_writable(&self, dir: &Path) -> bool {
+            self.inner.dir_writable(dir)
+        }
+        fn home(&self) -> Option<PathBuf> {
+            Host::home(&self.inner)
+        }
+        fn is_wsl(&self) -> bool {
+            self.inner.is_wsl()
+        }
+    }
+
+    /// Scenario: the user cancels the app upgrade while Gatekeeper assesses
+    /// the new app, on a host that refuses every command after that but a
+    /// cleanup one. The swap stops with the cancellation, the installed app
+    /// is untouched, nothing is copied, and the release's disk image is
+    /// still detached.
+    #[test]
+    fn execute_034_a_cancelled_swap_still_detaches_the_image() {
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let mut inner = with_version_answer(fake_mac("TEAM123", true), &work.join("mount"));
+        inner.handlers.remove(SPCTL);
+        let inner = inner.handle_io(SPCTL, |_| Err(crate::self_upgrade::cancelled_error(true)));
+        let host = Cancelling {
+            inner,
+            cancelled: Default::default(),
+            refused: Default::default(),
+        };
+        let err = swap_app(
+            &host,
+            Path::new("/s/x.dmg"),
+            &app,
+            "TEAM123",
+            "0.46.0",
+            &work,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("it was cancelled and stopped"),
+            "{err}"
+        );
+        assert!(
+            !matches!(err, UpgradeError::StillMounted { .. }),
+            "the image was left attached: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(app.join("Contents/MacOS").join(CLI_BINARY)).unwrap(),
+            b"old"
+        );
+        let ran = host.inner.ran();
+        assert!(
+            ran.iter()
+                .any(|line| line.starts_with(&format!("{HDIUTIL} detach"))),
+            "the image was not detached: ran {ran:?}, refused {:?}",
+            host.refused.lock().unwrap()
+        );
+        assert!(!ran.iter().any(|line| line.starts_with(DITTO)), "{ran:?}");
     }
 
     #[test]
