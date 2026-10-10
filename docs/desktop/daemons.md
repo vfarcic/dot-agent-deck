@@ -118,7 +118,7 @@ When a remote daemon runs an older release than the app, the app offers **Upgrad
 - On the Dashboard, on the daemon's section header, when the daemon is connected. Hovering it shows both versions.
 - In the **Incompatible daemon** note, when the app has refused the daemon because it is older, beside the note's other buttons.
 
-It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (update the app instead; upgrading the app is not done from here), or when the app could not learn the daemon's version. Upgrade is for remote daemons. For the daemon on this machine, update the deck the usual way and [recycle the daemon](../troubleshooting.md#recycling-the-daemon).
+It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (upgrade the app instead, with its own upgrade button; see [Desktop App → Upgrade the app](index.md#upgrade-the-app)), or when the app could not learn the daemon's version. Upgrade is for remote daemons. For the daemon on this machine, upgrade the app and the CLI ([Desktop App → Upgrade the app](index.md#upgrade-the-app), or `dot-agent-deck upgrade` in a terminal) and [recycle the daemon](../troubleshooting.md#recycling-the-daemon).
 
 **What happens when you press it:**
 

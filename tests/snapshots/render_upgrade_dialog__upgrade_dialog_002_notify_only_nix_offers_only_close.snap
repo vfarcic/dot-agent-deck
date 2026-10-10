@@ -1,0 +1,29 @@
+---
+source: tests/render_upgrade_dialog.rs
+expression: text
+---
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                                                  │  
+  │ dot-agent-deck: update available: v0.47.0 (current: v0.46.0)                                                     │  
+  │ Installed with Nix (/nix/store/abc-dot-agent-deck-0.46.0/bin/dot-agent-deck), so it is not changed from here.    │  
+  │ Update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`.              │  
+  │                                                                                                                  │  
+  │ > Close                                                                                                          │  
+  │                                                                                                                  │  
+  │ Enter or Esc closes                                                                                              │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

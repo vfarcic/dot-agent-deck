@@ -57,7 +57,7 @@ This is the rule that matters most. A cleanup unit that always finds something t
 
 ## Step 0: bring the base up to date
 
-Every unit is cut from this checkout's `HEAD` (`dispatch` has no base option). Apply `/issue-queue`'s step 0 as written: `git fetch origin`, then fast-forward `main` with `git merge --ff-only origin/main` under its three preconditions, or report which precondition blocked it and let the runner decide. When `/issue-queue` step 10 calls this skill it has just done this, so do not repeat it.
+Every unit is cut from this checkout's `HEAD` (`dispatch` has no base option). Apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill as written: it fetches, fast-forwards `main` when there is no local work to move, or reports which precondition blocked it and lets the runner decide. When `/issue-queue` step 10 calls this skill it has just done this, so do not repeat it.
 
 ## Step 1: resolve identity and make sure the label exists
 

@@ -123,6 +123,23 @@ desktopScenario("daemon-upgrade", async (page) => {
   await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
 });
 
+// Issue #1635 — upgrading this machine's own copies: the `docs` dashboard
+// behind the newer-release banner and the rail's upgrade button, and the
+// dialog the banner opens, stopped at its first question (the app's). The
+// fixture's stand-in plays a `.dmg` app and a Homebrew CLI on v0.46.0 with
+// v0.47.0 out; nothing is installed.
+desktopScenario("self-upgrade", async (page) => {
+  await page.goto("/?fixture=1&state=docs&selfupgrade=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.locator(".overview-row")).toHaveCount(4);
+  await expect(page.getByTestId("self-upgrade-rail")).toBeVisible();
+  await page.getByTestId("self-upgrade-banner-open").click();
+  await expect(page.getByTestId("self-upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+  await expect(page.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "app");
+  await expect(page.getByTestId("self-upgrade-plan-cli")).toBeVisible();
+});
+
 desktopScenario("settings-voice", async (page) => {
   await page.goto("/?fixture=1&state=docs");
   await page.getByTestId("open-settings").click();

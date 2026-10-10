@@ -1,0 +1,29 @@
+---
+source: tests/render_upgrade_dialog.rs
+expression: text
+---
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                                                  │  
+  │ dot-agent-deck: update available: v0.47.0 (current: v0.46.0)                                                     │  
+  │ Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck), but `brew` was not      │  
+  │ found. Upgrade it with:                                                                                          │  
+  │   brew upgrade dot-agent-deck                                                                                    │  
+  │                                                                                                                  │  
+  │ > Close                                                                                                          │  
+  │                                                                                                                  │  
+  │ Enter or Esc closes                                                                                              │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

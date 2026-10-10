@@ -1625,8 +1625,13 @@ pub struct AppState {
     /// agent's first real hook, or a pane that never sends one. Order only:
     /// nothing here is identity, and dropped with the pane.
     pane_surfaced_agent_seq: HashMap<String, u64>,
-    /// Set by the background version-check task when a newer release exists.
-    pub update_available: Option<String>,
+    /// Issue #1635: what the TUI's last release check found — the plans for
+    /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
+    /// at start and every re-check interval. `None` until a check succeeds.
+    pub upgrade_check: Option<std::sync::Arc<crate::upgrade_dialog::UpgradeCheck>>,
+    /// Issue #1635: the id of the check `upgrade_check` holds, so a check that
+    /// started earlier never replaces it ([`crate::upgrade_dialog::publish`]).
+    pub upgrade_check_id: u64,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no

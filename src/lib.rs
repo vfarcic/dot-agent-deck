@@ -100,7 +100,9 @@ pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod schedule_cli;
+// Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;
+pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
 pub mod submit_echo;
@@ -138,6 +140,7 @@ pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.
 pub mod untrusted_text;
+pub mod upgrade_dialog;
 pub mod version;
 pub mod watch;
 pub mod worktree_owner;

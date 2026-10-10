@@ -269,6 +269,17 @@ enum Commands {
         #[arg(long, conflicts_with = "topic")]
         all: bool,
     },
+    /// Check for a newer release and upgrade this machine's dot-agent-deck
+    /// and Agent Deck desktop app, each through the way it was installed.
+    /// Prints what it would do and asks before each upgrade (issue #1635).
+    Upgrade {
+        /// Only report what is installed and what an upgrade would do.
+        #[arg(long)]
+        check: bool,
+        /// Upgrade without asking for confirmation.
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+    },
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -1634,6 +1645,12 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Upgrade { check, yes }) => {
+            dot_agent_deck::self_upgrade::cli::main(dot_agent_deck::self_upgrade::cli::Args {
+                check,
+                yes,
+            })
+        }
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -2471,12 +2488,10 @@ async fn run_tui_session() -> ExitCode {
     // the TUI's `AppState` mirrors live agent activity.
     spawn_event_subscriber(attach_path.clone(), state.clone());
 
-    let version_state = state.clone();
-    tokio::spawn(async move {
-        if let Some(latest) = dot_agent_deck::version::check_for_update().await {
-            version_state.write().await.update_available = Some(latest);
-        }
-    });
+    // Issue #1635: check for a newer release at start and every re-check
+    // interval, and plan this machine's copies, for the footer badge and the
+    // upgrade dialog.
+    tokio::spawn(dot_agent_deck::upgrade_dialog::run_checker(state.clone()));
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 
