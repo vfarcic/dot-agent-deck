@@ -20,6 +20,8 @@
 //! maintainer page.
 
 mod common;
+#[path = "support/fake_releases.rs"]
+mod fake_releases;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -162,11 +164,16 @@ fn capture_unless(
         );
         page.replace_range(start..end, &format!("{display:<width$}"));
     }
+    write_page(scenario, &page);
+    true
+}
+
+/// Write a rendered frame as `<scenario>-tui.html`.
+fn write_page(scenario: &str, page: &str) {
     let dir = html_dir();
     std::fs::create_dir_all(&dir).expect("create the TUI HTML dir");
     let path = dir.join(format!("{scenario}-tui.html"));
     std::fs::write(&path, page).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    true
 }
 
 /// One agent on the dashboard: the pane it runs in and the hook events that
@@ -870,7 +877,97 @@ fn docs_screenshot_help() {
     let deck = launch();
     deck.wait_for_string("No active agents");
     deck.send_keys(b"?");
+    // The overlay's first and last lines, so a frame caught while it is still
+    // being drawn is not the one written.
     capture(&deck, "help", |grid| {
-        grid.contains("Create new agent") && grid.contains("┌ Help")
+        grid.contains("Create new agent")
+            && grid.contains("┌ Help")
+            && grid.contains("Press ? or Esc to close")
     });
+}
+
+/// The release the `self-upgrade` scene offers and the one its copy runs: the
+/// desktop half of the scenario shows the same pair.
+const SELF_UPGRADE_LATEST: &str = "0.47.0";
+const SELF_UPGRADE_RUNNING: &str = "0.46.0";
+/// Where the scene's copy appears to be installed.
+const SELF_UPGRADE_DISPLAY_EXE: &str = "/home/dev/.local/bin/dot-agent-deck";
+
+/// Scenario: Start the deck as a v0.46.0 copy installed as a downloaded binary
+/// in a folder it can write, with a fake release server offering v0.47.0. The
+/// footer badge names the release; pressing `u` opens the upgrade dialog at its
+/// first question, with this copy's plan and Cancel selected, and that frame is
+/// written as `self-upgrade-tui.html`.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_self_upgrade() {
+    use fake_releases::{FakeReleases, cli_asset};
+    use sha2::{Digest, Sha256};
+
+    html_dir();
+    // The dialog prints the copy's path, and the upgrade plan needs a folder
+    // the copy can really write to. A `/tmp` directory whose path is exactly
+    // as long as the displayed one is written over by it in the HTML, so the
+    // swap moves no cell and the dialog wraps as it would for that path.
+    const TAIL: &str = "/bin/dot-agent-deck";
+    const RANDOM: usize = 6;
+    let prefix_len = SELF_UPGRADE_DISPLAY_EXE.len() - "/tmp/".len() - RANDOM - TAIL.len();
+    let install = tempfile::Builder::new()
+        .prefix(&"dad-docs-upgrade"[..prefix_len])
+        .rand_bytes(RANDOM)
+        .tempdir_in("/tmp")
+        .expect("create the scene's install folder");
+    let exe = install.path().join("bin/dot-agent-deck");
+    let exe_text = exe.to_str().expect("UTF-8 path").to_string();
+    assert_eq!(
+        exe_text.chars().count(),
+        SELF_UPGRADE_DISPLAY_EXE.chars().count(),
+        "the install path must be as long as the one displayed"
+    );
+    std::fs::create_dir_all(exe.parent().unwrap()).expect("create the install's bin folder");
+    std::fs::write(&exe, b"#!/bin/sh\necho old\n").expect("write the installed copy");
+
+    let asset = format!("#!/bin/sh\necho 'dot-agent-deck {SELF_UPGRADE_LATEST}'\n").into_bytes();
+    let sha: String = Sha256::digest(&asset)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let server = FakeReleases::start(
+        SELF_UPGRADE_LATEST,
+        asset,
+        format!("{sha}  {}\n", cli_asset()),
+    );
+    let deck = launch_with(|mut builder| {
+        for (key, value) in server.env(&exe, SELF_UPGRADE_RUNNING) {
+            builder = builder.with_env(key, value);
+        }
+        builder
+    });
+    deck.wait_for_string("No active agents");
+    deck.wait_for_string("u to upgrade");
+    deck.send_keys(b"u");
+
+    let page = deck.capture_screen_when("self-upgrade", |screen| {
+        let grid = screen.contents();
+        (grid.contains(&format!(
+            "update available: v{SELF_UPGRADE_LATEST} (current: v{SELF_UPGRADE_RUNNING})"
+        )) && grid.contains(&format!("Upgrade to v{SELF_UPGRADE_LATEST}"))
+            && grid.contains("Downloaded binary at")
+            && grid.contains(&format!(
+                "Upgrade dot-agent-deck to v{SELF_UPGRADE_LATEST}?"
+            ))
+            && grid.contains("> Cancel"))
+        .then(|| render_page(screen, "self-upgrade (TUI)", &RenderOptions::default()))
+    });
+    assert!(
+        page.contains(&exe_text),
+        "the dialog shows the install path whole on one row"
+    );
+    let page = page.replace(&exe_text, SELF_UPGRADE_DISPLAY_EXE);
+    let temp_root = install.path().to_str().expect("UTF-8 path");
+    assert!(
+        !page.contains(temp_root),
+        "no part of the scene's temp path reaches the image"
+    );
+    write_page("self-upgrade", &page);
 }
