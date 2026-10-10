@@ -85,11 +85,12 @@ function runtime(agents: DesktopAgentDto[], overrides: Partial<DeckRuntimeState>
 function voiceRuntime(outcome: VoiceResultDto["outcome"]) {
   let started = false;
   let delivered = false;
+  let nextOutcome = outcome;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 1240, maxMs: 30_000, capped: false, available: true, backend: "remote" });
-  const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({ outcome, resolveMs: null, backend: "stub" }));
+  const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({ outcome: nextOutcome, resolveMs: null, backend: "stub" }));
   const declareVoiceScreen = vi.fn();
-  const said = outcome.kind === "dispatch" ? outcome.transcript : "";
   return {
+    deliver: (next: VoiceResultDto["outcome"]) => { nextOutcome = next; delivered = false; },
     resolveVoice,
     declareVoiceScreen,
     overrides: {
@@ -100,8 +101,12 @@ function voiceRuntime(outcome: VoiceResultDto["outcome"]) {
         return status(started ? "recording" : "idle");
       }),
       voiceStart: vi.fn(async () => { started = true; return status("recording"); }),
-      voiceStop: vi.fn(async () => ({ outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 })),
+      voiceStop: vi.fn(async () => {
+        const said = nextOutcome.kind === "dispatch" ? nextOutcome.transcript : "";
+        return { outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 };
+      }),
       voiceCancel: vi.fn(async () => status("idle")),
+      voiceCommands: vi.fn(async () => []),
     } satisfies Partial<DeckRuntimeState>,
   };
 }
@@ -154,6 +159,18 @@ describe("PRD #1401 — the pull request badge", () => {
     renderShell(host, [agent("7")]);
     expect(screen.queryByTestId("pr-badge-7")).not.toBeInTheDocument();
     expect(screen.queryByText(/Pull request #/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a pull request whose state is unknown uses a different glyph from an open request, with its unknown meaning named for readers. */
+  it("distinguishes an unknown PR state from the open PR icon", () => {
+    render(<>
+      <PullRequestBadge pullRequest={{ number: 9, state: "open" }} testId="open-badge" />
+      <PullRequestBadge pullRequest={{ number: 9, state: "unknown" }} testId="unknown-badge" />
+    </>);
+    const unknown = screen.getByTestId("unknown-badge");
+    expect(unknown).toHaveAccessibleName("Pull request #9: state unknown");
+    const glyph = (badge: HTMLElement) => badge.querySelector("svg")!.innerHTML;
+    expect(glyph(unknown), "Unknown must not show the open pull request glyph").not.toBe(glyph(screen.getByTestId("open-badge")));
   });
 
   it.each([
@@ -211,7 +228,7 @@ describe("PRD #1401 — the in-app pull request browser", () => {
    * the app over the agent's screen, with the app's toolbar around it, and the
    * agent's pane is still there underneath.
    */
-  it("opens over the agent's screen from the badge", () => {
+  it("opens over the agent's screen from the badge", async () => {
     const { host } = fakeHost();
     renderShell(host);
     fireEvent.click(screen.getByTestId("pr-badge-7"));
@@ -224,6 +241,14 @@ describe("PRD #1401 — the in-app pull request browser", () => {
       expect(within(browser).getByRole("button", { name })).toBeVisible();
     }
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    // MutationObserver in the still-mounted pane must have had a chance to
+    // notice the new sibling. fireEvent itself does not respect inert.
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(browser.closest("[inert]") !== null, "The frontmost PR browser must accept pointer and keyboard input").toBe(false);
+    for (const name of ["Back", "Open in browser", "Close pull request"]) {
+      expect.soft(within(browser).getByRole("button", { name }).closest("[inert]") !== null, `${name} must be reachable`).toBe(false);
+    }
+    expect(screen.getByTestId("agent-pane-overlay").closest("[inert]")).not.toBeNull();
   });
 
   /** Scenario: the toolbar's Back steps the page back and leaves it open. */
@@ -247,6 +272,31 @@ describe("PRD #1401 — the in-app pull request browser", () => {
     expect(host.openExternal).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: the system browser refuses to open the page; the app keeps the PR and explains the failure so the user can retry. */
+  it("keeps the PR open and shows a failed system-browser handoff", async () => {
+    const { host } = fakeHost();
+    host.openExternal.mockRejectedValueOnce(new Error("System browser launch failed"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Open in browser" })); });
+
+    expect.soft(screen.queryByTestId("pr-browser"), "A failed handoff must preserve the page").toBeInTheDocument();
+    expect.soft(screen.queryByRole("alert"), "The launch error must be visible").toHaveTextContent("System browser launch failed");
+    expect(host.close).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: Back cannot navigate the native PR page; the toolbar leaves it open and shows the navigation error. */
+  it("surfaces a rejected Back command", async () => {
+    const { host } = fakeHost();
+    host.back.mockRejectedValueOnce(new Error("PR page cannot go back"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByRole("alert"), "Back errors must be visible").toHaveTextContent("PR page cannot go back");
   });
 
   /**
@@ -357,6 +407,66 @@ describe("PRD #1401 — the pull request browser by voice", () => {
     );
     return voice;
   }
+
+  async function openVoiceHelp(host: PrBrowserHost) {
+    const voice = renderVoice(host, dispatchOutcome("list_commands", "showVoiceCommands", "what can I say?", "Here is what you can say."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(host.setVisible).toHaveBeenLastCalledWith(true);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await screen.findByTestId("voice-help");
+    return voice;
+  }
+
+  /** Scenario: the real What you can say overlay covers the PR, hides the native page, and Escape dismisses only help. */
+  it("hides the PR page under real voice help and leaves Escape to help", async () => {
+    const { host } = fakeHost();
+    await openVoiceHelp(host);
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+    expect.soft(host.setVisible).toHaveBeenLastCalledWith(false);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect.soft(screen.queryByTestId("voice-help")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pr-browser"), "Escape must preserve the PR underneath voice help").toBeInTheDocument();
+  });
+
+  /** Scenario: after asking for voice help over a PR, saying close dismisses the help through the real voice registry while keeping the PR open. */
+  it("withholds PR close from the voice registry while real help is up", async () => {
+    const { host } = fakeHost();
+    const voice = await openVoiceHelp(host);
+    act(() => voice.deliver(dispatchOutcome("close", "closeTopmost", "close", "Closed.")));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(2));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("voice-help")).not.toBeInTheDocument();
+    expect.soft(screen.queryByTestId("pr-browser"), "Voice close must dismiss help and keep the PR").toBeInTheDocument();
+    expect(host.close).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: a spoken system-browser handoff fails; the PR stays available and voice reports the failure instead of announcing success. */
+  it("does not announce a successful voice handoff when the host rejects", async () => {
+    const { host } = fakeHost();
+    host.openExternal.mockRejectedValueOnce(new Error("System browser launch failed"));
+    renderVoice(host, dispatchOutcome("open_pr_in_browser", "openPullRequestInBrowser", "open it in the browser", "Opened it in your browser."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.openExternal).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect.soft(screen.queryByText(/Opened it in your browser\./)).not.toBeInTheDocument();
+    expect(screen.queryAllByText(/System browser launch failed/).length, "Voice or browser must explain the host failure").toBeGreaterThan(0);
+  });
+
+  /** Scenario: a spoken scroll reaches the native PR page but fails; the app keeps the PR and explains the scroll failure. */
+  it("surfaces a rejected voice Scroll command", async () => {
+    const { host } = fakeHost();
+    host.scroll.mockRejectedValueOnce(new Error("PR page cannot scroll"));
+    renderVoice(host, dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.scroll).toHaveBeenCalledWith("down"));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryAllByText(/PR page cannot scroll/).length, "Scroll errors must be visible").toBeGreaterThan(0);
+  });
 
   /** Scenario: on the agent's screen the user says "open the PR"; GitHub's page opens in the app. */
   it("opens the pane's agent's pull request when told to", async () => {
