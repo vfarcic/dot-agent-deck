@@ -455,12 +455,6 @@ fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
         .collect()
 }
 
-/// How long work_done_005 waits for each report it expects. Every wait returns
-/// as soon as its report lands (0.7s for the whole test on a quiet box); 5s
-/// expired once in a full `cargo test-fast` run on a loaded box (2026-10-10,
-/// issue #1604's PR), so the budget is the 20s this file gives deliveries.
-const RESPAWN_FAILED_WAIT: Duration = Duration::from_secs(20);
-
 /// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be handed a SUBMITTED respawn-failure report that names no role, and must then report the completion as one it never commissioned, never pointing at a summary file. After the user types into the orchestrator, a second delegate must produce a second, identical report that is still submitted.
 #[spec("orchestration/work-done/005")]
 #[test]
@@ -497,7 +491,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let after_delegate = harness
             .wait_for_orchestrator(
                 |snapshot| snapshot.contains(RESPAWN_FAILED_NEEDLE),
-                RESPAWN_FAILED_WAIT,
+                Duration::from_secs(5),
             )
             .await;
         assert!(
@@ -516,7 +510,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let after_delegate = harness
             .wait_for_orchestrator(
                 |snapshot| matches!(respawn_failed_terminators(snapshot).first(), Some(Some(_))),
-                RESPAWN_FAILED_WAIT,
+                Duration::from_secs(5),
             )
             .await;
         let report = respawn_failed_reports(&after_delegate)
@@ -541,6 +535,16 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
             "the respawn-failure report must be SUBMITTED (CR after its final clause), not left \
              as an LF line in scrollback; snapshot = {after_delegate:?}"
         );
+        // The ledger is settled before the report goes out, so anything that
+        // answers the report finds no commission left to spend. Released after
+        // it instead, a `work-done` sent on seeing the report could land first
+        // and be laundered into a solicited one, as it did on a quiet macOS
+        // runner on 2026-10-10.
+        assert!(
+            !harness.registry.owes_delegation_commission(WORKER_PANE),
+            "the respawn-failure report must not be visible while the dead delegate's \
+             commission still stands"
+        );
 
         // The delegate never reached the worker, so a completion arriving now was
         // asked for by a person, not by the orchestrator.
@@ -551,7 +555,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         let snapshot = harness
             .wait_for_orchestrator(
                 |snapshot| snapshot.contains(UNSOLICITED_NEEDLE),
-                RESPAWN_FAILED_WAIT,
+                Duration::from_secs(5),
             )
             .await;
         assert!(
@@ -584,7 +588,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
                     let terminators = respawn_failed_terminators(snapshot);
                     terminators.len() >= 2 && terminators[1].is_some()
                 },
-                RESPAWN_FAILED_WAIT,
+                Duration::from_secs(5),
             )
             .await;
         let terminators = respawn_failed_terminators(&after_second);
