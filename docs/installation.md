@@ -284,6 +284,8 @@ When it connects, the app checks whether it and the daemon can work together:
 
 **Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
+When the daemon on this machine is an older release that the app can still work with, the app restarts it onto the app's version without being asked when nothing is running on it, and asks first, listing what would stop, when agents are running. See [Desktop app → Daemons → Upgrade the daemon on this machine](desktop/daemons.md#upgrade-the-daemon-on-this-machine).
+
 `daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this.
 
 ## How it runs
@@ -309,7 +311,7 @@ On launch the TUI compares its build with the running daemon's. If they differ:
 
 If you keep an older daemon, features added by the newer release may not work against it; see [Troubleshooting → Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon).
 
-If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. For the desktop app, install the new release's package the same way as the first time.
+If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. For the desktop app, install the new release's package the same way as the first time. When the updated app finds the daemon on this machine running the older release, it restarts the daemon onto its own version as the TUI does, asking first when agents are running ([Desktop app → Daemons → Upgrade the daemon on this machine](desktop/daemons.md#upgrade-the-daemon-on-this-machine)).
 
 ## Versioning
 

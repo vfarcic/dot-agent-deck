@@ -2938,3 +2938,115 @@ describe("ControlDeck", () => {
     expect(vi.mocked(live.listProjects).mock.calls.length).toBe(listings);
   });
 });
+
+/**
+ * Issue #1636 — the app upgrading the local daemon on its own when it finds it
+ * running an older release, as the TUI does at launch: straight away with
+ * nothing running on it, asking first with agents running, and once per
+ * daemon version while the app runs.
+ */
+describe("upgrading an older local daemon at launch (issue #1636)", () => {
+  const OLDER = { kind: "offered", from: "0.44.0", to: "0.45.0" } as const;
+  function olderLocal(runningAgentCount = 0) {
+    const snapshot = createFixtureSnapshot("connected");
+    snapshot.agents = [];
+    snapshot.connection = {
+      status: "connected",
+      deckId: "deck-local",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount,
+      daemonBuildVersion: "0.44.0-gabc1234",
+      upgradeOffer: OLDER,
+    };
+    return snapshot;
+  }
+  beforeEach(() => window.history.replaceState({}, "", "/"));
+
+  /** Scenario: Launch against an older local daemon with nothing running; the app restarts it onto its own version without being asked and says so. */
+  it("restarts an idle older local daemon without asking, and says so", async () => {
+    const snapshot = olderLocal();
+    const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") });
+    const view = render(<DeckShell runtime={live} />);
+
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledExactlyOnceWith("deck-local", expect.any(Function)));
+    expect(screen.queryByTestId("upgrade-start")).not.toBeInTheDocument();
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon upgraded");
+    expect(outcome).toHaveTextContent("The daemon on this machine now runs 0.45.0 (it was 0.44.0).");
+    expect(outcome).toHaveTextContent("Nothing was running, so nothing was stopped.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+
+    // A later snapshot of the same daemon version is not a new reason to restart.
+    view.rerender(<DeckShell runtime={{ ...live, snapshot: structuredClone(snapshot), fleet: [structuredClone(snapshot)] }} />);
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    expect(live.upgradeDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Launch against an older local daemon with an agent running; the app lists it, Keep current daemon stops nothing, the app does not ask again, and Upgrade on the daemon's section asks on demand. */
+  it("asks before stopping agents, keeps the daemon on Keep, and leaves Upgrade for later", async () => {
+    const snapshot = olderLocal(1);
+    const atStake = { agents: [{ id: "1", label: "coder", paneId: "4", cwd: "/work/app" }], roles: [] };
+    let release!: () => void;
+    const upgradeDaemon = vi.fn(async (deckId: string, onEvent: (event: UpgradeEvent) => void) => {
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "restarting" } });
+      onEvent({ type: "decision", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake, stale: false });
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake } } as UpgradeOutcome;
+    });
+    const live = runtime({ mode: "live", snapshot, upgradeDaemon, desktopFeatures: fixtureDesktopFeatures("") });
+    const view = render(<DeckShell runtime={live} />);
+
+    const question = await screen.findByTestId("upgrade-decision");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Restart and stop these?");
+    expect(question).toHaveTextContent("Restarting the daemon on this machine stops 1 agent");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder (pane 4, in /work/app)");
+    expect(within(question).getByTestId("upgrade-restart-now")).toHaveTextContent("Restart now");
+    fireEvent.click(within(question).getByTestId("upgrade-keep-current"));
+    expect(live.decideUpgrade).toHaveBeenCalledExactlyOnceWith("upgrade-1", 1, "keep-current");
+    await act(async () => release());
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon kept running");
+    expect(outcome).toHaveTextContent("The daemon keeps running 0.44.0, as you chose, so these keep running:");
+    expect(outcome).toHaveTextContent("Press Upgrade again when they have finished.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+
+    view.rerender(<DeckShell runtime={{ ...live, snapshot: structuredClone(snapshot), fleet: [structuredClone(snapshot)] }} />);
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    expect(upgradeDaemon).toHaveBeenCalledTimes(1);
+
+    const upgrade = screen.getByTestId("daemon-upgrade");
+    expect(upgrade).toHaveAccessibleName("Upgrade the daemon on this machine");
+    fireEvent.click(upgrade);
+    expect(screen.getByTestId("upgrade-confirm-body")).toHaveTextContent("The daemon on this machine runs 0.44.0, and this app is 0.45.0.");
+    expect(upgradeDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: The app starts nothing on its own for a local daemon at its own release or newer, for a remote daemon, for a refused local daemon, or in the fixture preview. */
+  it("starts nothing on its own unless the connected local daemon is older", () => {
+    const cases: [string, Partial<DeckRuntimeState>][] = [];
+    for (const upgradeOffer of [{ kind: "current" }, { kind: "daemon-newer", daemon: "0.46.0" }, { kind: "unknown" }] as const) {
+      const snapshot = olderLocal();
+      snapshot.connection.upgradeOffer = upgradeOffer;
+      cases.push([upgradeOffer.kind, { mode: "live", snapshot }]);
+    }
+    const remote = olderLocal();
+    remote.connection = { ...remote.connection, deckId: "deck-remote", socketPath: "dev@build-box", deckKind: "remote" };
+    cases.push(["remote", { mode: "live", snapshot: remote }]);
+    const refused = olderLocal();
+    refused.connection = { ...refused.connection, status: "error", message: "build mismatch" };
+    cases.push(["refused", { mode: "live", snapshot: refused }]);
+    cases.push(["fixture", { mode: "fixture", snapshot: olderLocal() }]);
+
+    for (const [name, overrides] of cases) {
+      const live = runtime({ ...overrides, desktopFeatures: fixtureDesktopFeatures("") });
+      const view = render(<DeckShell runtime={live} />);
+      expect(live.upgradeDaemon, name).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("upgrade-dialog"), name).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+});

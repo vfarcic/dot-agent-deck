@@ -118,7 +118,7 @@ When a remote daemon runs an older release than the app, the app offers **Upgrad
 - On the Dashboard, on the daemon's section header, when the daemon is connected. Hovering it shows both versions.
 - In the **Incompatible daemon** note, when the app has refused the daemon because it is older, beside the note's other buttons.
 
-It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (update the app instead; upgrading the app is not done from here), or when the app could not learn the daemon's version. Upgrade is for remote daemons. For the daemon on this machine, update the deck the usual way and [recycle the daemon](../troubleshooting.md#recycling-the-daemon).
+It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (update the app instead; upgrading the app is not done from here), or when the app could not learn the daemon's version. For the daemon on this machine, **Upgrade** installs nothing: it restarts the daemon onto the app's own version, and the app does that by itself when it finds an older one. See [Upgrade the daemon on this machine](#upgrade-the-daemon-on-this-machine).
 
 **What happens when you press it:**
 
@@ -156,6 +156,32 @@ The app installs over ssh from this computer, the way `remote upgrade` does, so 
 `It failed while checking the restarted daemon: restarted, but the new daemon did not answer within 20s` means the old daemon stopped and its replacement did not come up in time. If a systemd user service runs the daemon on that machine, systemd normally starts the new one itself: check that the unit keeps `Restart=on-failure` and run `systemctl --user restart dot-agent-deck.service` there ([Keep the daemon running](../remote-requirements.md#keep-the-daemon-running)). Otherwise, press **Start daemon** on its section of the Dashboard ([Start a daemon from the app](#start-a-daemon-from-the-app)), or run `dot-agent-deck connect <name>`, which starts one, and press **Reconnect**.
 
 When the reason ends with `and it is still the daemon that was asked to restart`, the old daemon agreed to restart but never stopped, and nothing replaced it. Press **Upgrade** again, or run `dot-agent-deck daemon restart` on that machine and press **Reconnect**.
+
+## Upgrade the daemon on this machine
+
+When the daemon on this machine runs an older release than the app, for example because you updated the app while the daemon kept running, the app restarts the daemon onto the app's version, as the TUI does when it starts ([Installation → Upgrading](../installation.md#upgrading) has the TUI's prompt). The daemon it starts is the one that came with the app, the same one **Start daemon** starts, so nothing is downloaded or installed.
+
+**What happens when the app finds an older daemon here**, at start or while it is open:
+
+- **Nothing is running on the daemon**: the app restarts it without asking. The **Upgrade** dialog opens on its progress (**Preparing this app's daemon**, **Restarting the daemon**, **Checking the new daemon answers**) and ends with **Daemon upgraded** and both versions, for example `The daemon on this machine now runs 0.47.0 (it was 0.46.0).` Press **Close**.
+- **Agents or orchestration roles are running on it**: the dialog says so and lists every one the restart would stop, by name, with its pane and directory where the daemon knows them, the same question the remote [Upgrade](#upgrade-a-remote-daemon) asks.
+  - **Restart now** stops exactly those and restarts the daemon onto the app's version.
+  - **Keep current daemon**, the default, stops nothing, and the daemon keeps running the older version with your agents. Closing the dialog or pressing `Escape` is the same as **Keep current daemon**.
+  - If what is running changes while you decide, nothing is stopped and the dialog shows the new list and asks again.
+
+The app does this once for each daemon version while it is open, so after **Keep current daemon**, or a restart that failed, it does not ask again until the next time you start the app. To upgrade sooner, press **Upgrade** on the **Local daemon** section of the Dashboard; hovering it shows both versions. The dialog asks first, then goes on as above.
+
+The restarted daemon sets up the agent hooks again, as every daemon start does.
+
+It applies only while the app is connected to the daemon on this machine, so the **Daemon** selector must show **This machine** or **All daemons**. Nothing happens when the daemon runs the same release as the app or a newer one. A daemon the app cannot work with shows **Incompatible daemon** with **Replace daemon** instead, which restarts it the same way ([Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)).
+
+A daemon from a release before 0.46.0 cannot be asked to restart. The app restarts it only when nothing is running on it; otherwise the dialog ends with **Daemon kept running** and lists what is running. Stop those agents, or let them finish, then press **Upgrade**.
+
+The dialog ends with one of the titles in the [remote table above](#upgrade-a-remote-daemon), without the install: **Daemon upgraded**, **Daemon kept running**, **Another restart is already running**, **Upgrade failed** or **Upgrade stopped unexpectedly**, each with what to do. **No daemon was running** means the daemon stopped before it could be restarted; press **Start daemon** on its section of the Dashboard.
+
+**Check it worked:** the **Local daemon** section of the Dashboard lists its agents (or **No agents are running yet**) and no longer offers **Upgrade**.
+
+**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)).
 
 ## Rename a remote daemon
 

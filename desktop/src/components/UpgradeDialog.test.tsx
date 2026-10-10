@@ -1,10 +1,12 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { UpgradeEvent, UpgradeOutcome, UpgradeStopSet } from "../lib/upgrade";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 
 const TARGET: UpgradeTarget = { deckId: "deck-remote", deckName: "build-box", kind: "upgrade", offer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
+const LOCAL_TARGET: UpgradeTarget = { deckId: "deck-local", deckName: "Local daemon", kind: "local-upgrade", offer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
 const AT_STAKE: UpgradeStopSet = {
   agents: [{ id: "7", label: "coder", paneId: "2", cwd: "/work/app" }],
   roles: [{ paneId: "1", role: "orchestrator", orchestration: "tdd", isOrchestrator: true }],
@@ -385,6 +387,60 @@ describe("UpgradeDialog", () => {
     await finish({ outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: { agents: [], roles: [] } });
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon replaced");
     expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("The daemon on this machine now runs 0.45.0");
+  });
+
+  /** Scenario: Upgrade on the local deck names both versions and restarts onto this app's build, installing nothing (issue #1636). */
+  it("words the local Upgrade as a restart onto this app's version", async () => {
+    const { runtime, emit, finish } = controlledRuntime();
+    render(<UpgradeDialog target={LOCAL_TARGET} runtime={runtime} onClose={vi.fn()} />);
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrade the daemon on this machine?");
+    expect(screen.getByTestId("upgrade-confirm-body")).toHaveTextContent("The daemon on this machine runs 0.44.0, and this app is 0.45.0. Agent Deck restarts the daemon onto the version that came with this app.");
+    expect(screen.getByTestId("upgrade-start")).toHaveTextContent("Upgrade");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrading the daemon on this machine…");
+    emit(progress("installing"));
+    expect(screen.getByTestId("upgrade-stage-installing")).toHaveTextContent("Preparing this app's daemon");
+    emit(decision);
+    const question = screen.getByTestId("upgrade-decision");
+    expect(question).toHaveTextContent("Restarting the daemon on this machine stops 1 agent and 1 orchestration role");
+    expect(question).toHaveTextContent("Keep current daemon leaves them running on the old version. Press Upgrade when they have finished.");
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "restart-now");
+    await finish({ outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: AT_STAKE });
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon upgraded");
+    expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("The daemon on this machine now runs 0.45.0 (it was 0.44.0).");
+    expect(screen.getByTestId("upgrade-outcome-list")).toHaveTextContent("Agent coder (pane 2, in /work/app)");
+  });
+
+  /** Scenario: Opened by the app on its own, the dialog starts the upgrade at once with no Upgrade/Cancel step, and still asks before stopping anything. */
+  it("starts at once when the app opens it on its own, and still asks before stopping agents", async () => {
+    const { runtime, emit, finish } = controlledRuntime();
+    render(<UpgradeDialog target={LOCAL_TARGET} runtime={runtime} onClose={vi.fn()} autoStart />);
+    expect(runtime.upgradeDaemon).toHaveBeenCalledTimes(1);
+    expect(runtime.upgradeDaemon).toHaveBeenCalledWith("deck-local", expect.any(Function));
+    expect(screen.queryByTestId("upgrade-start")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("upgrade-cancel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "running");
+    emit(decision);
+    // Nothing is stopped without an explicit Restart now; Escape is Keep.
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
+    expect(runtime.decideUpgrade).not.toHaveBeenCalledWith("upgrade-1", 1, "restart-now");
+    await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
+  });
+
+  /** Scenario: Under React's StrictMode, which runs effects twice, the app's own upgrade still starts exactly once. */
+  it("starts the app's own upgrade once under StrictMode", () => {
+    const { runtime } = controlledRuntime();
+    render(<StrictMode><UpgradeDialog target={LOCAL_TARGET} runtime={runtime} onClose={vi.fn()} autoStart /></StrictMode>);
+    expect(runtime.upgradeDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Opened on its own by a runtime that cannot upgrade, the dialog shows its confirmation with Upgrade disabled rather than a run that never starts. */
+  it("does not claim to be running when the runtime cannot upgrade", () => {
+    render(<UpgradeDialog target={LOCAL_TARGET} runtime={{ decideUpgrade: vi.fn() }} onClose={vi.fn()} autoStart />);
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+    expect(screen.getByTestId("upgrade-start")).toBeDisabled();
   });
 
   /**
