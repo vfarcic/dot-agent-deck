@@ -1948,7 +1948,9 @@ describe("sticky dictation in the open agent pane", () => {
     expect(stop.closest("[inert]")).toBeNull();
     expect(stop.tabIndex).toBeGreaterThanOrEqual(0);
     expect(voiceButton()).toHaveAccessibleName(/voice.*typing to coder/i);
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByText(/typing to coder/i)).toBeVisible();
+    // PRD #1497 decision 6 — marked on the one indicator row at the window's top edge.
+    expect(screen.getByTestId("voice-typing-indicator")).toHaveTextContent(/typing to coder/i);
+    expect(screen.getByTestId("voice-typing-indicator")).toBeVisible();
   }
 
   /** Scenario: enter the mode in coder's pane, dictate two full utterances,

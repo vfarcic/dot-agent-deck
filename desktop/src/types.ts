@@ -1486,7 +1486,7 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
    * PRD #1261 — answer a pending numbered choice, locally
@@ -1531,6 +1531,18 @@ export interface DeckRuntimeState {
   voiceStatus?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
   /** Abandon a recording without transcribing it. Idempotent and never refused. */
   voiceCancel?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /** PRD #1497 D9 — how the next spoken sentence is to be said. */
+  voiceSpeechPlan?: () => Promise<import("./lib/bridge").SpeechPlanDto>;
+  /** PRD #1497 D9 — the Commands connection's speech audio for `text`. */
+  voiceSpeechAudio?: (text: string) => Promise<ArrayBuffer>;
+  /** PRD #1497 M5 — start reading one agent; see `DeckBridge.voiceReadingStart`. */
+  voiceReadingStart?: (target: import("./lib/reading").ReadingTarget, onSentence: (sentence: import("./lib/reading").ReadingSentenceDto) => void) => Promise<import("./lib/reading").ReadingStartDto>;
+  /** PRD #1497 M5 — end a reading session. */
+  voiceReadingStop?: (session: number) => Promise<void>;
+  /** PRD #1497 — a save from any window turned reading's switch off; see `DeckBridge.onVoiceReadingConsentOff`. */
+  onVoiceReadingConsentOff?: (listener: () => void) => Promise<() => void>;
+  /** PRD #1497 — a save left reading's switch on; see `DeckBridge.onVoiceReadingConsentOn`. */
+  onVoiceReadingConsentOn?: (listener: () => void) => Promise<() => void>;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *

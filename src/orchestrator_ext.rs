@@ -42,9 +42,10 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 ///   - `orchestrator.ts` — the pure logic it imports via `./orchestrator.ts`.
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
-/// `index.ts` discovery layout does not require one, and the extension's only
-/// runtime import (`typebox`) plus its type-only `@earendil-works/pi-coding-agent`
-/// import are resolved from Pi's own installation when jiti loads the extension.
+/// `index.ts` discovery layout does not require one: the extension's one
+/// package import (`typebox`) plus its type-only `@earendil-works/pi-coding-agent`
+/// import are resolved from Pi's own installation when jiti loads the extension,
+/// and `node:child_process` is a Node built-in.
 ///
 /// `include_str!` paths are relative to this source file (`src/`), so they
 /// reference the real `pi-extension/` sources and stay in sync on rebuild.

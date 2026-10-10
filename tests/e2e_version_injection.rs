@@ -125,9 +125,9 @@
 //!   suite and a full-parallel nested compile can starve the timed tests around
 //!   it into flaking. That premise used to be mostly false and is now true: see
 //!   the next point.
-//! - nextest schedules this test at the **front** of its queue (`priority` in
-//!   `.config/nextest.toml`) instead of at its natural binary-name position
-//!   about 70% of the way down. It was the last of ~2,680 tests to finish in 13
+//! - nextest schedules this test near the **front** of its queue, behind only
+//!   the exclusive reservations (`priority` in `.config/nextest.toml`), instead
+//!   of at its natural binary-name position about 70% of the way down. It was the last of ~2,680 tests to finish in 13
 //!   of 13 CI runs *and* the last to start, at t = 148.6-156.9s every time, so
 //!   the job's whole test wall clock was that offset plus this test's duration.
 //!   The full measurement is in that file's comment.

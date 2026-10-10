@@ -159,9 +159,62 @@ const directorySessions = new Map();
 const sessionAliases = new Map();
 let shuttingDown = false;
 
+// PRD #1497: the assistant's reply, for the deck's voice "reading on". The text
+// parts of each assistant message are kept as they stream in (the full text
+// arrives on `message.part.updated`, and `message.part.delta` carries the
+// increments in between); when the session goes idle, the text of its LAST
+// assistant message is attached to that idle report as `reply`, once. Keyed by
+// OpenCode's own (raw) session id, never by the directory alias below: a
+// subagent's child session shares the root's directory, and its reply is not
+// the user's turn. A reply is only published for a session KNOWN to be a root
+// (no `parentID`) when it goes idle, learned from `session.created` /
+// `session.updated` or, when neither was seen, asked of OpenCode's client in
+// the background (lookUpAncestry); an unknown or child session's idle report
+// carries no reply, and never waits for an answer.
+//
+// Bounded: a message retains at most MAX_REPLY_BYTES of UTF-8 text across all
+// its parts (the daemon's own bound, so nothing kept here is cut there) and at
+// most MAX_REPLY_PARTS parts; at most MAX_REPLY_MESSAGES messages and
+// MAX_REPLY_SESSIONS sessions' reply state are tracked at once, the oldest
+// forgotten first, and a deleted or disposed session's state is dropped.
+const MAX_REPLY_BYTES = 8192;
+const MAX_REPLY_PARTS = 256;
+const MAX_REPLY_MESSAGES = 64;
+const MAX_REPLY_SESSIONS = 256;
+const ANCESTRY_LOOKUP_MS = 2000;
+const MAX_ANCESTRY_LOOKUPS = 8;
+const replyMessages = new Map();
+const lastAssistantMessage = new Map();
+const failedTurns = new Set();
+const abortedTurns = new Set();
+// Raw session id -> its parent's id, or "" for a root session.
+const sessionParents = new Map();
+let sessionClient = undefined;
+// Ancestry lookups in flight, by raw session id (lookUpAncestry), how many of
+// their requests have not settled, and a count bumped on every disposal so an
+// answer to a lookup started before one is discarded.
+const ancestryLookups = new Map();
+let unsettledAncestryLookups = 0;
+let disposalGeneration = 0;
+
+// PRD #1497: DOT_AGENT_DECK_BIN, when it is an absolute path, names the binary
+// to report through instead of BINARY_PATH (the `task run-all` sandbox sets it
+// to the build under test). Anything else — unset, empty, a bare name or a
+// relative path — is ignored, since execFileSync would resolve it through the
+// agent's PATH or working directory (issue #536). Used verbatim, not trimmed,
+// and read per event, like the deck's hook commands.
+const isAbsoluteOverride = (value) =>
+  process.platform === "win32"
+    ? /^([A-Za-z]:[\\/]|[\\/]{{2}})/.test(value)
+    : value.startsWith("/");
+const hookBinary = () => {{
+  const override = process.env.DOT_AGENT_DECK_BIN;
+  return typeof override === "string" && isAbsoluteOverride(override) ? override : BINARY_PATH;
+}};
+
 const sendEvent = (payload) => {{
   try {{
-    execFileSync(BINARY_PATH, ["hook", "--agent", "opencode"], {{
+    execFileSync(hookBinary(), ["hook", "--agent", "opencode"], {{
       input: JSON.stringify(payload),
       timeout: 5000,
       stdio: ["pipe", "ignore", "ignore"],
@@ -391,6 +444,7 @@ const flushSessions = () => {{
   for (const [sessionId, info] of knownSessions.entries()) {{
     closeSession(sessionId, info?.cwd, true, true);
   }}
+  forgetAllReplyState();
 }};
 
 const handleShutdown = () => {{
@@ -406,6 +460,276 @@ for (const signal of ["SIGINT", "SIGTERM"]) {{
   process.once(signal, handleShutdown);
 }}
 
+// `text` cut to at most `budget` bytes of UTF-8 at a code point boundary, with
+// a lone surrogate replaced by U+FFFD (JSON would carry it as an escape the
+// deck cannot decode). The string is walked lazily and the walk stops at the
+// budget, so a huge input costs the budget, not its length.
+const clipBytes = (text, budget) => {{
+  let kept = "";
+  let bytes = 0;
+  if (typeof text !== "string" || budget <= 0) {{
+    return {{ text: kept, bytes }};
+  }}
+  for (const ch of text) {{
+    const cp = ch.codePointAt(0);
+    const lone = cp >= 0xd800 && cp <= 0xdfff;
+    const size = lone ? 3 : cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + size > budget) {{
+      break;
+    }}
+    kept += lone ? "�" : ch;
+    bytes += size;
+  }}
+  return {{ text: kept, bytes }};
+}};
+
+// Insert or refresh `key` in a Map (with `value`) or a Set, as its newest
+// entry, forgetting the oldest past MAX_REPLY_SESSIONS.
+const rememberBounded = (collection, key, value) => {{
+  collection.delete(key);
+  if (collection instanceof Map) {{
+    collection.set(key, value);
+  }} else {{
+    collection.add(key);
+  }}
+  while (collection.size > MAX_REPLY_SESSIONS) {{
+    collection.delete(collection.keys().next().value);
+  }}
+}};
+
+const forgetReplyState = (sessionId) => {{
+  lastAssistantMessage.delete(sessionId);
+  failedTurns.delete(sessionId);
+  abortedTurns.delete(sessionId);
+  for (const [id, entry] of replyMessages.entries()) {{
+    if (entry.sessionId === sessionId) {{
+      replyMessages.delete(id);
+    }}
+  }}
+}};
+
+const forgetAllReplyState = () => {{
+  disposalGeneration += 1;
+  for (const sessionId of Array.from(ancestryLookups.keys())) {{
+    cancelAncestryLookup(sessionId);
+  }}
+  replyMessages.clear();
+  lastAssistantMessage.clear();
+  failedTurns.clear();
+  abortedTurns.clear();
+  sessionParents.clear();
+}};
+
+const isChildSession = (sessionId) => {{
+  const parent = sessionParents.get(sessionId);
+  return parent !== undefined && parent !== "";
+}};
+
+// Record a session's ancestry from its info; a child's reply state is dropped.
+const noteSessionAncestry = (info) => {{
+  if (!info || typeof info.id !== "string" || !info.id) {{
+    return;
+  }}
+  const parent = typeof info.parentID === "string" ? info.parentID : "";
+  rememberBounded(sessionParents, info.id, parent);
+  if (parent) {{
+    forgetReplyState(info.id);
+  }}
+}};
+
+// Stop waiting for `sessionId`'s ancestry lookup (it was deleted, or OpenCode
+// disposed): its answer, if one still comes, is discarded.
+const cancelAncestryLookup = (sessionId) => {{
+  const lookup = ancestryLookups.get(sessionId);
+  if (lookup) {{
+    ancestryLookups.delete(sessionId);
+    lookup.abort();
+  }}
+}};
+
+// Ask OpenCode's client, in the background, whether `sessionId` is a root,
+// when no session event named its ancestry; nothing waits for the answer, so
+// a report is never delayed by it. One lookup per session at a time, and none
+// started while MAX_ANCESTRY_LOOKUPS requests are unsettled, so a client that
+// never answers cannot pile them up. One that has not answered within
+// ANCESTRY_LOOKUP_MS is aborted through the request's `signal` (a client that
+// ignores the signal still holds its session's slot and one of the
+// MAX_ANCESTRY_LOOKUPS until it settles). An answer is recorded only if its
+// session was not deleted, and OpenCode not disposed, while it was asked.
+const lookUpAncestry = (sessionId) => {{
+  const sessions = sessionClient?.session;
+  if (
+    !sessionId ||
+    sessionParents.has(sessionId) ||
+    ancestryLookups.has(sessionId) ||
+    unsettledAncestryLookups >= MAX_ANCESTRY_LOOKUPS ||
+    typeof sessions?.get !== "function"
+  ) {{
+    return;
+  }}
+  const controller = typeof AbortController === "function" ? new AbortController() : undefined;
+  let timer;
+  const lookup = {{
+    abort: () => {{
+      clearTimeout(timer);
+      try {{
+        controller?.abort();
+      }} catch (_) {{}}
+    }},
+  }};
+  const disposal = disposalGeneration;
+  ancestryLookups.set(sessionId, lookup);
+  unsettledAncestryLookups += 1;
+  timer = setTimeout(lookup.abort, ANCESTRY_LOOKUP_MS);
+  timer?.unref?.();
+  let request;
+  try {{
+    request = Promise.resolve(
+      sessions.get({{ path: {{ id: sessionId }}, ...(controller ? {{ signal: controller.signal }} : {{}}) }})
+    );
+  }} catch (error) {{
+    request = Promise.reject(error);
+  }}
+  request
+    .then(
+      (answer) => {{
+        const info = answer?.data ?? answer;
+        if (
+          ancestryLookups.get(sessionId) === lookup &&
+          disposal === disposalGeneration &&
+          info?.id === sessionId
+        ) {{
+          noteSessionAncestry(info);
+        }}
+      }},
+      () => {{}}
+    )
+    .finally(() => {{
+      clearTimeout(timer);
+      unsettledAncestryLookups -= 1;
+      if (ancestryLookups.get(sessionId) === lookup) {{
+        ancestryLookups.delete(sessionId);
+      }}
+    }});
+}};
+
+const replyMessage = (messageId, sessionId) => {{
+  let message = replyMessages.get(messageId);
+  if (!message) {{
+    while (replyMessages.size >= MAX_REPLY_MESSAGES) {{
+      const [oldest, evicted] = replyMessages.entries().next().value;
+      replyMessages.delete(oldest);
+      if (lastAssistantMessage.get(evicted.sessionId) === oldest) {{
+        lastAssistantMessage.delete(evicted.sessionId);
+      }}
+    }}
+    message = {{ sessionId, parts: new Map(), bytes: 0 }};
+    replyMessages.set(messageId, message);
+  }}
+  return message;
+}};
+
+const recordAssistantMessage = (info) => {{
+  const sessionId = info?.sessionID;
+  if (!sessionId || !info.id || isChildSession(sessionId)) {{
+    return;
+  }}
+  // Asked now, so the answer is usually in by the time the turn goes idle.
+  lookUpAncestry(sessionId);
+  const previous = lastAssistantMessage.get(sessionId);
+  if (previous && previous !== info.id) {{
+    replyMessages.delete(previous);
+  }}
+  rememberBounded(lastAssistantMessage, sessionId, info.id);
+  replyMessage(info.id, sessionId);
+}};
+
+const recordReplyPart = (part) => {{
+  if (part?.type !== "text" || part.synthetic || part.ignored || !part.id || !part.messageID) {{
+    return;
+  }}
+  if (isChildSession(part.sessionID)) {{
+    return;
+  }}
+  const message = replyMessage(part.messageID, part.sessionID);
+  const existing = message.parts.get(part.id);
+  if (!existing && message.parts.size >= MAX_REPLY_PARTS) {{
+    return;
+  }}
+  const others = message.bytes - (existing?.bytes ?? 0);
+  const kept = clipBytes(part.text, MAX_REPLY_BYTES - others);
+  message.parts.set(part.id, kept);
+  message.bytes = others + kept.bytes;
+}};
+
+const recordReplyDelta = (props) => {{
+  if (props?.field !== "text" || typeof props.delta !== "string") {{
+    return;
+  }}
+  const message = replyMessages.get(props.messageID);
+  const existing = message?.parts.get(props.partID);
+  if (!existing) {{
+    return;
+  }}
+  const added = clipBytes(props.delta, MAX_REPLY_BYTES - message.bytes);
+  if (added.bytes === 0) {{
+    return;
+  }}
+  message.parts.set(props.partID, {{
+    text: existing.text + added.text,
+    bytes: existing.bytes + added.bytes,
+  }});
+  message.bytes += added.bytes;
+}};
+
+const recordTurnError = (sessionId, error) => {{
+  if (!sessionId || isChildSession(sessionId)) {{
+    return;
+  }}
+  rememberBounded(error?.name === "MessageAbortedError" ? abortedTurns : failedTurns, sessionId);
+}};
+
+// The reply owed for OpenCode session `sessionId`'s turn that just went idle,
+// as the fields to add to that idle report, consumed so it is sent once. Only
+// a session already known to be a root gets one; this never waits for a
+// lookup, so the idle report is sent at once. A subagent's child session gets
+// none. So does a session whose ancestry is not known yet, and that reply is
+// dropped rather than sent later: the deck takes a reply only on a turn-end
+// report, and a second idle report would end the turn twice. A session that
+// neither a session event nor the client ever names stays replyless on
+// purpose: an unknown session might be a subagent's, and its text is not the
+// user's turn, so privacy wins over completeness.
+//
+// A known root's turn whose last assistant message has no text (it ended on a
+// tool call, or said nothing) is still its turn end, and its idle report says
+// so with an empty `reply`, so the deck can say the turn ended with nothing to
+// read. Only the first idle report of a turn carries either: the state is
+// consumed here, so the second report finds no assistant message and carries
+// none.
+const takeReply = (sessionId) => {{
+  if (!sessionId) {{
+    return {{}};
+  }}
+  const messageId = lastAssistantMessage.get(sessionId);
+  const failed = failedTurns.has(sessionId);
+  const aborted = abortedTurns.has(sessionId);
+  const message = messageId ? replyMessages.get(messageId) : undefined;
+  forgetReplyState(sessionId);
+  if (!message || aborted) {{
+    return {{}};
+  }}
+  if (sessionParents.get(sessionId) !== "") {{
+    lookUpAncestry(sessionId);
+    return {{}};
+  }}
+  const text = Array.from(message.parts.values(), (part) => part.text).join("").trim();
+  return failed ? {{ reply: text, reply_failed: true }} : {{ reply: text }};
+}};
+
+const isIdleReport = (payload) =>
+  payload.event === "session.idle" ||
+  (payload.event === "session.status" && payload.status === "idle");
+
 const recordUserMessage = (event, directory) => {{
   const info = event?.properties?.info;
   const messageId = info?.id;
@@ -415,6 +739,9 @@ const recordUserMessage = (event, directory) => {{
   const role = (info?.role ?? "").toLowerCase();
   if (role !== "user") {{
     messageRoles.delete(messageId);
+    if (role === "assistant") {{
+      recordAssistantMessage(info);
+    }}
     return;
   }}
   const dir = info?.directory ?? directory ?? process.cwd();
@@ -441,11 +768,15 @@ const emitUserPrompt = (sessionId, prompt, directory) => {{
 
 const handleMessagePartUpdated = (event, directory) => {{
   const part = event?.properties?.part;
-  if (!part?.messageID || part.type !== "text" || !part.text) {{
+  if (!part?.messageID || part.type !== "text") {{
     return;
   }}
   const info = messageRoles.get(part.messageID);
   if (!info || info.role !== "user") {{
+    recordReplyPart(part);
+    return;
+  }}
+  if (!part.text) {{
     return;
   }}
   const sessionId = normalizeSessionId(
@@ -464,6 +795,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
   }}
 
   const directory = ctx?.directory ?? process.cwd();
+  sessionClient = ctx?.client;
 
   return {{
     event: async (input) => {{
@@ -480,6 +812,10 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         handleMessagePartUpdated(event, directory);
         return;
       }}
+      if (eventType === "message.part.delta") {{
+        recordReplyDelta(event?.properties);
+        return;
+      }}
       if (eventType === "permission.asked" || eventType === "permission.replied") {{
         const payload = permissionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);
@@ -493,8 +829,17 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (!event?.type?.startsWith("session.")) {{
         return;
       }}
+      if (eventType === "session.created" || eventType === "session.updated") {{
+        noteSessionAncestry(event?.properties?.info);
+      }}
       const payload = sessionPayload(event, directory);
       if (event?.type === "session.deleted") {{
+        const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
+        if (deletedId) {{
+          forgetReplyState(deletedId);
+          sessionParents.delete(deletedId);
+          cancelAncestryLookup(deletedId);
+        }}
         closeSession(payload.session_id, payload.cwd, false, false);
         return;
       }}
@@ -504,7 +849,11 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         payload.status,
         event?.type !== "session.created"
       );
-      sendEvent(payload);
+      const rawSessionId = event?.properties?.sessionID;
+      if (event?.type === "session.error") {{
+        recordTurnError(rawSessionId, event?.properties?.error);
+      }}
+      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
     }},
     "tool.execute.before": async (input, output) => {{
       const sessionId = normalizeSessionId(
@@ -1828,6 +2177,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// PRD #1497: the plugin reports through the binary `DOT_AGENT_DECK_BIN`
+    /// names when that is an absolute path, and through its pinned
+    /// `BINARY_PATH` otherwise — unset, empty, whitespace, a bare name the
+    /// agent's `PATH` would resolve, or a path relative to its working
+    /// directory (tester H2). Loaded under Node with two recorder scripts, one
+    /// pinned and one named by the variable, the latter's directory on `PATH`
+    /// and as the working directory so a relative value would reach it; each
+    /// run sends one event and exactly one recorder receives it.
+    #[cfg(unix)]
+    #[test]
+    fn plugin_reports_through_dot_agent_deck_bin_when_it_is_set() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = |name: &str| {
+            let script = dir.path().join(name);
+            let out = dir.path().join(format!("{name}.jsonl"));
+            crate::test_isolation::write_script(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                    out.display(),
+                    out.display()
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script, out)
+        };
+        let (pinned, pinned_out) = recorder("pinned");
+        let (built, built_out) = recorder("built");
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&pinned.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{}";
+const hooks = await plugin({{ directory: "/work" }});
+await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: "boom" }} }} }});
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let lines = |path: &Path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        };
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |bin: Option<&str>| {
+            let mut cmd = std::process::Command::new("node");
+            cmd.arg(&driver)
+                .current_dir(dir.path())
+                .env("PATH", &path)
+                .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN);
+            if let Some(bin) = bin {
+                cmd.env(crate::platform::paths::DOT_AGENT_DECK_BIN, bin);
+            }
+            assert!(
+                cmd.status().expect("run node").success(),
+                "the plugin driver failed"
+            );
+        };
+
+        // One run sends the error and whatever the plugin reports on its own
+        // around it (its shutdown handler), so count one run's events first.
+        run(None);
+        let per_run = lines(&pinned_out);
+        assert!(per_run > 0, "the plugin reported nothing");
+        assert_eq!(lines(&built_out), 0, "unset: only the pinned binary");
+        let mut runs = 1;
+        for ignored in ["", "   ", "built", "./built"] {
+            run(Some(ignored));
+            runs += 1;
+            assert_eq!(
+                (lines(&pinned_out), lines(&built_out)),
+                (runs * per_run, 0),
+                "{ignored:?} is not absolute: the pinned binary"
+            );
+        }
+        run(Some(&built.to_string_lossy()));
+        assert_eq!(
+            (lines(&pinned_out), lines(&built_out)),
+            (runs * per_run, per_run),
+            "absolute: only the named binary"
+        );
+    }
+
     /// Scenario: Load the generated plugin under Node with its binary pinned to
     /// a recorder script, and send it a `session.error` whose error carries a
     /// status, a JSON body over 8 KiB, and a mix of allowed and other response
@@ -1961,5 +2413,644 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
                 "{key} from an unexpected shape: {bare}"
             );
         }
+    }
+
+    /// PRD #1497: load the generated plugin under Node with its binary pinned to
+    /// a recorder, and play it a turn the way OpenCode 1.18 publishes one — the
+    /// user's message, a reasoning part, an assistant message streamed as an
+    /// empty text part plus deltas and then its full text, a second assistant
+    /// message after a tool step, then `session.status` idle and the deprecated
+    /// `session.idle`, for a session whose `session.created` named it a root.
+    /// The first idle report carries the LAST assistant
+    /// message's text as `reply`, the second none; a turn that hit a
+    /// `session.error` carries `reply_failed`; an interrupted turn carries none;
+    /// a turn whose last assistant message has no text carries an empty
+    /// `reply` on its first idle report only.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_attaches_the_last_assistant_reply_to_the_idle_report() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{}";
+const hooks = await plugin({{ directory: "/work" }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+const part = (sessionID, messageID, id, type, text) =>
+  send("message.part.updated", {{ sessionID, time: 1, part: {{ id, sessionID, messageID, type, text, time: {{ start: 1 }} }} }});
+await send("session.created", {{ sessionID: "s1", info: {{ id: "s1", directory: "/work" }} }});
+const turn = async (s, prefix, finalText) => {{
+  await send("session.status", {{ sessionID: s, status: {{ type: "busy" }} }});
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "u", sessionID: s, role: "user" }} }});
+  await part(s, prefix + "u", prefix + "pu", "text", "list the files");
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "a1", sessionID: s, role: "assistant" }} }});
+  await part(s, prefix + "a1", prefix + "r", "reasoning", "thinking about it");
+  await part(s, prefix + "a1", prefix + "t1", "text", "");
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a1", partID: prefix + "t1", field: "text", delta: "Let me " }});
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a1", partID: prefix + "t1", field: "text", delta: "look." }});
+  await part(s, prefix + "a1", prefix + "t1", "text", "Let me look.");
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "a2", sessionID: s, role: "assistant" }} }});
+  await part(s, prefix + "a2", prefix + "t2", "text", "");
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a2", partID: prefix + "t2", field: "text", delta: finalText }});
+}};
+await turn("s1", "m1", "Final: two files changed. 🦀");
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await send("session.idle", {{ sessionID: "s1" }});
+await turn("s1", "m2", "I could not finish.");
+await send("session.error", {{ sessionID: "s1", error: {{ name: "APIError", data: {{ message: "boom" }} }} }});
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await turn("s1", "m3", "half a sentence");
+await send("session.error", {{ sessionID: "s1", error: {{ name: "MessageAbortedError", data: {{}} }} }});
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await turn("s1", "m4", "");
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await send("session.idle", {{ sessionID: "s1" }});
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let replies: Vec<Option<crate::daemon_protocol::FinalReply>> = payloads
+            .iter()
+            .filter(|p| {
+                p["event"] == "session.idle"
+                    || (p["event"] == "session.status" && p["status"] == "idle")
+            })
+            .map(crate::hook::extract_opencode_turn_reply)
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: "Final: two files changed. 🦀".into(),
+                    failed: false,
+                }),
+                None,
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: "I could not finish.".into(),
+                    failed: true,
+                }),
+                None,
+                // Audit A2: a turn whose last assistant message says nothing
+                // is reported once, as ended with nothing to read.
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: String::new(),
+                    failed: false,
+                }),
+                None,
+            ],
+            "{payloads:#?}"
+        );
+        assert!(
+            payloads
+                .iter()
+                .filter(|p| p["event"] != "session.idle" && p["event"] != "session.status")
+                .all(|p| p.get("reply").is_none()),
+            "only an idle report carries a reply: {payloads:#?}"
+        );
+        // Every payload still decodes and builds its event.
+        for payload in &payloads {
+            let input: crate::hook::OpenCodeHookInput =
+                serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                crate::hook::build_opencode_event(input).is_some(),
+                "{payload}"
+            );
+        }
+    }
+
+    /// Run `body` under Node against the generated plugin, its binary pinned to
+    /// a recorder, and answer the payloads the plugin sent — or `None` (after a
+    /// `SKIP:`) when Node is not available. `node_args` go before the driver.
+    #[cfg(unix)]
+    fn run_plugin_driver(body: &str, node_args: &[&str]) -> Option<Vec<serde_json::Value>> {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import plugin from {};\n{body}",
+                serde_json::to_string(&plugin.display().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("node")
+            .args(node_args)
+            .arg(&driver)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "the plugin driver failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(
+            std::fs::read_to_string(&out)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("every payload is JSON the deck decodes"))
+                .collect(),
+        )
+    }
+
+    /// The final replies the plugin attached to its idle reports, in order,
+    /// paired with the session the report names.
+    #[cfg(unix)]
+    fn idle_replies(
+        payloads: &[serde_json::Value],
+    ) -> Vec<(String, Option<crate::daemon_protocol::FinalReply>)> {
+        payloads
+            .iter()
+            .filter(|p| {
+                p["event"] == "session.idle"
+                    || (p["event"] == "session.status" && p["status"] == "idle")
+            })
+            .map(|p| {
+                (
+                    p["session_id"].as_str().unwrap_or_default().to_owned(),
+                    crate::hook::extract_opencode_turn_reply(p),
+                )
+            })
+            .collect()
+    }
+
+    /// PRD #1497 audit AU-B1: a subagent's child session (`parentID` naming
+    /// the root, same directory) streams its own assistant text interleaved
+    /// with the root's turn and goes idle first. Its text never reaches any
+    /// report — not even the idle report the directory alias files under the
+    /// root's id — and the root's own final reply still arrives. A session
+    /// whose ancestry no session event named is asked of OpenCode's client:
+    /// a root's reply is sent, a child's or an unanswerable one's is not.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_never_attaches_a_subagent_reply_to_the_root() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const client = { session: { get: async ({ path }) => {
+  if (path.id === "lookup-fails") throw new Error("offline");
+  return { data: path.id === "resumed" ? { id: "resumed" } : { id: path.id, parentID: "root" } };
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const delta = (sessionID, messageID, partID, d) =>
+  send("message.part.delta", { sessionID, messageID, partID, field: "text", delta: d });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("message.updated", { sessionID: "root", info: { id: "ru", sessionID: "root", role: "user" } });
+await part("root", "ru", "rpu", "run the subagent");
+await assistant("root", "ra1");
+await part("root", "ra1", "rt1", "Delegating.");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await assistant("child", "ca1");
+await part("child", "ca1", "ct1", "");
+await delta("child", "ca1", "ct1", "SUBAGENT_PRIVATE_SENTINEL ");
+await assistant("root", "ra2");
+await part("root", "ra2", "rt2", "");
+await delta("child", "ca1", "ct1", "more SUBAGENT_PRIVATE_SENTINEL");
+await part("child", "ca1", "ct1", "SUBAGENT_PRIVATE_SENTINEL final");
+await send("session.status", { sessionID: "child", status: { type: "idle" } });
+await send("session.idle", { sessionID: "child" });
+await delta("root", "ra2", "rt2", "ROOT_FINAL_SENTINEL: done.");
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+for (const id of ["resumed", "lookup-child", "lookup-fails"]) {
+  await assistant(id, id + "-a");
+  await part(id, id + "-a", id + "-t", "LOOKUP_REPLY " + id);
+  await send("session.status", { sessionID: id, status: { type: "idle" } });
+}
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("SUBAGENT_PRIVATE_SENTINEL"),
+            "a subagent's reply leaked into a report: {payloads:#?}"
+        );
+        let replies: Vec<(String, Option<String>)> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(session, reply)| (session, reply.map(|r| r.text)))
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                ("root".to_owned(), None),
+                ("root".to_owned(), None),
+                (
+                    "root".to_owned(),
+                    Some("ROOT_FINAL_SENTINEL: done.".to_owned())
+                ),
+                ("root".to_owned(), Some("LOOKUP_REPLY resumed".to_owned())),
+                ("root".to_owned(), None),
+                ("root".to_owned(), None),
+            ],
+            "the child's two idle reports (filed under the root by the directory alias) carry \
+             nothing, the root's carries its own reply, and only the client-confirmed root is \
+             read: {payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 review: OpenCode's client never answers the ancestry lookup.
+    /// Each idle report of a session no event named is sent at once, without
+    /// a reply, instead of waiting on the lookup; the session is asked once
+    /// however many turns it ends, at most `MAX_ANCESTRY_LOOKUPS` (8) lookups
+    /// are outstanding across twenty such sessions, every one is aborted
+    /// through its `signal` after `ANCESTRY_LOOKUP_MS`, and once they have
+    /// settled the session can be asked again.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_ancestry_lookup_never_delays_the_idle_report_and_is_bounded() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const calls = [];
+let aborted = 0;
+const client = { session: { get: ({ path, signal }) => {
+  calls.push(path.id);
+  return new Promise((_, reject) => {
+    signal?.addEventListener("abort", () => { aborted += 1; reject(new Error("aborted")); });
+  });
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+for (let turn = 0; turn < 3; turn++) {
+  await assistant("hang", "hang-a" + turn);
+  await part("hang", "hang-a" + turn, "hang-t" + turn, "HANG_REPLY");
+  const started = Date.now();
+  await send("session.status", { sessionID: "hang", status: { type: "idle" } });
+  const took = Date.now() - started;
+  if (took > 1000) throw new Error("the idle report waited " + took + " ms for the lookup");
+}
+const asked = (id) => calls.filter((c) => c === id).length;
+if (asked("hang") !== 1) throw new Error("hang asked " + asked("hang") + " times: " + calls);
+for (let i = 0; i < 20; i++) {
+  await assistant("many" + i, "many-a" + i);
+}
+if (calls.length !== 8) throw new Error(calls.length + " lookups outstanding: " + calls);
+await new Promise((resolve) => setTimeout(resolve, 2600));
+if (aborted !== 8) throw new Error(aborted + " of 8 lookups aborted");
+await assistant("hang", "hang-again");
+if (asked("hang") !== 2) throw new Error("hang not asked again: " + calls);
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let replies = idle_replies(&payloads);
+        assert_eq!(replies.len(), 3, "{payloads:#?}");
+        assert!(
+            replies.iter().all(|(_, reply)| reply.is_none()),
+            "{payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 audit: OpenCode's client IGNORES the abort signal, so eight
+    /// lookups stay unsettled past `ANCESTRY_LOOKUP_MS` although every signal
+    /// fired. More assistant messages, idle reports, a delete and a recreated
+    /// session under the same id start no ninth request until one original
+    /// promise settles, and every idle report is still sent at once. The
+    /// deleted session's stale "root" answer, settling while the recreated
+    /// session's own lookup is in flight, does not make the recreated session
+    /// read; that lookup's answer does. After a dispose, the remaining stale
+    /// answers mark nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_ancestry_lookup_stays_bounded_when_the_client_ignores_abort() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const calls = [];
+const client = { session: { get: ({ path, signal }) => {
+  const call = { id: path.id, signal };
+  calls.push(call);
+  return new Promise((resolve) => { call.settle = resolve; });
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const expectCalls = (n, why) => {
+  if (calls.length !== n) throw new Error(why + ": " + calls.length + " requests: " + calls.map((c) => c.id));
+};
+const idle = async (s) => {
+  const started = Date.now();
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+  const took = Date.now() - started;
+  if (took > 1000) throw new Error("the idle report for " + s + " waited " + took + " ms");
+};
+const turn = async (s, m, text) => {
+  await assistant(s, m);
+  await part(s, m, m + "t", text);
+  await idle(s);
+};
+
+for (let i = 0; i < 8; i++) await assistant("s" + i, "s" + i + "-a0");
+expectCalls(8, "eight sessions, eight lookups");
+await new Promise((resolve) => setTimeout(resolve, 2300));
+if (!calls.every((c) => c.signal?.aborted)) throw new Error("a lookup's signal never fired");
+
+for (let i = 0; i < 4; i++) await turn("n" + i, "n" + i + "-a", "UNKNOWN_REPLY n" + i);
+for (let i = 0; i < 8; i++) await turn("s" + i, "s" + i + "-a1", "UNKNOWN_REPLY s" + i);
+await send("session.deleted", { sessionID: "s0", info: { id: "s0", directory: "/work/s0" } });
+await turn("s0", "s0-b1", "RECREATED_UNKNOWN_REPLY 1");
+expectCalls(8, "no ninth request while eight ignore their abort");
+
+calls[1].settle({ data: { id: "s1" } });
+await settle();
+await assistant("s0", "s0-b2");
+expectCalls(9, "a settled original frees one slot");
+if (calls[8].id !== "s0") throw new Error("the ninth request is " + calls[8].id);
+calls[0].settle({ data: { id: "s0" } });
+await settle();
+await part("s0", "s0-b2", "s0-b2t", "RECREATED_UNKNOWN_REPLY 2");
+await idle("s0");
+await turn("s1", "s1-a2", "S1_ROOT_REPLY");
+calls[8].settle({ data: { id: "s0" } });
+await settle();
+await turn("s0", "s0-b3", "RECREATED_ROOT_REPLY");
+
+await send("server.instance.disposed", {});
+for (let i = 2; i < 8; i++) calls[i].settle({ data: { id: "s" + i } });
+await settle();
+await turn("s2", "s2-a2", "AFTER_DISPOSE_UNKNOWN_REPLY");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("UNKNOWN_REPLY"),
+            "a session whose ancestry was never confirmed was read: {payloads:#?}"
+        );
+        let replies: Vec<Option<String>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply.map(|r| r.text))
+            .collect();
+        let mut expected = vec![None; 14];
+        expected.push(Some("S1_ROOT_REPLY".to_owned()));
+        expected.push(Some("RECREATED_ROOT_REPLY".to_owned()));
+        expected.push(None);
+        assert_eq!(
+            replies, expected,
+            "twelve turns of unknown sessions and two of the recreated one are sent replyless, \
+             the settled root and the recreated session's own confirmed lookup are read, and \
+             nothing is read after the dispose: {payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 review: an ancestry answer that arrives after its session was
+    /// deleted, or after OpenCode disposed, is discarded — so a session later
+    /// reported under the same id is not read on the strength of it — while
+    /// the same answer for a live session still makes its next idle report
+    /// carry the reply.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_discards_an_ancestry_answer_after_delete_or_dispose() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const pending = new Map();
+const client = { session: { get: ({ path }) =>
+  new Promise((resolve) => { pending.set(path.id, resolve); }) } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const answer = async (id) => { pending.get(id)({ data: { id } }); pending.delete(id); await settle(); };
+const turn = async (s, m, text) => {
+  await assistant(s, m);
+  await part(s, m, m + "t", text);
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+};
+
+await assistant("live", "live-a1");
+await answer("live");
+await turn("live", "live-a2", "LIVE_REPLY");
+
+await assistant("gone", "gone-a1");
+await send("session.deleted", { sessionID: "gone", info: { id: "gone", directory: "/work/gone" } });
+const staleGone = pending.get("gone");
+pending.delete("gone");
+staleGone({ data: { id: "gone" } });
+await settle();
+await turn("gone", "gone-a2", "STALE_DELETE_REPLY");
+
+await assistant("old", "old-a1");
+const staleOld = pending.get("old");
+pending.delete("old");
+await send("server.instance.disposed", {});
+staleOld({ data: { id: "old" } });
+await settle();
+await turn("old", "old-a2", "STALE_DISPOSE_REPLY");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let replies: Vec<Option<String>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply.map(|r| r.text))
+            .collect();
+        assert_eq!(
+            replies,
+            vec![Some("LIVE_REPLY".to_owned()), None, None],
+            "{payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 audit AU-B2 and review RV-S3: one assistant message streamed
+    /// as 10,000 distinct 8 KiB parts and 10,000 8 KiB deltas, under a 64 MiB
+    /// heap, retains at most the daemon's byte bound in total: the driver
+    /// completes (retaining every part, as the unbounded tracker did, exhausts
+    /// that heap), and the reply the plugin sends is the message's head, at most
+    /// `MAX_TURN_REPLY_BYTES` of UTF-8 bytes, with a lone surrogate replaced
+    /// rather than sent as an escape the deck cannot decode.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_bounds_a_huge_reply_by_bytes_and_parts() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "big", info: { id: "big", directory: "/work" } });
+await send("message.updated", { sessionID: "big", info: { id: "ba", sessionID: "big", role: "assistant" } });
+await send("message.part.updated", { sessionID: "big", part: { id: "p-first", sessionID: "big",
+  messageID: "ba", type: "text", text: "\ud800HEAD " } });
+for (let i = 0; i < 10000; i++) {
+  await send("message.part.updated", { sessionID: "big", part: { id: "p" + i, sessionID: "big",
+    messageID: "ba", type: "text", text: Buffer.alloc(8192, i + "é🦀").toString() } });
+}
+for (let i = 0; i < 10000; i++) {
+  await send("message.part.delta", { sessionID: "big", messageID: "ba", partID: "p" + (i % 300),
+    field: "text", delta: Buffer.alloc(8192, "x" + i).toString() });
+}
+await send("session.status", { sessionID: "big", status: { type: "idle" } });
+"#,
+            &["--max-old-space-size=64"],
+        ) else {
+            return;
+        };
+        let raw: Vec<&str> = payloads
+            .iter()
+            .filter_map(|p| p.get("reply").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0].len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES,
+            "the plugin sends at most the daemon's bound, in bytes: {}",
+            raw[0].len()
+        );
+        let replies = idle_replies(&payloads);
+        assert_eq!(replies.len(), 1);
+        let reply = replies[0].1.clone().expect("the head of the reply is kept");
+        assert!(
+            reply.text.len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES,
+            "{} bytes",
+            reply.text.len()
+        );
+        assert!(
+            reply.text.len() > crate::daemon_protocol::MAX_TURN_REPLY_BYTES - 8,
+            "the byte budget is used, not a code-point one: {} bytes",
+            reply.text.len()
+        );
+        assert!(
+            reply.text.starts_with("\u{fffd}HEAD 0é🦀"),
+            "{}",
+            &reply.text[..32]
+        );
+        // The deck bounds it identically, so nothing the plugin kept is cut.
+        assert_eq!(
+            crate::daemon_protocol::clamp_turn_reply(&reply.text),
+            reply.text
+        );
+    }
+
+    /// PRD #1497 audit AU-B2: a session deleted without going idle leaves no
+    /// reply state behind. A failed turn and an interrupted turn are each
+    /// followed by `session.deleted`; a session later reported under the same
+    /// id is read fresh — its reply is neither marked failed nor withheld as
+    /// interrupted, and the deleted turn's text is never sent.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_forgets_a_deleted_sessions_reply_state() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const reply = async (s, m, text) => {
+  await send("message.updated", { sessionID: s, info: { id: m, sessionID: s, role: "assistant" } });
+  await send("message.part.updated", { sessionID: s, part: { id: m + "t", sessionID: s, messageID: m, type: "text", text } });
+};
+for (const [s, error] of [["d1", "APIError"], ["d2", "MessageAbortedError"]]) {
+  await send("session.created", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await reply(s, s + "-old", "DELETED_TURN_SENTINEL");
+  await send("session.error", { sessionID: s, error: { name: error, data: { message: "boom" } } });
+  await send("session.deleted", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await send("session.created", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await reply(s, s + "-new", "FRESH " + s);
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+}
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(!all.contains("DELETED_TURN_SENTINEL"), "{payloads:#?}");
+        let replies: Vec<Option<crate::daemon_protocol::FinalReply>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect();
+        assert_eq!(
+            replies,
+            ["d1", "d2"]
+                .iter()
+                .map(|s| Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: format!("FRESH {s}"),
+                    failed: false,
+                }))
+                .collect::<Vec<_>>(),
+            "{payloads:#?}"
+        );
     }
 }

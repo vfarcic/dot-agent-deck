@@ -133,6 +133,7 @@ mod test_isolation;
 // deterministic were private to one of them.
 #[cfg(test)]
 mod test_pty_wait;
+pub mod turn_reply;
 pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.

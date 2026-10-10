@@ -13,6 +13,7 @@ import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
+import { speechAudioError } from "./speech";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -466,6 +467,24 @@ export interface VoiceSettingsDto {
    * #1223, audit finding A1). One of `VOICE_LABEL_SHARING`.
    */
   labels: string;
+  /**
+   * Where reading mode's voice comes from (PRD #1497 D9): `auto` (the
+   * connection's text-to-speech when it has one, else the system voice),
+   * `provider` or `system`. One of `VOICE_SPEECH_SOURCES`.
+   */
+  speech: string;
+  /**
+   * Whether reading is on (PRD #1497 D4; decision 1 of 2026-10-09: Settings →
+   * Voice → Reading, the only reading state, which "reading on" / "reading
+   * off" also flip): `off` (the default) or `on`. One of `VOICE_READING_CONSENT`.
+   */
+  reading: string;
+  /**
+   * Whether the one-time notice of where reading sends replies has been shown
+   * (decision 5 of 2026-10-09): `pending` (the default) or `shown`. One of
+   * `VOICE_READING_NOTICE`.
+   */
+  reading_notice: string;
 }
 
 /**
@@ -664,6 +683,25 @@ export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
 export const VOICE_LABEL_SHARING = ["shared", "withheld"] as const;
 
 /**
+ * Where reading mode's voice comes from (PRD #1497 D9). `auto` is the default.
+ * Keep identical to `SpeechSource::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_SPEECH_SOURCES = ["auto", "provider", "system"] as const;
+
+/**
+ * Whether reading is on (PRD #1497 D4). `off` is the default.
+ * Keep identical to `ReadingConsent::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_READING_CONSENT = ["off", "on"] as const;
+
+/**
+ * Whether reading's one-time notice has been shown (decision 5 of 2026-10-09).
+ * `pending` is the default. Keep identical to `ReadingNotice::TOKENS` in
+ * `src-tauri/src/settings.rs`.
+ */
+export const VOICE_READING_NOTICE = ["pending", "shown"] as const;
+
+/**
  * The bounds and the default for the command stage's answer ceiling.
  *
  * Mirrors `MIN_TOKEN_CEILING`, `MAX_TOKEN_CEILING` and `DEFAULT_TOKEN_CEILING`
@@ -739,6 +777,9 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
   labels: "shared",
+  speech: "auto",
+  reading: "off",
+  reading_notice: "pending",
 };
 
 /**
@@ -834,6 +875,17 @@ export interface VoiceDeckChoiceDto {
 export interface VoiceDictationTargetDto {
   deckId: string;
   agentId: string;
+}
+
+/**
+ * PRD #1497 — reading mode and the app's own speech, declared with each
+ * utterance — `voice::VoiceReadingState`. `speaking` is whether the app's
+ * speech overlapped the recording the utterance came from: while it did, Rust
+ * answers only "stop" and "quiet" and drops everything else (D8).
+ */
+export interface VoiceReadingStateDto {
+  reading: boolean;
+  speaking: boolean;
 }
 
 /**
@@ -1008,7 +1060,10 @@ export type VoiceOutcomeDto =
   */
   | { kind: "param_ambiguous"; transcript: string; action: string; invoke?: string; param: string; spoken: string; matches: string[]; candidates?: VoiceResolvedParamDto[]; params?: VoiceResolvedParamDto[]; reports?: string[]; sentence: string }
   | { kind: "resolution_failed"; transcript: string; detail: string; sentence: string }
-  | { kind: "transcription_failed"; detail: string; sentence: string };
+  | { kind: "transcription_failed"; detail: string; sentence: string }
+  /** PRD #1497 D8 — heard while the app was speaking and not a way of
+      silencing it: nothing ran and nothing was sent anywhere. */
+  | { kind: "dropped"; transcript: string; sentence: string };
 
 /**
  * One utterance's outcome, plus what it cost (`voice::VoiceResult`).
@@ -1072,6 +1127,16 @@ export interface VoiceCommandDto {
   unavailable_hint: string;
   params: { name: string; kind: string }[];
 }
+
+/**
+ * How reading mode's next sentence is to be spoken (PRD #1497 D9), as
+ * `desktop_voice_speech_plan` answers: `voice::speech::SpeechPlan`, field for
+ * field.
+ */
+export type SpeechPlanDto =
+  | { kind: "provider"; fallbackToSystem: boolean }
+  | { kind: "system" }
+  | { kind: "unavailable"; reason: string };
 
 export interface VoiceStatusDto {
   state: VoiceCaptureState;
@@ -1264,11 +1329,20 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
     ?? DEFAULT_VOICE_SETTINGS.activation;
   const labels = VOICE_LABEL_SHARING.find((candidate) => candidate === record.labels)
     ?? DEFAULT_VOICE_SETTINGS.labels;
+  const speech = VOICE_SPEECH_SOURCES.find((candidate) => candidate === record.speech)
+    ?? DEFAULT_VOICE_SETTINGS.speech;
+  const reading = VOICE_READING_CONSENT.find((candidate) => candidate === record.reading)
+    ?? DEFAULT_VOICE_SETTINGS.reading;
+  const readingNotice = VOICE_READING_NOTICE.find((candidate) => candidate === record.reading_notice)
+    ?? DEFAULT_VOICE_SETTINGS.reading_notice;
   return {
     activation,
     intent: normalizeVoiceIntentStage(record.intent),
     transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
     labels,
+    speech,
+    reading,
+    reading_notice: readingNotice,
   };
 }
 
@@ -1756,9 +1830,11 @@ export interface DeckBridge {
    * already shows is refused until the write lands. `dictation` is the sixth
    * (PRD #1260): the agent the panel is typing to while the dictation mode is
    * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
-   * Commands backend entirely.
+   * Commands backend entirely. `reading` is the seventh (PRD #1497): whether
+   * reading mode is on and whether the app was speaking while the utterance
+   * was recorded ({@link VoiceReadingStateDto}).
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -1852,6 +1928,42 @@ export interface DeckBridge {
    * which one it was in would get it wrong.
    */
   voiceCancel(): Promise<VoiceStatusDto>;
+  /**
+   * How reading mode's next sentence is to be spoken
+   * (`desktop_voice_speech_plan`, PRD #1497 D9). Read per sentence, so a
+   * changed Speech source applies to the next one.
+   */
+  voiceSpeechPlan(): Promise<SpeechPlanDto>;
+  /**
+   * The Commands connection's text-to-speech audio for `text`, as MP3 bytes
+   * (`desktop_voice_speech_audio`). Rejects with a sentence when the
+   * connection has no speech, no key, or the request fails.
+   */
+  voiceSpeechAudio(text: string): Promise<ArrayBuffer>;
+  /**
+   * PRD #1497 M5 — start reading one agent, `target`
+   * (`desktop_voice_reading_start`): each finished turn's summary, and each
+   * permission prompt or error, arrives on `onSentence` until
+   * {@link voiceReadingStop}. The agent's reply stays Rust-side; only the
+   * sentence crosses. Answers a refusal sentence when the Settings switch is
+   * off on disk or reading is not available for the agent or its deck. Many
+   * run at once: one per agent on the deck being read.
+   */
+  voiceReadingStart(target: import("./reading").ReadingTarget, onSentence: (sentence: import("./reading").ReadingSentenceDto) => void): Promise<import("./reading").ReadingStartDto>;
+  /** End the reading session `voiceReadingStart` answered (`desktop_voice_reading_stop`). Idempotent. */
+  voiceReadingStop(session: number): Promise<void>;
+  /**
+   * PRD #1497 — be told when a settings save, from any window of this app,
+   * turned reading's Settings switch off (`desktop://reading-consent-off`),
+   * so a start in progress here is ended too. Answers the unsubscribe.
+   */
+  onVoiceReadingConsentOff(listener: () => void): Promise<() => void>;
+  /**
+   * PRD #1497 — be told when a settings save left the switch on and in force
+   * (`desktop://reading-consent-on`), so a start refused because it read the
+   * settings before that save reached the disk is tried again.
+   */
+  onVoiceReadingConsentOn(listener: () => void): Promise<() => void>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -2864,12 +2976,45 @@ class FixtureDeckBridge implements DeckBridge {
   /* The preview's directory rows (the Filter box's two) and its Command row
      need only to know a listing or a live form is showing; the rows
      themselves feed nothing here. */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
     this.voiceScreen = screen;
     this.voiceDirectoryListing = directories !== undefined;
     this.voiceNewAgentForm = newAgent?.form !== undefined;
     this.voiceNewAgentDialog = newAgent !== undefined;
     this.voiceDictation = dictation;
+    this.voiceReading = reading;
+  }
+
+  /** PRD #1497 — reading mode and the app's speech, as last declared. */
+  private voiceReading: VoiceReadingStateDto | undefined;
+
+  /** The preview's reading sessions, so a stop is answered like the real one. */
+  private readingSession = 0;
+
+  /**
+   * The preview has no daemon turn events, so reading starts — the indicator
+   * and the switch can be exercised — and never speaks a turn.
+   */
+  async voiceReadingStart(): Promise<import("./reading").ReadingStartDto> {
+    await Promise.resolve();
+    this.readingSession += 1;
+    return { kind: "started", session: this.readingSession };
+  }
+
+  async voiceReadingStop(): Promise<void> {
+    await Promise.resolve();
+  }
+
+  /** The preview has one window and saves nothing elsewhere, so this is never told. */
+  async onVoiceReadingConsentOff(): Promise<() => void> {
+    await Promise.resolve();
+    return () => undefined;
+  }
+
+  /** The preview's starts never read a stale document, so this is never told. */
+  async onVoiceReadingConsentOn(): Promise<() => void> {
+    await Promise.resolve();
+    return () => undefined;
   }
 
   /**
@@ -2882,7 +3027,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm, this.voiceNewAgentDialog);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm, this.voiceNewAgentDialog, this.voiceReading);
   }
 
   /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
@@ -3008,6 +3153,17 @@ class FixtureDeckBridge implements DeckBridge {
     // device; it does not rewind the session's script.
     this.microphone = { ...this.microphone, recording: false, delivered: false };
     return fixtureVoiceStatus();
+  }
+
+  /** The preview has no Commands connection, so it speaks with the system voice. */
+  async voiceSpeechPlan(): Promise<SpeechPlanDto> {
+    await Promise.resolve();
+    return { kind: "system" };
+  }
+
+  async voiceSpeechAudio(): Promise<ArrayBuffer> {
+    await Promise.resolve();
+    throw new Error("the preview has no speech service");
   }
 
   /**
@@ -4561,8 +4717,11 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceEndpoints: EndpointSettingsDto | undefined;
   /** PRD #1260 — the dictation mode's target, while the mode is on. */
   private voiceDictation: VoiceDictationTargetDto | undefined;
+  /** PRD #1497 — reading mode and the app's speech, as declared. */
+  private voiceReading: VoiceReadingStateDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
+    this.voiceReading = reading;
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
@@ -4588,7 +4747,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null }));
   }
 
   /**
@@ -4624,6 +4783,51 @@ export class TauriDeckBridge implements DeckBridge {
   async voiceCancel(): Promise<VoiceStatusDto> {
     const invoke = await this.getInvoke();
     return invoke<VoiceStatusDto>("desktop_voice_cancel");
+  }
+
+  async voiceSpeechPlan(): Promise<SpeechPlanDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SpeechPlanDto>("desktop_voice_speech_plan");
+  }
+
+  async voiceSpeechAudio(text: string): Promise<ArrayBuffer> {
+    const invoke = await this.getInvoke();
+    // A raw `tauri::ipc::Response` arrives as an ArrayBuffer.
+    try {
+      return await invoke<ArrayBuffer>("desktop_voice_speech_audio", { text });
+    } catch (cause) {
+      // A refusal is told apart from a failure, so Auto never answers it
+      // with the system voice.
+      throw speechAudioError(cause);
+    }
+  }
+
+  async voiceReadingStart(target: import("./reading").ReadingTarget, onSentence: (sentence: import("./reading").ReadingSentenceDto) => void): Promise<import("./reading").ReadingStartDto> {
+    const invoke = await this.getInvoke();
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<import("./reading").ReadingSentenceDto>();
+    channel.onmessage = onSentence;
+    return invoke<import("./reading").ReadingStartDto>("desktop_voice_reading_start", {
+      deckId: target.deckId,
+      agentId: target.agentId,
+      agentLabel: target.label,
+      onSentence: channel,
+    });
+  }
+
+  async voiceReadingStop(session: number): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("desktop_voice_reading_stop", { session });
+  }
+
+  async onVoiceReadingConsentOff(listener: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<null>("desktop://reading-consent-off", () => listener());
+  }
+
+  async onVoiceReadingConsentOn(listener: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<null>("desktop://reading-consent-on", () => listener());
   }
 
   /**

@@ -341,10 +341,15 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
     // delete a live hook belonging to a user or to a newer sibling install.
     // That is issue #730's own defect one door along.
     //
-    // The consequence, stated rather than left to be discovered: nothing cleans
-    // a FOREIGN install's retired-event rule during install. That is the same
-    // tradeoff already accepted for the installed events, and `uninstall_impl`
-    // still clears every deck-signature command wide.
+    // The consequence, stated rather than left to be discovered: a FOREIGN
+    // install's retired-event hook is left in place by install, with the two
+    // exceptions the Codex writer applies (PRD #1497 audit F4,
+    // `remediate_retired_deck_handlers`), and like it only to a command naming
+    // a deck install (this binary, or an executable sharing its basename;
+    // audit A1): one whose executable has no safe spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper,
+    // or one whose executable needs quoting and is not spelled as the current
+    // command for it, is rebuilt into the current form in place. `uninstall_impl` still clears
+    // every deck-signature command wide.
     //
     // An event key left empty IS dropped by this INSTALL sweep, while Codex's
     // install sweep leaves it. (Both adapters' `uninstall` drop emptied keys;
@@ -359,6 +364,15 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
             strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            crate::agent_hook_config::remediate_retired_deck_handlers(
+                arr,
+                command_is_deck_owned,
+                deck_command_executable,
+                binary_path,
+                HOOK_COMMAND_SUFFIX,
+                HOOK_SHELL,
+                crate::agent_hook_config::EmptiedRule::Drop,
+            );
             if arr.is_empty() {
                 hooks.remove(&key);
             }
@@ -371,6 +385,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             deck_command_executable,
+            |exe| crate::agent_hook_config::build_command(exe, HOOK_COMMAND_SUFFIX, HOOK_SHELL),
         )
     };
     let keeper = match mode {
@@ -535,6 +550,8 @@ fn install_to_reporting(
     mode: InstallMode,
 ) -> io::Result<(bool, String)> {
     let path = config_path(config_dir);
+    // Before the config is read, so a refusal leaves it as it was (PRD #1497).
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
     std::fs::create_dir_all(config_dir)?;
@@ -739,7 +756,13 @@ mod tests {
             assert_eq!(rules.len(), 1, "one deck rule per event ({event})");
             assert_eq!(
                 rules[0]["hooks"][0]["command"].as_str(),
-                Some("/abs/dot-agent-deck hook --agent devin"),
+                Some(
+                    format!(
+                        "{}/abs/dot-agent-deck hook --agent devin",
+                        crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+                    )
+                    .as_str()
+                ),
                 "event {event}"
             );
             assert_eq!(rules[0]["hooks"][0]["type"].as_str(), Some("command"));
@@ -1226,9 +1249,79 @@ mod tests {
             .unwrap();
         assert_eq!(
             command,
-            "'/Applications/My Deck/dot-agent-deck' hook --agent devin"
+            format!(
+                "{}'/Applications/My Deck/dot-agent-deck' hook --agent devin",
+                crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+            )
         );
         assert!(command_is_deck_owned(command));
+        assert_eq!(
+            deck_command_executable(command).as_deref(),
+            Some("/Applications/My Deck/dot-agent-deck"),
+            "the installed path behind the DOT_AGENT_DECK_BIN wrapper is recovered"
+        );
+    }
+
+    /// PRD #1497: a Devin config holding the plain `<path> hook --agent devin`
+    /// command an older release wrote is migrated in place to the
+    /// `DOT_AGENT_DECK_BIN` form, one deck entry per event and the user's hook
+    /// kept; an uninstall over a config holding both forms removes both.
+    #[test]
+    fn install_migrates_the_plain_form_and_uninstall_removes_both_forms() {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let binary = "/abs/dot-agent-deck";
+        let plain = format!("{binary} {HOOK_COMMAND_SUFFIX}");
+        let overridden = format!(
+            "{}{binary} {HOOK_COMMAND_SUFFIX}",
+            crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+        );
+        let user = "./scripts/audit.sh";
+        let seed = |hooks: Value| {
+            std::fs::write(
+                config_path(dir.path()),
+                serde_json::to_string_pretty(&json!({ "theme_mode": "dark", "hooks": hooks }))
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        let commands = |root: &Value, event: &str| -> Vec<String> {
+            root["hooks"][event]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .flat_map(crate::agent_hook_config::rule_commands)
+                .map(str::to_string)
+                .collect()
+        };
+
+        seed(json!({ "Stop": [
+            { "hooks": [{ "type": "command", "command": plain }] },
+            { "hooks": [{ "type": "command", "command": user }] }
+        ] }));
+        install_to(dir.path(), binary).expect("install");
+        let root = read_back(dir.path());
+        for &event in DEVIN_HOOK_EVENTS {
+            let all = commands(&root, event);
+            let deck: Vec<_> = all
+                .iter()
+                .filter(|c| c.ends_with(HOOK_COMMAND_SUFFIX))
+                .collect();
+            assert_eq!(deck, vec![&overridden], "{event}: {all:?}");
+        }
+        assert!(commands(&root, "Stop").contains(&user.to_string()));
+        assert_eq!(root["theme_mode"], json!("dark"));
+
+        seed(json!({
+            "Stop": [{ "hooks": [
+                { "type": "command", "command": overridden },
+                { "type": "command", "command": user }
+            ] }],
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": plain }] }]
+        }));
+        uninstall_from(dir.path()).expect("uninstall");
+        let root = read_back(dir.path());
+        assert_eq!(commands(&root, "Stop"), vec![user.to_string()]);
+        assert!(commands(&root, "SessionStart").is_empty());
     }
 
     /// Uninstall removes only the deck's rules, drops the keys they emptied, and

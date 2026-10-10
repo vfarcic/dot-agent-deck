@@ -5460,6 +5460,8 @@ pub struct AgentPtyRegistry {
     focus_applied: tokio::sync::watch::Sender<u64>,
     /// Issue #714: see [`Self::codex_rollout_arms`].
     codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
+    /// PRD #1497: see [`Self::turn_replies`].
+    turn_replies: crate::turn_reply::TurnReplyHub,
     /// Issue #1383: see [`Self::pending_deliveries`].
     pending_deliveries: crate::delegate_retry::PendingDeliveries,
     /// Issue #1383 test seam: when set, the next [`Self::echo_watch`] reports
@@ -7243,6 +7245,7 @@ impl AgentPtyRegistry {
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
+            turn_replies: crate::turn_reply::TurnReplyHub::default(),
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
@@ -7267,6 +7270,28 @@ impl AgentPtyRegistry {
     /// object both already share.
     pub fn codex_rollout_arms(&self) -> &crate::codex_rollout_tail::CodexRolloutArms {
         &self.codex_rollout_arms
+    }
+
+    /// PRD #1497: the fan-out of finished-turn replies to
+    /// `subscribe-turn-replies` connections. Held here because the hook loop,
+    /// the Codex rollout monitor and the attach server all share the registry.
+    pub fn turn_replies(&self) -> &crate::turn_reply::TurnReplyHub {
+        &self.turn_replies
+    }
+
+    /// PRD #1497: publish `reply` as `agent_id`'s finished turn in `pane_id`,
+    /// only while `agent_id` is that pane's live owner, so no payload can speak
+    /// for another pane's agent. Returns the delivered sequence number.
+    pub fn publish_turn_reply(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        reply: crate::daemon_protocol::FinalReply,
+    ) -> Option<u64> {
+        if !self.is_live_owner(pane_id, agent_id) {
+            return None;
+        }
+        self.turn_replies.publish(agent_id, pane_id, reply)
     }
 
     /// Record the hook-ingestion socket the owning daemon bound, so
@@ -24626,7 +24651,7 @@ mod spawn_tests {
         pane: &str,
         sink: &std::path::Path,
     ) -> String {
-        let command = format!("stty raw -echo; exec cat >> '{}'", sink.display());
+        let command = format!("stty raw -echo && exec cat >> '{}'", sink.display());
         let agent = registry
             .spawn_agent(SpawnOptions {
                 command: Some(&command),
@@ -24634,8 +24659,16 @@ mod spawn_tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn stand-in");
-        // Let `stty` take effect before anything is typed.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The shell creates the sink for cat's redirection only after stty
+        // succeeds. A fixed wait can expire while the shell is still starting,
+        // leaving kernel echo enabled and falsely satisfying the echo watch.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !sink.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the no-echo sink never became ready");
         agent
     }
 
@@ -24733,10 +24766,10 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Issue #1383 (audit): once a gated submit into a pane has timed out with
-    /// no echo, the next submit to that pane is not held to the bound — so a
-    /// queue of notices to a pane that does not echo stalls once, not once per
-    /// message.
+    /// Scenario: start a ready shell sink with terminal echo disabled and submit
+    /// a notice, which waits out the echo bound. Submit three more notices and
+    /// check that they bypass that bound and reach the sink in order (issue
+    /// #1383, audit).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_that_did_not_echo_skips_the_gate_on_its_next_submit() {

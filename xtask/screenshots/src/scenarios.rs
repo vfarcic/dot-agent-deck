@@ -122,8 +122,13 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "settings-voice-reading",
+        description: "Desktop Voice settings scrolled to reading: the Reading switch with the sentence saying what it sends where, and the Speech source picker.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "voice-typing-mode",
-        description: "The desktop agent pane with voice typing mode on: the pane's Typing to marker, the voice row's reminder and its Stop typing button.",
+        description: "The desktop agent pane with voice typing mode on: the Typing to marker at the window's top edge, the voice row's reminder and its Stop typing button.",
         clients: &[Client::Desktop],
     },
     Scenario {

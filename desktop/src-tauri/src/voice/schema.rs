@@ -195,7 +195,7 @@ pub struct AnnotatedParam {
 /// is shown and the refusal a user reads (`Not here — <hint>.`).
 pub const LABELS_WITHHELD_HINT: &str = "naming an agent, daemon, directory, mode, agent type or \
     orchestration needs the command backend to see those names, and Settings → \
-    Voice → Names withholds them";
+    Voice → Send on-screen names is off";
 
 /// Whether this row needs the observed labels at all: it declares a REQUIRED
 /// param whose kind [`ParamKind::names_something_observed`]. An optional one
@@ -375,6 +375,9 @@ mod tests {
                 "interrupt_agent".to_string(),
                 "clear_prompt".to_string(),
                 "scratch_that".to_string(),
+                "reading_on".to_string(),
+                "reading_off".to_string(),
+                "hush_reading".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
@@ -462,6 +465,9 @@ mod tests {
                 "interrupt_agent",
                 "clear_prompt",
                 "scratch_that",
+                "reading_on",
+                "reading_off",
+                "hush_reading",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
@@ -661,6 +667,9 @@ mod tests {
                 ("interrupt_agent".to_string(), false),
                 ("clear_prompt".to_string(), false),
                 ("scratch_that".to_string(), false),
+                ("reading_on".to_string(), true),
+                ("reading_off".to_string(), true),
+                ("hush_reading".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -712,6 +721,9 @@ mod tests {
                 ("interrupt_agent".to_string(), false),
                 ("clear_prompt".to_string(), false),
                 ("scratch_that".to_string(), false),
+                ("reading_on".to_string(), true),
+                ("reading_off".to_string(), true),
+                ("hush_reading".to_string(), true),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -762,6 +774,9 @@ mod tests {
                 ("interrupt_agent".to_string(), true),
                 ("clear_prompt".to_string(), true),
                 ("scratch_that".to_string(), true),
+                ("reading_on".to_string(), true),
+                ("reading_off".to_string(), true),
+                ("hush_reading".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),

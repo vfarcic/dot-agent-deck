@@ -46,7 +46,18 @@ async fn fetch_latest_version() -> Option<String> {
 
 /// Returns the latest version string if a newer release exists, `None` otherwise.
 /// All errors are silently swallowed — this must never block or crash the app.
+///
+/// An `e2e` build does not ask. The L2 harness drives the real binary on a
+/// machine with network access, so whether the badge appears depended on
+/// whether GitHub answered that runner's unauthenticated request; when it
+/// did, the badge covered the right end of the footer that tests match on
+/// (`visibility_001` on PR #1617's CI). Gated on the feature rather than an
+/// env var for the reason `effective_current_exe` in `src/platform/paths.rs` gives: a
+/// release build carries no switch to turn the check off.
 pub async fn check_for_update() -> Option<String> {
+    if cfg!(feature = "e2e") {
+        return None;
+    }
     let current = current_version();
     let tag = fetch_latest_version().await?;
     should_notify(&current, &tag)

@@ -1492,10 +1492,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    what the browser tier measures. Between `.reader-overlay` (80) and
    `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
 .agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
-/* PRD #1260 — the dictation mode, marked on the pane it is typing into so it is
-   visible where the user is looking. Pinned to the pane's top edge, over the
-   scrim's padding rather than over the tile's own header. */
-.agent-pane-dictating { position: absolute; z-index: 1; top: 0; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px); margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); background: var(--amber-ink); font-size: 11px; font-weight: 650; line-height: 14px; }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
    tile, and every one of them exists to outrank something. The compound
    `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
@@ -1670,6 +1666,16 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* PRD #1260 — the dictation mode's non-voice exit, beside the Voice button and
    never squeezed out by a long report. */
 .voice-stop-typing { flex: 0 0 auto; }
+/* PRD #1497 decision 6 — typing's and reading's marks side by side on ONE row,
+   pinned to the top edge of the window over the content area, and so over the
+   open agent pane's top edge, where typing's mark used to sit alone. Reading is
+   deck-wide, so its mark shows on every screen. A child of `.voice-row` (for
+   its `VOICE_PEER_PROPS`), escaping it with a `position: fixed` of its own, and
+   so above the agent pane overlay as the row is. It holds no control. */
+.voice-indicators { position: fixed; top: 0; left: calc(var(--rail-width) + (100vw - var(--rail-width)) / 2); transform: translateX(-50%); max-width: calc(100vw - var(--rail-width) - 28px); display: flex; gap: 6px; pointer-events: none; }
+.voice-indicator { min-width: 0; margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); font-size: 11px; font-weight: 650; line-height: 14px; }
+.voice-indicator.is-typing { background: var(--amber-ink); }
+.voice-indicator.is-reading { flex: 0 0 auto; background: var(--teal-deep); }
 /* PR #1451 — typing mode's nudge to send: the "“send it” to send" words lit
    after a pause with dictated text unsent. Styling only — the sentence reads
    the same lit or not — and a pulse that runs twice rather than forever, so it

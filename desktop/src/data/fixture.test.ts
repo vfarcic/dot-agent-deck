@@ -299,3 +299,48 @@ it("refuses a preview scroll while the New agent dialog is open", () => {
   expect(fixtureVoiceCommands("overview", false, false, true).find((command) => command.id === "scroll_up")?.callable).toBe(false);
   expect(fixtureVoiceCommands("overview").find((command) => command.id === "scroll_up")?.callable).toBe(true);
 });
+
+describe("browser fixture reading rows (PRD #1497)", () => {
+  /** Scenario: the preview's reading rows carry Rust's own invoke, hint and report for `reading_on`, `reading_off` and `hush_reading`. */
+  it("has the same invoke, hint and report as commands.toml", () => {
+    for (const id of ["reading_on", "reading_off", "hush_reading"]) {
+      expect(fixtureSource).toContain(`invoke: "${rowField(id, "invoke")}"`);
+      expect(fixtureSource).toContain(`unavailableHint: "${rowField(id, "unavailable_hint")}"`);
+      expect(fixtureSource).toContain(`report: "${rowField(id, "report")}"`);
+    }
+  });
+
+  /** Scenario: "reading on" and "stop reading" dispatch the switch in an agent's pane in every mode, and on the dashboard and the deck as well (decision 2 of 2026-10-09). */
+  it("switches reading on every screen, in every mode", () => {
+    for (const typing of [false, true]) {
+      expect(resolveFixtureVoice("reading on", "agent", typing).outcome).toMatchObject({ kind: "dispatch", action: "reading_on", invoke: "startReading" });
+      expect(resolveFixtureVoice("stop reading", "agent", typing).outcome).toMatchObject({ kind: "dispatch", action: "reading_off" });
+    }
+    for (const screen of ["overview", "deck"] as const) {
+      expect(resolveFixtureVoice("reading on", screen).outcome).toMatchObject({ kind: "dispatch", action: "reading_on" });
+      expect(resolveFixtureVoice("reading off", screen).outcome).toMatchObject({ kind: "dispatch", action: "reading_off" });
+    }
+  });
+
+  /** Scenario (D8): while the app is speaking, "stop" and "quiet" silence it and everything else is dropped; with reading on outside typing mode a bare "stop" silences it too. */
+  it("honours only stop and quiet while the app speaks", () => {
+    const speaking = { reading: true, speaking: true };
+    expect(resolveFixtureVoice("stop", "agent", true, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    expect(resolveFixtureVoice("quiet", "overview", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    expect(resolveFixtureVoice("reading off", "agent", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dropped" });
+    expect(resolveFixtureVoice("open settings", "agent", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dropped" });
+    expect(resolveFixtureVoice("stop", "agent", false, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    expect(resolveFixtureVoice("stop", "agent", true, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ action: "interrupt_agent" });
+  });
+
+  /** Scenario: "quiet" and "hush" are reserved for silencing the app only while reading is on or the app is speaking, as in Rust; with reading off and nothing spoken, typing mode types them as it did before reading mode existed. */
+  it("reserves quiet only while reading or speaking", () => {
+    const off = { reading: false, speaking: false };
+    for (const phrase of ["quiet", "hush"]) {
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, off).outcome).not.toMatchObject({ action: "hush_reading" });
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, { reading: false, speaking: true }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    }
+    expect(resolveFixtureVoice("hush", "agent", true, false, false, false, off).outcome).toMatchObject({ kind: "dispatch", params: [{ value: "hush" }] });
+  });
+});

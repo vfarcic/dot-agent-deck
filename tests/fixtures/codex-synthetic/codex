@@ -15,6 +15,10 @@ if [ "${1:-}" = app-server ]; then
     printf '%s\n' '{"id":1,"result":{"userAgent":"startup-parity-test","codexHome":"test","platformFamily":"unix","platformOs":"linux"}}'
     IFS= read -r _list
     deck_command=$(sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' "$CODEX_HOME/hooks.json" 2>/dev/null | head -n 1)
+    # Still JSON-escaped, which is what the reply needs: the command the deck
+    # writes carries `\"` (PRD #1497's DOT_AGENT_DECK_BIN wrapper). Escape what
+    # a sed replacement would otherwise eat — `\`, `&` and the `|` delimiter.
+    deck_command=$(printf '%s\n' "$deck_command" | sed -e 's/[\\&|]/\\&/g')
     printf '%s\n' "$CODEX_HOOK_LIST_RESPONSE" \
         | sed -e "s|__CODEX_HOME__|$CODEX_HOME|g" -e "s|__DECK_COMMAND__|$deck_command|g"
 fi

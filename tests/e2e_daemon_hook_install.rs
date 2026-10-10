@@ -168,6 +168,11 @@ fn install_009_a_headless_daemon_installs_claude_hooks_and_the_opencode_plugin()
         let binary = command
             .strip_suffix(CLAUDE_SUFFIX)
             .expect("filtered on the suffix");
+        // PRD #1497: the installed path follows the `DOT_AGENT_DECK_BIN`
+        // wrapper.
+        let binary = binary
+            .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+            .unwrap_or_else(|| panic!("`{command}` does not honour DOT_AGENT_DECK_BIN"));
         assert!(
             binary.starts_with('\'') && binary.ends_with('\''),
             "`{command}` names a path with a space unquoted; /bin/sh would split it"

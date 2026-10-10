@@ -15,6 +15,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { describe, test } from "node:test";
 import {
 	AGENT_EVENT_TYPES,
@@ -26,25 +27,34 @@ import {
 	buildWorkDoneArgv,
 	createReporter,
 	createSerialQueue,
+	createTurnReplyTracker,
 	DECK_BIN,
+	DECK_BIN_OVERRIDE_ENV,
 	DECK_EXE_ENV,
 	DeckExecError,
 	DECLARE_PROMPT_REPORTS_FLAG,
 	execFailureMessage,
+	execWithStdin,
 	isAgentState,
 	isUnsupportedFlagFailure,
 	legacyAgentEventArgv,
 	MAX_PROMPT_CHARS,
+	MAX_TURN_REPLY_BYTES,
+	piAssistantReply,
 	piEventReport,
 	piEventToAgentState,
 	piToolDetail,
 	REPORT_LEVELS,
 	reportArgvAt,
 	resolveDeckBin,
+	isAbsoluteOverride,
 	SEED_DELIVER_AS,
 	seedToDeliver,
 	spawnFailureMessage,
 	STATUS_EVENTS,
+	TURN_REPLY_FAILED_FLAG,
+	TURN_REPLY_STDIN_FLAG,
+	turnReplyStdin,
 } from "../src/orchestrator.ts";
 
 // ---------------------------------------------------------------------------
@@ -344,21 +354,62 @@ describe("issue #1385: which deck binary the extension shells", () => {
 	test("uses the absolute path the spawning deck exported, verbatim", () => {
 		assert.equal(DECK_EXE_ENV, "DOT_AGENT_DECK_EXE");
 		assert.equal(
-			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/home/me/.local/bin/dot-agent-deck" }),
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/home/me/.local/bin/dot-agent-deck" }, "linux"),
 			"/home/me/.local/bin/dot-agent-deck",
 		);
 		// argv exec, no shell: a path with spaces is passed unquoted.
 		assert.equal(
-			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/opt/my tools/dot-agent-deck" }),
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/opt/my tools/dot-agent-deck" }, "linux"),
 			"/opt/my tools/dot-agent-deck",
 		);
 	});
 
 	test("falls back to the bare name when an older deck sets nothing", () => {
-		assert.equal(resolveDeckBin({}), DECK_BIN);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }), DECK_BIN);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }), DECK_BIN);
+		assert.equal(resolveDeckBin({}, "linux"), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }, "linux"), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }, "linux"), DECK_BIN);
 		assert.equal(DECK_BIN, "dot-agent-deck");
+	});
+
+	test("PRD #1497: the operator's DOT_AGENT_DECK_BIN wins over the deck's own path", () => {
+		assert.equal(DECK_BIN_OVERRIDE_ENV, "DOT_AGENT_DECK_BIN");
+		assert.equal(
+			resolveDeckBin({
+				DOT_AGENT_DECK_BIN: "/src/target/debug/dot-agent-deck",
+				DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck",
+			}, "linux"),
+			"/src/target/debug/dot-agent-deck",
+		);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/my build/dot-agent-deck" }, "linux"), "/my build/dot-agent-deck");
+		// Empty or blank is unset, so the deck's own path (or the bare name) is used.
+		assert.equal(
+			resolveDeckBin({ DOT_AGENT_DECK_BIN: "", DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck" }, "linux"),
+			"/opt/homebrew/bin/dot-agent-deck",
+		);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "  " }, "linux"), DECK_BIN);
+	});
+
+	test("PRD #1497 H2: a DOT_AGENT_DECK_BIN that is not absolute is ignored", () => {
+		const exe = "/opt/homebrew/bin/dot-agent-deck";
+		// A bare name would be looked up in Pi's PATH and a relative path
+		// against its cwd, so each falls back exactly as if it were unset.
+		for (const value of ["deck-hook", "./x", "target/debug/dot-agent-deck", " /abs/with-leading-space", "  "]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "linux"), exe, value);
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value }, "linux"), DECK_BIN, value);
+		}
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/abs/deck", DOT_AGENT_DECK_EXE: exe }, "linux"), "/abs/deck");
+	});
+
+	test("PRD #1497 H2: absolute on Windows means drive-qualified or UNC", () => {
+		const exe = "C:\\deck\\dot-agent-deck.exe";
+		for (const value of ["C:\\build\\dot-agent-deck.exe", "d:/build/dot-agent-deck.exe", "\\\\server\\share\\deck.exe"]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "win32"), value, value);
+		}
+		for (const value of ["deck.exe", ".\\deck.exe", "\\deck.exe", "C:deck.exe", ""]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "win32"), exe, value);
+		}
+		assert.equal(isAbsoluteOverride("/abs", "linux"), true);
+		assert.equal(isAbsoluteOverride("C:\\abs", "linux"), false);
 	});
 
 	test("failure messages name the binary actually shelled", () => {
@@ -675,5 +726,311 @@ describe("issue #622: reports reach the deck in the order Pi emitted them", () =
 		});
 		await assert.rejects(failed, /daemon down/);
 		assert.equal(await inOrder(async () => "next"), "next");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PRD #1497 — a settled turn's final reply, for the deck's reading mode
+// ---------------------------------------------------------------------------
+
+describe("PRD #1497: the settled turn's final reply", () => {
+	/** An assistant message as Pi 0.84's `message_end` carries it. */
+	function assistant(content: unknown[], extra: Record<string, unknown> = {}) {
+		return {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content,
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-haiku-4-5",
+				usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30 },
+				stopReason: "stop",
+				timestamp: 1_760_000_000_000,
+				...extra,
+			},
+		};
+	}
+	const toolResult = {
+		type: "message_end",
+		message: {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "ok 42 tests" }],
+			isError: false,
+			timestamp: 1_760_000_000_001,
+		},
+	};
+	const user = { type: "message_end", message: { role: "user", content: "run the tests", timestamp: 1 } };
+
+	test("an assistant message's text blocks are its reply; thinking and tool calls are not", () => {
+		const event = assistant([
+			{ type: "thinking", thinking: "let me check", thinkingSignature: "sig" },
+			{ type: "text", text: "All 42 tests pass." },
+			{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "cargo test" } },
+			{ type: "text", text: "  Nothing changed.  " },
+		]);
+		assert.deepEqual(piAssistantReply(event.message), { text: "All 42 tests pass.\n\nNothing changed.", failed: false });
+		assert.equal(piAssistantReply(toolResult.message), undefined);
+		assert.equal(piAssistantReply(user.message), undefined);
+		assert.equal(piAssistantReply(assistant([{ type: "toolCall", id: "c", name: "ls", arguments: {} }]).message), undefined);
+		assert.equal(piAssistantReply(null), undefined);
+	});
+
+	test("an errored message is failed, and says its error when it has no text", () => {
+		const errored = assistant([], { stopReason: "error", errorMessage: "429 rate limited" });
+		assert.deepEqual(piAssistantReply(errored.message), { text: "429 rate limited", failed: true });
+		const partial = assistant([{ type: "text", text: "I fixed half." }], { stopReason: "error", errorMessage: "boom" });
+		assert.deepEqual(piAssistantReply(partial.message), { text: "I fixed half.", failed: true });
+	});
+
+	test("a very long reply is bounded to what the deck keeps, never splitting a character", () => {
+		const long = assistant([{ type: "text", text: "a" + "é".repeat(MAX_TURN_REPLY_BYTES) }]);
+		const text = piAssistantReply(long.message)?.text ?? "";
+		// One ASCII byte, then two-byte characters: the last whole one ends a byte short of the bound.
+		assert.equal(Buffer.byteLength(text, "utf8"), MAX_TURN_REPLY_BYTES - 1);
+		assert.ok(text.endsWith("é"));
+		const emoji = turnReplyStdin({ text: "😀".repeat(MAX_TURN_REPLY_BYTES), failed: false }) ?? "";
+		assert.equal(Buffer.byteLength(emoji, "utf8"), MAX_TURN_REPLY_BYTES);
+		assert.equal(emoji, "😀".repeat(MAX_TURN_REPLY_BYTES / 4), "no surrogate pair is split");
+	});
+
+	test("the tracker keeps the run's last assistant reply and hands it over once", () => {
+		const tracker = createTurnReplyTracker();
+		tracker.observe("agent_start", { type: "agent_start" });
+		tracker.observe("message_end", user);
+		tracker.observe("message_end", assistant([{ type: "text", text: "Running the tests." }, { type: "toolCall", id: "c", name: "bash", arguments: {} }]));
+		tracker.observe("message_end", toolResult);
+		tracker.observe("message_end", assistant([{ type: "text", text: "All 42 tests pass." }]));
+		tracker.observe("tool_execution_end", { toolName: "bash" });
+		assert.deepEqual(tracker.take(), { text: "All 42 tests pass.", failed: false });
+		assert.equal(tracker.take(), undefined, "a reply is reported once");
+
+		// A new run forgets a reply the last run never settled with: it ended
+		// with nothing to read.
+		tracker.observe("message_end", assistant([{ type: "text", text: "stale" }]));
+		tracker.observe("agent_start", { type: "agent_start" });
+		assert.deepEqual(tracker.take(), { text: "", failed: false });
+		assert.equal(tracker.take(), undefined, "an empty turn end is reported once too");
+	});
+
+	test("a final assistant message with nothing to read leaves no earlier reply behind", () => {
+		const commentary = assistant([{ type: "text", text: "Running the tests." }]);
+		const finals: Array<[string, ReturnType<typeof assistant>, boolean]> = [
+			["thinking only", assistant([{ type: "thinking", thinking: "done", thinkingSignature: "sig" }]), false],
+			["a tool call only", assistant([{ type: "toolCall", id: "c", name: "bash", arguments: {} }]), false],
+			["empty", assistant([]), false],
+			["an error with no errorMessage", assistant([], { stopReason: "error" }), true],
+		];
+		for (const [label, final, failed] of finals) {
+			const tracker = createTurnReplyTracker();
+			tracker.observe("agent_start", { type: "agent_start" });
+			tracker.observe("message_end", commentary);
+			tracker.observe("message_end", toolResult);
+			tracker.observe("message_end", final);
+			assert.deepEqual(tracker.take(), { text: "", failed }, `${label}: the earlier commentary is not the reply; the turn ended with nothing to read`);
+		}
+		assert.equal(createTurnReplyTracker().take(), undefined, "no run, no turn end to report");
+		// A non-assistant message after the reply leaves it in place.
+		const tracker = createTurnReplyTracker();
+		tracker.observe("message_end", assistant([{ type: "text", text: "All 42 tests pass." }]));
+		tracker.observe("message_end", toolResult);
+		tracker.observe("message_end", user);
+		assert.deepEqual(tracker.take(), { text: "All 42 tests pass.", failed: false });
+	});
+
+	test("only agent_settled carries the reply, as the last flags of a declared report, its text never on argv", () => {
+		const reply = { text: "All 42 tests pass.", failed: false };
+		const settled = piEventReport("agent_settled", { type: "agent_settled" }, "/w", reply);
+		assert.deepEqual(settled, { type: "finished", detail: { cwd: "/w" }, reply });
+		assert.deepEqual(piEventReport("session_shutdown", {}, "/w", reply), { type: "finished", detail: { cwd: "/w" } });
+		assert.deepEqual(piEventReport("agent_settled", {}, "/w"), { type: "finished", detail: { cwd: "/w" } });
+		assert.deepEqual(reportArgvAt(settled!, "declared", true), [
+			"agent-event",
+			"--type",
+			"finished",
+			"--reports-prompts",
+			"--cwd=/w",
+			TURN_REPLY_STDIN_FLAG,
+		]);
+		const failed = { ...settled!, reply: { text: "--boom", failed: true } };
+		assert.deepEqual(reportArgvAt(failed, "declared", true)?.slice(-2), [TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
+		assert.equal(turnReplyStdin(settled!.reply), "All 42 tests pass.");
+		assert.equal(turnReplyStdin(failed.reply), "--boom");
+		assert.equal(turnReplyStdin({ text: " \n ", failed: false }), "", "a blank reply is an empty turn end");
+		assert.equal(turnReplyStdin(undefined), undefined);
+		// Without the reply, and below `declared`, the argv is what it always was.
+		assert.deepEqual(reportArgvAt(settled!, "declared"), ["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"]);
+		assert.deepEqual(reportArgvAt(settled!, "detail", true), ["agent-event", "--type", "finished", "--cwd=/w"]);
+		assert.deepEqual(reportArgvAt(settled!, "lifecycle", true), ["agent-event", "--type", "finished"]);
+		// A blank reply still carries the flags: the turn ended with nothing to read.
+		assert.deepEqual(buildAgentEventArgv("finished", {}, true, { text: "   ", failed: true }), [
+			"agent-event",
+			"--type",
+			"finished",
+			"--reports-prompts",
+			TURN_REPLY_STDIN_FLAG,
+			TURN_REPLY_FAILED_FLAG,
+		]);
+	});
+
+	/**
+	 * The fake CLI from the report-level tests, refusing unknown flags as clap
+	 * does, and recording what each call wrote to its stdin.
+	 */
+	function cliKnowing(known: string[]) {
+		const calls: string[][] = [];
+		const stdins: Array<string | undefined> = [];
+		const run = async (argv: string[], _signal?: AbortSignal, stdin?: string) => {
+			calls.push(argv);
+			stdins.push(stdin);
+			const unknown = argv.slice(3).find((arg) => !known.includes(arg.split("=")[0]));
+			if (unknown !== undefined) {
+				throw new DeckExecError("refused", {
+					code: 2,
+					stderr: `error: unexpected argument '${unknown.split("=")[0]}' found\n`,
+				});
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		};
+		return { calls, stdins, run };
+	}
+	const DETAIL = ["--cwd", "--prompt", "--tool-name", "--tool-detail"];
+	const settled = { type: "finished" as const, detail: { cwd: "/w" }, reply: { text: "done", failed: false } };
+
+	test("a current deck takes the reply on the declared report", async () => {
+		const cli = cliKnowing([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(settled);
+		assert.deepEqual(cli.calls, [["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w", "--turn-reply-stdin"]]);
+		assert.deepEqual(cli.stdins, ["done"], "the reply goes on stdin");
+		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.replies(), true);
+		// A report with no reply writes no stdin.
+		await reporter.send({ type: "running", detail: { cwd: "/w" } });
+		assert.equal(cli.stdins.at(-1), undefined);
+	});
+
+	test("a reply's text is never on any argv the reporter sends, at any level", async () => {
+		const secret = "the-reply-text-" + "x".repeat(20);
+		const report = { ...settled, reply: { text: secret, failed: true } };
+		for (const known of [
+			[DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG],
+			[DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL],
+			DETAIL,
+			[],
+		]) {
+			const cli = cliKnowing(known);
+			await createReporter(cli.run).send(report);
+			for (const argv of cli.calls) {
+				assert.ok(!argv.some((arg) => arg.includes(secret)), `argv ${JSON.stringify(argv)}`);
+			}
+			// Stdin carries the reply exactly when the argv announces it.
+			cli.calls.forEach((argv, i) => {
+				assert.equal(cli.stdins[i] === secret, argv.includes(TURN_REPLY_STDIN_FLAG), JSON.stringify(argv));
+			});
+		}
+	});
+
+	test("a deck from #1567 drops the reply once and keeps the declaration", async () => {
+		const cli = cliKnowing([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(settled);
+		assert.deepEqual(cli.calls, [
+			["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w", "--turn-reply-stdin"],
+			["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"],
+		]);
+		assert.deepEqual(cli.stdins, ["done", undefined], "the resend at the same level carries no reply");
+		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.replies(), false);
+		await reporter.send(settled);
+		assert.equal(cli.calls.length, 3, "no later report is spent on the reply");
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"]);
+	});
+
+	test("an older deck still steps down the levels exactly as before", async () => {
+		const detailOnly = cliKnowing(DETAIL);
+		const reporter = createReporter(detailOnly.run);
+		await reporter.send(settled);
+		assert.equal(reporter.level(), "detail");
+		assert.deepEqual(detailOnly.calls.at(-1), ["agent-event", "--type", "finished", "--cwd=/w"]);
+
+		const bare = cliKnowing([]);
+		const oldest = createReporter(bare.run);
+		await oldest.send(settled);
+		assert.equal(oldest.level(), "lifecycle");
+		assert.deepEqual(bare.calls.at(-1), ["agent-event", "--type", "finished"]);
+	});
+});
+
+describe("PRD #1497: a reply reaches the CLI on stdin, never on its command line", () => {
+	/**
+	 * A stand-in CLI: a Node child that prints its argv and the stdin it read
+	 * as JSON, or with `exitAt` exits with that code before reading anything,
+	 * the way an older CLI's usage error does.
+	 */
+	const echo = `
+		const exitAt = process.env.EXIT_AT;
+		if (exitAt) { process.stderr.write("error: unexpected argument '--turn-reply-stdin' found\\n"); process.exit(Number(exitAt)); }
+		let input = "";
+		process.stdin.setEncoding("utf8");
+		process.stdin.on("data", (c) => { input += c; });
+		process.stdin.on("end", () => { process.stdout.write(JSON.stringify({ argv: process.argv.slice(1), stdin: input, cwd: process.cwd() })); });
+	`;
+	const node = process.execPath;
+
+	test("the reply is written to the child's stdin, and the argv is only what was passed", async () => {
+		const reply = "All 42 tests pass.\n\n--not-a-flag é😀";
+		const outcome = await execWithStdin(spawn, node, ["-e", echo, "--", "agent-event", TURN_REPLY_STDIN_FLAG], reply, {
+			cwd: "/",
+		});
+		assert.equal(outcome.code, 0, outcome.stderr);
+		const seen = JSON.parse(outcome.stdout);
+		assert.equal(seen.stdin, reply);
+		assert.deepEqual(seen.argv, ["agent-event", TURN_REPLY_STDIN_FLAG]);
+		assert.equal(seen.cwd, "/");
+		assert.equal(outcome.killed, false);
+	});
+
+	test("a reply as long as the deck keeps reaches the child whole", async () => {
+		const reply = turnReplyStdin({ text: "é".repeat(MAX_TURN_REPLY_BYTES), failed: false })!;
+		const outcome = await execWithStdin(spawn, node, ["-e", echo], reply);
+		assert.equal(JSON.parse(outcome.stdout).stdin, reply);
+	});
+
+	test("an older CLI that exits without reading stdin answers with its exit code, not an error", async () => {
+		const prior = process.env.EXIT_AT;
+		process.env.EXIT_AT = "2";
+		try {
+			const outcome = await execWithStdin(spawn, node, ["-e", echo], "x".repeat(MAX_TURN_REPLY_BYTES));
+			assert.equal(outcome.code, 2);
+			assert.ok(isUnsupportedFlagFailure(outcome), outcome.stderr);
+		} finally {
+			if (prior === undefined) {
+				delete process.env.EXIT_AT;
+			} else {
+				process.env.EXIT_AT = prior;
+			}
+		}
+	});
+
+	test("a missing binary rejects, as a spawn failure", async () => {
+		await assert.rejects(execWithStdin(spawn, "/nonexistent/dot-agent-deck", ["agent-event"], "x"), /ENOENT/);
+	});
+
+	test("an aborted report kills the child", async () => {
+		const controller = new AbortController();
+		const pending = execWithStdin(spawn, node, ["-e", "setTimeout(() => {}, 60000)"], "x", { signal: controller.signal });
+		controller.abort();
+		const outcome = await pending;
+		assert.equal(outcome.killed, true);
+		assert.notEqual(outcome.code, 0);
+	});
+
+	test("a timeout kills a child that never finishes", async () => {
+		const outcome = await execWithStdin(spawn, node, ["-e", "setTimeout(() => {}, 60000)"], "x", { timeout: 50 });
+		assert.equal(outcome.killed, true);
+		assert.notEqual(outcome.code, 0);
 	});
 });

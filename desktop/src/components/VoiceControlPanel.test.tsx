@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_PROMPT_KEYS } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  DEFAULT_VOICE_SETTINGS,
   fixtureDesktopFeatures,
   type DesktopSettingsDto,
   type VoiceResultDto,
@@ -11,6 +12,7 @@ import {
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
+import { READING_ALREADY_OFF, READING_ALREADY_ON } from "../lib/reading";
 
 const { terminalInvoke } = vi.hoisted(() => ({ terminalInvoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -2651,5 +2653,284 @@ describe("voice control panel", () => {
     expect(started).toBe(false);
     expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
+describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    window.localStorage.clear();
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+      matches: false, media: query, onchange: null,
+      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    })));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * A system voice that records each utterance. Silent, it never finishes
+   * one, so the app stays "speaking"; otherwise each ends on the next tick, so
+   * everything queued is heard in turn.
+   */
+  function synth(silent: boolean) {
+    const spoken: string[] = [];
+    vi.stubGlobal("SpeechSynthesisUtterance", class { onend: (() => void) | null = null; onerror: (() => void) | null = null; constructor(public text: string) {} });
+    vi.stubGlobal("speechSynthesis", {
+      speak: vi.fn((utterance: { text: string; onend: (() => void) | null }) => {
+        spoken.push(utterance.text);
+        if (!silent) setTimeout(() => utterance.onend?.(), 0);
+      }),
+      cancel: vi.fn(),
+    });
+    return spoken;
+  }
+
+  function dispatchOf(said: string): VoiceResultDto {
+    const [action, invoke, sentence] = said === "reading on" ? ["reading_on", "startReading", "Reading on."]
+      : said === "reading off" ? ["reading_off", "stopReading", "Reading off."]
+      : said === "typing on" ? ["dictation_on", "startDictation", "Typing on."]
+      : ["open_settings", "openSettings", "Opening Settings."];
+    return result({ kind: "dispatch", transcript: said, action, invoke, params: [], sentence }, null, "local");
+  }
+
+  const NOTICE = "Each finished turn's reply is sent to api.openai.com to be summarised.";
+
+  /**
+   * The deck shell with voice on and nothing said yet. `reading` is the
+   * Reading switch the settings document starts with; `notice` whether its
+   * one-time notice was shown.
+   */
+  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean } = {}) {
+    const spoken = synth(silent);
+    const steps: Parameters<typeof sequencedVoice>[0] = [];
+    const voice = sequencedVoice(steps);
+    const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
+    const deck = runtime(resolveVoice, voice);
+    if (typing) {
+      const snapshot = {
+        ...deck.snapshot,
+        agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? {
+          ...agent, displayName: "Planner", status: "running" as const,
+          writeLease: "write" as const, agentType: "codex" as const, turn: "working" as const,
+          promptKeys: FIXTURE_PROMPT_KEYS.codex, spawnedAtMs: 100,
+        } : agent),
+      };
+      deck.snapshot = snapshot;
+      deck.fleet = [snapshot];
+    }
+    let sessions = 0;
+    const stopped: number[] = [];
+    const sinks = new Map<string, (sentence: { kind: string; text: string; bare?: string }) => void>();
+    const consentOn = new Set<() => void>();
+    const reader = {
+      declareVoiceScreen: vi.fn(),
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceSpeechAudio: vi.fn(async () => new ArrayBuffer(0)),
+      /* As the Rust side does (audit A5), a start is refused until the
+         settings on disk have the switch on and the notice recorded. */
+      voiceReadingStart: vi.fn(async (target: { agentId: string }, onSentence: (sentence: { kind: string; text: string; bare?: string }) => void) => {
+        if (document.voice?.reading !== "on" || document.voice.reading_notice !== "shown") return { kind: "not_enabled" as const, sentence: "Reading is off." };
+        sinks.set(target.agentId, onSentence);
+        return { kind: "started" as const, session: ++sessions };
+      }),
+      voiceReadingStop: vi.fn(async (session: number) => { stopped.push(session); }),
+      onVoiceReadingConsentOff: vi.fn(async () => () => undefined),
+      onVoiceReadingConsentOn: vi.fn(async (listener: () => void) => {
+        consentOn.add(listener);
+        return () => { consentOn.delete(listener); };
+      }),
+    };
+    Object.assign(deck, reader);
+    let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, voice: { ...DEFAULT_VOICE_SETTINGS, reading, reading_notice: notice } };
+    deck.getSettings = vi.fn(async () => ({ settings: structuredClone(document), path: undefined }));
+    const saved: DesktopSettingsDto[] = [];
+    /* With `holdNotice`, the save that records the notice waits until the
+       test releases it, so what happens before it reaches the settings shows. */
+    let releaseNotice: () => void = () => undefined;
+    const noticeHeld = new Promise<void>((resolve) => { releaseNotice = resolve; });
+    deck.saveSettings = vi.fn(async (next: DesktopSettingsDto) => {
+      if (holdNotice && next.voice?.reading_notice === "shown" && document.voice?.reading_notice !== "shown") await noticeHeld;
+      document = structuredClone(next);
+      // As the Rust side reports a save that leaves the switch on.
+      if (document.voice?.reading === "on") for (const listener of consentOn) listener();
+      saved.push(structuredClone(next));
+      return structuredClone(document);
+    });
+    render(<DeckShell runtime={deck} />);
+    await flush();
+    if (openPane) fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    await turnVoiceOn(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    await flush();
+    const say = async (said: string) => {
+      const before = voice.voiceStop.mock.calls.length;
+      steps.push({ outcome: heard(said) });
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+      await flush();
+      await flush();
+      expect(voice.voiceStop).toHaveBeenCalledTimes(before + 1);
+    };
+    /** Let a speaking voice finish what it is saying, sentence by sentence. */
+    const drain = async () => {
+      for (let tick = 0; tick < 5; tick += 1) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        await flush();
+      }
+    };
+    const agents = deck.snapshot.agents.map((agent) => agent.id);
+    return { deck, reader, spoken, stopped, sinks, say, drain, saved, agents, document: () => document, releaseNotice: () => releaseNotice(), sessions: () => sessions };
+  }
+
+  /** Scenario (decisions 1–3): on the deck with no pane open, saying "reading on" turns the Settings switch on through the settings save, reads every agent on the deck, says "Reading on.", and shows the reading indicator. */
+  it("turns Reading on by voice from any screen and reads every agent on the deck", async () => {
+    const h = await mount();
+    expect(screen.queryByTestId("voice-reading-indicator")).toBeNull();
+    await h.say("reading on");
+    expect(h.document().voice?.reading).toBe("on");
+    expect(h.reader.voiceReadingStart.mock.calls.map(([target]) => target.agentId).sort()).toEqual([...h.agents].sort());
+    expect(h.spoken[0]).toBe(NOTICE);
+    expect(within(screen.getByTestId("voice-indicators")).getByTestId("voice-reading-indicator")).toHaveTextContent("Reading aloud");
+  });
+
+  /** Scenario (decision 5): the first time Reading is turned on the app says and shows where replies go and records that it did; turned off and on again, it is not said again. */
+  it("says the one-time notice once", async () => {
+    const h = await mount({ silent: false });
+    await h.say("reading on");
+    await h.drain();
+    expect(h.spoken).toContain(NOTICE);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTICE);
+    expect(h.document().voice?.reading_notice).toBe("shown");
+    await h.say("reading off");
+    await h.say("reading on");
+    await h.drain();
+    expect(h.spoken.filter((text) => text === NOTICE)).toHaveLength(1);
+  });
+
+  /** Scenario (decision 5): with the notice already shown, turning Reading on says only "Reading on.". */
+  it("does not say the notice once it was shown", async () => {
+    const h = await mount({ notice: "shown" });
+    await h.say("reading on");
+    expect(h.spoken).toEqual(["Reading on."]);
+  });
+
+  /** Scenario (decision 2): saying "reading off" turns the switch off through the same save, stops every agent's session, cuts speech off and says "Reading off."; the indicator goes. */
+  it("turns Reading off by voice and stops every session", async () => {
+    const h = await mount({ reading: "on", notice: "shown" });
+    await act(async () => { h.sinks.get(h.agents[0])!({ kind: "turn", text: "Agent: being said." }); });
+    await flush();
+    expect(h.spoken).toEqual(["Agent: being said."]);
+    const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
+    await h.say("reading off");
+    expect(h.document().voice?.reading).toBe("off");
+    expect(h.stopped).toHaveLength(h.agents.length);
+    expect(vi.mocked(speechSynthesis.cancel).mock.calls.length).toBeGreaterThan(cancels);
+    expect(h.spoken.at(-1)).toBe("Reading off.");
+    expect(screen.queryByTestId("voice-reading-indicator")).toBeNull();
+  });
+
+  /** Scenario: "reading on" with Reading already on, and "reading off" with it off, are refused in plain words and save nothing. */
+  it("refuses a switch that is already where it was asked to be", async () => {
+    const on = await mount({ reading: "on", notice: "shown" });
+    await on.say("reading on");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(READING_ALREADY_ON);
+    expect(on.saved).toEqual([]);
+  });
+
+  /** Scenario: "reading off" with Reading already off is refused in plain words. */
+  it("refuses reading off when Reading is off", async () => {
+    const h = await mount();
+    await h.say("reading off");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(READING_ALREADY_OFF);
+    expect(h.saved).toEqual([]);
+  });
+
+  /** Scenario (decision 3): with Reading on, opening an agent's pane and then Settings neither ends reading nor says "Reading off."; the indicator stays on every screen. */
+  it("keeps reading through panes and Settings", async () => {
+    const h = await mount({ reading: "on", notice: "shown" });
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    await flush();
+    expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
+    await h.say("open settings");
+    expect(h.stopped).toEqual([]);
+    expect(h.spoken).not.toContain("Reading off.");
+    expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
+  });
+
+  /** Scenario: turning voice off turns the microphone off and leaves Reading on: nothing is stopped and "Reading off." is not said. */
+  it("leaves reading on through voice off", async () => {
+    const h = await mount({ reading: "on", notice: "shown" });
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+    expect(h.stopped).toEqual([]);
+    expect(h.spoken).not.toContain("Reading off.");
+    expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
+  });
+
+  /** Scenario (decision 4): with the Planner's pane open, the Planner's summary is said without its name and another agent's names it. */
+  it("drops the name of the agent whose pane is open", async () => {
+    const h = await mount({ reading: "on", notice: "shown", openPane: true });
+    const other = h.agents.find((agent) => agent !== "planner")!;
+    await act(async () => {
+      h.sinks.get("planner")!({ kind: "turn", text: "Planner: planned.", bare: "Planned." });
+      h.sinks.get(other)!({ kind: "turn", text: `${other}: built.`, bare: "Built." });
+    });
+    await flush();
+    expect(h.spoken[0]).toBe("Planned.");
+    expect(h.reader.voiceReadingStart).toHaveBeenCalledTimes(h.agents.length);
+  });
+
+  /** Scenario (decision 1): Settings → Voice names the switch Reading, and turning it on there reads the deck's agents and says the one-time notice, as saying "reading on" does. */
+  it("turns Reading on from its Settings row", async () => {
+    const h = await mount({ silent: false });
+    await h.say("open settings");
+    fireEvent.click(screen.getByTestId("settings-section-voice"));
+    const group = screen.getByRole("radiogroup", { name: "Reading" });
+    await act(async () => { fireEvent.click(within(group).getByRole("radio", { name: "On" })); });
+    await h.drain();
+    expect(h.document().voice?.reading).toBe("on");
+    expect(h.sessions()).toBe(h.agents.length);
+    expect(h.spoken.slice(0, 2)).toEqual([NOTICE, "Reading on."]);
+  });
+
+  /** Scenario (audit A5): the first time Reading is turned on, the notice is shown and queued to be said ahead of everything reading says, and no agent is subscribed while the record that it was shown has not reached the settings; once it has, the deck's agents are read. */
+  it("subscribes nothing before the notice is shown and recorded", async () => {
+    const h = await mount({ silent: false, holdNotice: true });
+    await h.say("reading on");
+    await h.drain();
+    expect(h.document().voice?.reading).toBe("on");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTICE);
+    expect(h.spoken[0]).toBe(NOTICE);
+    expect(h.document().voice?.reading_notice).toBe("pending");
+    expect(h.sessions()).toBe(0);
+    await act(async () => { h.releaseNotice(); });
+    await flush();
+    await h.drain();
+    expect(h.document().voice?.reading_notice).toBe("shown");
+    expect(h.sessions()).toBe(h.agents.length);
+    expect(h.spoken.filter((text) => text === NOTICE)).toHaveLength(1);
+  });
+
+  /** Scenario (decision 6): typing mode on with Reading on shows both indicators side by side on the one indicator row. */
+  it("shows typing and reading on one row", async () => {
+    const h = await mount({ reading: "on", notice: "shown", openPane: true, typing: true });
+    await h.say("typing on");
+    const row = screen.getByTestId("voice-indicators");
+    expect(within(row).getByTestId("voice-typing-indicator")).toHaveTextContent("Typing to Planner");
+    expect(within(row).getByTestId("voice-reading-indicator")).toBeInTheDocument();
+  });
+
+  /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */
+  it("declares the utterance heard while the app spoke", async () => {
+    const h = await mount();
+    await h.say("reading on");
+    await h.say("open settings");
+    const last = h.reader.declareVoiceScreen.mock.calls.at(-1)!;
+    expect(last[5]).toEqual({ reading: true, speaking: true });
   });
 });

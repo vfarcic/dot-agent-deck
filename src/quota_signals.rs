@@ -314,6 +314,9 @@ pub enum CodexLineOutcome {
     Nothing,
     /// The watched turn completed without an error; stop watching.
     TurnEnded,
+    /// PRD #1497 re-audit R3: the watched turn was interrupted (a
+    /// `turn_aborted` record); stop watching. It carries no reply.
+    TurnAborted,
     /// The watched turn ended on an error: `Blocked` for the provider's usage
     /// limit, `Error` for anything else (issue #1359).
     Failed {
@@ -360,11 +363,47 @@ struct CodexRateLimits {
 /// healthy sessions), any other `codex_error_info`, a `task_complete` for any
 /// other turn, and a line that is not JSON. Never an error: a `task_complete`
 /// whose `error` is absent or `null`, and every other record type — an
-/// interrupted turn is a `turn_aborted`, not a `task_complete`.
+/// interrupted turn is a `turn_aborted`, not a `task_complete`, and ends the
+/// watch as [`CodexLineOutcome::TurnAborted`] with no reply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexTurnWatch {
     turn_id: String,
     rate_limits: Option<CodexRateLimits>,
+    /// PRD #1497: the final reply of the watched turn's `task_complete`, once
+    /// seen, until [`Self::take_reply`].
+    reply: Option<crate::daemon_protocol::FinalReply>,
+}
+
+/// PRD #1497: the final reply a Codex rollout record carries — the
+/// `last_agent_message` of an `event_msg` whose payload is a `task_complete`,
+/// marked failed when that payload's `error` is an object. `None` for every
+/// other record. A `task_complete` whose message is missing, not a string, or
+/// blank is still the turn's end, and answers an empty reply: the turn ended
+/// with nothing to read (audit A2). The text is cut to
+/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8 boundary, and
+/// the payload's `turn_id` is kept.
+pub fn extract_codex_turn_reply(record: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        return None;
+    }
+    let text = payload
+        .get("last_agent_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: text.to_owned(),
+            failed: payload.get("error").is_some_and(Value::is_object),
+        },
+    ))
 }
 
 impl CodexTurnWatch {
@@ -372,7 +411,14 @@ impl CodexTurnWatch {
         Self {
             turn_id: turn_id.into(),
             rate_limits: None,
+            reply: None,
         }
+    }
+
+    /// PRD #1497: the watched turn's final reply, if its `task_complete` has
+    /// been seen and carried one. Taken, so it is handed out once.
+    pub fn take_reply(&mut self) -> Option<crate::daemon_protocol::FinalReply> {
+        self.reply.take()
     }
 
     /// The turn this watch is for.
@@ -385,6 +431,7 @@ impl CodexTurnWatch {
     /// what decides.
     pub fn line_is_candidate(line: &[u8]) -> bool {
         contains(line, b"\"task_complete\"")
+            || contains(line, b"\"turn_aborted\"")
             || contains(line, b"\"task_started\"")
             || contains(line, b"\"token_count\"")
     }
@@ -419,7 +466,11 @@ impl CodexTurnWatch {
                 }
                 CodexLineOutcome::Nothing
             }
+            Some("turn_aborted") if turn == Some(self.turn_id.as_str()) => {
+                CodexLineOutcome::TurnAborted
+            }
             Some("task_complete") if turn == Some(self.turn_id.as_str()) => {
+                self.reply = extract_codex_turn_reply(&record);
                 let Some(error) = payload.get("error").filter(|e| e.is_object()) else {
                     return CodexLineOutcome::TurnEnded;
                 };

@@ -594,14 +594,25 @@ const HOOK_COMMAND_SUFFIX: &str = "hook --agent claude-code";
 /// LEGACY `<path> hook` shape — see [`is_legacy_deck_rule`].
 const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 
+/// The deck's hook command for `binary_path`, as every rule [`make_rule`]
+/// builds carries it.
+fn hook_command(binary_path: &str) -> String {
+    // PRD #1497: through the `DOT_AGENT_DECK_BIN` override wherever the hook
+    // runs in a POSIX shell (`sh -c`, per Claude Code's hooks reference).
+    format!(
+        "{} {HOOK_COMMAND_SUFFIX}",
+        crate::agent_hook_config::overridable_command_word(
+            &shell_quote_if_needed(binary_path),
+            cfg!(windows),
+        )
+    )
+}
+
 /// Build a rule object in the new hooks format:
 /// `{ "hooks": [{"type": "command", "command": "..."}] }`
 /// For Notification, adds a matcher for permission_prompt.
 fn make_rule(binary_path: &str, hook_type: &str) -> Value {
-    let command = format!(
-        "{} {HOOK_COMMAND_SUFFIX}",
-        shell_quote_if_needed(binary_path)
-    );
+    let command = hook_command(binary_path);
     let command_obj = json!({
         "type": "command",
         "command": command
@@ -789,6 +800,7 @@ fn install_impl_in(
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             |cmd| current_format_executable(cmd).map(|exe| unquote_if_needed(exe).into_owned()),
+            hook_command,
         )
     };
     let keeper = match mode {
@@ -821,8 +833,8 @@ fn install_impl_in(
         let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), &own_command)
             .to_string();
         expected["hooks"][0]["command"] = Value::String(command.clone());
-        // Another install's rule is left exactly as that install wrote it,
-        // `matcher` included (PRD #1487).
+        // Another install's rule keeps its `matcher` and its place (PRD #1487);
+        // only its command is rebuilt, around the same executable (PRD #1497).
         let keeps_other = matches!(kept_here, Some(KeptDeckEntry::Other { .. }));
 
         // ONE deck rule per hook type (PRD #1487), shared with the Codex and
@@ -1187,6 +1199,10 @@ pub fn auto_install_to_gated(
             return;
         }
     };
+    if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
+        tracing::warn!("auto-install: {e}");
+        return;
+    }
 
     let _guard = match lock_settings(path) {
         Ok(guard) => guard,
@@ -1269,6 +1285,9 @@ pub fn install() -> Result<(), String> {
 /// durable deck on it.
 pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
     let binary_path = resolve()?;
+    // Before the settings are read, so a refusal leaves them as they were.
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path)
+        .map_err(|e| e.to_string())?;
     let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
@@ -1358,6 +1377,7 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     let before = settings.clone();
@@ -1606,7 +1626,13 @@ mod tests {
         );
         assert_eq!(
             commands[0],
-            format!("{} {HOOK_COMMAND_SUFFIX}", b.display())
+            format!(
+                "{} {HOOK_COMMAND_SUFFIX}",
+                crate::agent_hook_config::overridable_command_word(
+                    &shell_quote_if_needed(b.to_str().unwrap()),
+                    cfg!(windows)
+                )
+            )
         );
     }
 
