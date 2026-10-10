@@ -355,7 +355,7 @@ pub(crate) fn check_dto(checked: &Checked) -> CheckDto {
 pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
     RunDto {
         copy,
-        ok: true,
+        ok: outcome.upgraded(),
         lines: line_dtos(outcome.items()),
         relaunch: matches!(outcome, Outcome::AppReplaced { .. }),
     }
@@ -1014,6 +1014,26 @@ mod tests {
         assert_eq!(
             commands(&staged.lines),
             vec!["sudo apt install /stage/x.deb"]
+        );
+    }
+
+    #[test]
+    fn self_upgrade_028_a_brew_upgrade_homebrew_could_not_deliver_is_a_failure() {
+        let dto = outcome_dto(
+            SelfCopy::Cli,
+            &Outcome::BrewNotUpgraded {
+                formula: "dot-agent-deck",
+                reported: Some(CURRENT.into()),
+                offered: LATEST.into(),
+            },
+        );
+        assert!(!dto.ok);
+        assert!(!dto.relaunch);
+        assert_eq!(
+            texts(&dto.lines),
+            vec![
+                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later."
+            ]
         );
     }
 

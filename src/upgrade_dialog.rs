@@ -269,7 +269,7 @@ impl RunResult {
             Outcome::Replaced { .. } | Outcome::Installed { .. } | Outcome::BrewUpgraded { .. }
         );
         Self {
-            ok: true,
+            ok: outcome.upgraded(),
             lines,
             tui_restart: restart.filter(|_| on_disk),
         }
@@ -1010,6 +1010,64 @@ mod tests {
         assert_eq!(wrap("a bcdefgh", 4), vec!["a", "bcde", "fgh"]);
         // Two spaces are kept, and never broken at.
         assert_eq!(wrap("x 'ab  cd' y", 9), vec!["x", "'ab  cd'", "y"]);
+    }
+
+    #[test]
+    fn a_brew_upgrade_that_did_not_move_is_not_installed() {
+        use crate::self_upgrade::detect::{InstallMethod, Installation, Platform, Tools};
+        use crate::self_upgrade::{CopyKind, HomebrewFormula, PlanOptions, ProvenanceCheck};
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: "/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck".into(),
+            version: "0.46.0".into(),
+            platform: Some(Platform::MacosArm64),
+            method: InstallMethod::Homebrew {
+                formula: HomebrewFormula::Stable,
+                prefix: "/opt/homebrew".into(),
+            },
+            tools: Tools {
+                brew: Some("/opt/homebrew/bin/brew".into()),
+                ..Tools::default()
+            },
+        };
+        let plan = plan::plan(
+            &installation,
+            &"0.47.0".into(),
+            &PlanOptions {
+                staging_root: "/stage".into(),
+                can_prompt_for_privilege: false,
+                provenance: ProvenanceCheck::Unavailable { reason: "x".into() },
+            },
+        );
+        let behind = Outcome::BrewNotUpgraded {
+            formula: "dot-agent-deck",
+            reported: Some("0.46.0".into()),
+            offered: "0.47.0".into(),
+        };
+        let result = RunResult::from_outcome(&plan, &behind, true);
+        assert!(!result.ok);
+        assert_eq!(result.tui_restart, None, "nothing to restart into");
+        assert!(
+            !result
+                .lines
+                .iter()
+                .any(|line| line.render().contains("start it again")),
+            "{result:?}"
+        );
+        // So the badge still offers the upgrade.
+        let check = UpgradeCheck {
+            plans: vec![plan.clone()],
+        };
+        let badge = badge(Some(&check), Some(&result), "u").unwrap();
+        assert!(badge.offers_upgrade);
+
+        let reached = Outcome::BrewUpgraded {
+            formula: "dot-agent-deck",
+            reported: Some("0.47.0".into()),
+        };
+        let result = RunResult::from_outcome(&plan, &reached, true);
+        assert!(result.ok);
+        assert!(result.tui_restart.is_some());
     }
 
     #[test]

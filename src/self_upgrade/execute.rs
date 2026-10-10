@@ -245,10 +245,19 @@ pub enum Outcome {
         version: String,
         provenance: Provenance,
     },
-    /// `brew upgrade` ran; `reported` is what the Homebrew binary now says.
+    /// `brew upgrade` ran and the Homebrew binary now reports `reported`,
+    /// the offered release.
     BrewUpgraded {
         formula: &'static str,
         reported: Option<String>,
+    },
+    /// `brew upgrade` ran, but the Homebrew binary does not report `offered`:
+    /// it reports `reported`, or nothing. The usual reason is that the tap
+    /// does not carry the GitHub release yet. Not an upgrade.
+    BrewNotUpgraded {
+        formula: &'static str,
+        reported: Option<String>,
+        offered: String,
     },
     /// The verified file is at `path`; the user runs `command` to install it.
     /// `command` is `None` when it could not be shown safely
@@ -273,13 +282,21 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Whether the copy now has the offered release (or, once staged, will
+    /// once the user runs the command). `false` for a `brew upgrade` that
+    /// left the copy on another version: nothing was upgraded, so a client
+    /// reports it as a failure and offers it again.
+    pub fn upgraded(&self) -> bool {
+        !matches!(self, Self::BrewNotUpgraded { .. })
+    }
+
     /// What the TUI adds after upgrading the copy it runs from to `version`:
     /// the running process is still the old build until it is restarted. Once
     /// the copy is staged, the user installs it first. `None` for the desktop
     /// app, which is not the TUI the user restarts.
     pub fn tui_restart_line(&self, version: &str) -> Option<PlanLine> {
         let line = match self {
-            Self::AppReplaced { .. } => return None,
+            Self::AppReplaced { .. } | Self::BrewNotUpgraded { .. } => return None,
             Self::Staged { .. } => {
                 format!("Once it is installed, quit the TUI and start it again to run v{version}.")
             }
@@ -313,6 +330,20 @@ impl Outcome {
                 }
                 None => format!("`brew upgrade {formula}` finished."),
             })],
+            Self::BrewNotUpgraded {
+                formula,
+                reported: Some(reported),
+                offered,
+            } => vec![text(format!(
+                "`brew upgrade {formula}` finished, but {CLI_BINARY} still reports v{reported}, not v{offered}: Homebrew does not offer v{offered} yet. Try again later."
+            ))],
+            Self::BrewNotUpgraded {
+                formula,
+                reported: None,
+                offered,
+            } => vec![text(format!(
+                "`brew upgrade {formula}` finished, but the upgraded {CLI_BINARY} did not report its version, so it is not known to run v{offered}. Check with `{CLI_BINARY} --version`."
+            ))],
             Self::Staged {
                 command,
                 version,
@@ -378,14 +409,25 @@ pub async fn execute(
                 &[OsStr::new("upgrade"), OsStr::new(formula.name())],
                 INSTALL_TIMEOUT,
             )?;
+            // `brew upgrade` succeeds when the formula is already at the
+            // tap's newest, which lags the GitHub release for a while after
+            // it is published. Only the copy's own answer says it moved.
             let reported = brew
                 .parent()
                 .map(|bin| bin.join(CLI_BINARY))
                 .and_then(|deck| super::reported_version(host, &deck));
-            Ok(Outcome::BrewUpgraded {
-                formula: formula.name(),
-                reported,
-            })
+            if reported.as_deref() == Some(version) {
+                Ok(Outcome::BrewUpgraded {
+                    formula: formula.name(),
+                    reported,
+                })
+            } else {
+                Ok(Outcome::BrewNotUpgraded {
+                    formula: formula.name(),
+                    reported,
+                    offered: version.to_string(),
+                })
+            }
         }
         PlanAction::ReplaceBinary { target, asset } => {
             let staging = Staging::create(staging_root, version)?;
@@ -1284,6 +1326,79 @@ mod tests {
             "0.47.0"
         );
         assert!(releases_from(ReleaseChannel::Stable, &Default::default()).is_err());
+    }
+
+    /// A `brew upgrade` plan for the stable formula from 0.46.0 to 0.47.0,
+    /// with `brew` at `/opt/homebrew/bin/brew`.
+    fn brew_plan() -> UpgradePlan {
+        let mut found = copy_at(
+            "0.46.0",
+            InstallMethod::Homebrew {
+                formula: crate::self_upgrade::HomebrewFormula::Stable,
+                prefix: PathBuf::from("/opt/homebrew"),
+            },
+        );
+        found.tools.brew = Some(PathBuf::from("/opt/homebrew/bin/brew"));
+        let options = plan::PlanOptions {
+            staging_root: PathBuf::from("/stage"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: verify::GH_NOT_INSTALLED.into(),
+            },
+        };
+        let plan = plan::plan(&found, &"0.47.0".into(), &options);
+        assert!(matches!(plan.action, PlanAction::BrewUpgrade { .. }));
+        plan
+    }
+
+    /// Run `plan` on a machine whose upgraded `dot-agent-deck` answers
+    /// `--version` with `reported` (or not at all).
+    fn brew_upgrade_reporting(reported: Option<&str>) -> Result<Outcome, UpgradeError> {
+        let mut host = FakeHost::new()
+            .exe("/opt/homebrew/bin/brew")
+            .answer("/opt/homebrew/bin/brew upgrade dot-agent-deck", ok(""));
+        if let Some(version) = reported {
+            host = host.deck("/opt/homebrew/bin/dot-agent-deck", version);
+        }
+        let source = ReleaseSource {
+            api_url: String::new(),
+            list_url: String::new(),
+            download_base: String::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(execute(&host, &brew_plan(), &source, Path::new("/stage")))
+    }
+
+    #[test]
+    fn execute_022_a_brew_upgrade_is_upgraded_only_once_it_reports_the_offered_version() {
+        let reached = brew_upgrade_reporting(Some("0.47.0")).unwrap();
+        assert_eq!(
+            reached.lines(),
+            ["`brew upgrade dot-agent-deck` finished; it now reports v0.47.0."]
+        );
+        assert!(reached.upgraded());
+
+        // Homebrew's tap has not caught up with the GitHub release yet.
+        let behind = brew_upgrade_reporting(Some("0.46.0")).unwrap();
+        assert!(!behind.upgraded(), "{behind:?}");
+        assert_eq!(
+            behind.lines(),
+            [
+                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later."
+            ]
+        );
+        assert_eq!(behind.tui_restart_line("0.47.0"), None);
+
+        let silent = brew_upgrade_reporting(None).unwrap();
+        assert!(!silent.upgraded(), "{silent:?}");
+        assert_eq!(
+            silent.lines(),
+            [
+                "`brew upgrade dot-agent-deck` finished, but the upgraded dot-agent-deck did not report its version, so it is not known to run v0.47.0. Check with `dot-agent-deck --version`."
+            ]
+        );
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub async fn run(
                 for line in outcome.lines() {
                     let _ = writeln!(out, "{line}");
                 }
+                ok &= outcome.upgraded();
             }
             Err(e) => {
                 let _ = writeln!(out, "{e}");
