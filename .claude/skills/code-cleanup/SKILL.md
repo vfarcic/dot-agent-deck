@@ -121,11 +121,11 @@ THE RULES YOU ARE MOST LIKELY TO GET WRONG (all in the skill; repeated here on p
 
 GATES (CLAUDE.md rules 2, 5 and 6): `cargo xtask affected-checks --run` before every commit. It
 prints and runs what the change needs, stopping at the first failure: for a change with any Rust,
-build input or unmapped path in it, that is `cargo fmt --check`,
-`cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and
-`cargo test-fast`; for a change that is only mapped text (docs, skills, `changelog.d/`,
+build input or unmapped path in it, that is CLAUDE.md rule 2's fmt and clippy commands and rule
+5's `cargo test-fast`; for a change that is only mapped text (docs, skills, `changelog.d/`,
 `.github/`, PRDs, `CLAUDE.md` and the like), it is the xtask tests plus the root-package tests
-that read those files. Add the tests covering what you touched, found via
+that read those files. CLAUDE.md is the authority on the commands; run the helper rather than
+copying them. Add the tests covering what you touched, found via
 tests/CATALOG.md, the #[spec] annotations or `cargo xtask list-tests`, and NAMED in your report,
 including `cargo test-e2e-live <filter>` for any lane-2 test you change or whose covered code you
 change. There is NO full-tier obligation before the PR: do not run `cargo test-e2e` in full; CI's
@@ -133,7 +133,7 @@ e2e-deterministic job runs lane 1 on every PR, so read that run rather than repr
 `cargo xtask linkage-check` when you touch anything under tests/ or a #[spec] test.
 
 A test or check that goes red while you work is in scope under CLAUDE.md rule 6, whoever caused it
-and even if it passes on a retry. Rerun it alone first, as rule 6 says, to learn whether this box's
+and even if it passes on a retry. Rerun it alone first, as CLAUDE.md rule 6 says, to learn whether this box's
 load caused it; that rerun is a diagnosis, not a fix. Then fix it in this PR, or quarantine it (a
 named owner, an expiry issue, and `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and
 say in your report which you did for each one — rerunning it until green and mentioning it in the
@@ -207,7 +207,7 @@ The draw is weighted by file size, and skips every file an open PR or a running 
 
 - **code**: logic duplicated in N places that one existing helper already covers or one new one can (state N); code with no callers (prove it with a word-bounded search across the workspace, including `desktop/`, and with `cargo clippy` staying green after removal); a workaround whose stated reason no longer holds (prove it from the history); a comment the code contradicts. The `#[cfg(test)]` module in the file may change when the internals it tests change.
 - **tests**: tests that assert the same thing (remove the duplicates); over-granular tests that can be unified into one without losing a distinct assertion; slow tests that can be made faster without weakening them (a fixed sleep replaced by the harness's wait helpers, a fixture built once instead of per test). For any test you change, measure before and after.
-- **instructions**: duplicated instructions (keep the one in the most specific home and link to it); an instruction the code contradicts: a stale number, a file path or symbol that no longer exists (check with `git grep` and `git ls-tree` against `origin/main`), an absolute CLAUDE.md rule 17 would narrow; supporting evidence (measurements, incident histories) sitting in `CLAUDE.md` that belongs on a `docs/develop/` page, moved there with a link left behind. Every corrected claim is checked against the code, and any new sentence you write obeys rule 17 itself.
+- **instructions**: duplicated instructions (keep the one in the most specific home and link to it); an instruction the code contradicts: a stale number, a file path or symbol that no longer exists (check with `git grep` and `git ls-tree` against `origin/main`), an absolute CLAUDE.md rule 17 would narrow; supporting evidence (measurements, incident histories) sitting in `CLAUDE.md` that belongs on a `docs/develop/` page, moved there with a link left behind. Every corrected claim is checked against the code, and any new sentence you write obeys CLAUDE.md rule 17 itself.
 
 ### 3. Prove there is no behaviour change
 
