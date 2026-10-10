@@ -166,6 +166,10 @@ struct Inner {
     running: AtomicBool,
     /// The app's own copy, once an upgrade installed it.
     installed: Mutex<Option<Installed>>,
+    /// Run by [`SelfUpgradeState::claim`] once the plan is validated, so a
+    /// test can complete another upgrade at exactly that moment.
+    #[cfg(test)]
+    after_validate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The app's own copy, installed this session and waiting for a relaunch.
@@ -263,6 +267,29 @@ impl SelfUpgradeState {
             return Err(safe_message(plan.text()));
         }
         Ok(plan.clone())
+    }
+
+    /// Claim the one upgrade slot for `copy`, and the plan check `check_id`
+    /// found for it, when it can be carried out ([`Self::plan_for`]).
+    ///
+    /// The slot is taken first and the plan validated under it, so no other
+    /// upgrade can finish between the validation and the run: an app that an
+    /// upgrade installed is marked installed before that upgrade lets go of
+    /// the slot, and every later claim sees it. The caller holds the returned
+    /// [`Running`] until it has published what its upgrade installed. A claim
+    /// that fails validation lets go of the slot as it returns.
+    pub(crate) fn claim(
+        &self,
+        copy: SelfCopy,
+        check_id: u64,
+    ) -> Result<(Running, UpgradePlan), String> {
+        let running = self.begin()?;
+        let plan = self.plan_for(copy, check_id)?;
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.inner.after_validate).take() {
+            hook();
+        }
+        Ok((running, plan))
     }
 
     /// Claim the one upgrade slot.
@@ -540,8 +567,8 @@ pub(crate) async fn desktop_self_upgrade_run(
     check_id: u64,
 ) -> Result<RunDto, String> {
     crate::ensure_main_webview(&webview)?;
-    let plan = state.plan_for(copy, check_id)?;
-    let _running = state.begin()?;
+    // Held until the result is published below ([`SelfUpgradeState::claim`]).
+    let (_running, plan) = state.claim(copy, check_id)?;
     let state = state.inner().clone();
     let handle = tokio::runtime::Handle::current();
     let run_state = state.clone();
@@ -1591,5 +1618,57 @@ mod tests {
         assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
         assert!(text.contains("Stable release v0.47.0"), "{text}");
         assert_eq!(commands(&cli.lines), vec![SWITCH.to_string()]);
+    }
+
+    /// Scenario: two Upgrade requests for the app arrive together, the second
+    /// from a dialog still showing an older check that offered an older
+    /// release. The first install completes at the moment the second has
+    /// validated its plan. The second never runs: not while the first holds
+    /// the slot, and not after it finished, when the app is installed and
+    /// waits for Relaunch. Exactly one upgrade of the app runs.
+    #[test]
+    fn self_upgrade_032_a_second_upgrade_never_runs_over_the_app_just_installed() {
+        let state = SelfUpgradeState::default();
+        let older = state.next_check_id();
+        state.store(older, checked_against("0.46.1"));
+        let newer = state.next_check_id();
+        state.store(newer, checked_against(LATEST));
+
+        let (first, plan) = state.claim(SelfCopy::App, newer).unwrap();
+        assert_eq!(plan.latest, LATEST);
+
+        // The first install completes, marks the app installed and lets go
+        // of the slot, right after the second request validated its plan.
+        let completing = state.clone();
+        let complete = move || {
+            let installed = Outcome::Installed {
+                version: LATEST.into(),
+                provenance: provenance(),
+            };
+            completing.mark_installed(
+                SelfCopy::App,
+                &installed,
+                &outcome_dto(SelfCopy::App, &installed),
+            );
+            drop(first);
+        };
+        *lock(&state.inner.after_validate) = Some(Box::new(complete));
+        for check_id in [older, newer] {
+            if let Ok((_running, plan)) = state.claim(SelfCopy::App, check_id) {
+                panic!("v{} ran over the app just installed", plan.latest);
+            }
+        }
+        // If no request reached the hook, the first install completes now.
+        if let Some(complete) = lock(&state.inner.after_validate).take() {
+            complete();
+        }
+        for check_id in [older, newer] {
+            assert_eq!(
+                state.claim(SelfCopy::App, check_id).err().as_deref(),
+                Some(APP_ALREADY_INSTALLED)
+            );
+        }
+        // A refused claim never keeps the slot.
+        assert!(state.begin().is_ok());
     }
 }
