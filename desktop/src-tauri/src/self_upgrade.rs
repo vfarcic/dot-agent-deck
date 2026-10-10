@@ -975,6 +975,7 @@ mod tests {
                 app: PathBuf::from("/Applications/Agent Deck.app"),
                 version: LATEST.into(),
                 provenance: provenance(),
+                mount_left: None,
             },
         );
         assert!(replaced.ok);

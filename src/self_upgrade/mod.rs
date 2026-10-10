@@ -422,6 +422,13 @@ pub enum UpgradeError {
     Io(String),
     #[error("This install is not upgraded from here: {0}")]
     NotActionable(String),
+    /// `error` stopped the app swap, and the release's disk image could not
+    /// be detached afterwards: it is still attached at `mount`.
+    #[error("{error}")]
+    StillMounted {
+        error: Box<UpgradeError>,
+        mount: String,
+    },
 }
 
 impl UpgradeError {
@@ -431,6 +438,11 @@ impl UpgradeError {
     /// command cannot be shown safely.
     pub fn fallback(&self) -> Vec<PlanLine> {
         match self {
+            Self::StillMounted { error, mount } => {
+                let mut lines = error.fallback();
+                lines.extend(execute::still_mounted(Path::new(mount)));
+                lines
+            }
             Self::PrivilegeFailed {
                 install: Some(command),
                 ..

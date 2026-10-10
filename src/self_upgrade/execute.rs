@@ -274,10 +274,13 @@ pub enum Outcome {
         provenance: Provenance,
     },
     /// The app at `app` was replaced; it runs `version` once restarted.
+    /// `mount_left` is where the release's disk image is still attached when
+    /// detaching it failed.
     AppReplaced {
         app: PathBuf,
         version: String,
         provenance: Provenance,
+        mount_left: Option<PathBuf>,
     },
 }
 
@@ -374,13 +377,20 @@ impl Outcome {
                 app,
                 version,
                 provenance,
-            } => vec![
-                text(format!(
-                    "Replaced {} with v{version}. Quit and reopen Agent Deck to run it.",
-                    app.display()
-                )),
-                text(provenance.message()),
-            ],
+                mount_left,
+            } => {
+                let mut lines = vec![
+                    text(format!(
+                        "Replaced {} with v{version}. Quit and reopen Agent Deck to run it.",
+                        app.display()
+                    )),
+                    text(provenance.message()),
+                ];
+                if let Some(mount) = mount_left {
+                    lines.extend(still_mounted(mount));
+                }
+                lines
+            }
         }
     }
 }
@@ -527,11 +537,12 @@ pub async fn execute(
             let dmg = staging.dir().join(asset);
             write_new_file(&dmg, &downloaded.bytes, 0o644)?;
             verify::rehash(&dmg, &downloaded.sha256)?;
-            swap_app(host, &dmg, app, team_id, version, staging.dir())?;
+            let mount_left = swap_app(host, &dmg, app, team_id, version, staging.dir())?;
             Ok(Outcome::AppReplaced {
                 app: app.clone(),
                 version: version.to_string(),
                 provenance: downloaded.provenance,
+                mount_left,
             })
         }
     }
@@ -870,12 +881,91 @@ fn check_app(host: &dyn Host, app: &Path, team_id: &str, assess: bool) -> Result
     Ok(())
 }
 
+/// The lines that tell the user the release's disk image is still attached
+/// at `mount`, and how to detach it.
+pub(crate) fn still_mounted(mount: &Path) -> Vec<PlanLine> {
+    vec![
+        PlanLine::Text(format!(
+            "Warning: the release's disk image is still attached at {}. Detach it with:",
+            mount.display()
+        )),
+        PlanLine::Command(format!(
+            "{HDIUTIL} detach -force {}",
+            super::shell_word(&mount.to_string_lossy())
+        )),
+    ]
+}
+
+/// A disk image attached at `mount`, detached when this is dropped — on an
+/// early return or a panic as much as at the end — unless [`Self::detach`]
+/// already did.
+struct Attached<'a> {
+    host: &'a dyn Host,
+    mount: PathBuf,
+    attached: bool,
+}
+
+impl<'a> Attached<'a> {
+    /// Attach `dmg` read-only at `mount`.
+    fn attach(host: &'a dyn Host, dmg: &Path, mount: &Path) -> Result<Self, UpgradeError> {
+        run_checked(
+            host,
+            Path::new(HDIUTIL),
+            &[
+                OsStr::new("attach"),
+                OsStr::new("-readonly"),
+                OsStr::new("-nobrowse"),
+                OsStr::new("-noautoopen"),
+                OsStr::new("-mountpoint"),
+                mount.as_os_str(),
+                dmg.as_os_str(),
+            ],
+            INSTALL_TIMEOUT,
+        )?;
+        Ok(Self {
+            host,
+            mount: mount.to_path_buf(),
+            attached: true,
+        })
+    }
+
+    /// Detach the image, forcing it when a plain detach fails. Returns
+    /// whether it is detached.
+    fn detach(&mut self) -> bool {
+        if self.attached {
+            let detach = |extra: &[&OsStr]| {
+                let mut args = vec![OsStr::new("detach"), self.mount.as_os_str()];
+                args.extend_from_slice(extra);
+                self.host
+                    .run(Path::new(HDIUTIL), &args)
+                    .is_ok_and(|out| out.success)
+            };
+            self.attached = !(detach(&[]) || detach(&[OsStr::new("-force")]));
+        }
+        !self.attached
+    }
+}
+
+impl Drop for Attached<'_> {
+    fn drop(&mut self) {
+        if !self.detach() {
+            tracing::warn!(
+                mount = %self.mount.display(),
+                "the release's disk image could not be detached"
+            );
+        }
+    }
+}
+
 /// Replace the app bundle at `app` with the one inside the verified `dmg`.
 ///
 /// The image is attached read-only under `work_dir`; the app in it must pass
 /// [`check_app`] and its bundled CLI must report `version`. It is copied next to
 /// `app` with `ditto`, checked again, and swapped in by two renames, the second
-/// of which is rolled back if it fails. The image is detached either way.
+/// of which is rolled back if it fails. The image is detached on every path
+/// ([`Attached`]). When it cannot be, a successful swap returns where it is
+/// still attached, and a failed one says so in its error
+/// ([`UpgradeError::StillMounted`]).
 pub fn swap_app(
     host: &dyn Host,
     dmg: &Path,
@@ -883,34 +973,20 @@ pub fn swap_app(
     team_id: &str,
     version: &str,
     work_dir: &Path,
-) -> Result<(), UpgradeError> {
+) -> Result<Option<PathBuf>, UpgradeError> {
     let mount = work_dir.join("mount");
     create_private_dir_all(&mount)?;
-    run_checked(
-        host,
-        Path::new(HDIUTIL),
-        &[
-            OsStr::new("attach"),
-            OsStr::new("-readonly"),
-            OsStr::new("-nobrowse"),
-            OsStr::new("-noautoopen"),
-            OsStr::new("-mountpoint"),
-            mount.as_os_str(),
-            dmg.as_os_str(),
-        ],
-        INSTALL_TIMEOUT,
-    )?;
+    let mut attached = Attached::attach(host, dmg, &mount)?;
     let result = swap_from_mount(host, &mount, app, team_id, version);
-    let detach = |extra: &[&OsStr]| {
-        let mut args = vec![OsStr::new("detach"), mount.as_os_str()];
-        args.extend_from_slice(extra);
-        host.run(Path::new(HDIUTIL), &args)
-            .is_ok_and(|out| out.success)
-    };
-    if !detach(&[]) {
-        detach(&[OsStr::new("-force")]);
+    let detached = attached.detach();
+    match result {
+        Ok(()) => Ok((!detached).then_some(mount)),
+        Err(error) if detached => Err(error),
+        Err(error) => Err(UpgradeError::StillMounted {
+            error: Box::new(error),
+            mount: mount.display().to_string(),
+        }),
     }
-    result
 }
 
 fn swap_from_mount(
@@ -1133,6 +1209,153 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with(&format!("{HDIUTIL} detach"))),
             "the image is detached"
+        );
+    }
+
+    /// [`fake_mac`] whose `hdiutil detach` succeeds only as the listed kinds:
+    /// `plain` without `-force`, `force` with it.
+    fn fake_mac_detaching(spctl_ok: bool, plain: bool, force: bool) -> FakeHost {
+        let mut host = fake_mac("TEAM123", spctl_ok);
+        let attach = host.handlers.remove(HDIUTIL).unwrap();
+        host.handle(HDIUTIL, move |args| {
+            if args[0] == "detach" {
+                let forced = args.iter().any(|arg| arg == "-force");
+                if (forced && force) || (!forced && plain) {
+                    ok("")
+                } else {
+                    fail("hdiutil: couldn't unmount \"disk4\" - Resource busy")
+                }
+            } else {
+                attach(args)
+            }
+        })
+    }
+
+    #[test]
+    fn execute_023_an_image_that_will_not_detach_is_named_in_the_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let mount = work.join("mount");
+
+        // A forced detach still works: nothing to report.
+        let host = with_version_answer(fake_mac_detaching(true, false, true), &mount);
+        assert_eq!(
+            swap_app(
+                &host,
+                Path::new("/s/x.dmg"),
+                &app,
+                "TEAM123",
+                "0.46.0",
+                &work
+            ),
+            Ok(None)
+        );
+        assert!(
+            host.ran()
+                .contains(&format!("{HDIUTIL} detach {} -force", mount.display())),
+            "{:?}",
+            host.ran()
+        );
+
+        // Neither works: the swap still happened, and the outcome says where
+        // the image is still attached and how to detach it.
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let mount = work.join("mount");
+        let host = with_version_answer(fake_mac_detaching(true, false, false), &mount);
+        let left = swap_app(
+            &host,
+            Path::new("/s/x.dmg"),
+            &app,
+            "TEAM123",
+            "0.46.0",
+            &work,
+        )
+        .unwrap();
+        assert_eq!(left.as_deref(), Some(mount.as_path()));
+        let outcome = Outcome::AppReplaced {
+            app: app.clone(),
+            version: "0.46.0".into(),
+            provenance: Provenance::Verified,
+            mount_left: left,
+        };
+        let lines = outcome.lines();
+        assert_eq!(
+            lines[2],
+            format!(
+                "Warning: the release's disk image is still attached at {}. Detach it with:",
+                mount.display()
+            )
+        );
+        assert_eq!(
+            lines[3],
+            format!("  {HDIUTIL} detach -force {}", mount.display())
+        );
+        assert!(outcome.upgraded());
+    }
+
+    #[test]
+    fn execute_024_a_failed_swap_that_leaves_the_image_attached_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let mount = work.join("mount");
+        // Gatekeeper refuses the new app, and the image will not detach.
+        let host = with_version_answer(fake_mac_detaching(false, false, false), &mount);
+        let err = swap_app(
+            &host,
+            Path::new("/s/x.dmg"),
+            &app,
+            "TEAM123",
+            "0.46.0",
+            &work,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, UpgradeError::StillMounted { error, .. } if matches!(**error, UpgradeError::AppCheckFailed(_))),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("The new Agent Deck app failed a check"),
+            "{err}"
+        );
+        let fallback = plan::render_lines(&err.fallback()).join("\n");
+        assert!(
+            fallback.contains(&format!("still attached at {}", mount.display())),
+            "{fallback}"
+        );
+        assert_eq!(
+            std::fs::read(app.join("Contents/MacOS").join(CLI_BINARY)).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn execute_025_the_image_is_detached_even_when_the_swap_panics() {
+        let root = tempfile::tempdir().unwrap();
+        let app = installed_app(root.path());
+        let work = root.path().join("work");
+        let host = fake_mac("TEAM123", true).handle(CODESIGN, |_| panic!("codesign blew up"));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            swap_app(
+                &host,
+                Path::new("/s/x.dmg"),
+                &app,
+                "TEAM123",
+                "0.46.0",
+                &work,
+            )
+        }));
+        assert!(caught.is_err());
+        assert!(
+            host.ran()
+                .iter()
+                .any(|line| line.starts_with(&format!("{HDIUTIL} detach"))),
+            "{:?}",
+            host.ran()
         );
     }
 
