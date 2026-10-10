@@ -518,9 +518,15 @@ pub async fn execute(
             match pkexec {
                 Some(pkexec) => {
                     verify::rehash(&staged, &downloaded.sha256)?;
-                    install_deb(host, pkexec, &staged)
-                        .map_err(|e| privilege_failed(e, command, version))
-                        .inspect_err(|e| staging.keep_after(e))?;
+                    install_deb(
+                        host,
+                        pkexec,
+                        &staged,
+                        &plan.installation.version,
+                        version,
+                        command,
+                    )
+                    .inspect_err(|e| staging.keep_after(e))?;
                     Ok(Outcome::Installed {
                         version: version.to_string(),
                         provenance: downloaded.provenance,
@@ -566,19 +572,150 @@ fn release_page(version: &str) -> String {
     format!("{}/releases/tag/v{version}", crate::repo_identity::URL)
 }
 
-/// A failed privilege prompt, carrying the command that installs the verified
-/// file instead. Any other error passes through.
-fn privilege_failed(error: UpgradeError, install: Option<String>, version: &str) -> UpgradeError {
-    match error {
-        UpgradeError::CommandFailed { command, detail } => UpgradeError::PrivilegeFailed {
+/// The exit codes `pkexec` itself returns when its prompt was dismissed or
+/// authorization failed, before it ran anything.
+const PROMPT_EXIT_CODES: [i32; 2] = [126, 127];
+
+/// How a command run behind `pkexec` went wrong.
+enum Privileged {
+    /// The prompt did not authorize it, or `pkexec` could not be run: nothing
+    /// was installed.
+    Prompt { command: String, detail: String },
+    /// It started and did not complete: it failed once past the prompt, or
+    /// outlived its bound, and was stopped unless it `may_still_be_running`.
+    Unfinished {
+        command: String,
+        detail: String,
+        may_still_be_running: bool,
+    },
+}
+
+/// Run `pkexec args` for at most [`INSTALL_TIMEOUT`] and say how it failed.
+fn run_privileged(host: &dyn Host, pkexec: &Path, args: &[&OsStr]) -> Result<(), Privileged> {
+    let command = super::display_command(pkexec, args);
+    match host.run_within(pkexec, args, INSTALL_TIMEOUT) {
+        Ok(output) if output.success => Ok(()),
+        Ok(output) => {
+            let detail = match output.stderr.trim() {
+                "" => match output.code {
+                    Some(code) => format!("exit {code}"),
+                    None => "killed by a signal".to_string(),
+                },
+                stderr => stderr.to_string(),
+            };
+            if output
+                .code
+                .is_some_and(|code| PROMPT_EXIT_CODES.contains(&code))
+            {
+                Err(Privileged::Prompt { command, detail })
+            } else {
+                Err(Privileged::Unfinished {
+                    command,
+                    detail,
+                    may_still_be_running: false,
+                })
+            }
+        }
+        Err(error) => match super::timed_out_stopped(&error) {
+            Some(stopped) => Err(Privileged::Unfinished {
+                command,
+                detail: error.to_string(),
+                may_still_be_running: !stopped,
+            }),
+            None => Err(Privileged::Prompt {
+                command,
+                detail: error.to_string(),
+            }),
+        },
+    }
+}
+
+/// [`run_privileged`]'s failure as the error a client shows. `found` says
+/// what is at the target of an install that did not complete, asked only once
+/// nothing may still be writing it; `install` is the command that installs
+/// the verified file, offered for a failed prompt, and for an unfinished
+/// install only when the target is known not to be the new version.
+fn privileged_error(
+    failure: Privileged,
+    target: plan::InstallTarget,
+    found: impl FnOnce() -> plan::Found,
+    install: Option<String>,
+    version: &str,
+) -> UpgradeError {
+    match failure {
+        Privileged::Prompt { command, detail } => UpgradeError::PrivilegeFailed {
             command,
             detail,
             install,
             version: version.to_string(),
         },
-        other => other,
+        Privileged::Unfinished {
+            command,
+            detail,
+            may_still_be_running,
+        } => {
+            let found = if may_still_be_running {
+                plan::Found::NotChecked
+            } else {
+                found()
+            };
+            UpgradeError::InstallUnfinished(Box::new(super::UnfinishedInstall {
+                command,
+                detail,
+                may_still_be_running,
+                target,
+                install: install.filter(|_| found.known_not_new()),
+                found,
+                version: version.to_string(),
+            }))
+        }
     }
 }
+
+/// What is at `target` after an install of the build hashing to `sha256`
+/// stopped, `previous` being the target's hash before it started.
+fn found_binary(target: &Path, previous: Option<&str>, sha256: &str) -> plan::Found {
+    match verify::file_sha256(target) {
+        Ok(actual) if actual == sha256 => plan::Found::New,
+        Ok(actual) if Some(actual.as_str()) == previous => plan::Found::Previous,
+        Ok(_) => plan::Found::Neither,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => plan::Found::Missing,
+        Err(e) => plan::Found::Unreadable(e.to_string()),
+    }
+}
+
+/// What `dpkg-query` says of the desktop package after an install from
+/// `previous` to `version` stopped.
+fn found_package(host: &dyn Host, previous: &str, version: &str) -> plan::Found {
+    let output = host.run(
+        Path::new(DPKG_QUERY),
+        &[
+            OsStr::new("-W"),
+            OsStr::new("-f=${Version} ${db:Status-Abbrev}"),
+            OsStr::new(super::DESKTOP_DEB_PACKAGE),
+        ],
+    );
+    let output = match output {
+        Ok(output) if output.success => output,
+        Ok(output) => {
+            let why = match output.stderr.trim() {
+                "" => "`dpkg-query` did not answer".to_string(),
+                stderr => stderr.to_string(),
+            };
+            return plan::Found::Unreadable(why);
+        }
+        Err(e) => return plan::Found::Unreadable(e.to_string()),
+    };
+    let mut words = output.stdout.split_whitespace();
+    let (installed, status) = (words.next(), words.next());
+    match (installed, status) {
+        (Some(installed), Some("ii")) if installed == version => plan::Found::New,
+        (Some(installed), Some("ii")) if installed == previous => plan::Found::Previous,
+        _ => plan::Found::Neither,
+    }
+}
+
+const DPKG_QUERY: &str = "/usr/bin/dpkg-query";
 
 /// Install the verified binary at `staged` over `target` behind `pkexec`.
 ///
@@ -587,7 +724,14 @@ fn privilege_failed(error: UpgradeError, install: Option<String>, version: &str)
 /// against the verified digest BEFORE it is run for its `--version`: a
 /// mismatch means what root installed is not the verified build, which is
 /// reported as such and never executed. `fallback` is the command the user
-/// runs when the prompt itself fails.
+/// runs when the prompt itself fails, or when an install that did not
+/// complete left a target known not to be the new build.
+///
+/// A failure `pkexec` reports for its prompt is
+/// [`UpgradeError::PrivilegeFailed`]. Any other failure, a timeout included,
+/// is [`UpgradeError::InstallUnfinished`]: once the target is no longer being
+/// written, it is hashed against both the verified digest and its own digest
+/// from before the install, so the result can say which it holds.
 pub fn install_binary_privileged(
     host: &dyn Host,
     pkexec: &Path,
@@ -598,7 +742,8 @@ pub fn install_binary_privileged(
     fallback: Option<String>,
 ) -> Result<(), UpgradeError> {
     verify::rehash(staged, sha256)?;
-    run_checked(
+    let previous = verify::file_sha256(target).ok();
+    run_privileged(
         host,
         pkexec,
         &[
@@ -608,9 +753,16 @@ pub fn install_binary_privileged(
             staged.as_os_str(),
             target.as_os_str(),
         ],
-        INSTALL_TIMEOUT,
     )
-    .map_err(|e| privilege_failed(e, fallback, version))?;
+    .map_err(|failure| {
+        privileged_error(
+            failure,
+            plan::InstallTarget::Binary(target.to_path_buf()),
+            || found_binary(target, previous.as_deref(), sha256),
+            fallback,
+            version,
+        )
+    })?;
     let actual = verify::file_sha256(target).unwrap_or_else(|e| format!("unreadable: {e}"));
     if actual != sha256 {
         return Err(UpgradeError::InstalledMismatch {
@@ -665,15 +817,16 @@ impl Staging {
     }
 
     /// Keep the directory when `error` hands the user a command that installs
-    /// from it (a failed privilege prompt).
+    /// from it, or comes from an install that may still be reading it.
     fn keep_after(&mut self, error: &UpgradeError) {
-        if matches!(
-            error,
-            UpgradeError::PrivilegeFailed {
-                install: Some(_),
-                ..
+        let keep = match error {
+            UpgradeError::PrivilegeFailed { install, .. } => install.is_some(),
+            UpgradeError::InstallUnfinished(unfinished) => {
+                unfinished.install.is_some() || unfinished.may_still_be_running
             }
-        ) {
+            _ => false,
+        };
+        if keep {
             self.keep();
         }
     }
@@ -830,9 +983,20 @@ pub fn atomic_replace(
     result
 }
 
-/// Install a verified `.deb` behind `pkexec`.
-pub fn install_deb(host: &dyn Host, pkexec: &Path, deb: &Path) -> Result<(), UpgradeError> {
-    run_checked(
+/// Install a verified `.deb` behind `pkexec`, upgrading the package from
+/// `previous` to `version`. `fallback` is the command the user runs when the
+/// prompt itself fails. A failure past the prompt is classified as
+/// [`install_binary_privileged`]'s is, the package's state read from
+/// `dpkg-query` in place of a hash.
+pub fn install_deb(
+    host: &dyn Host,
+    pkexec: &Path,
+    deb: &Path,
+    previous: &str,
+    version: &str,
+    fallback: Option<String>,
+) -> Result<(), UpgradeError> {
+    run_privileged(
         host,
         pkexec,
         &[
@@ -841,9 +1005,16 @@ pub fn install_deb(host: &dyn Host, pkexec: &Path, deb: &Path) -> Result<(), Upg
             OsStr::new("-y"),
             deb.as_os_str(),
         ],
-        INSTALL_TIMEOUT,
     )
-    .map(|_| ())
+    .map_err(|failure| {
+        privileged_error(
+            failure,
+            plan::InstallTarget::Package,
+            || found_package(host, previous, version),
+            fallback,
+            version,
+        )
+    })
 }
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
@@ -1113,7 +1284,15 @@ mod tests {
             "/usr/bin/pkexec /usr/bin/apt-get install -y /s/x.deb",
             ok(""),
         );
-        install_deb(&host, Path::new("/usr/bin/pkexec"), Path::new("/s/x.deb")).unwrap();
+        install_deb(
+            &host,
+            Path::new("/usr/bin/pkexec"),
+            Path::new("/s/x.deb"),
+            "0.45.0",
+            "0.46.0",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             host.ran(),
             ["/usr/bin/pkexec /usr/bin/apt-get install -y /s/x.deb"]
@@ -1123,8 +1302,15 @@ mod tests {
             "/usr/bin/pkexec /usr/bin/apt-get install -y /s/x.deb",
             fail("Request dismissed"),
         );
-        let err =
-            install_deb(&host, Path::new("/usr/bin/pkexec"), Path::new("/s/x.deb")).unwrap_err();
+        let err = install_deb(
+            &host,
+            Path::new("/usr/bin/pkexec"),
+            Path::new("/s/x.deb"),
+            "0.45.0",
+            "0.46.0",
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Request dismissed"), "{err}");
     }
 
@@ -1230,14 +1416,14 @@ mod tests {
     fn fake_mac_detaching(spctl_ok: bool, plain: bool, force: bool) -> FakeHost {
         let mut host = fake_mac("TEAM123", spctl_ok);
         let attach = host.handlers.remove(HDIUTIL).unwrap();
-        host.handle(HDIUTIL, move |args| {
+        host.handle_io(HDIUTIL, move |args| {
             if args[0] == "detach" {
                 let forced = args.iter().any(|arg| arg == "-force");
-                if (forced && force) || (!forced && plain) {
+                Ok(if (forced && force) || (!forced && plain) {
                     ok("")
                 } else {
                     fail("hdiutil: couldn't unmount \"disk4\" - Resource busy")
-                }
+                })
             } else {
                 attach(args)
             }
@@ -1434,7 +1620,15 @@ mod tests {
         );
 
         let host = FakeHost::new().exe(PKEXEC).handle(PKEXEC, |_| ok(""));
-        install_deb(&host, Path::new(PKEXEC), Path::new("/s/x.deb")).unwrap();
+        install_deb(
+            &host,
+            Path::new(PKEXEC),
+            Path::new("/s/x.deb"),
+            "0.45.0",
+            "0.46.0",
+            None,
+        )
+        .unwrap();
         assert_eq!(host.bound_of(PKEXEC), Some(INSTALL_TIMEOUT));
     }
 
@@ -1847,6 +2041,44 @@ mod tests {
         (dir, staged, target, verify::sha256_hex(bytes))
     }
 
+    /// What `pkexec` answers when its password prompt is dismissed: exit 126,
+    /// before it runs anything.
+    fn dismissed() -> CommandOutput {
+        CommandOutput {
+            success: false,
+            code: Some(126),
+            stdout: String::new(),
+            stderr: "Error executing command as another user: Request dismissed".into(),
+        }
+    }
+
+    fn unfinished(err: &UpgradeError) -> &crate::self_upgrade::UnfinishedInstall {
+        match err {
+            UpgradeError::InstallUnfinished(unfinished) => unfinished,
+            other => panic!("not an unfinished install: {other:?}"),
+        }
+    }
+
+    fn privileged(
+        host: &FakeHost,
+        staged: &Path,
+        target: &Path,
+        sha: &str,
+    ) -> (UpgradeError, Option<String>) {
+        let command = plan::install_binary_command(None, staged, target, sha);
+        let err = install_binary_privileged(
+            host,
+            Path::new(PKEXEC),
+            staged,
+            target,
+            sha,
+            "0.46.0",
+            command.clone(),
+        )
+        .unwrap_err();
+        (err, command)
+    }
+
     /// `pkexec /usr/bin/install -m 0755 <from> <to>` writes `installed` to
     /// `<to>` (the verified bytes for an honest install).
     fn installing(installed: Option<&'static [u8]>) -> FakeHost {
@@ -1944,9 +2176,7 @@ mod tests {
     #[test]
     fn execute_018_a_failed_prompt_hands_over_the_install_command() {
         let (_dir, staged, target, sha) = staged_install(b"verified build");
-        let host = FakeHost::new()
-            .exe(PKEXEC)
-            .handle(PKEXEC, |_| fail("Request dismissed"));
+        let host = FakeHost::new().exe(PKEXEC).handle(PKEXEC, |_| dismissed());
         let command = plan::install_binary_command(None, &staged, &target, &sha);
         let err = install_binary_privileged(
             &host,
@@ -1994,7 +2224,7 @@ mod tests {
         let (_dir, staged, target, sha) = staged_install(b"verified build");
         let host = FakeHost::new()
             .exe(QUOTED_PKEXEC)
-            .handle(QUOTED_PKEXEC, |_| fail("Request dismissed"));
+            .handle(QUOTED_PKEXEC, |_| dismissed());
         let command = plan::install_binary_command(None, &staged, &target, &sha);
         let err = install_binary_privileged(
             &host,
@@ -2017,5 +2247,275 @@ mod tests {
                 PlanLine::Command(command.unwrap()),
             ]
         );
+    }
+
+    /// Scenario: the privileged install gets past the password prompt,
+    /// writes part of the target and fails. That is not a dismissed prompt:
+    /// the result says the target may be partly written, that it matches
+    /// neither version, and gives the install command again. A failure
+    /// `pkexec` reports for the prompt itself (exit 126 or 127) is still the
+    /// dismissed-prompt result.
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_026_a_failed_install_that_changed_the_target_is_not_a_dismissed_prompt() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new().exe(PKEXEC).handle(PKEXEC, |args| {
+            std::fs::write(&args[4], b"verif").unwrap();
+            fail("/usr/bin/install: error writing: No space left on device")
+        });
+        let (err, command) = privileged(&host, &staged, &target, &sha);
+        let command = command.unwrap();
+        let found = unfinished(&err);
+        assert!(!found.may_still_be_running);
+        assert_eq!(found.found, plan::Found::Neither);
+        assert_eq!(found.install.as_ref(), Some(&command));
+        assert!(err.to_string().contains("No space left on device"), "{err}");
+        assert_eq!(
+            err.fallback(),
+            vec![
+                PlanLine::Text(format!(
+                    "The install did not complete, so {} may be partly written.",
+                    target.display()
+                )),
+                PlanLine::Text(
+                    "WARNING: it matches neither the previous version nor the verified v0.46.0. Do not run it.".into()
+                ),
+                PlanLine::Text("Install v0.46.0 with:".into()),
+                PlanLine::Command(command),
+            ]
+        );
+        assert!(
+            !host.ran().iter().any(|line| line.ends_with("--version")),
+            "the damaged target was executed: {:?}",
+            host.ran()
+        );
+
+        for code in [126, 127] {
+            let (_dir, staged, target, sha) = staged_install(b"verified build");
+            let host = FakeHost::new()
+                .exe(PKEXEC)
+                .handle(PKEXEC, move |_| CommandOutput {
+                    code: Some(code),
+                    ..dismissed()
+                });
+            let (err, _) = privileged(&host, &staged, &target, &sha);
+            assert!(
+                matches!(err, UpgradeError::PrivilegeFailed { .. }),
+                "{code}: {err:?}"
+            );
+        }
+    }
+
+    /// Scenario: the privileged install outlives its bound and cannot be
+    /// stopped, because it runs as root. It may still be writing the target,
+    /// so nothing is checked and no install command is offered: the result
+    /// says to wait and then check the version, the binary's `--version` or
+    /// `dpkg -s` for the package. The staged file is kept for the install
+    /// still reading it.
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_027_a_timed_out_install_that_could_not_be_stopped_offers_no_command() {
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new().exe(PKEXEC).handle_io(PKEXEC, |args| {
+            std::fs::write(&args[4], b"verif").unwrap();
+            Err(crate::self_upgrade::timed_out(INSTALL_TIMEOUT, false))
+        });
+        let (err, _) = privileged(&host, &staged, &target, &sha);
+        let found = unfinished(&err);
+        assert!(found.may_still_be_running);
+        assert_eq!(found.found, plan::Found::NotChecked);
+        assert_eq!(found.install, None);
+        assert!(
+            err.to_string()
+                .ends_with("could not be stopped, so it may still be running"),
+            "{err}"
+        );
+        let waiting = "The install did not finish in time and may still be running, so whether v0.46.0 was installed is not known. Do not start it again: wait a few minutes for it to finish, then check which version is installed with:";
+        assert_eq!(
+            err.fallback(),
+            vec![
+                PlanLine::Text(waiting.into()),
+                PlanLine::Command(format!("{} --version", target.display())),
+            ]
+        );
+        let staging_root = tempfile::tempdir().unwrap();
+        let mut staging = Staging::create(&staging_root.path().join("upgrade"), "0.46.0").unwrap();
+        staging.keep_after(&err);
+        let kept = staging.dir().to_path_buf();
+        drop(staging);
+        assert!(
+            kept.is_dir(),
+            "the staged file was removed under the install"
+        );
+
+        let host = FakeHost::new().exe(PKEXEC).handle_io(PKEXEC, |_| {
+            Err(crate::self_upgrade::timed_out(INSTALL_TIMEOUT, false))
+        });
+        let err = install_deb(
+            &host,
+            Path::new(PKEXEC),
+            Path::new("/s/x.deb"),
+            "0.45.0",
+            "0.46.0",
+            Some("sudo apt install /s/x.deb".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.fallback(),
+            vec![
+                PlanLine::Text(waiting.into()),
+                PlanLine::Command("dpkg -s agent-deck".into()),
+            ]
+        );
+        assert_eq!(host.ran().len(), 1, "nothing else ran: {:?}", host.ran());
+    }
+
+    /// Scenario: the privileged install outlives its bound and is stopped.
+    /// The target may be partly written, so it is hashed and the result says
+    /// what is there: the previous version (install command given), the
+    /// verified new build (no command, check it), or nothing (command given).
+    // A Unix staging path the shown command can name: native Windows is
+    // unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_028_a_stopped_install_checks_the_target_hash() {
+        let stopped = || Err(crate::self_upgrade::timed_out(INSTALL_TIMEOUT, true));
+        let partly = |target: &Path| {
+            PlanLine::Text(format!(
+                "The install did not complete, so {} may be partly written.",
+                target.display()
+            ))
+        };
+
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new()
+            .exe(PKEXEC)
+            .handle_io(PKEXEC, move |_| stopped());
+        let (err, command) = privileged(&host, &staged, &target, &sha);
+        assert_eq!(
+            err.fallback(),
+            vec![
+                partly(&target),
+                PlanLine::Text("It is unchanged: it still holds the previous version.".into()),
+                PlanLine::Text("Install v0.46.0 with:".into()),
+                PlanLine::Command(command.unwrap()),
+            ]
+        );
+
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new().exe(PKEXEC).handle_io(PKEXEC, move |args| {
+            std::fs::copy(&args[3], &args[4]).unwrap();
+            stopped()
+        });
+        let (err, _) = privileged(&host, &staged, &target, &sha);
+        assert_eq!(unfinished(&err).found, plan::Found::New);
+        assert_eq!(unfinished(&err).install, None);
+        assert_eq!(
+            err.fallback(),
+            vec![
+                partly(&target),
+                PlanLine::Text(
+                    "It matches the verified v0.46.0, so v0.46.0 is installed. Check it with:"
+                        .into()
+                ),
+                PlanLine::Command(format!("{} --version", target.display())),
+            ]
+        );
+
+        let (_dir, staged, target, sha) = staged_install(b"verified build");
+        let host = FakeHost::new().exe(PKEXEC).handle_io(PKEXEC, move |args| {
+            std::fs::remove_file(&args[4]).unwrap();
+            stopped()
+        });
+        let (err, command) = privileged(&host, &staged, &target, &sha);
+        assert_eq!(
+            err.fallback(),
+            vec![
+                partly(&target),
+                PlanLine::Text("It is missing.".into()),
+                PlanLine::Text("Install v0.46.0 with:".into()),
+                PlanLine::Command(command.unwrap()),
+            ]
+        );
+    }
+
+    /// Scenario: the `.deb` install is stopped, or fails, once past the
+    /// prompt. The package's state is asked of `dpkg-query`: installed at the
+    /// new version gets no command, the previous version or a half-installed
+    /// package gets the install command again, and an unanswered query says
+    /// to check with `dpkg -s`.
+    #[test]
+    fn execute_029_a_stopped_package_install_reports_the_package_state() {
+        const QUERY: &str = "/usr/bin/dpkg-query -W -f=${Version} ${db:Status-Abbrev} agent-deck";
+        const INSTALL: &str = "sudo apt install /s/x.deb";
+        let run = |state: Option<&str>| {
+            let host = FakeHost::new()
+                .exe(PKEXEC)
+                .exe("/usr/bin/dpkg-query")
+                .handle(PKEXEC, |_| {
+                    fail("E: Sub-process /usr/bin/dpkg returned an error code (1)")
+                });
+            let host = match state {
+                Some(state) => host.answer(QUERY, ok(state)),
+                None => host,
+            };
+            install_deb(
+                &host,
+                Path::new(PKEXEC),
+                Path::new("/s/x.deb"),
+                "0.45.0",
+                "0.46.0",
+                Some(INSTALL.into()),
+            )
+            .unwrap_err()
+        };
+        let partly = PlanLine::Text(
+            "The install did not complete, so the agent-deck package may be partly installed."
+                .into(),
+        );
+        let install = [
+            PlanLine::Text("Install v0.46.0 with:".into()),
+            PlanLine::Command(INSTALL.into()),
+        ];
+        let check = PlanLine::Command("dpkg -s agent-deck".into());
+
+        let mut half = vec![
+            partly.clone(),
+            PlanLine::Text(
+                "The agent-deck package is not fully installed at the previous version or at v0.46.0."
+                    .into(),
+            ),
+        ];
+        half.extend(install.clone());
+        assert_eq!(run(Some("0.46.0 iU ")).fallback(), half);
+
+        let mut previous = vec![
+            partly.clone(),
+            PlanLine::Text("It is unchanged: it still holds the previous version.".into()),
+        ];
+        previous.extend(install);
+        assert_eq!(run(Some("0.45.0 ii ")).fallback(), previous);
+
+        assert_eq!(
+            run(Some("0.46.0 ii ")).fallback(),
+            vec![
+                partly.clone(),
+                PlanLine::Text(
+                    "The agent-deck package reports v0.46.0 installed. Check it with:".into()
+                ),
+                check.clone(),
+            ]
+        );
+        let unanswered = run(None);
+        assert!(
+            matches!(unfinished(&unanswered).found, plan::Found::Unreadable(_)),
+            "{unanswered:?}"
+        );
+        assert_eq!(unfinished(&unanswered).install, None);
+        assert_eq!(unanswered.fallback().last(), Some(&check));
     }
 }

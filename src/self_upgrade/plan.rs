@@ -12,7 +12,7 @@ use super::detect::{
     CopyKind, HomebrewFormula, InstallMethod, Installation, Platform, SourceReason,
 };
 use super::verify::ProvenanceCheck;
-use super::{DESKTOP_APP_BUNDLE, Host, shell_word};
+use super::{CLI_BINARY, DESKTOP_APP_BUNDLE, DESKTOP_DEB_PACKAGE, Host, shell_word};
 
 /// What [`plan`] needs to know about the client that will show the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +462,136 @@ pub fn manual_upgrade_line(version: &str) -> String {
 /// that was downloaded and checked, before the command that installs it.
 pub const PROMPT_FAILED: &str =
     "It was downloaded and checked, but not installed. Install it with:";
+
+/// What an install that did not complete was installing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallTarget {
+    /// The binary at this path.
+    Binary(PathBuf),
+    /// The desktop `.deb`'s package ([`DESKTOP_DEB_PACKAGE`]).
+    Package,
+}
+
+/// What was found at an install's target once the install stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// Not looked at: the install may still be writing it.
+    NotChecked,
+    /// The previous version, unchanged.
+    Previous,
+    /// The new version: the verified build, or the package installed at it.
+    New,
+    /// Neither the previous version nor the new one: partly written, or a
+    /// package left half installed.
+    Neither,
+    /// Nothing is there.
+    Missing,
+    /// It could not be checked, for this reason.
+    Unreadable(String),
+}
+
+impl Found {
+    /// Whether the target is known not to be the new version, so installing
+    /// it again is what the user needs.
+    pub fn known_not_new(&self) -> bool {
+        matches!(self, Self::Previous | Self::Neither | Self::Missing)
+    }
+}
+
+/// The command that shows which version `target` holds: the binary's own
+/// `--version` (by name when its path cannot be shown faithfully), or `dpkg
+/// -s` for the package.
+pub fn installed_version_command(target: &InstallTarget) -> String {
+    match target {
+        InstallTarget::Binary(path) => match shown_path(path) {
+            Some(path) => format!("{} --version", shell_word(path)),
+            None => format!("{CLI_BINARY} --version"),
+        },
+        InstallTarget::Package => format!("dpkg -s {DESKTOP_DEB_PACKAGE}"),
+    }
+}
+
+/// What a client shows after a privileged install that did not complete
+/// ([`super::UpgradeError::InstallUnfinished`]), after the error itself.
+///
+/// While it `may_still_be_running`, root may still be writing the target, so
+/// no install command is offered: a second install would race the first. The
+/// user waits, then checks. Once it stopped, what was `found` at the target
+/// is reported, and `install` is offered only when the target is known not to
+/// be the new version.
+pub fn install_unfinished_lines(
+    target: &InstallTarget,
+    found: &Found,
+    may_still_be_running: bool,
+    install: Option<&str>,
+    version: &str,
+) -> Vec<PlanLine> {
+    let text = |line: String| PlanLine::Text(line);
+    let check = PlanLine::Command(installed_version_command(target));
+    if may_still_be_running {
+        return vec![
+            text(format!(
+                "The install did not finish in time and may still be running, so whether v{version} was installed is not known. Do not start it again: wait a few minutes for it to finish, then check which version is installed with:"
+            )),
+            check,
+        ];
+    }
+    let mut lines = vec![text(match target {
+        InstallTarget::Binary(path) => format!(
+            "The install did not complete, so {} may be partly written.",
+            path.display()
+        ),
+        InstallTarget::Package => format!(
+            "The install did not complete, so the {DESKTOP_DEB_PACKAGE} package may be partly installed."
+        ),
+    })];
+    match found {
+        Found::New => {
+            lines.push(text(match target {
+                InstallTarget::Binary(_) => format!(
+                    "It matches the verified v{version}, so v{version} is installed. Check it with:"
+                ),
+                InstallTarget::Package => format!(
+                    "The {DESKTOP_DEB_PACKAGE} package reports v{version} installed. Check it with:"
+                ),
+            }));
+            lines.push(check);
+            return lines;
+        }
+        Found::NotChecked => {
+            lines.push(text("Check which version is installed with:".to_string()));
+            lines.push(check);
+            return lines;
+        }
+        Found::Unreadable(why) => {
+            lines.push(text(format!(
+                "It could not be checked ({why}). Check which version is installed with:"
+            )));
+            lines.push(check);
+            return lines;
+        }
+        Found::Previous => lines.push(text(
+            "It is unchanged: it still holds the previous version.".to_string(),
+        )),
+        Found::Neither => lines.push(text(match target {
+            InstallTarget::Binary(_) => format!(
+                "WARNING: it matches neither the previous version nor the verified v{version}. Do not run it."
+            ),
+            InstallTarget::Package => format!(
+                "The {DESKTOP_DEB_PACKAGE} package is not fully installed at the previous version or at v{version}."
+            ),
+        })),
+        Found::Missing => lines.push(text("It is missing.".to_string())),
+    }
+    match install {
+        Some(install) => {
+            lines.push(text(format!("Install v{version} with:")));
+            lines.push(PlanLine::Command(install.to_string()));
+        }
+        None => lines.push(text(manual_upgrade_line(version))),
+    }
+    lines
+}
 
 impl UpgradePlan {
     /// Whether the client can carry this plan out once the user confirms.

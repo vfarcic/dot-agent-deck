@@ -45,7 +45,7 @@ pub use detect::{CopyKind, HomebrewFormula, InstallMethod, Installation, Platfor
 pub use discover::OtherCopy;
 pub use execute::{Outcome, ReleaseSource};
 pub use plan::PlanLine;
-pub use plan::{PlanAction, PlanOptions, Releases, UpgradePlan};
+pub use plan::{Found, InstallTarget, PlanAction, PlanOptions, Releases, UpgradePlan};
 pub use verify::{Provenance, ProvenanceCheck};
 
 pub use crate::version::ReleaseChannel;
@@ -461,17 +461,44 @@ fn reap_later(mut child: std::process::Child) {
         });
 }
 
-/// A command that outlived `timeout`, in words for the user.
-fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error {
+/// A command that outlived its bound, as the error [`Host::run_within`]
+/// returns ([`std::io::ErrorKind::TimedOut`]): the message for the user, and
+/// whether the command was stopped, which [`timed_out_stopped`] reads back.
+#[derive(Debug)]
+struct TimedOut {
+    stopped: bool,
+    message: String,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// A command that outlived `timeout`, in words for the user. `stopped` is
+/// whether it was stopped; one that was not may still be running.
+pub fn timed_out(timeout: std::time::Duration, stopped: bool) -> std::io::Error {
     let within = describe_duration(timeout);
-    let what = if stopped {
+    let message = if stopped {
         format!("it did not finish within {within} and was stopped")
     } else {
         format!(
             "it did not finish within {within} and could not be stopped, so it may still be running"
         )
     };
-    std::io::Error::new(std::io::ErrorKind::TimedOut, what)
+    std::io::Error::new(std::io::ErrorKind::TimedOut, TimedOut { stopped, message })
+}
+
+/// For an error [`timed_out`] made, whether the command was stopped; `None`
+/// for any other error.
+pub fn timed_out_stopped(error: &std::io::Error) -> Option<bool> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<TimedOut>())
+        .map(|timed_out| timed_out.stopped)
 }
 
 /// `duration` in the largest whole unit that fits: "15 minutes", "60
@@ -551,6 +578,10 @@ pub enum UpgradeError {
         install: Option<String>,
         version: String,
     },
+    /// A privileged install started and did not complete
+    /// ([`UnfinishedInstall`]).
+    #[error("`{}` failed: {}", .0.command, .0.detail)]
+    InstallUnfinished(Box<UnfinishedInstall>),
     #[error(
         "The downloaded binary reports {actual} instead of dot-agent-deck {expected}. Nothing was changed."
     )]
@@ -572,11 +603,30 @@ pub enum UpgradeError {
     },
 }
 
+/// A privileged install that started and did not complete: it failed once
+/// past the prompt, or did not finish within its bound. Whether the new
+/// version is installed is not known from that alone, so `found` is what was
+/// found at `target` afterwards — not looked at while the install
+/// `may_still_be_running`. `install` is the command that installs the
+/// verified file again, offered only when `found` shows the target is not the
+/// new version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedInstall {
+    pub command: String,
+    pub detail: String,
+    pub may_still_be_running: bool,
+    pub target: plan::InstallTarget,
+    pub found: plan::Found,
+    pub install: Option<String>,
+    pub version: String,
+}
+
 impl UpgradeError {
     /// What the user can do instead, shown after the error itself: for a
     /// failed privilege prompt, the command that installs the file that was
     /// already downloaded and checked, or how to upgrade manually when that
-    /// command cannot be shown safely.
+    /// command cannot be shown safely; for an install that did not complete,
+    /// what was found and how to check it.
     pub fn fallback(&self) -> Vec<PlanLine> {
         match self {
             Self::StillMounted { error, mount } => {
@@ -596,6 +646,13 @@ impl UpgradeError {
                 version,
                 ..
             } => vec![PlanLine::Text(plan::manual_upgrade_line(version))],
+            Self::InstallUnfinished(unfinished) => plan::install_unfinished_lines(
+                &unfinished.target,
+                &unfinished.found,
+                unfinished.may_still_be_running,
+                unfinished.install.as_deref(),
+                &unfinished.version,
+            ),
             _ => Vec::new(),
         }
     }
@@ -909,7 +966,7 @@ pub(crate) mod test_host {
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
-    type Handler = Box<dyn Fn(&[String]) -> CommandOutput + Send + Sync>;
+    type Handler = Box<dyn Fn(&[String]) -> std::io::Result<CommandOutput> + Send + Sync>;
 
     #[derive(Default)]
     pub struct FakeHost {
@@ -999,9 +1056,19 @@ pub(crate) mod test_host {
 
         /// Run `handler` for every invocation of `program`.
         pub fn handle(
-            mut self,
+            self,
             program: &str,
             handler: impl Fn(&[String]) -> CommandOutput + Send + Sync + 'static,
+        ) -> Self {
+            self.handle_io(program, move |args| Ok(handler(args)))
+        }
+
+        /// [`Self::handle`] for a handler that can fail to run the command,
+        /// a timeout ([`super::timed_out`]) included.
+        pub fn handle_io(
+            mut self,
+            program: &str,
+            handler: impl Fn(&[String]) -> std::io::Result<CommandOutput> + Send + Sync + 'static,
         ) -> Self {
             self.handlers.insert(program.to_string(), Box::new(handler));
             self
@@ -1037,7 +1104,7 @@ pub(crate) mod test_host {
             self.log.lock().unwrap().push(line.clone());
             self.bounds.lock().unwrap().push((line.clone(), timeout));
             if let Some(handler) = self.handlers.get(&words[0]) {
-                return Ok(handler(&words[1..]));
+                return handler(&words[1..]);
             }
             match self.answers.get(&line) {
                 Some(output) => Ok(output.clone()),
