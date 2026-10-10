@@ -47,7 +47,7 @@ pub enum EventType {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
     ClaudeCode,
@@ -1444,21 +1444,23 @@ pub struct PresentedToken {
 /// Issue #318: serialize `event` as the one-line JSON a producer writes to the
 /// hook socket, with `token` added when there is one.
 ///
-/// With `None` the output is exactly `serde_json::to_string(event)`, so a
-/// producer without a token emits the bytes it always did and an older daemon
-/// receives nothing new. With a token, the key is added beside the event's own
-/// keys; an older daemon ignores it because [`AgentEvent`] does not deny
-/// unknown fields.
+/// The token is added beside the event's own keys; an older daemon ignores it
+/// because [`AgentEvent`] does not deny unknown fields. Issue #1637 adds the
+/// sender's stamp the same way, on every line
+/// ([`crate::hook_binary::stamp_hook_line`]): `deck_build` and `deck_exe`, which
+/// an older daemon ignores for the same reason.
 pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::Result<String> {
-    let Some(token) = token else {
-        return serde_json::to_string(event);
-    };
     let mut value = serde_json::to_value(event)?;
     if let serde_json::Value::Object(map) = &mut value {
-        map.insert(
-            "token".to_string(),
-            serde_json::Value::String(token.to_string()),
-        );
+        if let Some(token) = token {
+            map.insert(
+                "token".to_string(),
+                serde_json::Value::String(token.to_string()),
+            );
+        }
+        // Issue #1637: which deck sent this, so the daemon can tell when an
+        // agent's hooks run an older copy than itself.
+        crate::hook_binary::stamp_hook_line(map);
     }
     serde_json::to_string(&value)
 }
@@ -2545,6 +2547,21 @@ pub enum BroadcastMsg {
     /// it ships with.
     #[serde(rename = "worktree_kept")]
     WorktreeKept(crate::issue_dispatch_run::KeptWorktree),
+    /// Issue #1637: the daemon's hook-binary notices changed — an agent's
+    /// hooks were seen running an older `dot-agent-deck`, or stopped doing so.
+    /// Carries the whole current list, which replaces what a client holds.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: every client that
+    /// can attach to a v10 daemon carries [`Self::Unknown`] (it first shipped in
+    /// v0.40.0, before v10 in v0.41.0), so an older client decodes this as
+    /// `Unknown` and the stream survives.
+    ///
+    /// The list rides in a struct, not as the variant's own payload: this enum
+    /// is internally tagged, and serde cannot serialize a tagged newtype
+    /// variant whose payload is a sequence — the frame failed to encode and no
+    /// client ever received it.
+    #[serde(rename = "hook_binary_notice")]
+    HookBinaryNotice(crate::hook_binary::HookBinaryNotices),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -3419,6 +3436,33 @@ mod tests {
     // through the same `BroadcastMsg` wire the daemon forwards over KIND_EVENT,
     // and tag itself `orchestration_surface` so it's distinguishable from the
     // `event` variant an older peer expects (the reason PROTOCOL_VERSION bumped).
+    // Issue #1637: the hook-binary notice broadcast must actually encode. This
+    // enum is internally tagged, so a variant whose payload is a sequence
+    // fails `serde_json::to_vec` and the daemon skips the frame.
+    #[test]
+    fn hook_binary_notice_broadcast_round_trips() {
+        let notice = crate::hook_binary::HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: crate::hook_binary::HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        for notices in [Vec::new(), vec![notice]] {
+            let msg = BroadcastMsg::HookBinaryNotice(crate::hook_binary::HookBinaryNotices {
+                notices: notices.clone(),
+            });
+            let json = serde_json::to_value(&msg).expect("encodes");
+            assert_eq!(json["kind"], "hook_binary_notice", "{json}");
+            match serde_json::from_value::<BroadcastMsg>(json).expect("decodes") {
+                BroadcastMsg::HookBinaryNotice(payload) => assert_eq!(payload.notices, notices),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn orchestration_surface_broadcast_round_trips() {
         let msg = BroadcastMsg::OrchestrationSurface(OrchestrationSurface {

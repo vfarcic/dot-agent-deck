@@ -148,6 +148,10 @@ pub(crate) enum FetchReason {
     /// A dispatched worktree was left on disk, which is emitted *after* the
     /// close that reaped its agents. The registry has certainly changed.
     WorktreeKept,
+    /// The daemon's hook-binary notices changed (issue #1637). They live on
+    /// the `Hello` reply, so the refresh that answers this re-reads it as well
+    /// as the list ([`AgentView::take_handshake_due`]).
+    HookBinaryNotice,
     /// A broadcast whose `kind` this build does not know (PRD #741 M8, issue
     /// #801 item 3).
     ///
@@ -180,6 +184,9 @@ pub(crate) struct AgentView {
     fold: AppState,
     /// Set when a refresh must fetch. Sticky until a fetch lands.
     due: Option<FetchReason>,
+    /// Set when the next refresh must also re-read the daemon's `Hello` (issue
+    /// #1637). Separate from [`Self::due`], which keeps only the first reason.
+    handshake_due: bool,
     /// When the last full fetch landed.
     fetched_at: Option<Instant>,
     /// Full `ListAgents` replies installed. Test/measurement only.
@@ -195,6 +202,7 @@ impl Default for AgentView {
             schedule_revision: None,
             fold: AppState::default(),
             due: Some(FetchReason::Initial),
+            handshake_due: false,
             fetched_at: None,
             fetches: 0,
             folded: 0,
@@ -246,6 +254,12 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // Issue #1637: the notices ride the `Hello` reply, which the held
+            // link captured once; re-read it, and the list with it.
+            BroadcastMsg::HookBinaryNotice(_) => {
+                self.handshake_due = true;
+                self.mark(FetchReason::HookBinaryNotice);
+            }
             // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
             // not know. It marks a fetch for the same reason the two above do —
             // this view is a FOLD, and a message it could not read is a hole in
@@ -277,6 +291,13 @@ impl AgentView {
             Some(at) if now.saturating_duration_since(at) < RECONCILE_INTERVAL => None,
             _ => Some(FetchReason::Reconcile),
         }
+    }
+
+    /// Whether the next refresh must re-read the daemon's `Hello` (issue
+    /// #1637), clearing the demand. The caller drops its held handshake, so
+    /// the refresh's own connection re-reads it.
+    pub(crate) fn take_handshake_due(&mut self) -> bool {
+        std::mem::take(&mut self.handshake_due)
     }
 
     /// Force the next refresh to fetch, without a specific transition behind it.
@@ -776,6 +797,23 @@ mod tests {
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));
+    }
+
+    /// Scenario: the daemon pushes changed hook-binary notices. The view marks
+    /// a fetch due and asks for the handshake to be re-read once, because the
+    /// notices live on the `Hello` reply (issue #1637).
+    #[test]
+    fn a_hook_binary_notice_marks_a_fetch_and_a_handshake_re_read() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert!(!view.take_handshake_due());
+
+        view.apply(&BroadcastMsg::HookBinaryNotice(Default::default()));
+
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::HookBinaryNotice));
+        assert!(view.take_handshake_due());
+        assert!(!view.take_handshake_due(), "taken once");
     }
 
     /// Scenario: a newer daemon pushes a broadcast kind this build cannot read.

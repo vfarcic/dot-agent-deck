@@ -2316,6 +2316,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/009 — Same-release stamped hooks update the card without a stale-binary notice.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; synthetic Claude hook lines.
+- **Asserts:** session, Working and Idle states render after stamped hooks; Hello carries no notice for either the daemon's build or an equal release triple with a different build id and a different sender path.
+- **Does not assert:** a real agent producing the stamps, or an older release's notice.
+- **Platform coverage:** mac+linux.
+
 #### hooks/ingest
 
 ##### hooks/ingest/001 — An over-long hook line is refused at the production cap rather than buffered, and the daemon keeps serving (issues #903 / #319).
@@ -2484,6 +2491,57 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
+
+##### hooks/install/015 — Automatic startup takes over an older pin only from a newer installed durable copy.
+- **Layer:** fast real-binary subprocess integration, isolated HOME under `CARGO_TARGET_TMPDIR`.
+- **Agent:** none; version-reporting shell stubs stand in for the old and newer installed pins.
+- **Asserts:** a real copy in HOME's `.local/bin` replaces the `0.0.1` pin in place, leaves one deck handler per installed event and preserves the user's handler slot and matcher; a `999.0.0` pin is kept.
+- **Does not assert:** ties, failed version probes or other agents' writers (unit-covered).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/016 — A newer temporary copy on PATH cannot take over a durable old pin.
+- **Layer:** fast real-binary subprocess integration, isolated HOME.
+- **Agent:** none; old pin reports `0.0.1`.
+- **Asserts:** automatic startup from a scratch copy on PATH keeps the old binary, one handler per installed event and the user's shared rule.
+- **Does not assert:** other ephemeral classifiers or explicit installation.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/017 — Automatic startup refuses to pin a translocated sidecar and names /Applications.
+- **Layer:** fast real-binary subprocess integration.
+- **Agent:** none.
+- **Asserts:** a real copy under an `AppTranslocation` bundle-shaped path with no fallback writes no Claude settings and logs the move-to-Applications remedy.
+- **Does not assert:** macOS's actual translocation machinery, or the absolute `/Volumes/<name>` prefix, covered by `platform::paths::tests::step_3_refuses_a_mounted_or_translocated_copy`.
+- **Platform coverage:** mac+linux.
+
+#### hooks/stale
+
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, preserving the remedy at 60 columns.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the upgrade command survives; an empty list draws nothing.
+- **Does not assert:** the dashboard's placement or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hook.
+- **Asserts:** the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, and a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Does not assert:** a real Claude emitting hooks, desktop rendering, or takeover from an eligible binary; the built target binary and separate HOME keep takeover ineligible.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hooks.
+- **Asserts:** Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
+- **Does not assert:** TUI rendering or real-agent work.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice. [reel]
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** real Claude Code, interactive Haiku `claude-haiku-4-5-20251001`, with imported credentials, seeded project trust and Bash allowed.
+- **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
+- **Does not assert:** an actual old release binary, the desktop strip, or model-specific prose; the wrapper changes stamp metadata but preserves event content and provenance.
+- **Platform coverage:** mac+linux; local credentials required, never CI.
 
 ### Pane / agent lifecycle
 

@@ -625,34 +625,46 @@ fn durable_binary_path() -> Result<String, String> {
 /// Guarded, idempotent, and best-effort: SKIPs unless `devin` is on `PATH` and a
 /// real config dir resolves, and any failure is logged, never fatal. Never prints
 /// to stdout (it runs on the dashboard startup path).
-pub fn auto_install() {
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     if !devin_present_on_path() {
         tracing::debug!("devin startup install: skipped (devin not on PATH)");
-        return;
+        return Vec::new();
     }
     let Some(config_dir) = devin_config_dir() else {
         tracing::debug!("devin startup install: skipped (no config dir resolves)");
-        return;
+        return Vec::new();
     };
 
     let binary_path = match durable_binary_path() {
         Ok(binary_path) => binary_path,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return Vec::new();
         }
     };
 
-    match auto_install_to(&config_dir, &binary_path) {
-        Ok((true, named)) => crate::agent_hook_config::log_auto_install_change(
-            "devin",
-            &config_path(&config_dir),
-            &named,
-            "devin startup auto-install",
-        ),
-        Ok((false, _)) => {}
-        Err(e) => tracing::warn!("auto-install: failed to write Devin hooks: {e}"),
-    }
+    let named = match auto_install_to(&config_dir, &binary_path) {
+        Ok((changed, named)) => {
+            if changed {
+                crate::agent_hook_config::log_auto_install_change(
+                    "devin",
+                    &config_path(&config_dir),
+                    &named,
+                    "devin startup auto-install",
+                );
+            }
+            named
+        }
+        Err(e) => {
+            tracing::warn!("auto-install: failed to write Devin hooks: {e}");
+            return Vec::new();
+        }
+    };
+    vec![crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::Devin,
+        config: config_path(&config_dir),
+        binary: named,
+    }]
 }
 
 /// `dot-agent-deck hooks install --agent devin` — the explicit, chatty install.

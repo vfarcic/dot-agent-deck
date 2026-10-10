@@ -45,7 +45,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -939,6 +939,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
   if (state === "upgrade") return upgradeFleet();
   if (state === "upgrade-error") return [upgradeIncompatibleDeck()];
+  if (state === "hook-notice") return hookNoticeFleet();
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -1052,11 +1053,50 @@ function upgradeFleet(): DeckSnapshot[] {
   ];
 }
 
+/**
+ * Issue #1637 — `?fixture=1&state=hook-notice`: this machine's deck, whose
+ * Claude Code and Codex hooks still run an older Homebrew copy, beside a remote
+ * deck with nothing to report. The notice belongs to the first deck only.
+ */
+function hookNoticeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      {
+        status: "connected",
+        deckId: FIXTURE_DAEMON_ID,
+        socketPath: FIXTURE_DAEMON_ID,
+        message: "Daemon responding",
+        deckKind: "local",
+        hookBinaryNotices: [
+          {
+            binary: "/opt/homebrew/bin/dot-agent-deck",
+            agents: ["Claude Code", "Codex"],
+            version: "0.45.1",
+            daemonVersion: "0.46.0",
+            reason: "older",
+            remedy: "Run:",
+            command: "brew upgrade dot-agent-deck",
+          },
+        ],
+      },
+      docsAgents,
+      DOCS_CWD,
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error" || state === "hook-notice") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }

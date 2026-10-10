@@ -59,6 +59,7 @@ pub mod focus_report;
 // crate switches it off. Every `git` the crate spawns is built here.
 pub(crate) mod git_env;
 pub mod hook;
+pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;

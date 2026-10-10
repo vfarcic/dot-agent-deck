@@ -1,0 +1,5 @@
+---
+source: tests/hook_stale_notice.rs
+expression: wide
+---
+⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck

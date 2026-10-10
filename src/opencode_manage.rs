@@ -1002,10 +1002,15 @@ fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
 /// Roots that don't exist are skipped — no speculative directory creation. Per-target
 /// failures are logged via `tracing::warn!` and never abort the remaining targets.
 /// Silent on stdout (dashboard startup path).
-fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
+///
+/// Returns the binary each existing root's plugin pins afterwards (issue
+/// #1637), so the daemon can name the binary OpenCode's events come from.
+fn auto_install_to(roots: &[PathBuf], binary_path: &str) -> Vec<(PathBuf, String)> {
     // Held across the read-preserve-write span, not just the write. See
     // [`PLUGIN_LOCK`].
     let _guard = lock_plugin();
+    let takeover = crate::hook_binary::Takeover::current();
+    let mut pins = Vec::new();
     for root in roots {
         if !root.exists() {
             continue;
@@ -1038,21 +1043,51 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         // build output) is replaced by the installing binary. This path used to
         // fall back to `pin_is_repairable` here, which leaves an unstatable pin
         // alone, so an inaccessible install stayed pinned for OpenCode alone.
+        //
+        // Issue #1637: except one an eligible newer copy supersedes — a pin
+        // whose `--version` reports an older release than this install's. It
+        // is replaced like an unusable pin, and logged as a takeover.
+        let mut taking_over = None;
         let (pinned, repairing) = match existing_binary_path(root) {
             Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
-                if !crate::agent_hook_config::executables_match(&existing, binary_path) {
+                if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                    // This very install: refresh the template, keep the pin's
+                    // spelling.
+                    (existing, false)
+                } else if takeover.supersedes(&existing) {
+                    taking_over = Some(existing);
+                    (binary_path.to_string(), true)
+                } else {
+                    pins.push((root.clone(), existing));
                     continue;
                 }
-                // This very install: refresh the template, keep the pin's
-                // spelling.
-                (existing, false)
             }
             Some(_) => (binary_path.to_string(), true),
             None => (binary_path.to_string(), false),
         };
-        match write_plugin_reporting(root, &pinned) {
+        let written = write_plugin_reporting(root, &pinned);
+        // Reported only once it is what the plugin holds, as the Claude and
+        // Devin installers do: a failed write leaves the old pin in place.
+        if written.is_ok() {
+            pins.push((root.clone(), pinned.clone()));
+        }
+        match written {
             // Already current: nothing was written, so nothing is announced.
             Ok((_, false)) => {}
+            Ok((path, true)) if taking_over.is_some() => {
+                tracing::info!(
+                    "the OpenCode plugin at {} pinned an older dot-agent-deck ({}); now pinned \
+                     to this newer copy, {pinned}",
+                    path.display(),
+                    taking_over.as_deref().unwrap_or_default()
+                );
+                crate::agent_hook_config::log_auto_install_change(
+                    "opencode",
+                    &path,
+                    &pinned,
+                    "takeover: newer copy",
+                );
+            }
             // Repair logs what it changed: silently mutating global config is
             // the same class of thing that caused this bug.
             Ok((path, true)) if repairing => {
@@ -1080,6 +1115,7 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
             ),
         }
     }
+    pins
 }
 
 /// Fan-out core for explicit install: write the plugin into every candidate root that
@@ -1135,11 +1171,21 @@ fn install_to_roots(
 
 /// Silently install OpenCode plugin into every existing layout.
 /// Intended for dashboard startup — never prints to stdout, refusal included.
-pub fn auto_install() {
-    auto_install_resolved(
-        &candidate_roots(),
-        crate::platform::paths::durable_binary_path,
-    );
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    let roots = candidate_roots();
+    let pins = auto_install_resolved(&roots, crate::platform::paths::durable_binary_path);
+    // One pin per binary: the roots of one machine name the same install.
+    let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
+    for (root, binary) in pins {
+        if out.iter().all(|pin| pin.binary != binary) {
+            out.push(crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::OpenCode,
+                config: root,
+                binary,
+            });
+        }
+    }
+    out
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -1156,13 +1202,19 @@ pub fn auto_install() {
 /// often absent; resolving first logged `durable_binary_path`'s "pinning … as a
 /// last resort" warning for a plugin that was then never written (Qodo on PR
 /// #1344).
-fn auto_install_resolved(roots: &[PathBuf], resolve: impl FnOnce() -> Result<String, String>) {
+fn auto_install_resolved(
+    roots: &[PathBuf],
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Vec<(PathBuf, String)> {
     if !roots.iter().any(|root| root.exists()) {
-        return;
+        return Vec::new();
     }
     match resolve() {
         Ok(binary_path) => auto_install_to(roots, &binary_path),
-        Err(e) => tracing::warn!("auto-install: {e}"),
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -1275,6 +1327,66 @@ pub(crate) mod tests {
 
         assert_eq!(plugin_fingerprint(&path), before);
         assert_eq!(existing_binary_path(&root).as_deref(), Some(a.as_str()));
+    }
+
+    /// Scenario: an automatic install whose plugin write fails reports no pin, so the daemon never announces a binary the plugin does not hold (issue #1637).
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_reports_no_pin_when_the_write_fails() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        // A file where the plugin directory goes: the write cannot succeed.
+        std::fs::write(root.join("plugin"), b"not a directory").unwrap();
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+
+        let pins = auto_install_to(std::slice::from_ref(&root), &b);
+
+        assert!(pins.is_empty(), "{pins:?}");
+        assert_eq!(existing_binary_path(&root), None);
+    }
+
+    /// Scenario: the OpenCode plugin pins live install A. A newer, eligible copy B's automatic install repins it to B (issue #1637) and reports B as the pin; a tie, a newer A, an A whose version cannot be read, and an ineligible B all keep A and report A.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_takeover_matrix() {
+        use crate::hook_binary::{Takeover, with_takeover};
+        for (pinned, takeover, replaced) in [
+            (Some("0.0.1"), Takeover::eligible("1.0.0"), true),
+            (Some("1.0.0"), Takeover::eligible("1.0.0"), false),
+            (Some("2.0.0"), Takeover::eligible("1.0.0"), false),
+            (None, Takeover::eligible("1.0.0"), false),
+            (Some("0.0.1"), Takeover::ineligible(), false),
+        ] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let root = fixture.path().join("fake-operator-home").join("opencode");
+            let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+            if let Some(version) = pinned {
+                crate::test_isolation::write_script(
+                    std::path::Path::new(&a),
+                    format!("#!/bin/sh\necho 'dot-agent-deck {version}'\n").as_bytes(),
+                )
+                .unwrap();
+            }
+            let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+            write_plugin(&root, &a).unwrap();
+
+            let pins = with_takeover(takeover, || {
+                auto_install_to(std::slice::from_ref(&root), &b)
+            });
+
+            let expected = if replaced { &b } else { &a };
+            assert_eq!(
+                existing_binary_path(&root).as_deref(),
+                Some(expected.as_str()),
+                "pinned {pinned:?}"
+            );
+            assert_eq!(
+                pins,
+                vec![(root.clone(), expected.clone())],
+                "pinned {pinned:?}"
+            );
+        }
     }
 
     /// Scenario: An OpenCode plugin pins install A, which is then deleted or is cargo build output. An automatic install from B repins it to B.

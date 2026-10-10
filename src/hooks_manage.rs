@@ -1144,12 +1144,17 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// Intended for dashboard startup — **never prints to stdout**, including on
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
-pub fn auto_install() {
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637), so the daemon
+/// can name the binary Claude Code's events come from.
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     auto_install_to_gated(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
         || installed_claude_accepts_stop_failure().0,
-    );
+    )
+    .into_iter()
+    .collect()
 }
 
 /// [`auto_install`] against an explicit settings path, with the binary-path
@@ -1172,8 +1177,11 @@ pub fn auto_install() {
 /// Issue #714: this seam installs the base hook set, which every Claude Code
 /// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
 /// is the same seam with the gate injected, and what [`auto_install`] calls.
-pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
-    auto_install_to_gated(path, resolve, || false);
+pub fn auto_install_to(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Option<crate::hook_binary::HookPin> {
+    auto_install_to_gated(path, resolve, || false)
 }
 
 /// [`auto_install_to`] with the `StopFailure` gate injected (issue #714):
@@ -1185,9 +1193,9 @@ pub fn auto_install_to_gated(
     path: &Path,
     resolve: impl FnOnce() -> Result<String, String>,
     stop_failure: impl FnOnce() -> bool,
-) {
+) -> Option<crate::hook_binary::HookPin> {
     if path.parent().is_none_or(|p| !p.exists()) {
-        return;
+        return None;
     }
 
     let binary_path = match resolve() {
@@ -1196,26 +1204,26 @@ pub fn auto_install_to_gated(
         // command name, not a build-artifact path that breaks later.
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
         tracing::warn!("auto-install: {e}");
-        return;
+        return None;
     }
 
     let _guard = match lock_settings(path) {
         Ok(guard) => guard,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let before = settings.clone();
@@ -1228,13 +1236,18 @@ pub fn auto_install_to_gated(
 
     // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
     // still a change and is published — PRD #381 M4.
+    let pin = crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::ClaudeCode,
+        config: path.to_path_buf(),
+        binary: outcome.named.clone(),
+    };
     if settings == before {
-        return;
+        return Some(pin);
     }
 
     if let Err(e) = write_settings(path, &settings) {
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
-        return;
+        return None;
     }
     let binary_path = outcome.named.clone();
     crate::agent_hook_config::log_auto_install_change(
@@ -1261,6 +1274,7 @@ pub fn auto_install_to_gated(
             outcome.installed.join(", ")
         );
     }
+    Some(pin)
 }
 
 /// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty

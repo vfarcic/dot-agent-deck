@@ -1759,6 +1759,38 @@ pub async fn ingest_event(
     ingest_event_unless(state, event_tx, registry, event, false, None, || false).await;
 }
 
+/// Issue #1637: record which `dot-agent-deck` sent an admitted hook line
+/// (its `deck_build` / `deck_exe` stamp, or the absence of one), and broadcast
+/// the notices when that changes them. Under the state's write guard, so a
+/// `SubscribeEventsWithSnapshot` reply holds a change or its stream does.
+async fn observe_hook_sender(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_type: &crate::event::AgentType,
+    line: &str,
+) {
+    let sender = crate::hook_binary::HookLineSender::from_line(line);
+    // The steady state — an agent's hooks sending the stamp they sent last time
+    // — changes nothing, so it is settled under a read guard and never queues
+    // behind or blocks the event's own write.
+    if !state
+        .read()
+        .await
+        .hook_binaries
+        .would_change(agent_type, &sender)
+    {
+        return;
+    }
+    let mut state = state.write().await;
+    if state.hook_binaries.observe(agent_type, &sender) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
 /// [`ingest_event`] for a raw event the hook socket's provenance gate admitted
 /// (issue #318). `unproven` is the gate's verdict that the event comes from an
 /// outside agent — a pane, or a paneless agent, this daemon never issued a hook
@@ -4716,6 +4748,11 @@ async fn run_hook_loop_with_idle_timeout(
                                     &line,
                                 );
                             }
+                            // Issue #1637: which deck binary sent this line,
+                            // read off the line like the token, and never part
+                            // of the event.
+                            observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
+                                .await;
                             ingest_hook_event(
                                 &state,
                                 &event_tx,

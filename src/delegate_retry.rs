@@ -1139,6 +1139,7 @@ impl Watch {
                     Ok(
                         BroadcastMsg::OrchestrationSurface(_)
                         | BroadcastMsg::WorktreeKept(_)
+                        | BroadcastMsg::HookBinaryNotice(_)
                         | BroadcastMsg::Unknown,
                     ) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => return Err(RetryEnd::Lagged),

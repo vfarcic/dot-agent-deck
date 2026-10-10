@@ -1602,6 +1602,13 @@ impl KeptDeckEntry {
 /// installs that each resolve to themselves still do not rewrite the agent's
 /// config on every start.
 ///
+/// **A sibling an eligible newer copy supersedes is not kept either** (issue
+/// #1637, [`crate::hook_binary::Takeover`]): when the installing binary is an
+/// install outside any temporary location and the sibling's `--version`
+/// reports a strictly older release, it is passed over exactly as a dead pin
+/// is, so it is overwritten in place and the event keeps one deck entry. A
+/// tie, a newer sibling and a sibling whose version cannot be read are kept.
+///
 /// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
 pub(crate) fn auto_install_kept_entry(
     rules: &[Value],
@@ -1610,6 +1617,7 @@ pub(crate) fn auto_install_kept_entry(
     executable_of: impl Fn(&str) -> Option<String>,
     command_for_exe: impl Fn(&str) -> String,
 ) -> Option<KeptDeckEntry> {
+    let takeover = crate::hook_binary::Takeover::current();
     let exe = rules
         .iter()
         .filter_map(|rule| rule.get("hooks").and_then(Value::as_array))
@@ -1620,6 +1628,7 @@ pub(crate) fn auto_install_kept_entry(
             executable_of(command)
                 .filter(|exe| auto_install_keeps(exe))
                 .filter(|exe| ensure_hook_path_is_shell_safe(exe).is_ok())
+                .filter(|exe| executables_match(exe, binary_path) || !takeover.supersedes(exe))
         })?;
     Some(if executables_match(&exe, binary_path) {
         KeptDeckEntry::ThisBinary
@@ -2059,6 +2068,137 @@ mod tests {
         if let Some(named) = named {
             assert_eq!(named, a, "{agent}: the entries still name A");
         }
+    }
+
+    /// A live deck stub at `path` whose `--version` prints `version`, or, for
+    /// `None`, the plain `exit 0` stub every keep-rule fixture uses.
+    #[cfg(unix)]
+    fn seed_versioned_deck(path: &Path, version: Option<&str>) -> String {
+        let seeded = seed_deck(path);
+        if let Some(version) = version {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho 'dot-agent-deck {version}'\n").as_bytes(),
+            )
+            .unwrap();
+        }
+        seeded
+    }
+
+    /// Every event's rules with the deck's commands blanked, so a comparison
+    /// sees the user's handlers, the order and each rule's `matcher`.
+    #[cfg(unix)]
+    fn rules_around_the_deck(agent: &str, path: &Path) -> Value {
+        let suffix = format!("hook --agent {agent}");
+        let mut document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for rules in document["hooks"].as_object_mut().unwrap().values_mut() {
+            for rule in rules.as_array_mut().unwrap() {
+                for handler in rule["hooks"].as_array_mut().into_iter().flatten() {
+                    if handler["command"]
+                        .as_str()
+                        .is_some_and(|command| command.ends_with(&suffix))
+                    {
+                        handler["command"] = Value::String("<deck>".into());
+                    }
+                }
+            }
+        }
+        document["hooks"].take()
+    }
+
+    /// Issue #1637: an automatic install by B under `takeover`, over a file
+    /// whose deck entry pins A reporting `pinned` (or nothing). Returns A, B
+    /// and the config path.
+    #[cfg(unix)]
+    fn auto_install_over_a_versioned_pin(
+        agent: &str,
+        fixture: &Path,
+        pinned: Option<&str>,
+        takeover: crate::hook_binary::Takeover,
+    ) -> (String, String, std::path::PathBuf, Value) {
+        let home = fixture.join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_versioned_deck(&fixture.join("homebrew").join("dot-agent-deck"), pinned);
+        let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+        let around = rules_around_the_deck(agent, &path);
+        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        (a, b, path, around)
+    }
+
+    /// Issue #1637's takeover matrix for one writer.
+    #[cfg(unix)]
+    fn takeover_matrix(agent: &str) {
+        use crate::hook_binary::Takeover;
+        // A newer, eligible copy replaces an older pin in place: one deck
+        // entry per event, where the old one was, with the user's handler and
+        // every rule's `matcher` unchanged.
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (_, b, path, around) = auto_install_over_a_versioned_pin(
+            agent,
+            fixture.path(),
+            Some("0.0.1"),
+            Takeover::eligible("1.0.0"),
+        );
+        assert_every_event_names(agent, &path, &b, "a newer eligible copy takes the pin over");
+        assert_eq!(
+            rules_around_the_deck(agent, &path),
+            around,
+            "{agent}: only the deck's command changed"
+        );
+
+        // Kept: a tie, a newer pin, an unprobeable pin, and an ineligible copy
+        // even when it is newer.
+        for (pinned, takeover, why) in [
+            (
+                Some("1.0.0"),
+                Takeover::eligible("1.0.0"),
+                "a tie keeps the pin",
+            ),
+            (
+                Some("2.0.0"),
+                Takeover::eligible("1.0.0"),
+                "an older copy never displaces a newer pin",
+            ),
+            (
+                None,
+                Takeover::eligible("1.0.0"),
+                "a pin whose version cannot be read is kept",
+            ),
+            (
+                Some("0.0.1"),
+                Takeover::ineligible(),
+                "a copy that is not an install never takes over",
+            ),
+        ] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let (a, _, path, _) =
+                auto_install_over_a_versioned_pin(agent, fixture.path(), pinned, takeover);
+            assert_every_event_names(agent, &path, &a, why);
+        }
+    }
+
+    /// Scenario: Codex hooks pin an older live install; a newer eligible copy's automatic install switches them to itself in place, while a tie, a newer pin, an unprobeable pin and an ineligible copy leave them alone.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_takeover_matrix() {
+        takeover_matrix("codex");
+    }
+
+    /// Scenario: the same takeover matrix for Claude Code's settings file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_takeover_matrix() {
+        takeover_matrix("claude-code");
+    }
+
+    /// Scenario: the same takeover matrix for Devin's config file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_takeover_matrix() {
+        takeover_matrix("devin");
     }
 
     /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.

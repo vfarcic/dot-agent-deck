@@ -2239,22 +2239,34 @@ fn codex_present_on_path() -> bool {
 /// Guarded, idempotent, and best-effort: SKIPs unless `codex` is on `PATH` and a
 /// real home resolves (never a `/tmp` write), and any failure is logged, never
 /// fatal.
-pub fn auto_install_and_trust_at_startup() {
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637). After a
+/// takeover that is the new copy, and the trust recorded here is for its
+/// command, so Codex may ask the user once to review the changed hooks.
+pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
-        return;
+        return Vec::new();
     }
     let Some(home) = codex_home() else {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
-        return;
+        return Vec::new();
     };
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
     let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
-        return;
+        return Vec::new();
     };
+    let pins = binary_paths
+        .iter()
+        .map(|binary| crate::hook_binary::HookPin {
+            agent: crate::event::AgentType::Codex,
+            config: home.join("hooks.json"),
+            binary: binary.clone(),
+        })
+        .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     match trust_deck_hooks_for(&home, &cwd, &binary_paths) {
         Ok(outcome) => {
@@ -2270,6 +2282,7 @@ pub fn auto_install_and_trust_at_startup() {
              degrade to stdout classification"
         ),
     }
+    pins
 }
 
 #[cfg(test)]

@@ -79,6 +79,7 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         if let Ok(mut sub) = subscribed {
             // Reset backoff on a successful subscribe (and resync).
             delay = config.initial_delay;
+            seed_hook_binary_notices(&client, &state).await;
             loop {
                 match sub.next_event().await {
                     Ok(Some(BroadcastMsg::Event(event))) => {
@@ -103,6 +104,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     // `UiState`, which this task cannot touch.
                     Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
                         state.write().await.queue_worktree_kept(kept);
+                    }
+                    // Issue #1637: the daemon's hook-binary notices changed.
+                    // The whole list replaces what the dashboard footer shows.
+                    Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {
+                        state.write().await.hook_binary_notices = payload.notices;
                     }
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored
@@ -148,6 +154,21 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
 /// matching the TUI's startup hydration bound in spirit: a wedged daemon must not
 /// stall the subscriber, and an opened stream is not being read while they run.
 const RESYNC_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`seed_hook_binary_notices`] waits for the daemon's `Hello`.
+const HOOK_NOTICE_SEED_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Issue #1637: read the daemon's hook-binary notices once a subscription is
+/// open, so any change after this read is on the stream and is applied after
+/// it. A daemon that predates the notices, or does not answer in time, leaves
+/// what the state holds.
+async fn seed_hook_binary_notices(client: &DaemonClient, state: &SharedState) {
+    if let Ok(Ok(Some(notices))) =
+        tokio::time::timeout(HOOK_NOTICE_SEED_TIMEOUT, client.hook_binary_notices()).await
+    {
+        state.write().await.hook_binary_notices = notices;
+    }
+}
 
 /// Issue #1520: the subscriber is resubscribing after a gap. Open the new
 /// stream, re-read the daemon's agents and reconcile this state with them

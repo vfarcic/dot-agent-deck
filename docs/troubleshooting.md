@@ -169,7 +169,7 @@ Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release
 
 The hook command in that agent's config names a deck binary that is no longer there. A build directory is the usual cause: `cargo clean` removes it, and deleting a git worktree removes it with the worktree.
 
-The deck writes an **installed** binary into hooks when it can find one: `~/.local/bin/dot-agent-deck`, or a `dot-agent-deck` in a directory on your `PATH`. With no installed binary, it refuses to write a build-directory path at all (`hooks install` fails and says what to install), and pins any other path as a last resort, with a warning in the log.
+The deck writes an **installed** binary into hooks when it can find one: `~/.local/bin/dot-agent-deck`, or a `dot-agent-deck` in a directory on your `PATH`. With no installed binary, it refuses to write a build-directory path at all (`hooks install` fails and says what to install), and pins any other path as a last resort, with a warning in the log. The exception is the desktop app on macOS opened from its disk image, or from the temporary location macOS runs an app from before it has been moved: that path stops working once the image is ejected or the app is reopened, so no hooks are installed and both clients say `Move Agent Deck to /Applications and reopen it to turn agent hooks on.`
 
 To fix it:
 
@@ -179,7 +179,23 @@ To fix it:
 
 Check with the commands in [Checking that hooks are installed](#checking-that-hooks-are-installed).
 
-A hook command whose binary still **exists** is left alone, even when it names a different binary from the one the deck would write. The deck then adds its own entry beside it, so that agent runs two deck hooks per event. If the listing shows a second path that points at a copy of the deck you no longer want, delete that copy and start the deck once (its entry is then repaired, because its binary is missing), or remove the entry from the config by hand.
+A hook command whose binary still **exists** keeps calling it, even when it names a different copy from the one the deck would write, until an installed copy of a newer release starts and switches the hooks to itself. There is still one deck entry per event either way. To switch now, run `dot-agent-deck hooks install` from the copy you want, or delete the copy you no longer want and start the deck once (its entry is then repaired, because its binary is missing).
+
+### The deck says an agent's hooks run an older dot-agent-deck
+
+The TUI shows a line at the bottom of the dashboard, or the desktop app a strip under a daemon's header, such as:
+
+```text
+⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck
+```
+
+Those agents' hooks call an older copy of the deck than the one you are running, so whatever that copy does not know how to send is missing: a status, a reply or a signal. With a copy old enough, those agents' cards stop updating altogether. It usually happens when two copies are installed and only one was upgraded, for example a Homebrew CLI next to the desktop app or next to a copy in `~/.local/bin`.
+
+1. **Do what the notice says.** `Run: brew upgrade dot-agent-deck` upgrades the Homebrew copy the hooks call. `Run: <path> hooks install --agent <agent>` points the hooks at the deck you are running. `Upgrade the dot-agent-deck the hooks run, …` means the deck you are running cannot take the hooks over and has no command to offer: upgrade or replace the copy the notice names in parentheses, or run `hooks install` from the copy you want. In the desktop app, **Copy** copies the command shown, and appears only when the fix is a command.
+2. **Restart the agents** whose hooks changed, because an agent reads its hook configuration when it starts.
+3. **Check** with [Checking that hooks are installed](#checking-that-hooks-are-installed): every line should name the copy you meant.
+
+The notice goes away once the hooks run a current copy: after the agent's next event, or when the daemon restarts. "Predates version reporting" means the copy is too old to say its version, and "did not report its version" that it did not answer in time when the deck asked; treat both as an older copy. Pi is never named, because its extension always runs the copy that started its pane.
 
 ### An agent's config file cannot be edited
 

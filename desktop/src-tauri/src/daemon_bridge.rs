@@ -62,6 +62,8 @@ pub(crate) struct HandshakeInfo {
     /// Whether the deck honours the directory browser's listing options
     /// (issue #1240) — see [`listing_options`].
     pub(crate) listing_options: bool,
+    /// Issue #1637: the daemon's hook-binary notices, from the same reply.
+    pub(crate) hook_binary_notices: Vec<crate::dto::HookBinaryNoticeDto>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -1224,7 +1226,22 @@ fn classify_handshake(
             .flatten(),
         new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
         listing_options: response.ok && listing_options(response),
+        hook_binary_notices: hook_binary_notices(response),
     }
+}
+
+/// Issue #1637: the notices a `Hello` reply carries, for the webview. None from
+/// a refused handshake or a daemon that predates them.
+fn hook_binary_notices(response: &AttachResponse) -> Vec<crate::dto::HookBinaryNoticeDto> {
+    if !response.ok {
+        return Vec::new();
+    }
+    response
+        .hook_binary_notices
+        .iter()
+        .flatten()
+        .map(crate::dto::HookBinaryNoticeDto::new)
+        .collect()
 }
 
 /// [`classify_handshake`] with the process-wide allowance read, for
@@ -1286,6 +1303,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         daemon_version: handshake.daemon_version,
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
+        hook_binary_notices: handshake.hook_binary_notices,
     }
 }
 
@@ -1591,8 +1609,17 @@ pub(crate) async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> Des
 pub(crate) async fn snapshot_with(
     endpoint: &Endpoint,
     links: &DaemonLinks,
-    view: Option<&mut AgentView>,
+    mut view: Option<&mut AgentView>,
 ) -> DesktopSnapshot {
+    // Issue #1637: the daemon's hook-binary notices changed, and they live on
+    // the `Hello` reply the held link captured. Drop it so this refresh
+    // handshakes again.
+    if view
+        .as_deref_mut()
+        .is_some_and(AgentView::take_handshake_due)
+    {
+        links.invalidate(endpoint).await;
+    }
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
         Err(error) => return disconnected_with_reason(endpoint, links, error).await,
@@ -3628,6 +3655,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             );
             assert_eq!(connection.daemon_version.as_deref(), daemon_version);
@@ -3645,6 +3673,63 @@ mod tests {
         assert_eq!(offer(Some(CLIENT_VERSION))["kind"], "current");
         assert_eq!(offer(Some("999.0.0"))["kind"], "daemon-newer");
         assert_eq!(offer(None)["kind"], "unknown");
+    }
+
+    /// Issue #1637: a deck's connection carries the hook-binary notices its
+    /// daemon put on the `Hello` reply, camelCased for the webview, with the
+    /// daemon's remedy verbatim. A refused handshake carries none.
+    #[test]
+    fn the_connection_carries_the_hook_binary_notices_from_the_handshake() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = HookBinaryNotice {
+            binary: "/opt/homebrew/bin/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into()],
+            version: Some("0.45.1".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        response.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        response.hook_binary_notices = Some(vec![notice]);
+        let handshake =
+            classify_handshake_for_test(&response, &dot_agent_deck::build_id::local_build_id());
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            handshake,
+        );
+        let wire = serde_json::to_value(&connection).unwrap();
+        let notices = wire["hookBinaryNotices"].as_array().expect("on the wire");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["binary"], "/opt/homebrew/bin/dot-agent-deck");
+        assert_eq!(notices[0]["agents"][0], "Claude Code");
+        assert_eq!(notices[0]["version"], "0.45.1");
+        assert_eq!(notices[0]["daemonVersion"], "0.46.0");
+        assert_eq!(notices[0]["reason"], "older");
+        assert_eq!(notices[0]["remedy"], "Run:");
+        assert_eq!(notices[0]["command"], "brew upgrade dot-agent-deck");
+
+        let mut refused = response.clone();
+        refused.ok = false;
+        refused.error = Some("no".into());
+        let handshake =
+            classify_handshake_for_test(&refused, &dot_agent_deck::build_id::local_build_id());
+        assert!(handshake.hook_binary_notices.is_empty());
+
+        let mut silent = response;
+        silent.hook_binary_notices = None;
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            classify_handshake_for_test(&silent, &dot_agent_deck::build_id::local_build_id()),
+        );
+        assert!(
+            serde_json::to_value(&connection)
+                .unwrap()
+                .get("hookBinaryNotices")
+                .is_none(),
+            "omitted when the daemon reports none"
+        );
     }
 
     /// The revalidation backstop, at the predicate rather than through a
@@ -3669,6 +3754,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             ),
             _transport: tokio::runtime::Runtime::new()

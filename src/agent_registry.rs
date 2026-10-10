@@ -381,7 +381,11 @@ pub struct AgentSpec {
     /// own installer here. `None` where the agent has no startup install step —
     /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
-    pub startup_auto_install: Option<fn()>,
+    ///
+    /// Issue #1637: it returns what the agent's hooks are pinned to afterwards,
+    /// so `daemon serve` can name the binary an agent's events come from before
+    /// any hook fires. The TUI ignores it.
+    pub startup_auto_install: Option<fn() -> Vec<crate::hook_binary::HookPin>>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, as measured against the versions [`PromptKeys`] names. `None`
     /// where they are unmeasured (Devin) or there is no agent to press them at

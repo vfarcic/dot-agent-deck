@@ -270,7 +270,7 @@ pub fn verify_restart_target(
 /// platform has them, plus size and modification time (PRD #1487 audit A5).
 /// Read through symlinks, so a repointed Homebrew link reads as a different
 /// file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     dev: u64,
     ino: u64,
@@ -421,7 +421,7 @@ fn strip_v(v: &str) -> &str {
 }
 
 /// Run `<target> --version` with a wall-clock bound and a byte cap on stdout.
-fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, String> {
+pub(crate) fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let deadline = Instant::now() + timeout;
     // A file written moments ago can still be held open for writing by a

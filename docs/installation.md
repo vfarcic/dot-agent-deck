@@ -191,7 +191,7 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 
 The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
 
-The deck keeps one entry of its own per hook event, except where removing an extra one would move a hook of yours that follows it in the same rule: that one is kept, and calls the same copy as the deck's main entry. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`, or the desktop app's bundled copy and a CLI), the hooks call the first installed copy that registered them, and starting any other copy keeps them calling that copy rather than adding a second set or switching them over. They switch to another installed copy when the one they call has been deleted, or, on macOS and Linux, when its path contains a backslash (`\`), and they switch to a copy you choose when you run `dot-agent-deck hooks install` from it. The deck changes only entries it recognises as its own; your own hooks, and their order, are left alone. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
+The deck keeps one entry of its own per hook event, except where removing an extra one would move a hook of yours that follows it in the same rule: that one is kept, and calls the same copy as the deck's main entry. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`), the hooks move to a newer copy when you run one: starting an installed copy of a newer release switches them to that copy, in place, so there is still one set. Starting an older copy, or another copy of the same release, leaves them calling the copy they call, and so does starting a copy from a temporary directory, a mounted disk image or a build directory. The desktop app's bundled copy does not take the hooks over from a CLI you installed; when that CLI is older than the app, the app tells you so instead (see [When hooks run an older copy](#when-hooks-run-an-older-copy)). The hooks also switch to another installed copy when the one they call has been deleted, or, on macOS and Linux, when its path contains a backslash (`\`), and they switch to a copy you choose when you run `dot-agent-deck hooks install` from it. If that copy is older, they stay on it until a newer installed copy next starts. The deck changes only entries it recognises as its own; your own hooks, and their order, are left alone. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. After the hooks switch to a newer copy, Codex may ask you once to review the changed hooks. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
 
 To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
 
@@ -205,6 +205,25 @@ dot-agent-deck hooks install --agent devin
 `--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)). On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
 
 An agent that was already running when the hooks were installed may need a restart to load them. If a card stays on its first status while the agent works, see [Troubleshooting → Hooks](troubleshooting.md#hooks).
+
+### When hooks run an older copy
+
+If an agent's hooks call a `dot-agent-deck` older than the deck you are running, for example after you upgrade the desktop app but not the Homebrew copy the hooks call, the deck tells you which agents, which copy, both versions and what to do:
+
+- **TUI:** a line at the bottom of the dashboard, such as `⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck`. When the terminal is narrow, the path is shortened in the middle so the fix stays readable. When there is more than one notice, the line shows the first and how many more there are.
+- **Desktop app:** a strip under that daemon's header, on the dashboard and on the daemon's own screen, with the same words and, when the fix is a command, a **Copy** button that copies exactly the command shown. Only the affected daemon shows it, and it does not block anything.
+
+The fix is one of:
+
+- `Run: brew upgrade dot-agent-deck`: the hooks call a Homebrew copy. Upgrade it.
+- `Run: <path> hooks install --agent <agent>`: the deck you are running can take the hooks over. Run the command it shows.
+- ``Upgrade the dot-agent-deck the hooks run, or run `hooks install` from the copy you want the hooks to use.``: the deck cannot offer a command for that copy. Upgrade or replace the copy the notice names, or run `hooks install` from the copy you want the hooks to call.
+
+A copy so old that it does not report its version is named as one that "predates version reporting", and a copy that did not answer when asked its version as one that "did not report its version". The fix is the same. The notice goes away once the agent's hooks run a current copy: after the next event they send, or when the daemon restarts.
+
+If you open the desktop app on macOS straight from its disk image, or before moving it out of Downloads (macOS then runs it from a temporary location), it installs no hooks, and both clients say `Agent hooks are off` with `Move Agent Deck to /Applications and reopen it to turn agent hooks on.` Do that, and the hooks are installed when the app starts again.
+
+Pi is not affected: its extension always runs the copy that started the pane.
 
 ## Desktop app
 
