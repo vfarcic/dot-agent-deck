@@ -128,6 +128,14 @@ pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
 /// leaves a wide margin while keeping the announcement prompt.
 pub const FAILED_REPLY_HOLD: Duration = Duration::from_secs(1);
 
+/// How long, by event timestamp, an announced permission hook owes [`coalesce`]
+/// the `permission_prompt` notification that describes the same prompt. Claude
+/// Code's notification was measured at 6.0 s after its `PermissionRequest`
+/// hook, in 4 runs of 4; 30 s covers that five times over, while a missing
+/// notification stops silencing the next notification-only prompt half a
+/// minute later.
+pub const PERMISSION_NOTICE_WINDOW: Duration = Duration::from_secs(30);
+
 /// What a reading start answers while the Settings switch is off on disk —
 /// only in a race, since the webview starts sessions only while it shows the
 /// switch on, so it is not spoken.
@@ -275,8 +283,8 @@ impl TurnEventSource for DaemonTurnEvents {
                         let BroadcastMsg::Event(event) = message else {
                             continue;
                         };
-                        if let Some(status) = status_turn_event(&event, &agent_id)
-                            && status_tx.send(Incoming::Status(status)).await.is_err()
+                        if let Some(status) = status_incoming(&event, &agent_id)
+                            && status_tx.send(status).await.is_err()
                         {
                             return;
                         }
@@ -307,7 +315,19 @@ impl TurnEventSource for DaemonTurnEvents {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     Reply(FinalReply),
+    /// A status whose event time is not known.
     Status(TurnEvent),
+    /// A status and the timestamp of the event it came from, in milliseconds
+    /// since the Unix epoch ([`status_incoming`]), which times a permission
+    /// prompt's notification against its hook ([`PERMISSION_NOTICE_WINDOW`]).
+    StatusAt(TurnEvent, i64),
+}
+
+/// [`status_turn_event`] as what [`coalesce`] merges, stamped with `event`'s
+/// timestamp.
+pub fn status_incoming(event: &AgentEvent, agent_id: &str) -> Option<Incoming> {
+    status_turn_event(event, agent_id)
+        .map(|status| Incoming::StatusAt(status, event.timestamp.timestamp_millis()))
 }
 
 /// The status event `event` means for reading the agent `agent_id`, or `None`.
@@ -407,13 +427,18 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// merged exactly like one with text, so it is announced once, in its turn's
 /// place (audit A2).
 ///
-/// A permission prompt is announced once, too. Claude Code reports one prompt
-/// twice: its permission hook (a [`TurnEvent::Permission`]) when the prompt
-/// appears, and its `permission_prompt` notification (a
-/// [`TurnEvent::PermissionNotice`]) about six seconds later, which can be after
-/// the deck already answered the prompt. So each permission prompt absorbs the first
-/// notification after it, whenever it comes; a notification with no prompt
-/// before it — a Claude Code too old for the permission hook — is announced.
+/// A permission prompt Claude Code reports twice is announced once. It sends
+/// its permission hook (a [`TurnEvent::Permission`]) when the prompt appears,
+/// and its `permission_prompt` notification (a [`TurnEvent::PermissionNotice`])
+/// about six seconds later, which can be after the deck already answered the
+/// prompt or the turn moved on. So each announced permission hook owes one
+/// notification, and a notification pays the oldest debt still owed, unsaid —
+/// a debt lapses [`PERMISSION_NOTICE_WINDOW`] after its hook's event, by the
+/// events' timestamps, not by when they arrive. A notification nothing is owed
+/// for — a Claude Code too old for the permission hook, or a prompt whose
+/// hook's debt lapsed — is announced. Neither an answer nor the turn's progress
+/// pays a debt: the answered prompt's notification still comes. A status with
+/// no event time ([`Incoming::Status`]) owes, and pays, with no lapse.
 ///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
@@ -422,8 +447,10 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     let mut held: Option<(String, Instant)> = None;
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
-    // A permission prompt was announced and its notification has not come.
-    let mut notice_owed = false;
+    // The announced permission hooks whose notification has not come, oldest
+    // first, each with its event's timestamp when known.
+    let mut notices_owed: std::collections::VecDeque<Option<i64>> =
+        std::collections::VecDeque::new();
     loop {
         let next = match held.as_ref().map(|(_, until)| *until) {
             Some(until) => tokio::select! {
@@ -440,6 +467,15 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
         let recent = announced
             .filter(|(_, until)| now < *until)
             .map(|(what, _)| what);
+        // The status's event timestamp, when known.
+        let at = match &next {
+            Some(Some(Incoming::StatusAt(_, at))) => Some(*at),
+            _ => None,
+        };
+        // Debts lapsed by this event's time are no longer owed.
+        if let Some(at) = at {
+            notices_owed.retain(|owed| owed.is_none_or(|hook| !notice_lapsed(hook, at)));
+        }
         let mut emit = Vec::new();
         let release_held =
             |held: &mut Option<(String, Instant)>,
@@ -470,7 +506,10 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                 release_held(&mut held, &mut emit, &mut announced);
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
-            Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
+            Some(Some(
+                Incoming::Status(TurnEvent::Blocked { cause })
+                | Incoming::StatusAt(TurnEvent::Blocked { cause }, _),
+            )) => {
                 match (held.is_some(), cause, recent) {
                     // The usage limit replaces the held failed reply.
                     (true, BlockCause::Quota, _) => {
@@ -501,16 +540,17 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     }
                 }
             }
-            // The notification of the prompt already announced.
-            Some(Some(Incoming::Status(TurnEvent::PermissionNotice { .. }))) if notice_owed => {
-                notice_owed = false;
+            // The notification of the oldest prompt already announced.
+            Some(Some(
+                Incoming::Status(TurnEvent::PermissionNotice { .. })
+                | Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, _),
+            )) if !notices_owed.is_empty() => {
+                notices_owed.pop_front();
             }
-            Some(Some(Incoming::Status(status))) => {
+            Some(Some(Incoming::Status(status) | Incoming::StatusAt(status, _))) => {
                 release_held(&mut held, &mut emit, &mut announced);
-                match status {
-                    TurnEvent::Permission { .. } => notice_owed = true,
-                    TurnEvent::PermissionNotice { .. } => notice_owed = false,
-                    _ => {}
+                if let TurnEvent::Permission { .. } = status {
+                    notices_owed.push_back(at);
                 }
                 emit.push(status);
             }
@@ -521,6 +561,13 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
             }
         }
     }
+}
+
+/// Whether a notification at `notice` comes too late to be the one a permission
+/// hook at `hook` owes ([`PERMISSION_NOTICE_WINDOW`]), both in milliseconds
+/// since the Unix epoch. A notification stamped before its hook is not late.
+fn notice_lapsed(hook: i64, notice: i64) -> bool {
+    i128::from(notice) - i128::from(hook) > PERMISSION_NOTICE_WINDOW.as_millis() as i128
 }
 
 /// What [`coalesce`] last announced of a failed turn.
