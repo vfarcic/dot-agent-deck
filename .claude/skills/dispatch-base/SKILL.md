@@ -37,12 +37,15 @@ A skill that fetched in an earlier step of its own does not need to fetch again,
 
 ## Step 2 — Fast-forward when there is no local work to move
 
-**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt and no question: an up-to-date base is the default here, and the user is told what happened rather than asked to authorise it. Print the sha before moving, so the report can say where the base was.
+**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt and no question: an up-to-date base is the default here, and the user is told what happened rather than asked to authorise it. Print the sha before moving, so the report can say where the base was, and again after, since that is the base the units inherit.
 
 ```bash
 git rev-parse --short HEAD                             # the sha before moving
 git merge --ff-only origin/main
+git rev-parse --short HEAD                             # the sha after: the units' base
 ```
+
+When step 3 declines to move, the base is `HEAD` as step 1 left it: record `git rev-parse --short HEAD` then, with the distance step 1 read.
 
 **Why this is safe.** The hazard behind the older rule, which surfaced staleness and asked every time (until issue #760), was that *the user may have local work, and a dispatching agent has no business moving their branch*. That hazard is kept: it is what the three preconditions test for. Together they say **there is no local work here to move**: no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
 
