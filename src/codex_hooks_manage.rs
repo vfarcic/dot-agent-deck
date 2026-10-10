@@ -950,7 +950,7 @@ pub struct HooksListing {
 /// ```text
 /// → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{…}}}
 /// ← {"id":1,"result":{"userAgent":…,"codexHome":…}}
-/// → {"jsonrpc":"2.0","id":2,"method":"hooks/list","params":{"cwd":"<cwd>"}}
+/// → {"jsonrpc":"2.0","id":2,"method":"hooks/list","params":{"cwds":["<cwd>"]}}
 /// ← {"id":2,"result":{"data":[{"cwd":"…","hooks":[ <entry>, … ],
 ///                             "warnings":[],"errors":[]}]}}
 /// ```
@@ -959,14 +959,37 @@ pub struct HooksListing {
 /// `source`, `pluginId`, `isManaged`, `enabled`, `currentHash`, and `trustStatus`
 /// (camelCase). This function is the ONE place that shape is decoded.
 ///
+/// The listing is for `cwd`, and that is held two ways (issue #1652), because
+/// what Codex loads depends on the directory: a trusted project's own
+/// `.codex/hooks.json` adds entries, and its config can turn hooks off. The
+/// child is spawned IN `cwd`, and the request names it in `cwds`, the field
+/// codex-cli 0.160.0's `HooksListParams` schema declares. This used to send a
+/// singular `cwd`, which 0.160.0 ignores — measured: the reply echoed the
+/// child's own directory, not the requested one — while the child inherited
+/// the caller's directory, so the listing was for wherever the caller sat.
+/// Every caller today asks about `std::env::current_dir()`, so the two agreed
+/// except when that directory could not be read and the caller fell back to
+/// `home`: the child then sat in a deleted directory, and 0.160.0 exits there
+/// without answering, so a deck started from one could record no trust at all.
+/// Either half alone makes 0.160.0 list `cwd`; the spawn directory is the half
+/// that does not depend on the field's name, since Codex falls back to it when
+/// `cwds` is empty or unread.
+///
 /// `CODEX_HOME` is set to `home` on the child so the listing describes exactly the
 /// home the deck installed into and pins on the Codex child. stderr is discarded,
 /// the wait is bounded by [`HOOKS_LIST_TIMEOUT`], and the child is killed before
 /// returning. EVERY failure — codex absent, non-zero exit, protocol drift, timeout
 /// — is an `Err` so the caller degrades quietly (no spawn is ever blocked).
 pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
-    let mut child = Command::new("codex")
+    list_hooks_with(Path::new("codex"), home, cwd)
+}
+
+/// [`list_hooks_in`] with the `codex` program named, so a test can hand it a
+/// stand-in without rewriting this process's `PATH`.
+fn list_hooks_with(codex: &Path, home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
+    let mut child = Command::new(codex)
         .arg("app-server")
+        .current_dir(cwd)
         .env("CODEX_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -991,7 +1014,7 @@ pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "hooks/list",
-            "params": { "cwd": cwd.display().to_string() }
+            "params": { "cwds": [cwd.display().to_string()] }
         }),
     );
 
@@ -2268,15 +2291,36 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
         })
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    match trust_deck_hooks_for(&home, &cwd, &binary_paths) {
-        Ok(outcome) => {
-            // The `Unrecognised` case has already warned from inside; this path
-            // has no user watching, so the count is all it needs.
-            tracing::debug!(
-                count = outcome.trusted(),
-                "codex startup install: recorded scoped hook trust"
-            )
-        }
+    report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
+}
+
+/// Log what [`auto_install_and_trust_at_startup`]'s trust write came to.
+///
+/// A zero is `warn!` (issue #1652). It used to be `debug!` whatever the count,
+/// so a startup that trusted nothing — which can leave a Codex started outside
+/// a deck pane running without the deck's hooks — said so below the level
+/// anyone runs. `NothingListed` cannot mean "not installed" here, since this
+/// runs only after [`auto_install`] reported a durable install, so it is worth
+/// a line. A non-zero is `info!`, as the wrapper's own trust write logs it.
+/// The `Unrecognised` zero has already warned from inside
+/// [`trust_deck_hooks_for`], so it is not said twice.
+fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
+    match result {
+        Ok(TrustOutcome::Trusted { count, .. }) => tracing::info!(
+            count,
+            cwd = %cwd.display(),
+            "codex startup install: recorded scoped hook trust"
+        ),
+        Ok(TrustOutcome::NothingListed) => tracing::warn!(
+            cwd = %cwd.display(),
+            "codex startup install: recorded no hook trust — Codex listed none of the deck's own \
+             hooks as eligible from this directory; any of them without an earlier matching trust \
+             record stays untrusted, and a Codex started outside a deck pane runs without it"
+        ),
+        Ok(TrustOutcome::Unrecognised { listed }) => tracing::debug!(
+            listed,
+            "codex startup install: trusted no hook (already warned)"
+        ),
         Err(e) => tracing::warn!(
             "codex startup install: could not record scoped hook trust ({e}); Codex events \
              degrade to stdout classification"
@@ -3485,6 +3529,180 @@ mod tests {
         assert!(
             !sent.contains(&"x".repeat(200)),
             "an id too large to echo must draw no reply at all"
+        );
+    }
+
+    /// Issue #1652: `hooks/list` is answered for the directory the deck asks
+    /// about, not for wherever the deck itself was launched.
+    ///
+    /// The stand-in does what codex-cli 0.160.0 was measured doing: it lists
+    /// for its own working directory, so it reports the deck's hook only when
+    /// it was spawned in the project. The test process sits in the crate root,
+    /// so a spawn that inherits the caller's directory lists nothing. It also
+    /// records the request, which must name the project in `cwds`, the field
+    /// 0.160.0's schema declares (it ignores the singular `cwd` this used to
+    /// send).
+    #[cfg(unix)]
+    #[test]
+    fn hooks_list_runs_in_and_asks_for_the_requested_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::test_temp::tempdir().expect("codex fixture tempdir");
+        let root = fixture
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture root");
+        let home = root.join("codex-home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).expect("create codex home");
+        std::fs::create_dir_all(&project).expect("create project");
+        assert_ne!(
+            std::env::current_dir().expect("test cwd"),
+            project,
+            "the test must call from somewhere other than the project, or it proves nothing"
+        );
+        let pwd_record = root.join("pwd.txt");
+        let request_record = root.join("request.txt");
+        let entry = json!({
+            "key": format!("{}:session_start:0:0", home.join("hooks.json").display()),
+            "command": "/abs/dot-agent-deck hook --agent codex",
+            "sourcePath": home.join("hooks.json").display().to_string(),
+            "currentHash": "abc123",
+            "trustStatus": "untrusted"
+        });
+        let reply = |hooks: Value| {
+            let group = json!({"hooks": hooks, "warnings": [], "errors": []});
+            format!("{}\n", json!({"id": 2, "result": {"data": [group]}}))
+        };
+        // The script is a constant: every path and reply it needs sits in a
+        // file beside it, found through `$0`, so nothing from the fixture's
+        // location is ever spliced into shell source (Greptile on PR #1655).
+        std::fs::write(root.join("project.txt"), project.display().to_string())
+            .expect("write the project path for the stand-in");
+        std::fs::write(root.join("listed.json"), reply(json!([entry])))
+            .expect("write the listed reply");
+        std::fs::write(root.join("empty.json"), reply(json!([]))).expect("write the empty reply");
+        let script = "#!/bin/sh\n\
+             [ \"$1\" = app-server ] || exit 2\n\
+             dir=$(dirname \"$0\")\n\
+             pwd -P > \"$dir/pwd.txt\"\n\
+             IFS= read -r _initialize\n\
+             printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"stand-in\"}}'\n\
+             IFS= read -r list\n\
+             printf '%s\\n' \"$list\" > \"$dir/request.txt\"\n\
+             if [ \"$(pwd -P)\" = \"$(cat \"$dir/project.txt\")\" ]; then\n\
+             cat \"$dir/listed.json\"\n\
+             else\n\
+             cat \"$dir/empty.json\"\n\
+             fi\n";
+        let codex = root.join("codex");
+        crate::test_isolation::write_script(&codex, script).expect("write codex stand-in");
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
+            .expect("make codex stand-in executable");
+
+        let listing =
+            list_hooks_with(&codex, &home, &project).expect("the stand-in answers hooks/list");
+
+        let pwd = std::fs::read_to_string(&pwd_record).expect("the stand-in recorded its cwd");
+        assert_eq!(
+            Path::new(pwd.trim()),
+            project,
+            "codex app-server must run in the directory hooks/list is asked about"
+        );
+        let request: Value = serde_json::from_str(
+            std::fs::read_to_string(&request_record)
+                .expect("the stand-in recorded the request")
+                .trim(),
+        )
+        .expect("the hooks/list request is JSON");
+        assert_eq!(
+            request["params"]["cwds"],
+            json!([project.display().to_string()]),
+            "the request must name the directory in `cwds`: {request}"
+        );
+        assert_eq!(
+            listing.entries.len(),
+            1,
+            "a listing taken in the project must carry the hook listed there"
+        );
+    }
+
+    /// Issue #1652: the startup trust write says when it trusted nothing.
+    ///
+    /// It used to log every outcome at `debug!`, so a startup that recorded no
+    /// trust was invisible at the level anyone runs. A zero the startup has not
+    /// already explained is a `warn!` naming the directory it listed from; a
+    /// non-zero is an `info!`, as the wrapper logs it; and the `Unrecognised`
+    /// zero, which `trust_deck_hooks_for` has already warned about, is not said
+    /// a second time.
+    #[test]
+    fn a_startup_that_trusted_nothing_warns() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let cwd = Path::new("/work/startup-dir");
+        let capture = |result: std::io::Result<TrustOutcome>| -> String {
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_ansi(false)
+                .finish();
+            let guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+            report_startup_trust(&result, cwd);
+            drop(guard);
+            String::from_utf8(captured.0.lock().unwrap().clone()).expect("captured log is UTF-8")
+        };
+
+        let nothing = capture(Ok(TrustOutcome::NothingListed));
+        assert!(
+            nothing.contains("WARN")
+                && nothing.contains("recorded no hook trust")
+                && nothing.contains("/work/startup-dir"),
+            "a startup that trusted nothing must warn, naming where it listed from: {nothing:?}"
+        );
+
+        let trusted = capture(Ok(TrustOutcome::Trusted {
+            count: 10,
+            reports_prompts: true,
+            turned_off: Vec::new(),
+        }));
+        assert!(
+            trusted.contains("INFO")
+                && trusted.contains("count=10")
+                && trusted.contains("recorded scoped hook trust"),
+            "a startup that trusted hooks must say how many at info: {trusted:?}"
+        );
+
+        let unrecognised = capture(Ok(TrustOutcome::Unrecognised { listed: 2 }));
+        assert_eq!(
+            unrecognised, "",
+            "the Unrecognised zero has already warned and must not warn twice"
+        );
+
+        let failed = capture(Err(io::Error::other("no codex")));
+        assert!(
+            failed.contains("WARN") && failed.contains("could not record scoped hook trust"),
+            "a failed trust write still warns: {failed:?}"
         );
     }
 }
