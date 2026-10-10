@@ -2426,7 +2426,7 @@ mod tests {
             );
             assert!(
                 row.description.contains("bare \"go back\""),
-                "`{id}` claims \"go back\" unscoped — the word `bare` is what keeps                  open-settings-deck-collision off the tie-break: {}",
+                "`{id}` claims \"go back\" unscoped — the word `bare` is what keeps open-settings-deck-collision off the tie-break: {}",
                 row.description
             );
         }
