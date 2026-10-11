@@ -140,6 +140,18 @@ pub const SWITCH_DECK_ROW: &str = "switch_deck";
 /// and a filter that resolved no facet at all is refused rather than
 /// dispatched as one that shows everything.
 pub const FILTER_DASHBOARD_ROW: &str = "filter_dashboard";
+/// PRD #1401 — an agent's pull request, whose `agent` is optional only for the
+/// agent screen, where no name means the open pane's agent (the webview
+/// supplies it).
+///
+/// Named for what no column carries: a name that does not resolve REFUSES the
+/// row instead of being dropped, because dropping it would open the open
+/// pane's page for "open the PR for the ghost"; and on the agent dashboard no
+/// name is the only agent there, or a choice between them, since the
+/// dashboard has no pane of its own to fall back to ([`unnamed_pr_agent`]).
+/// A resolved agent is named in a note of its own ("Agent: tester."), the way
+/// an optional param's value is, so a wrong one is audible.
+pub const OPEN_PR_ROW: &str = "open_pr";
 /// One reading of a pick in [`UNGROUNDED_READS_AS`]: the row it is answered
 /// as, and the requirement that has to hold for it to be read that way.
 type Reading = (&'static str, Option<Requirement>);
@@ -1025,9 +1037,13 @@ pub async fn handle_utterance_with_modes(
         // in 10 once issue #1496 added the dashboard filter's rows. Only for
         // words that name nothing the Daemons screen alone is, so "back to the
         // deck" still hears that it is not here.
-        if row.id == OPEN_DECK_ROW
+        //
+        // PRD #1401: "close the PR" over the pull request browser is the same
+        // case — it grounds `open_pr` too ("pr"), which cannot run over the
+        // browser, and its close word asks for `close`, which closes the page.
+        if (row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW)
             && let Some(close) = table.row(CLOSE_ROW).filter(|close| {
-                !names_the_daemons_screen(transcript.text())
+                (row.id != OPEN_DECK_ROW || !names_the_daemons_screen(transcript.text()))
                     && close.callable(screen, directories, new_agent)
                     && action_grounded(close, transcript.text(), directories, new_agent)
             })
@@ -1164,6 +1180,16 @@ pub async fn handle_utterance_with_modes(
             // a dropped one, whose note it answers ([`Unmet::dropped_note`]).
             // Several eligible decks never reach here with one: the dialog
             // then preselects nothing unless told.
+            if row.id == OPEN_PR_ROW && screen != Screen::Agent {
+                match unnamed_pr_agent(spec, &transcript, row, agents) {
+                    Ok(param) => {
+                        notes.push(facet_note(&param));
+                        resolved.push(param);
+                        continue;
+                    }
+                    Err(asked) => return finish(*asked),
+                }
+            }
             if spec.optional {
                 if row.id != FILTER_DASHBOARD_ROW {
                     resolved.extend(implied_param(spec, decks));
@@ -1221,7 +1247,7 @@ pub async fn handle_utterance_with_modes(
             // silent, which matters because a voice-only user cannot change
             // the deck once the dialog is open (#1263).
             Ok(param) => {
-                if row.id == FILTER_DASHBOARD_ROW {
+                if row.id == FILTER_DASHBOARD_ROW || row.id == OPEN_PR_ROW {
                     notes.push(facet_note(&param));
                 } else if spec.optional {
                     notes.push(preselected_note(&param));
@@ -1264,7 +1290,7 @@ pub async fn handle_utterance_with_modes(
             // deck can take a new agent the dialog preselects it whatever it
             // was asked for, so that deck is dispatched and named instead
             // ([`implied_param`]) — the report says what the dialog shows.
-            Err(unmet) if spec.optional => {
+            Err(unmet) if spec.optional && row.id != OPEN_PR_ROW => {
                 let implied = implied_param(spec, decks);
                 notes.push(unmet.dropped_note(
                     spec.kind,
@@ -1573,6 +1599,59 @@ fn implied_param(spec: &super::table::ParamSpec, decks: &[VoiceDeck]) -> Option<
         deck_identity: None,
         names: Vec::new(),
     })
+}
+
+/// [`OPEN_PR_ROW`]'s agent when the user named none, off the agent screen:
+/// the only agent here, or the question of which, each agent offered as a
+/// choice (PRD #1261) so "the second one" answers it.
+fn unnamed_pr_agent(
+    spec: &super::table::ParamSpec,
+    transcript: &Transcript,
+    row: &CommandRow,
+    agents: &[DesktopAgent],
+) -> Result<ResolvedParam, Box<VoiceOutcome>> {
+    let here: Vec<&DesktopAgent> = agents.iter().collect();
+    match agent_ref_match(&here, agents) {
+        AgentRefMatch::One { id, label } => Ok(ResolvedParam {
+            name: spec.name.clone(),
+            kind: spec.kind,
+            spoken: String::new(),
+            value: id,
+            label,
+            deck_identity: None,
+            names: Vec::new(),
+        }),
+        AgentRefMatch::None => Err(Box::new(VoiceOutcome::ParamMissing {
+            sentence: heard(transcript, spec.kind.missing_phrase()),
+            transcript: transcript.clone(),
+            action: row.id.clone(),
+            param: spec.name.clone(),
+        })),
+        AgentRefMatch::Ambiguous(candidates) => {
+            let matches = labels_of(&candidates);
+            Err(Box::new(
+                VoiceOutcome::ParamAmbiguous {
+                    sentence: heard(
+                        transcript,
+                        &format!(
+                            "say which agent's pull request to open: {}",
+                            listed(&matches)
+                        ),
+                    ),
+                    transcript: transcript.clone(),
+                    action: row.id.clone(),
+                    invoke: row.invoke.clone(),
+                    param: spec.name.clone(),
+                    spoken: String::new(),
+                    matches,
+                    candidates: offered(spec, "", &candidates),
+                    params: Vec::new(),
+                    reports: Vec::new(),
+                }
+                .with_reports(row),
+            ))
+        }
+    }
 }
 
 /// The sentence appended to a dispatch's report when an OPTIONAL param
@@ -9494,6 +9573,133 @@ mod tests {
             deck.sentence(),
             "Not here — stopping an agent works from the agent dashboard, with the New agent dialog closed."
         );
+    }
+
+    /// Scenario: on the agent dashboard, "open the PR for the tester" opens the
+    /// tester's pull request, and on an agent's screen a named agent wins over
+    /// the open pane's. A name that matches nobody is refused rather than
+    /// dropped, so it never opens the pane's agent's page instead; with no name
+    /// the agent screen opens its own pane's, and the dashboard opens its only
+    /// agent's or asks which agent, offering each one.
+    #[tokio::test]
+    async fn voice_outcome_open_pr_takes_the_agent_it_names() {
+        let resolver = StubResolver::new()
+            .answering(
+                "open the PR for the tester",
+                IntentAnswer::new("open_pr").with_param("agent", "tester"),
+            )
+            .answering(
+                "open the PR for the ghost",
+                IntentAnswer::new("open_pr").with_param("agent", "ghost"),
+            )
+            .answering("open the PR", IntentAnswer::new("open_pr"));
+
+        for screen in [Screen::Overview, Screen::Agent] {
+            let named = run_agents(&resolver, screen, &fleet(), "open the PR for the tester").await;
+            let VoiceOutcome::Dispatch {
+                invoke,
+                params,
+                sentence,
+                ..
+            } = named
+            else {
+                panic!("a dispatch on {screen}: {named:?}");
+            };
+            assert_eq!(invoke, "openPullRequest");
+            assert_eq!(params.len(), 1, "{params:?}");
+            assert_eq!(params[0].kind, ParamKind::AgentRef);
+            assert_eq!(params[0].value, "1");
+            assert_eq!(sentence, "Opening the pull request. Agent: tester.");
+
+            let ghost = run_agents(&resolver, screen, &fleet(), "open the PR for the ghost").await;
+            assert!(
+                matches!(&ghost, VoiceOutcome::ParamUnresolved { action, .. } if action == "open_pr"),
+                "{ghost:?}"
+            );
+            assert_eq!(
+                ghost.sentence(),
+                "Heard: \u{201c}open the PR for the ghost\u{201d} — no agent here matches \u{201c}ghost\u{201d}."
+            );
+        }
+
+        // No name on the agent screen: the open pane's, which the webview
+        // supplies, so nothing is dispatched with it.
+        let pane = run_agents(&resolver, Screen::Agent, &fleet(), "open the PR").await;
+        assert!(
+            matches!(&pane, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params.is_empty() && sentence == "Opening the pull request."),
+            "{pane:?}"
+        );
+
+        // No name on the dashboard: one agent is the one meant…
+        let lone = [role_agent("1", "tester")];
+        let only = run_agents(&resolver, Screen::Overview, &lone, "open the PR").await;
+        assert!(
+            matches!(&only, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params.len() == 1 && params[0].value == "1"
+                && sentence == "Opening the pull request. Agent: tester."),
+            "{only:?}"
+        );
+        // …and several are asked about, each one offered as a choice.
+        let which = run_agents(&resolver, Screen::Overview, &fleet(), "open the PR").await;
+        let VoiceOutcome::ParamAmbiguous {
+            ref action,
+            ref candidates,
+            ..
+        } = which
+        else {
+            panic!("asks which agent: {which:?}");
+        };
+        assert_eq!(action, "open_pr");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(
+            which.sentence(),
+            "Heard: \u{201c}open the PR\u{201d} — say which agent's pull request to open: tester, orchestrator."
+        );
+
+        // Over the browser itself it is not here, as before.
+        let over = run_agents(&resolver, Screen::PullRequest, &fleet(), "open the PR").await;
+        assert!(
+            matches!(&over, VoiceOutcome::Unavailable { action, .. } if action == "open_pr"),
+            "{over:?}"
+        );
+    }
+
+    /// Scenario: with a pull request open in the app, "close the PR" and
+    /// "close the pull request" close the page and go back to the screen under
+    /// it, whichever of the rows their words touch the model answers with —
+    /// `close`, `open_pr` (which cannot run over the browser) or
+    /// `close_orchestration` (which needs a run named). No row acts on the pull
+    /// request itself.
+    #[tokio::test]
+    async fn voice_outcome_close_the_pr_closes_the_page() {
+        for said in ["close the PR", "close the pull request"] {
+            for picked in ["close", "open_pr"] {
+                let resolver = StubResolver::new().answering(said, IntentAnswer::new(picked));
+                let outcome = run_agents(&resolver, Screen::PullRequest, &fleet(), said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                        if action == "close" && invoke == "closeTopmost" && params.is_empty()),
+                    "{said} answered {picked}: {outcome:?}"
+                );
+                assert_eq!(outcome.sentence(), "Closed.");
+            }
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "build"),
+            );
+            let outcome = run_agents(&resolver, Screen::PullRequest, &fleet(), said).await;
+            assert!(
+                !matches!(outcome, VoiceOutcome::Dispatch { .. }),
+                "{said} answered close_orchestration: {outcome:?}"
+            );
+        }
     }
 
     /// Scenario: with the New agent dialog open over the dashboard, a spoken

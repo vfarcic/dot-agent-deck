@@ -113,7 +113,7 @@ The badge appears by itself: you do not link the pull request. An agent gets one
 
 ### Read a pull request in the app
 
-1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.
+1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR for the coder" on the dashboard, or "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.
 2. Read, comment and review on the page as you would on github.com.
 3. Use the toolbar above the page: **Back** goes back one page, **Open in browser** opens the page you are on in your system browser and closes it in the app, and **Close** closes it. If your system browser does not open, or the page cannot go back, the page stays in the app and a message under the toolbar says why, so you can try again.
 4. Press `Escape` to close the page and return to where you were. When you are typing in the page or a menu or dialog of GitHub's is open, `Escape` closes that first, as it does on github.com.
@@ -130,7 +130,7 @@ To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github
 
 ### In the TUI
 
-The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR" instead.
+The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR for" and the agent's name instead.
 
 ## Closing agents and orchestrations
 

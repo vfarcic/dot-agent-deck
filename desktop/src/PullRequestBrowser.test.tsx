@@ -102,7 +102,7 @@ function voiceRuntime(outcome: VoiceResultDto["outcome"]) {
       }),
       voiceStart: vi.fn(async () => { started = true; return status("recording"); }),
       voiceStop: vi.fn(async () => {
-        const said = nextOutcome.kind === "dispatch" ? nextOutcome.transcript : "";
+        const said = "transcript" in nextOutcome ? nextOutcome.transcript : "";
         return { outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 };
       }),
       voiceCancel: vi.fn(async () => status("idle")),
@@ -526,6 +526,77 @@ describe("PRD #1401 — the pull request browser by voice", () => {
     fireEvent.click(screen.getByTestId("voice-trigger"));
 
     await waitFor(() => expect(screen.getByText(/Coder 7 has no pull request\./)).toBeInTheDocument());
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+
+  /** On the agent dashboard rather than an agent's screen (PRD #1401: "open the PR for agent X"). */
+  function renderOverviewVoice(host: PrBrowserHost, outcome: VoiceResultDto["outcome"], agents: DesktopAgentDto[]) {
+    const voice = voiceRuntime(outcome);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(agents, voice.overrides)} initialView={{ kind: "overview" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return voice;
+  }
+
+  function openNamedPr(id: string, label: string): VoiceResultDto["outcome"] {
+    return {
+      kind: "dispatch",
+      transcript: `open the PR for ${label}`,
+      action: "open_pr",
+      invoke: "openPullRequest",
+      params: [{ name: "agent", kind: "agent_ref", spoken: label, value: id, label }],
+      sentence: `Opening the pull request. Agent: ${label}.`,
+    };
+  }
+
+  /** Scenario: on the agent dashboard the user says "open the PR for Coder 7"; that agent's GitHub page opens in the app over the dashboard. */
+  it("opens the named agent's pull request from the dashboard", async () => {
+    const { host } = fakeHost();
+    renderOverviewVoice(host, openNamedPr("7", "Coder 7"), [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByTestId("pr-browser")).toBeInTheDocument());
+    expect(host.open).toHaveBeenCalledWith(PR_URL, expect.any(Object));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: on the agent dashboard, "open the PR for Coder 8" names an agent with no pull request; the app says so and opens nothing. */
+  it("says the named agent has no pull request from the dashboard", async () => {
+    const { host } = fakeHost();
+    renderOverviewVoice(host, openNamedPr("8", "Coder 8"), [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByText(/Coder 8 has no pull request\./)).toBeInTheDocument());
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: on the agent dashboard a bare "open the PR" with two agents asks which agent's, and opens nothing until the user answers. */
+  it("asks which agent's pull request on the dashboard when none is named", async () => {
+    const { host } = fakeHost();
+    const candidates = [
+      { name: "agent", kind: "agent_ref", spoken: "", value: "8", label: "Coder 8" },
+      { name: "agent", kind: "agent_ref", spoken: "", value: "7", label: "Coder 7" },
+    ];
+    renderOverviewVoice(host, {
+      kind: "param_ambiguous",
+      transcript: "open the PR",
+      action: "open_pr",
+      invoke: "openPullRequest",
+      param: "agent",
+      spoken: "",
+      matches: ["Coder 8", "Coder 7"],
+      candidates,
+      params: [],
+      reports: ["Opening the pull request.", "Opening the pull request."],
+      sentence: "Heard: \u201copen the PR\u201d — say which agent's pull request to open: Coder 8, Coder 7.",
+    }, [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getAllByText(/say which agent's pull request to open/).length).toBeGreaterThan(0));
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
     expect(host.open).not.toHaveBeenCalled();
   });

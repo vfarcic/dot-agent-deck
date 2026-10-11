@@ -691,7 +691,7 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
-                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
                 ("open_pr".to_string(), false),
                 ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
@@ -748,8 +748,8 @@ mod tests {
                 ("scroll_up".to_string(), true),
                 ("scroll_to_top".to_string(), true),
                 ("scroll_to_bottom".to_string(), true),
-                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
-                ("open_pr".to_string(), false),
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), true),
                 ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
@@ -804,7 +804,7 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
-                // PRD #1401: `open_pr` is the agent screen's, the hand-off the browser's own.
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
                 ("open_pr".to_string(), true),
                 ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.

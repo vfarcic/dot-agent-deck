@@ -1511,8 +1511,8 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["open the pr", "show the pull request", "open the pull request"],
     action: "open_pr",
     invoke: "openPullRequest",
-    screens: ["agent"],
-    unavailableHint: "a pull request opens from its agent's own screen, so open the agent first",
+    screens: ["overview", "agent"],
+    unavailableHint: "a pull request opens from the agent dashboard or from its agent's own screen",
     report: "Opening the pull request.",
   },
   {
@@ -1677,6 +1677,12 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
     };
+  }
+  /* PRD #1401 — the dashboard has no pane whose pull request a bare "open the
+     PR" means, and the preview resolves no agent names, so it asks, as Rust
+     does when several agents are on the dashboard. */
+  if (command.action === "open_pr" && screen === "overview") {
+    return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "agent", sentence: fixtureHeard(utterance, "say which agent's pull request to open") } };
   }
   if (command.action === "filter_directories") {
     const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
