@@ -25,13 +25,19 @@ dot-agent-deck close --all
 dot-agent-deck close --all --yes
 ```
 
-That lists the units again and then closes exactly the units in that list, so a unit started in the meantime is not swept up. A listed unit marked `would be refused` is refused again unless you add `--force`.
+That lists the units again and then closes exactly the units in that list, by their unit ids, so a unit started in the meantime is not swept up. A listed unit marked `would be refused` is refused again unless you add `--force`. If more than 256 units are running, `--all` lists the first 256 and says so; close those, then list again.
+
+To close one unit by the id a list printed, use `--unit-id`:
+
+```bash
+dot-agent-deck close --unit-id u-3f9a2c71d04e8b56-4
+```
 
 **Check it worked:** the output has a `closed:` section naming each unit and each of its panes with `— stopped`, and a `worktrees:` section saying what happened to each worktree. The unit's card (or its tab in the TUI, its **ORCHESTRATION** group in the desktop app) disappears from every client attached to the daemon.
 
 ```
 closed:
-  fix-auth-bug (u-3f9a2c-4, single)
+  fix-auth-bug (u-3f9a2c71d04e8b56-4, single)
     pane 7 agent 12 Idle — stopped
 worktrees:
   /home/you/src/api-dispatch-fix-auth-bug: removed (branch agent/dispatch-fix-auth-bug kept)
@@ -56,6 +62,7 @@ An agent running `close` is held to these rules, and `--force` does not change a
 
 ```
 dot-agent-deck close <UNIT>... [--dry-run] [--force] [--json]
+dot-agent-deck close --unit-id <ID>... [--dry-run] [--force] [--json]
 dot-agent-deck close --pane <PANE_ID> [--dry-run] [--force] [--json]
 dot-agent-deck close --orchestration-of <PANE_ID> [--dry-run] [--force] [--json]
 dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
@@ -64,6 +71,7 @@ dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
 | Argument | What it closes |
 |---|---|
 | `<UNIT>...` | The dispatched units with these names: the name given to `dispatch`. A unit started as an orchestration is closed whole, orchestrator first. |
+| `--unit-id <ID>...` | The dispatched units with these unit ids, as `--all` or an `ambiguous` refusal printed them. A unit id names one unit and is never reused, so it cannot reach a different unit that took the same name later. Unit ids do not survive a daemon restart. |
 | `--pane <PANE_ID>` | The one agent in this pane. |
 | `--orchestration-of <PANE_ID>` | Every role of the orchestration this pane belongs to, orchestrator first. |
 | `--all` | Nothing: it lists every unit you may close. |
@@ -72,7 +80,7 @@ dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
 | `--force` | Also closes a unit that has not reported back, an agent that is busy, and one role of a running orchestration (see the next section). |
 | `--json` | Prints the report as JSON instead of text. |
 
-Pane ids appear in the `--all` list and in `dot-agent-deck daemon status`. There is no pattern or wildcard selector; name what you mean, or use `--all` and read the list.
+Pane ids appear in the `--all` list and in `dot-agent-deck daemon status`. There is no pattern or wildcard selector; name what you mean, or use `--all` and read the list. One command names at most 256 units.
 
 ## What is refused, and why
 
@@ -88,9 +96,10 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 | `not-attested` / `superseded` | The request came from a pane the deck cannot confirm, or from an agent that has since been replaced in its pane. | Run `close` from the agent now in that pane, or from a shell. |
 | `unknown-unit` | No running unit has that name. Units are not remembered after the daemon restarts. | Check the name with `close --all`. After a restart, see [Worktrees](#worktrees). |
 | `already-ended` | The unit has already been closed or has ended. | Nothing to close. |
-| `ambiguous` | Units with that name are running in more than one repository. The refusal lists each one with its unit id, worktree and panes. | Close the one you mean with `--orchestration-of` (a team) or `--pane` (a single agent) and a pane id from that list, or use `close --all --yes`, which closes by unit id. |
+| `ambiguous` | Units with that name are running in more than one repository. The refusal lists each one with its unit id, worktree and panes. | Close the one you mean with `--unit-id` and its id from that list. |
 | `unknown-pane` | No agent is in that pane. | Check the id with `daemon status`. |
 | `not-an-orchestration` | `--orchestration-of` named a pane that is not part of an orchestration. | Use `--pane`. |
+| `selector-too-large` | The command named more than 256 units, or a name or id far longer than any real one. Nothing was closed. | Close them in smaller batches. |
 
 `--force` overrides `not-reported`, `busy` and `strands-orchestration` only. A forced close says so in its output, for example `(forced: was Working)`.
 
@@ -104,7 +113,7 @@ An agent whose status the deck has not heard yet is not refused as busy either. 
 
 ## Worktrees
 
-When the last agent of a dispatched unit is closed, the deck deals with the unit's worktree the same way closing its card does, and `close` waits for the result and reports it:
+When the last agent of a dispatched unit is closed, whether you named the unit, its pane or its orchestration, the deck deals with the unit's worktree the same way closing its card does, and `close` waits for the result and reports it. Closing one role of an orchestration with `--pane` while other roles keep running leaves the shared worktree alone:
 
 | Output | What happened |
 |---|---|
@@ -127,9 +136,9 @@ To clean up worktrees the deck no longer knows about, such as after a daemon res
 | `2` | The running daemon is too old for `close`. Nothing was closed. |
 | `3` | No daemon is running. Nothing was closed. |
 
-`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry carries the unit's `name` and `unit_id`. Entries in `listed` also carry `reported`, `completed_at_ms`, `worktree`, `branch`, `clone` and `panes`. With `--all --yes`, the list that was closed from is under `preview`.
+`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry carries the unit's `name` and `unit_id`. Entries in `listed` also carry `reported`, `completed_at_ms`, `worktree`, `branch`, `clone` and `panes`. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units.
 
-A script that closes the units whose pull requests merged can join `close --all --json` with `dot-agent-deck worktree list --json`, which reports each worktree's PR state, on the worktree path.
+A script that closes the units whose pull requests merged can join `close --all --json` with `dot-agent-deck worktree list --json`, which reports each worktree's PR state, on the branch, and close each selected unit with `close --unit-id` and the `unit_id` from `listed`.
 
 ## Closing in the TUI and the desktop app
 

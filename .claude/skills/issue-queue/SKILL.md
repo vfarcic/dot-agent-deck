@@ -519,14 +519,14 @@ jq -r --slurpfile wt "$WORKTREES" '
 - **Join on the branch**, `agent/dispatch-<name>` in both documents. The two can spell the worktree path differently.
 - **Keep only units this run dispatched**, by intersecting with step 5's ledger. Run from this pane, `close --all` lists only the units this pane's agent dispatched, so another runner's units do not appear; the ledger narrows it to this run. If it lists none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
 
-**Close each selected unit by its name, one at a time, and check the unit id that comes back:**
+**Close each selected unit by its unit id, one at a time**, using the `unit_id` the join took from `.listed[]`:
 
 ```bash
-dot-agent-deck close --json '<name>'
+dot-agent-deck close --json --unit-id '<unit_id>'
 ```
 
-- **`close` has no selector for a single unit id.** It closes by name, `--pane` or `--orchestration-of`; unit ids are applied only by `close --all --yes`, which closes everything `--all` listed and so is not this step. So read `.closed[0].unit_id` in the reply and compare it with the id the join selected; report any difference. Names in this run are unique within the repository (step 6), so a mismatch means something changed between the two calls.
-- **`ambiguous`** means a unit with the same name is live in another clone. Do not guess: report the candidates the reply lists, and leave that unit to the runner.
+- **By unit id, not by name.** A unit id names exactly the unit the listing showed and is never reused, so the close cannot reach a different unit that took the name in between, and a name live in another clone cannot make it `ambiguous`. Read `.closed[0].unit_id` in the reply to confirm which unit closed.
+- **`already-ended`** means the unit ended between the listing and the close (a person closed it, say); report it. **`unknown-unit`** with a restart hint means the daemon restarted since the listing; nothing was closed, so report it and stop.
 - **Never pass `--force` on your own.** A refusal is information: `not-reported` means the unit never sent `work-done --done`, so its report is still owed or was lost, and `busy` means its agent is mid-turn. Report each refusal with its reason; `--force` only on the runner's word, per unit.
 - **Report each unit's `worktrees` verdict**: `removed` (branch kept), or a `kept: …` verdict with its path. A kept worktree holds uncommitted work or could not be checked; it is the runner's to inspect, not yours to remove.
 - **Exit status 2** (the daemon is too old for `close`) **or 3** (no daemon): nothing was closed; report it and stop.
