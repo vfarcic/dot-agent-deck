@@ -743,6 +743,7 @@ mod tests {
     // targets the absolute path it is given and drops its temp file next to
     // that path, never under the process cwd.
     #[test]
+    #[serial_test::serial]
     fn write_atomic_targets_absolute_path_not_cwd() {
         // Serialize cwd mutation against any other test that fiddles with it.
         static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

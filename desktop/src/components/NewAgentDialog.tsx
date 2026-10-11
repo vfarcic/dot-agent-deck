@@ -36,7 +36,7 @@ import {
 } from "../lib/newAgent";
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import type { NewAgentVoiceChannel, VoiceDispatchTarget } from "../lib/voiceActions";
-import { draftHasEdits, draftWorthKeeping, type NewAgentDraft } from "../lib/newAgentDraft";
+import { draftHasEdits, draftWorthKeeping, type NO_MODE_ID, type NewAgentDraft } from "../lib/newAgentDraft";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
@@ -137,8 +137,10 @@ export const SEARCH_TRUNCATED = "More subdirectories match this filter than the 
  * can start (PRD #1223 M7, from {@link authoringModes}).
  */
 // The literal, not `NO_MODE_ID`: `voice_outcome_every_control_label_asks_for_its_own_row`
-// reads this line to find the chip's label. `lib/newAgentDraft.ts` keeps the two equal.
-const NO_MODE = { id: "none", label: "No mode" } as const;
+// reads this line to find the chip's label. The `satisfies` makes `tsc` refuse the two
+// drifting apart, which would make `draftHasEdits` count No mode as an edit and show
+// `DRAFT_RESTORED` on a reopen that put nothing back.
+const NO_MODE = { id: "none", label: "No mode" } as const satisfies { id: typeof NO_MODE_ID; label: string };
 
 type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestrationModeId>;
 

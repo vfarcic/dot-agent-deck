@@ -93,6 +93,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
 | `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
+| `u` | Open the upgrade dialog while the footer shows an update notice (see [Upgrade from the TUI](installation.md#upgrade-from-the-tui)) |
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input** |
 | `?` | Toggle the help overlay |
 
@@ -182,6 +183,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Generate config** | `g` | `Up` / `Down` (or `k` / `j`) to choose **Yes**, **No** or **Never** · `Enter` confirms · `Esc` cancels. **Yes** asks the selected agent to write `.dot-agent-deck.toml`; **Never** stops offering it for that directory. |
 | **Quit** | `Ctrl+C` in command mode | `Up` / `Down` (or `k` / `j`) to choose **Detach** (default), **Stop** or **Cancel** · `Enter` confirms · `Esc` dismisses · `Ctrl+C` again leaves immediately. **Detach** keeps the agents running; **Stop** stops them and the daemon, asking once more first while agents are running. See [Resuming Sessions](session-management.md#resuming-sessions). |
 | **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed just before it appeared is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
+| **Upgrade** | `u`, or a click on the footer's update notice | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Upgrade** · `Enter` confirms · `Esc` closes · `PageUp` / `PageDown` (or the mouse wheel) scroll a plan too long for the terminal; **Upgrade** waits until the whole plan has been on screen. It asks about one copy at a time; after one copy is upgraded, **Cancel** skips the next. A copy the TUI cannot upgrade offers only **Close**. See [Upgrade from the TUI](installation.md#upgrade-from-the-tui). |
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
 | **Host of this deck** | `m` | `Esc`, `q` or `m` closes it |
@@ -255,6 +257,7 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `deny_permission` | `n` | Deny a pending permission request |
 | `generate_config` | `g` | Generate `.dot-agent-deck.toml` |
 | `open_scheduled_tasks` | `s` | Open the Schedules manager |
+| `open_upgrade` | `u` | Open the upgrade dialog |
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
 | `host_metrics` | `m` | Open the Host of this deck overlay |

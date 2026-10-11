@@ -793,7 +793,11 @@ heard_as_whole = [
 # submit "the meeting is at the" when the user said "type the meeting is at the
 # end". Submitting is the last thing that happens to a prompt, so that failure
 # is unrecoverable — see the constant's own doc for the phrases that were
-# rejected and why.
+# rejected and why. The row's other `heard_as_whole` entries ("go ahead",
+# "finished", …) are answered by the same fast path, by the same comparison,
+# but only where this row is callable: elsewhere they reach the model, which
+# answers a bare "go ahead" over the New agent dialog with `start_new_agent`
+# (issue #1246).
 #
 # The MODEL's path is held to the same rule by `heard_as_whole` (PRD #1223,
 # closing audit G1). With `heard_as` a steered pick grounded on any occurrence

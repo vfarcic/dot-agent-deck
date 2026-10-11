@@ -5,7 +5,6 @@ expression: text
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
         ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
         │  Global (works from any pane)                       Mouse                                           │         
         │                                                                                                     │         
@@ -37,6 +36,7 @@ expression: text
         │  y / n              Approve / deny permission                                                       │         
         │  s                  Schedules manager                                                               │         
         │  m                  Host of this deck                                                               │         
+        │  u                  Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

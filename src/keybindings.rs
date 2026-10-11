@@ -92,6 +92,8 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    /// Issue #1635: open the upgrade dialog the footer's update badge names.
+    OpenUpgrade,
     ScrollPaneUp,
     ScrollPaneDown,
     /// PRD #1258 M3: open the overlay showing the attached deck's host — disk
@@ -335,6 +337,16 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_scheduled_tasks",
         default: "s",
         description: "Schedules manager",
+    },
+    // Issue #1635: open the upgrade dialog the footer's update badge names.
+    // Default `u`, free in command mode; the badge and the help overlay read
+    // the active binding, so a rebind shows there too.
+    ActionSpec {
+        action: Action::OpenUpgrade,
+        section: Section::Dashboard,
+        name: "open_upgrade",
+        default: "u",
+        description: "Upgrade",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back

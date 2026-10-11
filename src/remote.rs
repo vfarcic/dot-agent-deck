@@ -426,6 +426,44 @@ pub trait SshExecutor {
         self.run_capped(target, command, max_capture_bytes)
     }
 
+    /// [`run_capped_within`](Self::run_capped_within) with `input` written to
+    /// the remote command's stdin, which is then closed (issue #1619).
+    ///
+    /// For a payload too large for the command line: the ssh route runs one
+    /// remote command string, which the remote shell receives as one argument,
+    /// so anything carried in it shares Linux's per-argument limit
+    /// (`MAX_ARG_STRLEN`, 128 KiB). Bounded exactly as `run_capped_within` is.
+    /// On Unix the writer stops when the call returns, so a remote that never
+    /// reads its stdin costs nothing past the deadline; elsewhere a write
+    /// blocked on a full pipe is abandoned and ends when the pipe's last
+    /// reader closes.
+    ///
+    /// The default refuses without running anything: an executor that cannot
+    /// deliver the input must not run a command that expects it. The
+    /// production [`SystemSshExecutor`] overrides it. Callers check
+    /// [`writes_stdin`](Self::writes_stdin) first, so the refusal is a
+    /// backstop rather than a path.
+    fn run_capped_within_input(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: &[u8],
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        let _ = (command, input, max_capture_bytes, deadline);
+        Err(SshError::Other {
+            target: target.user_host(),
+            detail: "this ssh executor cannot write to a remote command's stdin".to_string(),
+        })
+    }
+
+    /// Whether [`run_capped_within_input`](Self::run_capped_within_input)
+    /// delivers its input. `false` for this default, which refuses.
+    fn writes_stdin(&self) -> bool {
+        false
+    }
+
     /// The shortest `deadline` [`run_capped_within`](Self::run_capped_within)
     /// honours: a caller with less time left should not start a command. Zero
     /// for this default, which ignores the deadline; the production
@@ -651,7 +689,17 @@ impl SystemSshExecutor {
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
     pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
+        self.build_command_with(target, remote_command, false)
+    }
+
+    /// [`Self::build_command`], with `-T` when the session carries input on
+    /// stdin: a terminal the user's `RequestTTY` asked for would echo and
+    /// rewrite that input instead of passing it through (Greptile 4236434468).
+    fn build_command_with(&self, target: &SshTarget, remote_command: &str, input: bool) -> Command {
         let mut cmd = Command::new(&self.program);
+        if input {
+            cmd.arg("-T");
+        }
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
@@ -935,6 +983,41 @@ impl SshExecutor for SystemSshExecutor {
         max_capture_bytes: usize,
         deadline: std::time::Duration,
     ) -> Result<CappedOutput, SshError> {
+        self.run_bounded_session(target, command, None, max_capture_bytes, deadline)
+    }
+
+    /// [`Self::run_capped_within`], with `input` fed to the session's stdin.
+    fn run_capped_within_input(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: &[u8],
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        self.run_bounded_session(target, command, Some(input), max_capture_bytes, deadline)
+    }
+
+    fn writes_stdin(&self) -> bool {
+        true
+    }
+
+    fn min_bounded_run(&self) -> std::time::Duration {
+        MIN_BOUNDED_REMOTE_RUN
+    }
+}
+
+impl SystemSshExecutor {
+    /// The body of [`SshExecutor::run_capped_within`] and
+    /// [`SshExecutor::run_capped_within_input`]: stdin is null, or `input`.
+    fn run_bounded_session(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: Option<&[u8]>,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
         // Whole seconds, rounded DOWN: `run_local_bounded`'s granularity. A
         // deadline under one second cannot be honoured, so nothing is started
         // rather than granting the session a whole second the caller does not
@@ -953,15 +1036,14 @@ impl SshExecutor for SystemSshExecutor {
                 ),
             });
         }
-        let mut cmd = self.build_command(target, command);
+        let mut cmd = self.build_command_with(target, command, input.is_some());
         // Its own process group: a `ProxyCommand` or jump-route helper that
         // outlives the session is killed with it (PRD #1487 re-check R1).
-        let capture = run_local_bounded_owning_group(&mut cmd, secs, max_capture_bytes).map_err(
-            |source| SshError::Io {
+        let capture = run_local_bounded_in(&mut cmd, secs, max_capture_bytes, true, input)
+            .map_err(|source| SshError::Io {
                 target: target.user_host(),
                 source,
-            },
-        )?;
+            })?;
         let Some(status) = capture.status else {
             return Err(SshError::Other {
                 target: target.user_host(),
@@ -984,10 +1066,6 @@ impl SshExecutor for SystemSshExecutor {
             },
             truncated: capture.truncated,
         })
-    }
-
-    fn min_bounded_run(&self) -> std::time::Duration {
-        MIN_BOUNDED_REMOTE_RUN
     }
 }
 
@@ -1090,7 +1168,7 @@ pub fn run_local_bounded(
     secs: u64,
     max_capture_bytes: usize,
 ) -> std::io::Result<LocalCapture> {
-    run_local_bounded_in(cmd, secs, max_capture_bytes, false)
+    run_local_bounded_in(cmd, secs, max_capture_bytes, false, None)
 }
 
 /// [`run_local_bounded`], with the child started in a process group of its own
@@ -1117,21 +1195,33 @@ pub fn run_local_bounded_owning_group(
     secs: u64,
     max_capture_bytes: usize,
 ) -> std::io::Result<LocalCapture> {
-    run_local_bounded_in(cmd, secs, max_capture_bytes, true)
+    run_local_bounded_in(cmd, secs, max_capture_bytes, true, None)
 }
 
+/// `input`, when given, is written to the child's stdin by a [`PipeWriter`],
+/// which then closes it; otherwise stdin is null. The writer is cancelled when
+/// the call returns, however it returns (issue #1619). On Unix that stops it
+/// within a poll tick, so a child (or a descendant holding its stdin) that
+/// never reads costs nothing past the call; elsewhere a write blocked on a full
+/// pipe is abandoned, as a blocked reader is, and ends when the pipe's last
+/// reader closes.
 fn run_local_bounded_in(
     cmd: &mut Command,
     secs: u64,
     max_capture_bytes: usize,
     own_group: bool,
+    input: Option<&[u8]>,
 ) -> std::io::Result<LocalCapture> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     #[cfg(unix)]
     if own_group {
         use std::os::unix::process::CommandExt;
@@ -1139,6 +1229,14 @@ fn run_local_bounded_in(
     }
     let child = cmd.spawn()?;
     let mut leader = Leader::new(child, own_group);
+    // Dropped on every return below, which cancels it.
+    let _writer = input.and_then(|bytes| {
+        leader
+            .child
+            .stdin
+            .take()
+            .map(|pipe| PipeWriter::spawn(pipe, bytes.to_vec()))
+    });
 
     // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
     // `None` so the uncapped install path reads without a byte limit.
@@ -1441,8 +1539,10 @@ mod leader_seam {
 
 /// One stream's drainer: a helper thread that reads the pipe into a shared
 /// buffer, so the caller can stop waiting for it — and still keep what it
-/// read — without joining the thread.
-struct PipeReader {
+/// read — without joining the thread. Crate-visible for the daemon's restart
+/// target check (`daemon_restart::run_version_bounded`, issue #1615), which
+/// has the same problem of a descendant holding a pipe open.
+pub(crate) struct PipeReader {
     shared: std::sync::Arc<PipeShared>,
 }
 
@@ -1456,7 +1556,7 @@ struct PipeShared {
 }
 
 impl PipeReader {
-    fn spawn<R>(pipe: R, cap: Option<usize>) -> Self
+    pub(crate) fn spawn<R>(pipe: R, cap: Option<usize>) -> Self
     where
         R: std::io::Read + PipeFd + Send + 'static,
     {
@@ -1471,14 +1571,14 @@ impl PipeReader {
         Self { shared }
     }
 
-    fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.shared.done.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Cancel every reader, then give them [`READER_STOP_GRACE`] together to
     /// drain and close. A reader still running after that is abandoned: it
     /// owns nothing but its pipe and its share of the buffer.
-    fn stop_all(readers: &[&PipeReader]) {
+    pub(crate) fn stop_all(readers: &[&PipeReader]) {
         for reader in readers {
             reader
                 .shared
@@ -1492,7 +1592,7 @@ impl PipeReader {
     }
 
     /// What this stream delivered so far.
-    fn take(self) -> Vec<u8> {
+    pub(crate) fn take(self) -> Vec<u8> {
         let mut buf = self
             .shared
             .buf
@@ -1549,7 +1649,7 @@ fn drain_pipe<R: std::io::Read + PipeFd>(mut pipe: R, cap: Option<usize>, shared
                     // Everything the kernel held has been read.
                     break;
                 }
-                pipe.wait_readable(std::time::Duration::from_millis(50));
+                pipe.wait_ready(Ready::Readable, std::time::Duration::from_millis(50));
             }
             Err(_) => break,
         }
@@ -1557,14 +1657,76 @@ fn drain_pipe<R: std::io::Read + PipeFd>(mut pipe: R, cap: Option<usize>, shared
     drop(pipe);
 }
 
-/// The two things [`drain_pipe`] needs from a pipe beyond `Read`, which only
-/// Unix can provide; elsewhere both are no-ops and the read blocks.
-trait PipeFd {
-    /// Switch the read end to non-blocking. `false` when that failed or is
-    /// not supported, in which case reads block.
+/// One child's stdin feeder: a helper thread that writes a payload into the
+/// pipe and then closes it, so the child reads the payload and then EOF.
+/// Dropping the value cancels it, and the caller never joins the thread.
+struct PipeWriter {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PipeWriter {
+    fn spawn<W>(pipe: W, payload: Vec<u8>) -> Self
+    where
+        W: std::io::Write + PipeFd + Send + 'static,
+    {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_cancel = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || feed_pipe(pipe, &payload, &thread_cancel));
+        Self { cancel }
+    }
+}
+
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Write `payload` into a child's stdin, then close it. On Unix the pipe is
+/// written non-blocking under `poll(2)`, so a cancel is noticed within a tick
+/// while nothing reads the other end; elsewhere the write blocks, and the
+/// thread ends when the last reader closes the pipe (`EPIPE`), which is when
+/// the child and anything that inherited its stdin have exited.
+fn feed_pipe<W: std::io::Write + PipeFd>(
+    mut pipe: W,
+    payload: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    pipe.set_nonblocking();
+    let mut rest = payload;
+    while !rest.is_empty() && !cancel.load(Ordering::Acquire) {
+        match pipe.write(rest) {
+            Ok(0) => break,
+            Ok(n) => rest = &rest[n..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                pipe.wait_ready(Ready::Writable, std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(pipe);
+}
+
+/// Which readiness [`PipeFd::wait_ready`] waits for.
+#[derive(Clone, Copy)]
+pub(crate) enum Ready {
+    Readable,
+    Writable,
+}
+
+/// The two things [`drain_pipe`] and [`feed_pipe`] need from a pipe beyond
+/// `Read`/`Write`, which only Unix can provide; elsewhere both are no-ops and
+/// the read or write blocks.
+pub(crate) trait PipeFd {
+    /// Switch this end to non-blocking. `false` when that failed or is not
+    /// supported, in which case reads and writes block.
     fn set_nonblocking(&self) -> bool;
-    /// Wait up to `timeout` for the pipe to become readable (or closed).
-    fn wait_readable(&self, timeout: std::time::Duration);
+    /// Wait up to `timeout` for the pipe to become `ready`, or closed.
+    fn wait_ready(&self, ready: Ready, timeout: std::time::Duration);
 }
 
 #[cfg(unix)]
@@ -1573,17 +1735,21 @@ impl<T: std::os::fd::AsRawFd> PipeFd for T {
         let fd = self.as_raw_fd();
         // SAFETY: fcntl on a descriptor this value owns; F_GETFL/F_SETFL have
         // no memory effects. O_NONBLOCK is per open file description, and the
-        // child's write end is a different one, so the child is unaffected.
+        // child's end of the pipe is a different one, so the child is
+        // unaffected.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
         }
     }
 
-    fn wait_readable(&self, timeout: std::time::Duration) {
+    fn wait_ready(&self, ready: Ready, timeout: std::time::Duration) {
         let mut pfd = libc::pollfd {
             fd: self.as_raw_fd(),
-            events: libc::POLLIN,
+            events: match ready {
+                Ready::Readable => libc::POLLIN,
+                Ready::Writable => libc::POLLOUT,
+            },
             revents: 0,
         };
         let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
@@ -1601,7 +1767,7 @@ impl<T> PipeFd for T {
         false
     }
 
-    fn wait_readable(&self, _timeout: std::time::Duration) {}
+    fn wait_ready(&self, _ready: Ready, _timeout: std::time::Duration) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -2780,6 +2946,9 @@ pub enum RemoteUpgradeError {
     #[error("{installed_version} was installed, but {step} failed: {source}")]
     AfterInstall {
         installed_version: String,
+        /// The binary the build was installed at — what the deck list would
+        /// have recorded had this step not failed (issue #1604).
+        binary: String,
         step: &'static str,
         #[source]
         source: Box<RemoteUpgradeError>,
@@ -2797,6 +2966,19 @@ impl RemoteUpgradeError {
                 installed_version, ..
             } => Some(installed_version),
             Self::Inner(RemoteAddError::ReplacedButUnverified { on_disk, .. }) => Some(on_disk),
+            _ => None,
+        }
+    }
+
+    /// The binary [`Self::installed_version`] is at, whenever that is set.
+    /// The deck list may still name the binary from before the upgrade — a
+    /// legacy `~/.local/bin` copy beside the Homebrew install that was just
+    /// upgraded — because the step that records the new one is what failed
+    /// (issue #1604).
+    pub fn installed_binary(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall { binary, .. } => Some(binary),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { binary, .. }) => Some(binary),
             _ => None,
         }
     }
@@ -2913,8 +3095,10 @@ pub fn upgrade_entry_reporting_to(
     //    already in place by now, so a failure from here on says so.
     let after_install = |step: &'static str| {
         let installed_version = installed.version.clone();
+        let binary = installed.remote_binary().to_string();
         move |source: RemoteUpgradeError| RemoteUpgradeError::AfterInstall {
             installed_version,
+            binary,
             step,
             source: Box::new(source),
         }
@@ -3842,6 +4026,7 @@ mod tests {
         );
         let upgrade_err = RemoteUpgradeError::Inner(err);
         assert_eq!(upgrade_err.installed_version(), Some(UNVERIFIED_BUILD));
+        assert_eq!(upgrade_err.installed_binary(), Some(REMOTE_INSTALL_PATH));
         let msg = upgrade_err.to_string();
         assert!(msg.contains("cannot execute binary file"), "{msg}");
         assert!(msg.contains("an unverified build"), "{msg}");
@@ -4213,13 +4398,13 @@ mod tests {
 /// None of this reaches a real remote, a real `ssh` or a real Homebrew; what
 /// it pins is the remote-side behaviour of the commands themselves.
 #[cfg(all(test, unix))]
-mod homebrew_remote_tests {
+pub(crate) mod homebrew_remote_tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     /// Where the remote's `brew` can be found.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum BrewAt {
+    pub(crate) enum BrewAt {
         /// On the `PATH` of the non-interactive shell.
         OnPath,
         /// Only at its prefix — the usual macOS case, where Homebrew puts
@@ -4234,7 +4419,7 @@ mod homebrew_remote_tests {
     /// `rewrites` points each of the production [`HOMEBREW_PREFIXES`] at a
     /// sandbox path, so neither a Homebrew on the machine running the tests
     /// nor its absence can change an answer.
-    struct SandboxShell {
+    pub(crate) struct SandboxShell {
         home: PathBuf,
         path: String,
         rewrites: Vec<(String, String)>,
@@ -4287,28 +4472,28 @@ mod homebrew_remote_tests {
     }
 
     /// What the remote has installed before the flow under test runs.
-    struct Fixture {
+    pub(crate) struct Fixture {
         /// Version Homebrew has installed, if any.
-        brew: Option<&'static str>,
+        pub(crate) brew: Option<&'static str>,
         /// Version of a copy at `~/.local/bin`, if any.
-        local_bin: Option<&'static str>,
+        pub(crate) local_bin: Option<&'static str>,
         /// What `brew upgrade` lands, and what the release download writes.
-        tap: &'static str,
+        pub(crate) tap: &'static str,
         /// `brew upgrade` exits non-zero without changing anything.
-        brew_upgrade_fails: bool,
+        pub(crate) brew_upgrade_fails: bool,
     }
 
-    struct Remote {
+    pub(crate) struct Remote {
         _dir: tempfile::TempDir,
         root: PathBuf,
         home: PathBuf,
         brew_prefix: PathBuf,
         log: PathBuf,
-        registry: PathBuf,
+        pub(crate) registry: PathBuf,
     }
 
     impl Remote {
-        fn new(fixture: Fixture) -> Self {
+        pub(crate) fn new(fixture: Fixture) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let root = dir.path().canonicalize().unwrap();
             let home = root.join("home");
@@ -4371,7 +4556,7 @@ mod homebrew_remote_tests {
             }
         }
 
-        fn shell(&self, brew_at: BrewAt) -> SandboxShell {
+        pub(crate) fn shell(&self, brew_at: BrewAt) -> SandboxShell {
             let mut path = format!("{}:/usr/bin:/bin", self.root.join("stubs").display());
             if brew_at == BrewAt::OnPath {
                 path = format!("{}:{path}", self.brew_prefix.join("bin").display());
@@ -4400,22 +4585,22 @@ mod homebrew_remote_tests {
             std::fs::read_to_string(&self.log).unwrap()
         }
 
-        fn local_bin_copy(&self) -> PathBuf {
+        pub(crate) fn local_bin_copy(&self) -> PathBuf {
             self.home.join(".local/bin/dot-agent-deck")
         }
 
-        fn brew_binary(&self) -> PathBuf {
+        pub(crate) fn brew_binary(&self) -> PathBuf {
             self.brew_prefix.join("bin/dot-agent-deck")
         }
 
-        fn version_of(&self, binary: &Path) -> String {
+        pub(crate) fn version_of(&self, binary: &Path) -> String {
             let out = Command::new(binary).arg("--version").output().unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
         /// Register the remote as an entry written before #1372: no install
         /// method recorded.
-        fn register_legacy_entry(&self, version: &str) {
+        pub(crate) fn register_legacy_entry(&self, version: &str) {
             RemotesFile {
                 remotes: vec![RemoteEntry {
                     name: "mac".to_string(),
@@ -4439,7 +4624,7 @@ mod homebrew_remote_tests {
             .unwrap();
         }
 
-        fn entry(&self) -> RemoteEntry {
+        pub(crate) fn entry(&self) -> RemoteEntry {
             RemotesFile::load(&self.registry).unwrap().remotes[0].clone()
         }
 
@@ -4611,6 +4796,7 @@ mod homebrew_remote_tests {
         let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
         let err = result.expect_err("a failed hook install must fail the upgrade");
         assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert_eq!(err.installed_binary(), Some(REMOTE_INSTALL_PATH));
         assert!(
             matches!(
                 &err,
@@ -4633,10 +4819,9 @@ mod homebrew_remote_tests {
 
         // A failure before anything landed carries no installed version.
         let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
-        assert_eq!(
-            result.expect_err("version mismatch").installed_version(),
-            None
-        );
+        let err = result.expect_err("version mismatch");
+        assert_eq!(err.installed_version(), None);
+        assert_eq!(err.installed_binary(), None);
     }
 
     /// Control: a remote with no Homebrew install keeps today's behaviour —
@@ -4741,6 +4926,7 @@ mod homebrew_remote_tests {
             "got {error:?}"
         );
         assert_eq!(error.installed_version(), Some("0.43.0"));
+        assert_eq!(error.installed_binary(), Some(REMOTE_INSTALL_PATH));
         let message = error.to_string();
         assert!(
             message.contains("was changed to reach a different machine"),
