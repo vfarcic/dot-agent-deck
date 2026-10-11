@@ -43,6 +43,11 @@ title = "Dispatcher Mode"
 description = "Start background work units (one agent or a team) from a dispatcher pane, check they started, and clean up afterwards."
 
 [[page]]
+slug = "closing-agents"
+title = "Closing Agents"
+description = "Close dispatched units, one agent or a whole orchestration with dot-agent-deck close, from a shell or a dispatcher agent: what is refused, what happens to worktrees, and the TUI and desktop equivalents."
+
+[[page]]
 slug = "scheduled-tasks"
 title = "Schedules"
 description = "Run a prompt on a cron schedule, or dispatch agents onto open GitHub issues: set up, check, troubleshoot, plus the full schedules.toml, cron and schedule CLI reference."
