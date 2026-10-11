@@ -26,6 +26,8 @@ pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;
 pub mod deck_list;
+// PRD #1666: the deck's persistent id, carried in inbox addresses and message ids.
+pub mod deck_identity;
 pub mod delegate_retry;
 pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
@@ -62,6 +64,8 @@ pub mod hook;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
+// PRD #1666: the per-agent inbox every deck message is posted to (pure data).
+pub mod inbox;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;

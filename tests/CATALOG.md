@@ -7634,6 +7634,122 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ### Agent messaging inbox (PRD #1666)
 
+#### inbox/core
+
+The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). Time is passed in as an `Instant` on every operation, so every deadline is exercised without a sleep.
+
+##### inbox/core/001 — Message ids are `m-<deck>-<16 hex>`, unique, and nothing else validates.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** a thousand minted ids are valid, distinct and carry their deck; old `d-…` delivery ids, wrong lengths, upper case and non-base32 deck parts are rejected by `is_valid_message_id`, `MessageId::parse` and deserialisation.
+- **Does not assert:** uniqueness across processes beyond the 64 random bits.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/002 — The deck id persists in `<state_dir>/deck-id`, owner-only, and a bad file is replaced.
+- **Layer:** L1 unit (src/deck_identity.rs), tempdir state directory.
+- **Agent:** none.
+- **Asserts:** the first load creates a valid 8-character base32 id, the file is `0600` on Unix with no temp file left behind, a second load returns the same id, and a file holding garbage is replaced by a fresh valid id.
+- **Does not assert:** two daemons racing their first start (the hard-link publish is not exercised concurrently); the Windows ACL.
+- **Platform coverage:** mac+linux+windows (the mode check is Unix-only).
+
+##### inbox/core/003 — A repeated message id inside the dedup window is refused and enqueues nothing.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** a duplicate is refused with the first message's current state (queued, then acknowledged, including after the message left the history), and accepted again once the time window or the id-count bound has passed.
+- **Does not assert:** the CLI's `--id` option (S2/S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/004 — An unacknowledged fetch is redelivered when its ack-wait passes.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` (read through an injected lookup), the message stays fetched until its deadline, returns to queued at it, and its next fetch counts a second delivery; `next_deadline` reports the deadline.
+- **Does not assert:** the daemon's timer driving `tick` (S2).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/005 — After `max_deliver` unacknowledged hand-overs a message is undeliverable.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** five expired fetches make the message undeliverable for `max_deliver`, the last event says so, and no fetch returns it again.
+- **Does not assert:** the sender's undelivered notice (S5).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/006 — Every bound refuses explicitly and drops nothing.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** past the per-recipient bound the post is refused `InboxFull`, past the deck-wide bound `DeckFull`, and an oversized body `BodyTooLarge`; the queued messages are all still listed, and a refused post does not burn its sender-chosen id.
+- **Does not assert:** how the refusal reaches the sender over the wire (S2/S5).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/007 — A fetched message is handed to one consumer until it returns to the queue.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** a second and third consumer get nothing while the message is fetched; a dropped consumer's messages return to queued and are fetched again; a message bound to another agent generation of the pane is not handed over, an unbound one is.
+- **Does not assert:** waiter connections and their EOF handling (S2).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/008 — Ack outcomes are explicit.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** another pane's agent and another generation of the same pane get `WrongAgent` with the state unchanged; the owner's ack is `Acknowledged`, a repeat `AlreadyAcknowledged`; an old `d-…` id or an absent id is `Unknown`; a retired message answers `Undeliverable`; fetch-and-ack acknowledges in one step.
+- **Does not assert:** attestation of the acking agent (S2).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/009 — An offer goes to exactly one taker.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** of two candidates only the first is offered the job and can fetch it; its ack is a claim for the offer's TTL; only the claimant can complete it, which acknowledges it; a claim TTL outside one minute to 24 hours is refused.
+- **Does not assert:** the offerer's notices (S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/010 — An expired or released claim re-offers to someone who has not held it.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** after a claim expires the offer waits unassigned and goes to the next candidate; after a release it goes to the third; an unacknowledged fetch also excludes its holder; with every candidate excluded it waits unassigned; `offer_candidates` drops excluded holders.
+- **Does not assert:** when the daemon calls `assign_offer` (S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/011 — An exited agent's bound messages become undeliverable.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** queued and fetched messages bound to the exited agent become undeliverable for `agent_exited`; an unbound message waits for the pane's next agent, which fetches it; an offer the agent claimed returns to its pool excluding it.
+- **Does not assert:** the daemon's exit detection (S5).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/012 — A publish's scope is the sender's orchestration instance, or its whole dispatch tree.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** two orchestrations sharing a config name are separate scopes (#463); every pane in a dispatch tree (dispatcher, single-agent unit, orchestration unit and a unit it dispatched) resolves to one `d-<root>` scope listing the same members and both dispatch callers; a pane in neither has no scope; a caller cycle ends the walk.
+- **Does not assert:** building the pane facts from the daemon's maps (S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/013 — Configured subscriptions decide who receives a publish and who may be offered a job.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** orchestration topics reach every role, role topics that role, `[dispatch]` topics the dispatch callers, offers only roles taking the pool; the sender is excluded; an unsubscribed topic reaches no one; a publish posts one copy per recipient under one id, each acknowledged separately.
+- **Does not assert:** reading `.dot-agent-deck.toml` (S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/014 — States, outcomes and refusals have stable lower-case wire spellings; limits take overrides.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** the five states serialise as `queued`, `fetched`, `claimed`, `acknowledged` and `undeliverable`; ack outcomes and refusals are snake case; a listing summary round-trips; environment overrides apply, and a zero or unparsable one leaves the default in place.
+- **Does not assert:** the hook-socket or attach replies that carry them (S2/S3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/015 — Publishes and offers are rate-limited per sending agent.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** past the per-minute limit an agent's publish is refused `RateLimited` and enqueues nothing, other agents and the deck are not limited, and the agent may publish again after the window.
+- **Does not assert:** attestation of the sender (S11).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/016 — The per-pane history ring keeps the newest finished messages; address tokens encode reversibly.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** past the history bound only the newest acknowledged messages are kept and a live message is never trimmed; every address token encodes into `[A-Za-z0-9_-]` and decodes back, and addresses render as `inbox.…`, `topic.…` and `offer.…` subjects.
+- **Does not assert:** NATS subject compatibility beyond the character set (#1264).
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
