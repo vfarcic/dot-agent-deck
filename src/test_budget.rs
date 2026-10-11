@@ -35,6 +35,12 @@ const MAX_LOAD_FACTOR: f64 = 6.0;
 /// publish one cheaply. Linux (`/proc/loadavg`) and macOS (`getloadavg(3)`),
 /// exactly as the harness's twin, which records why macOS joined; elsewhere
 /// `None`, because an unmeasurable load must widen nothing.
+///
+/// The load average is all this copy measures. The harness's `load_scaled`
+/// also widens by a Pressure Stall Information stall factor (`stall_factor`,
+/// `machine_stall_share` in `tests/common/mod.rs`); that factor is
+/// harness-only, so a lib-side ceiling is not widened on a box that is IO- or
+/// memory-starved at a modest load average.
 fn machine_load_per_cpu() -> Option<f64> {
     let one_minute = one_minute_load_average()?;
     let cpus = std::thread::available_parallelism().ok()?.get() as f64;
