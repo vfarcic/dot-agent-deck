@@ -54,6 +54,19 @@ export type AgentBlocked = {
   detail?: string;
   resetsAtMs?: number;
 };
+/**
+ * Issue #1678: the background work an agent left running after its turn ended,
+ * as the DAEMON counts it — commands still running in their own session and
+ * subagents started and not yet stopped. Present only with at least one count
+ * above zero; `sinceMs` is when the oldest counted item started on the daemon's
+ * clock, absent when the daemon has no start for any of them. The background
+ * aggregate carries counts and an instant, not subagent ids or command lines.
+ */
+export type AgentBackground = {
+  commands: number;
+  subagents: number;
+  sinceMs?: number;
+};
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
 
@@ -831,6 +844,13 @@ export interface AgentSession {
   authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
+  /**
+   * HONEST. Issue #1678: background work still running after the agent's turn
+   * ended, copied from the daemon's aggregate and validated at the bridge.
+   * Rendering goes through `displayBackgroundWork`, which words it exactly as
+   * the TUI card does.
+   */
+  background?: AgentBackground;
   /** HONEST. */
   rows: number;
   /** HONEST. */

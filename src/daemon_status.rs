@@ -256,6 +256,8 @@ mod tests {
             last_activity_ms: None,
             blocked: None,
             hook_generation: None,
+            background: None,
+            background_revision: None,
         }
     }
 

@@ -67,7 +67,7 @@ The desktop app shows five statuses. Each covers one or more of the words the TU
 | --- | --- | --- |
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
 | **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane. |
-| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
+| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands or subagents it left running keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
 | **FAILED** | Error | Something went wrong. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
 
@@ -85,7 +85,7 @@ To watch or talk to one agent:
 
 The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal.
 
-The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one.
+The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one. When the agent has ended its turn but left commands or subagents running, a line below that says so, for example `Background: 2 commands, 1 subagent · 3h 12m`, in the same words as the TUI card; see [Session Management → Work left running after a turn](../session-management.md#work-left-running-after-a-turn).
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
