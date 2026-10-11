@@ -24,6 +24,9 @@
 //! `daemon serve`. Every remote command carries the deck's configured socket as
 //! `DOT_AGENT_DECK_ATTACH_SOCKET`, which is where `daemon serve` binds its
 //! attach endpoint, so the daemon it starts is the one the tunnel looks for.
+//! A deck that runs the default install, which is missing, is looked for in
+//! Homebrew the way `connect` looks (issue #1675), and a verified find is
+//! recorded in the deck list.
 //!
 //! **Nothing here is a wire verb.** There is no daemon to send "start" to, so
 //! this module puts nothing on the TUI↔daemon protocol and owes no
@@ -32,7 +35,7 @@
 //! The remote half is sync, like [`crate::daemon_upgrade`]: its ssh calls block,
 //! so a desktop caller runs it inside `spawn_blocking`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +43,9 @@ use serde::{Deserialize, Serialize};
 use crate::connect::VersionProbeFailure;
 use crate::daemon_attach::{AttachError, ensure_daemon_running};
 use crate::daemon_client::{Endpoint, LocalEndpoint, RemoteEndpoint};
-use crate::remote::{RemoteBinaryPath, SshError, SshExecutor, SystemSshExecutor};
+use crate::remote::{
+    RemoteBinaryPath, RemoteDeckBinary, RemoteEntry, SshError, SshExecutor, SystemSshExecutor,
+};
 use crate::remote_daemon::{EndpointAnswer, RemoteDaemonError, SshDaemonPort};
 
 /// How a local deck's host is named to the user.
@@ -341,6 +346,10 @@ where
 pub struct RemoteDeck<E: SshExecutor> {
     pub port: SshDaemonPort<E>,
     pub host: String,
+    /// The deck list and the row this deck was read from, where a Homebrew
+    /// install found in place of a missing default install is recorded
+    /// ([`RemoteDeck::recording_to`]). `None` records nothing.
+    record: Option<(PathBuf, RemoteEntry)>,
 }
 
 impl RemoteDeck<SystemSshExecutor> {
@@ -368,7 +377,17 @@ impl<E: SshExecutor> RemoteDeck<E> {
         Self {
             port: SshDaemonPort::for_endpoint(executor, endpoint, binary),
             host: endpoint.describe(),
+            record: None,
         }
+    }
+
+    /// Record a Homebrew install found for this deck in the deck list at
+    /// `remotes_path`, on the row `entry` — the row the deck was read from —
+    /// so the next check runs it straight away, as `connect` records one
+    /// (issue #1675).
+    pub fn recording_to(mut self, remotes_path: PathBuf, entry: RemoteEntry) -> Self {
+        self.record = Some((remotes_path, entry));
+        self
     }
 
     fn socket(&self) -> String {
@@ -401,7 +420,28 @@ impl Default for StartTiming {
 ///
 /// `daemon probe --json` answers on a deck from PRD #1487 on; an older deck's
 /// `daemon endpoint` (issue #1174) answers the same question in exit codes.
+///
+/// A deck that runs the default install, which is missing, is looked for in
+/// Homebrew first ([`find_homebrew`]) and asked through what that finds.
 pub fn probe_remote<E: SshExecutor>(deck: &RemoteDeck<E>) -> DisconnectedReason {
+    let reason = ask_remote(deck);
+    match &reason {
+        DisconnectedReason::Unknown(problem)
+            if problem.failure == StartFailure::NotInstalled
+                && deck.port.runs_default_install() =>
+        {
+            match find_homebrew(deck) {
+                Ok(true) => ask_remote(deck),
+                Ok(false) => reason,
+                Err(problem) => DisconnectedReason::Unknown(problem),
+            }
+        }
+        _ => reason,
+    }
+}
+
+/// [`probe_remote`] through the binary the deck runs now.
+fn ask_remote<E: SshExecutor>(deck: &RemoteDeck<E>) -> DisconnectedReason {
     match deck.port.probe() {
         Ok(probe) if probe.running => DisconnectedReason::RunningNotConnected,
         Ok(_) => DisconnectedReason::NotRunning,
@@ -428,12 +468,21 @@ pub fn probe_remote<E: SshExecutor>(deck: &RemoteDeck<E>) -> DisconnectedReason 
 }
 
 /// Start the remote deck's daemon: check the deck binary is there (`connect`'s
-/// `--version` probe), check whether a daemon already runs at the deck's
-/// socket, start `daemon serve` detached at that socket, and wait up to
+/// `--version` probe, then a Homebrew install when the default install is
+/// missing — [`find_homebrew`]), check whether a daemon already runs at the
+/// deck's socket, start `daemon serve` detached at that socket, and wait up to
 /// `timing.wait` for it to answer there.
 pub fn start_remote<E: SshExecutor>(deck: &RemoteDeck<E>, timing: StartTiming) -> StartOutcome {
-    if let Err(failure) = deck.port.version() {
-        return StartOutcome::Failed(version_problem(deck, failure));
+    match deck.port.version() {
+        Ok(_) => {}
+        Err(VersionProbeFailure::BinaryMissing) if deck.port.runs_default_install() => {
+            match find_homebrew(deck) {
+                Ok(true) => {}
+                Ok(false) => return StartOutcome::Failed(not_installed(deck)),
+                Err(problem) => return StartOutcome::Failed(problem),
+            }
+        }
+        Err(failure) => return StartOutcome::Failed(version_problem(deck, failure)),
     }
     match probe_remote(deck) {
         DisconnectedReason::RunningNotConnected => return StartOutcome::AlreadyRunning,
@@ -529,14 +578,61 @@ fn ssh_problem(host: &str, error: &SshError) -> StartProblem {
     }
 }
 
+/// Look for a Homebrew install of the deck when it runs the default install,
+/// which is missing, the way `connect` does (issue #1459, here since issue
+/// #1675): verify what is found with the same `--version` probe, run every
+/// later command through it, and record it in the deck list when the deck was
+/// given one ([`RemoteDeck::recording_to`]). `Ok(true)` when one was found and
+/// answered; `Ok(false)` when there is none (or the deck records its own
+/// binary, which is not searched past, as in `connect`); `Err` when looking or
+/// verifying failed.
+fn find_homebrew(deck: &RemoteDeck<impl SshExecutor>) -> Result<bool, StartProblem> {
+    if !deck.port.runs_default_install() {
+        return Ok(false);
+    }
+    let Some(binary) = deck
+        .port
+        .discover_homebrew()
+        .map_err(|error| ssh_problem(&deck.host, &error))?
+    else {
+        return Ok(false);
+    };
+    deck.port.set_binary(RemoteDeckBinary::Path(binary.clone()));
+    let version = deck
+        .port
+        .version()
+        .map_err(|failure| version_problem(deck, failure))?;
+    if let Some((remotes_path, entry)) = &deck.record
+        && let Err(error) =
+            crate::remote::record_homebrew_binary(remotes_path, entry, binary, &version)
+    {
+        tracing::warn!(
+            target: "remote",
+            deck = %entry.name,
+            %error,
+            "found the deck's Homebrew binary but could not record it in the deck list"
+        );
+    }
+    Ok(true)
+}
+
+/// No deck binary to run on the host. A deck that runs the default install
+/// was also looked for in Homebrew ([`find_homebrew`]), so the message names
+/// both ways to install it rather than one.
 fn not_installed(deck: &RemoteDeck<impl SshExecutor>) -> StartProblem {
+    let binary = deck.port.binary();
+    let detail = if deck.port.runs_default_install() {
+        format!("no deck binary at {binary}, and no Homebrew install of dot-agent-deck")
+    } else {
+        format!("no deck binary at {binary}")
+    };
     StartProblem::new(
         StartFailure::NotInstalled,
         format!(
-            "dot-agent-deck is not installed on {}. Install it there with `dot-agent-deck remote add`.",
+            "dot-agent-deck is not installed on {}. To install it with Homebrew, run `brew install vfarcic/tap/dot-agent-deck` there; otherwise `dot-agent-deck remote add` installs it in ~/.local/bin from this machine.",
             deck.host
         ),
-        Some(format!("no deck binary at {}", deck.port.binary())),
+        Some(detail),
     )
 }
 
@@ -615,6 +711,8 @@ mod tests {
         probe: RefCell<VecDeque<Answer>>,
         endpoint: RefCell<VecDeque<Answer>>,
         start: RefCell<VecDeque<Answer>>,
+        /// The Homebrew install probe (`crate::remote::discover_homebrew_binary`).
+        brew: RefCell<VecDeque<Answer>>,
     }
 
     fn take(queue: &RefCell<VecDeque<Answer>>, command: &str) -> Answer {
@@ -659,7 +757,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push((target.clone(), command.to_string()));
-            if command.ends_with(" --version") {
+            if command.contains("dad_brew") {
+                take(&self.brew, command)
+            } else if command.ends_with(" --version") {
                 take(&self.version, command)
             } else if command.ends_with("daemon probe --json") {
                 take(&self.probe, command)
@@ -809,10 +909,11 @@ mod tests {
     /// Issue #1490 audit A1: the checks the desktop runs unattended and the
     /// detached start are observation sessions that require a trusted host
     /// key. Each ssh invocation the production executor makes — the probe,
-    /// the older `daemon endpoint` check, the `--version` check and the
-    /// detached start — is recorded by a stand-in `ssh` and must suppress every
-    /// delegation, forwarding, local-command and shared-master option a user
-    /// `Host` block could turn on, not only carry batch mode and the route.
+    /// the older `daemon endpoint` check, the `--version` check, the detached
+    /// start and the Homebrew search (issue #1675) — is recorded by a
+    /// stand-in `ssh` and must suppress every delegation, forwarding,
+    /// local-command and shared-master option a user `Host` block could turn
+    /// on, not only carry batch mode and the route.
     #[cfg(unix)]
     #[test]
     fn every_remote_check_and_the_start_delegate_no_credential() {
@@ -839,6 +940,7 @@ mod tests {
         let _ = deck.port.endpoint();
         let _ = deck.port.version();
         let _ = deck.port.start_detached();
+        let _ = deck.port.discover_homebrew();
 
         let recorded = std::fs::read_to_string(&log).unwrap();
         let sessions: Vec<Vec<&str>> = recorded
@@ -850,12 +952,16 @@ mod tests {
             .iter()
             .map(|args| *args.last().expect("a remote command"))
             .collect();
-        assert_eq!(sessions.len(), 4, "{remote_commands:?}");
+        assert_eq!(sessions.len(), 5, "{remote_commands:?}");
         assert!(remote_commands[0].ends_with("daemon probe --json"));
         assert!(remote_commands[1].ends_with("daemon endpoint"));
         assert!(remote_commands[2].ends_with("--version"));
         assert!(
             remote_commands[3].contains("nohup ") && remote_commands[3].contains("daemon serve"),
+            "{remote_commands:?}"
+        );
+        assert!(
+            remote_commands[4].contains("dad_brew"),
             "{remote_commands:?}"
         );
         for args in &sessions {
@@ -916,6 +1022,178 @@ mod tests {
                 "{SOCKET_ENV}/opt/homebrew/bin/dot-agent-deck daemon probe --json"
             )]
         );
+    }
+
+    // -- a Homebrew install the deck-list row does not record (issue #1675) --
+
+    const BREW_BINARY: &str = "/opt/homebrew/bin/dot-agent-deck";
+
+    fn missing_at_default() -> Answer {
+        out(127, "", "sh: 1: ~/.local/bin/dot-agent-deck: not found")
+    }
+
+    fn brew_finds(prefix: &str) -> Answer {
+        out(
+            0,
+            &format!("local-bin=\nhomebrew={prefix}\nformula=dot-agent-deck\n"),
+            "",
+        )
+    }
+
+    fn brew_finds_nothing() -> Answer {
+        out(0, "local-bin=\nhomebrew=\nformula=\n", "")
+    }
+
+    /// Issue #1675: a row with no recorded binary on a host whose only
+    /// install is Homebrew's. `connect` finds that install (#1459); the
+    /// desktop's **Start daemon** said "not installed". The start finds it,
+    /// verifies it with `--version`, and runs every later command through it.
+    #[test]
+    fn a_start_finds_a_homebrew_install_when_the_default_is_missing() {
+        let fake = FakeSsh::default();
+        fake.version
+            .borrow_mut()
+            .extend([missing_at_default(), version_ok()]);
+        fake.brew
+            .borrow_mut()
+            .push_back(brew_finds("/opt/homebrew"));
+        fake.probe
+            .borrow_mut()
+            .extend([probe_says(false), probe_says(true)]);
+        fake.start.borrow_mut().push_back(out(0, "", ""));
+        let deck = deck(fake);
+
+        assert_eq!(start_remote(&deck, quick()), StartOutcome::Started);
+
+        let commands = commands(&deck);
+        assert_eq!(commands[0], "~/.local/bin/dot-agent-deck --version");
+        assert!(commands[1].contains("dad_brew"), "{commands:?}");
+        assert_eq!(
+            commands[2..],
+            [
+                format!("{BREW_BINARY} --version"),
+                format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json"),
+                format!(
+                    "{SOCKET_ENV}nohup {BREW_BINARY} daemon serve </dev/null >/dev/null 2>&1 &"
+                ),
+                format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json"),
+            ]
+        );
+    }
+
+    /// Issue #1675: the desktop's check of a disconnected deck said "not
+    /// installed" for the same row. It finds the Homebrew install too, and
+    /// answers through it.
+    #[test]
+    fn a_check_finds_a_homebrew_install_when_the_default_is_missing() {
+        let fake = FakeSsh::default();
+        fake.probe
+            .borrow_mut()
+            .extend([missing_at_default(), probe_says(false)]);
+        fake.brew
+            .borrow_mut()
+            .push_back(brew_finds("/opt/homebrew"));
+        fake.version.borrow_mut().push_back(version_ok());
+        let deck = deck(fake);
+
+        assert_eq!(probe_remote(&deck), DisconnectedReason::NotRunning);
+
+        let commands = commands(&deck);
+        assert_eq!(
+            commands[0],
+            format!("{SOCKET_ENV}~/.local/bin/dot-agent-deck daemon probe --json")
+        );
+        assert!(commands[1].contains("dad_brew"), "{commands:?}");
+        assert_eq!(
+            commands[2..],
+            [
+                format!("{BREW_BINARY} --version"),
+                format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json"),
+            ]
+        );
+    }
+
+    /// Issue #1675: a found Homebrew install is recorded on the deck's row in
+    /// the shared deck list, as `connect` records it, so the next check — by
+    /// either client — goes straight to it.
+    #[test]
+    fn a_found_homebrew_install_is_recorded_for_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let entry = RemoteEntry {
+            name: "build".into(),
+            kind: "ssh".into(),
+            host: "deploy@build-box".into(),
+            port: 2222,
+            key: None,
+            version: "0.40.0".into(),
+            added_at: "2026-10-01T00:00:00Z".into(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
+        };
+        crate::remote::RemotesFile {
+            remotes: vec![entry.clone()],
+        }
+        .save(&path)
+        .unwrap();
+
+        let fake = FakeSsh::default();
+        fake.probe
+            .borrow_mut()
+            .extend([missing_at_default(), probe_says(false)]);
+        fake.brew
+            .borrow_mut()
+            .push_back(brew_finds("/opt/homebrew"));
+        fake.version.borrow_mut().push_back(version_ok());
+        let deck = deck(fake).recording_to(path.clone(), entry);
+        assert_eq!(probe_remote(&deck), DisconnectedReason::NotRunning);
+
+        let row = crate::remote::RemotesFile::load(&path)
+            .unwrap()
+            .remotes
+            .remove(0);
+        assert_eq!(
+            row.install.as_deref(),
+            Some(crate::remote::INSTALL_HOMEBREW)
+        );
+        assert_eq!(row.binary.as_ref().map(|b| b.as_str()), Some(BREW_BINARY));
+        assert_eq!(row.version, "0.45.1");
+
+        let fake = FakeSsh::default();
+        fake.probe.borrow_mut().push_back(probe_says(false));
+        let next = RemoteDeck::with_executor(fake, &endpoint(), row.binary.as_ref());
+        assert_eq!(probe_remote(&next), DisconnectedReason::NotRunning);
+        assert_eq!(
+            commands(&next),
+            [format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json")]
+        );
+    }
+
+    /// The control: a row that records its own binary is not searched past
+    /// when that binary is missing, as in `connect`, and nothing is recorded.
+    #[test]
+    fn a_missing_recorded_binary_is_not_searched_past() {
+        let fake = FakeSsh::default();
+        fake.version.borrow_mut().push_back(out(
+            127,
+            "",
+            "sh: 1: /opt/homebrew/bin/dot-agent-deck: not found",
+        ));
+        let homebrew = RemoteBinaryPath::try_from(BREW_BINARY.to_string()).unwrap();
+        let deck = RemoteDeck::with_executor(fake, &endpoint(), Some(&homebrew));
+        let problem = failed(start_remote(&deck, quick()));
+        assert_eq!(problem.failure, StartFailure::NotInstalled);
+        assert_eq!(
+            problem.detail.as_deref(),
+            Some("no deck binary at /opt/homebrew/bin/dot-agent-deck")
+        );
+        assert_eq!(commands(&deck), [format!("{BREW_BINARY} --version")]);
     }
 
     // -- the remote start's outcomes ----------------------------------------
@@ -983,22 +1261,35 @@ mod tests {
         );
     }
 
+    /// Issue #1675: with no install anywhere the app looked — not at the
+    /// default install, not in Homebrew — the message names both install
+    /// methods rather than sending a Homebrew user to `remote add` alone, and
+    /// the detail says where it looked.
     #[test]
-    fn a_missing_install_points_at_remote_add() {
+    fn a_missing_install_names_both_install_methods() {
         for answer in [
             out(127, "", "sh: ~/.local/bin/dot-agent-deck: not found"),
             out(0, "hello from a stub\n", ""),
         ] {
             let fake = FakeSsh::default();
             fake.version.borrow_mut().push_back(answer);
+            fake.brew.borrow_mut().push_back(brew_finds_nothing());
             let deck = deck(fake);
             let problem = failed(start_remote(&deck, quick()));
             assert_eq!(problem.failure, StartFailure::NotInstalled);
             assert_eq!(
                 problem.message,
-                "dot-agent-deck is not installed on deploy@build-box:2222. Install it there with `dot-agent-deck remote add`."
+                "dot-agent-deck is not installed on deploy@build-box:2222. To install it with Homebrew, run `brew install vfarcic/tap/dot-agent-deck` there; otherwise `dot-agent-deck remote add` installs it in ~/.local/bin from this machine."
             );
-            assert_eq!(commands(&deck).len(), 1, "nothing runs after the probe");
+            assert_eq!(
+                problem.detail.as_deref(),
+                Some(
+                    "no deck binary at ~/.local/bin/dot-agent-deck, and no Homebrew install of dot-agent-deck"
+                )
+            );
+            let commands = commands(&deck);
+            assert!(commands[1].contains("dad_brew"), "{commands:?}");
+            assert_eq!(commands.len(), 2, "nothing runs after the search");
         }
     }
 
@@ -1186,6 +1477,7 @@ mod tests {
             "",
             "sh: 1: ~/.local/bin/dot-agent-deck: not found",
         ));
+        fake.brew.borrow_mut().push_back(brew_finds_nothing());
         let DisconnectedReason::Unknown(problem) = probe_remote(&deck(fake)) else {
             panic!("a missing install cannot tell");
         };
