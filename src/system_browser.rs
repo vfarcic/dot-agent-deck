@@ -21,13 +21,119 @@
 //! user can copy it ([`open_pull_request`]).
 
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-/// How long [`open_pull_request`] watches a launched browser or opener, off
-/// the caller's thread, for a failing exit before reporting how the launch
-/// went. A browser that is still running then — one that stays in the
-/// foreground — counts as launched, and is reaped in the background.
+/// How long a launched browser or opener is polled for a failing exit before
+/// the launch is reported ([`watch_launch`]). A polling policy, not a
+/// wall-clock bound: the last poll can land up to one poll interval past it,
+/// later on a starved machine. A browser that is still running then — one
+/// that stays in the foreground — counts as launched, and is handed to the
+/// shared reaper ([`reap_in_background`]).
 pub const LAUNCH_GRACE: Duration = Duration::from_millis(500);
+
+/// How many launches may be watched at once, across the process. A launch
+/// beyond it starts no browser and says so ([`TOO_MANY_LAUNCHES`]); a watch
+/// lasts about [`LAUNCH_GRACE`], so the next attempt a moment later succeeds.
+pub const MAX_WATCHED_LAUNCHES: usize = 4;
+
+/// Why a launch beyond [`MAX_WATCHED_LAUNCHES`] was refused.
+pub const TOO_MANY_LAUNCHES: &str = "earlier launches are still starting; try again in a moment";
+
+/// How often the reaper checks the children it holds for an exit.
+const REAP_POLL: Duration = Duration::from_millis(250);
+
+/// A count of launches being watched, capped. [`Self::claim`] answers a slot
+/// that is released when it is dropped, or `None` at the cap.
+pub struct LaunchSlots {
+    in_use: AtomicUsize,
+    max: usize,
+}
+
+/// One claimed [`LaunchSlots`] slot, released on drop.
+pub struct LaunchSlot<'a>(&'a LaunchSlots);
+
+impl LaunchSlots {
+    pub const fn new(max: usize) -> Self {
+        Self {
+            in_use: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// A slot, or `None` when `max` are already claimed.
+    pub fn claim(&self) -> Option<LaunchSlot<'_>> {
+        self.in_use
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| LaunchSlot(self))
+    }
+}
+
+impl Drop for LaunchSlot<'_> {
+    fn drop(&mut self) {
+        self.0.in_use.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The process's launch watches: the TUI's `o` and the desktop's hand-offs
+/// both claim from it.
+static LAUNCH_SLOTS: LaunchSlots = LaunchSlots::new(MAX_WATCHED_LAUNCHES);
+
+/// The one reaper thread's queue, started on first use. `None` when the
+/// thread could not be started.
+static REAPER: OnceLock<Option<Sender<Child>>> = OnceLock::new();
+
+/// Hand `child`, still running, to the process's one reaper thread, which
+/// waits for every child it is given — however many — so none lingers as a
+/// zombie and none costs a thread of its own. If that thread could not be
+/// started, the child is dropped unreaped: it keeps running, and on Unix
+/// stays a zombie after it exits, until this process does.
+pub fn reap_in_background(child: Child) {
+    let reaper = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("browser-reaper".into())
+            .spawn(move || reap(rx))
+        {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start the browser reaper thread");
+                None
+            }
+        }
+    });
+    if let Some(tx) = reaper {
+        let _ = tx.send(child);
+    }
+}
+
+/// The reaper's loop: hold every child it is sent and poll each for an exit
+/// every [`REAP_POLL`], dropping it once it has one. Blocks without polling
+/// while it holds none.
+fn reap(rx: Receiver<Child>) {
+    let mut children: Vec<Child> = Vec::new();
+    loop {
+        let next = if children.is_empty() {
+            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(REAP_POLL)
+        };
+        match next {
+            Ok(child) => children.push(child),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) if children.is_empty() => return,
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(REAP_POLL),
+        }
+        children.extend(rx.try_iter());
+        // An unreadable status will not become readable: stop holding it.
+        children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+}
 
 /// The `https://github.com/<owner>/<repo>/pull/<number>` form of `raw`, rebuilt
 /// from its validated parts, or `None` when `raw` is anything else.
@@ -180,10 +286,11 @@ pub enum Launched {
     Running,
 }
 
-/// Watch `child`, launched as `program`, for up to `grace`: a non-zero exit in
-/// that time is a failure, an exit of 0 or a child still running is a launch.
-/// A child still running is handed to a thread that reaps it, so a browser
-/// that stays in the foreground neither blocks the caller past `grace` nor
+/// Watch `child`, launched as `program`, polling it for `grace` (a polling
+/// policy, see [`LAUNCH_GRACE`]): a non-zero exit in that time is a failure,
+/// an exit of 0 or a child still running is a launch. A child still running
+/// is handed to the shared reaper ([`reap_in_background`]), so a browser that
+/// stays in the foreground neither holds up the caller much past `grace` nor
 /// lingers as a zombie.
 pub fn watch_launch(mut child: Child, program: &str, grace: Duration) -> Result<Launched, String> {
     let deadline = Instant::now() + grace;
@@ -197,9 +304,7 @@ pub fn watch_launch(mut child: Child, program: &str, grace: Duration) -> Result<
             // Still running, or its status cannot be read: nothing says it
             // failed, so it counts as launched.
             Ok(None) | Err(_) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                reap_in_background(child);
                 return Ok(Launched::Running);
             }
         }
@@ -208,8 +313,13 @@ pub fn watch_launch(mut child: Child, program: &str, grace: Duration) -> Result<
 
 /// Open `url` with the platform's opener (`xdg-open` and its fallbacks,
 /// `open`, `start`), the first one that can be started, watched like a
-/// `BROWSER` program ([`watch_launch`]).
+/// `BROWSER` program ([`watch_launch`]) on the caller's thread. Counted
+/// against [`MAX_WATCHED_LAUNCHES`]: beyond it, nothing is started and the
+/// answer is [`TOO_MANY_LAUNCHES`].
 pub fn open_with_platform_opener(url: &str, grace: Duration) -> Result<Launched, String> {
+    let _slot = LAUNCH_SLOTS
+        .claim()
+        .ok_or_else(|| TOO_MANY_LAUNCHES.to_string())?;
     let (child, program) = spawn_platform_opener(url)?;
     watch_launch(child, &program, grace)
 }
@@ -255,18 +365,20 @@ impl BrowserEnv {
 }
 
 /// Start opening the pull request at `raw_url` and return the status-line
-/// message to show now. The caller is never held up by the browser.
+/// message to show now. The browser is spawned on the caller's thread, and
+/// waiting for its exit happens off it.
 ///
 /// When a program was launched, that message is `Opening <url> in the
 /// browser`, and `on_settled` is called once, from another thread, with the
-/// message for how the launch went: watched for up to [`LAUNCH_GRACE`], a
+/// message for how the launch went: watched for about [`LAUNCH_GRACE`], a
 /// program that exited successfully reports "Opened", one that exited
 /// non-zero reports the could-not-open message with the URL, and one still
 /// running keeps "Opening … in the browser", since a browser that stays in
 /// the foreground never says whether the page loaded. When nothing was
 /// launched — the URL was refused, there is no display, or no program could
-/// be started — the returned message is already the outcome, and
-/// `on_settled` is dropped uncalled.
+/// be started, [`MAX_WATCHED_LAUNCHES`] launches are already being watched,
+/// or no thread could be started to watch it — the returned message is
+/// already the outcome, and `on_settled` is dropped uncalled.
 ///
 /// Whenever no browser opens, the message leads with the URL, so a user on a
 /// host with no browser can copy it.
@@ -275,31 +387,65 @@ pub fn open_pull_request(
     env: &BrowserEnv,
     on_settled: impl FnOnce(String) + Send + 'static,
 ) -> String {
+    open_pull_request_in(&LAUNCH_SLOTS, raw_url, env, on_settled)
+}
+
+/// [`open_pull_request`], counting its watch against `slots`.
+fn open_pull_request_in(
+    slots: &'static LaunchSlots,
+    raw_url: &str,
+    env: &BrowserEnv,
+    on_settled: impl FnOnce(String) + Send + 'static,
+) -> String {
     let Some(url) = canonical_pull_request_url(raw_url) else {
         return "Could not open the pull request: not a GitHub pull request URL".to_string();
     };
-    let spawned = match env.browser.as_deref().map(|b| browser_command(b, &url)) {
-        Some(Ok(Some((program, args)))) => {
-            spawn_browser(&program, &args).map(|child| (child, program))
-        }
-        Some(Err(e)) => Err(e),
+    let browser = match env.browser.as_deref().map(|b| browser_command(b, &url)) {
+        Some(Ok(Some(command))) => Some(command),
+        Some(Err(e)) => return launch_message(&url, Err(e)),
         None | Some(Ok(None)) if !env.display => {
             return format!("Pull request: {url} (no display here to open a browser on)");
         }
-        None | Some(Ok(None)) => spawn_platform_opener(&url),
+        None | Some(Ok(None)) => None,
     };
-    let (child, program) = match spawned {
-        Ok(spawned) => spawned,
-        Err(e) => return launch_message(&url, Err(e)),
+    let Some(slot) = slots.claim() else {
+        return launch_message(&url, Err(TOO_MANY_LAUNCHES.to_string()));
     };
-    let opening = launch_message(&url, Ok(Launched::Running));
-    std::thread::spawn(move || {
-        on_settled(launch_message(
-            &url,
-            watch_launch(child, &program, LAUNCH_GRACE),
-        ));
-    });
-    opening
+    // The watcher starts before the browser does, so a thread that cannot be
+    // started leaves nothing launched and unwatched. It holds the slot until
+    // its watch ends, and exits uncalled if no child ever reaches it.
+    let (tx, rx) = mpsc::channel::<(Child, String)>();
+    let watched_url = url.clone();
+    let watcher = std::thread::Builder::new()
+        .name("browser-watch".into())
+        .spawn(move || {
+            let Ok((child, program)) = rx.recv() else {
+                return;
+            };
+            let launched = watch_launch(child, &program, LAUNCH_GRACE);
+            // The watch is over: free the slot before reporting it.
+            drop(slot);
+            on_settled(launch_message(&watched_url, launched));
+        });
+    if let Err(e) = watcher {
+        return launch_message(&url, Err(format!("could not watch the launch: {e}")));
+    }
+    let spawned = match browser {
+        Some((program, args)) => spawn_browser(&program, &args).map(|child| (child, program)),
+        None => spawn_platform_opener(&url),
+    };
+    match spawned {
+        Ok(spawned) => {
+            // The watcher waits on `rx` until this send or the drop of `tx`,
+            // so the send fails only if that thread died first; the child
+            // then comes back in the error and is reaped here.
+            if let Err(mpsc::SendError((child, _))) = tx.send(spawned) {
+                reap_in_background(child);
+            }
+            launch_message(&url, Ok(Launched::Running))
+        }
+        Err(e) => launch_message(&url, Err(e)),
+    }
 }
 
 /// The status-line message for how opening `url` went.
@@ -538,6 +684,101 @@ mod tests {
                 "Pull request: https://github.com/o/r/pull/3 (could not open a browser:"
             ),
             "{msg}"
+        );
+    }
+
+    /// The threads this process has right now.
+    #[cfg(target_os = "linux")]
+    fn thread_count() -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().count()
+    }
+
+    /// Scenario: Launch many browsers that all outlive the grace period. They
+    /// are all reaped once they exit, by one shared reaper rather than one
+    /// waiting thread each, so the deck's thread count stays bounded.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browsers_that_outlive_the_grace_share_one_reaper() {
+        const CHILDREN: usize = 64;
+        let before = thread_count();
+        let mut pids = Vec::new();
+        for _ in 0..CHILDREN {
+            let child = spawn_browser("sleep", &["1".to_string()]).unwrap();
+            pids.push(child.id());
+            assert_eq!(
+                watch_launch(child, "sleep", Duration::ZERO),
+                Ok(Launched::Running)
+            );
+        }
+        let grown = thread_count().saturating_sub(before);
+        assert!(
+            grown < CHILDREN / 2,
+            "{grown} threads were started to wait for {CHILDREN} browsers"
+        );
+        // Every one is reaped once it exits: no zombie is left behind.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for pid in pids {
+            let stat = format!("/proc/{pid}/stat");
+            loop {
+                let zombie_or_running = std::fs::read_to_string(&stat).is_ok();
+                if !zombie_or_running {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "browser {pid} was never reaped");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Scenario: Press `o` while as many launches as the cap allows are still
+    /// being watched. The new launch starts no browser and says why, with the
+    /// URL; once a watch ends, the next launch opens normally.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_beyond_the_watch_cap_is_refused_with_the_url() {
+        use std::os::unix::fs::PermissionsExt;
+        static SLOTS: LaunchSlots = LaunchSlots::new(1);
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("argv");
+        let script = dir.path().join("browser");
+        crate::test_isolation::write_script(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", record.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = BrowserEnv {
+            browser: Some(script.display().to_string()),
+            display: false,
+        };
+
+        let held = SLOTS.claim().expect("a free slot");
+        let shown = open_pull_request_in(&SLOTS, "https://github.com/o/r/pull/5", &env, |_| {});
+        assert_eq!(
+            shown,
+            format!(
+                "Pull request: https://github.com/o/r/pull/5 (could not open a browser: {TOO_MANY_LAUNCHES})"
+            )
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!record.exists(), "a refused launch started a browser");
+
+        drop(held);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shown = open_pull_request_in(&SLOTS, "https://github.com/o/r/pull/5", &env, move |m| {
+            let _ = tx.send(m);
+        });
+        assert_eq!(
+            shown,
+            "Opening https://github.com/o/r/pull/5 in the browser"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            "Opened https://github.com/o/r/pull/5"
+        );
+        assert!(
+            SLOTS.claim().is_some(),
+            "the settled watch released its slot"
         );
     }
 

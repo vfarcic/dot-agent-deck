@@ -41,16 +41,22 @@
 //! event in [`crate::state::AppState::apply_event`] and the snapshot in
 //! hydration (the TUI and the desktop's fold both run those), and each keeps
 //! whichever value has the higher revision; with no revision on either, as
-//! from a daemon that sends none, the one applied last wins, as before.
+//! from a daemon that sends none, the one applied last wins, as before, and
+//! the card's revision drops to `0`.
 //!
 //! A revision is the daemon's wall clock in microseconds, raised past the
-//! previous one when the clock has not moved on, so it increases within one
-//! daemon, and across a restart unless the clock stepped backwards. A session
-//! the daemon has reported no change for carries revision `0`. So a client
-//! that keeps a card across a daemon being replaced, holding a revision from
-//! the old one, refuses the new daemon's replies about that card until the new
-//! daemon reports a change for it: always while the new daemon has reported
-//! none (its replies carry `0`), and after one too if the clock stepped back.
+//! previous one when the clock has not moved on, so it strictly increases
+//! within one daemon process. A session the daemon has reported no change for
+//! carries revision `0`. Revisions from two daemon processes are not
+//! comparable — a replacement's clock may be behind, and its unchanged
+//! sessions carry `0` — so a client compares them only within one connection.
+//! A client that keeps a card across a reconnect, which is how a replacement
+//! daemon's first answer reaches it, takes the reply of the resync that
+//! follows the stream gap outright, value and revision both
+//! ([`crate::state::AppState::resync_after_event_gap`]): that reply is built
+//! after everything the client holds, so it is the newer answer whatever its
+//! revision, and the revision it brings is the new daemon's, which that
+//! daemon's later reports are stamped above.
 //!
 //! An older client decodes the event type as `Unknown`. That is not a no-op
 //! there: the event is still journalled on the card and still runs the
@@ -1116,6 +1122,118 @@ mod tests {
             Some(&current),
         );
         assert_eq!(client.sessions["s1"].pull_request, merged);
+    }
+
+    /// A client holding card `s1` on `pane-1` with an open PR at `revision`,
+    /// as a report from the daemon it was attached to left it.
+    fn client_holding_revision(revision: u64) -> crate::state::AppState {
+        let mut client = crate::state::AppState::default();
+        client.register_pane("pane-1".into());
+        let mut session = sample_session();
+        session.pull_request = pr_in(PullRequestState::Open).flatten();
+        session.pull_request_revision = revision;
+        client.sessions.insert("s1".into(), session);
+        client
+    }
+
+    /// A report for `s1` of `pr` at `revision`, or with no revision at all as
+    /// from a daemon that sends none.
+    fn report_at(pr: Option<PullRequestInfo>, revision: Option<u64>) -> AgentEvent {
+        let mut session = sample_session();
+        session.pull_request = pr;
+        session.pull_request_revision = revision.unwrap_or(0);
+        let mut event = report_event(&session);
+        if revision.is_none() {
+            event.metadata.remove(PULL_REQUEST_REVISION_METADATA_KEY);
+        }
+        event
+    }
+
+    /// Resynchronize `client` after an event-stream gap from a daemon whose
+    /// snapshot of `s1` carries `pr` at `revision`.
+    fn resync_with(
+        client: &mut crate::state::AppState,
+        pr: Option<PullRequestInfo>,
+        revision: Option<u64>,
+    ) {
+        let mut session = sample_session();
+        session.pull_request = pr;
+        let mut snapshot = session.live_snapshot();
+        snapshot.pull_request_revision = revision;
+        let mut record: crate::agent_pty::AgentRecord =
+            serde_json::from_value(serde_json::json!({ "id": "agent-1", "pane_id_env": "pane-1" }))
+                .unwrap();
+        record.live = Some(snapshot);
+        client.resync_after_event_gap(&[record]);
+    }
+
+    /// Scenario: A card holds a PR revision from a daemon that was then
+    /// replaced by one whose clock is behind. The replacement's resync
+    /// snapshot and its later reports must both land on the card.
+    #[test]
+    fn a_replacement_daemon_with_a_lower_clock_is_adopted() {
+        let mut client = client_holding_revision(10_000);
+        let merged = pr_in(PullRequestState::Merged).flatten();
+        resync_with(&mut client, merged.clone(), Some(500));
+        assert_eq!(
+            client.sessions["s1"].pull_request, merged,
+            "the replacement daemon's snapshot must be adopted"
+        );
+        let closed = pr_in(PullRequestState::Closed).flatten();
+        client.apply_event(report_at(closed.clone(), Some(600)));
+        assert_eq!(
+            client.sessions["s1"].pull_request, closed,
+            "a later report from the replacement daemon must be applied"
+        );
+    }
+
+    /// Scenario: A card holds an open PR from a daemon that was replaced by
+    /// one that knows no PR for it (revision 0). The resync must clear the
+    /// badge.
+    #[test]
+    fn a_cleared_pull_request_on_a_replacement_daemon_is_adopted() {
+        let mut client = client_holding_revision(10_000);
+        resync_with(&mut client, None, Some(0));
+        assert_eq!(client.sessions["s1"].pull_request, None);
+        assert_eq!(client.sessions["s1"].pull_request_revision, 0);
+    }
+
+    /// Scenario: A card holds a revision from a newer daemon, then takes a
+    /// report and a snapshot from an older daemon that sends no revision, then
+    /// a report from a newer daemon with a lower clock. No stale floor may
+    /// remain to refuse the last one.
+    #[test]
+    fn a_value_with_no_revision_leaves_no_stale_floor() {
+        let merged = pr_in(PullRequestState::Merged).flatten();
+        let closed = pr_in(PullRequestState::Closed).flatten();
+
+        let mut client = client_holding_revision(10_000);
+        client.apply_event(report_at(merged.clone(), None));
+        assert_eq!(client.sessions["s1"].pull_request, merged);
+        client.apply_event(report_at(closed.clone(), Some(500)));
+        assert_eq!(
+            client.sessions["s1"].pull_request, closed,
+            "after a report with no revision"
+        );
+
+        let mut client = client_holding_revision(10_000);
+        let mut session = sample_session();
+        session.pull_request = merged.clone();
+        let mut snapshot = session.live_snapshot();
+        snapshot.pull_request_revision = None;
+        client.seed_hydrated_session(
+            "pane-1".into(),
+            Some("/work/repo".into()),
+            Some(crate::event::AgentType::ClaudeCode),
+            Some("agent-1".into()),
+            Some(&snapshot),
+        );
+        assert_eq!(client.sessions["s1"].pull_request, merged);
+        client.apply_event(report_at(closed.clone(), Some(500)));
+        assert_eq!(
+            client.sessions["s1"].pull_request, closed,
+            "after a snapshot with no revision"
+        );
     }
 
     /// The report moves nothing else on the card — not status, not activity,

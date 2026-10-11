@@ -1084,8 +1084,9 @@ pub struct SessionState {
     pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
     /// PRD #1401: which daemon report [`Self::pull_request`] came from. On the
     /// daemon, the [`crate::pull_request::next_revision`] stamped when it last
-    /// changed, `0` before the first change; on a client, the highest revision
-    /// it has applied, from a report or a reply. Carried by
+    /// changed, `0` before the first change; on a client, the revision of the
+    /// value it holds — from a report or a reply, the last resync's reply
+    /// taken outright, or `0` after a value that carried none. Carried by
     /// [`SessionSnapshot::pull_request_revision`] and by the report's
     /// [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`]. Not an activity
     /// clock: it orders the pull request alone and moves nothing else.
@@ -1850,8 +1851,8 @@ pub struct AppState {
     /// render loop. Filled by the thread that watches the browser
     /// ([`crate::system_browser::open_pull_request`]), which has no `UiState`,
     /// and drained by the render loop, which shows it only while that launch
-    /// is still the latest. Only the last one is kept, as for
-    /// `pending_worktree_kept`.
+    /// is still the latest. One outcome is kept, the most recent launch's
+    /// ([`Self::queue_pull_request_launch`]), as for `pending_worktree_kept`.
     pub pending_pull_request_launch: Option<(u64, String)>,
     /// PRD #1223: panes the daemon announced as stopped, waiting for the render
     /// loop to drop them from the `TabManager`, the pane controller and the
@@ -10455,8 +10456,8 @@ fn overlay_snapshot_onto_kept_card(
     }
 }
 
-/// PRD #1401: take a `ListAgents` snapshot's pull request onto `session`
-/// unless the card already holds a newer one.
+/// PRD #1401: take a hydration snapshot's pull request onto `session` unless
+/// the card already holds a newer one.
 ///
 /// The daemon sets a session's value and broadcasts its report under one write
 /// lock, which orders the daemon's own state, not a client's two streams: a
@@ -10464,17 +10465,55 @@ fn overlay_snapshot_onto_kept_card(
 /// change carries a daemon-assigned revision on both the snapshot and the
 /// event, so a snapshot whose revision is lower than the one the card last
 /// applied is the older answer and is ignored; a clear carries a revision like
-/// any other value. A snapshot with no revision comes from a daemon that sends
-/// none, and is taken as it always was.
+/// any other value. See [`apply_pull_request_revision`] for a snapshot with no
+/// revision.
+///
+/// Revisions order one daemon's answers only, so this comparison is sound
+/// only where the card's revision and the snapshot come from the same daemon:
+/// hydration, where the events applied before it came over the same
+/// connection. The resync after an event-stream gap, which is where a
+/// replacement daemon's first answer arrives, takes the snapshot outright
+/// instead ([`take_snapshot_pull_request`]).
 fn adopt_snapshot_pull_request(session: &mut SessionState, snap: &SessionSnapshot) {
-    match snap.pull_request_revision {
+    apply_pull_request_revision(
+        session,
+        snap.pull_request.clone(),
+        snap.pull_request_revision,
+    );
+}
+
+/// PRD #1401: put `pull_request`, reported at `revision`, on `session` unless
+/// the card already holds a higher revision. A value with no revision comes
+/// from a daemon that sends none: it is applied as it always was, by arrival,
+/// and it resets the card's revision to `0`, so a revision kept from some
+/// earlier daemon cannot outlive the value it described and refuse a later
+/// daemon's reports.
+fn apply_pull_request_revision(
+    session: &mut SessionState,
+    pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    revision: Option<u64>,
+) {
+    match revision {
         Some(revision) if revision < session.pull_request_revision => {}
-        Some(revision) => {
-            session.pull_request = snap.pull_request.clone();
-            session.pull_request_revision = revision;
+        revision => {
+            session.pull_request = pull_request;
+            session.pull_request_revision = revision.unwrap_or(0);
         }
-        None => session.pull_request = snap.pull_request.clone(),
     }
+}
+
+/// PRD #1401: take `snap`'s pull request and revision onto `session`
+/// outright, whatever revision the card held. For
+/// [`AppState::resync_after_event_gap`] only: its reply was built after
+/// everything the state holds (see that function), so it is the newer answer
+/// by construction, and it is the first answer from whichever daemon now
+/// serves the connection, possibly a replacement whose revisions are not
+/// comparable with the old one's. Adopting its revision as the card's new
+/// watermark is what lets that daemon's later reports land: they are stamped
+/// after the reply, by the same daemon, so none is lower than it.
+fn take_snapshot_pull_request(session: &mut SessionState, snap: &SessionSnapshot) {
+    session.pull_request = snap.pull_request.clone();
+    session.pull_request_revision = snap.pull_request_revision.unwrap_or(0);
 }
 
 /// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
@@ -10515,9 +10554,8 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     };
     session.active_tool = snap.active_tool.clone();
     session.tool_count = snap.tool_count;
-    // PRD #1401: the daemon's pull request for the card's branch, unless the
-    // card already holds a newer report.
-    adopt_snapshot_pull_request(session, snap);
+    // PRD #1401: the pull request is not taken here. Each caller decides how
+    // (`adopt_snapshot_pull_request` or `take_snapshot_pull_request`).
     session.first_prompts = snap.first_prompts.clone();
     session.last_user_prompt = snap.last_user_prompt.clone();
     // PRD #20 blocker-4: restore the durable live-target so a history-only /
@@ -11554,8 +11592,18 @@ impl AppState {
     }
 
     /// PRD #1401: record how pull request launch `launch` settled, for the
-    /// render loop to put on the status line.
+    /// render loop to put on the status line. Launches settle in any order, so
+    /// an outcome for an earlier launch than the one already waiting is
+    /// dropped rather than put in its place: the render loop would drop it as
+    /// stale anyway, and the later launch's outcome would be lost with it.
     pub fn queue_pull_request_launch(&mut self, launch: u64, message: String) {
+        if self
+            .pending_pull_request_launch
+            .as_ref()
+            .is_some_and(|(waiting, _)| *waiting > launch)
+        {
+            return;
+        }
         self.pending_pull_request_launch = Some((launch, message));
     }
 
@@ -11597,7 +11645,8 @@ impl AppState {
     ///
     /// A report carrying a revision lower than the one the card holds is older
     /// than a reply the card already took, and is ignored; one with no revision
-    /// comes from a daemon that sends none and is applied as it always was. See
+    /// comes from a daemon that sends none, is applied as it always was and
+    /// resets the card's revision ([`apply_pull_request_revision`]). See
     /// [`SessionState::pull_request_revision`].
     fn apply_pull_request_report(
         &mut self,
@@ -11613,14 +11662,7 @@ impl AppState {
             if !same_card {
                 continue;
             }
-            match revision {
-                Some(revision) if revision < session.pull_request_revision => {}
-                Some(revision) => {
-                    session.pull_request = pull_request.clone();
-                    session.pull_request_revision = revision;
-                }
-                None => session.pull_request = pull_request.clone(),
-            }
+            apply_pull_request_revision(session, pull_request.clone(), revision);
         }
     }
 
@@ -11964,6 +12006,7 @@ impl AppState {
         };
         if minted {
             overlay_snapshot_fields(session, snap);
+            adopt_snapshot_pull_request(session, snap);
             // Issue #804: newer-only, per the doc comment. Deliberately
             // AFTER the carrier `overlay_snapshot_fields` pushed, which keeps
             // its minted stamp: the carrier's timestamp feeds the pane's event
@@ -12170,6 +12213,7 @@ impl AppState {
                     card.last_activity = observed;
                 }
                 overlay_snapshot_fields(card, snap);
+                take_snapshot_pull_request(card, snap);
                 // Qodo, PR #1559: the overlay can push a live-target carrier
                 // outside the accounted path; see `forget_unproven_journal_count`.
                 if let Some(entry) = self.unproven_sessions.get_mut(&card.session_id) {

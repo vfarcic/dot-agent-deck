@@ -24398,6 +24398,29 @@ mod tests {
         );
     }
 
+    /// PRD #1401: an earlier launch settling AFTER a later one queued its
+    /// outcome must not replace that outcome in the one-slot queue, or the
+    /// render loop drops the earlier one as stale and the later one is lost.
+    #[test]
+    fn an_older_pull_request_launch_cannot_overwrite_a_newer_queued_one() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
+    }
+
     /// Scenario: Open the schedule manager with no configured entries and
     /// inspect its rendered title. The dialog must call the collection
     /// "Schedules" even when the list is empty.

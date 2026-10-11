@@ -590,10 +590,18 @@ fn hand_off(url: &Url) {
     match HAND_OFF.admit(Instant::now()) {
         Admission::Launch => {
             let url = url.clone();
-            std::thread::spawn(move || {
-                open_in_system_browser(&url);
+            let launch = std::thread::Builder::new()
+                .name("pr-hand-off".into())
+                .spawn(move || {
+                    open_in_system_browser(&url);
+                    HAND_OFF.finished();
+                });
+            if let Err(error) = launch {
+                eprintln!(
+                    "dot-agent-deck-desktop: could not start a thread to open the system browser: {error}"
+                );
                 HAND_OFF.finished();
-            });
+            }
         }
         Admission::Drop { report: true } => eprintln!(
             "dot-agent-deck-desktop: the pull request page asked for more pages in the system browser than one every {} ms; dropping the rest until it pauses",
@@ -826,20 +834,46 @@ pub fn scroll<R: Runtime>(app: &AppHandle<R>, scroll: Scroll) -> Result<(), Stri
 }
 
 /// Open in browser: the page on screen in the system browser, then close —
-/// in that order and only on success ([`handoff_page`]). The launch is
-/// watched for up to [`LAUNCH_GRACE`], so it runs on the blocking pool rather
+/// in that order and only on success ([`handoff_in_session`]). The launch is
+/// watched for about [`LAUNCH_GRACE`], so it runs on the blocking pool rather
 /// than holding up the async runtime, and the caller still awaits its outcome.
 ///
 /// [`LAUNCH_GRACE`]: dot_agent_deck::system_browser::LAUNCH_GRACE
 pub async fn open_external<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let webview = open_webview(app)?;
     let url = webview.url().map_err(|error| error.to_string())?;
+    let generation = GENERATIONS.current();
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        handoff_page(&url, system_browser, || close_browser(&app))
-    })
+    handoff_in_session(
+        url,
+        &SESSION,
+        &GENERATIONS,
+        generation,
+        system_browser,
+        || close_browser(&app),
+    )
     .await
-    .map_err(|error| error.to_string())?
+}
+
+/// [`handoff_page`] for the page of open `generation`: the launch runs on the
+/// blocking pool, and the close after it runs only if that open is still the
+/// current one ([`in_session`]). A page the user closed, or replaced with
+/// another pull request, while the launch was being watched is left alone:
+/// the launch still answers its own outcome, but the page it would close is
+/// no longer the one it was asked about.
+pub async fn handoff_in_session(
+    url: Url,
+    session: &tokio::sync::Mutex<()>,
+    generations: &Generations,
+    generation: u64,
+    open: impl FnOnce(&Url) -> Result<(), String> + Send + 'static,
+    close: impl FnOnce(),
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || handoff_page(&url, open, || ()))
+        .await
+        .map_err(|error| error.to_string())??;
+    in_session(session, generations, generation, close).await;
+    Ok(())
 }
 
 /// The toolbar's Close, `Escape` in the app, and voice's "close".
@@ -2558,6 +2592,49 @@ mod tests {
             assert!(result.is_err(), "{refused}");
             assert!(steps.borrow().is_empty(), "{refused}");
         }
+    }
+
+    /// Scenario: the user presses Open in browser on pull request A, and while
+    /// the launch is still being watched closes A and opens B. A's completion
+    /// must not close B; a hand-off whose session is still current closes its
+    /// page as before.
+    #[tokio::test]
+    async fn a_hand_off_from_an_earlier_open_does_not_close_the_new_one() {
+        let session: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
+        let generations: &'static Generations = Box::leak(Box::new(Generations::new()));
+        let page = url("https://github.com/o/r/pull/7");
+        let closed = std::sync::Arc::new(Mutex::new(0));
+
+        let a = generations.begin();
+        let close = {
+            let closed = closed.clone();
+            move || *closed.lock().unwrap() += 1
+        };
+        let result = handoff_in_session(
+            page.clone(),
+            session,
+            generations,
+            a,
+            move |_| {
+                // During the watch: A closes and B opens.
+                generations.begin();
+                Ok(())
+            },
+            close,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(*closed.lock().unwrap(), 0, "A's hand-off closed B");
+
+        let b = generations.current();
+        let close = {
+            let closed = closed.clone();
+            move || *closed.lock().unwrap() += 1
+        };
+        let result = handoff_in_session(page, session, generations, b, |_| Ok(()), close).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(*closed.lock().unwrap(), 1, "B's own hand-off closes B");
     }
 
     /// Scenario: the page's Escape asks for a close, and before the spawned
