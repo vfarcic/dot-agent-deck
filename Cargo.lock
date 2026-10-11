@@ -7322,6 +7322,7 @@ name = "xtask-linkage-check"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "portable-pty",
  "proc-macro2",
  "regex",
  "serde_json",
