@@ -284,6 +284,8 @@ When it connects, the app checks whether it and the daemon can work together:
 
 **Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
+When the daemon on this machine is an older release that the app can still work with, the app restarts it onto the app's version without being asked when nothing is running on it, and asks first, listing what would stop, when agents are running. See [Desktop app → Daemons → Upgrade the daemon on this machine](desktop/daemons.md#upgrade-the-daemon-on-this-machine).
+
 `daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this: `dot-agent-deck upgrade` and the desktop app's upgrade dialog each offer to upgrade the other ([Keep the CLI and the desktop app on the same release](#keep-the-cli-and-the-desktop-app-on-the-same-release)).
 
 ## How it runs
@@ -415,7 +417,7 @@ Upgrading does not stop a running daemon or its agents. On launch the TUI compar
 
 If you keep an older daemon, features added by the newer release may not work against it; see [Troubleshooting → Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon).
 
-If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. After the desktop app is upgraded, it connects to the running daemon as before; if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
+If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. When the upgraded desktop app finds the daemon on this machine running the older release, it restarts the daemon onto its own version as the TUI does, asking first when agents are running ([Desktop app → Daemons → Upgrade the daemon on this machine](desktop/daemons.md#upgrade-the-daemon-on-this-machine)); if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
 
 ## Versioning
 

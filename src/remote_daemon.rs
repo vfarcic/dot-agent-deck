@@ -233,6 +233,23 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         self.binary.borrow().as_shell_word().to_string()
     }
 
+    /// Whether later commands run the default install, `~/.local/bin`.
+    pub fn runs_default_install(&self) -> bool {
+        *self.binary.borrow() == RemoteDeckBinary::DefaultInstall
+    }
+
+    /// Look for a Homebrew install of the deck on the remote, within the
+    /// probe deadline, the way `connect` does when a row's default install is
+    /// gone ([`crate::remote::discover_homebrew_binary`], issue #1459).
+    /// Changes nothing on the remote, and does not repoint this port.
+    pub fn discover_homebrew(&self) -> Result<Option<RemoteBinaryPath>, SshError> {
+        crate::remote::discover_homebrew_binary_within(
+            &self.executor,
+            &self.target,
+            self.probe_deadline,
+        )
+    }
+
     /// The executor, for a test that asserts what was run.
     #[cfg(test)]
     pub(crate) fn executor_for_tests(&self) -> &E {

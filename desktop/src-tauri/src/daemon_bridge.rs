@@ -406,14 +406,8 @@ impl DaemonLinks {
     pub(crate) async fn refresh_disconnected_reason(&self, endpoint: &Endpoint) -> bool {
         self.refresh_disconnected_reason_with(endpoint, |remote| {
             let endpoint = Endpoint::Remote(remote.clone());
-            match remote_binary_for(&endpoint) {
-                Ok(binary) => {
-                    let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
-                        &remote,
-                        binary.as_ref(),
-                    );
-                    dot_agent_deck::daemon_start::probe_remote(&deck)
-                }
+            match remote_deck_for(&endpoint, &remote) {
+                Ok(deck) => dot_agent_deck::daemon_start::probe_remote(&deck),
                 Err(error) => DisconnectedReason::Unknown(deck_list_problem(
                     &endpoint,
                     dot_agent_deck::daemon_start::StartFailure::CheckFailed,
@@ -1857,25 +1851,39 @@ pub(crate) fn spawn_local_daemon() -> Result<(), String> {
         .map_err(|error| safe_message(error.to_string()))
 }
 
-/// The deck-list row's recorded deck binary for a remote `endpoint` — a
-/// Homebrew install records its own — `Ok(None)` when the row records none,
-/// which runs the default install path, and `Err` when the deck list could
-/// not be read or holds no row for this deck. The two are kept apart (PR #1623
-/// review): running the default path on a failed lookup would report a
-/// recorded non-default install as "not installed". Validated when the row
-/// was read, so it is safe to put in a remote command.
-pub(crate) fn remote_binary_for(
+/// The remote deck a check or a start reaches for `endpoint` (`remote`): it
+/// runs the deck-list row's recorded deck binary — a Homebrew install records
+/// its own — or the default install path when the row records none, and a
+/// Homebrew install found in place of a missing default one is recorded on
+/// that row (issue #1675), as `connect` records it. `Err` when the deck list
+/// could not be read or holds no row for this deck, kept apart from a row with
+/// no binary (PR #1623 review): running the default path on a failed lookup
+/// would report a recorded non-default install as "not installed". The binary
+/// is validated when the row is read, so it is safe to put in a remote command.
+pub(crate) fn remote_deck_for(
     endpoint: &Endpoint,
-) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
-    remote_binary_in(endpoint, &crate::decks::remotes_path())
+    remote: &dot_agent_deck::daemon_client::RemoteEndpoint,
+) -> Result<
+    dot_agent_deck::daemon_start::RemoteDeck<dot_agent_deck::remote::SystemSshExecutor>,
+    String,
+> {
+    remote_deck_in(endpoint, remote, crate::decks::remotes_path())
 }
 
-/// [`remote_binary_for`] against the deck list at `path`.
-fn remote_binary_in(
+/// [`remote_deck_for`] against the deck list at `path`.
+fn remote_deck_in(
     endpoint: &Endpoint,
-    path: &Path,
-) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
-    crate::upgrade::remote_entry_for(endpoint, path).map(|entry| entry.binary)
+    remote: &dot_agent_deck::daemon_client::RemoteEndpoint,
+    path: PathBuf,
+) -> Result<
+    dot_agent_deck::daemon_start::RemoteDeck<dot_agent_deck::remote::SystemSshExecutor>,
+    String,
+> {
+    let entry = crate::upgrade::remote_entry_for(endpoint, &path)?;
+    Ok(
+        dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(remote, entry.binary.as_ref())
+            .recording_to(path, entry),
+    )
 }
 
 /// What a failed deck-list lookup means for a check or a start on
@@ -1919,8 +1927,8 @@ pub(crate) async fn start_deck_daemon(endpoint: &Endpoint) -> StartOutcome {
             let remote = remote.clone();
             let lookup = endpoint.clone();
             tokio::task::spawn_blocking(move || {
-                let binary = match remote_binary_for(&lookup) {
-                    Ok(binary) => binary,
+                let deck = match remote_deck_for(&lookup, &remote) {
+                    Ok(deck) => deck,
                     Err(error) => {
                         return StartOutcome::Failed(deck_list_problem(
                             &lookup,
@@ -1929,10 +1937,6 @@ pub(crate) async fn start_deck_daemon(endpoint: &Endpoint) -> StartOutcome {
                         ));
                     }
                 };
-                let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
-                    &remote,
-                    binary.as_ref(),
-                );
                 dot_agent_deck::daemon_start::start_remote(&deck, Default::default())
             })
             .await
@@ -8060,20 +8064,27 @@ start = true
             )
         };
         let (brew, plain) = (endpoint_of(0), endpoint_of(1));
+        let binary_run = |endpoint: &Endpoint| {
+            let Endpoint::Remote(remote) = endpoint else {
+                panic!("a remote deck")
+            };
+            remote_deck_in(endpoint, remote, path.clone()).map(|deck| deck.port.binary())
+        };
 
         assert_eq!(
-            remote_binary_in(&brew, &path)
-                .unwrap()
-                .map(|binary| binary.as_str().to_string()),
-            Some("/opt/homebrew/bin/dot-agent-deck".to_string())
+            binary_run(&brew).unwrap(),
+            "/opt/homebrew/bin/dot-agent-deck"
         );
-        assert_eq!(remote_binary_in(&plain, &path).unwrap(), None);
+        assert_eq!(
+            binary_run(&plain).unwrap(),
+            dot_agent_deck::remote::REMOTE_INSTALL_PATH
+        );
 
         // The row is gone, and then the file is unreadable: both fail.
         std::fs::write(&path, "").unwrap();
-        assert!(remote_binary_in(&brew, &path).is_err());
+        assert!(binary_run(&brew).is_err());
         std::fs::write(&path, "[[remotes]\nnot toml").unwrap();
-        let error = remote_binary_in(&brew, &path).unwrap_err();
+        let error = binary_run(&brew).unwrap_err();
 
         let problem = deck_list_problem(
             &brew,

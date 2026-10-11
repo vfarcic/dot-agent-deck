@@ -104,6 +104,19 @@ describe("the dashboard's Upgrade action", () => {
     expect(onNavigate).toHaveBeenCalled();
   });
 
+  /** Scenario: With voice on, a modal this screen did not open (the shell's own Upgrade dialog) also keeps a digit from opening a row behind it. */
+  it("keeps the dashboard's number keys off under a modal it does not own", () => {
+    const onNavigate = vi.fn();
+    const view = render(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} /><div role="alertdialog" aria-modal="true" data-testid="shell-modal" /></VoiceOn.Provider>);
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(onNavigate).not.toHaveBeenCalled();
+
+    // The control: the same digit once that modal is gone opens the first row.
+    view.rerender(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} /></VoiceOn.Provider>);
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(onNavigate).toHaveBeenCalled();
+  });
+
   /** Scenario: A runtime that cannot upgrade offers no button rather than one that does nothing. */
   it("offers no button when the runtime cannot upgrade", () => {
     render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"), { upgradeDaemon: undefined })} onNavigate={vi.fn()} />);

@@ -5232,8 +5232,15 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 ##### remote/start/003 — Missing installs and unreachable remote hosts explain the failure.
 - **Layer:** L2 (lane 1, shared start functions, sandbox SSH shell shim).
 - **Agent:** none.
-- **Asserts:** probes and starts classify a missing binary as not-installed with a remote add remedy, and an SSH connection refusal as host-unreachable naming the host; the suggested action is Reconnect and no daemon spawns.
+- **Asserts:** probes and starts classify a missing binary as not-installed with a remedy naming `remote add` (and Homebrew), and an SSH connection refusal as host-unreachable naming the host; the suggested action is Reconnect and no daemon spawns.
 - **Does not assert:** real network failure, SSH authentication or host-key verification.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/004 — A Homebrew-only host is found, started and recorded (issue #1675).
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim, stand-in `brew` on the remote PATH).
+- **Agent:** none.
+- **Asserts:** with the deck-list row recording no binary and `~/.local/bin/dot-agent-deck` missing, the check finds the Homebrew binary and reports not-running (not not-installed); the row now records `install = "homebrew"` and that binary; a start from the recorded row runs it, returns Started, and the daemon answers Hello at the configured socket with one spawn.
+- **Does not assert:** a real Homebrew install or SSH server, the desktop's rendering, or a start that itself discovers the binary (the unit tests in `src/daemon_start.rs` cover that path).
 - **Platform coverage:** linux+mac.
 
 #### lifecycle/daemon-start

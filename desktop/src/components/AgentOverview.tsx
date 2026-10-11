@@ -8,7 +8,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { upgradeOffered } from "../lib/upgrade";
+import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
 import { HostMetricsPanel } from "./HostMetricsPanel";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
@@ -1243,6 +1243,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   useEffect(() => {
     if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      // A modal this screen does not own covers it too, such as the Upgrade
+      // dialog the shell opens on its own (issue #1636): a digit pressed in it
+      // must not open a row hidden behind it.
       if (modalOpen()) return;
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
@@ -1531,10 +1534,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               /*
                 PRD #1487 D8/D9: Upgrade on THIS deck's card, offered only when
-                the crate says its daemon runs an older release than the app.
+                the crate says its daemon runs an older release than the app —
+                on the local deck too since issue #1636, as a restart onto this
+                app's build.
               */
               onUpgrade={runtime.upgradeDaemon && upgradeOffered(deck.snapshot.connection) && deck.snapshot.connection.deckId !== undefined
-                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: "upgrade", offer: deck.snapshot.connection.upgradeOffer })
+                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: upgradeKindOf(deck.snapshot.connection), offer: deck.snapshot.connection.upgradeOffer })
                 : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
@@ -1765,7 +1770,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
-        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${deckName(connection)}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
+        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 

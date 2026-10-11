@@ -52,7 +52,7 @@ import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
-import { upgradeOffered } from "./lib/upgrade";
+import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
@@ -64,6 +64,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
+import { useLocalUpgradeAtStart } from "./hooks/useLocalUpgradeAtStart";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { useVoiceOn, VoiceOn } from "./hooks/useVoiceOn";
 import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, VoiceNumberingContext, type NumberedLayer, type VoiceNumbering } from "./hooks/useVoiceNumbers";
@@ -673,7 +674,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * `false` as it unmounts.
    */
   // voice-registry-exempt: a mirror of the mounted screen's own confirmation state, written only by its report so the voice panel can see it; it opens nothing
-  const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const [screenConfirmationOpen, setConfirmationOpen] = useState(false);
+  /**
+   * Issue #1636 — the Upgrade dialog the app opens on its own when the local
+   * daemon runs an older release than this app. The shell's, not a screen's:
+   * it belongs to whichever screen is up, and counts as a confirmation for the
+   * voice gate because it can ask whether to stop agents.
+   */
+  const localUpgrade = useLocalUpgradeAtStart(runtime);
+  const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined;
 
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
@@ -1084,6 +1093,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
+        {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
       </KeyboardInput.Provider>
       </VoiceChoiceOpen.Provider>
       </DialogNumbered.Provider>
@@ -1887,11 +1897,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     setUpgrade({ deckId, deckName: deckName(snapshot.connection), kind: "replace" });
   };
 
-  /** PRD #1487 D9: Upgrade on a remote deck whose daemon is older than this app. */
+  /**
+   * PRD #1487 D9: Upgrade on a deck whose daemon is older than this app — an
+   * install on a remote deck, a restart onto this app's build on the local
+   * one (issue #1636).
+   */
   const requestUpgrade = () => {
     const deckId = snapshot.connection.deckId;
     if (!offersUpgrade || deckId === undefined) return;
-    setUpgrade({ deckId, deckName: deckName(snapshot.connection), kind: "upgrade", offer: snapshot.connection.upgradeOffer });
+    setUpgrade({ deckId, deckName: deckName(snapshot.connection), kind: upgradeKindOf(snapshot.connection), offer: snapshot.connection.upgradeOffer });
   };
 
   /**
@@ -2165,7 +2179,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
-            {offersUpgrade && !upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon" title={`Upgrade the daemon on ${deckName(snapshot.connection)} to this app's version`} onClick={requestUpgrade}><ArrowUpCircleIcon size={14} /><span>Upgrade</span></button>}
+            {offersUpgrade && !upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon" title={`Upgrade the daemon on ${remoteDeck ? deckName(snapshot.connection) : "this machine"} to this app's version`} onClick={requestUpgrade}><ArrowUpCircleIcon size={14} /><span>Upgrade</span></button>}
             <button
               className="button danger compact"
               data-testid="stop-run"

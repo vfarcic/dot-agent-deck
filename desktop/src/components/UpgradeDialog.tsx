@@ -60,19 +60,27 @@ type Phase =
  * An answer chosen with the buttons stays on screen until it has been
  * delivered: the upgrade waits for it, so one that did not arrive is said so,
  * with the question still there to answer again.
+ *
+ * `autoStart` skips the confirmation and starts at once: the app upgrading the
+ * local daemon on its own at launch, as the TUI does (issue #1636). Nothing is
+ * stopped on that path without the same explicit Restart now — the daemon asks
+ * whenever something is running on it.
  */
-export function UpgradeDialog({ target, runtime, onClose }: {
+export function UpgradeDialog({ target, runtime, onClose, autoStart = false }: {
   target: UpgradeTarget;
   runtime: Pick<DeckRuntimeState, "upgradeDaemon" | "decideUpgrade">;
   onClose: () => void;
+  autoStart?: boolean;
 }) {
-  const [state, setState] = useState<Phase>({ phase: "confirm" });
+  const [state, setState] = useState<Phase>(autoStart && runtime.upgradeDaemon ? { phase: "running" } : { phase: "confirm" });
   /** The question still waiting, for the unmount answer below. */
   const pendingQuestion = useRef<QuestionRef | undefined>(undefined);
   /** The question a button's answer is on its way to, if any. */
   const answering = useRef<QuestionRef | undefined>(undefined);
   const deck = displayText(target.deckName, DISPLAY_LIMITS.name);
   const replace = target.kind === "replace";
+  /* The local deck's daemon is the one on this machine, whatever the deck is called. */
+  const where = target.kind === "upgrade" ? deck : "this machine";
 
   const send = (question: QuestionRef, choice: UpgradeChoice): Promise<void> => runtime.decideUpgrade
     ? runtime.decideUpgrade(question.upgradeId, question.questionId, choice)
@@ -140,6 +148,23 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     );
   };
 
+  /* Focus inside the dialog from the start, so Escape and Tab reach it: an
+     autoStart dialog opens in its running phase, with no button to take it,
+     over whatever had focus (Qodo, PR #1640). A button that autofocused keeps it. */
+  const section = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const element = section.current;
+    if (element && !element.contains(document.activeElement)) element.focus();
+  }, []);
+
+  /* Started once, however often React runs the effect (StrictMode runs it twice). */
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (!autoStart || autoStarted.current || !runtime.upgradeDaemon) return;
+    autoStarted.current = true;
+    start();
+  }, []);
+
   const decide = (choice: UpgradeChoice) => {
     if (state.phase !== "deciding" || state.answering) return;
     const question: QuestionRef = { upgradeId: state.question.upgradeId, questionId: state.question.questionId };
@@ -184,15 +209,17 @@ export function UpgradeDialog({ target, runtime, onClose }: {
   };
 
   const title = state.phase === "confirm"
-    ? (replace ? "Replace the incompatible daemon?" : `Upgrade the daemon on ${deck}?`)
+    ? (replace ? "Replace the incompatible daemon?" : `Upgrade the daemon on ${where}?`)
     : state.phase === "deciding" ? "Restart and stop these?"
       : state.phase === "done" ? outcomeView(state.outcome, deck, target.kind).title
         : state.phase === "error" ? (replace ? "Replace daemon could not start" : "Upgrade could not start")
-          : replace ? "Replacing the daemon…" : `Upgrading ${deck}…`;
+          : replace ? "Replacing the daemon…" : target.kind === "local-upgrade" ? "Upgrading the daemon on this machine…" : `Upgrading ${deck}…`;
 
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={dismiss}>
       <section
+        ref={section}
+        tabIndex={-1}
         className="confirm-dialog upgrade-dialog"
         role="alertdialog"
         aria-modal="true"
@@ -213,7 +240,7 @@ export function UpgradeDialog({ target, runtime, onClose }: {
         <h2 id="upgrade-title">{title}</h2>
         {state.phase === "confirm" && <ConfirmBody target={target} deck={deck} onCancel={onClose} onStart={start} available={Boolean(runtime.upgradeDaemon)} />}
         {(state.phase === "running" || state.phase === "deciding") && <StageList stage={state.stage} kind={target.kind} />}
-        {state.phase === "deciding" && <DecisionBody question={state.question} deck={replace ? "this machine" : deck} kind={target.kind} answering={state.answering} undelivered={state.undelivered ?? false} onDecide={decide} />}
+        {state.phase === "deciding" && <DecisionBody question={state.question} deck={where} kind={target.kind} answering={state.answering} undelivered={state.undelivered ?? false} onDecide={decide} />}
         {state.phase === "done" && <OutcomeBody outcome={state.outcome} deck={deck} kind={target.kind} onClose={onClose} />}
         {state.phase === "error" && (
           <>
@@ -231,7 +258,9 @@ function ConfirmBody({ target, deck, available, onCancel, onStart }: { target: U
   const offer = target.offer?.kind === "offered" ? target.offer : undefined;
   const body = target.kind === "replace"
     ? "Agent Deck stops the daemon running on this machine and starts the one that came with this app. If agents or orchestration roles are running on it, you are shown each one and asked before anything is stopped."
-    : `This installs ${offer ? displayText(offer.to, DISPLAY_LIMITS.name) : "this app's version"} on ${deck}${offer ? ` (its daemon runs ${displayText(offer.from, DISPLAY_LIMITS.name)} now)` : ""} and restarts the daemon onto it. If agents or orchestration roles are running there, you are shown each one and asked before anything is stopped.`;
+    : target.kind === "local-upgrade"
+      ? `The daemon on this machine runs ${offer ? displayText(offer.from, DISPLAY_LIMITS.name) : "an older version"}, and this app is ${offer ? displayText(offer.to, DISPLAY_LIMITS.name) : "newer"}. Agent Deck restarts the daemon onto the version that came with this app. If agents or orchestration roles are running on it, you are shown each one and asked before anything is stopped.`
+      : `This installs ${offer ? displayText(offer.to, DISPLAY_LIMITS.name) : "this app's version"} on ${deck}${offer ? ` (its daemon runs ${displayText(offer.from, DISPLAY_LIMITS.name)} now)` : ""} and restarts the daemon onto it. If agents or orchestration roles are running there, you are shown each one and asked before anything is stopped.`;
   return (
     <>
       <p data-testid="upgrade-confirm-body">{body}</p>
@@ -268,7 +297,9 @@ function DecisionBody({ question, deck, kind, answering, undelivered, onDecide }
       <StopList lines={stopSetLines(question.atStake)} testId="upgrade-at-stake" />
       <p className="upgrade-hint">{kind === "replace"
         ? "Keep current daemon leaves them running on the daemon you have now."
-        : "Keep current daemon leaves them running on the old version; the new version stays installed for its next restart."}</p>
+        : kind === "local-upgrade"
+          ? "Keep current daemon leaves them running on the old version. Press Upgrade when they have finished."
+          : "Keep current daemon leaves them running on the old version; the new version stays installed for its next restart."}</p>
       {undelivered && <p role="alert" data-testid="upgrade-decision-error">Your answer did not reach Agent Deck, so nothing has been stopped or restarted yet. Choose again to retry.</p>}
       <div>
         <button className="button secondary" data-testid="upgrade-keep-current" autoFocus onClick={() => onDecide("keep-current")}>Keep current daemon</button>
