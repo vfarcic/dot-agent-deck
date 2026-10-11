@@ -433,6 +433,13 @@ fn unit_detail_lines(out: &mut String, t: &CloseTarget) {
     }
 }
 
+/// The note for a target whose lists the daemon cut short.
+fn truncated_line(out: &mut String, t: &CloseTarget) {
+    if t.truncated {
+        out.push_str("    (more than this is shown: the daemon cut the list short)\n");
+    }
+}
+
 /// The human-readable report.
 pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> String {
     let mut out = String::new();
@@ -478,6 +485,12 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
             "listed only the first {} units; more are running. Close these, then list again.\n",
             listed.len() + closed.len() + refused.len()
         ));
+    } else if preview.is_some_and(|p| p.truncated) {
+        // `--all --yes` applied a listing that was cut short (reviewer nit-1).
+        out.push_str(
+            "closed only the units the listing above named; more are running. Run it again \
+             to close the rest.\n",
+        );
     }
     if report.dry_run {
         if listed.is_empty() && refused.is_empty() {
@@ -496,6 +509,7 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
                     codes.join(", ")
                 ));
             }
+            truncated_line(&mut out, t);
         }
     }
     if !closed.is_empty() {
@@ -527,6 +541,7 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
                     shown(&d.clone)
                 ));
             }
+            truncated_line(&mut out, t);
         }
     }
     if !refused.is_empty() {
@@ -554,6 +569,7 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
                         .join(", ")
                 ));
             }
+            truncated_line(&mut out, t);
         }
     }
     let worktrees: Vec<&CloseTarget> = report
@@ -827,6 +843,32 @@ mod tests {
             "bidi override must be escaped: {text}"
         );
         assert!(text.contains("evil\\nname"), "{text}");
+    }
+
+    /// Scenario: reviewer nit-1 — `--all --yes` applied a listing the daemon
+    /// cut short. The human report of the closes says more are still running,
+    /// and a target whose own list was cut says so too.
+    #[test]
+    fn an_applied_truncated_listing_says_more_are_running() {
+        let mut closed = target(CloseOutcome::Closed);
+        closed.truncated = true;
+        let preview = CloseReport {
+            dry_run: true,
+            truncated: true,
+            ..CloseReport::default()
+        };
+        let text = render_human(
+            &CloseReport {
+                targets: vec![closed],
+                ..CloseReport::default()
+            },
+            Some(&preview),
+        );
+        assert!(
+            text.contains("closed only the units the listing above named; more are running"),
+            "{text}"
+        );
+        assert!(text.contains("the daemon cut the list short"), "{text}");
     }
 
     /// Scenario: `--unit-id` names units by the ids a listing printed and

@@ -5623,7 +5623,14 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_close_revalidation_for_test`].
     #[cfg(test)]
     close_revalidation_pause: RespawnPause,
+    /// PRD #1589 test seam: see [`Self::pause_at_for_test`].
+    #[cfg(test)]
+    named_pauses: NamedPauses,
 }
+
+/// See [`AgentPtyRegistry::pause_at_for_test`].
+#[cfg(test)]
+type NamedPauses = Mutex<HashMap<String, (oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
 /// See [`AgentPtyRegistry::pause_next_publish_for_test`].
 #[cfg(test)]
@@ -7572,6 +7579,8 @@ impl AgentPtyRegistry {
             role_registration_pause: Mutex::new(None),
             #[cfg(test)]
             close_revalidation_pause: Mutex::new(None),
+            #[cfg(test)]
+            named_pauses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -10839,6 +10848,7 @@ impl AgentPtyRegistry {
             dir,
             root_dirs.clone(),
             instance.as_deref(),
+            admission.is_admitted_respawn(),
         )?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -10966,8 +10976,12 @@ impl AgentPtyRegistry {
         // PRD #1589 D4: a spawn that reserved before a `close` of its instance
         // began, and is publishing after, is refused here — its child killed by
         // `guard` — so it cannot add a pane the close's membership did not see.
+        // An admitted respawn is exempt while the close is undecided: the close
+        // waits for it before taking its membership, so what it publishes is a
+        // member the close stops if it commits, and keeps if it refuses
+        // (auditor B1).
         if let Some(instance) = instance.as_deref()
-            && Self::instance_refuses_spawns_locked(&inner, instance)
+            && Self::instance_refuses_join_locked(&inner, instance, admission.is_admitted_respawn())
         {
             reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn(INSTANCE_CLOSING_REASON.into()));
@@ -13006,9 +13020,11 @@ impl AgentPtyRegistry {
             // admission state under this lock too, so a respawn either sees the
             // close and leaves the running generation exactly as it was, or is
             // admitted first and counted in `respawning_members`, where the
-            // close finds it and waits for it to settle. Refusing at the fresh
-            // spawn instead — which also happens — would come after the old
-            // child was terminated: a refused respawn that destroyed its pane.
+            // close finds it and waits for it to settle. Its replacement is
+            // then let through the close's admission state (only a finished
+            // close refuses it), because refusing at the fresh spawn would come
+            // after the old child was terminated: a close that went on to
+            // refuse would have destroyed the pane (auditor B1).
             if let Some(instance) = inner.agents.get(&agent_id).and_then(|a| {
                 orchestration_instance_of(a.tab_membership.as_ref()).map(str::to_string)
             }) && Self::instance_refuses_spawns_locked(&inner, &instance)
@@ -15939,13 +15955,16 @@ impl AgentPtyRegistry {
         dir: SpawnDir<'_>,
         spawn_dirs: Vec<PathBuf>,
         instance: Option<&str>,
+        admitted_respawn: bool,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
         let mut inner = self.inner.lock().unwrap();
         // PRD #1589 D4: no pane joins an instance a `close` is taking down or
         // has finished. Under the same acquisition as the reservation, so a
-        // close that begins after this check sees the reservation instead.
+        // close that begins after this check sees the reservation instead. An
+        // admitted respawn's replacement is refused only once the close has
+        // finished; see `instance_refuses_join_locked`.
         if let Some(instance) = instance
-            && Self::instance_refuses_spawns_locked(&inner, instance)
+            && Self::instance_refuses_join_locked(&inner, instance, admitted_respawn)
         {
             return Err(AgentPtyError::Spawn(INSTANCE_CLOSING_REASON.into()));
         }
@@ -16101,7 +16120,14 @@ impl AgentPtyRegistry {
     pub fn reserve_spawn_for_test(&self, pane_id: Option<&str>) -> (String, String) {
         let token = crate::hook_provenance::mint();
         let (id, mut reservation) = self
-            .reserve_spawn(&pane_id.map(str::to_string), &token, None, Vec::new(), None)
+            .reserve_spawn(
+                &pane_id.map(str::to_string),
+                &token,
+                None,
+                Vec::new(),
+                None,
+                false,
+            )
             .expect("reserve a spawn");
         // Disarm the guard so the reservation outlives this call.
         reservation.id = None;
@@ -16120,7 +16146,7 @@ impl AgentPtyRegistry {
     ) -> Result<String, AgentPtyError> {
         let token = crate::hook_provenance::mint();
         let (id, mut reservation) =
-            self.reserve_spawn(&None, &token, None, vec![cwd.to_path_buf()], None)?;
+            self.reserve_spawn(&None, &token, None, vec![cwd.to_path_buf()], None, false)?;
         reservation.id = None;
         Ok(id)
     }
@@ -16191,6 +16217,26 @@ impl AgentPtyRegistry {
     fn instance_refuses_spawns_locked(inner: &RegistryInner, instance: &str) -> bool {
         inner.closing_instances.contains(instance)
             || inner.ended_instances.iter().any(|ended| ended == instance)
+    }
+
+    /// PRD #1589 (auditor B1): whether a spawn joining `instance` is refused.
+    /// A fresh spawn is refused while a close holds the instance and after one
+    /// finished it. An admitted respawn's replacement — whose old generation
+    /// was already lifted out before the close opened — is refused only after
+    /// a close finished: while the close is undecided it waits for the respawn
+    /// before taking its membership, so the replacement is stopped as a member
+    /// if the close commits, and keeps the pane if the close refuses, instead
+    /// of a refused close leaving the role with no agent.
+    fn instance_refuses_join_locked(
+        inner: &RegistryInner,
+        instance: &str,
+        admitted_respawn: bool,
+    ) -> bool {
+        if admitted_respawn {
+            inner.ended_instances.iter().any(|ended| ended == instance)
+        } else {
+            Self::instance_refuses_spawns_locked(inner, instance)
+        }
     }
 
     /// PRD #1589 D4: open the instance-scoped Closing admission state for
@@ -16326,6 +16372,46 @@ impl AgentPtyRegistry {
     /// PRD #1589: whether a close holds `instance` right now, or finished it.
     pub fn is_instance_closing(&self, instance: &str) -> bool {
         Self::instance_refuses_spawns_locked(&self.inner.lock().unwrap(), instance)
+    }
+
+    /// PRD #1589 (auditor S1): whether a close finished `instance`, so nothing
+    /// may be published or recorded for it any more.
+    pub fn is_instance_ended(&self, instance: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .ended_instances
+            .iter()
+            .any(|ended| ended == instance)
+    }
+
+    /// PRD #1589 test seam: the next time [`Self::pause_point`] is reached
+    /// with `name`, it reports on the returned receiver and waits for the
+    /// returned sender.
+    #[cfg(test)]
+    pub(crate) fn pause_at_for_test(
+        &self,
+        name: &str,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.named_pauses
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Where [`Self::pause_at_for_test`] waits. A no-op outside tests.
+    pub(crate) async fn pause_point(&self, _name: &str) {
+        #[cfg(test)]
+        {
+            let pause = self.named_pauses.lock().unwrap().remove(_name);
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
     }
 
     /// PRD #1589: the record of dispatched units. Held only for pure reads and

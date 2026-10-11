@@ -3064,9 +3064,15 @@ pub struct CloseTarget {
     /// transitive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_descendants: Vec<OpenDescendant>,
-    /// For [`CloseRefusalReason::Ambiguous`]: every unit the name matched.
+    /// For [`CloseRefusalReason::Ambiguous`]: the units the name matched, at
+    /// most `crate::close_agents::MAX_LISTED_TARGETS` of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<AmbiguousCandidate>,
+    /// One of this entry's lists — `candidates`, a candidate's `panes`,
+    /// `open_descendants` or `panes` — was cut short: there was more than the
+    /// report lists (auditor S3). Additive; absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl CloseTarget {
@@ -3095,6 +3101,7 @@ impl CloseTarget {
             worktree_verdict: None,
             open_descendants: Vec::new(),
             candidates: Vec::new(),
+            truncated: false,
         }
     }
 }

@@ -65,8 +65,9 @@ const MEMBERSHIP_ROUNDS: usize = 4;
 /// are typed or copied out of a listing, so a few hundred is far past any real
 /// request while keeping the work and the report one request can cause small.
 /// A larger selector is refused whole ([`CloseRefusalReason::SelectorTooLarge`])
-/// before anything is resolved or stopped; this bound is also what keeps the
-/// report for an accepted request well inside the attach frame.
+/// before anything is resolved or stopped. It bounds how many targets one
+/// report has; what each target lists is bounded separately
+/// ([`MAX_LISTED_TARGETS`], [`MAX_NESTED_REPORT_BYTES`]).
 pub const MAX_SELECTOR_ENTRIES: usize = 256;
 
 /// PRD #1589 (auditor S4): the longest single selector entry, in bytes. A
@@ -79,35 +80,144 @@ pub const MAX_SELECTOR_ENTRY_BYTES: usize = 512;
 pub const MAX_SELECTOR_BYTES: usize = 32 * 1024;
 
 /// PRD #1589 (auditor S4): the most units `--all` lists in one report, and the
-/// most candidates an `ambiguous` refusal lists. A daemon holding more live
-/// units than this lists the first ones and says the listing was cut short
-/// ([`CloseReport::truncated`]).
+/// most entries any one list in a target's report holds — an `ambiguous`
+/// refusal's candidates, a candidate's panes, a target's open descendants and
+/// panes. A daemon holding more live units than this lists the first ones and
+/// says the listing was cut short ([`CloseReport::truncated`]); a cut list says
+/// so on its target ([`CloseTarget::truncated`]). Applied while the entries are
+/// collected, not after (auditor S3).
 pub const MAX_LISTED_TARGETS: usize = MAX_SELECTOR_ENTRIES;
 
+/// PRD #1589 (auditor S3): the most bytes, approximately, that all of one
+/// report's nested lists — panes, open descendants, candidates and their
+/// panes — may add up to. Each entry is costed as the bytes of its strings
+/// plus [`NESTED_ENTRY_OVERHEAD`]; once an entry does not fit, it and every
+/// later nested entry of the report are left out and their targets marked
+/// [`CloseTarget::truncated`]. A target's own fields are not counted here.
+pub const MAX_NESTED_REPORT_BYTES: usize = 4 * 1024 * 1024;
+
+/// What [`MAX_NESTED_REPORT_BYTES`] charges a nested entry beyond its strings:
+/// its field names and punctuation once serialized.
+const NESTED_ENTRY_OVERHEAD: usize = 128;
+
+/// How many times one target is retried when the unit it names moved to a new
+/// generation while it was being closed (auditor S2). Each retry re-reads the
+/// unit's generation from the ledger; a unit that keeps being replaced fails.
+const REBIND_ATTEMPTS: usize = 3;
+
 /// The whole-request refusal for a selector past the limits above, or `None`.
+/// The entry count is read from the slice's length before any entry is looked
+/// at, so an oversized selector costs nothing proportional to its size; only an
+/// accepted count of entries is walked for their bytes (auditor S3).
 fn selector_too_large(selector: &CloseSelector) -> Option<CloseRefusal> {
-    let entries: Vec<&str> = match selector {
-        CloseSelector::Units(units) => units.names.iter().map(String::as_str).collect(),
-        CloseSelector::UnitIds { ids } => ids.iter().map(String::as_str).collect(),
+    let entries: &[String] = match selector {
+        CloseSelector::Units(units) => &units.names,
+        CloseSelector::UnitIds { ids } => ids,
         CloseSelector::Pane { pane_id } | CloseSelector::OrchestrationOf { pane_id } => {
-            vec![pane_id.as_str()]
+            std::slice::from_ref(pane_id)
         }
-        CloseSelector::AllUnits => Vec::new(),
+        CloseSelector::AllUnits => &[],
     };
-    let total: usize = entries.iter().map(|e| e.len()).sum();
-    let too_long = entries.iter().any(|e| e.len() > MAX_SELECTOR_ENTRY_BYTES);
-    if entries.len() <= MAX_SELECTOR_ENTRIES && !too_long && total <= MAX_SELECTOR_BYTES {
+    let limits = format!(
+        "refused: a close names at most {MAX_SELECTOR_ENTRIES} entries of at most \
+         {MAX_SELECTOR_ENTRY_BYTES} bytes each, {MAX_SELECTOR_BYTES} bytes in all"
+    );
+    let advice = "Nothing was closed; close them in smaller batches.";
+    if entries.len() > MAX_SELECTOR_ENTRIES {
+        return Some(CloseRefusal {
+            reason: CloseRefusalReason::SelectorTooLarge,
+            message: format!(
+                "{limits}; this one names {} entries. {advice}",
+                entries.len()
+            ),
+        });
+    }
+    let total: usize = entries.iter().map(String::len).sum();
+    if entries.iter().all(|e| e.len() <= MAX_SELECTOR_ENTRY_BYTES) && total <= MAX_SELECTOR_BYTES {
         return None;
     }
     Some(CloseRefusal {
         reason: CloseRefusalReason::SelectorTooLarge,
         message: format!(
-            "refused: a close names at most {MAX_SELECTOR_ENTRIES} entries of at most \
-             {MAX_SELECTOR_ENTRY_BYTES} bytes each, {MAX_SELECTOR_BYTES} bytes in all; this one \
-             names {} entries, {total} bytes. Nothing was closed; close them in smaller batches.",
+            "{limits}; this one names {} entries, {total} bytes. {advice}",
             entries.len()
         ),
     })
+}
+
+/// PRD #1589 (auditor S3): what is left of one report's
+/// [`MAX_NESTED_REPORT_BYTES`].
+struct ReportBudget {
+    remaining: usize,
+}
+
+impl ReportBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_NESTED_REPORT_BYTES,
+        }
+    }
+
+    /// Charge `cost`, or answer `false` — and spend the rest, so every later
+    /// nested entry is left out too — when it does not fit.
+    fn take(&mut self, cost: usize) -> bool {
+        if cost > self.remaining {
+            self.remaining = 0;
+            return false;
+        }
+        self.remaining -= cost;
+        true
+    }
+
+    /// Keep the entries of `list` that fit, in order; `true` when one was cut.
+    fn fit<T>(&mut self, list: &mut Vec<T>, cost: impl Fn(&T) -> usize) -> bool {
+        let mut kept = 0;
+        for entry in list.iter() {
+            if !self.take(cost(entry)) {
+                break;
+            }
+            kept += 1;
+        }
+        let cut = kept < list.len();
+        list.truncate(kept);
+        cut
+    }
+}
+
+fn opt_len(s: &Option<String>) -> usize {
+    s.as_ref().map_or(0, String::len)
+}
+
+/// Fit one finished target's nested lists into the report's budget, marking it
+/// truncated when anything was cut. Panes first: they say what was stopped.
+fn fit_to_budget(target: &mut CloseTarget, budget: &mut ReportBudget) {
+    let panes = budget.fit(&mut target.panes, |p| {
+        NESTED_ENTRY_OVERHEAD
+            + p.agent_id.len()
+            + opt_len(&p.pane_id)
+            + opt_len(&p.role)
+            + opt_len(&p.status)
+    });
+    let descendants = budget.fit(&mut target.open_descendants, |d| {
+        NESTED_ENTRY_OVERHEAD + d.unit_id.len() + d.name.len() + d.clone.len()
+    });
+    let candidates = budget.fit(&mut target.candidates, |c| {
+        NESTED_ENTRY_OVERHEAD
+            + c.unit_id.len()
+            + c.name.len()
+            + c.worktree.len()
+            + c.panes.iter().map(|p| p.len() + 4).sum::<usize>()
+    });
+    target.truncated |= panes || descendants || candidates;
+}
+
+/// At most [`MAX_LISTED_TARGETS`] items of `items`, and whether there were more
+/// — taking one past the limit to know, and no further.
+fn listed<T>(items: impl IntoIterator<Item = T>) -> (Vec<T>, bool) {
+    let mut items = items.into_iter();
+    let kept: Vec<T> = items.by_ref().take(MAX_LISTED_TARGETS).collect();
+    let more = items.next().is_some();
+    (kept, more)
 }
 
 /// The person-or-agent label for logs and reports.
@@ -299,14 +409,16 @@ fn generation_on_pane(pane_id: &str, registry: &AgentPtyRegistry) -> Option<Agen
     registry.agent_record_any(&id)
 }
 
-/// Step 2: resolve the selector into targets and refusals.
+/// Step 2: resolve the selector into targets and refusals, and whether `--all`
+/// had more live units than it lists.
 fn resolve(
     selector: &CloseSelector,
     caller: &Caller,
     registry: &AgentPtyRegistry,
-) -> (Vec<Resolved>, Vec<CloseTarget>) {
+) -> (Vec<Resolved>, Vec<CloseTarget>, bool) {
     let mut resolved = Vec::new();
     let mut refused = Vec::new();
+    let mut truncated = false;
     match selector {
         CloseSelector::Units(units) => {
             let mut seen_slugs = HashSet::new();
@@ -318,9 +430,11 @@ fn resolve(
                 // candidates' panes are read from the registry.
                 let resolution = {
                     let records = registry.dispatched_units();
-                    match records.resolve_name(name, caller) {
+                    match records.resolve_name(name, caller, MAX_LISTED_TARGETS) {
                         Ok(unit) => Ok(unit.clone()),
                         Err(r) => {
+                            // At most `MAX_LISTED_TARGETS` ids came back, so at
+                            // most that many units are cloned (auditor S3).
                             let candidates: Vec<DispatchedUnit> = r
                                 .candidates
                                 .iter()
@@ -340,14 +454,18 @@ fn resolve(
                     }),
                     Err((r, candidates)) => {
                         let mut target = CloseTarget::refused(name, r.reason, r.message);
+                        target.truncated = r.candidates_total > candidates.len();
                         target.candidates = candidates
                             .iter()
-                            .take(MAX_LISTED_TARGETS)
-                            .map(|u| AmbiguousCandidate {
-                                unit_id: u.id.clone(),
-                                name: u.name.clone(),
-                                worktree: u.worktree.to_string_lossy().into_owned(),
-                                panes: unit_panes(u, registry),
+                            .map(|u| {
+                                let (panes, more) = listed(unit_panes(u, registry));
+                                target.truncated |= more;
+                                AmbiguousCandidate {
+                                    unit_id: u.id.clone(),
+                                    name: u.name.clone(),
+                                    worktree: u.worktree.to_string_lossy().into_owned(),
+                                    panes,
+                                }
                             })
                             .collect();
                         refused.push(target);
@@ -412,27 +530,54 @@ fn resolve(
             },
         },
         CloseSelector::AllUnits => {
+            // Cut at `MAX_LISTED_TARGETS` while walking the ledger, so only the
+            // units listed are cloned (auditor S3).
             let records = registry.dispatched_units();
-            for unit in records.live() {
-                let mine = match caller {
-                    Caller::Person => true,
-                    Caller::Agent { agent_id, .. } => &unit.dispatcher.agent_id == agent_id,
-                };
-                if mine {
-                    resolved.push(Resolved {
-                        selector: unit.id.clone(),
-                        scope: scope_of_unit(unit),
-                        unit: Some(unit.clone()),
-                        by_pane: false,
-                        named_pane: None,
-                    });
-                }
-            }
+            let mine = records.live().filter(|unit| match caller {
+                Caller::Person => true,
+                Caller::Agent { agent_id, .. } => &unit.dispatcher.agent_id == agent_id,
+            });
+            let (units, more) = listed(mine);
+            truncated = more;
+            resolved.extend(units.into_iter().map(|unit| Resolved {
+                selector: unit.id.clone(),
+                scope: scope_of_unit(unit),
+                unit: Some(unit.clone()),
+                by_pane: false,
+                named_pane: None,
+            }));
         }
     }
     let mut keys = HashSet::new();
     resolved.retain(|r| keys.insert(r.dedupe_key()));
-    (resolved, refused)
+    (resolved, refused, truncated)
+}
+
+/// PRD #1589 (auditor S2): the generations `target` covers now. A unit's
+/// generation moves when it is replaced in its pane (`note_generation_replaced`),
+/// so the scope is re-read from the ledger by the unit's id — which no other
+/// unit of this daemon ever carries — rather than kept from the resolution. A
+/// pane target follows its pane only to a generation of the same unit; one with
+/// no unit, or whose pane now holds another unit's agent, keeps the generation
+/// it resolved to.
+fn current_scope(target: &Resolved, registry: &AgentPtyRegistry) -> Scope {
+    let Some(unit) = target.unit.as_ref() else {
+        return target.scope.clone();
+    };
+    if !target.by_pane {
+        return registry
+            .dispatched_units()
+            .get(&unit.id)
+            .map(scope_of_unit)
+            .unwrap_or_else(|| target.scope.clone());
+    }
+    if let Some(pane) = target.named_pane.as_deref()
+        && let Some(record) = generation_on_pane(pane, registry)
+        && unit_of_record(&record, registry).is_some_and(|now| now.id == unit.id)
+    {
+        return Scope::Generation(record.id);
+    }
+    target.scope.clone()
 }
 
 fn scope_of_unit(unit: &DispatchedUnit) -> Scope {
@@ -587,16 +732,29 @@ fn base_target(
         }
     }
     let agent_ids: Vec<String> = members.iter().map(|m| m.record.id.clone()).collect();
-    out.open_descendants = registry
-        .dispatched_units()
-        .open_descendants(&agent_ids)
-        .map(|u| OpenDescendant {
-            unit_id: u.id.clone(),
-            name: u.name.clone(),
-            clone: u.clone_dir.to_string_lossy().into_owned(),
-        })
-        .collect();
+    let (descendants, more) = listed(
+        registry
+            .dispatched_units()
+            .open_descendants(&agent_ids)
+            .map(|u| OpenDescendant {
+                unit_id: u.id.clone(),
+                name: u.name.clone(),
+                clone: u.clone_dir.to_string_lossy().into_owned(),
+            }),
+    );
+    out.open_descendants = descendants;
+    out.truncated |= more;
     out
+}
+
+/// The refusal sentence for a forceable refusal a close was not forced past.
+fn refusal_message(reason: CloseRefusalReason, detail: &str) -> String {
+    match reason {
+        CloseRefusalReason::NotReported | CloseRefusalReason::Busy => {
+            format!("{detail}; pass --force to close it anyway")
+        }
+        _ => format!("{detail}; or pass --force"),
+    }
 }
 
 fn refuse(out: &mut CloseTarget, reason: CloseRefusalReason, message: String) {
@@ -655,21 +813,43 @@ pub async fn handle_close_agents(
             return report;
         }
     };
-    let (mut resolved, refused) = resolve(&selector, &caller, registry);
-    if resolved.len() > MAX_LISTED_TARGETS {
-        // Only `--all` can get here: every other selector is bounded above.
-        resolved.truncate(MAX_LISTED_TARGETS);
-        report.truncated = true;
+    let (resolved, refused, truncated) = resolve(&selector, &caller, registry);
+    report.truncated = truncated;
+    let mut budget = ReportBudget::new();
+    for mut entry in refused {
+        fit_to_budget(&mut entry, &mut budget);
+        report.targets.push(entry);
     }
-    report.targets.extend(refused);
     for target in resolved {
-        let entry = close_one(
-            &target, &caller, force, dry_run, registry, state, event_tx, worktrees,
-        )
-        .await;
+        let mut entry = None;
+        for _ in 0..REBIND_ATTEMPTS {
+            match close_one(
+                &target, &caller, force, dry_run, registry, state, event_tx, worktrees,
+            )
+            .await
+            {
+                Attempt::Done(done) => {
+                    entry = Some(done);
+                    break;
+                }
+                Attempt::Rebind(failed) => entry = Some(failed),
+            }
+        }
+        let mut entry = entry.expect("REBIND_ATTEMPTS is at least one");
+        fit_to_budget(&mut entry, &mut budget);
         report.targets.push(entry);
     }
     report
+}
+
+/// What one attempt at closing a target came to.
+enum Attempt {
+    /// The target's report entry.
+    Done(CloseTarget),
+    /// The unit moved to a new generation while it was being closed, and
+    /// nothing was stopped: try again against its generation now. Carries the
+    /// entry to report if no attempt is left (auditor S2).
+    Rebind(CloseTarget),
 }
 
 /// The member a respawn lifted out and that never came back: its record is
@@ -688,20 +868,23 @@ fn pane_held(pane_id: &str, registry: &AgentPtyRegistry) -> bool {
         || registry.agent_id_for_pane_any(pane_id).is_some()
 }
 
-/// PRD #1589 (auditor B1): end `unit` only once nothing of it remains — no
-/// record, no respawn in its window, and for an orchestration no pane of its
-/// instance in the role maps either, the rule `stop_agent_steps` ends a unit
-/// by. A close that stopped every member has normally ended the unit already,
-/// through that seam; this covers a close with nothing left to stop.
+/// PRD #1589 (auditor B1): end the unit `unit_id` only once nothing of it
+/// remains — no record, no respawn in its window, and for an orchestration no
+/// pane of its instance in the role maps either, the rule `stop_agent_steps`
+/// ends a unit by. A close that stopped every member has normally ended the
+/// unit already, through that seam; this covers a close with nothing left to
+/// stop. Read from the ledger now, not from the close's snapshot, so a unit
+/// whose generation moved to a successor is judged by that successor (auditor
+/// S2).
 async fn end_unit_if_nothing_remains(
-    unit: &DispatchedUnit,
+    unit_id: &str,
     registry: &AgentPtyRegistry,
     state: &SharedState,
 ) {
-    if registry.dispatched_units().get(&unit.id).is_none() {
+    let Some(unit) = registry.dispatched_units().get(unit_id).cloned() else {
         return;
-    }
-    let scope = scope_of_unit(unit);
+    };
+    let scope = scope_of_unit(&unit);
     if !enumerate(&scope, registry).is_empty() || !respawning(&scope, registry).is_empty() {
         return;
     }
@@ -747,12 +930,22 @@ async fn close_one(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     worktrees: &WorktreeRegistry,
-) -> CloseTarget {
+) -> Attempt {
+    // The generations the target covers now, and its unit as the ledger has
+    // it now (auditor S2).
+    let scope = current_scope(target, registry);
+    let unit_then: Option<DispatchedUnit> = target.unit.as_ref().map(|u| {
+        registry
+            .dispatched_units()
+            .get(&u.id)
+            .cloned()
+            .unwrap_or_else(|| u.clone())
+    });
     // A member in its respawn window counts as one for authority, the
     // refusals and the listing: it is still part of the target (auditor B1).
-    let mut members = enumerate(&target.scope, registry);
+    let mut members = enumerate(&scope, registry);
     members.extend(
-        respawning(&target.scope, registry)
+        respawning(&scope, registry)
             .into_iter()
             .map(|record| Member {
                 record,
@@ -760,16 +953,32 @@ async fn close_one(
             }),
     );
     let (target_facts, statuses) =
-        facts(target, target.unit.as_ref(), &members, state, registry).await;
-    let mut out = base_target(target, target.unit.as_ref(), &members, &statuses, registry);
+        facts(target, unit_then.as_ref(), &members, state, registry).await;
+    let mut out = base_target(target, unit_then.as_ref(), &members, &statuses, registry);
     if let Err(refusal) = authorize_target(caller, target, &members) {
         refuse(&mut out, refusal.reason, refusal.message);
-        return out;
+        return Attempt::Done(out);
     }
     let refusals = default_refusals(&target_facts);
     if dry_run {
         out.would_refuse = refusals.iter().map(|(r, _)| *r).collect();
-        return out;
+        return Attempt::Done(out);
+    }
+    // Refusals already decidable are answered here, before any admission
+    // state opens (auditor B1): an open one refuses respawns of the target's
+    // members, so a close that was always going to refuse must not get that
+    // far. They are checked again after the holds, for what changed since.
+    if !caller_still_current(caller, registry) {
+        refuse(
+            &mut out,
+            CloseRefusalReason::Superseded,
+            "refused: the calling agent no longer holds its pane".to_string(),
+        );
+        return Attempt::Done(out);
+    }
+    if let Some((reason, detail)) = refusals.first().filter(|_| !force) {
+        refuse(&mut out, *reason, refusal_message(*reason, detail));
+        return Attempt::Done(out);
     }
 
     // Step 5a: the Closing admission state — for the unit, and for an
@@ -784,7 +993,7 @@ async fn close_one(
                     out.outcome = CloseOutcome::Failed;
                     out.error =
                         Some("another close of this unit is already in progress".to_string());
-                    return out;
+                    return Attempt::Done(out);
                 }
             }
         }
@@ -795,7 +1004,7 @@ async fn close_one(
             registry.dispatched_units().abort_closing(id, *prior);
         }
     };
-    let mut instance_guard = match &target.scope {
+    let mut instance_guard = match &scope {
         Scope::Instance(id) => match registry.begin_instance_close(id) {
             Some(guard) => Some(guard),
             None => {
@@ -803,7 +1012,7 @@ async fn close_one(
                 out.outcome = CloseOutcome::Failed;
                 out.error =
                     Some("another close of this orchestration is already in progress".to_string());
-                return out;
+                return Attempt::Done(out);
             }
         },
         Scope::Generation(_) => None,
@@ -812,14 +1021,16 @@ async fn close_one(
     // Step 5a′: respawns admitted before the admission state opened (auditor
     // B1/B2). Read after it opened: from here on a respawn of a member is
     // refused before it touches the running generation, so this set only
-    // shrinks. Each has terminated, or is terminating, its old child; its
-    // replacement is refused by the admission state unless it was published
-    // before, in which case it is an ordinary member below. Waited out rather
-    // than read as stopped, so the report says what became of each.
-    let pending = respawning(&target.scope, registry);
+    // shrinks. Each has terminated, or is terminating, its old child. Its
+    // replacement is let through the admission state (only a finished close
+    // refuses one), so once it has settled it is an ordinary member below:
+    // stopped if this close goes ahead, left running if it refuses. A
+    // replacement that failed for its own reasons leaves its pane empty, and
+    // is reported as stopped.
+    let pending = respawning(&scope, registry);
     let mut aborted: Vec<Member> = Vec::new();
     if !pending.is_empty() {
-        if matches!(target.scope, Scope::Generation(_)) {
+        if matches!(scope, Scope::Generation(_)) {
             // No instance admission state guards a single generation, so a
             // replacement would land; refuse rather than race it.
             restore_unit(registry);
@@ -828,7 +1039,7 @@ async fn close_one(
                 "this agent is being replaced in its pane right now; close it again in a moment"
                     .to_string(),
             );
-            return out;
+            return Attempt::Done(out);
         }
         let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
         if !registry
@@ -843,7 +1054,7 @@ async fn close_one(
                  closed"
                     .to_string(),
             );
-            return out;
+            return Attempt::Done(out);
         }
         aborted = pending
             .into_iter()
@@ -862,7 +1073,9 @@ async fn close_one(
     // converges; one that reserved before the close began is seen and held.
     let mut holds: Vec<(String, crate::agent_pty::PaneCleanupHold)> = Vec::new();
     let mut held: HashSet<String> = HashSet::new();
-    let mut members = enumerate(&target.scope, registry);
+    #[cfg(test)]
+    registry.pause_point("close-holds").await;
+    let mut members = enumerate(&scope, registry);
     let mut stable = false;
     for _ in 0..MEMBERSHIP_ROUNDS {
         let mut preflight_error = None;
@@ -893,9 +1106,9 @@ async fn close_one(
             restore_unit(registry);
             out.outcome = CloseOutcome::Failed;
             out.error = Some(error);
-            return out;
+            return Attempt::Done(out);
         }
-        let again = enumerate(&target.scope, registry);
+        let again = enumerate(&scope, registry);
         let same = again.len() == members.len()
             && again
                 .iter()
@@ -912,7 +1125,7 @@ async fn close_one(
         restore_unit(registry);
         out.outcome = CloseOutcome::Failed;
         out.error = Some("the orchestration kept changing while it was being closed".to_string());
-        return out;
+        return Attempt::Done(out);
     }
     #[cfg(test)]
     registry.before_close_revalidation().await;
@@ -936,6 +1149,19 @@ async fn close_one(
         drop::<Option<crate::agent_pty::InstanceCloseGuard>>(guard);
         restore_unit(registry);
     };
+    // The unit moved to a successor generation since the scope was read: what
+    // was held is not the unit any more. Nothing was stopped; retry against
+    // the generation it has now (auditor S2).
+    if current_scope(target, registry) != scope {
+        release(holds, instance_guard, registry);
+        out.outcome = CloseOutcome::Failed;
+        out.error = Some(
+            "the agent was replaced in its pane while it was being closed; nothing was closed \
+             — close it again"
+                .to_string(),
+        );
+        return Attempt::Rebind(out);
+    }
     if !caller_still_current(caller, registry) {
         release(holds, instance_guard, registry);
         refuse(
@@ -943,27 +1169,19 @@ async fn close_one(
             CloseRefusalReason::Superseded,
             "refused: the calling agent no longer holds its pane".to_string(),
         );
-        return out;
+        return Attempt::Done(out);
     }
     let all_members: Vec<Member> = members.iter().chain(aborted.iter()).cloned().collect();
     if let Err(refusal) = authorize_target(caller, target, &all_members) {
         release(holds, instance_guard, registry);
         refuse(&mut out, refusal.reason, refusal.message);
-        return out;
+        return Attempt::Done(out);
     }
     let refusals = default_refusals(&now_facts);
-    if !refusals.is_empty() && !force {
+    if let Some((reason, detail)) = refusals.first().filter(|_| !force) {
         release(holds, instance_guard, registry);
-        let (reason, detail) = refusals[0].clone();
-        let message = match reason {
-            CloseRefusalReason::NotReported => {
-                format!("{detail}; pass --force to close it anyway")
-            }
-            CloseRefusalReason::Busy => format!("{detail}; pass --force to close it anyway"),
-            _ => format!("{detail}; or pass --force"),
-        };
-        refuse(&mut out, reason, message);
-        return out;
+        refuse(&mut out, *reason, refusal_message(*reason, detail));
+        return Attempt::Done(out);
     }
     out.forced_over = refusals.iter().map(|(r, _)| *r).collect();
 
@@ -1032,9 +1250,9 @@ async fn close_one(
         }
     }
     drop(holds);
-    // A respawn this close refused left its pane with no agent and its role
-    // still registered: take the registration down the way a stop does, and
-    // tell the clients the pane is gone.
+    // A respawn whose replacement failed left its pane with no agent and its
+    // role still registered: take the registration down the way a stop does,
+    // and tell the clients the pane is gone.
     for (offset, member) in aborted.iter().enumerate() {
         if let Some(pane) = member.record.pane_id_env.as_deref()
             && !pane_held(pane, registry)
@@ -1051,7 +1269,7 @@ async fn close_one(
             guard.finish();
         }
         if let Some(unit) = target.unit.as_ref() {
-            end_unit_if_nothing_remains(unit, registry, state).await;
+            end_unit_if_nothing_remains(&unit.id, registry, state).await;
         }
     } else if stopped_any {
         out.outcome = CloseOutcome::PartiallyClosed;
@@ -1100,7 +1318,7 @@ async fn close_one(
         }
     }
     drop(instance_guard);
-    out
+    Attempt::Done(out)
 }
 
 /// PRD #1589 D6: remove a closed unit's worktree under the existing policy
@@ -2109,13 +2327,30 @@ mod tests {
         state.pane_orchestration_map.contains_key(pane)
     }
 
+    /// How many "this pane was closed" removals were broadcast for `pane`
+    /// since `events` subscribed.
+    fn pane_closed_broadcasts(events: &mut broadcast::Receiver<BroadcastMsg>, pane: &str) -> usize {
+        let mut count = 0;
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = msg
+                && event.pane_id.as_deref() == Some(pane)
+                && event
+                    .metadata
+                    .contains_key(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Scenario: auditor B1 — an orchestration's orchestrator was stopped
     /// first, and its only remaining worker is mid-respawn, so the registry
     /// holds no record of the unit at all. Closing it by name waits for the
     /// respawn instead of reading the empty snapshot as "gone"; the respawn's
-    /// replacement is refused, the report names the worker as stopped, the
-    /// worker's role registration is taken down, and no agent comes back in
-    /// the pane behind the ended unit.
+    /// replacement lands and is stopped as a member, the report names the
+    /// worker's pane as stopped, its role registration is taken down, and no
+    /// agent comes back in the pane behind the ended unit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_unit_whose_last_worker_is_mid_respawn_does_not_resurrect() {
         let deck = Deck::new().await;
@@ -2134,21 +2369,18 @@ mod tests {
         })
         .await;
         let _ = release.send(());
-        let err = respawn
+        let replaced = respawn
             .await
             .unwrap()
-            .expect_err("the replacement is refused");
-        assert!(
-            err.to_string()
-                .contains(crate::agent_pty::INSTANCE_CLOSING_REASON),
-            "{err}"
-        );
+            .expect("an admitted respawn's replacement is let through");
         let report = close.await.unwrap();
         let target = &report.targets[0];
         assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
         assert_eq!(target.panes.len(), 1, "{target:?}");
         assert_eq!(target.panes[0].pane_id.as_deref(), Some("orch-b1-w"));
+        assert_eq!(target.panes[0].agent_id, replaced);
         assert_eq!(target.panes[0].stopped, Some(true));
+        assert!(!deck.live(&replaced));
         assert!(deck.registry.pane_current_agent_id("orch-b1-w").is_none());
         assert!(deck.registry.dispatched_units().get(&id).is_none());
         assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1-w"));
@@ -2157,10 +2389,12 @@ mod tests {
         deck.shutdown().await;
     }
 
-    /// Scenario: auditor B1 — the same empty-snapshot unit, never reported.
-    /// A close without --force is refused not-reported (it used to be closed
-    /// outright), the unit stays live and closeable, and --force then closes
-    /// it, taking the dead worker's role registration down.
+    /// Scenario: auditor B1 — the same empty-snapshot unit, never reported,
+    /// while its worker is mid-respawn. A close without --force is refused
+    /// not-reported before it opens the instance's admission state, so the
+    /// worker's replacement lands and keeps running in its pane, still
+    /// registered, with no removal announced; --force then closes the unit,
+    /// replacement included.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_empty_snapshot_unit_still_meets_the_default_refusals() {
         let deck = Deck::new().await;
@@ -2169,15 +2403,9 @@ mod tests {
             .stop_agent(&o)
             .await
             .expect("stop the orchestrator");
+        let mut events = deck.event_tx.subscribe();
         let (respawn, release) = paused_respawn(&deck, "orch-b1r-w").await;
-        let close = close_in_background(&deck, by_name("team-b1r"), None, false);
-        wait_until("the close opens the instance's admission state", || {
-            deck.registry.is_instance_closing("orch-b1r")
-        })
-        .await;
-        let _ = release.send(());
-        let _ = respawn.await.unwrap();
-        let report = close.await.unwrap();
+        let report = deck.close(by_name("team-b1r"), None, false, false).await;
         assert_eq!(
             report.targets[0].reason,
             Some(CloseRefusalReason::NotReported),
@@ -2185,13 +2413,29 @@ mod tests {
             report.targets[0]
         );
         assert!(
+            !deck.registry.is_instance_closing("orch-b1r"),
+            "a close that refuses never opens the admission state"
+        );
+        let _ = release.send(());
+        let replaced = respawn
+            .await
+            .unwrap()
+            .expect("the worker's replacement lands");
+        assert!(deck.live(&replaced));
+        assert_eq!(
+            deck.registry.pane_current_agent_id("orch-b1r-w").as_deref(),
+            Some(replaced.as_str())
+        );
+        assert!(mapped_in_state(&*deck.state.read().await, "orch-b1r-w"));
+        assert!(
             deck.registry.dispatched_units().get(&id).is_some(),
             "a refused unit is not tombstoned"
         );
-        assert!(!deck.registry.is_instance_closing("orch-b1r"));
+        assert_eq!(pane_closed_broadcasts(&mut events, "orch-b1r-w"), 0);
 
         let report = deck.close(by_name("team-b1r"), None, true, false).await;
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
+        assert!(!deck.live(&replaced));
         assert!(deck.registry.dispatched_units().get(&id).is_none());
         assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1r-w"));
         deck.shutdown().await;
@@ -2199,7 +2443,9 @@ mod tests {
 
     /// Scenario: auditor B1 — while a close waits for the unit's respawning
     /// worker, the dispatcher that asked is replaced in its pane. The close is
-    /// refused superseded once it re-validates, and the unit is not ended.
+    /// refused superseded once it re-validates, the unit is not ended, and the
+    /// worker's replacement keeps running in its pane with no removal
+    /// announced.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_caller_superseded_while_a_respawn_settles_is_refused() {
         let deck = Deck::new().await;
@@ -2211,6 +2457,7 @@ mod tests {
             .await
             .expect("stop the orchestrator");
         let claim = deck.claim("disp", &dispatcher);
+        let mut events = deck.event_tx.subscribe();
         let (respawn, release) = paused_respawn(&deck, "orch-b1s-w").await;
         let close = close_in_background(&deck, by_name("team-b1s"), Some(claim), false);
         wait_until("the close opens the instance's admission state", || {
@@ -2223,7 +2470,10 @@ mod tests {
             .expect("stop the dispatcher");
         deck.start("disp", "sleep 30", None).await;
         let _ = release.send(());
-        let _ = respawn.await.unwrap();
+        let replaced = respawn
+            .await
+            .unwrap()
+            .expect("the worker's replacement lands");
         let report = close.await.unwrap();
         assert_eq!(
             report.targets[0].reason,
@@ -2232,6 +2482,14 @@ mod tests {
             report.targets[0]
         );
         assert!(deck.registry.dispatched_units().get(&id).is_some());
+        assert!(deck.live(&replaced), "the refused close stopped nothing");
+        assert_eq!(
+            deck.registry.pane_current_agent_id("orch-b1s-w").as_deref(),
+            Some(replaced.as_str())
+        );
+        assert!(mapped_in_state(&*deck.state.read().await, "orch-b1s-w"));
+        assert!(!deck.registry.is_instance_closing("orch-b1s"));
+        assert_eq!(pane_closed_broadcasts(&mut events, "orch-b1s-w"), 0);
         deck.shutdown().await;
     }
 
@@ -2297,9 +2555,9 @@ mod tests {
     }
 
     /// Scenario: auditor B2 — a worker's respawn is admitted just before a
-    /// close of its unit begins. The close waits for it, the replacement is
-    /// refused, and the report accounts for the worker as stopped beside the
-    /// orchestrator it stopped itself; nothing is left running in the unit.
+    /// close of its unit begins. The close waits for it, stops the replacement
+    /// as a member, and the report accounts for the worker's pane as stopped
+    /// beside the orchestrator; nothing is left running in the unit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_respawn_admitted_before_the_close_is_in_its_report() {
         let deck = Deck::new().await;
@@ -2705,5 +2963,202 @@ mod tests {
         assert!(!deck.live(&w));
         assert!(deck.registry.dispatched_units().get(&id).is_none());
         deck.shutdown().await;
+    }
+
+    /// Run `target` through one close attempt in-process, as the person.
+    async fn close_attempt(deck: &Deck, target: &Resolved) -> Attempt {
+        close_one(
+            target,
+            &Caller::Person,
+            false,
+            false,
+            &deck.registry,
+            &deck.state,
+            &deck.event_tx,
+            &deck.worktrees,
+        )
+        .await
+    }
+
+    /// Scenario: auditor S2 — a single unit is resolved to its agent A, and
+    /// before the close acts a respawn replaces A with B in the same pane,
+    /// moving the unit to B. The close follows the unit to B and stops it:
+    /// it never reports the unit closed, or ends it, while B keeps running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unit_replaced_after_resolution_is_closed_in_its_successor() {
+        let deck = Deck::new().await;
+        let a = deck.start("solo-s2", "sleep 30", None).await;
+        let id = deck.single_unit("solo-s2", ("disp", "nobody"), "solo-s2", &a);
+        deck.report_done("solo-s2", &a);
+        let (resolved, refused, _) = resolve(&by_name("solo-s2"), &Caller::Person, &deck.registry);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(resolved[0].scope, Scope::Generation(a.clone()));
+        let b = deck
+            .registry
+            .respawn_agent_for_pane("solo-s2", "sleep 30")
+            .await
+            .expect("respawn the unit's agent");
+        let entry = match close_attempt(&deck, &resolved[0]).await {
+            Attempt::Done(entry) => entry,
+            Attempt::Rebind(entry) => panic!("the scope is read when the close starts: {entry:?}"),
+        };
+        assert_eq!(entry.outcome, CloseOutcome::Closed, "{entry:?}");
+        assert!(
+            entry
+                .panes
+                .iter()
+                .any(|p| p.agent_id == b && p.stopped == Some(true)),
+            "{entry:?}"
+        );
+        assert!(
+            !deck.live(&b),
+            "a Closed report never leaves the successor running"
+        );
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S2 — a close of a single unit has checked for a
+    /// respawn in flight and found none, and before it takes its holds a
+    /// respawn replaces the unit's agent A with B. The close sees the unit
+    /// moved, stops nothing in that attempt, and retries against B: B is
+    /// stopped and the unit ends, never the unit ending with B live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_respawn_settling_before_the_holds_rebinds_the_close() {
+        let deck = Deck::new().await;
+        let a = deck.start("solo-s2b", "sleep 30", None).await;
+        let id = deck.single_unit("solo-s2b", ("disp", "nobody"), "solo-s2b", &a);
+        deck.report_done("solo-s2b", &a);
+        let (reached, release) = deck.registry.pause_at_for_test("close-holds");
+        let close = close_in_background(&deck, by_name("solo-s2b"), None, false);
+        reached.await.expect("the close passes its respawn check");
+        let b = deck
+            .registry
+            .respawn_agent_for_pane("solo-s2b", "sleep 30")
+            .await
+            .expect("respawn the unit's agent");
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+        let _ = release.send(());
+        let report = close.await.unwrap();
+        let entry = &report.targets[0];
+        assert_eq!(entry.outcome, CloseOutcome::Closed, "{entry:?}");
+        assert!(
+            entry
+                .panes
+                .iter()
+                .any(|p| p.agent_id == b && p.stopped == Some(true)),
+            "{entry:?}"
+        );
+        assert!(!deck.live(&b));
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S3 — a selector of a million (empty) ids, already
+    /// decoded, is refused by its length alone, before the caller's forged
+    /// claim is even looked at; the refusal counts the entries without adding
+    /// up their bytes.
+    #[tokio::test]
+    async fn an_oversized_selector_is_refused_by_its_length_before_its_caller() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let worktrees = crate::issue_dispatch_run::new_worktree_registry();
+        let forged = CallerClaim {
+            pane_id: "disp".to_string(),
+            token: "0".repeat(crate::hook_provenance::TOKEN_LEN),
+        };
+        let report = handle_close_agents(
+            CloseSelector::UnitIds {
+                ids: vec![String::new(); 1_000_000],
+            },
+            Some(forged),
+            false,
+            false,
+            &registry,
+            &state,
+            &event_tx,
+            &worktrees,
+        )
+        .await;
+        let refused = report.refused.expect("refused whole");
+        assert_eq!(refused.reason, CloseRefusalReason::SelectorTooLarge);
+        assert!(
+            refused.message.contains("names 1000000 entries."),
+            "{}",
+            refused.message
+        );
+        assert!(report.targets.is_empty());
+    }
+
+    /// Scenario: auditor S3 — a ledger holding thousands of live units, many
+    /// sharing names and with long worktree paths, and no agent running. `close
+    /// --all` lists the first 256 and says it was cut short; closing 40
+    /// ambiguous names lists at most 256 candidates each, marks every entry
+    /// whose list was cut, and the whole report stays within the nested-list
+    /// budget instead of growing with the ledger.
+    #[tokio::test]
+    async fn a_populated_ledger_yields_a_bounded_report() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let worktrees = crate::issue_dispatch_run::new_worktree_registry();
+        let long = "w".repeat(2000);
+        let names: Vec<String> = (0..40).map(|k| format!("fix-{k}")).collect();
+        {
+            let mut units = registry.dispatched_units();
+            for name in &names {
+                for n in 0..300 {
+                    units.register(NewUnit {
+                        name: name.clone(),
+                        worktree: PathBuf::from(format!("/{long}/{name}-{n}")),
+                        branch: format!("agent/{name}"),
+                        clone_dir: PathBuf::from("/clone"),
+                        dispatcher: Dispatcher {
+                            pane_id: "disp".into(),
+                            agent_id: "nobody".into(),
+                        },
+                        kind: UnitKind::Single {
+                            pane_id: format!("{name}-{n}"),
+                            agent_id: format!("gone-{name}-{n}"),
+                        },
+                        dispatched_at_ms: 1,
+                    });
+                }
+            }
+        }
+        let close = |selector: CloseSelector| {
+            handle_close_agents(
+                selector, None, false, true, &registry, &state, &event_tx, &worktrees,
+            )
+        };
+
+        let report = close(CloseSelector::AllUnits).await;
+        assert!(report.truncated);
+        assert_eq!(report.targets.len(), MAX_LISTED_TARGETS);
+
+        let report = close(CloseSelector::Units(UnitSelector {
+            names: names.clone(),
+        }))
+        .await;
+        assert_eq!(report.targets.len(), names.len());
+        for target in &report.targets {
+            assert_eq!(target.reason, Some(CloseRefusalReason::Ambiguous));
+            assert!(target.candidates.len() <= MAX_LISTED_TARGETS);
+            assert!(target.truncated, "300 candidates never fit in the list");
+        }
+        let listed: usize = report.targets.iter().map(|t| t.candidates.len()).sum();
+        assert!(listed > 0, "the budget lists what fits");
+        assert!(
+            listed < names.len() * MAX_LISTED_TARGETS,
+            "the budget cut the candidates short: {listed}"
+        );
+        let bytes = serde_json::to_string(&report).unwrap().len();
+        assert!(
+            bytes < MAX_NESTED_REPORT_BYTES + 64 * 1024,
+            "the report is bounded by the budget, not the ledger: {bytes} bytes"
+        );
     }
 }

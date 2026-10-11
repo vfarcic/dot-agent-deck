@@ -818,6 +818,28 @@ async fn spawn_with_unit(
             // flat `SessionStart` can't carry, so it rides the typed
             // [`BroadcastMsg::OrchestrationSurface`] variant instead of this
             // synthetic-`SessionStart` path.
+            //
+            // PRD #1589 (auditor S1): the card and the unit record are
+            // published under the state WRITE guard, and only while the agent's
+            // record is still in the registry. A close removes the record
+            // before it takes that guard to unregister the pane and announce
+            // the removal, so a close that won the race leaves nothing to
+            // publish — the spawn is answered as closed — and one that lost it
+            // announces its removal after this card and ends this record.
+            registry.pause_point("dispatch-publication").await;
+            let publish_guard = match state {
+                Some(state) => Some(state.write().await),
+                None => None,
+            };
+            if !registry.generation_registered(&id) {
+                drop(publish_guard);
+                tracing::info!(
+                    agent_id = %id,
+                    "spawn: the agent was closed before it was published; publishing nothing \
+                     for it"
+                );
+                return Err(SpawnError::Agent(CLOSED_WHILE_STARTING.to_string()));
+            }
             if let Some(tx) = event_tx {
                 surface_spawned_pane(
                     tx,
@@ -840,6 +862,7 @@ async fn spawn_with_unit(
                     agent_id: id.clone(),
                 },
             );
+            drop(publish_guard);
             run_delivery(
                 registry,
                 pane_id.clone(),
@@ -1131,7 +1154,13 @@ async fn spawn_with_unit(
                 // role map claimed to have.
                 // PRD #1589 (auditor S1): not for a role a close already took
                 // down since it was published — re-checked under the write
-                // guard below, which the close's unregister needs too.
+                // guard below, which the close's unregister needs too. A role
+                // found closed aborts the whole construction after the loop
+                // body, below.
+                registry
+                    .pause_point(&format!("dispatch-role:{}", role.role_name))
+                    .await;
+                let mut closed_while_starting = false;
                 if let Some(state) = state.filter(|_| {
                     crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
                         tracing::warn!(
@@ -1154,6 +1183,7 @@ async fn spawn_with_unit(
                             "spawn: the role was closed before it was registered; \
                              registering nothing for it"
                         );
+                        closed_while_starting = true;
                     } else {
                         // Issue #962: the daemon holds the run title itself, beside
                         // the role maps, so a `clear = true` worker re-created later
@@ -1196,14 +1226,36 @@ async fn spawn_with_unit(
                     pane_id,
                     role_name: Some(role.role_name.clone()),
                 });
+                if closed_while_starting {
+                    return Err(
+                        abort_closed_orchestration(registry, state, &agents, &identity).await,
+                    );
+                }
+            }
+            // PRD #1589 (auditor S1): what follows publishes the orchestration
+            // — its tab, its cards and its unit record — under the state WRITE
+            // guard, after checking that every role is still registered and no
+            // close finished the instance. A close removes a role's record
+            // before it takes that guard to unregister the pane and announce the
+            // removal, so either this sees a closed role and aborts, publishing
+            // nothing, or the close's removal follows this publication.
+            registry.pause_point("dispatch-publication").await;
+            let mut publish_guard = match state {
+                Some(state) => Some(state.write().await),
+                None => None,
+            };
+            if agents
+                .iter()
+                .any(|agent| !registry.generation_registered(&agent.id))
+                || registry.is_instance_ended(&orchestration_id)
+            {
+                drop(publish_guard);
+                return Err(abort_closed_orchestration(registry, state, &agents, &identity).await);
             }
             // Issue #1339: every role is registered, so its panes hold the
             // title from here on and the spawn's own claim ends.
-            if let Some(state) = state {
-                state
-                    .write()
-                    .await
-                    .release_orchestration_title_claim(&identity);
+            if let Some(guard) = publish_guard.as_mut() {
+                guard.release_orchestration_title_claim(&identity);
             }
             // PRD #120: surface this orchestration LIVE to any already-attached
             // TUI. Unlike the single-agent card above (a synthetic
@@ -1267,6 +1319,9 @@ async fn spawn_with_unit(
             // PRD #1589 D5: the unit's record, before the orchestrator's task is
             // delivered. Its terminal generation is the orchestrator the task
             // goes to, which is the only generation whose `--done` completes it.
+            // Still under the publication guard (auditor S1), so a close of the
+            // instance either ended it before this check or ends this record
+            // when it stops the last role.
             let unit_id = register_dispatched_unit(
                 registry,
                 unit,
@@ -1277,6 +1332,7 @@ async fn spawn_with_unit(
                     terminal_agent_id: delivery_agent_id.clone(),
                 },
             );
+            drop(publish_guard);
             run_delivery(
                 registry,
                 delivery_pane_id.clone(),
@@ -1298,6 +1354,46 @@ async fn spawn_with_unit(
             })
         }
     }
+}
+
+/// PRD #1589 (auditor S1): why a spawn that a close overtook answers `Err`.
+pub const CLOSED_WHILE_STARTING: &str =
+    "it was closed while it was starting; nothing was published or recorded for it";
+
+/// PRD #1589 (auditor S1): end an orchestration construction that found one of
+/// its roles closed. A close of the instance stops every role it enumerated and
+/// refuses any later one, so it owns the teardown and this stops nothing; a
+/// role stopped some other way (a `StopAgent` of one pane) leaves the rest to
+/// this, which rolls back the roles still registered, as a failed role does.
+/// The title claim is released either way, and the returned error is what the
+/// spawn answers: no tab, no card and no unit record is published.
+async fn abort_closed_orchestration(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&crate::state::SharedState>,
+    started: &[SpawnedAgent],
+    identity: &crate::state::OrchestrationIdentity,
+) -> SpawnError {
+    tracing::warn!(
+        orchestration = %identity.name,
+        orchestration_id = %identity.id,
+        "spawn: a role of this orchestration was closed while it was starting; publishing \
+         nothing for it"
+    );
+    if !registry.is_instance_closing(&identity.id) {
+        let still: Vec<SpawnedAgent> = started
+            .iter()
+            .filter(|agent| registry.generation_registered(&agent.id))
+            .cloned()
+            .collect();
+        roll_back_partial_orchestration(registry, state, &still, &identity.name, "-").await;
+    }
+    if let Some(state) = state {
+        state
+            .write()
+            .await
+            .release_orchestration_title_claim(identity);
+    }
+    SpawnError::Agent(CLOSED_WHILE_STARTING.to_string())
 }
 
 /// Issue #600: tear down the roles an orchestration spawn had already started
@@ -8012,6 +8108,191 @@ mod tests {
         drop(guard);
 
         registry.shutdown_all();
+    }
+
+    /// A two-role dispatched orchestration (`orchestrator`, then `worker`),
+    /// both `sleep 30`, rooted at `dir`.
+    #[cfg(unix)]
+    fn closable_orchestration_request(dir: &Path, task: &str) -> SpawnRequest {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        let role = |idx: usize, name: &str| RoleSpawn {
+            agent_type: None,
+            role_index: idx,
+            role_name: name.to_string(),
+            command: "sleep 30".to_string(),
+            is_start_role: idx == 0,
+        };
+        SpawnRequest {
+            task_name: task.to_string(),
+            working_dir: dir.to_string_lossy().into_owned(),
+            command: None,
+            prompt: "unused".to_string(),
+            resolved_target: Some(SpawnTarget::Orchestration {
+                name: task.to_string(),
+                roles: vec![role(0, "orchestrator"), role(1, "worker")],
+                config: Box::new(OrchestrationConfig {
+                    default: false,
+                    name: task.to_string(),
+                    roles: vec![OrchestrationRoleConfig {
+                        agent: None,
+                        name: "orchestrator".to_string(),
+                        command: "sleep 30".to_string(),
+                        start: true,
+                        description: None,
+                        prompt_template: None,
+                        clear: false,
+                    }],
+                }),
+            }),
+            compose_orchestrator_context: None,
+        }
+    }
+
+    /// Start [`closable_orchestration_request`] as a dispatched unit, pause it
+    /// at `pause`, close its orchestration through its already-registered
+    /// orchestrator pane, resume it, and check that it publishes nothing for
+    /// the closed panes: no tab, no card, no unit record (auditor S1).
+    #[cfg(unix)]
+    async fn close_a_dispatch_paused_at(pause: &str) {
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+        let dir = tempfile::tempdir().expect("tempdir for the orchestration cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _keep) = broadcast::channel(1024);
+        let worktrees = crate::issue_dispatch_run::new_worktree_registry();
+        let mut events = event_tx.subscribe();
+        let (reached, release) = registry.pause_at_for_test(pause);
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let req = closable_orchestration_request(dir.path(), "closed-s1");
+            let origin = crate::dispatched_units::UnitOrigin {
+                name: "closed-s1".to_string(),
+                worktree: dir.path().to_path_buf(),
+                branch: "agent/closed-s1".to_string(),
+                clone_dir: dir.path().to_path_buf(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "nobody".to_string(),
+                },
+            };
+            let caller = crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".to_string(),
+                agent_id: "nobody".to_string(),
+                unit_name: "closed-s1".to_string(),
+            };
+            tokio::spawn(async move {
+                spawn_dispatched_unit(
+                    req,
+                    &registry,
+                    &SilentNotifier,
+                    Some(&event_tx),
+                    true,
+                    Some(&state),
+                    origin,
+                    caller,
+                )
+                .await
+                .map(|handle| handle.unit_id)
+            })
+        };
+        reached.await.expect("the dispatch reaches the pause");
+        let records = registry.agent_records();
+        let pane_of = |role: &str| {
+            records
+                .iter()
+                .find(|r| {
+                    matches!(&r.tab_membership,
+                        Some(TabMembership::Orchestration { role_name, .. }) if role_name == role)
+                })
+                .and_then(|r| r.pane_id_env.clone())
+                .expect("the role was published")
+        };
+        let (orchestrator, worker) = (pane_of("orchestrator"), pane_of("worker"));
+        assert!(
+            state
+                .read()
+                .await
+                .pane_orchestration_map
+                .contains_key(&orchestrator),
+            "precondition: the sibling is registered"
+        );
+        let report = crate::close_agents::handle_close_agents(
+            crate::daemon_protocol::CloseSelector::OrchestrationOf {
+                pane_id: orchestrator.clone(),
+            },
+            None,
+            false,
+            false,
+            &registry,
+            &state,
+            &event_tx,
+            &worktrees,
+        )
+        .await;
+        assert_eq!(
+            report.targets[0].outcome,
+            crate::daemon_protocol::CloseOutcome::Closed,
+            "{:?}",
+            report.targets[0]
+        );
+        let _ = release.send(());
+        let result = spawned.await.unwrap();
+        assert!(
+            matches!(&result, Err(SpawnError::Agent(m)) if m == CLOSED_WHILE_STARTING),
+            "a dispatch closed while it was starting answers so: {result:?}"
+        );
+        assert_eq!(
+            registry.dispatched_units().live().count(),
+            0,
+            "no live unit is recorded for a closed instance"
+        );
+        assert!(registry.agent_records().is_empty());
+        let guard = state.read().await;
+        assert!(!guard.pane_orchestration_map.contains_key(&orchestrator));
+        assert!(!guard.pane_orchestration_map.contains_key(&worker));
+        drop(guard);
+        while let Ok(msg) = events.try_recv() {
+            match msg {
+                BroadcastMsg::OrchestrationSurface(surface) => {
+                    panic!("a tab was surfaced for a closed orchestration: {surface:?}")
+                }
+                BroadcastMsg::Event(event)
+                    if event.event_type == EventType::SessionStart
+                        && [&orchestrator, &worker]
+                            .iter()
+                            .any(|p| event.pane_id.as_deref() == Some(p.as_str())) =>
+                {
+                    panic!("a card was announced for a closed pane: {event:?}")
+                }
+                _ => {}
+            }
+        }
+        registry.shutdown_all();
+    }
+
+    /// Scenario: auditor S1 — a dispatched orchestration has published its
+    /// final role and pauses before registering it. A person closes the
+    /// orchestration through the already-registered orchestrator's pane. When
+    /// the dispatch resumes it registers nothing, surfaces no tab and no card
+    /// for the closed panes, records no unit, and answers that it was closed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_closed_before_its_last_role_registers_publishes_nothing() {
+        close_a_dispatch_paused_at("dispatch-role:worker").await;
+    }
+
+    /// Scenario: auditor S1 — the same, with the close landing after the last
+    /// role registered and before the dispatch surfaces its tab and cards.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_closed_before_its_publication_publishes_nothing() {
+        close_a_dispatch_paused_at("dispatch-publication").await;
     }
 
     // --- issue #1065: an unpublishable coordinator context refuses the spawn ---

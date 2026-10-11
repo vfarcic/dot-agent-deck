@@ -329,8 +329,12 @@ pub enum Caller {
 pub struct Refused {
     pub reason: RefusalReason,
     pub message: String,
-    /// For [`RefusalReason::Ambiguous`]: the ids of every candidate.
+    /// For [`RefusalReason::Ambiguous`]: the ids of the candidates, at most
+    /// the limit [`DispatchedUnits::resolve_name`] was given.
     pub candidates: Vec<String>,
+    /// For [`RefusalReason::Ambiguous`]: how many candidates there were, which
+    /// is more than `candidates` holds when the limit cut the list short.
+    pub candidates_total: usize,
 }
 
 impl Refused {
@@ -339,6 +343,7 @@ impl Refused {
             reason,
             message: message.into(),
             candidates: Vec::new(),
+            candidates_total: 0,
         }
     }
 }
@@ -371,8 +376,10 @@ pub struct DispatchedUnits {
 /// The epoch is what stops a unit id a previous daemon issued — one a script
 /// held across `daemon restart` — from naming a unit of this daemon, whose
 /// counter starts at 1 again. With the six characters it started with, two
-/// epochs matched one time in about 16.7 million (auditor B4 note); at 64 bits
-/// a match is not a case that occurs.
+/// epochs matched one time in about 16.7 million (auditor B4 note). At 64 bits
+/// of randomness an accidental match is negligibly likely, though not
+/// impossible; within one daemon's lifetime an id is never reused, since the
+/// counter only grows.
 pub const EPOCH_HEX_CHARS: usize = 16;
 
 impl Default for DispatchedUnits {
@@ -538,33 +545,50 @@ impl DispatchedUnits {
     /// a sibling's of the same name, and only the caller's own tombstones are
     /// consulted, so a sibling's old unit never masks this caller's. A name the
     /// caller does not own but a sibling does is [`RefusalReason::NotYourUnit`].
-    pub fn resolve_name(&self, name: &str, caller: &Caller) -> Result<&DispatchedUnit, Refused> {
+    ///
+    /// An ambiguous refusal lists the ids of at most `max_candidates`
+    /// candidates, collected without holding more than that, and counts them
+    /// all in [`Refused::candidates_total`] (auditor S3).
+    pub fn resolve_name(
+        &self,
+        name: &str,
+        caller: &Caller,
+        max_candidates: usize,
+    ) -> Result<&DispatchedUnit, Refused> {
         let slug = slug_of(name);
-        let matches: Vec<&DispatchedUnit> = self.live.iter().filter(|u| u.slug == slug).collect();
-        let candidates: Vec<&DispatchedUnit> = match caller {
-            Caller::Person => matches.clone(),
-            Caller::Agent { agent_id, .. } => matches
-                .iter()
-                .copied()
-                .filter(|u| &u.dispatcher.agent_id == agent_id)
-                .collect(),
-        };
-        match candidates.as_slice() {
-            [one] => return Ok(one),
-            [] => {}
-            many => {
+        let mut matched = false;
+        let mut first = None;
+        let mut total = 0usize;
+        let mut ids = Vec::new();
+        for unit in self.live.iter().filter(|u| u.slug == slug) {
+            matched = true;
+            let mine = match caller {
+                Caller::Person => true,
+                Caller::Agent { agent_id, .. } => &unit.dispatcher.agent_id == agent_id,
+            };
+            if !mine {
+                continue;
+            }
+            total += 1;
+            first.get_or_insert(unit);
+            if ids.len() < max_candidates {
+                ids.push(unit.id.clone());
+            }
+        }
+        match (total, first) {
+            (1, Some(one)) => return Ok(one),
+            (0, _) => {}
+            (many, _) => {
                 let mut refused = Refused::new(
                     RefusalReason::Ambiguous,
-                    format!(
-                        "{} live units are named this; close one by its unit id",
-                        many.len()
-                    ),
+                    format!("{many} live units are named this; close one by its unit id"),
                 );
-                refused.candidates = many.iter().map(|u| u.id.clone()).collect();
+                refused.candidates = ids;
+                refused.candidates_total = many;
                 return Err(refused);
             }
         }
-        if !matches.is_empty() {
+        if matched {
             // Only reachable for an agent: a person's candidates are every match.
             return Err(Refused::new(
                 RefusalReason::NotYourUnit,
@@ -587,6 +611,16 @@ impl DispatchedUnits {
             RefusalReason::UnknownUnit,
             "no live unit has that name (units are not remembered across a daemon restart)",
         ))
+    }
+
+    /// [`Self::resolve_name`] with no limit on the candidates listed.
+    #[cfg(test)]
+    pub fn resolve_name_all(
+        &self,
+        name: &str,
+        caller: &Caller,
+    ) -> Result<&DispatchedUnit, Refused> {
+        self.resolve_name(name, caller, usize::MAX)
     }
 
     /// Resolve a daemon-issued unit id, as `close --all --yes` and `close
@@ -829,16 +863,16 @@ mod tests {
         let mut units = DispatchedUnits::with_epoch("aaaaaa");
         let id = units.register(single("issue 1531", "a", "p1", "1"));
         let found = units
-            .resolve_name("issue-1531", &Caller::Person)
+            .resolve_name_all("issue-1531", &Caller::Person)
             .expect("the slug resolves");
         assert_eq!(found.id, id);
         units.end(&id, EndReason::Stopped, 5);
         let refused = units
-            .resolve_name("issue 1531", &Caller::Person)
+            .resolve_name_all("issue 1531", &Caller::Person)
             .expect_err("an ended unit is never a target");
         assert_eq!(refused.reason, RefusalReason::AlreadyEnded);
         let refused = units
-            .resolve_name("never-dispatched", &Caller::Person)
+            .resolve_name_all("never-dispatched", &Caller::Person)
             .expect_err("unknown");
         assert_eq!(refused.reason, RefusalReason::UnknownUnit);
     }
@@ -851,13 +885,13 @@ mod tests {
         other.clone_dir = PathBuf::from("/other-repo");
         let second = units.register(other);
         let refused = units
-            .resolve_name("fix", &Caller::Person)
+            .resolve_name_all("fix", &Caller::Person)
             .expect_err("two live units share the slug");
         assert_eq!(refused.reason, RefusalReason::Ambiguous);
         assert_eq!(refused.candidates, vec![first, second]);
         // The same for the agent that dispatched both.
         let refused = units
-            .resolve_name("fix", &agent("a"))
+            .resolve_name_all("fix", &agent("a"))
             .expect_err("ambiguous");
         assert_eq!(refused.reason, RefusalReason::Ambiguous);
     }
@@ -867,12 +901,12 @@ mod tests {
         let mut units = DispatchedUnits::with_epoch("aaaaaa");
         let _theirs = units.register(single("fix", "b", "p1", "1"));
         let mine = units.register(single("fix", "a", "p2", "2"));
-        assert_eq!(units.resolve_name("fix", &agent("a")).unwrap().id, mine);
+        assert_eq!(units.resolve_name_all("fix", &agent("a")).unwrap().id, mine);
         // A sibling's name is NotYourUnit, not unknown.
         let mut units = DispatchedUnits::with_epoch("aaaaaa");
         units.register(single("theirs", "b", "p1", "1"));
         let refused = units
-            .resolve_name("theirs", &agent("a"))
+            .resolve_name_all("theirs", &agent("a"))
             .expect_err("not mine");
         assert_eq!(refused.reason, RefusalReason::NotYourUnit);
     }
@@ -883,16 +917,21 @@ mod tests {
         let theirs = units.register(single("fix", "b", "p1", "1"));
         units.end(&theirs, EndReason::ClosedByVerb, 2);
         // A sibling's old unit never answers "already ended" to this caller.
-        let refused = units.resolve_name("fix", &agent("a")).expect_err("none");
+        let refused = units
+            .resolve_name_all("fix", &agent("a"))
+            .expect_err("none");
         assert_eq!(refused.reason, RefusalReason::UnknownUnit);
         // But its owner, and a person, see it ended.
         assert_eq!(
-            units.resolve_name("fix", &agent("b")).unwrap_err().reason,
+            units
+                .resolve_name_all("fix", &agent("b"))
+                .unwrap_err()
+                .reason,
             RefusalReason::AlreadyEnded
         );
         assert_eq!(
             units
-                .resolve_name("fix", &Caller::Person)
+                .resolve_name_all("fix", &Caller::Person)
                 .unwrap_err()
                 .reason,
             RefusalReason::AlreadyEnded
@@ -912,7 +951,7 @@ mod tests {
             "the old preview id does not retarget to the new unit"
         );
         assert_eq!(units.resolve_id(&new).unwrap().id, new);
-        assert_eq!(units.resolve_name("fix", &agent("a")).unwrap().id, new);
+        assert_eq!(units.resolve_name_all("fix", &agent("a")).unwrap().id, new);
     }
 
     /// Scenario: two records built the way the daemon builds them carry
@@ -1083,7 +1122,7 @@ mod tests {
         units.note_exited(&id);
         assert_eq!(units.get(&id).unwrap().state, UnitState::Exited);
         // Exited is still closeable by name.
-        assert!(units.resolve_name("fix", &Caller::Person).is_ok());
+        assert!(units.resolve_name_all("fix", &Caller::Person).is_ok());
         let prior = units.begin_closing(&id).expect("begins");
         assert_eq!(prior, UnitState::Exited);
         assert!(units.begin_closing(&id).is_none(), "already closing");
