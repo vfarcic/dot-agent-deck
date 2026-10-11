@@ -2071,7 +2071,7 @@ mod tests {
         let app = mock_builder()
             .plugin(clipboard)
             .invoke_handler(tauri::generate_handler![probe])
-            .build(tauri::generate_context!())
+            .build(crate::app_context())
             .expect("a mock app");
         let main =
             tauri::WebviewWindowBuilder::new(&app, MAIN_WEBVIEW_LABEL, WebviewUrl::default())

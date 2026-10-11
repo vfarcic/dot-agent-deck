@@ -578,7 +578,11 @@ mod tests {
             Some(("firefox".into(), vec![url.into()]))
         );
         assert_eq!(
-            browser_command("chromium --new-window %s:firefox", url).unwrap(),
+            browser_command(
+                &format!("chromium --new-window %s{BROWSER_SEPARATOR}firefox"),
+                url
+            )
+            .unwrap(),
             Some(("chromium".into(), vec!["--new-window".into(), url.into()]))
         );
         assert_eq!(browser_command("  ", url).unwrap(), None);

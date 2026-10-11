@@ -6342,6 +6342,13 @@ fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// The app's compiled context. One expansion of `generate_context!` only: on
+/// macOS each one embeds an `_EMBED_INFO_PLIST` symbol, so a second one in a
+/// test build fails to link.
+pub(crate) fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
+    tauri::generate_context!()
+}
+
 pub fn run() {
     // Issue #1350: the decks a pre-#1350 build kept in `desktop.toml` move to
     // the shared `remotes.toml` here, once per launch and before anything below
@@ -6534,7 +6541,7 @@ pub fn run() {
             desktop_pr_browser_close,
             desktop_pr_browser_sign_out,
         ])
-        .build(tauri::generate_context!())
+        .build(app_context())
         .expect("failed to build dot-agent-deck desktop application");
     app.run(|app_handle, event| {
         if matches!(
