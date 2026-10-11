@@ -2162,7 +2162,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
             */}
             <DeckSelector settings={settings} connection={snapshot.connection} />
           </div>
-          {!allDecks && <div className="run-instruments">
+          {!allDecks && <div className="run-instruments deck-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
             <Instrument label="NODE"><strong>{String(snapshot.currentNode).padStart(2, "0")}<em>/{String(snapshot.totalNodes).padStart(2, "0")}</em></strong></Instrument>
             {/* Em dash, this deck's established "not known": no daemon tracks an attempt count (PRD #745 M8). */}

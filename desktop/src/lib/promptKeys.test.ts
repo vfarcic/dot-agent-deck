@@ -37,10 +37,10 @@ describe("PRD #1541 — the voice surface's view of the open agent", () => {
 
   it("gives fixture agents the keys a real deck serves, and none to Devin or an unknown binary", () => {
     expect(fixtureAgentIdentity("claude", "running")).toEqual({ agentType: "claude_code", turn: "working", promptKeys: FIXTURE_PROMPT_KEYS.claude_code });
-    expect(fixtureAgentIdentity("opencode", "waiting")).toEqual({ agentType: "open_code", turn: "idle", promptKeys: FIXTURE_PROMPT_KEYS.open_code });
+    expect(fixtureAgentIdentity("opencode", "needs_input")).toEqual({ agentType: "open_code", turn: "idle", promptKeys: FIXTURE_PROMPT_KEYS.open_code });
     expect(fixtureAgentIdentity("devin", "running")).toEqual({ agentType: "devin", turn: "working" });
     expect(fixtureAgentIdentity("bash", "failed")).toEqual({ agentType: "none" });
-    expect(fixtureAgentIdentity(undefined, "waiting")).toEqual({ agentType: "none", turn: "idle" });
+    expect(fixtureAgentIdentity(undefined, "idle")).toEqual({ agentType: "none", turn: "idle" });
   });
 
   it("puts the identity on every agent of the fixture's scenarios", () => {

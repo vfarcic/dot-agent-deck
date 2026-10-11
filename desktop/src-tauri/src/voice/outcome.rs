@@ -4690,13 +4690,14 @@ const DASHBOARD_KINDS: [(&str, &str, &[&str]); 5] = [
 /// The agent dashboard filter's statuses (issue #1496), the same three
 /// columns as [`DASHBOARD_KINDS`]. Each is one of the daemon's own status
 /// words, which the dashboard keeps apart: Working is not Thinking, and Idle
-/// is not Waiting for input.
+/// is not Needs input. The labels are the dashboard filter's, which say Needs
+/// input as the TUI's cards do (issue #1676).
 const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 6] = [
     ("working", "Working", &["working", "busy"]),
     ("thinking", "Thinking", &["thinking"]),
     (
         "waiting_for_input",
-        "Waiting for input",
+        "Needs input",
         &["waiting for input", "waiting", "needs input", "need input"],
     ),
     ("idle", "Idle", &["idle"]),

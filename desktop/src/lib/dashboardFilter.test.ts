@@ -47,7 +47,7 @@ describe("dashboard filter", () => {
     expect(ids(filter({ kinds: [kind] }))).toEqual(expected);
   });
 
-  /// Scenario: select each user-facing status using the daemon's original facts. Thinking and Working, and Idle and Waiting for input, must remain independently selectable.
+  /// Scenario: select each user-facing status using the daemon's original facts. Thinking and Working, and Idle and Needs input, must remain independently selectable.
   it.each([
     ["working", "dispatcher"], ["thinking", "schedule"],
     ["waiting_for_input", "issues"], ["idle", "idle"],
