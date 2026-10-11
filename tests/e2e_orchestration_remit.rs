@@ -32,6 +32,12 @@
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use std::time::Duration;
 
@@ -40,7 +46,7 @@ use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE,
-    EventType, Writable,
+    EventType,
 };
 use spec::spec;
 
@@ -975,111 +981,12 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
     );
 }
 
-/// Scenario: `Compacting` fires on the start role while its pane currently
-/// declares itself history-only (not writable). The re-assertion must NOT
-/// write blindly — the pointer must stay undelivered, with the same
-/// `History-only session cannot accept live input` feedback the spawn-time
-/// seed already surfaces for a non-applied `SendResult`, until the SAME pane
-/// later declares itself live again, at which point the deferred
-/// re-assertion must complete. Proves re-assertion goes through the seed's
-/// own readiness-gating and delivery-confirmation discipline rather than a
-/// direct, unconfirmed write.
+/// Scenario: Open a real TUI orchestration and fetch its initial remit. Compact it while history-only; one new bound remit stays Queued until the same pane becomes live, then its CLI fetch acknowledges and visibly renders it.
 #[spec("orchestration/remit/003")]
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
-    let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
-
-    std::fs::write(deck.workdir().join("go-history-only"), "")
-        .expect("trigger the fixture script's history-only phase");
-    assert!(
-        common::wait_until(Duration::from_secs(5), || {
-            deck.workdir().join("history-only-emitted").exists()
-        }),
-        "the fixture script never emitted its history-only session_start within 5s"
-    );
-    // The marker file above proves only that the fixture WROTE that
-    // `session_start` to the socket, and its `EventType::SessionStart` arm
-    // asserts `session.status = Idle` just as unconditionally as the
-    // confirmation's `thinking` does — so injecting while it is still in
-    // flight loses the same race [`open_and_confirm_initial_delivery`]'s
-    // barrier closes. Wait for the phase change the emit actually declares
-    // (`live_target.writable`), which is what this test needs to be true
-    // anyway: the whole point is a re-assertion arriving while the pane is
-    // history-only.
-    assert!(
-        wait_for_applied(&socket, &pane_id, CONFIRMATION_APPLIED_TIMEOUT, |s| {
-            s.live_target.map(|t| t.writable) == Some(Writable::HistoryOnly)
-        }),
-        "the daemon never applied the fixture's history-only live_target for pane \
-         {pane_id} within {CONFIRMATION_APPLIED_TIMEOUT:?}; the pane is still writable, \
-         so the injection below would exercise the live path this test is not about.\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // Reuse the fixture's own boot session id here, unlike `_001`/`_002`'s
-    // synthetic per-call ids: a real `Compacting` hook carries the agent's
-    // own session id (its `PreCompact` originates from that agent's own
-    // process), so a differing synthetic id models an event shape that does
-    // not occur in production. `_003` is the only test in this file whose
-    // flow (history-only -> live-again) makes the resulting id-overwrite
-    // observable, which is why only this call needs the boot id.
-    inject_compacting(
-        &deck,
-        &socket,
-        &pane_id,
-        &agent_id,
-        "remit-reassert-boot-session",
-    );
-
-    let wrote_blindly = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
-    assert!(
-        !wrote_blindly,
-        "a Compacting-triggered re-assertion must not write to a history-only pane \
-         before delivery is confirmed; the log rose past its settled {baseline} \
-         `{DELIVERED_POINTER}` line(s) while the pane was still history-only.\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    let feedback = deck.wait_for_grid_string_within(
-        "History-only session cannot accept live input",
-        Duration::from_secs(5),
-    );
-
-    std::fs::write(deck.workdir().join("go-live-again"), "")
-        .expect("trigger the fixture script's return-to-live phase");
-    let delivered_once_live = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
-
-    assert!(
-        feedback,
-        "a deferred re-assertion attempt against a history-only pane must surface the \
-         same visible feedback the spawn-time seed uses for a non-applied SendResult\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        delivered_once_live,
-        "once the start-role pane reports itself live again, the deferred \
-         re-assertion must complete and deliver the pointer once more (past the \
-         settled {baseline} line(s))\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
+    route::client_orchestration(true);
 }
 
 /// Scenario: Open a real orchestration tab and let the start role's

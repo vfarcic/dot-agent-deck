@@ -30,13 +30,18 @@
 //! reuse/003 runs fast without a real ~5s wait. It sets the window to 2000.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use std::time::Duration;
 
 use spec::spec;
 
 const PROMPT_MARKER: &str = "REUSEPROMPTMARKER";
-const TYPING_MARKER: &str = "USERTYPINGMARKER";
 
 /// Create a working dir plus a "recorder" command that appends every stdin line
 /// to `record_file`. Returns (working_dir, record_file, command-string). The
@@ -156,114 +161,18 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
     );
 }
 
-/// Scenario: With a short injected debounce (`DOT_AGENT_DECK_REUSE_DEBOUNCE_MS`
-/// = 2000), fire a `new_tab_per_fire = false` task once to open the reused
-/// pane, simulate a recent user keystroke into it, then fire again. The reuse
-/// prompt must be QUEUED — not delivered while the user is "typing" (within the
-/// debounce window) — and then delivered once the pane goes idle. A subsequent
-/// fire with no recent input is delivered immediately.
+/// Scenario: Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
 #[spec("scheduler/reuse/003")]
 #[test]
+#[cfg(unix)]
 fn reuse_003_deliver_on_idle_debounce() {
-    let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let (work, record, command) = recorder_setup(scratch.path(), "idle");
-
-    let toml = task_block("idle", &work.to_string_lossy(), &command, false);
-    // Issue #544: the simulated keystroke is an unsent draft, which the draft
-    // gate would hold the prompt behind until Enter. This test's subject is
-    // the debounce alone, so the gate is off; `scheduler/reuse/005` pins it.
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[
-            ("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS", "2000"),
-            ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "0"),
-        ],
-    );
-
-    // First fire opens the reused pane and delivers the prompt once.
-    daemon.run_now("idle").expect("run-now idle #1");
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
-    let pane = records.first().cloned().expect("first fire spawns a pane");
-    assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 1, Duration::from_secs(10)),
-        "first fire must deliver the prompt once"
-    );
-
-    // Simulate the user actively typing into the pane (sets the debounce clock).
-    assert!(
-        daemon.send_pane_input(&pane.id, TYPING_MARKER),
-        "simulated user keystroke must reach the pane"
-    );
-
-    // Reuse fire while the user is "typing": the prompt must be QUEUED, NOT
-    // delivered within the debounce window (no 2nd recorded prompt yet).
-    daemon.run_now("idle").expect("run-now idle #2 (typing)");
-    assert!(
-        !common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_millis(900)),
-        "with recent user input the reuse prompt must be debounced (not delivered within the window)"
-    );
-
-    // Once the pane goes idle (debounce elapses) the queued prompt is delivered.
-    assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(6)),
-        "after the debounce window the queued prompt must be delivered into the reused pane"
-    );
-
-    // No recent input now → the next reuse fire delivers immediately.
-    daemon.run_now("idle").expect("run-now idle #3 (idle)");
-    assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 3, Duration::from_millis(1800)),
-        "with no recent input a reuse fire must deliver immediately"
-    );
+    route::scheduled(Some(3));
 }
 
-/// Scenario: Leave an unsent draft in a reused pane and fire its schedule after
-/// the ordinary idle debounce has passed. The prompt must stay queued until
-/// the user's Enter submits the draft, then arrive as a separate line.
+/// Scenario: Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
 #[spec("scheduler/reuse/005")]
 #[test]
+#[cfg(unix)]
 fn reuse_005_unsent_draft_outlives_idle_debounce() {
-    let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let (work, record, command) = recorder_setup(scratch.path(), "draft");
-    let toml = task_block("draft", &work.to_string_lossy(), &command, false);
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[
-            ("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS", "500"),
-            ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000"),
-        ],
-    );
-
-    daemon.run_now("draft").expect("open reused pane");
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
-    let pane = records.first().expect("first fire spawned a pane");
-    assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 1, Duration::from_secs(10)),
-        "first scheduled prompt must reach recorder"
-    );
-
-    assert!(
-        daemon.send_pane_input(&pane.id, TYPING_MARKER),
-        "draft bytes must reach reused pane"
-    );
-    daemon.run_now("draft").expect("fire into drafted pane");
-    assert!(
-        !common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(2)),
-        "reuse prompt reached pane while a user draft was still unsent"
-    );
-
-    assert!(daemon.send_pane_input(&pane.id, "\r"), "submit user draft");
-    assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(6)),
-        "reuse prompt did not arrive after the user submitted the draft"
-    );
-    let lines = std::fs::read_to_string(&record).expect("read submitted lines");
-    assert!(
-        lines.lines().any(|line| line == TYPING_MARKER)
-            && lines.lines().any(|line| line == PROMPT_MARKER)
-            && !lines.contains(&format!("{TYPING_MARKER}{PROMPT_MARKER}")),
-        "draft and reuse prompt were not separate submitted lines: {lines:?}"
-    );
+    route::scheduled(Some(5));
 }

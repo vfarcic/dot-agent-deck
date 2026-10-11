@@ -3,6 +3,12 @@
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use std::time::Duration;
 
@@ -12,15 +18,6 @@ use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::SendResult;
 use serde_json::json;
 use spec::spec;
-
-#[cfg(unix)]
-fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write send-result recorder");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod send-result recorder");
-}
 
 /// Scenario: Launch a real dashboard with a long-lived synthetic pane, then
 /// identify its Codex session as history-only through a synthetic hook event.
@@ -175,119 +172,12 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
     );
 }
 
-/// Scenario: Open an orchestration whose start role declares itself
-/// history-only, let the real spawn-time prompt action receive that non-applied
-/// result, then transition the same role to live. The UI must show feedback,
-/// avoid marking the role Working, retain the prompt, and deliver it after live.
+/// Scenario: Open an orchestration through the real TUI and report its start role history-only. The remit remains Queued without a typed pointer, then the same role becoming live fetches and visibly renders it.
 #[spec("prompt/pane-input/007")]
 #[test]
 #[cfg(unix)]
 fn pane_input_007_orchestrator_prompt_retries_after_non_applied_result() {
-    const MARKER: &str = "ORCHESTRATORRESULTMARKER20";
-    const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context";
-    let deck = TuiDeck::launch_with_fixture("send-result-orchestration");
-    deck.wait_for_string("No active agents");
-    let script = deck.workdir().join("orchestrator-send-result.sh");
-    write_executable(
-        &script,
-        r#"#!/bin/sh
-emit_target() {
-    WRITABLE="$1" python3 - <<'PY'
-import datetime
-import json
-import os
-import socket
-
-pane = os.environ["DOT_AGENT_DECK_PANE_ID"]
-payload = {
-    "session_id": "orchestrator-send-result-session",
-    "agent_type": "codex",
-    "event_type": "session_start",
-    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "pane_id": pane,
-    "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
-    "token": os.environ.get("DOT_AGENT_DECK_PANE_CAPABILITY"),
-    "live_target": {
-        "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
-        "writable": os.environ["WRITABLE"],
-    },
-}
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(os.environ["DOT_AGENT_DECK_SOCKET"])
-s.sendall((json.dumps(payload) + "\n").encode())
-s.close()
-PY
-}
-
-emit_target history-only
-while [ ! -f allow-live-target ]; do sleep 0.05; done
-emit_target live
-while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; done
-"#,
-    );
-
-    deck.send_keys(b"\x0e");
-    deck.wait_for_string("Select Directory");
-    deck.send_keys(b" ");
-    deck.wait_for_string("No mode");
-    deck.send_keys(b"\x1b[C");
-    deck.wait_for_absence("Command:");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-
-    // 30s rather than 5s. This wait covers a chain that spawns the pane, runs
-    // the stand-in through a `python3` interpreter, round-trips a
-    // `session_start` over the daemon socket and repaints — and it fails as a
-    // unit when the runner stalls. Measured 2026-09-07: this test took 20.9s on
-    // a `ubuntu-latest` runner against 1.54s on the same tier's green run of
-    // `main` (13.6x its own CI-normal), expiring this budget AND the delivery
-    // budget below before asserting. That is NOT a slower runner: across the
-    // 2653 tests the two reports share, the median CI/local per-test ratio is
-    // 0.96x, and this test is faster on a healthy runner (1.54s) than locally
-    // (1.94s). It is an intermittent stall, and 30s — the modal
-    // `wait_for_grid_string_within` budget in this suite, 19 of 61 uses — rides
-    // it out. The wait returns as soon as the string paints, so a healthy run
-    // pays nothing for the headroom; only a genuine failure waits longer.
-    let feedback = deck.wait_for_grid_string_within(
-        "History-only session cannot accept live input",
-        Duration::from_secs(30),
-    );
-    let marked_working = deck.snapshot_grid().contains("Working");
-    std::fs::write(deck.workdir().join("allow-live-target"), "")
-        .expect("allow synthetic role to become live");
-    // 15s rather than 10s, for the same stall: the run above expired this
-    // budget too, so widening only the feedback wait would not have saved it.
-    // 15s is the top of the range this helper already uses across the suite
-    // (10s in 13 places, 15s in 10).
-    let delivered = common::wait_for_file_substr_count(
-        &deck.workdir().join("orchestrator-prompt.log"),
-        DELIVERED_POINTER,
-        1,
-        Duration::from_secs(15),
-    );
-    let context = std::fs::read_to_string(
-        deck.workdir()
-            .join(".dot-agent-deck/orchestrator-context.md"),
-    )
-    .expect("read generated orchestrator context");
-    let grid = deck.snapshot_grid();
-
-    assert!(
-        feedback,
-        "the orchestrator prompt's HistoryOnly result must surface visible feedback\nFinal grid:\n{grid}"
-    );
-    assert!(
-        !marked_working,
-        "a role whose prompt was not delivered must not be marked Working\nFinal grid:\n{grid}"
-    );
-    assert!(
-        delivered,
-        "the non-delivered orchestrator prompt must be retained and retried after the role becomes live\nFinal grid:\n{grid}"
-    );
-    assert!(
-        context.contains(MARKER),
-        "the delivered context pointer must reference the generated context containing the role prompt"
-    );
+    route::client_orchestration(false);
 }
 
 /// Scenario: Launch a real dashboard with two panes — one whose program puts

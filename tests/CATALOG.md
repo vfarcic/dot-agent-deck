@@ -1415,11 +1415,12 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** daemon production of stale/wrong-session or orchestration-role status; those require identity-bearing daemon requests and the orchestration render loop.
 - **Platform coverage:** mac+linux+windows.
 
-##### prompt/pane-input/007 — An orchestrator prompt is retained and the role stays non-working after a non-applied result (PRD #20, blocker 5 / finding 17).
-- **Layer:** L2 PTY-attached real orchestration flow with a synthetic role that changes from history-only to live.
-- **Agent:** synthetic Codex role emitting raw `AgentEvent` liveness transitions; no LLM.
-- **Asserts:** the real spawn-time orchestrator-prompt action surfaces HistoryOnly feedback, does not mark the role Working, retains the prompt, and retries it successfully once the same role declares a live PTY target.
-- **Does not assert:** the other result variants (covered at the seed consumer by `prompt/pane-input/006`).
+##### prompt/pane-input/007 — Open an orchestration through the real TUI and report its start role history-only. The remit remains Queued without a typed pointer, then the same role becoming live fetches and visibly renders it.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Open an orchestration through the real TUI and report its start role history-only. The remit remains Queued without a typed pointer, then the same role becoming live fetches and visibly renders it.
+- **Test:** `pane_input_007_orchestrator_prompt_retries_after_non_applied_result` in `tests/e2e_pane_send_result.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/pane-input/008 — Stream-input rejection visibly exits PaneInput for both keys and paste (PRD #20 R20-007).
@@ -1676,11 +1677,12 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the real `wrap` binary or real Codex hooks (the frames are applied directly to the daemon's state); the TUI-side `delivery_target_changed` path, which reads the same `pane_hook_session_id` value; or a producer whose session id rolls over without a `SessionStart`, which now keeps the pane on its first generation (no supported agent does that).
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/044 — A dispatcher seed is delivered when the deck's own event stream missed its agent's conversation (issue #621).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_seed_late_announcement.rs`, `#![cfg(all(feature = "e2e", unix))]`): the real binary through the vt100 `TuiDeck` harness and the production New Agent form. The deck is launched with `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS`, an `e2e`-build-only seam in `spawn_event_subscriber` that drops every event of the named conversation, standing in for a reconnect gap across the agent's boot; the daemon applies those events as normal.
-- **Agent:** none (a `claude`-named shell stand-in that posts one genuine `SessionStart` through `dot-agent-deck hook --agent claude-code` — no wrapper-fork boot start, which the deck would see and bind — then records every line it reads).
-- **Asserts:** the stand-in's announcement reached the daemon; the seed then reaches the stand-in within 40 s of submitting the form, well inside the 60 s delivery deadline. Reverting the daemon's half of the fix turns it red (the seed never arrives in 40 s) and restoring it green (~13 s).
-- **Does not assert:** the reconnect itself (the seam models its effect, because a resubscribe cannot be timed against an agent's boot from a PTY); a gap covering only the `SessionStart` — measured, the daemon's `ShellIdle` for the quiet pane follows it carrying the same session id and teaches the deck the generation on its own, so that gap recovers without this fix; confirmation of the delivered seed (the stand-in reports no `UserPromptSubmit`); a real agent (`prompt/new-pane/016` drives the seed path with real Haiku).
+##### prompt/pane-input/044 — Create a dispatcher while the TUI subscriber drops its session events. The daemon still binds the seed to the correct pane and its in-pane CLI fetch acknowledges and visibly renders the seed.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Create a dispatcher while the TUI subscriber drops its session events. The daemon still binds the seed to the correct pane and its in-pane CLI fetch acknowledges and visibly renders the seed.
+- **Test:** `pane_input_044_a_seed_whose_session_start_the_deck_missed_is_still_delivered` in `tests/e2e_seed_late_announcement.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/pane-input/045 — A seed or orchestrator prompt whose `SessionStart` the TUI's event stream dropped is still delivered, naming the conversation the daemon's `stale` refusal reported (issue #621).
@@ -1959,14 +1961,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Platform coverage:** mac+linux.
 - **Note:** the fixture repo is given an initial commit by the test — the harness `git init`s fixtures but never commits, and `git worktree add` cannot branch from an unborn HEAD.
 
-##### prompt/new-pane/017 — A spawn-time seed is not written into a pane before the agent has announced itself, and is delivered exactly once and acted upon after (issues #1005 / #1006).
-- **Layer:** L2 PTY-attached, **lane 1** (`#![cfg(all(feature = "e2e", unix))]` — no `e2e-live` term, so `e2e-deterministic` runs it on every PR). The real binary is driven through the vt100 `TuiDeck` harness; the seed is enqueued by the production `Ctrl+N` new-pane flow and delivered by `ui::process_pending_seed_prompts`.
-- **Agent:** none — `common::write_late_announcing_paste_agent`, a `claude`-named stand-in whose announcement latency is a parameter. It emits a `wrapper_fork`-origin `SessionStart` at exec, withholds its genuine `SessionStart` for 3 s, then reports the built-in dispatcher's bracketed-paste seed as one `UserPromptSubmit`.
-- **Asserts:** three things, in the order they can fail. The stand-in's PTY input queue is EMPTY at the instant it announces (`clean`) — nothing was typed into a program that had not started reading. Then the seed arrives and the card's prompt history carries it (`AgentRecord.live.last_user_prompt`), i.e. the agent ACTED on it. Then exactly one copy of the seed was ever typed in, so the single bounded replacement payload (`MAX_PAYLOAD_SUBMISSIONS`) is still available to whatever genuinely needs it.
-- **The ordering is read from the INPUT QUEUE, not from the screen, and that is the whole design.** A PTY buffers a premature write and hands it over the moment the agent starts reading, so the seed's text arrives — and is visible in the pane — whether or not the delivery was sound. The stand-in therefore drains its own tty non-blockingly (`stty -icanon min 0 time 0`, then one `dd`) immediately BEFORE announcing, and labels what it finds `premature|` rather than `received|`. A blocking read cannot tell the two apart at all, which is why no existing test could see this. The probe reports `probe-failed|…` rather than degrading to silence, so the assertion is on `clean` being PRESENT, never on `premature|` being absent.
-- **Why it is lane 1, and why the delay is 3 s.** `prompt/new-pane/016` covers the same user-visible scenario with a real agent, and issue #1006 measured that it passed with the bug present: it is lane 2 (so it runs in no CI anywhere) AND its `claude` booted fast enough to win the race the test exists to exercise. `/016` has since been put behind the same delaying launcher and can now fail, but it stays lane 2 — dropping the `e2e-live` term here is what puts the ordering in front of every PR, with no credential and no token spend. 3 s is comfortably past the 500 ms `SPAWN_TIME_READINESS_BUFFER` the broken gate writes on and comfortably short of the 10 s `timeout_ready` slow path, which would deliver the seed for an unrelated reason and make the test green on a broken product.
-- **Does not assert:** the daemon-owned delivery paths (`spawn::run_delivery`, pinned by `scheduler/dispatch/014` and `/015`), which route through `latch_generation` and were never affected; the real-agent shape (`prompt/new-pane/016`); or that the daemon's own card-surfacing `SessionStart` reaches the same gate — that trigger is pinned at L1 by `prompt/pane-input/036`, since it is broadcast-only and the interactive spawn path does not emit one.
-- **Platform coverage:** mac+linux (the stand-in is `/bin/sh` plus `stty`/`dd`).
+##### prompt/new-pane/017 — Create a dispatcher through the real TUI with a stand-in that sends no SessionStart. Its seed is queued once before any hook, and after Idle the pane fetches and visibly renders that seed without typed seed bytes.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Create a dispatcher through the real TUI with a stand-in that sends no SessionStart. Its seed is queued once before any hook, and after Idle the pane fetches and visibly renders that seed without typed seed bytes.
+- **Test:** `new_pane_017_a_spawn_time_seed_waits_for_the_agent_to_announce_itself` in `tests/e2e_seed_late_announcement.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/018 — A legacy `[[modes]]` declaration warns while the New Agent form keeps the surviving Mode choices (issue #1199).
 - **Layer:** L2 PTY-attached, lane 1 (`#![cfg(feature = "e2e")]`).
@@ -3461,11 +3462,12 @@ without depending on the config struct API.
 
 #### orchestration/delegate
 
-##### orchestration/delegate/001 — `dot-agent-deck delegate --to coder --task <text>` from the orchestrator pane writes the task into the target role's pane.
-- **Layer:** L2.
-- **Agent:** none (synthetic — invoke the delegate subcommand from inside the orchestrator pane via a scripted keystroke).
-- **Asserts:** the target role's parsed grid contains the task text; the orchestrator's pane stays clean.
-- **Does not assert:** the target agent's response (no real agent in the loop).
+##### orchestration/delegate/001 — An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
+- **Test:** `delegate_001_posts_one_bound_task_and_worker_fetches` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/002 — Delegating to a role missing from the config produces a clear error on the orchestrator pane and no other side effects.
@@ -3475,11 +3477,12 @@ without depending on the config struct API.
 - **Does not assert:** the error message text exactly.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/003 — `dot-agent-deck work-done --task <summary>` from a worker pane writes the summary to the orchestrator and to `.dot-agent-deck/work-done-<role>.md`.
-- **Layer:** L2.
+##### orchestration/delegate/003 — Complete a commissioned task from a synthetic worker. Its report is saved and reaches the recorded orchestrator generation as exactly one Untrusted-framed inbox message, fetched by the orchestrator's own pane CLI.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** orchestrator pane shows the summary; the file exists with the expected contents.
-- **Does not assert:** the orchestrator's reply (no real LLM in this synthetic test).
+- **Asserts:** Complete a commissioned task from a synthetic worker. Its report is saved and reaches the recorded orchestrator generation as exactly one Untrusted-framed inbox message, fetched by the orchestrator's own pane CLI.
+- **Test:** `delegate_003_work_done_posts_one_untrusted_report` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/004 — A worker calling `delegate` is rejected (only the `start = true` role may delegate).
@@ -3549,12 +3552,13 @@ without depending on the config struct API.
 - **Does not assert:** a real Claude or OpenCode timing distribution; the deterministic stub pins the race that real-agent timing cannot reproduce reliably. Nor the wrapper's interface buffer, the one path this 1000 ms value no longer covers (`orchestration/delegate/027`, `codex/wrap/006`).
 - **Platform coverage:** mac+linux (unix-only — Python `termios` raw-mode stub).
 
-##### orchestration/delegate/013 — A worker that receives a delegate and then emits no event produces a submitted, actionable orchestrator notice REPORTING WHAT ITS PANE IS SHOWING (PRD #249 M3; issues #686 and #702).
-- **Layer:** fast synthetic PTY integration (real `handle_delegate`, managed worker and orchestrator PTYs, the production silence watch, and a shortened worker-response window; no LLM and no `e2e` feature gate).
-- **Agent:** none — two silent worker stand-ins plus a raw no-echo orchestrator observer whose scrollback is exactly what the daemon wrote into it. Both workers set `stty raw -echo`, divert everything written into their PTY to a FILE rather than echoing it (a real agent TUI puts a typed prompt into its own input widget, not into the scrollback), and emit no agent event of any kind. They stand in for the agents that emit nothing until their first prompt arrives — Codex and OpenCode, measured; Claude and Pi emit at boot — which is why a silent pane needs no LLM to reproduce: the pane's bytes and the absence of events are both established by the fixture.
-- **Asserts:** two arms sharing one delegate path. **Ready-prompt arm:** a worker sitting at a booted agent's own ready prompt receives the task pointer (proved against the delivery log, not the scrollback), and its silence then produces a CR-submitted daemon notice in the ORCHESTRATOR's pane that names the remediation options to keep waiting, re-delegate, reassign, or notify the user. The notice quotes the line that pane is actually rendering — carrying a nonce, so the text provably came from that pane — inside the `[UNTRUSTED-PANE-TEXT: … :END-UNTRUSTED-PANE-TEXT]` frame, and no longer asserts "It may never have received the prompt". **Blank-pane arm (control):** the same delegate to a worker whose pane has drawn nothing is reported as blank, and does NOT carry the other arm's ready-prompt text — without it a notice that always claimed a ready prompt would pass. Both arms also pin that the daemon-authored prose still interpolates no role name (PRD #249 finding B3). Verified load-bearing: reverting the pane read turns the first arm red, collapsing the blank branch into the generic wording turns the second red, and reverting the delivery to `write_notice_guarded` turns the first arm red on `observed terminator = Some(10)`. **How "submitted" is discriminated, and why it is exact:** the observer prints its readiness marker terminated by a bare LF and the fixture asserts the pane delivered that LF unchanged — under a cooked line discipline ONLCR would rewrite it to CRLF, and since `stty raw` applies its whole flag set in one `tcsetattr`, an observed `-opost` is also proof of `-icrnl`, so neither an output- nor an input-side CR/LF translation can sit between the daemon and the assertion. The terminator itself is then read as the single byte following the notice payload's stable final clause, rather than as the first line break anywhere after the notice's opening clause, so an unrelated line break landing in the pane cannot be mistaken for it and a missing CR cannot be papered over by one.
-- **Does not assert:** that the pane text is genuinely unreachable as instructions once it lands in an orchestrator's context — the frame is a mitigation, not a proof, and now the only one, since #702 makes this text an agent turn rather than scrollback; `compose_delegate_silence_notice`'s own doc records why the trade was taken and where it differs from the idle prompt's; that a `vt100` replay is *required* to read a pane (a stand-in writing plain lines would also be legible raw — the cursor-addressed case is pinned by `pane_screen_text`'s unit tests instead); tracing output from the companion `warn!`; any first-run-gate string matching, which the fix deliberately does not do; an actual agent response or recovery after the notice (covered by `/024`); that an orchestrator pane holding an unsent human draft has that draft submitted along with the notice, which is issue #544's accepted limitation on every automatic submit and is shared with the idle-worker prompt; and whether a bare LF is inert on every agent, which is moot for this caller now that it submits with CR, and moot for every production notice since issue #708 moved the worker-exited and respawn-no-live-worker notices onto the submitted path as well (`scheduler/idle-worker/016`, `orchestration/delegate/023`) and issue #1337 the respawn-failure notice (`orchestration/work-done/005`); it stays open only for `write_notice_guarded` itself, kept with no production caller (`scheduler/idle-worker/015`).
-- **Platform coverage:** mac+linux (unix-only — raw-mode shell stand-ins).
+##### orchestration/delegate/013 — In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
+- **Test:** `delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/014 — A `clear = true` delegate reaches a REAL interactive Claude worker and the worker visibly acts on it (PRD #249 M4 real-agent happy path). [reel]
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant lane-2 e2e tier, runtime-skipped when the Claude CLI or credentials are unavailable). Imported Claude credentials plus project trust clear onboarding without a keystroke, and the production delegate CLI drives the daemon through its real socket.
@@ -3643,12 +3647,13 @@ without depending on the config struct API.
 - **Does not assert:** exact model prose beyond the directive's unique completion marker, which remediation choice a production orchestrator should prefer, or a real silent worker agent — `orchestration/delegate/013` and `/025` deterministically pin the notice bytes, pane evidence, and generation accounting without an LLM.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/025 — A silence watch cannot report a worker generation after a newer `clear = true` respawn has taken over its pane (issue #687).
-- **Layer:** fast synthetic PTY integration (real `handle_delegate`, two `clear = true` respawns on one managed worker pane, the production readiness wait and silence watches, and a raw no-echo orchestrator observer; no LLM and no `e2e` feature gate).
-- **Agent:** none — a deterministic shell stand-in renders a distinct nonce-bearing sentinel on generation A and generation B, accepts submitted payload bytes without emitting any agent event, and lets the test identify which generation a notice quoted.
-- **Asserts:** generation A renders its sentinel, receives its pointer and arms a silence watch; generation B then visibly takes ownership of the same pane before A's short window expires and remains inside its longer readiness wait with no payload of its own. No silence notice may reach the orchestrator during that gap and no later notice may quote A's sentinel. As the non-vacuous control, B subsequently receives its own pointer and its own watch remains armed long enough to fire exactly one notice quoting B's distinct sentinel.
-- **Does not assert:** internal silence-watch sequence numbers, retirement variants, or the implementation seam where supersession is recorded; the observable contract is solely which generation's pane evidence reaches the orchestrator.
-- **Platform coverage:** mac+linux (unix-only — raw-mode POSIX shell stand-ins and managed PTYs).
+##### orchestration/delegate/025 — Supersede an unacknowledged delegate with clear enabled, replacing its worker generation again. Only the successor's message is bound to the current worker and only its id appears in the eventual undelivered notice.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Supersede an unacknowledged delegate with clear enabled, replacing its worker generation again. Only the successor's message is bound to the current worker and only its id appears in the eventual undelivered notice.
+- **Test:** `delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/026 — The wrapper's WEAK interface fact (output settled) does not release the delegate gate; the pointer is held until the STRONG one upgrades it, and then priced as an interface observation (issue #243, `INTERFACE_UPGRADE_WINDOW`).
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket + the REAL `dot-agent-deck wrap` rewrite at the common spawn boundary; no LLM and no `e2e` feature gate).
@@ -3885,12 +3890,13 @@ without depending on the config struct API.
 - **Does not assert:** the no-cwd and mkdir-only variants of the same failure (unit-tested on `write_work_done_summary`); the stale-file READ itself (the pointer's absence is what makes it unreachable); recovery of the file on a later delegation.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/004 — On the REAL binary, an unsolicited `work-done` renders its label and the worker's framed report in the attached TUI's orchestration surface, with no pointer to a file that was never written (issues #448 + #433).
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon; the completion is issued by running the REAL `dot-agent-deck work-done` CLI against the deck's own hook socket, so the spawned-binary → hook-socket → daemon → rendered-pane boundary is covered end to end). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
-- **Agent:** none (the `orch-deck` fixture's two `cat` roles: `orchestrator` start + `worker`). Both delegation watches are switched off via the millisecond seams so no detector competes for the surface under assertion.
-- **Asserts:** with the orchestration opened through the production new-pane flow and NOTHING delegated, the real `work-done` CLI exits 0 and the rendered orchestration surface visibly carries the daemon's unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded from `you have no outstanding delegation to that worker` by issue #505) plus its provenance clause, and the worker's own report inside `[UNTRUSTED-WORKER-REPORT: … ]` (sentinel `e2e-unsolicited-report-4b7d`); the happy-path pointer (`Read .dot-agent-deck/work-done-worker.md …`) is ABSENT; and no `work-done-worker.md` exists on disk. Needles are matched with whitespace squeezed out of both sides, because a long daemon-injected line wraps at whatever column a role pane happens to be — the failure mode `scheduler/idle-worker/011` demonstrates.
-- **Does not assert:** the failed-summary-write branch (deterministic only by sabotaging the coordination path, so it stays fast-tier as `orchestration/work-done/003`); the commission ledger's arithmetic (unit-tested); a real agent reading and acting on the label (an LLM decision, not a rendering fact).
-- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+##### orchestration/work-done/004 — Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+- **Test:** `work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui` in `tests/e2e_work_done_reporting.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/005 — A `clear = true` delegate whose respawn FAILS releases its commission, so the next uncommissioned `work-done` from that worker is still reported as unsolicited (issue #448 review, round 2).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
@@ -3924,13 +3930,13 @@ without depending on the config struct API.
 - **Does not assert:** that framing binds an LLM (it is advisory, defence in depth rather than a parser boundary, as #509 itself says); case-insensitive and bracket-preserving details of the defang (`state::tests::frame_untrusted_report_for_file_keeps_the_report_and_its_frame_intact`); #331's clobber of a worker's own report at the role-keyed path (`orchestration/work-done/013` and `/012`).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/009 — On the REAL binary, a cut unsolicited report ends with where its full copy is saved, and that file holds the whole report framed as untrusted (issue #508).
-- **Layer:** L2 PTY-attached, lane 1 (the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon; the completion is issued by the REAL `dot-agent-deck work-done --task-file` CLI over the deck's own hook socket). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
-- **Agent:** none. The `orch-deck` fixture's `worker` stays a plain `cat`, but the test rewrites its copy of the fixture so the `orchestrator` is a RAW, no-echo `cat` (`stty -echo -icanon … && exec cat -u`). A canonical-mode tty hands a plain `cat` at most 4095 bytes of one line, so it echoes the whole feedback and then reprints a copy cut near the 4000-character mark, and that copy scrolls the closing notice off the pane. This failed CI run 36241233852, and it reproduces deterministically with a 3 s settle before the screen check. A real agent reads its input raw, as this stand-in now does. Both delegation watches are off via the millisecond seams.
-- **Asserts:** with nothing delegated, the real CLI delivers a ~7 KB multi-line report read verbatim from a file and exits 0; the daemon writes into the orchestrator's PTY the sentence `the full report is saved at`, with the report's opening inlined and its tail sentinel ABSENT (control: it was cut); the path is read out of that PTY text, lies under the fixture's `.dot-agent-deck/`, and names a file whose first and last lines are the untrusted-report markers and which holds the report verbatim; and the saved-report sentence becomes visible in the rendered orchestration surface's pane column. The notice closes the message, so it is what stays on screen however far the report scrolled — which is why this test does not extend `orchestration/work-done/004`, whose label a 7 KB report scrolls off a 40-row pane.
-- **Why it exists:** the fast-tier `orchestration/work-done/007` drives the handler in-process; this covers the CLI → hook socket → daemon → file → screen path end to end (PR #1341 review). Confirmed red with the `save_full_report` call disabled.
-- **Does not assert:** the file-framing edge cases (unit-tested); the Filed path's framing through the real binary (the lane-2 `delegate_work_done_chain_claude` drives that write with a real agent); an orchestrator reading the file.
-- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+##### orchestration/work-done/009 — Send an unsolicited worker report larger than the inline budget through the real CLI. The orchestrator fetches its framed head and saved-copy path from the inbox; that saved file holds the entire Untrusted-fenced report.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Send an unsolicited worker report larger than the inline budget through the real CLI. The orchestrator fetches its framed head and saved-copy path from the inbox; that saved file holds the entire Untrusted-fenced report.
+- **Test:** `work_done_009_a_cut_unsolicited_report_names_its_saved_full_copy_in_the_attached_tui` in `tests/e2e_work_done_reporting.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/011 — A delegated worker's completion after an ABANDONED pane close is not reported to the orchestrator as work it never commissioned (issue #505).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, with the registry's own `begin_pane_close` / `finish_pane_close(_, false)` pair — the calls `StopAgent` makes when `close_agent` fails; `cat` stand-ins, no LLM and no `e2e` feature gate).
@@ -3940,13 +3946,13 @@ without depending on the config struct API.
 - **Does not assert:** a genuinely failed `StopAgent` round trip through the attach socket (the registry pair is the seam it calls, and `close_agent` failing is not reachable deterministically from a test); the #448 arm-refused-mid-close path, which reaches the same label by a different route; what an orchestrator then does with the reworded label (an LLM decision).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/012 — On the REAL binary, `work-done --task-file` naming the deck's own summary path leaves that file intact and the orchestrator is visibly told where the report went (issue #331).
-- **Layer:** L2 PTY-attached, lane 1 (the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon; the REAL `delegate` and `work-done` CLIs over the deck's own hook socket). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
-- **Agent:** none (the `orch-deck` fixture's two `cat` roles). Both delegation watches are off via the millisecond seams.
-- **Asserts:** after the real `delegate --to worker` from the orchestrator's pane, the worker's markdown report is written to `.dot-agent-deck/work-done-worker.md` and handed to the real `work-done --task-file ./.dot-agent-deck/../.dot-agent-deck/work-done-worker.md`, which exits 0; the file is unchanged byte for byte; the daemon writes the diverted wording into the orchestrator's PTY; the path read out of that PTY text names a file under the fixture's `.dot-agent-deck/` holding the report between the untrusted-report marker lines; the diverted wording becomes visible in the rendered pane column; and the happy-path pointer is absent from it.
-- **Why it exists:** the fast-tier `orchestration/work-done/013` passes the report text to the handler directly; this covers the CLI's `--task-file` read → hook socket → daemon → file → screen path with the input and the output being one file. Confirmed red with the guard made to accept every file.
-- **Does not assert:** a symlinked or hard-linked `--task-file` (the daemon never sees the input path, so the form cannot matter; the contents at the destination decide); a real agent choosing that path.
-- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+##### orchestration/work-done/012 — Delegate a task and pass a worker-owned summary file to the real work-done CLI. The source survives byte for byte, a separately framed report copy is saved, and one bound report is fetched and rendered in the orchestrator pane.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Delegate a task and pass a worker-owned summary file to the real work-done CLI. The source survives byte for byte, a separately framed report copy is saved, and one bound report is fetched and rendered in the orchestrator pane.
+- **Test:** `work_done_012_task_file_at_the_summary_path_survives_in_the_attached_tui` in `tests/e2e_work_done_reporting.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/013 — A worker's own report parked at `work-done-<role>.md` is kept, and the commissioned report is saved to a new file the feedback names (issue #331).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
@@ -3964,14 +3970,13 @@ without depending on the config struct API.
 - **Does not assert:** a successor that arrives through `pane restart` or a `clear = true` respawn (those retire on replacement, issue #590); the idle-worker and silent-worker watches, which the exit sweep already retires; a successor reporting while a delegate to the pane is still queued, which is credited to that queued commission by design.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/015 — On the REAL binary, an agent started in the pane of a worker that EXITED ON ITS OWN is not credited with that worker's task (issue #507).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_exited_worker.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon, the REAL `delegate` and `work-done` CLIs, and the daemon's real `StartAgent` over the attach socket). Synthetic stand-ins, so deliberately NOT demo-reel-marked.
-- **Agent:** none. The `delegate-exited-worker` fixture's `quitter` role (`clear = false`) runs the fixture's `worker.py` stand-in, which logs what it reads from its PTY and exits on a trigger file WITHOUT reporting. The successor is started through `DaemonClient::start_agent` — the request a TUI sends when it opens a pane — on the quitter's pane id and tab membership; it runs the branch's own `work-done` from inside its pane on a second trigger, so it carries the token the daemon minted for it.
-- **Asserts:** control first — `delegate --to quitter` exits 0 and the live worker reads its pointer, which still shows in its log after the test resizes the pane (see `orchestration/delegate/049` for why, issue #1539). The worker exits on its own, the successor starts in the same pane and reports, and the orchestrator's PTY then carries the successor's report with the unsolicited label and NOT `Worker quitter has completed their task`; no `.dot-agent-deck/work-done-quitter.md` exists.
-- **Why it exists:** the L2 counterpart of `orchestration/work-done/014`, through the real daemon's `StartAgent`, hook socket and token gate (Qodo, #1525). Verified red with only the crediting-time retire disabled: the orchestrator was told `Worker quitter has completed their task. Read .dot-agent-deck/work-done-quitter.md …`.
-- **Does not assert:** the rendered TUI grid (the daemon's own PTY snapshot of the orchestrator pane is what it reads); a successor that is itself delegated to before it reports, which the ledger's unit tests own (`commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own`).
-- **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
-- **Flake history:** quarantined under #1539 with `orchestration/delegate/049`, for the same cause: a delivered pointer dropped from the pane snapshot by the TUI's layout resize. Fixed the same way.
+##### orchestration/work-done/015 — Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+- **Test:** `work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task` in `tests/e2e_delegate_exited_worker.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 #### orchestration/provenance
 
@@ -4267,12 +4272,13 @@ without depending on the config struct API.
 - **Does not assert:** a genuinely non-orchestration (plain agent/mode) pane's compaction re-asserting nothing — deliberately not exercised here since the worker-role case already proves the guard does not key off "any pane in the orchestration" and the settled scope names only the start role as a trigger; the readiness-gating/delivery-confirmation discipline of the re-assertion itself (`003`).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`).
 
-##### orchestration/remit/003 — A re-assertion triggered while the start-role pane is history-only does not write blindly: the pointer stays undelivered (with the same `History-only session cannot accept live input` feedback the spawn-time seed already surfaces for a non-applied `SendResult`) until the pane later reports itself live again, at which point the deferred re-assertion completes.
-- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
-- **Agent:** none (`remit-reassert-orchestration` fixture; the orchestrator role's script additionally toggles its own declared liveness live -> history-only -> live on cue from control files the test writes into the fixture workdir).
-- **Asserts:** with the start-role pane confirmed history-only, injecting `Compacting` for its identity does not push the delivery log past its settled count within a 900ms bounded wait, and the rendered grid surfaces `History-only session cannot accept live input` within 5s; once the SAME pane subsequently reports itself live again, the log rises one `Read .dot-agent-deck/orchestrator-context` line past that count within 30s — proving the re-assertion is gated on confirmed delivery rather than a direct, unconfirmed pane write. Deliberately asserts only on the rendered grid and the delivery-log line count — both pre-existing, stable observables — never on an internal helper or `SendResult` variant, so this test's correctness does not depend on internal refactoring of the delivery-confirmation machinery.
-- **Does not assert:** the pure liveness-toggle mechanism in isolation (covered generally by `prompt/pane-input/007`'s identical `emit_target` technique at spawn time); a genuinely dropped/lost re-assertion attempt distinct from a merely-deferred one (not constructible without comparing against a broken implementation).
-- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`002`).
+##### orchestration/remit/003 — Open a real TUI orchestration and fetch its initial remit. Compact it while history-only; one new bound remit stays Queued until the same pane becomes live, then its CLI fetch acknowledges and visibly renders it.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Open a real TUI orchestration and fetch its initial remit. Compact it while history-only; one new bound remit stays Queued until the same pane becomes live, then its CLI fetch acknowledges and visibly renders it.
+- **Test:** `orchestration_remit_003_reassertion_waits_for_confirmed_delivery` in `tests/e2e_orchestration_remit.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/remit/004 — A `/clear`-originated `SessionStart` event on the orchestrator start-role pane re-delivers the remit pointer a second time, exactly once.
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; the daemon's own `AppState::apply_event` and `deliver_orchestrator_prompt` render-loop path handle the injected event and the redelivery for real).
@@ -4463,29 +4469,29 @@ without depending on the config struct API.
 
 #### dispatch/return
 
-##### dispatch/return/001 — A dispatched orchestration's terminal completion returns to the pane that dispatched it as a submitted turn (PRD #220 M2.0/M2.1).
-- **Layer:** L2 synthetic, lane 1 (`TuiDeck` on the `orch-deck` fixture) driving the REAL `dot-agent-deck dispatch --orchestration=demo-orch` and `dot-agent-deck work-done --done` CLIs through the deck's hook socket. The dispatch creates a real sibling git worktree and the fixture's two real role PTYs; there is no real agent and no credential.
-- **Agent:** none. The dispatched orchestration's `orchestrator` and `worker` commands are `cat`. The caller runs a narrow Python terminal probe: raw/no-echo stdin, a readiness marker, and one labelled output line per terminator (`SUBMITTED:` for CR, `NOTICE:` for LF), so the rendered result proves the daemon submitted a turn rather than merely making bytes visible. This is the one property plain `cat` cannot distinguish.
-- **Asserts:** in failure order, the caller probe registers and prints its readiness marker; the dispatch CLI exits successfully; the existing acknowledgement appears in the caller's rendered grid as a `SUBMITTED:dispatch:` line carrying `spawned isolated` and the quoted unit name (the control that proves guarded caller delivery and the probe itself work); the dispatched worktree's start-role pane is registered with orchestration membership; its real `work-done --done` CLI exits successfully; and one rendered completion turn in the CALLER begins `SUBMITTED:dispatch:`, carries the whole word `completed`, fences the exact unit as `[UNTRUSTED-ROLE-LABEL: orch-return-probe :END-UNTRUSTED-ROLE-LABEL]`, and fences the distinctive report as `[UNTRUSTED-WORKER-REPORT: orchestration-return-report-7f31 :END-UNTRUSTED-WORKER-REPORT]`. Because the long turn wraps, the helper isolates only the right-hand pane cells from that submitted opening through the worker-report closing marker, then applies the harness's wrap-insensitive search normalization to that bounded region; it never concatenates the whole grid.
-- **Why it exists:** before Phase 2, dispatch captures the caller's `(pane_id, agent_id)` only long enough to deliver the spawn acknowledgement, then discards it. A terminal `--done` from the dispatched orchestration's own start role reaches `handle_work_done`, logs `orchestration complete (orchestrator --done)`, and returns with no consequence. The caller therefore starts a unit successfully and never hears from it again. This test begins at both real CLI boundaries and ends on the rendered caller conversation, so a callback that is merely stored, merely logged, sent to the unit's own tab, or written as a passive notice cannot satisfy it.
-- **Does not assert:** callback refusal after caller identity hand-over, pane-gone drop-and-log, retry policy, or a durable outcome store; the exact completion sentence beyond its four stable components; real-agent compliance with the `work-done` instruction; ordinary worker-to-orchestrator feedback (`orchestration/work-done/004` and `orchestration/route/001` own that non-regression).
-- **Platform coverage:** mac+linux (PTY-attached lane 1; POSIX-style PATH and the harness's local socket transport).
+##### dispatch/return/001 — Dispatch an isolated orchestration from an attached synthetic caller and complete it through the real CLI. One bound acknowledgement and one Untrusted-framed completion reach that caller through its inbox; a repeat completion posts nothing.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Dispatch an isolated orchestration from an attached synthetic caller and complete it through the real CLI. One bound acknowledgement and one Untrusted-framed completion reach that caller through its inbox; a repeat completion posts nothing.
+- **Test:** `dispatch_return_001_orchestration_completion_reaches_the_caller` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
-##### dispatch/return/002 — The dispatch return callback survives detaching and reattaching the caller pane before the unit completes (PRD #220 M2.1).
-- **Layer:** L2 synthetic, lane 1 (`TuiDeck` on `orch-deck`) using the same real dispatch/work-done CLI and real daemon-owned role PTYs as `dispatch/return/001`, plus the real TUI's two-sided Ctrl+D transition: detach the caller from `TYPING` into dashboard `COMMAND` mode, then return to that pane's `TYPING` mode, between those two commands. No LLM, network or credential.
-- **Agent:** none (`cat` for both dispatched roles; the caller is the same raw terminal probe as `/001`, which labels CR delivery `SUBMITTED:` and LF delivery `NOTICE:`).
-- **Asserts:** in failure order, the caller and dispatch preconditions from `/001`; the dispatched orchestration's start role exists before any UI transition; the first Ctrl+D visibly reaches dashboard `COMMAND` mode with the `caller` card selected and that caller's submitted acknowledgement in the split-layout preview; the second Ctrl+D visibly restores `TYPING`, removes `COMMAND`, and keeps that same acknowledgement visible; the dispatched orchestrator's terminal work-done CLI succeeds; and the caller's reattached grid gains one wrapped turn beginning `SUBMITTED:dispatch:`, carrying whole word `completed`, the exact unit inside its `UNTRUSTED-ROLE-LABEL` frame, and unique report `reattach-return-report-82ac` inside its `UNTRUSTED-WORKER-REPORT` frame. It uses `/001`'s bounded right-pane-region normalization.
-- **Why it exists:** the PRD names callback loss across detach/reattach as the risk that leaves a dispatcher waiting forever. Pane PTYs and their scrollback already live in the daemon, so a correct callback belongs beside that state and survives a TUI leaving and returning to the pane. The acknowledgement-before/`COMMAND`/`TYPING` sequence is load-bearing: it proves both halves of the real Ctrl+D state transition and identifies the selected pane on each side, rather than treating an unchanged mode or a different tab as a persistence test. Split layout deliberately retains the selected pane's preview while detached, so disappearance would be the wrong precondition.
-- **Does not assert:** killing and relaunching the entire TUI client, daemon restart (not promised), caller identity hand-over, pane-gone handling, or a durable result after the pane closes; completion while the caller is still detached (the contract is retention across the cycle, and this scenario completes after the original pane is visibly reattached).
-- **Platform coverage:** mac+linux (PTY-attached lane 1; POSIX-style PATH and the harness's local socket transport).
+##### dispatch/return/002 — Dispatch an orchestration, fetch its acknowledgement, then detach and reattach the caller in the real TUI. Its eventual completion must still be fetched and visibly rendered in the same caller pane.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Dispatch an orchestration, fetch its acknowledgement, then detach and reattach the caller in the real TUI. Its eventual completion must still be fetched and visibly rendered in the same caller pane.
+- **Test:** `dispatch_return_002_callback_survives_caller_detach_and_reattach` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
-##### dispatch/return/003 — A dispatched `--single` unit can complete back to its caller, while an unrelated pane's work-done remains on the unknown-pane path (PRD #220 M2.3).
-- **Layer:** L2 synthetic, lane 1 (`TuiDeck` on `minimal`) driving the REAL `dot-agent-deck dispatch --single` CLI, then two REAL `work-done --done` CLI calls through the hook socket: first from the unrelated caller control and then from the dispatched unit. The daemon creates the real sibling worktree and PTY; all child behaviour is deterministic and credential-free.
-- **Agent:** none. Both caller and single unit use the raw terminal probe from `/001`: it stays alive like `cat`, prints an explicit readiness marker, and labels a CR-terminated delivery as `SUBMITTED:` so the test distinguishes a turn from a notice without a real agent.
-- **Asserts:** in failure order, caller readiness, successful single dispatch, submitted acknowledgement in the caller, and a dispatched `dispatch-<name>` record rooted in the expected worktree whose own probe is ready; a `work-done --done` from the caller (neither a role nor a dispatched unit) exits successfully but produces the existing `work-done from unknown pane` warning naming that pane; the single unit's work-done CLI exits successfully; the caller renders one wrapped turn beginning `SUBMITTED:dispatch:`, with whole word `completed`, the exact unit inside its `UNTRUSTED-ROLE-LABEL` frame, and unique report `single-return-report-4d92` inside its `UNTRUSTED-WORKER-REPORT` frame; and, only after that positive return barriers daemon ingestion, no pane snapshot contains the control's unique `unknown-pane-report-93e1-must-not-route` text. It uses `/001`'s bounded right-pane-region normalization.
-- **Why it exists:** a single dispatch has no orchestration membership and today never enters any useful work-done branch: `handle_work_done` requires `pane_role_map`, which only orchestration-role spawn populates, so it warns `work-done from unknown pane` and returns. Phase 2 must give the dispatched single pane enough daemon-owned identity to resolve its retained callback without weakening that admission gate for arbitrary panes. The adjacent unknown control pins both sides of that distinction and its absence is barriered by the successful return, not by a sleep or an early empty read.
-- **Does not assert:** how a real single agent learns to invoke `work-done --done`, real-agent execution, callback refusal after caller identity hand-over, pane-gone handling, exact completion prose, or the ordinary non-dispatched orchestration routes already owned by `orchestration/work-done/*` and `orchestration/route/001`.
-- **Platform coverage:** mac+linux (PTY-attached lane 1; POSIX-style PATH and the harness's local socket transport).
+##### dispatch/return/003 — Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+- **Test:** `dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 ##### dispatch/return/004 — A dispatched unit's completion is refused, with no bytes written, when the caller pane has changed hands before the unit completes (PRD #220 M2.1 / issue #617).
 - **Layer:** fast integration (the real `AppState::handle_work_done` completion path and `daemon::deliver_dispatch_result` identity gate against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
@@ -4521,13 +4527,13 @@ without depending on the config struct API.
 - **Does not assert:** the file surviving worktree removal (it does not, and the user docs say so); the save failing (unit-tested wording in `state::tests`); orchestration-shaped units (the same code path, keyed by the terminal pane); a real dispatcher reading the file.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
-##### dispatch/return/008 — On the REAL binary, a dispatched unit's cut report ends with where its full copy is saved in the unit's worktree, and that file holds the whole report (issue #508).
-- **Layer:** L2 synthetic, lane 1 (`TuiDeck` on `minimal`) driving the REAL `dispatch --single` and `work-done --done` CLIs through the hook socket, exactly as `dispatch/return/003` does; the daemon creates the real sibling worktree and PTY.
-- **Agent:** none — the caller and the single unit are `/001`'s raw terminal probe, which labels a submitted turn `SUBMITTED:`.
-- **Asserts:** after the usual caller-readiness, dispatch and acknowledgement preconditions, the unit's real `work-done --done` carries a ~7 KB multi-line report; the caller's PTY text gains `the full report is saved at` inside a `SUBMITTED:dispatch:` turn with the report's opening inlined and its tail ABSENT (control: cut, and delivered as a turn); the named path lies under the DISPATCHED WORKTREE's `.dot-agent-deck/` (not the caller's directory), and the file holds the report verbatim between the untrusted-report marker lines. This is the case the fast-tier `dispatch/return/007` cannot reach: its unit's cwd is read from a real dispatched agent's registry record, bound to the agent id retained at dispatch time.
-- **Why it exists:** PR #1341 review asked for L2 coverage of the changed completion path. Confirmed red with the `save_full_report` call disabled.
-- **Does not assert:** the rendered grid region of the turn (`/001`–`/003` own its wrapping); the file surviving worktree removal (it does not); a real dispatcher reading it.
-- **Platform coverage:** mac+linux (PTY-attached lane 1; POSIX-style PATH and the harness's local socket transport).
+##### dispatch/return/008 — Complete a dispatched single stand-in with an over-budget report. Its framed inbox completion names a full Untrusted-fenced saved copy under the unit worktree, while the fetched head and completion are visibly rendered in the caller pane.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Complete a dispatched single stand-in with an over-budget report. Its framed inbox completion names a full Untrusted-fenced saved copy under the unit worktree, while the fetched head and completion are visibly rendered in the caller pane.
+- **Test:** `dispatch_return_008_cut_report_names_its_saved_full_copy_in_the_unit_worktree` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 #### dispatch/close
 
@@ -5497,12 +5503,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** what the delegate gate then does with the signal (`orchestration/delegate/029`); the fork-time event's own card-surfacing role (`orchestration/delegate/007`); real codex-cli boot output (`codex/live/001`).
 - **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
-##### codex/wrap/007 — A wrapped Codex pane whose wrapper could not get Codex's hooks trusted receives its seed prompt exactly once (issue #559).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_codex_seed_delivery.rs`, `#![cfg(all(feature = "e2e", unix))]`): the real deck, daemon and `dot-agent-deck wrap`, the built-in dispatcher seed selected by its visible chip in the New Agent form, and an explicitly wrapped Codex stand-in.
-- **Agent:** a stand-in that paints one composer line (so the wrapper's classifier gives the pane a producer), records every submission, and reports none. Two decks, differing only in `PATH`: one with the `codex-synthetic` app-server stand-in listing the deck's `pre_tool_use` and `user_prompt_submit` hooks, so the wrapper records trust for the prompt hook; one with no `codex` at all (`<deck bin dir>:/usr/bin:/bin`), the `devbox run codex-big` host, so the trust step cannot run. Never the inherited `PATH`, since a host `codex` would decide the trust step.
-- **Asserts:** the seed reaches the pane in both runs; the healthy pane is re-submitted after the 10 s Codex retry floor, so it records the seed twice (the control — the retry that recovers a swallowed seed); the untrusted pane records it exactly once. RED with the wrapper's marker stamping disabled: the untrusted pane recorded it twice.
-- **Does not assert:** the orchestrator or daemon-owned delivery paths (`prompt/pane-input/041`, `scheduler/dispatch/016`); a real Codex (`codex/hooks/001` and `codex/live/001` cover the wrapper under one); which event carried the marker (`codex/trust/005`).
-- **Platform coverage:** mac+linux (unix-only file).
+##### codex/wrap/007 — Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Exactly one seed waits in its inbox and is fetched after Idle without typed seed bytes or a typed retry.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Exactly one seed waits in its inbox and is fetched after Idle without typed seed bytes or a typed retry.
+- **Test:** `codex_wrap_007_untrusted_codex_pane_receives_its_seed_once` in `tests/e2e_codex_seed_delivery.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
 
 #### codex/trust
 
@@ -6612,11 +6619,12 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** any `$SHELL` fallback — `command` is now a required field, so there is no implicit-shell case (the former omitted-command fallback was removed); prompt delivery for this case (covered by spawn/002 + spawn/004).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/spawn/004 — A single fire calls spawn exactly once and delivers the configured prompt (no double-spawn, no missed delivery) (PRD #127 M2.3).
-- **Layer:** L2.
-- **Agent:** none (run-now; observes registry agent count + PTY prompt echo).
-- **Asserts:** one run-now spawns exactly one agent (count stays at 1 across a short window) and the configured prompt is echoed by that agent's PTY.
-- **Does not assert:** tab-reuse vs `new_tab_per_fire` semantics (Phase 2B).
+##### scheduler/spawn/004 — Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
+- **Test:** `spawn_004_fires_spawn_exactly_once_and_delivers` in `tests/e2e_scheduler_spawn.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/spawn/005 — A scheduled single-agent fire does NOT deliver its prompt until the agent's `SessionStart` is observed; delivery is gated on readiness, not a flat 300ms timer (PRD #127 scheduled-prompt readiness bug).
@@ -6894,14 +6902,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** ordering of the two tabs; tab titles.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/reuse/003 — On a reuse fire, a recent user keystroke debounces delivery until the pane goes idle; with no recent input the prompt is delivered immediately (PRD #127 M2.2, Q6).
-- **Layer:** L2.
-- **Agent:** none (run-now + simulated STREAM_IN keystroke; observes PTY prompt-echo occurrence count over time). Debounce window injected via `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` so the test is fast.
-- **Asserts:** after a simulated keystroke, a reuse fire's prompt is NOT delivered within the debounce window and IS delivered into the same pane once the window elapses; a later fire with no recent input is delivered immediately.
-- **Draft gate setup:** sets `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS=0` because the simulated keystroke is an unsent draft, which issue #544's gate would otherwise hold the prompt behind; `scheduler/reuse/005` pins that gate.
-- **Does not assert:** the production default debounce duration (the test injects a short one); queue depth beyond the latest prompt.
+##### scheduler/reuse/003 — Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
+- **Test:** `reuse_003_deliver_on_idle_debounce` in `tests/e2e_scheduler_reuse.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
-
 
 ##### scheduler/reuse/004 — A reuse fire's queued prompt is refused, with no bytes written, when the delivery pane changes hands inside the deliver-on-idle debounce (issue #617, finding 2).
 - **Layer:** fast integration, in `src/spawn.rs`'s own `mod tests` because `deliver_on_idle` is private (real `deliver_on_idle` against registry-owned PTYs; no daemon, no scheduler, no `e2e` feature gate).
@@ -6911,11 +6918,12 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the reuse DECISION that resolves the identity (`decide_reuse_spawns_fresh_when_the_pane_id_was_inherited_by_another_agent`, a pure unit test beside it, and `scheduler/reuse/001` / `/002` for the tab-count surface); the hard-timeout policy (`decide_delivery_capped` is pure and unit-tested); the issue #424 F1 record lifecycle this delivery now participates in.
 - **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
 
-##### scheduler/reuse/005 — A reused pane's unsent draft keeps the next scheduled prompt queued beyond the idle debounce (issue #544).
-- **Layer:** L2, lane 1 (real daemon `RunNow` and simulated STREAM_IN into a recorder PTY).
+##### scheduler/reuse/005 — Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** after the debounce has elapsed, the prompt remains absent while the user draft is unsent; Enter releases it and the recorder sees the draft and prompt as separate lines.
-- **Does not assert:** native agent editor state, real-agent prompt handling, or the default cap duration.
+- **Asserts:** Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
+- **Test:** `reuse_005_unsent_draft_outlives_idle_debounce` in `tests/e2e_scheduler_reuse.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/manager
@@ -7233,48 +7241,52 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the card's status after the subagent ends (`status/subagent/006`); a real agent's subagent; the rendering in an attached TUI.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/026 — Response watches start when a deferred delegate pointer reaches the worker (issue #544, PR #1398 review).
-- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
-- **Agent:** none (`cat` stand-ins).
-- **Asserts:** after a worker's unsent draft holds its pointer longer than both the idle-worker and no-event windows, neither report reaches the orchestrator; Enter delivers the pointer, and only after the configured windows then elapse do both reports arrive.
-- **Does not assert:** real-agent event handling, rendered card state, or the exact wording of either report.
+##### scheduler/idle-worker/026 — Leave a task Queued and then Fetched across two idle windows. No idle notice appears until the worker acknowledges it, after which the idle clock begins and one daemon notice reaches the orchestrator inbox.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Leave a task Queued and then Fetched across two idle windows. No idle notice appears until the worker acknowledges it, after which the idle clock begins and one daemon notice reaches the orchestrator inbox.
+- **Test:** `idle_worker_026_response_clocks_start_after_deferred_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/027 — A delegate queued behind a parked pointer is not reported idle before its own pointer is written (issue #544, PR #1398 review).
-- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
-- **Agent:** none (`cat` stand-ins).
-- **Asserts:** a worker's unsent draft parks a first delegate's pointer, and a `--supersede` delegate dispatched meanwhile queues behind it past both response windows; neither the idle-worker nor the no-event report reaches the orchestrator while it is queued. Enter delivers both pointers, and only after the windows then elapse do both reports arrive. Verified red on the pre-fix code, where the queued delegate's idle-worker report fired one second after it was armed.
-- **Does not assert:** a queued dispatch that ends without writing (the queued mark's seq-guarding and dequeue are pinned by the `agent_pty` unit test `delegation_idle_clock_holds_a_queued_pointer_write_until_it_dequeues`), real-agent event handling, rendered card state, or the exact wording of either report.
+##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+- **Test:** `idle_worker_027_queued_delegate_clocks_start_after_its_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/028 — An idle-worker report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
-- **Layer:** fast integration (production delegate handler, idle-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
-- **Agent:** none (`cat` stand-ins).
-- **Asserts:** with an unsent draft typed into the orchestrator pane, the idle-worker window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "has not responded with work-done" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
-- **Does not assert:** the other resolutions the same check refuses on (supersede, release, `pane restart`), which share the one generation bump pinned by the `agent_pty` unit test `delegation_resolution_epoch_moves_on_every_resolution`; real-agent event handling; the exact wording of either message.
+##### scheduler/idle-worker/028 — Acknowledge a task and report work-done before its idle timeout. The orchestrator receives the completion in its inbox and never a stale idle-worker notice.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Acknowledge a task and report work-done before its idle timeout. The orchestrator receives the completion in its inbox and never a stale idle-worker notice.
+- **Test:** `idle_worker_028_waiting_idle_report_is_dropped_after_work_done` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/029 — A went-quiet report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
-- **Layer:** fast integration (production delegate handler, silent-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
-- **Agent:** none (`cat` stand-ins).
-- **Asserts:** with an unsent draft typed into the orchestrator pane, the no-event window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "delegated worker went quiet" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
-- **Does not assert:** the other resolutions the same check refuses on (see `scheduler/idle-worker/028`), real-agent event handling, or the exact wording of either message.
+##### scheduler/idle-worker/029 — Complete a task before fetching its delegate message. Work-done reaches the orchestrator inbox and retires the unacknowledged task so no later undelivered notice is posted.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Complete a task before fetching its delegate message. Work-done reaches the orchestrator inbox and retires the unacknowledged task so no later undelivered notice is posted.
+- **Test:** `idle_worker_029_waiting_silence_report_is_dropped_after_work_done` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/030 — A waiting-for-input notice that is waiting on the orchestrator's draft still arrives when the worker's own task pointer lands meanwhile (issue #1526).
-- **Layer:** fast integration (the daemon's real hook-ingestion step `daemon::ingest_event` plus real `handle_delegate` against daemon-owned PTYs; the debounce shortened through `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS`; the orchestrator's unsent draft typed through the registry's attach writer, as a deck client forwards keystrokes).
-- **Agent:** none (`cat` stand-ins; the orchestrator is a raw/no-echo `cat` so one submission appears once).
-- **Asserts:** two workers report `WaitingForInput` before they are delegated to, so the delegate-time path opens both episodes, and the orchestrator holds an unsent draft, so both notices fire and then wait on it. `held-pointer-worker`'s dispatch is held on its pane's real dispatch lock (`pane_dispatch_lock`) until its notice is waiting, then released, so its task pointer lands while the notice waits; `control-worker`'s pointer lands before its notice fires. After Enter on the orchestrator's draft, exactly one notice about each worker arrives. Two preconditions prove the order: no notice reached the orchestrator before Enter, and the held worker's notice quotes a screen without its own pointer, since a notice quotes the worker's screen as it stood when it fired. So the notice fired before the pointer landed, and the pointer landed while the notice waited.
-- **Verified load-bearing:** red on the pre-fix code (#1502's `confirm_silence_watch_delivered` moved the pane's shared delegation resolution epoch, which the notice's write-time revalidation reads): no notice for `held-pointer-worker`, one for `control-worker`. Green once a delivery moves only the separate pointer delivery epoch that the went-quiet report alone reads.
-- **Does not assert:** the timing of a starved machine, which is how `scheduler/idle-worker/021` and `/023` met this race (#1526) — the dispatch lock and the draft make the order deterministic here; the went-quiet report standing down on a newer delivery (`scheduler/idle-worker/031`); the rendering in an attached TUI.
+##### scheduler/idle-worker/030 — Report a delegated worker waiting for input and let its notice enter the orchestrator inbox. Acknowledge the task while that notice is queued; the same notice remains fetchable exactly once, independent of task acknowledgement.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Report a delegated worker waiting for input and let its notice enter the orchestrator inbox. Acknowledge the task while that notice is queued; the same notice remains fetchable exactly once, independent of task acknowledgement.
+- **Test:** `idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_waits` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/031 — A went-quiet report about an earlier delegation that is waiting on the orchestrator's draft is dropped when a newer task pointer reaches the worker meanwhile (Qodo on PR #1502, issue #1526).
-- **Layer:** fast integration (production delegate handler and silent-worker watch with real `cat` PTYs and shortened test clocks; the orchestrator's draft typed through the registry's attach writer).
-- **Agent:** none (`cat` stand-ins).
-- **Asserts:** after a first delegate's pointer lands, a `--supersede` delegate's dispatch is held on the worker pane's real dispatch lock (`pane_dispatch_lock`), and the first delegation's no-event window runs out while its report waits on an unsent orchestrator draft. Releasing the lock lets the newer pointer land, and its delivery is confirmed (the registry's pointer delivery epoch moves) before Enter on the orchestrator's draft. Exactly one went-quiet report reaches the orchestrator: the newer delegation's own, armed when its pointer landed. A precondition asserts that the setup finished inside the first window, so the first report fired after the newer delegate was armed and only the delivery can refuse it.
-- **Verified load-bearing:** red (two went-quiet reports) with the report's pointer-delivery re-check removed.
-- **Does not assert:** a refused newer pointer, which restores the displaced watch (`agent_pty::spawn_tests::silence_watch_until_delivered_keeps_the_displaced_watch_until_settled`); real-agent event handling; the exact wording of the report.
+##### scheduler/idle-worker/031 — Supersede an unacknowledged task before its notice deadline. The orchestrator receives only the newer task id in its undelivered notice; the old task produces no stale notice.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Supersede an unacknowledged task before its notice deadline. The orchestrator receives only the newer task id in its undelivered notice; the old task produces no stale notice.
+- **Test:** `idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_lands` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live
@@ -7940,3 +7952,61 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
 | Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shiftenter-or-ctrlenter-sends-the-message](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |
+
+#### Routing producers through the inbox
+
+##### inbox/route/001 — Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
+- **Test:** `route_001_clear_posts_after_respawn_to_new_agent` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/002 — Trigger quota-blocked, waiting-for-input and worker-exit notices in separate synthetic orchestrations. Each trigger posts one bound message labelled as a daemon notice, with no notice prose typed into the orchestrator.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Trigger quota-blocked, waiting-for-input and worker-exit notices in separate synthetic orchestrations. Each trigger posts one bound message labelled as a daemon notice, with no notice prose typed into the orchestrator.
+- **Test:** `route_002_worker_notices_are_bound_deck_messages` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/003 — Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+- **Test:** `route_003_exited_bound_agent_is_undeliverable_and_notifies_sender` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/004 — Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; after Idle, the pane fetches it without the seed being typed.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; after Idle, the pane fetches it without the seed being typed.
+- **Test:** `route_004_start_agent_seed_is_first_message_for_every_agent_type` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/005 — Start a daemon authoring agent with the dispatcher kind and no client seed. Exactly one bound inbox message contains the generated dispatcher instructions, with no seed bytes typed into its pane before any hook arrives.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Start a daemon authoring agent with the dispatcher kind and no client seed. Exactly one bound inbox message contains the generated dispatcher instructions, with no seed bytes typed into its pane before any hook arrives.
+- **Test:** `route_005_daemon_authoring_seed_is_queued_without_readiness` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/006 — After a worker starts successfully, change its clear-enabled role command to a nonexistent executable and delegate again. The spawn failure reaches the orchestrator as one bound daemon-notice message, with no task content typed into any pane.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** After a worker starts successfully, change its clear-enabled role command to a nonexistent executable and delegate again. The spawn failure reaches the orchestrator as one bound daemon-notice message, with no task content typed into any pane.
+- **Test:** `route_006_respawn_failure_posts_daemon_notice` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/007 — Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
+- **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.

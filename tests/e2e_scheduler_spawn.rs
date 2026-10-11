@@ -16,6 +16,12 @@
 //! `make_schedule_callback` is still a logging no-op (no agent is ever spawned).
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use std::time::Duration;
 
@@ -323,35 +329,12 @@ fn spawn_003_command_is_honored() {
     );
 }
 
-/// Scenario: Register a single task and fire it once via run-now. Assert
-/// exactly one agent is spawned (no double-spawn) and the configured prompt is
-/// delivered to it (echoed by its PTY).
+/// Scenario: Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
 #[spec("scheduler/spawn/004")]
 #[test]
+#[cfg(unix)]
 fn spawn_004_fires_spawn_exactly_once_and_delivers() {
-    let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let work = scratch.path().join("work");
-    std::fs::create_dir_all(&work).expect("create work dir");
-
-    let toml = task_block("once", &work.to_string_lossy(), Some("cat"));
-    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
-
-    daemon.run_now("once").expect("run-now once");
-
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
-    assert_eq!(
-        records.len(),
-        1,
-        "a single fire must spawn exactly one agent, got {records:?}"
-    );
-    // Hold the line: no second tab appears shortly after.
-    daemon.assert_agent_count_stays_at_most(1, Duration::from_secs(2));
-
-    let agent = &daemon.agent_records()[0];
-    assert!(
-        daemon.attach_and_wait_for_output(&agent.id, PROMPT_MARKER, Duration::from_secs(10)),
-        "the configured prompt must be delivered to the spawned agent"
-    );
+    route::scheduled(None);
 }
 
 /// Scenario: Register one single-agent task whose `command` is `cat` (a process

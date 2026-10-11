@@ -58,7 +58,7 @@ pub struct Pane {
     pub token: String,
     pub pid: u32,
     pub capture: PathBuf,
-    attach_socket: PathBuf,
+    pub(crate) attach_socket: PathBuf,
 }
 
 impl Drop for Pane {
