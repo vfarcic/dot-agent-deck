@@ -31,6 +31,7 @@ fn delivery_009_stamped_hooks_apply_without_notices_for_the_same_release() {
             &AttachRequest::Hello {
                 client_version: PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .expect("Hello response")

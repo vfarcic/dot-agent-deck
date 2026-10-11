@@ -2147,6 +2147,7 @@ impl DaemonClient {
             &AttachRequest::Hello {
                 client_version: crate::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .await?;
