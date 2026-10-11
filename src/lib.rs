@@ -7,6 +7,10 @@ pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
+// PRD #1589: the daemon side of `close` — resolve, authorize, refuse or close.
+pub mod close_agents;
+// PRD #1589: the `close` command's request building and report rendering.
+pub mod close_cli;
 pub mod codex_hooks_manage;
 pub mod codex_rollout_tail;
 pub mod config;
@@ -34,6 +38,8 @@ pub mod directory_listing;
 // Issue #544: automatic first writes wait while the user has an unsent draft.
 pub mod dispatch;
 pub mod dispatch_return;
+// PRD #1589: the record of dispatched units the `close` verb is authorized from.
+pub mod dispatched_units;
 pub mod draft_deferral;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.

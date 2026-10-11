@@ -363,30 +363,83 @@ pub async fn remove_worktree(
     clone_dir: &Path,
     policy: RemovalPolicy,
 ) -> Option<KeptWorktree> {
+    remove_worktree_outcome(worktree_dir, clone_dir, policy)
+        .await
+        .kept(worktree_dir)
+}
+
+/// PRD #1589 D6: what [`remove_worktree_outcome`] did, with the three ways a
+/// tree ends up kept told apart — [`KeptWorktree`] folds a failed status probe
+/// and a failed removal into one `confirmed_dirty: false`, which is enough for
+/// a warning and not for the `close` verb's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeRemoval {
+    /// Removed; the clone and the branch are kept.
+    Removed,
+    /// Kept: `git status --porcelain` reported uncommitted work.
+    KeptDirty,
+    /// Kept: the status probe failed, so dirtiness is unknown.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+}
+
+impl WorktreeRemoval {
+    /// The issue #717 report of this outcome: `None` when the tree was
+    /// removed.
+    pub fn kept(self, worktree_dir: &Path) -> Option<KeptWorktree> {
+        let path = worktree_dir.to_string_lossy().into_owned();
+        match self {
+            WorktreeRemoval::Removed => None,
+            WorktreeRemoval::KeptDirty => Some(KeptWorktree {
+                path,
+                confirmed_dirty: true,
+            }),
+            WorktreeRemoval::KeptCouldNotCheck | WorktreeRemoval::RemoveFailed => {
+                Some(KeptWorktree {
+                    path,
+                    confirmed_dirty: false,
+                })
+            }
+        }
+    }
+}
+
+/// [`remove_worktree`], answering with the typed [`WorktreeRemoval`]. The one
+/// implementation: [`remove_worktree`] is this outcome mapped to its report.
+pub async fn remove_worktree_outcome(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> WorktreeRemoval {
     let worktree = worktree_dir.to_string_lossy();
+    // PRD #1589 (auditor S5): the path and git's error text are producer
+    // values — a directory name may carry a newline or a terminal control — so
+    // each is escaped and bounded before it reaches the log.
+    let logged = |value: &str| {
+        crate::config_validation::escape_field_for_log(
+            value,
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        )
+    };
+    let shown_worktree = logged(&worktree);
     if policy == RemovalPolicy::KeepIfDirty {
         match worktree_is_dirty(worktree_dir).await {
             Ok(true) => {
                 tracing::warn!(
-                    worktree = %worktree_dir.display(),
+                    worktree = %shown_worktree,
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: true,
-                });
+                return WorktreeRemoval::KeptDirty;
             }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
-                    worktree = %worktree_dir.display(),
-                    error = %e,
+                    worktree = %shown_worktree,
+                    error = %logged(&e.to_string()),
                     "dispatch: could not check worktree status; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: false,
-                });
+                return WorktreeRemoval::KeptCouldNotCheck;
             }
         }
     }
@@ -400,10 +453,10 @@ pub async fn remove_worktree(
     match res {
         Ok(()) => {
             tracing::info!(
-                worktree = %worktree_dir.display(),
+                worktree = %shown_worktree,
                 "issue-dispatch: removed worktree on tab close (clone preserved)"
             );
-            None
+            WorktreeRemoval::Removed
         }
         // A FAILED removal leaves the directory on disk too, so the user is
         // told about it for the same reason a deliberate keep is: something
@@ -412,14 +465,11 @@ pub async fn remove_worktree(
         // reason is a stuck `git worktree remove` rather than their edits.
         Err(e) => {
             tracing::warn!(
-                worktree = %worktree_dir.display(),
-                error = %e,
+                worktree = %shown_worktree,
+                error = %logged(&e.to_string()),
                 "issue-dispatch: worktree cleanup on close failed"
             );
-            Some(KeptWorktree {
-                path: worktree_dir.to_string_lossy().into_owned(),
-                confirmed_dirty: false,
-            })
+            WorktreeRemoval::RemoveFailed
         }
     }
 }
@@ -2253,6 +2303,64 @@ async fn capture_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: PRD #1589 (auditor S5) — the worktree cleanup a close awaits
+    /// is pointed at a directory whose name carries a newline, a CR, an ESC and
+    /// a bidi override and runs far past any real path. The status check fails
+    /// (nothing is there), and its warning names the path escaped, on one line,
+    /// bounded — never with the raw controls that would forge a log line.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_worktree_cleanup_log_escapes_and_bounds_the_path() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = dir
+            .path()
+            .join(String::from("wt\nWARN forged line\r\u{1b}[2J\u{202e}") + &"x".repeat(2000));
+        let captured = CapturedLog::default();
+        let guard = crate::test_isolation::capture_tracing_on_this_thread(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with_ansi(false)
+                .finish(),
+        );
+        let outcome =
+            remove_worktree_outcome(&hostile, dir.path(), RemovalPolicy::KeepIfDirty).await;
+        drop(guard);
+        assert_eq!(outcome, WorktreeRemoval::KeptCouldNotCheck);
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("could not check worktree status"),
+            "the warning must be logged: {logged:?}"
+        );
+        assert_eq!(logged.trim_end().lines().count(), 1, "{logged:?}");
+        for raw in ['\r', '\u{1b}', '\u{202e}'] {
+            assert!(!logged.contains(raw), "{raw:?} reached the log: {logged:?}");
+        }
+        assert!(logged.contains("wt\\nWARN"), "{logged:?}");
+        assert!(
+            logged.chars().count() < 1800,
+            "each value is bounded: {} chars",
+            logged.chars().count()
+        );
+    }
 
     /// Issue #692: a subprocess that outlives its bound is reported as a
     /// failure naming the command and the bound, and the call returns promptly

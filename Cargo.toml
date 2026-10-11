@@ -151,6 +151,10 @@ xtask-screenshots = { path = "xtask/screenshots" }
 # `tauri-utils`, with the same `default-features = false`, so this adds no
 # crate to the build.
 ctor = { version = "1.0", default-features = false }
+# PRD #1589: `src/agent_pty.rs`'s PTY-less test master implements
+# `portable_pty::MasterPty`, whose methods return `anyhow::Error`. Already in the
+# lockfile through `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
 # `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the

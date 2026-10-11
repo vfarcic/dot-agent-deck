@@ -1392,6 +1392,7 @@ async fn hello_exchange(socket_path: &Path) -> Result<(HandshakeInfo, AttachResp
         &AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(client_build.clone()),
+            follow_on: false,
         },
     )
     .await

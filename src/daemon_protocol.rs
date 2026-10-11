@@ -860,6 +860,21 @@ pub const CAP_LAST_COMMAND: &str = "last-command";
 /// rollout tailer, which run on every platform this builds for.
 pub const CAP_TURN_REPLIES: &str = "turn-replies";
 
+/// Capability string for [`AttachRequest::CloseAgents`] (PRD #1589): close
+/// dispatched units, one agent, or one orchestration instance, with the
+/// default refusals and the caller authority the `close` verb applies. Held by
+/// [`crate::daemon_client::DaemonClient::close_agents`], which refuses to send
+/// the request to a daemon that does not advertise it. Advertised on every
+/// platform: the dispatch arm is not `#[cfg]`-gated.
+pub const CAP_CLOSE_AGENTS: &str = "close-agents";
+
+/// Capability string for [`AttachRequest::Hello`]'s `follow_on` (PRD #1589,
+/// review on PR #1681): this daemon serves one more request on a connection
+/// whose `Hello` set it. [`crate::daemon_client::DaemonClient::close_agents`]
+/// sends its request that way, so the daemon that answers it is the one whose
+/// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
+pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1032,6 +1047,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
+    CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1048,6 +1065,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
+    CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1638,6 +1657,19 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// mattered.
 const CLOSE_PREVIEW_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// PRD #1589 (review on PR #1681): how long the daemon waits for the request
+/// that follows a `Hello { follow_on: true }` reply — header and payload both —
+/// before dropping the connection. The one sender, `DaemonClient::close_agents`,
+/// writes that request as soon as it has read the reply, so this is the same
+/// "the peer cannot be doing its part" bound as [`CLIENT_WRITE_TIMEOUT`]; it
+/// keeps a stalled peer from holding a client-count slot, and with it idle
+/// shutdown. The first frame on a connection stays unbounded, as it always was.
+#[cfg(not(test))]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Short under unit test, so the stall tests observe the release quickly.
+#[cfg(test)]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Wire I/O
 // ---------------------------------------------------------------------------
@@ -1846,6 +1878,30 @@ pub enum AttachRequest {
     StopAgent {
         id: String,
     },
+    /// PRD #1589: close dispatched units, one agent, or one orchestration
+    /// instance — the `dot-agent-deck close` verb.
+    ///
+    /// Unlike [`Self::StopAgent`], which stops exactly the id it names with no
+    /// questions (its contract is unchanged), this request is resolved and
+    /// refused daemon-side: the caller's authority ([`CallerClaim`]), the
+    /// default refusals (`not-reported`, `busy`, `strands-orchestration`,
+    /// overridden by `force`), and a bulk selector that applies only as a dry
+    /// run. Answered with [`AttachResponse::close_report`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_CLOSE_AGENTS`]**, so no
+    /// [`PROTOCOL_VERSION`] bump: every sender gates in the client library.
+    CloseAgents {
+        selector: CloseSelector,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+        /// Override the forceable refusals. Never authority.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+        /// Resolve and report, stop nothing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
     AttachStream {
         id: String,
         /// PRD #882 — the geometry this client can draw the agent at, if it
@@ -2034,10 +2090,21 @@ pub enum AttachRequest {
     /// it — mirroring the server-policy on `client_version`. Older clients
     /// omit the field; deserialization tolerates that via
     /// `#[serde(default)]`.
+    ///
+    /// PRD #1589 (review on PR #1681): `follow_on` asks the daemon to keep the
+    /// connection open after the reply and serve ONE more request on it, so a
+    /// client can check a capability and send the verb it gates to the same
+    /// daemon — a second connection could reach a daemon that replaced it.
+    /// Honoured by a daemon that advertises [`CAP_HELLO_FOLLOW_ON`]; an older
+    /// one ignores the field and closes after the reply, as it always did, and
+    /// its reply does not advertise the capability, so a client that checks it
+    /// never writes the follow-on request.
     Hello {
         client_version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_build_version: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow_on: bool,
     },
     /// PRD #127 M1.3: re-read the global `schedules.toml` and diff/replace the
     /// daemon's registered scheduled-task set without a restart. The handler
@@ -2879,6 +2946,290 @@ pub enum StopRefusalReason {
     Unknown,
 }
 
+// ---------------------------------------------------------------------------
+// PRD #1589: the `close` verb's wire types.
+// ---------------------------------------------------------------------------
+
+/// Why a close refused a target, or the whole request. See
+/// [`crate::dispatched_units::RefusalReason`]: kebab-case, with a
+/// `#[serde(other)] Unknown`.
+pub use crate::dispatched_units::RefusalReason as CloseRefusalReason;
+
+/// PRD #1589: the calling agent's claim to a pane — the same
+/// `(pane, token)` pair a hook-socket message presents, checked by the same
+/// [`crate::hook_provenance::classify`]. A standalone struct so PRD #1590's
+/// follow-up request can embed it unchanged.
+///
+/// **The token is a capability and never leaves this struct**: `Debug` redacts
+/// it, and nothing derived from a request — a log line, an error, a report, a
+/// tombstone — carries it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerClaim {
+    pub pane_id: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for CallerClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerClaim")
+            .field("pane_id", &self.pane_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// PRD #1589: dispatched units by the name they were dispatched under. A
+/// standalone struct so PRD #1590 can embed it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitSelector {
+    pub names: Vec<String>,
+}
+
+/// PRD #1589: what a [`AttachRequest::CloseAgents`] names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CloseSelector {
+    /// Dispatched units, by dispatch name (compared by sanitized slug).
+    Units(UnitSelector),
+    /// Dispatched units by the daemon-issued ids a preview listed — how a bulk
+    /// close applies, so a name reused between the preview and the apply
+    /// cannot retarget it.
+    UnitIds { ids: Vec<String> },
+    /// One agent, by the pane it holds.
+    Pane { pane_id: String },
+    /// Every role of the orchestration instance this pane belongs to.
+    OrchestrationOf { pane_id: String },
+    /// Every unit the caller may close. **Dry run only**: the daemon refuses it
+    /// otherwise ([`CloseRefusalReason::BulkRequiresDryRun`]), so bulk safety
+    /// does not rest on a CLI convention.
+    AllUnits,
+}
+
+/// PRD #1589: the answer to [`AttachRequest::CloseAgents`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseReport {
+    pub dry_run: bool,
+    #[serde(default)]
+    pub forced: bool,
+    /// The whole request was refused before any target was resolved: the
+    /// caller's claim did not attest it, its generation was superseded, or a
+    /// bulk selector came without `dry_run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<CloseRefusal>,
+    /// `--all` listed only the first `crate::close_agents::MAX_LISTED_TARGETS`
+    /// units: more were live. Additive (auditor S4); absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// One entry per resolved target, or per selector entry that did not
+    /// resolve.
+    #[serde(default)]
+    pub targets: Vec<CloseTarget>,
+}
+
+/// A refusal and the sentence explaining it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseRefusal {
+    pub reason: CloseRefusalReason,
+    pub message: String,
+}
+
+/// What happened to one target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloseOutcome {
+    /// Every pane of it stopped.
+    Closed,
+    /// Some panes stopped and others did not; [`CloseTarget::survivors`] names
+    /// them. Never reported as `Closed`.
+    PartiallyClosed,
+    /// Nothing was stopped; [`CloseTarget::reason`] says why.
+    Refused,
+    /// Nothing was stopped, or what was is in `panes`; [`CloseTarget::error`]
+    /// says what went wrong.
+    Failed,
+    /// A dry run: listed, nothing stopped.
+    Listed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One target of a close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseTarget {
+    /// The selector entry that reached this target, as given (a name, an id or
+    /// a pane id). Producer input: escape it before showing it.
+    pub selector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
+    /// The unit's dispatch name, bounded. Producer input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `single`, `orchestration`, or `pane` for a target that is not a unit.
+    pub kind: String,
+    #[serde(default)]
+    pub panes: Vec<ClosePane>,
+    pub outcome: CloseOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CloseRefusalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// For [`CloseOutcome::PartiallyClosed`]: the pane ids still running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub survivors: Vec<String>,
+    /// The refusals `force` overrode for this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forced_over: Vec<CloseRefusalReason>,
+    /// In a preview: the forceable refusals a close without `force` would
+    /// meet right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_refuse: Vec<CloseRefusalReason>,
+    /// For a unit: whether it reported an attested `work-done --done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<CloseDispatcher>,
+    /// What became of the unit's worktree, once the close's cleanup answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_verdict: Option<WorktreeVerdict>,
+    /// Units this target's agents dispatched that stay open: closing is not
+    /// transitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_descendants: Vec<OpenDescendant>,
+    /// For [`CloseRefusalReason::Ambiguous`]: the units the name matched, at
+    /// most `crate::close_agents::MAX_LISTED_TARGETS` of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<AmbiguousCandidate>,
+    /// One of this entry's lists — `candidates`, a candidate's `panes`,
+    /// `open_descendants` or `panes` — was cut short: there was more than the
+    /// report lists (auditor S3). Also set when a report too large for its
+    /// size bound shortened this entry's long fields, each ending in `…`
+    /// (auditor SF3). Additive; absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+impl CloseTarget {
+    /// A target that never resolved: refused before anything else was known.
+    pub fn refused(selector: &str, reason: CloseRefusalReason, message: String) -> Self {
+        Self {
+            selector: selector.to_string(),
+            unit_id: None,
+            name: None,
+            kind: "unknown".to_string(),
+            panes: Vec::new(),
+            outcome: CloseOutcome::Refused,
+            reason: Some(reason),
+            message: Some(message),
+            error: None,
+            survivors: Vec::new(),
+            forced_over: Vec::new(),
+            would_refuse: Vec::new(),
+            reported: None,
+            completed_at_ms: None,
+            dispatched_at_ms: None,
+            worktree: None,
+            branch: None,
+            clone: None,
+            dispatcher: None,
+            worktree_verdict: None,
+            open_descendants: Vec::new(),
+            candidates: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+/// One pane of a close target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosePane {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub is_orchestrator: bool,
+    /// The card's status when the close looked, e.g. `Working`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The agent had already exited on its own.
+    #[serde(default)]
+    pub exited: bool,
+    /// `Some(true)` once its stop was confirmed, `Some(false)` when the stop
+    /// failed, `None` when no stop was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<bool>,
+}
+
+/// The pane and agent that dispatched a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseDispatcher {
+    pub pane_id: String,
+    pub agent_id: String,
+}
+
+/// A unit a closed target's agents dispatched, left open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenDescendant {
+    pub unit_id: String,
+    pub name: String,
+    pub clone: String,
+}
+
+/// One unit an ambiguous name matched — enough to close it by id instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    pub unit_id: String,
+    pub name: String,
+    pub worktree: String,
+    #[serde(default)]
+    pub panes: Vec<String>,
+}
+
+/// What a close's worktree cleanup did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeVerdict {
+    pub path: String,
+    pub verdict: WorktreeVerdictKind,
+}
+
+/// PRD #1589 D6: the typed cleanup verdict a close waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorktreeVerdictKind {
+    /// `git worktree remove` succeeded; the branch is kept.
+    Removed,
+    /// Kept: `git status` reported uncommitted changes.
+    KeptDirty,
+    /// Kept: whether it was dirty could not be checked.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+    /// Kept: something this daemon runs or is starting is still rooted in it.
+    StillInUse,
+    /// The daemon has no record of the worktree (it restarted since the
+    /// dispatch, or an earlier close already took it) — `worktree reclaim`'s
+    /// job now.
+    NotRecorded,
+    /// The agents are stopped, and the cleanup had not answered within the
+    /// bound; it is still running and its outcome is unknown.
+    TimedOut,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Discriminated by the populated optional fields rather than a tag, since
 /// each request type has a fixed shape and clients can decide what to read
 /// based on which request they sent.
@@ -3191,6 +3542,13 @@ pub struct AttachResponse {
     /// older client ignores the key and an older daemon omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
+    /// other response. A refusal is a report, answered `ok: true`; `ok: false`
+    /// is reserved for a request the daemon could not process at all. Additive
+    /// and optional, and the request it answers is capability-gated, so no
+    /// [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_report: Option<CloseReport>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -3650,6 +4008,7 @@ pub async fn serve_attach_with_restart(
                         reuse_registry,
                         worktree_registry,
                         restart,
+                        None,
                     )
                     .await
                     {
@@ -4630,6 +4989,165 @@ async fn refuse_restart_for_stop(stream: &mut IpcStream) -> io::Result<()> {
     write_resp(stream, &resp).await
 }
 
+/// PRD #1589: the teardown `StopAgent` performs on one agent, shared with
+/// `CloseAgents` so the two cannot drift: everything between taking the
+/// pane-cleanup hold and answering, minus the dispatched-worktree cleanup —
+/// which `StopAgent` runs detached after its quick reply and `CloseAgents`
+/// awaits for its report.
+///
+/// `pane_id_env` is the pane the caller's [`PaneCleanupHold`] authorises
+/// cleaning up, `None` when the agent no longer holds a pane it may clean up
+/// (its successor owns it); the hold itself stays with the caller, which
+/// releases it after this returns. On success the agent's unit, if it was one
+/// and this was its last pane, ends with `end_reason`. On failure the closing
+/// mark is rolled back and the error returned.
+pub(crate) async fn stop_agent_steps(
+    id: &str,
+    stopping_record: Option<&AgentRecord>,
+    pane_id_env: Option<&str>,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    end_reason: crate::dispatched_units::EndReason,
+) -> Result<(), String> {
+    // PRD #126 M1 review (finding 1) / audit (finding 2): open the
+    // race-safe close transition BEFORE terminating the child. This
+    // atomically marks the pane closing and drops every outstanding
+    // delegation that touches it — as the worker AND as the
+    // orchestrator. Three defects close here: the old cancellation ran
+    // only AFTER `close_agent`, so a timer firing during the up-to-3s
+    // SIGTERM grace window injected the very nudge a deliberate close
+    // exists to suppress; it was keyed by worker pane only, so closing
+    // an ORCHESTRATOR left every worker's timer armed against a pane id
+    // a later, unrelated agent could inherit; and it left a window in
+    // which a concurrent `handle_delegate` (holding only the state read
+    // guard) could arm after the cancellation, leaving a record nothing
+    // would remove. Arming is refused while the mark is set.
+    if let Some(pane_id) = pane_id_env {
+        let dropped = registry.begin_pane_close(pane_id);
+        if !dropped.is_empty() {
+            tracing::debug!(
+                pane_id = %pane_id,
+                dropped = dropped.len(),
+                "StopAgent: dropped outstanding delegations touching the closing pane"
+            );
+        }
+        // Issue #424 (reviewer finding B9): the same treatment for a
+        // spawn-time prompt still being held provisional on this pane.
+        // Its guarded re-submissions would refuse anyway once the agent
+        // is gone, but a deliberate close should not have to wait out a
+        // backoff window to stop being retried into, and the
+        // abandonment notice has nowhere left to go.
+        crate::spawn::cancel_prompt_confirmation(pane_id);
+    }
+    // PRD #92 F8 followup (auditor #1): `close_agent` runs the
+    // synchronous SIGTERM-with-grace loop in
+    // `terminate_child_with_grace_and_wait`, which calls
+    // `std::thread::sleep` for up to 3 s while polling the
+    // child's `try_wait`. Calling that from inside the async
+    // attach-connection task would block a Tokio worker thread
+    // for the duration of the grace window — under load this
+    // can starve other connections. Mirror the
+    // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
+    // onto a `spawn_blocking` pool task, await the
+    // `JoinHandle`, and surface a join error as a failed
+    // close.
+    let registry_for_close = registry.clone();
+    let id_for_close = id.to_string();
+    let close_result =
+        tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close)).await;
+    let close_outcome: Result<(), String> = match close_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                agent_id = %id,
+                "spawn_blocking for close_agent panicked or was cancelled"
+            );
+            Err(format!("close_agent task failed: {join_err}"))
+        }
+    };
+    match close_outcome {
+        Ok(()) => {
+            if let Some(pane_id) = pane_id_env {
+                // PRD #126: a deliberately closed worker owes nothing.
+                // Without this, closing a stuck worker would still
+                // nag the orchestrator when its timeout expired hours
+                // later, pointing at a pane that no longer exists.
+                // Order matters: take the state write guard and
+                // unregister the pane first, then sweep once more and
+                // only then clear the closing mark, so no interleaving
+                // leaves a record behind.
+                state.write().await.unregister_pane(pane_id);
+                registry.finish_pane_close(pane_id, true);
+                // PRD #1223: tell every attached TUI the pane is gone,
+                // not only the client that asked — a desktop stop was
+                // otherwise invisible to an attached TUI, which kept
+                // the card (and an orchestration's tab) indefinitely.
+                // Here, and only here, for three reasons: it is the one
+                // arm every stop route reaches; `pane_id_env` is `Some`
+                // only while this agent still held the pane, so a stale
+                // stop never removes a successor's pane; and the
+                // cleanup hold is still held, so no successor's start
+                // can be broadcast ahead of this removal. After the
+                // child is reaped, so the removal describes a finished
+                // stop; a hook the dying agent posted that is still in
+                // flight lands on a pane the TUI has unregistered, where
+                // a non-`SessionStart` frame is dropped rather than
+                // redrawing the card. See
+                // `crate::spawn::surface_attach_stopped_agent`.
+                if let Some(record) = stopping_record {
+                    crate::spawn::surface_attach_stopped_agent(event_tx, record, pane_id);
+                }
+            }
+            // PRD #1589 D5: the unit this agent belonged to ends once no pane
+            // of it remains — for an orchestration, once neither this registry
+            // nor the role maps hold any pane of its instance.
+            if let Some(record) = stopping_record {
+                let instance = match &record.tab_membership {
+                    Some(crate::agent_pty::TabMembership::Orchestration {
+                        orchestration_id: Some(id),
+                        ..
+                    }) => Some(id.clone()),
+                    _ => None,
+                };
+                let in_state = match instance.as_deref() {
+                    Some(instance) => state
+                        .read()
+                        .await
+                        .pane_orchestration_map
+                        .values()
+                        .any(|identity| identity.id == instance),
+                    None => false,
+                };
+                if let Some(unit_id) =
+                    registry.note_unit_member_removed(record, in_state, end_reason)
+                {
+                    tracing::info!(
+                        unit_id = %unit_id,
+                        agent_id = %record.id,
+                        "dispatch: the unit's last pane closed; the unit has ended"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(msg) => {
+            // PRD #126: the close failed, so the agent is still live. Roll the
+            // transition back by clearing the closing mark — future delegates
+            // to this pane can arm again. The records swept at `begin` are
+            // deliberately NOT restored: losing a watch fails safe,
+            // resurrecting one could nag about a pane the user explicitly
+            // asked to close.
+            if let Some(pane_id) = pane_id_env {
+                registry.finish_pane_close(pane_id, false);
+            }
+            Err(msg)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -4641,10 +5159,18 @@ async fn handle_connection(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     restart: Arc<crate::daemon_restart::RestartControl>,
+    follow_on_frame: Option<(u8, Vec<u8>)>,
 ) -> io::Result<()> {
-    let frame = match read_frame(&mut stream).await? {
+    // PRD #1589: `follow_on_frame` is a `Hello` follow-on's frame, already read
+    // under [`FOLLOW_ON_READ_TIMEOUT`]; it is served as a fresh connection's
+    // first, and may not ask for a follow-on of its own.
+    let follow_on_allowed = follow_on_frame.is_none();
+    let frame = match follow_on_frame {
         Some(f) => f,
-        None => return Ok(()),
+        None => match read_frame(&mut stream).await? {
+            Some(f) => f,
+            None => return Ok(()),
+        },
     };
     // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
     // that means "shut the daemon down now." It comes before any
@@ -5629,62 +6155,90 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // panes (and a legacy `TabMembership::Mode` pane)
                     // don't participate in delegate dispatch.
-                    if let (Some(pane_id), Some(meta)) =
-                        (pane_id_env.as_deref(), orchestration_meta)
+                    //
+                    // PRD #1589 (auditor S1): registration and the start's
+                    // broadcast run under ONE state write guard, and only for a
+                    // generation still in the registry. A `close` that took this
+                    // generation down in the window since it was published
+                    // removed its record before taking this guard to unregister
+                    // the pane, so a start that sees the record registers and
+                    // announces ahead of that unregister and its removal
+                    // broadcast, and one that does not see it registers and
+                    // announces nothing — it would re-create a role and a card
+                    // for a pane already closed.
+                    registry.before_role_registration().await;
                     {
-                        // Shared with the daemon-internal spawn path
-                        // (`crate::spawn::spawn`) — see
-                        // [`crate::state::AppState::register_orchestration_role`]
-                        // for why this must not be inlined again. The identity
-                        // is the one the title check above scoped by
-                        // (`OrchestrationSpawnMeta::identity`).
-                        let identity = meta.identity();
                         let mut state = state.write().await;
-                        state.register_orchestration_role(
-                            pane_id,
-                            &meta.role_name,
-                            meta.is_start_role,
-                            identity.clone(),
-                            cwd_for_state.as_deref(),
-                        );
-                        // Issue #697: outside cards the registration dropped
-                        // leave every attached client's view too.
-                        state.announce_unproven_evictions(&event_tx);
-                        // Issue #555: the registered pane holds the title from
-                        // here on, so this start's in-flight claim ends — under
-                        // the same guard, so there is no instant in which
-                        // neither holds it.
-                        if title_claim.is_some() {
-                            state.release_orchestration_title_claim(&identity);
+                        if !registry.generation_registered(&id) {
+                            if let Some(identity) = title_claim.as_ref() {
+                                state.release_orchestration_title_claim(identity);
+                            }
+                            info!(
+                                agent_id = %id,
+                                "start: the agent was closed before its start was registered; \
+                                 registering and announcing nothing for it"
+                            );
+                        } else {
+                            if let (Some(pane_id), Some(meta)) =
+                                (pane_id_env.as_deref(), orchestration_meta)
+                            {
+                                // Shared with the daemon-internal spawn path
+                                // (`crate::spawn::spawn`) — see
+                                // [`crate::state::AppState::register_orchestration_role`]
+                                // for why this must not be inlined again. The
+                                // identity is the one the title check above
+                                // scoped by (`OrchestrationSpawnMeta::identity`).
+                                let identity = meta.identity();
+                                state.register_orchestration_role(
+                                    pane_id,
+                                    &meta.role_name,
+                                    meta.is_start_role,
+                                    identity.clone(),
+                                    cwd_for_state.as_deref(),
+                                );
+                                // Issue #697: outside cards the registration
+                                // dropped leave every attached client's view too.
+                                state.announce_unproven_evictions(&event_tx);
+                                // Issue #555: the registered pane holds the title
+                                // from here on, so this start's in-flight claim
+                                // ends — under the same guard, so there is no
+                                // instant in which neither holds it.
+                                if title_claim.is_some() {
+                                    state.release_orchestration_title_claim(&identity);
+                                }
+                                // Issue #1395: only the start role carries the
+                                // coordinator's context, so only it records the
+                                // file.
+                                if meta.is_start_role
+                                    && let Some(path) = prepared_context_path
+                                {
+                                    state.record_orchestration_context(&identity, path);
+                                }
+                            }
+                            // PRD #1223: announce the start to every attached
+                            // TUI, not only to the client that sent it — a
+                            // desktop start was otherwise invisible to an
+                            // already-attached TUI. After the record is published
+                            // and the role registered, before the reply. See
+                            // `crate::spawn::surface_attach_started_agent` for
+                            // what is emitted and why the sending TUI is
+                            // unaffected.
+                            if let Some(mut record) = registry.agent_record_any(&id) {
+                                // Issue #1395 item 1: the start role's surface
+                                // carries the context file recorded just above,
+                                // so a live tab re-arms from its own file.
+                                // Stamped from daemon state only — the
+                                // `ListAgents` rule — never from the request.
+                                state.attach_orchestrator_context_paths(std::slice::from_mut(
+                                    &mut record,
+                                ));
+                                crate::spawn::surface_attach_started_agent(
+                                    &event_tx,
+                                    &record,
+                                    command.as_deref(),
+                                );
+                            }
                         }
-                        // Issue #1395: only the start role carries the
-                        // coordinator's context, so only it records the file.
-                        if meta.is_start_role
-                            && let Some(path) = prepared_context_path
-                        {
-                            state.record_orchestration_context(&identity, path);
-                        }
-                    }
-                    // PRD #1223: announce the start to every attached TUI, not
-                    // only to the client that sent it — a desktop start was
-                    // otherwise invisible to an already-attached TUI. After the
-                    // record is published and the role registered, before the
-                    // reply. See `crate::spawn::surface_attach_started_agent`
-                    // for what is emitted and why the sending TUI is unaffected.
-                    if let Some(mut record) = registry.agent_record_any(&id) {
-                        // Issue #1395 item 1: the start role's surface carries
-                        // the context file recorded just above, so a live tab
-                        // re-arms from its own file. Stamped from daemon state
-                        // only — the `ListAgents` rule — never from the request.
-                        state
-                            .read()
-                            .await
-                            .attach_orchestrator_context_paths(std::slice::from_mut(&mut record));
-                        crate::spawn::surface_attach_started_agent(
-                            &event_tx,
-                            &record,
-                            command.as_deref(),
-                        );
                     }
                     // Issue #1540: the start is accepted, so a form start's
                     // command becomes the deck's last command — in memory
@@ -5802,98 +6356,25 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
-            // PRD #126 M1 review (finding 1) / audit (finding 2): open the
-            // race-safe close transition BEFORE terminating the child. This
-            // atomically marks the pane closing and drops every outstanding
-            // delegation that touches it — as the worker AND as the
-            // orchestrator. Three defects close here: the old cancellation ran
-            // only AFTER `close_agent`, so a timer firing during the up-to-3s
-            // SIGTERM grace window injected the very nudge a deliberate close
-            // exists to suppress; it was keyed by worker pane only, so closing
-            // an ORCHESTRATOR left every worker's timer armed against a pane id
-            // a later, unrelated agent could inherit; and it left a window in
-            // which a concurrent `handle_delegate` (holding only the state read
-            // guard) could arm after the cancellation, leaving a record nothing
-            // would remove. Arming is refused while the mark is set.
-            if let Some(pane_id) = pane_id_env.as_deref() {
-                let dropped = registry.begin_pane_close(pane_id);
-                if !dropped.is_empty() {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        dropped = dropped.len(),
-                        "StopAgent: dropped outstanding delegations touching the closing pane"
-                    );
-                }
-                // Issue #424 (reviewer finding B9): the same treatment for a
-                // spawn-time prompt still being held provisional on this pane.
-                // Its guarded re-submissions would refuse anyway once the agent
-                // is gone, but a deliberate close should not have to wait out a
-                // backoff window to stop being retried into, and the
-                // abandonment notice has nowhere left to go.
-                crate::spawn::cancel_prompt_confirmation(pane_id);
-            }
-            // PRD #92 F8 followup (auditor #1): `close_agent` runs the
-            // synchronous SIGTERM-with-grace loop in
-            // `terminate_child_with_grace_and_wait`, which calls
-            // `std::thread::sleep` for up to 3 s while polling the
-            // child's `try_wait`. Calling that from inside the async
-            // attach-connection task would block a Tokio worker thread
-            // for the duration of the grace window — under load this
-            // can starve other connections. Mirror the
-            // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
-            // onto a `spawn_blocking` pool task, await the
-            // `JoinHandle`, and surface a join error as a failed
-            // close.
-            let registry_for_close = registry.clone();
-            let id_for_close = id.clone();
-            let close_result =
-                tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close))
-                    .await;
-            let close_outcome: Result<(), String> = match close_result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(join_err) => {
-                    tracing::warn!(
-                        error = %join_err,
-                        agent_id = %id,
-                        "spawn_blocking for close_agent panicked or was cancelled"
-                    );
-                    Err(format!("close_agent task failed: {join_err}"))
-                }
-            };
+            // PRD #1589: the teardown itself is shared with `CloseAgents`, which
+            // takes the same steps in the same order — see
+            // [`stop_agent_steps`]. The existing teardown is unchanged. What the
+            // extraction added is the unit-lifecycle end: a stop that removes a
+            // dispatched unit's last pane now also ends that unit, which touches
+            // only the daemon's in-memory dispatched-units record — nothing a
+            // client of this request, older or newer, reads.
+            let close_outcome = stop_agent_steps(
+                &id,
+                stopping_record.as_ref(),
+                pane_id_env.as_deref(),
+                &registry,
+                &state,
+                &event_tx,
+                crate::dispatched_units::EndReason::Stopped,
+            )
+            .await;
             match close_outcome {
                 Ok(()) => {
-                    if let Some(pane_id) = pane_id_env.as_deref() {
-                        // PRD #126: a deliberately closed worker owes nothing.
-                        // Without this, closing a stuck worker would still
-                        // nag the orchestrator when its timeout expired hours
-                        // later, pointing at a pane that no longer exists.
-                        // Order matters: take the state write guard and
-                        // unregister the pane first, then sweep once more and
-                        // only then clear the closing mark, so no interleaving
-                        // leaves a record behind.
-                        state.write().await.unregister_pane(pane_id);
-                        registry.finish_pane_close(pane_id, true);
-                        // PRD #1223: tell every attached TUI the pane is gone,
-                        // not only the client that asked — a desktop stop was
-                        // otherwise invisible to an attached TUI, which kept
-                        // the card (and an orchestration's tab) indefinitely.
-                        // Here, and only here, for three reasons: it is the one
-                        // arm every stop route reaches; `pane_id_env` is `Some`
-                        // only while this agent still held the pane, so a stale
-                        // stop never removes a successor's pane; and the
-                        // cleanup hold is still held, so no successor's start
-                        // can be broadcast ahead of this removal. After the
-                        // child is reaped, so the removal describes a finished
-                        // stop; a hook the dying agent posted that is still in
-                        // flight lands on a pane the TUI has unregistered, where
-                        // a non-`SessionStart` frame is dropped rather than
-                        // redrawing the card. See
-                        // `crate::spawn::surface_attach_stopped_agent`.
-                        if let Some(record) = stopping_record.as_ref() {
-                            crate::spawn::surface_attach_stopped_agent(&event_tx, record, pane_id);
-                        }
-                    }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a
                     // per-issue worktree, the tab close is its cleanup trigger.
                     // But a multi-role orchestration shares ONE worktree across
@@ -5956,15 +6437,8 @@ async fn handle_connection(
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
                 Err(msg) => {
-                    // PRD #126: the close failed, so the agent is still live.
-                    // Roll the transition back by clearing the closing mark —
-                    // future delegates to this pane can arm again. The records
-                    // swept at `begin` are deliberately NOT restored: losing a
-                    // watch fails safe, resurrecting one could nag about a pane
-                    // the user explicitly asked to close.
-                    if let Some(pane_id) = pane_id_env.as_deref() {
-                        registry.finish_pane_close(pane_id, false);
-                    }
+                    // PRD #126: the close failed, so the agent is still live;
+                    // `stop_agent_steps` has already rolled the closing mark back.
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
             };
@@ -5982,6 +6456,32 @@ async fn handle_connection(
             // desktop both mint fresh ones), and one that relied on the stronger
             // order would still race older daemons.
             drop(pane_cleanup_hold);
+        }
+        AttachRequest::CloseAgents {
+            selector,
+            caller,
+            force,
+            dry_run,
+        } => {
+            // PRD #1589: resolve, authorize, refuse or close — see
+            // `crate::close_agents`. Every outcome, refusals included, is a
+            // report on an `ok` response.
+            let report = crate::close_agents::handle_close_agents(
+                selector,
+                caller,
+                force,
+                dry_run,
+                &registry,
+                &state,
+                &event_tx,
+                &worktree_registry,
+            )
+            .await;
+            let resp = AttachResponse {
+                close_report: Some(report),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::SetAgentLabel {
             id,
@@ -6279,6 +6779,7 @@ async fn handle_connection(
         AttachRequest::Hello {
             client_version: _,
             client_build_version,
+            follow_on,
         } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
             // `client_version` — we always reply with our own
@@ -6349,6 +6850,46 @@ async fn handle_connection(
             }
             resp.hook_binary_notices = Some(state.read().await.hook_binaries.notices());
             write_resp(&mut stream, &resp).await?;
+            // PRD #1589 (review on PR #1681): serve one more request on this
+            // connection, so the verb a client gates on this reply reaches
+            // this daemon and no other. One only: the follow-on request is
+            // served as a fresh connection's first, without a follow-on of
+            // its own.
+            if follow_on && follow_on_allowed {
+                // Bounded (review on PR #1681): a peer that goes silent here,
+                // or sends a header and withholds the payload, would otherwise
+                // hold this connection's client-count slot — deferring idle
+                // shutdown — and the frame's allocation. Only the read is
+                // bounded; serving the request may legitimately take longer.
+                let frame =
+                    match tokio::time::timeout(FOLLOW_ON_READ_TIMEOUT, read_frame(&mut stream))
+                        .await
+                    {
+                        Ok(Ok(Some(frame))) => frame,
+                        Ok(Ok(None)) => return Ok(()),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            warn!(
+                                timeout = ?FOLLOW_ON_READ_TIMEOUT,
+                                "no follow-on request arrived after Hello; dropping the connection"
+                            );
+                            return Ok(());
+                        }
+                    };
+                return Box::pin(handle_connection(
+                    stream,
+                    registry,
+                    event_tx,
+                    state,
+                    shutdown,
+                    scheduler,
+                    reuse_registry,
+                    worktree_registry,
+                    restart,
+                    Some(frame),
+                ))
+                .await;
+            }
         }
         AttachRequest::ReloadSchedules => {
             // PRD #127 M1.3: re-read the global config and diff/replace the
@@ -10931,6 +11472,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(env!("DAD_BUILD_ID").to_string()),
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -10943,6 +11485,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, PROTOCOL_VERSION);
                 assert_eq!(client_build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
@@ -10960,6 +11503,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -10981,6 +11525,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, 2);
                 assert!(client_build_version.is_none());
@@ -12401,5 +12946,163 @@ mod tests {
             std::collections::BTreeSet::from([first, second]),
             "both agents survived"
         );
+    }
+
+    /// An in-process attach server and the client count it keeps, for the
+    /// follow-on stall tests below.
+    #[cfg(unix)]
+    async fn follow_on_stall_server() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    Arc::new(AgentPtyRegistry::new()),
+                    event_tx,
+                    counter,
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // The probe connection is itself counted; wait for it to drain.
+            if tokio::net::UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        (dir, sock, counter, server)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_client_count(
+        counter: &std::sync::atomic::AtomicUsize,
+        want: usize,
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let now = counter.load(std::sync::atomic::Ordering::SeqCst);
+            if now == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client count stayed at {now}, expected {want} within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Opens a connection, sends `Hello { follow_on: true }` and reads its
+    /// reply, leaving the daemon waiting for the follow-on.
+    #[cfg(unix)]
+    async fn hello_awaiting_follow_on(sock: &std::path::Path) -> tokio::net::UnixStream {
+        let mut s = tokio::net::UnixStream::connect(sock)
+            .await
+            .expect("connect");
+        let hello = serde_json::to_vec(&AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: true,
+        })
+        .unwrap();
+        write_frame(&mut s, KIND_REQ, &hello).await.expect("hello");
+        let (kind, payload) = read_frame(&mut s).await.unwrap().expect("a reply");
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).unwrap();
+        assert!(resp.ok, "{:?}", resp.error);
+        s
+    }
+
+    /// While a stalled follow-on holds its slot, and after, a fresh client is
+    /// still answered.
+    #[cfg(unix)]
+    async fn assert_serviceable(sock: &std::path::Path) {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::daemon_client::DaemonClient::new(sock.to_path_buf()).list_agents(),
+        )
+        .await
+        .expect("another client is answered within 5 s")
+        .expect("ListAgents succeeds");
+        assert!(resp.is_empty());
+    }
+
+    /// Runs one stall: `stall` leaves the connection open after the Hello
+    /// reply without completing a follow-on frame. The daemon must drop the
+    /// connection — releasing its client-count slot — within the follow-on
+    /// deadline, and serve another client throughout.
+    #[cfg(unix)]
+    async fn a_stalled_follow_on_releases_its_slot(stall: &[u8]) {
+        let (_dir, sock, counter, server) = follow_on_stall_server().await;
+        let started = tokio::time::Instant::now();
+        let mut s = hello_awaiting_follow_on(&sock).await;
+        s.write_all(stall).await.expect("write the stall");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stalled peer holds a slot"
+        );
+        assert_serviceable(&sock).await;
+
+        // The slack covers scheduling on a loaded box, not the deadline.
+        wait_for_client_count(&counter, 0, FOLLOW_ON_READ_TIMEOUT + Duration::from_secs(4)).await;
+        assert!(
+            started.elapsed() >= FOLLOW_ON_READ_TIMEOUT,
+            "the slot is held until the deadline, not dropped early"
+        );
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the daemon closed the stalled connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the daemon closed the stalled connection");
+        assert_serviceable(&sock).await;
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        server.abort();
+    }
+
+    /// Scenario: a client sends `Hello { follow_on: true }`, reads the reply
+    /// and then sends nothing. The daemon drops that connection once the
+    /// follow-on deadline passes, so its client count returns to zero, and
+    /// answers another client meanwhile (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_peer_after_a_follow_on_hello_is_dropped_at_the_deadline() {
+        a_stalled_follow_on_releases_its_slot(&[]).await;
+    }
+
+    /// Scenario: after a `Hello { follow_on: true }` reply, a client sends a
+    /// frame header declaring a 1 KiB payload, a few bytes of it, and then
+    /// nothing. The daemon drops the connection at the follow-on deadline
+    /// rather than waiting for the rest (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_truncated_follow_on_payload_is_dropped_at_the_deadline() {
+        let mut stall = vec![KIND_REQ];
+        stall.extend_from_slice(&1024u32.to_be_bytes());
+        stall.extend_from_slice(b"{\"op\":");
+        a_stalled_follow_on_releases_its_slot(&stall).await;
     }
 }

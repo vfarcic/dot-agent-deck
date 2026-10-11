@@ -562,6 +562,7 @@ async fn probe_daemon(attach_path: &Path) -> Result<ProbeOutcome, HandshakeError
             // value we're matching against, even under the test-only
             // `DOT_AGENT_DECK_BUILD_ID_OVERRIDE`.
             client_build_version: Some(local_build_id()),
+            follow_on: false,
         };
         issue_command(&mut rd, &mut wr, &req)
             .await
