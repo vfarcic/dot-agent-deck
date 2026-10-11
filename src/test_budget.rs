@@ -36,11 +36,8 @@ const MAX_LOAD_FACTOR: f64 = 6.0;
 /// exactly as the harness's twin, which records why macOS joined; elsewhere
 /// `None`, because an unmeasurable load must widen nothing.
 ///
-/// The load average is all this copy measures. The harness's `load_scaled`
-/// also widens by a Pressure Stall Information stall factor (`stall_factor`,
-/// `machine_stall_share` in `tests/common/mod.rs`); that factor is
-/// harness-only, so a lib-side ceiling is not widened on a box that is IO- or
-/// memory-starved at a modest load average.
+/// One of the two readings [`load_scaled`] takes; the other is
+/// [`machine_stall_share`].
 fn machine_load_per_cpu() -> Option<f64> {
     let one_minute = one_minute_load_average()?;
     let cpus = std::thread::available_parallelism().ok()?.get() as f64;
@@ -86,6 +83,74 @@ fn load_factor(load_per_cpu: Option<f64>) -> f64 {
     }
 }
 
+/// How much slower than an idle box work progresses when every non-idle task
+/// is stalled for `stall_share` of the time: `1 / (1 - stall_share)`, clamped to
+/// `1.0..=MAX_LOAD_FACTOR`. An unmeasurable or non-finite share yields 1.0, for
+/// [`load_factor`]'s reason. A copy of the harness's `stall_factor`.
+fn stall_factor(stall_share: Option<f64>) -> f64 {
+    match stall_share {
+        Some(share) if share.is_finite() => {
+            let progress = 1.0 - share.clamp(0.0, 1.0);
+            if progress <= 1.0 / MAX_LOAD_FACTOR {
+                MAX_LOAD_FACTOR
+            } else {
+                (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
+            }
+        }
+        _ => 1.0,
+    }
+}
+
+/// The larger of the IO and memory `full` stall shares from Pressure Stall
+/// Information, as a fraction, or `None` where neither file can be read. A
+/// copy of the harness's `machine_stall_share`, which says why `full`, why IO
+/// and memory, and why the larger of `avg10` and `avg60`.
+fn machine_stall_share() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |file: &str| {
+            std::fs::read_to_string(format!("/proc/pressure/{file}"))
+                .ok()
+                .and_then(|text| parse_psi_full_share(&text))
+        };
+        match (read("io"), read("memory")) {
+            (Some(io), Some(memory)) => Some(io.max(memory)),
+            (one, other) => one.or(other),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The larger of the `avg10` and `avg60` fields on the `full` line of a PSI
+/// file, as a fraction rather than the percentage the kernel prints.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_psi_full_share(text: &str) -> Option<f64> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("full"))?;
+    let field = |name: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find_map(|f| f.strip_prefix(name))?
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    let percent = match (field("avg10="), field("avg60=")) {
+        (Some(a), Some(b)) => a.max(b),
+        (one, other) => one.or(other)?,
+    };
+    Some(percent / 100.0)
+}
+
+/// The factor [`load_scaled`] applies: the larger of the two readings, so
+/// either kind of contention widens a ceiling.
+fn contention_factor(load_per_cpu: Option<f64>, stall_share: Option<f64>) -> f64 {
+    load_factor(load_per_cpu).max(stall_factor(stall_share))
+}
+
 /// Widen a wait ceiling in proportion to how contended the machine is, so a fast
 /// box still fails fast and a loaded one still passes.
 ///
@@ -95,8 +160,17 @@ fn load_factor(load_per_cpu: Option<f64>) -> f64 {
 /// happy path and is paid only where the alternative was a wrong verdict; a
 /// negative window is always paid in full and its length is part of the
 /// assertion.
+///
+/// **Contention is the larger of the load average and the PSI stall share**,
+/// as in the harness. This copy used to read the load average alone, and PRD
+/// #1631 measured what that misses: `first_write_within_bounds_only_the_time_not_spent_on_the_draft`
+/// failed at a load of ~33 on 16 CPUs (a factor of ~2) beside `io full` at
+/// 75% (a factor of 4).
 pub(crate) fn load_scaled(base: Duration) -> Duration {
-    base.mul_f64(load_factor(machine_load_per_cpu()))
+    base.mul_f64(contention_factor(
+        machine_load_per_cpu(),
+        machine_stall_share(),
+    ))
 }
 
 #[cfg(test)]
@@ -144,12 +218,46 @@ mod tests {
     }
 
     #[test]
+    fn a_stall_share_widens_by_the_progress_it_leaves() {
+        assert_eq!(stall_factor(None), 1.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(stall_factor(Some(bad)), 1.0, "{bad} is not a stall share");
+        }
+        assert_eq!(stall_factor(Some(0.0)), 1.0);
+        assert_eq!(stall_factor(Some(0.5)), 2.0);
+        assert_eq!(stall_factor(Some(0.75)), 4.0, "PRD #1631's io full 75%");
+        assert_eq!(stall_factor(Some(0.928)), MAX_LOAD_FACTOR);
+        assert_eq!(stall_factor(Some(-0.3)), 1.0, "never shrinks");
+    }
+
+    #[test]
+    fn contention_is_the_larger_of_load_and_stall() {
+        assert_eq!(contention_factor(Some(33.0 / 16.0), Some(0.75)), 4.0);
+        assert_eq!(contention_factor(Some(2.75), Some(0.0)), 2.75);
+        assert_eq!(contention_factor(None, None), 1.0);
+        assert_eq!(contention_factor(Some(1000.0), Some(1.0)), MAX_LOAD_FACTOR);
+    }
+
+    #[test]
+    fn the_psi_full_line_is_read_as_a_fraction() {
+        let io = "some avg10=82.47 avg60=76.65 avg300=67.06 total=1\n\
+                  full avg10=74.69 avg60=70.26 avg300=61.17 total=1\n";
+        assert_eq!(parse_psi_full_share(io), Some(0.7469));
+        let lull = "full avg10=10.00 avg60=72.00 avg300=1.00 total=1\n";
+        assert_eq!(parse_psi_full_share(lull), Some(0.72));
+        assert_eq!(parse_psi_full_share("some avg10=9.00 avg60=9.00\n"), None);
+        assert_eq!(parse_psi_full_share("full avg10=x avg60=y\n"), None);
+        assert_eq!(parse_psi_full_share(""), None);
+    }
+
+    #[test]
     fn scaling_is_the_factor_applied_to_the_base() {
         let base = Duration::from_secs(3);
-        assert_eq!(
-            load_scaled(base),
-            base.mul_f64(load_factor(machine_load_per_cpu()))
+        let scaled = load_scaled(base);
+        assert!(scaled >= base, "a ceiling is never narrowed");
+        assert!(
+            scaled <= base.mul_f64(MAX_LOAD_FACTOR),
+            "and never past the cap"
         );
-        assert!(load_scaled(base) >= base, "a ceiling is never narrowed");
     }
 }

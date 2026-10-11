@@ -25401,6 +25401,18 @@ mod spawn_tests {
     /// someone else holds, with no draft pending, it gives up at the deadline
     /// rather than a whole draft cap later; waiting for a draft, it is not
     /// dropped for having waited past the deadline.
+    ///
+    /// PRD #1631: the deferred half's deadline is also the whole budget for the
+    /// work the write does after the draft clears — the writer lock, the PTY
+    /// going idle, `revalidate` and the echo watch's blocking-pool setup —
+    /// because none of that is draft time. A flat 300 ms budget failed cold at
+    /// io full 75%, and a 400 ms stall injected into the echo watch's setup
+    /// drops the write under that budget the same way every time, which is
+    /// the deadline doing its job (it is `Applied` under 700 ms). So the
+    /// budget is load-scaled, and the draft window is kept longer than it:
+    /// every check after the draft clears then runs past the unshifted
+    /// deadline, and an implementation that counted the draft wait would drop
+    /// the write. The window stays under the draft cap at any load factor.
     #[cfg(unix)]
     #[tokio::test]
     async fn first_write_within_bounds_only_the_time_not_spent_on_the_draft() {
@@ -25418,9 +25430,10 @@ mod spawn_tests {
 
         let target = registry.writer_target_for_pane(PANE).expect("target");
         let held = target.writer.lock().await;
+        let cap = registry.draft_defer_cap();
         let began = Instant::now();
         let queued = tokio::time::timeout(
-            Duration::from_secs(5),
+            cap,
             registry.write_and_submit_guarded_first_write_within(
                 PANE,
                 "QUEUED",
@@ -25436,7 +25449,15 @@ mod spawn_tests {
             matches!(queued, Err(AgentPtyError::DeadlineElapsed)),
             "queued on a held writer past the deadline: {queued:?}"
         );
-        assert!(began.elapsed() < Duration::from_secs(2));
+        // Gave up at the deadline, not a cap later. Load-scaled because the
+        // return is something that must happen, and never past the cap, which
+        // is the distinction this half exists to draw.
+        let gave_up = crate::test_budget::load_scaled(Duration::from_secs(2)).min(cap);
+        assert!(
+            began.elapsed() < gave_up,
+            "queued on a held writer, the write outlived its deadline by {:?}",
+            began.elapsed()
+        );
         drop(held);
 
         let type_bytes = |bytes: &'static [u8]| {
@@ -25449,6 +25470,11 @@ mod spawn_tests {
             }
         };
         type_bytes(b"draft").await;
+        // The budget for the write's non-draft work, and a draft window that
+        // outlasts it: the Ctrl+U goes in `window` after the write's first
+        // draft poll, so by then the unshifted deadline has passed.
+        let budget = crate::test_budget::load_scaled(Duration::from_millis(700));
+        let window = budget + Duration::from_millis(200);
         // Counted before the write starts, so the wait below needs a poll of
         // this write's own: the queued write above may already have polled.
         let mut draft_polls = registry.draft_polls_for_test();
@@ -25464,7 +25490,7 @@ mod spawn_tests {
                         &agent,
                         || async { true },
                         Instant::now(),
-                        Instant::now() + Duration::from_millis(300),
+                        Instant::now() + budget,
                     )
                     .await
             })
@@ -25478,24 +25504,28 @@ mod spawn_tests {
         .await
         .expect("the first write waits for the draft")
         .expect("the registry keeps its seam");
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(window).await;
         assert!(
             !waiting.is_finished(),
             "the first write waits for the draft"
         );
         type_bytes(b"\x15").await;
-        let sent = tokio::time::timeout(Duration::from_secs(3), waiting)
-            .await
-            .expect("released by Ctrl+U")
-            .expect("join")
-            .expect("a wait past the deadline must not drop the write");
+        let sent = tokio::time::timeout(
+            crate::test_budget::load_scaled(Duration::from_secs(3)),
+            waiting,
+        )
+        .await
+        .expect("released by Ctrl+U")
+        .expect("join")
+        .expect("a wait past the deadline must not drop the write");
         assert_eq!(
             sent.detail,
             GuardedSendDetail::Outcome(GuardedSend::Applied)
         );
         assert!(
-            sent.deferred >= Duration::from_millis(700),
-            "{:?}",
+            sent.deferred >= budget,
+            "the write must have waited past its deadline for this to prove anything: {:?} \
+             against a {budget:?} deadline",
             sent.deferred
         );
         registry.shutdown_all();
