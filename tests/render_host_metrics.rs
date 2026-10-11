@@ -6,7 +6,7 @@ use dot_agent_deck::daemon_client::HostMetricsReport;
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
     render_help_overlay_with_bindings_to_buffer, render_host_metrics_key_sequence_to_buffers,
-    render_host_metrics_overlay_to_buffer,
+    render_host_metrics_overlay_held_to_buffer, render_host_metrics_overlay_to_buffer,
 };
 use ratatui::buffer::Buffer;
 use serde_json::json;
@@ -218,5 +218,42 @@ fn remap_004_host_metrics_uses_configured_key() {
     assert!(
         row.contains("F2"),
         "help must show the remapped host-metrics key\n{help}"
+    );
+}
+
+/// Scenario: Render the same daemon answer, reported as 1500 ms old, as just
+/// received, after the TUI has held it for 2.5 s, and after an hour. The sample
+/// age row reads 1500, 4000 and 3601500 ms, so a held answer shows how old its
+/// figures really are, as the desktop does; an age past what the desktop can
+/// print reads the shared ceiling instead.
+#[spec("dashboard/host-metrics/009")]
+#[test]
+fn dashboard_host_metrics_009_a_held_answer_shows_its_growing_age() {
+    let age_row = |held_ms: u64, report: &HostMetricsReport| {
+        let rendered = text(&render_host_metrics_overlay_held_to_buffer(
+            report,
+            std::time::Duration::from_millis(held_ms),
+            100,
+            32,
+        ));
+        let line = rendered
+            .lines()
+            .find_map(|line| line.split_once("Sample age").map(|(_, value)| value))
+            .unwrap_or_else(|| panic!("missing the sample age row\n{rendered}"));
+        line.trim().trim_end_matches('│').trim().to_owned()
+    };
+    let report = sample();
+    assert_eq!(age_row(0, &report), "1500 ms");
+    assert_eq!(age_row(2_500, &report), "4000 ms");
+    assert_eq!(age_row(3_600_000, &report), "3601500 ms");
+
+    let mut ancient = report.clone();
+    if let HostMetricsReport::Available(metrics) = &mut ancient {
+        metrics.sample_age_ms = u64::MAX;
+    }
+    assert_eq!(
+        age_row(2_500, &ancient),
+        "9007199254740991 ms",
+        "the held time saturates, and the age stops at the ceiling both clients share"
     );
 }

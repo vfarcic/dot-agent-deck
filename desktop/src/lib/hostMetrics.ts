@@ -23,10 +23,52 @@ export function hostRoleLabel(role: string): string {
   }
 }
 
+/**
+ * The largest age either client shows, in ms: the largest integer a JS number
+ * holds exactly. The daemon's age is a u64; above this the webview could not
+ * print the figure the TUI prints, so both clients stop here. The TUI's
+ * `HOST_METRICS_MAX_SHOWN_AGE_MS` is the same number.
+ */
+export const HOST_MAX_SHOWN_AGE_MS = Number.MAX_SAFE_INTEGER;
+
+/**
+ * `value` with `decimals` places, written exactly as the TUI's Rust
+ * `format!("{:.N}")` writes it — which `toFixed` does not in three cases:
+ *
+ * - an exact tie rounds to the even neighbour (`0.125` → `0.12`), where
+ *   `toFixed` rounds away from zero (`0.13`). Ties are common here: a load of
+ *   `1.00` on 8 cores is exactly `0.125` per core, and `1.25 GiB` is exact.
+ * - negative zero keeps its sign (`-0.00`).
+ * - from `1e21` up every digit is written, where `toFixed` switches to
+ *   exponent notation.
+ *
+ * Exported for its test; the formatters below are its only callers.
+ */
+export function fixedLikeRust(value: number, decimals: number): string {
+  const sign = value < 0 || Object.is(value, -0) ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs >= 1e21) {
+    // A double this large is an integer, so BigInt holds it exactly.
+    return `${sign}${BigInt(abs).toString()}${decimals > 0 ? `.${"0".repeat(decimals)}` : ""}`;
+  }
+  let text = abs.toFixed(decimals);
+  // A double sits exactly halfway between two `decimals`-place numbers only
+  // when it is an odd multiple of 2^-(decimals+1); scaling by a power of two is
+  // exact, so this test is too. `toFixed` then took the upper neighbour, and
+  // when that ends in an odd digit the even one is a single digit below it —
+  // an odd digit is at least 1, so no borrow is needed.
+  const scaled = abs * 2 ** (decimals + 1);
+  if (Number.isInteger(scaled) && scaled % 2 === 1) {
+    const last = text.charCodeAt(text.length - 1) - 48;
+    if (last % 2 === 1) text = `${text.slice(0, -1)}${last - 1}`;
+  }
+  return `${sign}${text}`;
+}
+
 /** Bytes as GiB with at most one decimal, none when it would be `.0` — `128 GiB`, `7.5 GiB`. */
 export function formatGib(bytes: number | undefined): string {
   if (bytes === undefined || !Number.isFinite(bytes)) return HOST_UNKNOWN;
-  const text = (bytes / GIB).toFixed(1).replace(/\.0$/, "");
+  const text = fixedLikeRust(bytes / GIB, 1).replace(/\.0$/, "");
   return `${text} GiB`;
 }
 
@@ -37,12 +79,12 @@ export function formatDisk(free: number | undefined, total: number | undefined):
 
 /** `0.75 across 8 cores`, with each half independently `unknown`. */
 export function formatLoad(loadPerCpu: number | undefined, cpuCount: number | undefined): string {
-  const load = loadPerCpu === undefined || !Number.isFinite(loadPerCpu) ? HOST_UNKNOWN : loadPerCpu.toFixed(2);
+  const load = loadPerCpu === undefined || !Number.isFinite(loadPerCpu) ? HOST_UNKNOWN : fixedLikeRust(loadPerCpu, 2);
   const cores = cpuCount === undefined ? HOST_UNKNOWN : String(cpuCount);
   return `${load} across ${cores} cores`;
 }
 
-/** `1500 ms` — the daemon's own figure, never rounded into something it did not say. */
+/** `1500 ms` — the daemon's own figure, never rounded into something it did not say, up to {@link HOST_MAX_SHOWN_AGE_MS}. */
 export function formatSampleAge(ms: number): string {
-  return `${Math.max(0, Math.round(ms))} ms`;
+  return `${Math.min(HOST_MAX_SHOWN_AGE_MS, Math.max(0, Math.round(ms)))} ms`;
 }

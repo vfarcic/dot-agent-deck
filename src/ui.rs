@@ -17634,7 +17634,14 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
     }
     if ui.mode == UiMode::HostMetrics {
-        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics);
+        // The loop redraws every frame, so the shown age counts up while the
+        // answer is held and drops back when the next one lands.
+        let held = ui
+            .host_metrics_received_at
+            .map_or(std::time::Duration::ZERO, |at| {
+                std::time::Instant::now().saturating_duration_since(at)
+            });
+        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics, held);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -20169,9 +20176,26 @@ fn host_metrics_role_label(role: &str) -> String {
     }
 }
 
+/// PRD #1258: the largest sample age either client shows, in ms — the largest
+/// integer a JS number holds exactly. Above it the desktop could not print the
+/// figure this overlay prints, so both stop here (CLAUDE.md rule 22); the
+/// desktop's `HOST_MAX_SHOWN_AGE_MS` is the same number.
+const HOST_METRICS_MAX_SHOWN_AGE_MS: u64 = (1 << 53) - 1;
+
+/// PRD #1258: the sample age the overlay shows — the age the daemon reported
+/// plus how long the TUI has held the answer since, so a held answer does not
+/// claim to be as fresh as when it arrived. The desktop bridge adds its held
+/// time the same way (`HostMetricsReportDto::from_report`).
+fn host_metrics_shown_age_ms(reported_ms: u64, held: std::time::Duration) -> u64 {
+    reported_ms
+        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX))
+        .min(HOST_METRICS_MAX_SHOWN_AGE_MS)
+}
+
 /// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
-/// says `unknown`; nothing absent is ever drawn as zero.
-fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
+/// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
+/// TUI has held the answer, added to its sample age.
+fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<Line<'static>> {
     use crate::daemon_client::HostMetricsReport;
     const UNKNOWN: &str = "unknown";
     let row = |label: &str, value: String| {
@@ -20229,8 +20253,12 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
                     ),
                 ));
             }
+            // A non-finite load is not a reading; the desktop bridge drops it
+            // the same way. Rust's `{:.2}` rounds an exact tie to even, which
+            // the desktop's formatter matches (`fixedLikeRust`).
             let load = metrics
                 .load_per_cpu
+                .filter(|load| load.is_finite())
                 .map_or_else(|| UNKNOWN.to_string(), |load| format!("{load:.2}"));
             let cores = metrics
                 .cpu_count
@@ -20238,7 +20266,13 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
             lines.push(row("Load per core", format!("{load} across {cores}")));
             lines.push(row("Memory used", gib(metrics.memory_used_bytes)));
             lines.push(row("Memory available", gib(metrics.memory_available_bytes)));
-            lines.push(row("Sample age", format!("{} ms", metrics.sample_age_ms)));
+            lines.push(row(
+                "Sample age",
+                format!(
+                    "{} ms",
+                    host_metrics_shown_age_ms(metrics.sample_age_ms, held)
+                ),
+            ));
         }
     }
     lines
@@ -20246,8 +20280,12 @@ fn host_metrics_lines(view: &HostMetricsView) -> Vec<Line<'static>> {
 
 /// PRD #1258 M3: the "Host of this deck" overlay. Returns its `[Close]` button
 /// rect for the mouse hit-test, as [`render_help_overlay`] does.
-fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec<(Action, Rect)> {
-    let lines = host_metrics_lines(view);
+fn render_host_metrics_overlay(
+    frame: &mut Frame,
+    view: &HostMetricsView,
+    held: std::time::Duration,
+) -> Vec<(Action, Rect)> {
+    let lines = host_metrics_lines(view, held);
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(2));
     // Body, then a blank row, the button row and the hint: plus the border.
@@ -24347,9 +24385,20 @@ pub fn observe_command_banner_key_burst(
 }
 
 /// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`
-/// into a `width × height` buffer.
+/// into a `width × height` buffer, as just received.
 pub fn render_host_metrics_overlay_to_buffer(
     report: &crate::daemon_client::HostMetricsReport,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_host_metrics_overlay_held_to_buffer(report, std::time::Duration::ZERO, width, height)
+}
+
+/// PRD #1258 L1 seam: draw the live host overlay renderer for `report` after
+/// the TUI has held it for `held`.
+pub fn render_host_metrics_overlay_held_to_buffer(
+    report: &crate::daemon_client::HostMetricsReport,
+    held: std::time::Duration,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -24360,7 +24409,7 @@ pub fn render_host_metrics_overlay_to_buffer(
         Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
-            render_host_metrics_overlay(frame, &view);
+            render_host_metrics_overlay(frame, &view, held);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()

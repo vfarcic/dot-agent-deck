@@ -1,5 +1,5 @@
 {
-  "description": "PRD #1258: the words and formats both clients use for a deck's host (CLAUDE.md rule 22). Read by the TUI's `dashboard_host_metrics_008_*` (tests/render_host_metrics_copy.rs), which renders the host overlay, and by the desktop's HostMetricsPanel.copy.test.tsx, which renders the deck card's host panel, so a word or format changed on one side fails the other. Each sample is the daemon's wire shape (snake_case); `rows` is every label/value row the client draws for it, in order. `notAvailable` is the text for a deck that does not report host metrics.",
+  "description": "PRD #1258: the words and formats both clients use for a deck's host (CLAUDE.md rule 22). Read by the TUI's `dashboard_host_metrics_008_*` (tests/render_host_metrics_copy.rs), which renders the host overlay, and by the desktop's HostMetricsPanel.copy.test.tsx, which renders the deck card's host panel, so a word or format changed on one side fails the other. Each sample is the daemon's wire shape (snake_case); `rows` is every label/value row the client draws for it, in order. `notAvailable` is the text for a deck that does not report host metrics. Samples three to six hold the cases the two clients' number formatters once disagreed on (PR #1672 review): exact rounding ties (0.125 per core; 1.25, 2.75, 0.25, 1.75 and 3.25 GiB), which both round to the even neighbour as Rust's `format!` does; negative zero; a load of 1e21, which JS `toFixed` writes in exponent form; a u64::MAX disk; and a u64::MAX age, which both clients cap at 2^53 - 1, the largest integer the webview holds exactly.",
   "title": "Host of this deck",
   "subtitle": "The machine this deck's daemon runs on",
   "notAvailable": [
@@ -42,6 +42,74 @@
       "rows": [
         ["Load per core", "unknown across unknown cores"],
         ["Memory used", "1.5 GiB"],
+        ["Memory available", "unknown"],
+        ["Sample age", "0 ms"]
+      ]
+    },
+    {
+      "sample": {
+        "disks": [
+          { "role": "working_root", "free_bytes": 1342177280, "total_bytes": 2952790016 },
+          { "role": "temp_root", "free_bytes": 268435456, "total_bytes": 18446744073709551615 }
+        ],
+        "load_per_cpu": 0.125,
+        "cpu_count": 8,
+        "memory_used_bytes": 1879048192,
+        "memory_available_bytes": 3489660928,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 18446744073709551615
+      },
+      "rows": [
+        ["Working root", "1.2 GiB free of 2.8 GiB total"],
+        ["Temp root", "0.2 GiB free of 17179869184 GiB total"],
+        ["Load per core", "0.12 across 8 cores"],
+        ["Memory used", "1.8 GiB"],
+        ["Memory available", "3.2 GiB"],
+        ["Sample age", "9007199254740991 ms"]
+      ]
+    },
+    {
+      "sample": {
+        "disks": [],
+        "load_per_cpu": 0.625,
+        "cpu_count": 4,
+        "memory_used_bytes": 1,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 7
+      },
+      "rows": [
+        ["Load per core", "0.62 across 4 cores"],
+        ["Memory used", "0 GiB"],
+        ["Memory available", "unknown"],
+        ["Sample age", "7 ms"]
+      ]
+    },
+    {
+      "sample": {
+        "disks": [],
+        "load_per_cpu": -0.0,
+        "memory_available_bytes": 1073741824,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 0
+      },
+      "rows": [
+        ["Load per core", "-0.00 across unknown cores"],
+        ["Memory used", "unknown"],
+        ["Memory available", "1 GiB"],
+        ["Sample age", "0 ms"]
+      ]
+    },
+    {
+      "sample": {
+        "disks": [],
+        "load_per_cpu": 1e21,
+        "cpu_count": 1,
+        "sampled_at_ms": 1700000000000,
+        "sample_age_ms": 0
+      },
+      "rows": [
+        ["Load per core", "1000000000000000000000.00 across 1 cores"],
+        ["Memory used", "unknown"],
         ["Memory available", "unknown"],
         ["Sample age", "0 ms"]
       ]

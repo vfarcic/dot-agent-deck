@@ -609,6 +609,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/host-metrics/009 — A held answer's sample age grows by the time the TUI has held it.
+- **Layer:** L1 (ratatui `TestBackend`, the overlay renderer given an explicit held duration).
+- **Agent:** none.
+- **Asserts:** an answer the daemon reported as 1500 ms old reads `1500 ms` as received, `4000 ms` after 2.5 s held and `3601500 ms` after an hour, the same reply age plus held time the desktop bridge shows (CLAUDE.md rule 22, PR #1672 review); a `u64::MAX` age plus held time saturates and reads the shared `9007199254740991 ms` ceiling.
+- **Does not assert:** the event loop's clock (the draw passes `Instant::now()` less the time the answer landed); the desktop's age, which its bridge computes (`HostMetricsReportDto::from_report`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/config-gen
 
 ##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
