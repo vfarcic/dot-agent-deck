@@ -9,6 +9,9 @@
  * is called at each — and the queue's `speaking` going true marks the open
  * segment as overlapped. "Is it speaking now" would be the wrong question: a
  * recording of the app's own voice ends after the voice does.
+ *
+ * It also tells the reader when the open pane changes (issue #1667), so
+ * opening an agent's pane drops what was still to be said about the others.
  */
 
 import { useEffect, useMemo, useRef } from "react";
@@ -118,6 +121,15 @@ export function useReadingMode(
       for (const stop of unsubscribe) stop();
     };
   }, [reader]);
+  /* Issue #1667 — an agent's pane opening drops what was still to be said
+     about every other agent. Keyed on the pane's identity, so a render that
+     leaves the same pane open drops nothing. */
+  const open = openPane();
+  const openDeck = open?.deckId;
+  const openAgent = open?.agentId;
+  useEffect(() => {
+    reader.focus(openDeck === undefined || openAgent === undefined ? undefined : { deckId: openDeck, agentId: openAgent });
+  }, [reader, openDeck, openAgent]);
   // Unmounting stops every session and silences the app, without a sentence.
   useEffect(() => () => { reader.dispose(); }, [reader]);
 

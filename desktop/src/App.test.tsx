@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
 import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, DEFAULT_VOICE_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import { LaunchCleanupError } from "./lib/actionError";
 import type { UpgradeEvent, UpgradeOutcome } from "./lib/upgrade";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
@@ -3065,5 +3065,41 @@ describe("upgrading an older local daemon at launch (issue #1636)", () => {
       expect(screen.queryByTestId("upgrade-dialog"), name).not.toBeInTheDocument();
       view.unmount();
     }
+  });
+});
+
+/**
+ * Issue #1667 — what Reading is told to call each agent: an orchestration
+ * agent by its run's title (the overview's group heading) and its name, a
+ * standalone agent by its name.
+ */
+describe("Reading's agent labels", () => {
+  beforeEach(() => window.history.replaceState({}, "", "/"));
+
+  /** Scenario: Reading is on with a titled run's coder, an untitled run's coder and a standalone agent on the deck; Reading names the first "prd-1401 Coder", the second by its orchestration's name and "Coder", and the standalone agent by its own name — the same titles the overview shows as the group headings. */
+  it("names an orchestration agent by the run title and its name", async () => {
+    const coder = (id: string, orchestrationId: string, displayTitle: string | undefined): AgentSession => ({
+      ...agentIn(id, "/work/app"),
+      displayName: "Coder",
+      tab: { kind: "orchestration", orchestrationId, name: "mixed", displayTitle, roleName: "coder", roleIndex: 1, isStartRole: false },
+    });
+    const solo = { ...agentIn("3", "/work/app"), displayName: "Reviewer" };
+    const snapshot = liveSnapshot([coder("1", "run-a", "prd-1401"), coder("2", "run-b", undefined), solo]);
+    const settings = settingsStore({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on", reading_notice: "shown" } });
+    const voiceReadingStart = vi.fn(async (_target: { deckId: string; agentId: string; label: string }) => ({ kind: "started" as const, session: 1 }));
+    const live = runtime({
+      snapshot,
+      ...settings,
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceReadingStart,
+      voiceReadingStop: vi.fn(async () => undefined),
+      onVoiceReadingConsentOff: vi.fn(async () => () => undefined),
+      onVoiceReadingConsentOn: vi.fn(async () => () => undefined),
+    });
+    render(<DeckShell runtime={live} />);
+
+    await waitFor(() => expect(voiceReadingStart).toHaveBeenCalledTimes(3));
+    const labels = Object.fromEntries(voiceReadingStart.mock.calls.map(([target]) => [target.agentId, target.label]));
+    expect(labels).toEqual({ "1": "prd-1401 Coder", "2": "mixed Coder", "3": "Reviewer" });
   });
 });
