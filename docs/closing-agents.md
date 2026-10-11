@@ -136,7 +136,7 @@ To clean up worktrees the deck no longer knows about, such as after a daemon res
 | `2` | The running daemon is too old for `close`. Nothing was closed. |
 | `3` | No daemon is running. Nothing was closed. |
 
-`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry carries the unit's `name` and `unit_id`. Entries in `listed` also carry `reported`, `completed_at_ms`, `worktree`, `branch`, `clone` and `panes`. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units.
+`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry names the unit in `name` and gives its `unit_id`. In `closed`, `refused` and `worktrees`, a unit id the deck does not know is `null`, and a refusal of the whole command, rather than of one unit, is an entry in `refused` whose `name` and `unit_id` are both `null`. Entries in `listed` always carry `panes`, and carry `name`, `unit_id`, `reported`, `completed_at_ms`, `worktree`, `branch` and `clone` only when there is something to report, leaving each one out rather than setting it to `null`: `completed_at_ms`, for example, is missing for a unit that has not finished. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units.
 
 A script that closes the units whose pull requests merged can join `close --all --json` with `dot-agent-deck worktree list --json`, which reports each worktree's PR state, on the branch, and close each selected unit with `close --unit-id` and the `unit_id` from `listed`.
 
