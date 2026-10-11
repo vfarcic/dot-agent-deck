@@ -1628,8 +1628,11 @@ pub(crate) async fn snapshot_with(
         }
         // PRD #1258 M4: the host sample rides the same refreshes the list does —
         // the first one, every reconcile tick and every refetch — and is asked
-        // concurrently, so it adds no latency to a refresh that was fetching
-        // anyway.
+        // concurrently, so the two waits overlap rather than add up: the refresh
+        // waits for the slower of the two replies. The host request is bounded
+        // at `HOST_METRICS_REPLY_TIMEOUT` (2 s), so it can lengthen a refresh by
+        // at most that much, and only when the deck's sample is slower than its
+        // agent list.
         let (listing, host) = tokio::join!(
             bounded_reply("ListAgents", daemon.client.list_agents_detailed()),
             fetch_host_metrics(&daemon.client),

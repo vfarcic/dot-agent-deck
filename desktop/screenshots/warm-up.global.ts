@@ -6,6 +6,9 @@ import { chromium } from "@playwright/test";
 
 import { TUI_HTML_DIR } from "./support";
 
+/** How long the warm-up waits for a page and its fonts before giving up on it. */
+const WARM_UP_BUDGET_MS = 180_000;
+
 /**
  * Pays Chromium's first-use font cost once, before any shot's 30-second budget
  * is running — the screenshot generator's counterpart of the browser tier's
@@ -24,8 +27,16 @@ import { TUI_HTML_DIR } from "./support";
  * **What it does.** It opens the first TUI page this run will rasterize, or a
  * page of monospace and proportional text when there is none (a desktop-only
  * run), waits for its fonts under a deliberately generous budget, and logs how
- * long that took. It writes no image and asserts nothing. A run where it fails
- * has a real problem, because three minutes is not a cold start.
+ * long that took. It writes no image and asserts nothing. When the fonts have
+ * not settled within the budget it warns and lets the run go on, because it is
+ * only a warm-up: three minutes is not a cold start, so the shots that follow
+ * are likely to fail on their own budgets, and that failure names a shot.
+ *
+ * **The budget is enforced here, not by Playwright** (PR #1672 review).
+ * `page.setDefaultTimeout` bounds actions and navigations, not
+ * `page.evaluate`, so an `evaluate` awaiting `document.fonts.ready` would wait
+ * for as long as the fonts never settle — and `globalSetup` runs outside every
+ * test's timeout, so nothing else would stop it.
  *
  * **Why `globalSetup` and not a setup project.** `cargo docs-screenshots`
  * selects shots with `--grep` anchored to scenario titles, which a setup
@@ -39,15 +50,29 @@ export default async function warmUp(): Promise<void> {
   const browser = await chromium.launch();
   try {
     const page = await browser.newPage();
-    page.setDefaultTimeout(180_000);
+    page.setDefaultTimeout(WARM_UP_BUDGET_MS);
     if (first) {
       await page.goto(pathToFileURL(path.join(TUI_HTML_DIR!, first)).href);
     } else {
       await page.setContent('<p style="font-family: monospace">0</p><p>0</p>');
     }
-    await page.evaluate(async () => {
+    const fonts = page.evaluate(async () => {
       await document.fonts.ready;
     });
+    // When the budget wins, closing the browser below rejects this evaluate;
+    // that rejection is the expected end of an abandoned wait, not an error.
+    fonts.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      fonts.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), WARM_UP_BUDGET_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (!settled) {
+      console.warn(`chromium warm-up: fonts had not settled after ${WARM_UP_BUDGET_MS}ms; continuing without the warm-up`);
+      return;
+    }
   } finally {
     await browser.close();
   }
