@@ -25439,7 +25439,6 @@ mod spawn_tests {
         assert!(began.elapsed() < Duration::from_secs(2));
         drop(held);
 
-        let mut draft_polls = registry.draft_polls_for_test();
         let type_bytes = |bytes: &'static [u8]| {
             let registry = Arc::clone(&registry);
             let agent = agent.clone();
@@ -25450,6 +25449,10 @@ mod spawn_tests {
             }
         };
         type_bytes(b"draft").await;
+        // Counted before the write starts, so the wait below needs a poll of
+        // this write's own: the queued write above may already have polled.
+        let mut draft_polls = registry.draft_polls_for_test();
+        let base = *draft_polls.borrow_and_update();
         let waiting = {
             let registry = Arc::clone(&registry);
             let agent = agent.clone();
@@ -25470,7 +25473,7 @@ mod spawn_tests {
         // given in `only_the_first_write_entry_waits_for_a_pending_draft`.
         let _ = tokio::time::timeout(
             Duration::from_secs(10),
-            draft_polls.wait_for(|polls| *polls >= 1),
+            draft_polls.wait_for(|polls| *polls > base),
         )
         .await
         .expect("the first write waits for the draft")
