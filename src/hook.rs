@@ -1862,6 +1862,10 @@ pub fn send_and_await_spawn_role_reply(json: &str) -> SocketReply {
 /// misses it is [`SocketReply::NoReply`], which the CLI reports as handed to
 /// the daemon rather than as a failure.
 ///
+/// So `work-done`'s ordering holds only for an ack the CLI received within
+/// these 5s: after a `NoReply` the report may not be queued yet, and a report
+/// the same worker sends next can be queued ahead of it.
+///
 /// It is also the first deadline these two verbs have ever had. They went
 /// through [`send_to_socket`], whose connect and write are unbounded, so a
 /// wedged daemon hung the calling agent indefinitely; now it fails in 5s. That
