@@ -10,7 +10,9 @@ import {
   READING_OFF,
   READING_ON,
   READING_VOICE_KEY,
+  READING_LABEL_MAX_CHARS,
   readingKey,
+  readingLabel,
   readingNotice,
   readingStartFailed,
   type ReadingAgent,
@@ -187,6 +189,56 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     expect(h.stop).not.toHaveBeenCalled();
     expect(h.start).toHaveBeenCalledTimes(2);
     expect(h.said).toEqual([]);
+  });
+
+  /** Scenario (issue #1667): with the tester's pane open, the coder's turn summary, permission prompt and error are not spoken, and the tester's own summary and permission prompt are, without its name. */
+  it("reads only the agent whose pane is open", async () => {
+    const h = harness();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    h.open(TESTER);
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: done.", bare: "Done." });
+    h.sinks.get("coder")!({ kind: "permission", text: "The coder is asking for permission.", bare: "Asking for permission." });
+    h.sinks.get("coder")!({ kind: "blocked", text: "The coder stopped with an error.", bare: "Stopped with an error." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: green.", bare: "Green." });
+    h.sinks.get("tester")!({ kind: "permission", text: "The tester is asking for permission.", bare: "Asking for permission." });
+    expect(h.said.map(([, text]) => text)).toEqual(["Green.", "Asking for permission."]);
+    expect(h.said.every(([key]) => key.startsWith(readingKey(TESTER)))).toBe(true);
+    expect(h.stop).not.toHaveBeenCalled();
+  });
+
+  /** Scenario (issue #1667): on the overview, with no pane open, every agent's sentences are spoken, each naming its agent; after the tester's pane closes the coder is read again from then on, and what it said while the pane was open is not replayed. */
+  it("reads every agent with no pane open, and replays nothing after one closes", async () => {
+    const h = harness();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: one.", bare: "One." });
+    h.sinks.get("tester")!({ kind: "permission", text: "The tester is asking for permission.", bare: "Asking for permission." });
+    h.open(TESTER);
+    h.reader.focus(TESTER);
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: skipped.", bare: "Skipped." });
+    h.open(undefined);
+    h.reader.focus(undefined);
+    h.sinks.get("coder")!({ kind: "blocked", text: "The coder stopped with an error.", bare: "Stopped with an error." });
+    expect(h.said.map(([, text]) => text)).toEqual(["Coder: one.", "The tester is asking for permission.", "The coder stopped with an error."]);
+  });
+
+  /** Scenario (issue #1667): opening the tester's pane drops the queued sentences of every other agent, on any deck, and keeps the tester's own and the reader's own; closing it drops nothing. */
+  it("drops other agents' queued sentences when a pane opens", () => {
+    const h = harness();
+    h.reader.focus(TESTER);
+    expect(h.speech.drop).toHaveBeenCalledTimes(1);
+    const match = h.speech.drop.mock.calls[0][0];
+    expect(match(readingKey(CODER))).toBe(true);
+    expect(match(`${readingKey(CODER)}\u0000alert\u00001`)).toBe(true);
+    expect(match(readingKey(BUILDER))).toBe(true);
+    expect(match(readingKey(TESTER))).toBe(false);
+    expect(match(`${readingKey(TESTER)}\u0000alert\u00002`)).toBe(false);
+    expect(match(`${readingKey({ ...TESTER, incarnation: 9 })}`)).toBe(false);
+    expect(match(READING_VOICE_KEY)).toBe(false);
+    expect(match(`${READING_VOICE_KEY}\u0000problem\u00001`)).toBe(false);
+    h.reader.focus(undefined);
+    expect(h.speech.drop).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: an agent exits — its events close after its last summary; that agent's session ends without cutting off speech, it is not subscribed again while still listed, and the other agent is read on. */
@@ -494,7 +546,7 @@ function speaking(plan: SpeechPlanDto = { kind: "provider", fallbackToSystem: fa
 }
 
 describe("DeckReader with speech in flight", () => {
-  /** Scenario (decision 4): the tester's summary is queued while the tester's pane is open, and the user opens the coder's pane before it is said; it is said naming the tester. Queued while the coder's pane is open and said after the tester's opens, it drops the name. */
+  /** Scenario (decision 4): the tester's summary is queued while the tester's pane is open, and the user goes back to the overview before it is said; it is said naming the tester. Queued on the overview and said after the tester's pane opens, it drops the name. */
   it("decides the name when the sentence is said", async () => {
     const h = speaking();
     h.reader.update(true, [TESTER, CODER], false);
@@ -503,7 +555,7 @@ describe("DeckReader with speech in flight", () => {
     await flush();
     h.open(TESTER);
     h.sinks.get("tester")!({ kind: "turn", text: "Tester: all tests pass.", bare: "All tests pass." });
-    h.open(CODER);
+    h.open(undefined);
     h.provider.finish();
     await flush();
     expect(h.provider.fetched).toEqual(["Coder: first.", "Tester: all tests pass."]);
@@ -513,6 +565,43 @@ describe("DeckReader with speech in flight", () => {
     h.provider.finish();
     await flush();
     expect(h.provider.fetched.at(-1)).toBe("Second.");
+  });
+
+  /** Scenario (issue #1667): the coder's summary is being said, and a coder error and a tester summary wait behind it, when the user opens the tester's pane; the coder's sentence is cut off and its error dropped, the tester's summary is said without its name, and nothing about the coder is said once the pane closes. */
+  it("drops what was queued about other agents when a pane opens", async () => {
+    const h = speaking();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: first.", bare: "First." });
+    await flush();
+    h.sinks.get("coder")!({ kind: "blocked", text: "The coder stopped with an error." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: green.", bare: "Green." });
+    h.open(TESTER);
+    h.reader.focus(TESTER);
+    await flush();
+    expect(h.provider.aborted).toEqual(["Coder: first."]);
+    expect(h.provider.fetched).toEqual(["Coder: first.", "Green."]);
+    h.provider.finish();
+    h.open(undefined);
+    h.reader.focus(undefined);
+    await flush();
+    expect(h.queue.pending).toEqual([]);
+    expect(h.provider.fetched).toEqual(["Coder: first.", "Green."]);
+  });
+
+  /** Scenario (issue #1667): the coder's summary waits behind another sentence when the tester's pane opens, before the reader is told of the pane; when its turn comes it is said as nothing. */
+  it("says nothing about another agent once a pane is open, even before it is told", async () => {
+    const h = speaking();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: one.", bare: "One." });
+    await flush();
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: two.", bare: "Two." });
+    h.open(TESTER);
+    h.provider.finish();
+    await flush();
+    expect(h.provider.fetched).toEqual(["Tester: one."]);
+    expect(h.queue.speaking).toBe(false);
   });
 
   /** Scenario (D6, shared across agents): while one sentence is being said, the tester finishes two turns and the coder one; the tester's newer summary replaces its older one, the coder's is kept, and they are heard in order. */
@@ -700,5 +789,15 @@ describe("the one-time notice (decision 5 of 2026-10-09)", () => {
   it("matches the wording the speech command recognises", () => {
     expect(noticeCases.length).toBeGreaterThan(0);
     for (const { endpoint, notice } of noticeCases) expect(readingNotice(endpoint), endpoint).toBe(notice);
+  });
+});
+
+describe("the label sent for an agent (issue #1667)", () => {
+  /** Scenario: a run title long enough to push the label past what a sentence names is cut to that many characters, counting a multi-byte character as one; a short label is sent as it is. */
+  it("bounds the label to what a sentence names", () => {
+    expect(readingLabel("prd-1401 Coder")).toBe("prd-1401 Coder");
+    const long = `${"é".repeat(READING_LABEL_MAX_CHARS)} Coder`;
+    expect(readingLabel(long)).toBe("é".repeat(READING_LABEL_MAX_CHARS));
+    expect(new TextEncoder().encode(readingLabel("🛠".repeat(200))).length).toBeLessThanOrEqual(256);
   });
 });

@@ -19,6 +19,7 @@ import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
+import { orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
@@ -231,7 +232,7 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
         id,
         key: id === undefined ? anonymousOrchestrationKey(agent) : groupKey("orchestration", id),
         kind: "orchestration" as const,
-        title: agent.tab.displayTitle || agent.tab.name,
+        title: orchestrationTitle(agent.tab),
         subtitle: agent.tab.displayTitle ? agent.tab.name : undefined,
         agents: [],
       };
