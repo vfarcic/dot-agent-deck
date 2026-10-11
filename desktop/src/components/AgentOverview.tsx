@@ -1439,16 +1439,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
-          <div className="run-instruments">
+          {/*
+            Issue #1676: which counters give way at a medium-width window is
+            named here, not left to their position. IDLE and GROUPS are the two
+            nobody has to act on; NEEDS INPUT and FAILED stay.
+          */}
+          <div className="run-instruments overview-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
             <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
             <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
             <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
-            <OverviewInstrument label="IDLE" testId="overview-count-idle"><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
-            <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
+            <OverviewInstrument label="IDLE" testId="overview-count-idle" optional><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
+            <OverviewInstrument label="GROUPS" testId="overview-count-groups" optional><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
             {/*
               PRD #742 M4. The one instrument that is ALWAYS known, and it is
-              what makes the four beside it readable: they are computed over the
+              what makes the counters beside it readable: they are computed over the
               decks that answered, so "how many answered" is the caveat that
               belongs next to them. It renders at one deck too — `1/1` is the
               honest reading of a single-deck fleet, and hiding it would mean
@@ -2703,8 +2708,9 @@ function OverviewNote({ className, testId, icon, title, children }: { className?
   return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
 }
 
-function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
-  return <div className="instrument" data-testid={testId}><span>{label}</span>{children}</div>;
+/** `optional`: one of the counters a medium-width window hides to make room. */
+function OverviewInstrument({ label, children, testId, optional }: { label: string; children: ReactNode; testId?: string; optional?: boolean }) {
+  return <div className={optional ? "instrument instrument-optional" : "instrument"} data-testid={testId}><span>{label}</span>{children}</div>;
 }
 
 /**

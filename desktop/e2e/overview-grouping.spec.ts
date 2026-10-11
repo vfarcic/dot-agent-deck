@@ -336,6 +336,30 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     await expect(page.getByTestId("overview-count-agents").locator("strong")).toHaveText("7");
   });
 
+  /*
+    Issue #1676. Between 961px and 1260px the header has room for five
+    counters, and which five is named, not positional: NEEDS INPUT and FAILED
+    stay, because a person has to act on them, and IDLE and GROUPS give way.
+  */
+  test.describe("at a 1200px window", () => {
+    test.use({ viewport: { width: 1200, height: 800 } });
+
+    /// Scenario: open the fleet dashboard in a 1200px window. NEEDS INPUT and FAILED are among the counters still shown, IDLE and GROUPS are not, and the counters stop short of the header's buttons.
+    test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
+      await openOverview(page, "fleet");
+      for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
+        await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at 1200px`).toBeVisible();
+      }
+      for (const name of ["idle", "groups"]) {
+        await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at 1200px`).toBeHidden();
+      }
+      const counters = await page.locator(".overview-instruments").boundingBox();
+      const actions = await page.locator(".topbar .top-actions").first().boundingBox();
+      expect(counters && actions, "the header did not lay out").toBeTruthy();
+      expect(counters!.x + counters!.width, "the counters run under the header's buttons").toBeLessThanOrEqual(actions!.x + 0.5);
+    });
+  });
+
   test.describe("at 400x780 phone", () => {
     test.use({ viewport: { width: 400, height: 780 } });
 

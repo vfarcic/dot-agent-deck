@@ -1160,7 +1160,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
   .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
-  .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
+  .deck-instruments .instrument:nth-child(3), .deck-instruments .instrument:nth-child(5) { display: none; }
+  .overview-instruments .instrument-optional { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }
 
