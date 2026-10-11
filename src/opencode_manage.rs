@@ -169,13 +169,18 @@ let shuttingDown = false;
 
 // Issue #1678: the longest session or message id, in UTF-8 bytes, the plugin
 // keeps in its child-session, alias and reply records — the daemon's own bound
-// on a tracked subagent id. A longer child id is recognised by a fixed-size
+// on a tracked subagent id. A longer session id is recognised by a fixed-size
 // stand-in (sessionKey), never by a cut-down copy, so two long ids sharing a
-// prefix stay apart; it is never reported active (no `subagent.start` or
-// `subagent.stop`), and its tool calls and permission prompts still carry
-// subagent attribution, as OVERSIZED_SUBAGENT_ID.
+// prefix do not collapse into one (the stand-in holds a 64-bit digest of the
+// whole id, so two ids of the same length can still share one, with
+// negligible probability). Stand-ins begin with OVERSIZED_ID_PREFIX, and an id
+// that itself begins with it is held by a stand-in too, so no stand-in equals
+// an id held as itself. A child held by a stand-in is never reported active
+// (no `subagent.start` or `subagent.stop`); its tool calls and permission
+// prompts still carry subagent attribution, as its stand-in, so each such
+// child's prompt is its own.
 const MAX_ID_BYTES = 256;
-const OVERSIZED_SUBAGENT_ID = "oversized-subagent-id";
+const OVERSIZED_ID_PREFIX = "oversized-id:";
 const utf8Length = (text) =>
   typeof Buffer !== "undefined" ? Buffer.byteLength(text, "utf8") : new TextEncoder().encode(text).length;
 const idFits = (id) =>
@@ -188,15 +193,18 @@ const digest = (text) => {{
     a = Math.imul(a ^ c, 0x01000193);
     b = Math.imul(b ^ c, 0x5bd1e995);
   }}
-  return (a >>> 0).toString(16) + (b >>> 0).toString(16);
+  return (a >>> 0).toString(16).padStart(8, "0") + (b >>> 0).toString(16).padStart(8, "0");
 }};
-// How the plugin holds session id `id`: the id itself when it fits in
-// MAX_ID_BYTES, otherwise a fixed-size stand-in derived from all of it.
+// Does session id `id` keep its own id: it fits in MAX_ID_BYTES and is not in
+// the stand-ins' namespace?
+const keepsOwnId = (id) => idFits(id) && !id.startsWith(OVERSIZED_ID_PREFIX);
+// How the plugin holds session id `id`: the id itself when it keeps it,
+// otherwise a fixed-size stand-in derived from all of it.
 const sessionKey = (id) => {{
   if (typeof id !== "string" || !id) {{
     return undefined;
   }}
-  return idFits(id) ? id : "\u0000" + id.length + ":" + digest(id);
+  return keepsOwnId(id) ? id : OVERSIZED_ID_PREFIX + id.length + ":" + digest(id);
 }};
 
 // PRD #1497: the assistant's reply, for the deck's voice "reading on". The text
@@ -584,7 +592,9 @@ const forgetAllReplyState = () => {{
 // that is not sends no stop, so a child that goes busy again later starts
 // again. Its other session events and its user message (the prompt it was
 // given) are not sent, and its tool calls and permission prompts carry
-// `subagent_id`, so none of them moves the card's status. A session whose
+// `subagent_id`, so none of them counts as the main session's work or turn
+// activity; a permission prompt still puts the card on Needs Input, and its
+// answer (or the child's stop) takes the card back off it. A session whose
 // ancestry is not known when it reports is still treated as the main
 // session's.
 //
@@ -638,9 +648,9 @@ const rootKeyOf = (key) => {{
   return routeOf(key) ?? routeOf(current) ?? current;
 }};
 
-// What a child's report is attributed to: its own id, or OVERSIZED_SUBAGENT_ID
-// for one longer than MAX_ID_BYTES.
-const subagentAttribution = (childId) => (idFits(childId) ? childId : OVERSIZED_SUBAGENT_ID);
+// What a child's report is attributed to: its own id, or its stand-in for one
+// that does not keep it (sessionKey), so two such children stay apart.
+const subagentAttribution = (childId) => sessionKey(childId);
 
 const subagentPayload = (event, childId, directory, rest) => {{
   const props = event?.properties ?? {{}};
@@ -672,7 +682,7 @@ const handleChildSessionEvent = (event, childId, directory) => {{
   if (
     active &&
     !running &&
-    idFits(childId) &&
+    keepsOwnId(childId) &&
     activeSubagents.size < MAX_ACTIVE_SUBAGENTS
   ) {{
     const payload = subagentPayload(event, childId, directory, {{ event: "subagent.start" }});
@@ -923,6 +933,12 @@ const recordUserMessage = (event, directory) => {{
   const info = event?.properties?.info;
   const messageId = info?.id;
   if (!idFits(messageId)) {{
+    return;
+  }}
+  // A message from a session id over the bound is not kept, so its prompt is
+  // not reported.
+  if (info?.sessionID !== undefined && info?.sessionID !== null && !idFits(info.sessionID)) {{
+    messageRoles.delete(messageId);
     return;
   }}
   const role = (info?.role ?? "").toLowerCase();
@@ -3211,10 +3227,12 @@ await text("root", "ru", "ROOT_PROMPT");
     /// Issue #1678 audit AU-4: a child session id over 256 UTF-8 bytes (by
     /// length, and by multi-byte characters under 256 characters) is never
     /// reported active and never sent, yet its tool call and permission prompt
-    /// still carry subagent attribution. Another long id sharing all but its
-    /// last character is not taken for that child. A 256-byte id is a child
-    /// like any other. At most 64 user messages wait for their text: the
-    /// oldest one's prompt is then not reported, the newest one's is.
+    /// still carry subagent attribution — each such child its own stand-in.
+    /// Another long id sharing all but its last character is not taken for
+    /// that child. A 256-byte id is a child like any other. At most 64 user
+    /// messages wait for their text: the oldest one's prompt is then not
+    /// reported, the newest one's is, and one sent from a session id over the
+    /// bound is not reported (audit AU-8).
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_bounds_the_ids_and_messages_it_holds() {
@@ -3240,19 +3258,31 @@ await tool("x".repeat(299) + "b");
 for (let i = 0; i < 65; i += 1) {
   await send("message.updated", { sessionID: "root", info: { id: "m" + i, sessionID: "root", role: "user" } });
 }
+await send("message.updated", { sessionID: "root", info: { id: "mz", sessionID: "z".repeat(300), role: "user" } });
 for (const i of [0, 64]) {
   await send("message.part.updated", { sessionID: "root", part: { id: "p" + i, sessionID: "root", messageID: "m" + i, type: "text", text: "PROMPT_" + i } });
 }
+await send("message.part.updated", { sessionID: "root", part: { id: "pz", sessionID: "root", messageID: "mz", type: "text", text: "OVERSIZED_SESSION_PROMPT" } });
 "#,
             &[],
         ) else {
             return;
         };
         let fits = "y".repeat(256);
-        let oversized = "oversized-subagent-id";
+        // Each oversized child is attributed to its own stand-in.
+        let stand_ins: Vec<String> = payloads
+            .iter()
+            .filter_map(|p| p["subagent_id"].as_str())
+            .filter(|id| id.starts_with("oversized-id:"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(stand_ins.len(), 4, "{payloads:#?}");
+        assert_eq!(stand_ins[0], stand_ins[1], "one child, one stand-in");
+        assert_eq!(stand_ins[2], stand_ins[3], "one child, one stand-in");
+        assert_ne!(stand_ins[0], stand_ins[2], "two children stay apart");
         let expected = {
             let mut rows = vec![row("root", "session.created", "")];
-            for _ in 0..2 {
+            for oversized in [&stand_ins[0], &stand_ins[2]] {
                 rows.push(row("root", "tool.execute.before", oversized));
                 rows.push(row("root", "permission.asked", oversized));
             }
@@ -3275,8 +3305,16 @@ for (const i of [0, 64]) {
             .map(str::len)
             .max();
         assert_eq!(longest, Some(256), "no field carries an id over the bound");
-        let prompt = payloads.iter().find(|p| p["event"] == "session.prompt");
-        assert_eq!(prompt.map(|p| &p["prompt"]), Some(&"PROMPT_64".into()));
+        let prompts: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .map(|p| &p["prompt"])
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![&serde_json::Value::from("PROMPT_64")],
+            "neither the oldest pending prompt nor one from an oversized session is reported"
+        );
         for payload in &payloads {
             let event = crate::hook::build_opencode_event(
                 serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
@@ -3288,6 +3326,92 @@ for (const i of [0, 64]) {
                 "{payload}"
             );
         }
+    }
+
+    /// Issue #1678 audit AU-5: two child sessions whose ids are over the bound
+    /// both ask for permission after the root's turn ended, and only the first
+    /// is answered. Each prompt is attributed to its own child, so the card,
+    /// fed those reports through the deck's hook decoder, stays on Needs Input
+    /// until the second is answered too, then returns to Idle.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_keeps_two_oversized_childrens_prompts_apart() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+await created("root");
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+const first = "x".repeat(299) + "a";
+const second = "x".repeat(299) + "b";
+for (const id of [first, second]) {
+  await created(id, "root");
+  await send("session.status", { sessionID: id, status: { type: "busy" } });
+  await send("permission.asked", { sessionID: id, title: "ask" });
+}
+await send("permission.replied", { sessionID: first });
+await send("permission.replied", { sessionID: second });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let rows = payload_rows(&payloads);
+        let asks: Vec<&(String, String, String)> = rows
+            .iter()
+            .filter(|(_, event, _)| event.starts_with("permission."))
+            .collect();
+        assert_eq!(asks.len(), 4, "{payloads:#?}");
+        let (first, second) = (&asks[0].2, &asks[1].2);
+        assert!(first.starts_with("oversized-id:"), "{first}");
+        assert!(second.starts_with("oversized-id:"), "{second}");
+        assert_ne!(first, second, "two oversized children stay apart");
+        assert_eq!(
+            asks.iter()
+                .map(|(session, event, id)| (session.as_str(), event.as_str(), id))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root", "permission.asked", first),
+                ("root", "permission.asked", second),
+                ("root", "permission.replied", first),
+                ("root", "permission.replied", second),
+            ]
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, event, _)| event.starts_with("subagent.")),
+            "an oversized child is never reported active: {payloads:#?}"
+        );
+
+        let mut state = crate::state::AppState::default();
+        let mut statuses = Vec::new();
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            let is_permission = payload["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("permission."));
+            state.apply_event(event);
+            if is_permission {
+                statuses.push(state.sessions["root"].status.clone());
+            }
+        }
+        use crate::state::SessionStatus;
+        assert_eq!(
+            statuses,
+            vec![
+                SessionStatus::WaitingForInput,
+                SessionStatus::WaitingForInput,
+                SessionStatus::WaitingForInput,
+                SessionStatus::Idle,
+            ],
+            "answering one oversized child's prompt leaves the other's open"
+        );
     }
 
     /// Issue #1678 review #2: OpenCode disposing its instance while a child is

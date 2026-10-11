@@ -4629,4 +4629,88 @@ mod opencode_child_permission_tests {
         send(&mut state, reply(Some("child")));
         assert_eq!(card(&state), (SessionStatus::Thinking, 0));
     }
+
+    /// Scenario (audit AU-5): after the root's turn ended, two child sessions
+    /// whose ids are over the bound — each attributed to its own stand-in, and
+    /// never reported active — both ask for permission, and only the first is
+    /// answered. The second's prompt is still open, so the card stays on Needs
+    /// Input until it is answered too.
+    #[test]
+    fn opencode_child_permission_two_oversized_children_keep_their_own_prompts() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        let first = format!("oversized-id:300:{}", "0".repeat(16));
+        let second = format!("oversized-id:300:{}", "1".repeat(16));
+        send(&mut state, ask(Some(&first)));
+        send(&mut state, ask(Some(&second)));
+        send(&mut state, reply(Some(&first)));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::WaitingForInput, 1),
+            "the second oversized child's prompt is still open"
+        );
+        send(&mut state, reply(Some(&second)));
+        assert_eq!(card(&state), (SessionStatus::Idle, 1));
+    }
+
+    /// Scenario (audit AU-7, the mixed-version pairing): during the root's
+    /// turn the root and a child both ask for permission and only the child's
+    /// prompt is answered. A new reducer keeps the root's Needs Input. An
+    /// older client knows neither the subagent attribution on that answer nor
+    /// its `permission_state`, so it folds the same event as a plain Thinking —
+    /// modelled here by stripping both before the fold — and shows Thinking,
+    /// which is what it showed for that answer before issue #1678. This is the
+    /// accepted old-client display limitation docs/develop/background-work.md
+    /// records, not a contract break.
+    #[test]
+    fn opencode_child_permission_reply_an_older_client_folds_as_thinking() {
+        let events = || {
+            [
+                serde_json::json!({"event": "session.created"}),
+                serde_json::json!({"event": "session.status", "status": "busy"}),
+                ask(None),
+                ask(Some("child")),
+                reply(Some("child")),
+            ]
+            .map(|payload| {
+                let mut payload = payload;
+                payload["session_id"] = "root".into();
+                let mut event = build_opencode_event(serde_json::from_value(payload).unwrap())
+                    .expect("a known OpenCode event");
+                event.pane_id = Some(PANE.into());
+                event.agent_id = Some(AGENT.into());
+                event
+            })
+        };
+        let status = |state: &AppState| state.live_session_for(AGENT, Some(PANE)).unwrap().status;
+
+        let mut new_client = AppState::default();
+        new_client.register_pane(PANE.into());
+        for event in events() {
+            new_client.apply_event(event);
+        }
+        assert_eq!(status(&new_client), SessionStatus::WaitingForInput);
+
+        let mut old_client = AppState::default();
+        old_client.register_pane(PANE.into());
+        let mut stripped = 0;
+        for mut event in events() {
+            if event.is_subagent_permission_reply() {
+                stripped += 1;
+                event
+                    .metadata
+                    .remove(crate::event::PERMISSION_STATE_METADATA_KEY);
+                event
+                    .metadata
+                    .remove(crate::event::SUBAGENT_ID_METADATA_KEY);
+            }
+            old_client.apply_event(event);
+        }
+        assert_eq!(stripped, 1, "the child's answer is the tagged reply");
+        assert_eq!(
+            status(&old_client),
+            SessionStatus::Thinking,
+            "the old-client view of the answer is the legacy Thinking"
+        );
+    }
 }

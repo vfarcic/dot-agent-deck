@@ -103,7 +103,8 @@ fn strip_event_payload(event: &mut AgentEvent) {
 /// the whole bound on what a wait tracks, at a few kilobytes per session for
 /// ordinary ids. Up to this many subagents a wait is exact: a re-ask from an
 /// id it holds is the same subagent, and a stop from an id it does not hold
-/// is one that never asked. Subagents that join past this many are counted in
+/// is one that never asked or whose share it already resolved
+/// ([`SubagentWait::resolved`]). Subagents that join past this many are counted in
 /// [`SubagentWait::overflow`] instead of being remembered, never dropped: an
 /// id forgotten while its prompt is still open would let the card leave the
 /// wait with that prompt pending.
@@ -1325,9 +1326,10 @@ pub struct SubagentWait {
     pub resume_idle: bool,
     /// Issue #697: how many asks arrived from ids not in
     /// [`Self::subagent_ids`] after [`MAX_SUBAGENT_IDS`] ids were already
-    /// recorded. Their ids are not kept, so a `SubagentStop` naming an id not
-    /// in [`Self::subagent_ids`] counts one off while this is non-zero, and the
-    /// wait ends only once both are empty. Without the ids the count cannot
+    /// recorded. Their ids are not kept, so a `SubagentStop` (or, issue #1678,
+    /// an answered subagent prompt) naming an id in neither
+    /// [`Self::subagent_ids`] nor [`Self::resolved`] counts one off while this
+    /// is non-zero, and the wait ends only once both are empty. Without the ids the count cannot
     /// tell a re-ask from a new subagent, or a waiting subagent's stop from one
     /// that never asked, so once a wait holds more than [`MAX_SUBAGENT_IDS`]
     /// subagents it is approximate in both directions: an untracked subagent
@@ -1338,6 +1340,21 @@ pub struct SubagentWait {
     /// an older reader ignores it and a newer one reads its absence as zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub overflow: u32,
+    /// Issue #1678: subagents already taken off [`Self::subagent_ids`] — their
+    /// prompt was answered (an OpenCode child's `permission.replied`) or they
+    /// stopped — oldest first, at most [`MAX_SUBAGENT_IDS`]. A later stop or a
+    /// repeated answer from one of them has nothing left to resolve, so it must
+    /// not count off [`Self::overflow`], which belongs to a subagent whose id
+    /// was never kept. An id that asks again leaves this list. Bounded like
+    /// [`Self::subagent_ids`]: past that many the oldest is forgotten, and its
+    /// later stop can then count off an overflowed prompt — the approximation
+    /// [`Self::overflow`] already accepts, now reached only past
+    /// [`MAX_SUBAGENT_IDS`] resolutions in one wait. Additive optional on the
+    /// wire like [`Self::overflow`]: an older reader ignores it (and counts such
+    /// a stop off the overflow, as it always did), and a newer one reads its
+    /// absence as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved: Vec<String>,
 }
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -1346,10 +1363,16 @@ fn is_zero_u32(value: &u32) -> bool {
 
 /// Issue #1364: subagent `ended` no longer holds the card's wait — it stopped,
 /// or (issue #1678) its permission prompt was answered. When the wait is
-/// subagents' alone and that subagent is one of them, it is taken off; once
-/// none is left the wait is over and the card resumes as [`SubagentWait`]
-/// says, which is the only case that answers `true`. Anything else — no wait,
-/// a main-thread wait, a subagent the wait does not name — changes nothing.
+/// subagents' alone and names that subagent, it is taken off and remembered in
+/// [`SubagentWait::resolved`]. A subagent the wait neither names nor has
+/// already resolved is, while [`SubagentWait::overflow`] is non-zero, taken to
+/// be one of the subagents counted past the cap, and counts one off it — an
+/// approximation, since a subagent that never asked is counted off the same
+/// way (see that field). Once nothing is left the wait is over and the card
+/// resumes as [`SubagentWait`] says, which is the only case that answers
+/// `true`. Anything else — no wait, a main-thread wait, a subagent already
+/// resolved, one the wait does not name while nothing overflowed — changes
+/// nothing.
 fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
     if session.status != SessionStatus::WaitingForInput {
         return false;
@@ -1357,10 +1380,16 @@ fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
     let Some(wait) = session.subagent_wait.as_mut() else {
         return false;
     };
-    // Issue #697: an id the wait does not hold is one of the subagents counted
-    // past the cap (see `SubagentWait::overflow`).
     if wait.subagent_ids.iter().any(|id| id == ended) {
         wait.subagent_ids.retain(|id| id != ended);
+        if wait.resolved.len() >= MAX_SUBAGENT_IDS {
+            wait.resolved.remove(0);
+        }
+        wait.resolved.push(ended.to_string());
+    } else if wait.resolved.iter().any(|id| id == ended) {
+        // Its share was already resolved; a later stop or a repeated answer
+        // must not pay off another subagent's overflowed prompt.
+        return false;
     } else if wait.overflow > 0 {
         wait.overflow -= 1;
     } else {
@@ -17545,10 +17574,13 @@ impl AppState {
                             subagent_ids: vec![id],
                             resume_idle: session.status == SessionStatus::Idle,
                             overflow: 0,
+                            resolved: Vec::new(),
                         })
                     }
                     Some(id) => session.subagent_wait.take().map(|mut wait| {
                         if !wait.subagent_ids.contains(&id) {
+                            // Issue #1678: asking again reopens its share.
+                            wait.resolved.retain(|resolved| resolved != &id);
                             // Issue #697: bounded — past the cap an ask is
                             // counted rather than remembered, so the wait stays
                             // open for it instead of forgetting its prompt (see
@@ -27378,6 +27410,80 @@ while True:
             SessionStatus::Thinking,
             "every subagent has stopped, so the wait is over"
         );
+    }
+
+    /// Issue #1678 (AU-6): an answered subagent's later stop must not pay off
+    /// the prompt of a subagent counted past the cap. One more subagent than
+    /// [`MAX_SUBAGENT_IDS`] asks (the last counted in the overflow), `sub-0`'s
+    /// prompt is answered and `sub-0` then stops, and every other remembered
+    /// subagent's prompt is answered: the overflowed subagent has neither
+    /// answered nor stopped, so the card must still read Needs Input, until it
+    /// stops.
+    #[test]
+    fn subagent_wait_an_answered_subagents_stop_leaves_the_overflow_open() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+        let answer = |id: &str, secs: i64| {
+            let mut event = subagent_event(EventType::Thinking, id, secs);
+            event.metadata.insert(
+                crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
+                crate::event::PERMISSION_STATE_REPLIED.to_string(),
+            );
+            event
+        };
+
+        for i in 0..=MAX_SUBAGENT_IDS {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        state.apply_event(answer("sub-0", 3));
+        state.apply_event(subagent_event(EventType::SubagentStop, "sub-0", 4));
+        // A repeated answer is no different.
+        state.apply_event(answer("sub-0", 4));
+        for i in 1..MAX_SUBAGENT_IDS {
+            state.apply_event(answer(&format!("sub-{i}"), 5));
+        }
+        assert_eq!(
+            status(&state),
+            SessionStatus::WaitingForInput,
+            "the overflowed subagent's prompt is still open"
+        );
+
+        state.apply_event(subagent_event(
+            EventType::SubagentStop,
+            &format!("sub-{MAX_SUBAGENT_IDS}"),
+            6,
+        ));
+        assert_eq!(status(&state), SessionStatus::Thinking);
+    }
+
+    /// Issue #1678 (AU-6): a subagent whose prompt was answered and that then
+    /// asks again holds the wait again, and its stop ends it.
+    #[test]
+    fn subagent_wait_an_answered_subagent_asking_again_holds_the_wait() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+        let mut answer = subagent_event(EventType::Thinking, "a", 3);
+        answer.metadata.insert(
+            crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
+            crate::event::PERMISSION_STATE_REPLIED.to_string(),
+        );
+
+        state.apply_event(subagent_event(EventType::PermissionRequest, "a", 2));
+        state.apply_event(subagent_event(EventType::PermissionRequest, "b", 2));
+        state.apply_event(answer);
+        state.apply_event(subagent_event(EventType::PermissionRequest, "a", 4));
+        state.apply_event(subagent_event(EventType::SubagentStop, "b", 5));
+        assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        state.apply_event(subagent_event(EventType::SubagentStop, "a", 6));
+        assert_eq!(status(&state), SessionStatus::Thinking);
     }
 
     /// Issue #697 control: under the cap the wait behaves as before — it ends
