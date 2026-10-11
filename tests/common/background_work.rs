@@ -59,11 +59,19 @@ finally:
             .unwrap();
         let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
         let events = deck.subscribe_events();
+        let stand_in = common::capability_export_command("exec python3 background-parent.py");
+        let command = if agent_type == AgentType::Codex {
+            // The Codex wrapper needs one program with arguments. Keep the
+            // capability export and exec together inside that program rather
+            // than putting shell syntax directly after `wrap --`.
+            std::fs::write(deck.workdir().join("background-parent.sh"), &stand_in).unwrap();
+            "sh background-parent.sh".to_string()
+        } else {
+            stand_in
+        };
         let agent_id = runtime
             .block_on(client.start_agent(StartAgentOptions {
-                command: Some(common::capability_export_command(
-                    "exec python3 background-parent.py",
-                )),
+                command: Some(command),
                 cwd: Some(deck.workdir().to_string_lossy().into_owned()),
                 display_name: Some("background-synthetic".into()),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
