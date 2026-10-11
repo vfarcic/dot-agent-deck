@@ -863,14 +863,22 @@ const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// on one that had answered before, with almost all of the time spent before
 /// `initialize` answered. The wait returns as soon as the reply arrives, so a
 /// Codex that answers within the old 5 s waits no longer than before; what the
-/// wider ceiling costs is a pane whose Codex launches up to this much later when
-/// `codex app-server` answers slowly or never. A delegate that respawned that
-/// pane can then pay for it twice: its readiness fallback
-/// (`crate::state::SESSION_START_WAIT_TIMEOUT`, also 30 s) is counted from the
-/// respawn, so when this wait takes most of its 30 s the fallback can expire
-/// before Codex has drawn its interface, and the task pointer is typed into a
-/// pane Codex is not yet reading. That is the fixed-timer readiness problem
-/// tracked in #1663 (and #1662 for Pi), which this bound does not address.
+/// wider ceiling costs is a pane whose Codex launches up to 30 s later when
+/// `codex app-server` answers slowly or never.
+///
+/// This bounds the listing wait only, not the pane. The rest of the wrapper's
+/// spawn prep has waits of its own: the `hooks.json` install and the
+/// `config.toml` trust write each take a cross-process lock that waits up to
+/// 10 s (`crate::agent_hook_config::lock_config`), so the whole prep can hold
+/// Codex's launch for about 50 s. Threading one deadline through
+/// `crate::wrap::codex_spawn_prep` is left to the readiness work in #1663. A
+/// delegate that respawned that pane can then pay for it twice: its readiness
+/// fallback (`crate::state::SESSION_START_WAIT_TIMEOUT`, also 30 s) is counted
+/// from the respawn, so when the prep takes most of its 30 s the fallback can
+/// expire before Codex has drawn its interface, and the task pointer is typed
+/// into a pane Codex is not yet reading. That is the fixed-timer readiness
+/// problem tracked in #1663 (and #1662 for Pi), which this bound does not
+/// address.
 /// The daemon's startup install and `hooks install` keep the shorter bound: the
 /// startup one sits before the daemon binds its sockets (issue #1665), and
 /// neither is about to launch Codex.
@@ -1063,13 +1071,28 @@ fn list_hooks_in_within(
                 }
             }
         });
-        read_hooks_list_reply(&rx, &mut stdin, Instant::now() + timeout)
+        read_hooks_list_reply(&rx, &mut stdin, hooks_list_deadline(timeout))
     });
 
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     response
+}
+
+/// The instant a `hooks/list` wait of `timeout` gives up at.
+///
+/// The timeout is the caller's choice, and `Instant + Duration` panics on
+/// overflow, so a huge one such as `Duration::MAX` is clamped to a far-future
+/// deadline (about a century) instead. Should even that not fit the platform's
+/// `Instant`, the wait gives up at once and the caller degrades as it does on
+/// any other timeout, rather than panicking.
+fn hooks_list_deadline(timeout: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
 }
 
 /// Is this line the `hooks/list` **response**, as opposed to some other message
@@ -1698,7 +1721,7 @@ pub fn trust_deck_hooks_for(
 
 /// [`trust_deck_hooks_for`] with the caller choosing how long to wait for Codex's
 /// `hooks/list` reply; the wrapper passes [`SPAWN_HOOKS_LIST_TIMEOUT`].
-pub fn trust_deck_hooks_for_within(
+pub(crate) fn trust_deck_hooks_for_within(
     home: &Path,
     cwd: &Path,
     binary_paths: &[String],
@@ -3283,6 +3306,29 @@ mod tests {
             sent.contains("-32601") && sent.contains("account/chatgptAuthTokens/refresh"),
             "the stray request must be answered, not merely stepped over; got {sent:?}"
         );
+    }
+
+    /// `trust_deck_hooks_for_within` takes its `hooks/list` wait from the
+    /// caller, so a timeout too large for `Instant + Duration` must not panic: it
+    /// becomes a far-future deadline, and a reply that arrives is still read.
+    #[test]
+    fn a_duration_max_hooks_list_timeout_does_not_panic() {
+        let before = Instant::now();
+        let deadline = hooks_list_deadline(Duration::MAX);
+        assert!(
+            deadline >= before + Duration::from_secs(365 * 24 * 60 * 60),
+            "Duration::MAX must clamp to a far-future deadline, not give up at once"
+        );
+
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"data": [{"hooks": []}]}}).to_string(),
+        )
+        .expect("queue a line");
+        drop(tx);
+        let listing = read_hooks_list_reply(&rx, &mut Vec::new(), deadline)
+            .expect("a reply read under a far-future deadline must parse");
+        assert!(listing.entries.is_empty());
     }
 
     /// The response test above must not be passing because the predicate demands
