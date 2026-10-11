@@ -10198,6 +10198,20 @@ impl AgentPtyRegistry {
             .unwrap_or(false)
     }
 
+    /// Issue #1678 (A3): whether `agent_id` is a live (non-exited) agent on the
+    /// pane with `pane_id_env` — the lifecycle half of the shell-activity
+    /// monitor's spawn identity, answered without sampling any process.
+    pub fn agent_is_live_on_pane(&self, agent_id: &str, pane_id_env: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .is_some_and(|a| {
+                !a.exited.load(Ordering::SeqCst) && a.pane_id_env.as_deref() == Some(pane_id_env)
+            })
+    }
+
     /// PRD #127 C3: whether the pane with `pane_id_env` is backed by a live
     /// (non-exited) agent. The reuse path gates reuse on the liveness of the
     /// SPECIFIC delivery pane (the orchestrator role pane / single-agent pane)

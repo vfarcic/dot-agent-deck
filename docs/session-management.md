@@ -100,7 +100,7 @@ The deck picks a density from how many cards it has to fit and the space availab
 | Compact | 1 | 1 |
 | Minimal | none | none |
 
-Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason takes the place of `Dir:`, on a card with work left running the `Background:` line does, and on an orphaned card `Orphaned — delegation unavailable` does. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
+Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason displaces `Dir:` when the card is too short to show both, and so do the `Background:` line on a card with work left running and `Orphaned — delegation unavailable` on an orphaned card. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
 
 ![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
 

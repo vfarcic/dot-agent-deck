@@ -632,9 +632,8 @@ pub struct DesktopDeleteCharKey {
     pub max_literal_write_chars: Option<u32>,
 }
 
-/// Issue #1678: the webview's view of a `BackgroundWork` — counts only. No
-/// subagent id, command line or hook text reaches the webview, because the
-/// daemon's aggregate carries none.
+/// Issue #1678: the webview's view of a `BackgroundWork`. The background
+/// aggregate carries counts and an instant, not subagent ids or command lines.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopBackground {

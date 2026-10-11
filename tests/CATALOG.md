@@ -1083,13 +1083,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/background/002 — Paired subagent identity, receipt age and bounded tracking (#1678).
 - **Layer:** L2 synthetic, daemon hook ingestion (`e2e_background_work.rs`, lane 1).
 - **Agent:** none; real hook CLI with Claude- and Codex-shaped payloads.
-- **Asserts:** two starts before Stop become two background subagents on Stop's broadcast and snapshot; duplicate start preserves oldest receipt time; three unpaired stops and a duplicate stop leave counts intact; paired stops remove only their ids; empty and oversized ids (including UTF-8 byte bounds) cannot become main-thread tool events; 128-entry cap; a clear starts a fresh conversation.
+- **Asserts:** two starts before Stop become two background subagents on Stop's broadcast and snapshot; duplicate start preserves oldest receipt time; three unpaired stops and a duplicate stop leave counts intact; paired stops remove only their ids; empty and oversized ids (including UTF-8 byte bounds) cannot become main-thread tool events; 128-entry cap; a same-agent clear removes old subagents but preserves the running command and its age, and a new subagent shares that command's aggregate after the generation rollover.
 - **Does not assert:** real Agent tool behavior (008), permission-wait resolution (status/subagent/006 and 007), desktop.
 
 ##### status/background/003 — Snapshot hydration and revision ordering prevent replay resurrection (#1678).
 - **Layer:** L1 protocol/fold, fast tier (`subagent_tool_status.rs`).
 - **Agent:** none; serialized daemon snapshots and events applied to a fresh TUI AppState.
-- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
+- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; reseeding an existing placeholder preserves its newer clear or nonempty reading; a kept non-placeholder card accepts a newer background revision despite equal/older activity; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
 - **Does not assert:** daemon admission/producer stripping, rendered layout (004), desktop replay.
 
 ##### status/background/004 — The TUI card shows background kinds, counts and oldest elapsed span (#1678).
@@ -1140,6 +1140,27 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none; OpenCode-shaped bus events and tool hooks fed to the plugin, payloads captured by a recorder script.
 - **Asserts:** a child's busy/retry/busy sends one `subagent.start` under the root with the child's id; its tool calls carry `subagent_id`; a grandchild is filed under the root; idle plus `session.idle` sends one stop; busy again starts again, and `session.error` stops it; deleting an inactive child sends nothing and deleting an active one stops it; the child's creation, update and prompt are never sent as the root's; every payload decodes, attributed to a subagent exactly when it carries `subagent_id`.
 - **Does not assert:** daemon tracking (010), a real OpenCode process.
+- **Platform coverage:** mac+linux.
+
+##### status/background/012 — Conversation endings and direct pane removal retire background tracking (#1678).
+- **Layer:** unit, in-module (`src/state.rs`, fast tier).
+- **Agent:** none; ownership stub with genuine-shaped Claude frames and a retained command observation.
+- **Asserts:** after the first SessionEnd restores a placeholder, the same agent's second conversation uses that key and publishes a command and subagent; its SessionEnd leaves a restored card with no work. Direct remove_sessions_for_pane and apply_daemon_pane_closed likewise leave a reseeded same-agent card with no stale work.
+- **Does not assert:** registry exit detection (013), attached-client broadcast delivery (014), real agent lifetime.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/background/013 — Spawn retirement works before a valid sample and during unsupported or failed sampling (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, paused-clock monitor sampler, fast tier).
+- **Agent:** none; real shell stand-ins with synthetic Claude subagent/Stop reports.
+- **Asserts:** an exact-pid exit without SessionEnd clears the departed card before any valid sample; a None sampler with another live pane does not prevent retirement; a prior valid sample followed by another pane's sampling failure/backoff does not prevent retirement. Unknown samples retain the still-live pane's subagent.
+- **Does not assert:** native Windows process execution (the None sampler models its observation shape), PTY-attached rendering (014), real agents.
+- **Platform coverage:** mac+linux.
+
+##### status/background/014 — Natural process exit clears only the departed attached card (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; Python parent exits naturally on a fixture sentinel, with Claude-shaped subagent/Stop hooks.
+- **Asserts:** a visible background subagent clears after the parent exits without SessionEnd; subscribers receive an explicit-zero aggregate with a higher revision and the departed agent's identity. A successor in the same pane holds its own subagent, including after replaying the departed clear through the client fold.
+- **Does not assert:** retirement without valid command samples (013), real agent behavior, desktop rendering.
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).

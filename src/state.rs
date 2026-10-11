@@ -184,6 +184,22 @@ impl BackgroundTrack {
         true
     }
 
+    /// Issue #1678 (A2): the conversation this record counted for is over — a
+    /// `SessionEnd` or a pane removal took its card. Its subagents end with it,
+    /// and nothing is counted until a turn of a later conversation ends; with
+    /// `drop_commands` (the pane itself is gone) the sampled commands go too,
+    /// otherwise they keep their first-seen ages for that later turn. The
+    /// revision keeps advancing, so a copy of the old aggregate replayed later
+    /// reads as older than this clear. Returns whether the aggregate changed.
+    fn end_conversation(&mut self, drop_commands: bool) -> bool {
+        self.subagents.clear();
+        if drop_commands {
+            self.commands.clear();
+        }
+        self.turn_ended = false;
+        self.republish()
+    }
+
     /// D4/D5: replace the sampled command set with `sessions`, keeping the
     /// first-seen time of every session still present.
     fn observe_commands(&mut self, sessions: &HashSet<i32>, now_ms: i64) {
@@ -10990,6 +11006,11 @@ fn overlay_snapshot_onto_kept_card(
         // the snapshot's instant too, so it moves no watermark.
         push_live_target_carrier(session, live_target);
     }
+    // Issue #1678: the background aggregate is ordered by its own revision, not
+    // by the activity watermark above, so a newer reading is taken even from a
+    // snapshot whose activity stamp is equal or older (and an older one is
+    // refused whatever its stamp).
+    merge_snapshot_background(session, snap);
 }
 
 /// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
@@ -11042,17 +11063,30 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     if let Some(live_target) = snap.live_target {
         push_live_target_carrier(session, live_target);
     }
-    // Issue #1678: the daemon's background aggregate, re-seeded the same way —
-    // unless the card already holds a newer revision, which a replayed older
-    // snapshot must not overwrite.
-    if let Some(revision) = snap.background_revision
-        && held_background(session).is_none_or(|(_, held)| revision >= held)
-    {
-        let mut carrier = live_target_carrier_event(session, session.live_target());
-        carrier.background = Some(snap.background.unwrap_or_default());
-        carrier.background_revision = Some(revision);
-        push_journal_carrier(session, carrier);
+    merge_snapshot_background(session, snap);
+}
+
+/// Issue #1678: re-seed the daemon's background aggregate from `snap` the way
+/// the live target is — unless the card already holds a newer revision, which a
+/// replayed older snapshot must not overwrite. Decided by revision alone, never
+/// by the activity watermark the other snapshot fields are weighed by: the
+/// aggregate can change (a command ending, a spawn retired) with no producer
+/// activity at all. Re-merging the copy the card already holds adds nothing.
+fn merge_snapshot_background(session: &mut SessionState, snap: &SessionSnapshot) {
+    let Some(revision) = snap.background_revision else {
+        return;
+    };
+    let incoming = snap.background.unwrap_or_default();
+    if held_background(session).is_some_and(|(held, held_revision)| {
+        revision < held_revision
+            || (revision == held_revision && held.unwrap_or_default() == incoming)
+    }) {
+        return;
     }
+    let mut carrier = live_target_carrier_event(session, session.live_target());
+    carrier.background = Some(incoming);
+    carrier.background_revision = Some(revision);
+    push_journal_carrier(session, carrier);
 }
 
 /// Push a [`live_target_carrier_event`] onto `session`'s bounded journal,
@@ -12131,6 +12165,7 @@ impl AppState {
             .collect();
         for id in doomed {
             self.sessions.remove(&id);
+            self.retire_removed_card_background(&id);
         }
         // The pane the daemon announced is GONE, so its remembered start goes
         // with it. `pane_started_at` exists to keep a card's start across an
@@ -12235,6 +12270,16 @@ impl AppState {
         {
             return existing;
         }
+        // Issue #1678: re-seeding the same spawn's placeholder keeps the
+        // background aggregate the card holds, with its revision, so an older
+        // snapshot merged onto the fresh card cannot win by default. A card of
+        // another spawn (or of none) under this key starts from nothing.
+        let held = agent_id.as_ref().and_then(|_| {
+            self.sessions
+                .get(&session_id)
+                .filter(|session| session.agent_id == agent_id)
+                .and_then(held_background)
+        });
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.forget_unproven_journal_count(&session_id);
@@ -12264,6 +12309,14 @@ impl AppState {
                 output_set_status: false,
             },
         );
+        if let Some((background, revision)) = held
+            && let Some(session) = self.sessions.get_mut(&session_id)
+        {
+            let mut carrier = live_target_carrier_event(session, None);
+            carrier.background = background;
+            carrier.background_revision = Some(revision);
+            push_journal_carrier(session, carrier);
+        }
         session_id
     }
 
@@ -13489,6 +13542,7 @@ impl AppState {
         let n = doomed.len();
         for id in doomed {
             self.sessions.remove(&id);
+            self.retire_removed_card_background(&id);
         }
         n
     }
@@ -15489,20 +15543,138 @@ impl AppState {
         track.observe_commands(sessions, Utc::now().timestamp_millis());
     }
 
-    /// Issue #1678 D3/D5: `agent_id`'s process on `pane_id` is gone, so nothing
-    /// it started is its background work any longer — without waiting for a
-    /// `SessionEnd` hook it may never send. Read back through
-    /// [`Self::live_session_for`]; no event carries it.
-    pub(crate) fn retire_background_spawn(&mut self, pane_id: &str, agent_id: &str) {
-        let Some(card) = self.background_card(pane_id, agent_id) else {
-            return;
-        };
-        if let Some(track) = self.background_tracks.get_mut(&card)
-            && track.agent_id.as_deref() == Some(agent_id)
-        {
+    /// Issue #1678 D3/D5 (A3): the `(pane, agent)` identities of every card
+    /// whose background record still counts something — what the
+    /// shell-activity monitor checks against the registry's liveness on every
+    /// poll, whether or not that poll's process-table sample answers.
+    pub(crate) fn background_spawns_with_work(&self) -> Vec<(String, String)> {
+        self.background_tracks
+            .iter()
+            .filter(|(_, track)| !track.commands.is_empty() || !track.subagents.is_empty())
+            .filter_map(|(card_id, track)| {
+                let pane = self.sessions.get(card_id)?.pane_id.clone()?;
+                Some((pane, track.agent_id.clone()?))
+            })
+            .collect()
+    }
+
+    /// Issue #1678 D3/D5 (A3, A4): retire the background work of every card
+    /// whose spawn `is_live` says is gone from its pane — without waiting for a
+    /// `SessionEnd` hook it may never send, and without depending on a command
+    /// sample, which may never have answered for it (no sample yet, sampling
+    /// unsupported, or a failure episode). Called by the monitor under the state
+    /// write lock.
+    ///
+    /// Returns one event per card whose published aggregate changed: the
+    /// daemon's [`AgentEvent::is_background_retirement`] report, carrying the
+    /// explicit-zero aggregate with the advanced revision, already journalled on
+    /// the daemon's own card. It names the departed agent, its card's key and
+    /// its pane, and is stamped at the card's last activity, so it can never
+    /// read as newer than a successor's frames; clients apply it to that card
+    /// alone ([`Self::apply_background_retirement`]).
+    pub(crate) fn retire_departed_background_spawns(
+        &mut self,
+        is_live: impl Fn(&str, &str) -> bool,
+    ) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for (card_id, track) in self.background_tracks.iter_mut() {
+            if track.commands.is_empty() && track.subagents.is_empty() {
+                continue;
+            }
+            let Some(session) = self.sessions.get_mut(card_id) else {
+                continue;
+            };
+            let (Some(pane_id), Some(agent_id)) = (session.pane_id.clone(), track.agent_id.clone())
+            else {
+                continue;
+            };
+            if session.agent_id.as_deref() != Some(agent_id.as_str())
+                || is_live(&pane_id, &agent_id)
+            {
+                continue;
+            }
             track.commands.clear();
             track.subagents.clear();
-            track.republish();
+            if !track.republish() {
+                continue;
+            }
+            let mut event = live_target_carrier_event(session, None);
+            event.event_type = EventType::ShellIdle;
+            event.cwd = None;
+            event.metadata.insert(
+                crate::event::BACKGROUND_RETIRED_METADATA_KEY.to_string(),
+                crate::event::BACKGROUND_RETIRED_METADATA_VALUE.to_string(),
+            );
+            track.stamp(&mut event);
+            let mut journal = live_target_carrier_event(session, session.live_target());
+            track.stamp(&mut journal);
+            push_journal_carrier(session, journal);
+            events.push(event);
+        }
+        for event in &mut events {
+            self.stamp_pane_generation(event);
+        }
+        events
+    }
+
+    /// Issue #1678 (A4): a client's half of
+    /// [`Self::retire_departed_background_spawns`]. The report lands on the
+    /// named agent's own card on the named pane — the one under the named key
+    /// when that is it, else that agent's newest card there — and only moves
+    /// that card's background copy, by revision like every other copy. A card
+    /// already gone is not rebuilt, a successor's card is never touched, and no
+    /// status, generation or card set changes. The daemon applies its own report
+    /// when it makes it and refuses one arriving from anywhere else.
+    fn apply_background_retirement(&mut self, event: &AgentEvent) -> AppliedEvent {
+        if self.agent_ownership.is_some() {
+            return AppliedEvent::Rejected;
+        }
+        let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+        else {
+            return AppliedEvent::Rejected;
+        };
+        let ours = |session: &SessionState| {
+            session.pane_id.as_deref() == Some(pane_id)
+                && session.agent_id.as_deref() == Some(agent_id)
+        };
+        let card_id = match self.sessions.get(&event.session_id) {
+            Some(session) if ours(session) => Some(event.session_id.clone()),
+            _ => self
+                .sessions
+                .iter()
+                .filter(|(_, session)| ours(session))
+                .max_by(|(a_id, a), (b_id, b)| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a_id.cmp(b_id))
+                })
+                .map(|(id, _)| id.clone()),
+        };
+        let (Some(card_id), Some(revision)) = (card_id, event.background_revision) else {
+            return AppliedEvent::Rejected;
+        };
+        let Some(session) = self.sessions.get_mut(&card_id) else {
+            return AppliedEvent::Rejected;
+        };
+        if held_background(session).is_some_and(|(_, held)| revision < held) {
+            return AppliedEvent::StatusKept;
+        }
+        let mut carrier = live_target_carrier_event(session, session.live_target());
+        carrier.background = Some(event.background.unwrap_or_default());
+        carrier.background_revision = Some(revision);
+        push_journal_carrier(session, carrier);
+        self.forget_unproven_journal_count(&card_id);
+        AppliedEvent::StatusKept
+    }
+
+    /// Issue #1678 (A2): `card_id` was removed with its pane, so whatever its
+    /// background record counted ended with it. Retired in place rather than
+    /// dropped, so a card the same spawn gets back under that key continues the
+    /// revision; the record itself goes at the next sweep if the key stays
+    /// empty (see [`Self::apply_event_reporting`]).
+    fn retire_removed_card_background(&mut self, card_id: &str) {
+        if let Some(track) = self.background_tracks.get_mut(card_id) {
+            track.end_conversation(true);
         }
     }
 
@@ -15561,6 +15733,13 @@ impl AppState {
         if event.is_unproven_eviction() {
             self.apply_unproven_eviction(&event);
             return AppliedEvent::Rejected;
+        }
+        // Issue #1678 (A4): the daemon's report that a departed spawn's
+        // background work is over is a statement about that spawn's one card,
+        // not a shell reading: none of the generation, adoption or status
+        // machinery below may act on it.
+        if event.is_background_retirement() {
+            return self.apply_background_retirement(&event);
         }
         // Issue #714: the daemon's lift of a replaced agent's block is a
         // statement about ONE existing card — the replaced agent's. A client
@@ -16566,6 +16745,17 @@ impl AppState {
                 })
             });
             self.sessions.remove(&event.session_id);
+            // Issue #1678 (A2): the conversation's background record ends with
+            // it, explicitly — not by whether a card is still filed under its
+            // key, since the placeholder restored below can reuse that key.
+            let ended_track = self
+                .background_tracks
+                .remove(&event.session_id)
+                .map(|mut track| {
+                    let changed = track.end_conversation(false);
+                    self.applied_background = Some(track.applied(changed));
+                    track
+                });
             // Restore a placeholder card so the pane remains visible on the dashboard.
             if let Some((pane_id, cwd, agent_id, display_name)) = restored
                 && self.managed_pane_ids.contains(&pane_id)
@@ -16579,6 +16769,19 @@ impl AppState {
                     && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
                 {
                     placeholder.display_name = Some(name);
+                }
+                // The same spawn's next conversation continues the ended
+                // record's revision, so nothing it publishes can read as older
+                // than the aggregate a client last copied for this spawn.
+                if let Some(track) = ended_track
+                    && self
+                        .sessions
+                        .get(&placeholder_id)
+                        .is_some_and(|placeholder| placeholder.agent_id == track.agent_id)
+                {
+                    self.background_tracks
+                        .entry(placeholder_id)
+                        .or_insert(track);
                 }
             }
             return AppliedEvent::StatusAsserted;
@@ -25585,6 +25788,90 @@ while True:
 
     const CLI_PANE: &str = "cli-pane-454";
     const CLI_AGENT_ID: &str = "agent-454";
+
+    /// Scenario: End two conversations on one managed pane, leaving commands and a subagent running in the second conversation's placeholder card. Ending that conversation, removing its pane's sessions, or applying a daemon pane-close must leave a restored same-agent card with no background work.
+    #[spec("status/background/012")]
+    #[test]
+    fn background_012_conversation_end_and_direct_removal_retire_work() {
+        let mut failures = Vec::new();
+        for removal in [
+            "SessionEnd",
+            "remove_sessions_for_pane",
+            "apply_daemon_pane_closed",
+        ] {
+            let mut state = AppState::default();
+            let _ownership =
+                install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+            state.register_pane(CLI_PANE.into());
+            let frame = |session: &str, event_type: &str| {
+                serde_json::from_value::<AgentEvent>(serde_json::json!({
+                    "session_id": session, "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                    "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+                }))
+                .unwrap()
+            };
+            state.apply_event(frame("first-conversation", "session_start"));
+            state.apply_event(frame("first-conversation", "session_end"));
+            let placeholder = placeholder_session_id(CLI_PANE);
+            assert!(
+                state.sessions.contains_key(&placeholder),
+                "first end restores a placeholder"
+            );
+            state.apply_event(frame("second-conversation", "session_start"));
+            let mut start = frame("second-conversation", "subagent_start");
+            start.metadata.insert(
+                crate::event::SUBAGENT_ID_METADATA_KEY.into(),
+                "still-running".into(),
+            );
+            state.apply_event(start);
+            state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &[12345].into_iter().collect());
+            state.apply_event(frame("second-conversation", "idle"));
+            let before = state
+                .live_session_for(CLI_AGENT_ID, Some(CLI_PANE))
+                .unwrap();
+            let work = before
+                .background
+                .expect("precondition: background work on second conversation");
+            assert_eq!((work.commands, work.subagents), (1, 1));
+            assert!(
+                state.sessions.contains_key(&placeholder),
+                "second conversation uses the placeholder key"
+            );
+            match removal {
+                "SessionEnd" => state.apply_event(frame("second-conversation", "session_end")),
+                "remove_sessions_for_pane" => {
+                    state.remove_sessions_for_pane(CLI_PANE);
+                }
+                "apply_daemon_pane_closed" => {
+                    state.apply_daemon_pane_closed(CLI_PANE, Some(CLI_AGENT_ID))
+                }
+                _ => unreachable!(),
+            }
+            // A restored card is the observable surface on which stale private
+            // tracking would reappear; inspect no tracker internals here.
+            state.register_pane(CLI_PANE.into());
+            state.insert_placeholder_session(
+                CLI_PANE.into(),
+                None,
+                None,
+                Some(CLI_AGENT_ID.into()),
+            );
+            let after = state
+                .live_session_for(CLI_AGENT_ID, Some(CLI_PANE))
+                .unwrap();
+            if after.background.is_some() {
+                failures.push(format!(
+                    "{removal}: restored card still shows {:?}",
+                    after.background
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "retired conversations must have no background:\n{}",
+            failures.join("\n")
+        );
+    }
 
     /// The exact payload `dot-agent-deck agent-event --type running` puts on
     /// the hook socket (`Commands::AgentEvent` in `main.rs`): a bare

@@ -545,6 +545,27 @@ pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key marking the DAEMON's report that a spawn's process
+/// is gone, so the background work its card showed is over (issue #1678). It
+/// rides a [`EventType::ShellIdle`] naming the departed agent, its card's
+/// session key and its pane, stamped at the card's own last activity, and
+/// carrying the explicit-zero aggregate with the advanced revision
+/// ([`AgentEvent::is_background_retirement`]).
+///
+/// An attached client applies it to that agent's existing card on that pane
+/// and to nothing else: it creates, adopts, retires and re-keys no card and
+/// moves no status, so a successor on the same pane is out of its reach
+/// (`crate::state::AppState::apply_background_retirement`).
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` removes the key from every inbound hook event. Additive on the
+/// wire: an older client reads a plain `ShellIdle` for the departed card.
+pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
+
+/// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.
+pub const BACKGROUND_RETIRED_METADATA_VALUE: &str = "spawn_exited";
+
 /// `AgentEvent.metadata` key carrying the DAEMON's verdict that a hook event is
 /// UNPROVEN (issues #601, #697): the hook-provenance gate admitted it for a pane
 /// (or a paneless agent) this daemon never issued a hook capability token for,
@@ -1262,6 +1283,20 @@ impl AgentEvent {
                 .metadata
                 .get(DAEMON_PANE_CLOSED_METADATA_KEY)
                 .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
+    /// Issue #1678: is this the daemon's report that the named spawn's
+    /// background work is over (see [`BACKGROUND_RETIRED_METADATA_KEY`])?
+    /// Requires the shell event type and both identities, so a malformed frame
+    /// is never read as a statement about no card in particular.
+    pub fn is_background_retirement(&self) -> bool {
+        self.event_type == EventType::ShellIdle
+            && self.pane_id.is_some()
+            && self.agent_id.is_some()
+            && self
+                .metadata
+                .get(BACKGROUND_RETIRED_METADATA_KEY)
+                .is_some_and(|v| v == BACKGROUND_RETIRED_METADATA_VALUE)
     }
 
     /// Issue #601: does this event carry the daemon's UNPROVEN marker (see

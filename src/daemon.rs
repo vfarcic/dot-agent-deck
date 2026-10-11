@@ -1940,6 +1940,12 @@ async fn ingest_event_unless(
     event
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
+    // Issue #1678: so is the background-retirement marker, which makes an
+    // attached client clear a card's background copy. The daemon's own report
+    // is broadcast directly by the shell-activity monitor and never ingested.
+    event
+        .metadata
+        .remove(crate::event::BACKGROUND_RETIRED_METADATA_KEY);
     // Issues #601 / #697: both unproven markers are the daemon's alone too. The
     // first comes only from the hook gate's own verdict; the second is only
     // ever on an eviction the daemon broadcasts below and never ingests.
@@ -2002,8 +2008,12 @@ async fn ingest_event_unless(
     // Stamped on the frame that changed the aggregate, and on every shell frame
     // of a pane that reports its own turns — the client's cue that the frame
     // is background work and not a status (an older daemon never stamps one).
+    // And on every later event of a card whose aggregate has changed at least
+    // once, so a turn end that leaves the count as it was (a same-agent
+    // `/clear` keeps a running command) still tells clients what is running.
     if let Some(applied) = state.take_applied_background()
         && (applied.changed
+            || applied.revision > 0
             || (applied.reporting
                 && matches!(
                     broadcast.event_type,
@@ -3099,6 +3109,32 @@ async fn run_shell_activity_monitor_with<S, F>(
         let candidates = pty_registry
             .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
 
+        // Issue #1678 D3/D5 (A3, A4): retire the background work of every spawn
+        // the registry no longer holds live on its pane, before and regardless
+        // of whether this tick's sample answers. Retirement is a lifecycle
+        // fact, not a process-table reading: a spawn can exit before its first
+        // valid sample, on a platform whose sampler always answers `None`, or
+        // while another pane keeps sampling in a failure episode, and its
+        // subagents would otherwise stay counted. A still-live spawn is never
+        // touched here, so an unknown sample keeps its commands (D4). The
+        // retirement reaches attached clients as the daemon's report, sent
+        // under the same write lock that applied it.
+        let departed_work = {
+            let state = state.read().await;
+            state
+                .background_spawns_with_work()
+                .into_iter()
+                .any(|(pane, agent)| !pty_registry.agent_is_live_on_pane(&agent, &pane))
+        };
+        if departed_work {
+            let mut state = state.write().await;
+            for event in state.retire_departed_background_spawns(|pane, agent| {
+                pty_registry.agent_is_live_on_pane(agent, pane)
+            }) {
+                let _ = event_tx.send(BroadcastMsg::Event(event));
+            }
+        }
+
         let snapshot = if candidates.is_empty() {
             // No pane, so no sample — and an empty reading rather than a
             // skipped tick, because "there are no panes" is a fact we just
@@ -3252,22 +3288,11 @@ async fn run_shell_activity_monitor_with<S, F>(
         // inheriting a stale reading — keyed by spawn identity, so a successor
         // in the same pane is never measured against its predecessor. A spawn
         // that is still a candidate keeps its last known reading even when this
-        // sample could not answer for it (D4: unknown is not zero). Whatever a
-        // departed spawn left counted is no longer its background work.
+        // sample could not answer for it (D4: unknown is not zero). Its
+        // background work was retired by the lifecycle sweep above.
         let current: std::collections::HashSet<ShellActivityKey> =
             candidates.iter().map(ShellActivityKey::of).collect();
-        let departed: Vec<ShellActivityKey> = last_known
-            .keys()
-            .filter(|key| !current.contains(*key))
-            .cloned()
-            .collect();
-        for key in departed {
-            last_known.remove(&key);
-            state
-                .write()
-                .await
-                .retire_background_spawn(&key.pane_id, &key.agent_id);
-        }
+        last_known.retain(|key, _| current.contains(key));
 
         for (candidate, sessions) in snapshot {
             let key = ShellActivityKey::of(&candidate);
@@ -8637,6 +8662,159 @@ mod hook_ingestion_tests {
         );
         drop(guard);
         registry.shutdown_all();
+    }
+
+    /// Scenario: Let a reporting pane exit with a background subagent before its first successful command sample, while sampling is unsupported, or during another pane's failure/backoff episode. The exited card loses its background indicator in every case, while the still-live pane retains its subagent across unknown samples.
+    #[spec("status/background/013")]
+    #[tokio::test(start_paused = true)]
+    async fn background_013_exit_retirement_does_not_depend_on_command_samples() {
+        let mut failures = Vec::new();
+        for mode in [
+            "before-first-sample",
+            "unsupported-sampler",
+            "failure-backoff",
+        ] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let spawn = |pane: &str| {
+                registry
+                    .spawn_agent(SpawnOptions {
+                        command: Some("/bin/sh"),
+                        env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+                        agent_type: Some(AgentType::ClaudeCode),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            };
+            let old = spawn("retirement-old");
+            let other = (mode != "before-first-sample").then(|| spawn("retirement-live"));
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            {
+                let mut guard = state.write().await;
+                guard.set_agent_ownership(Arc::downgrade(&ownership));
+                for (pane, agent) in std::iter::once(("retirement-old", &old))
+                    .chain(other.as_ref().map(|id| ("retirement-live", id)))
+                {
+                    for kind in ["session_start", "subagent_start", "idle"] {
+                        let event = serde_json::from_value(serde_json::json!({
+                            "session_id": pane, "pane_id": pane, "agent_id": agent,
+                            "agent_type": "claude_code", "event_type": kind, "timestamp": chrono::Utc::now(),
+                            "metadata": {crate::event::SUBAGENT_ID_METADATA_KEY: "background-child"}
+                        })).unwrap();
+                        // Only the subagent start is attributed to a child.
+                        let mut event: AgentEvent = event;
+                        if kind != "subagent_start" {
+                            event.metadata.clear();
+                        }
+                        guard.apply_event(event);
+                    }
+                    assert_eq!(
+                        guard
+                            .live_session_for(agent, Some(pane))
+                            .unwrap()
+                            .background
+                            .unwrap()
+                            .subagents,
+                        1
+                    );
+                }
+            }
+            let pids: Vec<i32> = [&old]
+                .into_iter()
+                .chain(other.iter())
+                .map(|id| registry.child_pid(id).unwrap() as i32)
+                .collect();
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let monitor = tokio::spawn({
+                let registry = registry.clone();
+                let state = state.clone();
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                async move {
+                    run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                        let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        let _ = started_tx.send(());
+                        let table = (mode == "failure-backoff" && first).then(|| {
+                            pids.iter()
+                                .map(|&pid| crate::platform::proc::ProcessInfo {
+                                    pid,
+                                    ppid: 1,
+                                    session_id: pid,
+                                    has_controlling_tty: true,
+                                    session_leader: true,
+                                    command_line: crate::platform::proc::CommandLine::NotSampled,
+                                })
+                                .collect()
+                        });
+                        async move { table }
+                    })
+                    .await;
+                }
+            });
+            if mode != "before-first-sample" {
+                next_sample_start(&mut started_rx, "the initial sample").await;
+                if mode == "failure-backoff" {
+                    next_sample_start(&mut started_rx, "the failing sample before exit").await;
+                }
+            }
+            // Kill only the test's exact child pid; no SessionEnd hook or pane
+            // close is sent, and the old card stays in the state for inspection.
+            // The exit watcher uses a real OS thread, so its deadline must use
+            // wall time rather than this test's auto-advancing paused clock.
+            unsafe {
+                libc::kill(registry.child_pid(&old).unwrap() as i32, libc::SIGKILL);
+            }
+            tokio::task::spawn_blocking({
+                let registry = registry.clone();
+                let old = old.clone();
+                move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while registry.agent_is_live(&old) {
+                        assert!(std::time::Instant::now() < deadline, "agent exit deadline");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!registry.agent_is_live(&old));
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            monitor.abort();
+            let _ = monitor.await;
+            let guard = state.read().await;
+            let live = guard
+                .live_session_for(&old, Some("retirement-old"))
+                .unwrap();
+            if live.background.is_some() {
+                failures.push(format!(
+                    "{mode}: exited card still shows {:?}",
+                    live.background
+                ));
+            }
+            if let Some(other) = other.as_ref() {
+                assert_eq!(
+                    guard
+                        .live_session_for(other, Some("retirement-live"))
+                        .unwrap()
+                        .background
+                        .unwrap()
+                        .subagents,
+                    1,
+                    "unknown samples must preserve the live pane's background"
+                );
+            }
+            drop(guard);
+            registry.shutdown_all();
+        }
+        assert!(
+            failures.is_empty(),
+            "spawn retirement must be independent of sampling success:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a

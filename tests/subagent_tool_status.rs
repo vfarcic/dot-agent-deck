@@ -693,7 +693,7 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .clone()
 }
 
-/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates. The card keeps the newest counts, clears on an explicit zero, and preserves legacy shell promotion when an older daemon omits the fields.
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, while legacy shell promotion still works without the fields.
 #[spec("status/background/003")]
 #[test]
 fn background_003_snapshot_hydration_and_revision_ordering() {
@@ -793,6 +793,65 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
     old_busy.event_type = EventType::ShellBusy;
     legacy.apply_event(old_busy);
     assert_eq!(pane_status_of(&legacy), SessionStatus::Working);
+
+    let mut failures = Vec::new();
+    for placeholder in [true, false] {
+        for held_nonempty in [false, true] {
+            for activity_delta in [0, -1000] {
+                let mut state = AppState::default();
+                state.register_pane(PANE.into());
+                let mut held = invoke_hook("claude-code", &stop());
+                held.agent_id = Some("hydrated-agent".into());
+                held.session_id = if placeholder {
+                    format!("pane-{PANE}")
+                } else {
+                    SESSION.into()
+                };
+                held.background = serde_json::from_value(json!({
+                    "commands": u32::from(held_nonempty), "subagents": 0, "since_ms": null
+                }))
+                .ok();
+                held.background_revision = Some(if placeholder { 9 } else { 8 });
+                held.timestamp = chrono::Utc::now() - chrono::Duration::seconds(5);
+                state.apply_event(held.clone());
+                assert_eq!(state.sessions.len(), 1);
+                let held_card = state.sessions.values().next().unwrap();
+                assert_eq!(held_card.session_id, held.session_id);
+                let mut incoming = held_card.live_snapshot();
+                incoming.last_activity_ms =
+                    Some(held_card.last_activity.timestamp_millis() + activity_delta);
+                incoming.background_revision = Some(if placeholder { 8 } else { 9 });
+                incoming.background = serde_json::from_value(json!({
+                    "commands": u32::from(!held_nonempty), "subagents": 0, "since_ms": null
+                }))
+                .ok();
+                state.seed_hydrated_session(
+                    PANE.into(),
+                    None,
+                    None,
+                    Some("hydrated-agent".into()),
+                    Some(&incoming),
+                );
+                let got = snapshot(&state);
+                let expected_nonempty = if placeholder {
+                    held_nonempty
+                } else {
+                    !held_nonempty
+                };
+                if got["background"]["commands"].as_u64().unwrap_or(0)
+                    != u64::from(expected_nonempty)
+                    || got["background_revision"] != json!(9)
+                {
+                    failures.push(format!("placeholder={placeholder}, held_nonempty={held_nonempty}, activity_delta={activity_delta}: expected commands={}, revision=9; got {got}", u32::from(expected_nonempty)));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "hydration must merge background by revision, independently of activity:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Scenario: A background subagent raises a permission request after the turn ended, and only then does a TUI attach, restoring the card from the daemon's live snapshot as it arrives over the wire. When that subagent then stops, the attached TUI's card must leave Needs Input for Idle, as the daemon's does; the control is a snapshot from a daemon that sends no subagent attribution, whose card keeps today's Needs Input.

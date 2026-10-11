@@ -33,7 +33,7 @@ impl Fixture {
 import pathlib, subprocess, time
 children = {}
 try:
-    while True:
+    while not pathlib.Path('parent-exit.run').exists():
         for name in ('one', 'two'):
             enabled = pathlib.Path(name + '.run').exists()
             child = children.get(name)

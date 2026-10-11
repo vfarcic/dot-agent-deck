@@ -94,7 +94,7 @@ fn background_001_reporting_turn_stays_idle_while_command_runs() {
     );
 }
 
-/// Scenario: Replay paired Claude and Codex subagent hooks around a main Stop, including duplicate starts/stops and three unpaired internal stops. Counts and oldest receipt time follow only live ids, bounded at 128; empty/oversized ids stay subagent-attributed without becoming main-thread tools, and a new conversation clears the work.
+/// Scenario: Replay paired Claude and Codex subagent hooks around a main Stop, including duplicate starts/stops and three unpaired internal stops. Counts and oldest receipt time follow only live ids, bounded at 128; a same-agent clear removes the old conversation's subagents while preserving a command still running in that pane.
 #[spec("status/background/002")]
 #[test]
 fn background_002_subagent_pairing_bounds_and_codex_hooks() {
@@ -183,13 +183,54 @@ fn background_002_subagent_pairing_bounds_and_codex_hooks() {
             );
         }
         f.assert_subagents(0);
+        f.command("one", true);
+        f.wait_commands(1);
+        let command_since = f.live()["background"]["since_ms"].clone();
         f.hook(agent, "SubagentStart", json!({"agent_id": "before-clear"}));
         f.hook(
             agent,
             "SessionStart",
             json!({"source": "clear", "session_id": "background-cleared-session"}),
         );
-        f.assert_subagents(0);
+        let ended = f.hook(
+            agent,
+            "Stop",
+            json!({"session_id": "background-cleared-session"}),
+        );
+        assert_eq!(
+            ended["background"]["commands"],
+            json!(1),
+            "same-agent clear preserves the still-running command: {ended}"
+        );
+        assert_eq!(
+            ended["background"]["subagents"],
+            json!(0),
+            "same-agent clear retires old-conversation subagents: {ended}"
+        );
+        assert_eq!(
+            ended["background"]["since_ms"], command_since,
+            "same-agent clear preserves command age"
+        );
+        f.wait_commands(1);
+        f.hook(
+            agent,
+            "SubagentStart",
+            json!({"session_id": "background-cleared-session", "agent_id": "after-clear"}),
+        );
+        let before_sample = f.events.snapshot().len();
+        f.command("two", true);
+        f.wait_commands(2);
+        f.wait_count_event(before_sample, 2);
+        let live = f.live();
+        assert_eq!(
+            live["background"]["commands"],
+            json!(2),
+            "monitor and hooks share the new generation's card: {live}"
+        );
+        assert_eq!(live["background"]["subagents"], json!(1));
+        f.command("one", false);
+        f.command("two", false);
+        f.wait_commands(0);
     }
 }
 
@@ -309,4 +350,126 @@ fn background_006_monitor_count_edges_no_idle_spam_and_replacement() {
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
     f.assert_successor_clean(before);
+}
+
+/// Scenario: Display a background subagent on an attached TUI, then let its parent stand-in exit naturally without a SessionEnd hook. The departed card's line clears via an explicit-zero revision-stamped frame, and a successor in the same pane retains its own background work even if that old clear is replayed.
+#[spec("status/background/014")]
+#[test]
+fn background_014_natural_exit_clears_the_attached_card_only() {
+    let mut f = Fixture::new(AgentType::ClaudeCode);
+    f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
+    f.events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&f.agent_id)
+                && event.event_type == EventType::ShellIdle
+        },
+        Duration::from_secs(10),
+    );
+    f.hook(
+        "claude-code",
+        "SubagentStart",
+        json!({"agent_id": "departed-child"}),
+    );
+    let ended = f.hook("claude-code", "Stop", json!({}));
+    assert!(
+        f.deck
+            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid
+                .contains("Background: 1 subagent")),
+        "precondition: background is visible:\n{}",
+        f.deck.snapshot_grid()
+    );
+    let old_id = f.agent_id.clone();
+    let before = f.events.snapshot().len();
+    std::fs::write(f.deck.workdir().join("parent-exit.run"), "exit naturally").unwrap();
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let records = f.runtime.block_on(f.client.list_agents()).unwrap();
+            !records.iter().any(|record| record.id == old_id)
+        }),
+        "stand-in did not exit naturally"
+    );
+    let cleared = f
+        .deck
+        .wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            !grid.contains("Background:")
+        });
+    let departed_grid = f.deck.snapshot_grid();
+    let frames: Vec<_> = f.events.snapshot().into_iter().skip(before).collect();
+    let clear = frames
+        .iter()
+        .find(|event| {
+            event.agent_id.as_deref() == Some(&old_id)
+                && event.background.is_some_and(|work| work.is_empty())
+                && event.background_revision.is_some_and(|revision| {
+                    revision > ended["background_revision"].as_u64().unwrap()
+                })
+        })
+        .cloned();
+
+    f.agent_id = f
+        .runtime
+        .block_on(f.client.start_agent(StartAgentOptions {
+            command: Some(common::capability_export_command("cat")),
+            cwd: Some(f.deck.workdir().to_string_lossy().into_owned()),
+            display_name: Some("successor".into()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
+            agent_type: Some(AgentType::ClaudeCode),
+            ..Default::default()
+        }))
+        .unwrap();
+    f.capability = f
+        .runtime
+        .block_on(common::recorded_hook_capability(
+            f.deck.workdir(),
+            &f.agent_id,
+        ))
+        .unwrap();
+    f.hook(
+        "claude-code",
+        "SessionStart",
+        json!({"source": "startup", "session_id": "successor-session"}),
+    );
+    f.hook(
+        "claude-code",
+        "SubagentStart",
+        json!({"agent_id": "successor-child", "session_id": "successor-session"}),
+    );
+    f.hook(
+        "claude-code",
+        "Stop",
+        json!({"session_id": "successor-session"}),
+    );
+    f.assert_subagents(1);
+    // Replay the daemon's actual carrier: retirement may use an informational
+    // event, so do not invent a shell/status event with different semantics.
+    if let Some(control_clear) = clear.as_ref() {
+        let mut tui = dot_agent_deck::state::AppState::default();
+        tui.register_pane(PANE.into());
+        // An attached client has seen the predecessor and the successor's
+        // announcement; preserve that generation evidence in this replay.
+        for frame in f.events.snapshot() {
+            tui.apply_event(frame);
+        }
+        assert!(
+            tui.sessions
+                .values()
+                .any(|card| card.agent_id.as_deref() == Some(&f.agent_id)),
+            "precondition: replay holds the successor"
+        );
+        tui.apply_event(control_clear.clone());
+        let held = tui
+            .sessions
+            .values()
+            .find(|card| card.agent_id.as_deref() == Some(&f.agent_id))
+            .expect("successor survives departed clear");
+        assert_eq!(
+            held.live_snapshot().background.unwrap().subagents,
+            1,
+            "departed clear must not clear the successor"
+        );
+    }
+    assert!(
+        cleared && clear.is_some(),
+        "natural exit must clear the attached card and broadcast a newer explicit-zero frame for the departed agent; cleared={cleared}, clear={clear:?}, frames={frames:?}\n{departed_grid}"
+    );
 }

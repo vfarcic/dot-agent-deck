@@ -59,8 +59,8 @@ export type AgentBlocked = {
  * as the DAEMON counts it — commands still running in their own session and
  * subagents started and not yet stopped. Present only with at least one count
  * above zero; `sinceMs` is when the oldest counted item started on the daemon's
- * clock, absent when the daemon has no start for any of them. Counts only: no
- * subagent id or command line ever reaches the webview.
+ * clock, absent when the daemon has no start for any of them. The background
+ * aggregate carries counts and an instant, not subagent ids or command lines.
  */
 export type AgentBackground = {
   commands: number;
