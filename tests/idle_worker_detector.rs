@@ -752,12 +752,13 @@ fn runtime() -> tokio::runtime::Runtime {
 /// attempt fails a correct product. That is how `scheduler/idle-worker/006`
 /// failed on a starved box (io full 94% of the window), where `StopAgent`
 /// answered after the 2.5 s timeout. So `attempt` measures its own ordering
-/// (with [`landed_in_time`]) and returns `Err` saying how late it was, or runs
-/// the scenario's assertions and returns `Ok`. A late attempt is never a pass:
-/// when all three are late this panics.
+/// (with [`landed_in_time`]) and returns [`Late`] saying how late it was, or
+/// runs the scenario's assertions and returns `Ok`. A late attempt is never a
+/// pass: when all three are late this panics, naming each attempt's lateness
+/// beside its window.
 fn run_until_the_cancel_beats_its_deadline(
     initial: Duration,
-    mut attempt: impl FnMut(Duration) -> Result<(), String>,
+    mut attempt: impl FnMut(Duration) -> Result<(), Late>,
 ) {
     let mut window = initial;
     let mut late = Vec::new();
@@ -771,28 +772,101 @@ fn run_until_the_cancel_beats_its_deadline(
             }
         }
     }
+    let attempts: Vec<String> = late
+        .iter()
+        .enumerate()
+        .map(|(n, why)| format!("  attempt {}: {why}", n + 1))
+        .collect();
     panic!(
         "the cancel never landed inside its deadline, so no attempt reached the scenario under \
-         test; attempts = {late:#?}"
+         test. A starved box fails this way, and so does a cancel path that became slow: a \
+         lateness that stays about the same while the window doubles points at the cancel \
+         path rather than the box.\n{}",
+        attempts.join("\n")
     );
 }
 
+/// An attempt whose cancel landed at or after its deadline, for
+/// [`run_until_the_cancel_beats_its_deadline`].
+#[derive(Debug)]
+struct Late {
+    what: String,
+    /// How long after the deadline was armed the cancel landed.
+    after: Duration,
+    /// The deadline's window in that attempt.
+    window: Duration,
+}
+
+impl std::fmt::Display for Late {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Late {
+            what,
+            after,
+            window,
+        } = self;
+        write!(
+            f,
+            "{what} landed {:?} late: {after:?} after its deadline was armed, with a \
+             {window:?} window",
+            after.saturating_sub(*window)
+        )
+    }
+}
+
+/// Review L6: when every attempt is late, the panic says a slow cancel path
+/// fails the same way, and names each attempt's lateness beside its window.
+#[test]
+fn every_late_attempt_panics_with_each_lateness_beside_its_window() {
+    let panic = std::panic::catch_unwind(|| {
+        run_until_the_cancel_beats_its_deadline(Duration::from_millis(100), |window| {
+            Err(Late {
+                what: "the cancel".to_string(),
+                after: window + Duration::from_millis(40),
+                window,
+            })
+        })
+    })
+    .expect_err("three late attempts must panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("a formatted panic message");
+    assert!(
+        message.contains("a cancel path that became slow"),
+        "{message}"
+    );
+    for (n, window) in [(1, "100ms"), (2, "200ms"), (3, "400ms")] {
+        assert!(
+            message.contains(&format!(
+                "attempt {n}: the cancel landed 40ms late: {} after its deadline was armed, with a {window} window",
+                match n {
+                    1 => "140ms",
+                    2 => "240ms",
+                    _ => "440ms",
+                }
+            )),
+            "{message}"
+        );
+    }
+}
+
 /// `Ok` when `landed` is less than `window` after `armed`, which puts it before
-/// any deadline armed no earlier than `armed` with that window; otherwise `Err`
-/// saying how late `what` was, for [`run_until_the_cancel_beats_its_deadline`].
+/// any deadline armed no earlier than `armed` with that window; otherwise
+/// [`Late`] saying how late `what` was.
 fn landed_in_time(
     what: &str,
     armed: tokio::time::Instant,
     landed: tokio::time::Instant,
     window: Duration,
-) -> Result<(), String> {
+) -> Result<(), Late> {
     let after = landed.duration_since(armed);
     if after < window {
         Ok(())
     } else {
-        Err(format!(
-            "{what} landed {after:?} after its deadline was armed, with a {window:?} window"
-        ))
+        Err(Late {
+            what: what.to_string(),
+            after,
+            window,
+        })
     }
 }
 
@@ -856,7 +930,7 @@ fn idle_worker_002_work_done_cancels_idle_prompt() {
 /// can fire: that watch is armed inside the delegate, so its deadline is no
 /// earlier than `delegated + timeout`, and `work_done` returns its acceptance
 /// only after `prepare_work_done` retired the record.
-async fn work_done_before_the_deadline(timeout: Duration) -> Result<(), String> {
+async fn work_done_before_the_deadline(timeout: Duration) -> Result<(), Late> {
     let harness = IdleHarness::new(&["silent-control", "responsive-worker"], None).await;
     let delegated = tokio::time::Instant::now();
     harness
@@ -1107,7 +1181,7 @@ fn idle_worker_005_redelegation_replaces_first_timer() {
 /// delegation one's deadline, and the premature-prompt snapshot is read before
 /// delegation two's. Each watch is armed inside its delegate, so each deadline
 /// is no earlier than the instant before that delegate plus `timeout`.
-async fn redelegation_before_the_deadline(timeout: Duration) -> Result<(), String> {
+async fn redelegation_before_the_deadline(timeout: Duration) -> Result<(), Late> {
     // Three fifths of the timeout, as 1200 ms was of the original 2000 ms: the
     // re-delegation lands well inside delegation one's window, and the
     // premature snapshot is read after delegation one's deadline and well
@@ -1195,7 +1269,7 @@ fn idle_worker_006_stop_agent_cancels_idle_prompt() {
 /// earlier than `delegated + timeout`. With that ordering the record is gone
 /// before the watch's take, and the assertion that no notice ever names the
 /// stopped worker is exact.
-async fn stop_agent_before_the_deadline(timeout: Duration) -> Result<String, String> {
+async fn stop_agent_before_the_deadline(timeout: Duration) -> Result<String, Late> {
     let harness = IdleHarness::new(&["silent-control", "stopped-worker"], None).await;
     let server = start_attach_server(&harness).await;
     let delegated = tokio::time::Instant::now();
@@ -1241,7 +1315,7 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
 /// assertions below would pass without exercising anything. The watch is armed
 /// inside the delegate, so its deadline is no earlier than `delegated +
 /// timeout`, and `spawn_raw_cat_observer` claims the pane id before returning.
-async fn successor_owns_the_pane_before_the_deadline(timeout: Duration) -> Result<(), String> {
+async fn successor_owns_the_pane_before_the_deadline(timeout: Duration) -> Result<(), Late> {
     let harness = IdleHarness::new(&["orphaned-worker"], None).await;
     let server = start_attach_server(&harness).await;
     let delegated = tokio::time::Instant::now();
@@ -1833,7 +1907,7 @@ fn idle_worker_013_a_completion_retires_every_generation_for_the_pane() {
 /// delegation one's deadline, and the work-done is accepted before delegation
 /// two's. Each watch is armed inside its delegate, so each deadline is no
 /// earlier than the instant before that delegate plus `timeout`.
-async fn completion_before_the_deadlines(timeout: Duration) -> Result<(), String> {
+async fn completion_before_the_deadlines(timeout: Duration) -> Result<(), Late> {
     // `never-answering-worker` is the BEHAVIORAL CONTROL. Asserting only
     // that the answering worker goes unreported would pass just as happily
     // if a supersede disarmed the detector outright, or if the test never
@@ -1929,7 +2003,7 @@ fn idle_worker_020_an_answered_worker_is_never_reported_as_silent() {
 /// delegation one's deadline, and the work-done is accepted before delegation
 /// two's. Each watch is armed inside its delegate, so each deadline is no
 /// earlier than the instant before that delegate plus `timeout`.
-async fn answered_before_the_deadlines(timeout: Duration) -> Result<(), String> {
+async fn answered_before_the_deadlines(timeout: Duration) -> Result<(), Late> {
     // `silent-control` is the POSITIVE control for the clock. Without it,
     // "the answered worker produced no prompt" would pass just as happily
     // if the detector were switched off, or if the test simply never waited
@@ -2146,7 +2220,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
 /// restarted worker's new session. Each notice's clock starts while its
 /// `waiting_for_input` is ingested, so its deadline is no earlier than the
 /// instant before that ingestion plus `debounce`.
-async fn waiting_workers_reported(debounce: Duration) -> Result<(), String> {
+async fn waiting_workers_reported(debounce: Duration) -> Result<(), Late> {
     let asking_command = format!("printf {WORKER_QUESTION}; exec cat");
     let harness = IdleHarness::with_workers(
         &[
@@ -2822,7 +2896,7 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
 /// assertion that it goes unreported fails a correct product. The notice's
 /// clock starts while the `permission_request` is ingested, so its deadline is
 /// no earlier than the instant before that ingestion plus `debounce`.
-async fn waiting_episodes_end_and_reopen(debounce: Duration) -> Result<(), String> {
+async fn waiting_episodes_end_and_reopen(debounce: Duration) -> Result<(), Late> {
     let roles = [
         "redelegated-worker",
         "many-times-cleared-worker",
