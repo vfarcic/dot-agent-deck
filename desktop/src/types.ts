@@ -22,7 +22,21 @@ export const UNREPORTED = "Unavailable";
 
 export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
-export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped" | "blocked";
+/**
+ * The status an agent is shown in. `needs_input` and `idle` are the TUI's
+ * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
+ * finished its turn are two states, never one.
+ */
+export type AgentStatus = "queued" | "running" | "needs_input" | "idle" | "passed" | "failed" | "stopped" | "blocked";
+
+/**
+ * The words a status is shown as. Each is its own id except Needs input, whose
+ * id cannot carry a space; the TUI's cards say Needs Input and Idle for the
+ * same two states.
+ */
+export function statusLabel(status: AgentStatus): string {
+  return status === "needs_input" ? "needs input" : status;
+}
 
 /** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
 export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
@@ -695,7 +709,7 @@ export interface AgentSession {
   status: AgentStatus;
   /**
    * HONEST. The daemon's own status word, before `status` merges Working
-   * with Thinking and Idle with Waiting for input — which the dashboard
+   * with Thinking — which the dashboard
    * filter keeps apart (issue #1496). Absent in fixture mode, whose agents
    * have only `status`.
    */

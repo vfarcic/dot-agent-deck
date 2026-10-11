@@ -1017,11 +1017,11 @@ describe("TauriDeckBridge", () => {
       thinking: "running",
       working: "running",
       compacting: "running",
-      waiting_for_input: "waiting",
-      idle: "waiting",
+      waiting_for_input: "needs_input",
+      idle: "idle",
       error: "failed",
       blocked: "blocked",
-      unknown: "waiting",
+      unknown: "idle",
     };
 
     for (const [daemonStatus, deckStatus] of Object.entries(expected)) {
@@ -1030,11 +1030,11 @@ describe("TauriDeckBridge", () => {
       expect(mapDesktopSnapshot(dto).agents[0]?.status, `daemon status "${daemonStatus}"`).toBe(deckStatus);
     }
 
-    // The fallthrough itself stays "waiting" for a status this build has never
+    // The fallthrough itself is "idle" for a status this build has never
     // heard of — a newer daemon may add one without a protocol bump.
     const future = structuredClone(snapshot);
     future.agents[0].status = "hyperthinking" as DesktopAgentDto["status"];
-    expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("waiting");
+    expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("idle");
   });
 
   /**

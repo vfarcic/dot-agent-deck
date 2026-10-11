@@ -561,7 +561,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* Issue #714: blocked shares failed's colour (a person has to act) but not its
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
-.agent-state-mark.status-waiting, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
+.agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -571,7 +571,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status-label.status-waiting, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
+.status-label.status-needs_input, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
 /*
   Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:
   the live colour goes and the mark hollows out. Written after the per-status
@@ -1160,7 +1160,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
   .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
-  .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
+  .deck-instruments .instrument:nth-child(3), .deck-instruments .instrument:nth-child(5) { display: none; }
+  .overview-instruments .instrument-optional { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }
 
@@ -1442,7 +1443,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .count-running { color: var(--teal); }
-.count-waiting { color: var(--amber); }
+.count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }

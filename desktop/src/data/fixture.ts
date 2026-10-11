@@ -229,7 +229,7 @@ export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatu
   const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
   const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
   // What `agentTurn` makes of the daemon status each fixture status stands for.
-  const turn = status === "running" ? "working" : status === "waiting" ? "idle" : undefined;
+  const turn = status === "running" ? "working" : status === "needs_input" || status === "idle" ? "idle" : undefined;
   return {
     agentType,
     ...(turn ? { turn } : {}),
@@ -687,21 +687,21 @@ const crowdedAgents: AgentSession[] = [
   // No prompt and no lease: a pane the daemon adopted but that has emitted no
   // prompt event yet. Both columns stay blank, which is the case the screen has
   // to look right for.
-  crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
   crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/done/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "orchestrator", 0, true, PRD_CWD) }),
   // History-only: a wrapped session the deck can replay but cannot type into.
   crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "opencode", status: "running", cwd: DECK_CWD, toolCount: 33, upForMinutes: 12, quietForMinutes: 1, activeTool: "read", activeToolDetail: "src/state.rs", writeLease: "read", lastUserPrompt: "Read the daemon state module and tell me which fields never reach the desktop.", tab: { kind: "mode", name: "review" } }),
-  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "docs", 4, false, PRD_CWD) }),
-  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 12, upForMinutes: 213, quietForMinutes: 8, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
+  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "idle", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "docs", 4, false, PRD_CWD) }),
+  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "idle", cwd: DECK_CWD, toolCount: 12, upForMinutes: 213, quietForMinutes: 8, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
   crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, upForMinutes: 47, quietForMinutes: 3, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "reviewer", 3, false, PRD_CWD) }),
   crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude", status: "running", cwd: DECK_CWD, toolCount: 15, upForMinutes: 3, quietForMinutes: 0, activeTool: "bash", activeToolDetail: "git log --oneline -20", writeLease: "write", lastUserPrompt: "Collect every changelog fragment merged since the last tag and group them.", tab: { kind: "dashboard" } }),
   crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude", status: "failed", cwd: PRD_CWD, toolCount: 8, upForMinutes: 88, quietForMinutes: 71, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "release", 5, false, PRD_CWD) }),
-  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "tester", 2, false, PRD_CWD) }),
-  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
+  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "needs_input", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "tester", 2, false, PRD_CWD) }),
+  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
   // View-only: the daemon knows the session but holds nothing it can write to.
-  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, quietForMinutes: 2760, writeLease: "none", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, upForMinutes: 168, quietForMinutes: 128, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
-  crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 7, upForMinutes: 27, quietForMinutes: 9, tab: { kind: "mode", name: "review" } }),
+  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "idle", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, quietForMinutes: 2760, writeLease: "none", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 5, upForMinutes: 168, quietForMinutes: 128, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
+  crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude", status: "needs_input", cwd: DECK_CWD, toolCount: 7, upForMinutes: 27, quietForMinutes: 9, tab: { kind: "mode", name: "review" } }),
 ];
 
 /**
@@ -711,8 +711,8 @@ const crowdedAgents: AgentSession[] = [
  * TUI and desktop images of the `dashboard` scenario depict ONE state. Names,
  * agent types, directory, prompts, tools and ages are the TUI's; each status is
  * what live mode maps the TUI's hook state to (`DAEMON_STATUS` in
- * `lib/bridge.ts`), which folds the TUI's Idle and Needs Input into `waiting`
- * and its Working into `running`. Keep the two lists in step when either moves.
+ * `lib/bridge.ts`), which keeps the TUI's Idle and Needs Input as `idle` and
+ * `needs_input` and folds its Working into `running`. Keep the two lists in step when either moves.
  *
  * Separate from `agents` on purpose: the `connected` scenario is what the unit
  * and snapshot tests are written against, and a docs image must not be able to
@@ -760,10 +760,10 @@ const DOCS_IMPL_TRANSCRIPT = [
   "",
 ].join("\r\n");
 const docsAgents: AgentSession[] = [
-  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
   { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
   crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "needs_input", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
 /** Two answering daemons with synthetic projects and no demo-run paths. */
@@ -777,7 +777,7 @@ function docsFleet(): DeckSnapshot[] {
     connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
-      crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "waiting", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
+      crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
     ].map((agent) => ({ ...agent, daemonId: FIXTURE_REMOTE_DAEMON_ID })),
     totalNodes: 2,
   };
@@ -833,7 +833,7 @@ const remoteAgents: AgentSession[] = [
     daemonId: FIXTURE_REMOTE_DAEMON_ID,
     displayName: "Matrix reviewer",
     role: "Reviewer",
-    status: "waiting",
+    status: "needs_input",
     task: "Read the failing arm64 job and say whether it is the change or the runner.",
     cwd: "/home/dev/code/dot-agent-deck",
     transcript: "",
@@ -886,7 +886,7 @@ const staleAgents: AgentSession[] = [
     daemonId: FIXTURE_UNREACHABLE_DAEMON_ID,
     displayName: "Flake triage",
     role: "Reviewer",
-    status: "waiting",
+    status: "idle",
     task: "Classify last night's flakes by whether they touch the PTY harness.",
     cwd: "/home/ci/code/dot-agent-deck",
     transcript: "",

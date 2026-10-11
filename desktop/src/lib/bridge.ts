@@ -2105,13 +2105,18 @@ const FIXTURE_UNRESOLVED_REFUSAL = "daemon returned error: unresolved: that path
  * The daemon's closed status vocabulary (src-tauri `session_status_name`),
  * mapped exhaustively — PR #416 review B1/M3. The record makes a NEW daemon
  * status a visible fallthrough here instead of a silent one, and the
- * fallthrough itself is "waiting", never a terminal state: the daemon's own
+ * fallthrough itself is "idle", never a terminal state: the daemon's own
  * `SessionStatus::Unknown` doc says it must be "rendered neutrally (like
  * Idle) so it never masquerades as an active state" — and a status this
  * build has never heard of gets the same treatment, because per PRD #162 a
  * newer daemon can add one without a protocol bump. The old substring
  * matcher sent "unknown" to "stopped", which locked a LIVE agent's terminal
  * read-only.
+ *
+ * Issue #1676: `waiting_for_input` and `idle` are two columns, the TUI's Needs
+ * Input and Idle. They used to share one, `waiting`, so an agent that had
+ * simply finished its turn read as one waiting on the user. `unknown` goes
+ * with `idle`, as it does in the TUI: nothing asked the user anything.
  */
 const DAEMON_STATUS: Record<string, AgentStatus> = {
   // `running` is what the Rust side emits for an agent with no hook state yet
@@ -2124,19 +2129,19 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   thinking: "running",
   working: "running",
   compacting: "running",
-  waiting_for_input: "waiting",
-  idle: "waiting",
+  waiting_for_input: "needs_input",
+  idle: "idle",
   error: "failed",
   // Issue #714: a distinct state, not `failed` — the agent is alive and its
   // terminal stays writable (only `stopped` locks it), but its provider refuses
   // it, so the tile has to say something different from a crashed agent.
   blocked: "blocked",
-  unknown: "waiting",
+  unknown: "idle",
 };
 
 /** The status column a daemon status word is shown in. */
 export function statusFromDaemon(status: string): AgentStatus {
-  return DAEMON_STATUS[status.toLowerCase()] ?? "waiting";
+  return DAEMON_STATUS[status.toLowerCase()] ?? "idle";
 }
 
 function roleFromAgent(agent: DesktopAgentDto, index: number): string {

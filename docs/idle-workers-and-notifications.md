@@ -102,7 +102,7 @@ DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=0 DOT_AGENT_DECK_WAITING_NOTICE_DEBOU
 - **Restarting the daemon forgets the tasks in progress.** Tasks delegated before the restart are not reported; tasks delegated after it are.
 - **The timeout counts time, not activity.** A worker busy on a long task is still reported when the timeout passes; the orchestrator can ignore it. That is why the default is two hours.
 - **Two overlapping tasks for one worker** (possible only with `delegate --supersede`) can occasionally produce one report too many, or leave one task unreported.
-- **Waiting reports can outlive the prompt.** A wait raised by a Claude Code or Codex subagent ends when that subagent stops or fails: the worker's TUI card leaves **Needs Input** (its desktop row leaves **WAITING**), and a waiting report not yet sent is cancelled. One already sent stays sent, so the orchestrator can receive a report about a prompt that is gone.
+- **Waiting reports can outlive the prompt.** A wait raised by a Claude Code or Codex subagent ends when that subagent stops or fails: the worker's TUI card leaves **Needs Input** (its desktop row leaves **needs input**), and a waiting report not yet sent is cancelled. One already sent stays sent, so the orchestrator can receive a report about a prompt that is gone.
 - **The deck sends no report about the orchestrator itself.** If the orchestrator's agent crashes, or the orchestration fails before any agent starts, nobody receives a report.
 
 ## Get notified when a run needs you
