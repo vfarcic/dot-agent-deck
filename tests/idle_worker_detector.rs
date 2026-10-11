@@ -1040,41 +1040,85 @@ fn idle_worker_005_redelegation_replaces_first_timer() {
 #[test]
 fn idle_worker_006_stop_agent_cancels_idle_prompt() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let _env = EnvGuard::set(Some("2500"));
-    runtime().block_on(async {
-        let harness = IdleHarness::new(&["silent-control", "stopped-worker"], None).await;
-        let server = start_attach_server(&harness).await;
-        harness
-            .delegate(&["silent-control", "stopped-worker"])
-            .await;
+    // The scenario is a stop that lands BEFORE the stopped worker's deadline. A
+    // stop that lands after it is a different scenario, in which the worker
+    // really was silent for the whole timeout and the deck rightly reported it
+    // before the stop arrived — which is what this test used to fail on under
+    // load: with io full 94% of the window, the StopAgent round trip took
+    // longer than the 2.5 s timeout, and the snapshot held the stopped worker's
+    // notice ahead of the control's. A 3 s stall injected before the request
+    // reproduces it exactly. So each attempt proves its own ordering, and one
+    // whose stop came too late is run again with the timeout doubled instead
+    // of being asserted on.
+    let mut timeout = Duration::from_millis(2500);
+    let mut late_stops = Vec::new();
+    for _ in 0..3 {
+        let _env = EnvGuard::set(Some(&timeout.as_millis().to_string()));
+        // Bound first so the runtime drops before `_env` does (see `ENV_LOCK`).
+        let outcome = runtime().block_on(stop_agent_before_the_deadline(timeout));
+        match outcome {
+            Some(snapshot) => {
+                assert!(
+                    idle_mentions_role(&snapshot, "silent-control"),
+                    "silent control worker did not prove the detector fired; snapshot = \
+                     {snapshot:?}"
+                );
+                assert!(
+                    !idle_mentions_role(&snapshot, "stopped-worker"),
+                    "StopAgent did not cancel the stopped worker's idle prompt; snapshot = \
+                     {snapshot:?}"
+                );
+                return;
+            }
+            None => {
+                late_stops.push(timeout);
+                timeout *= 2;
+            }
+        }
+    }
+    panic!(
+        "StopAgent never answered inside the idle timeout, so no attempt reached the scenario \
+         under test; timeouts tried = {late_stops:?}"
+    );
+}
 
-        let stopped_id = harness
-            .worker_agent_ids
-            .get("stopped-worker")
-            .expect("stopped worker registry id");
-        let response = common::attach_request_on(
-            &server.path,
-            &AttachRequest::StopAgent {
-                id: stopped_id.clone(),
-            },
+/// One attempt at `scheduler/idle-worker/006` with `timeout` as the idle
+/// timeout: the orchestrator's snapshot once the control worker has been
+/// reported, or `None` when `StopAgent` did not answer within `timeout` of the
+/// delegate being sent.
+///
+/// An answer within `timeout` proves the close began before the stopped
+/// worker's watch could fire: the handler runs `begin_pane_close` before it
+/// replies, and the watch is armed inside the delegate, so its deadline is no
+/// earlier than `delegated + timeout`. With that ordering the record is gone
+/// before the watch's take, and the assertion that no notice ever names the
+/// stopped worker is exact.
+async fn stop_agent_before_the_deadline(timeout: Duration) -> Option<String> {
+    let harness = IdleHarness::new(&["silent-control", "stopped-worker"], None).await;
+    let server = start_attach_server(&harness).await;
+    let delegated = tokio::time::Instant::now();
+    harness
+        .delegate(&["silent-control", "stopped-worker"])
+        .await;
+
+    let stopped_id = harness
+        .worker_agent_ids
+        .get("stopped-worker")
+        .expect("stopped worker registry id")
+        .clone();
+    let (_, answered) = IdleHarness::stop_agent_timed(server.path.clone(), stopped_id).await;
+    if answered.duration_since(delegated) >= timeout {
+        return None;
+    }
+
+    let _ = harness
+        .wait_for_idle_role(
+            "silent-control",
+            timeout + common::load_scaled(Duration::from_millis(3500)),
         )
-        .expect("StopAgent over attach socket");
-        assert!(response.ok, "StopAgent failed: {:?}", response.error);
-
-        let _ = harness
-            .wait_for_idle_role("silent-control", Duration::from_secs(6))
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
-        assert!(
-            idle_mentions_role(&snapshot, "silent-control"),
-            "silent control worker did not prove the detector fired; snapshot = {snapshot:?}"
-        );
-        assert!(
-            !idle_mentions_role(&snapshot, "stopped-worker"),
-            "StopAgent did not cancel the stopped worker's idle prompt; snapshot = {snapshot:?}"
-        );
-    });
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Some(harness.wait_for_snapshot(|_| true, Duration::ZERO).await)
 }
 
 /// Scenario: Delegate to a silent worker, close the ORCHESTRATOR through the real StopAgent request, wait for that close to release its pane, then spawn a brand-new unrelated agent that inherits the freed orchestrator pane id. After two full timeout windows the new occupant's PTY must still hold only its own readiness marker — the dead orchestration's idle prompt must never be auto-submitted into a stranger's session.
