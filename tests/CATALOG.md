@@ -7652,6 +7652,96 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
 - **Platform coverage:** mac+linux.
 
+### Agent messaging inbox (PRD #1666)
+
+#### Protocol and waiter lifecycle
+
+##### inbox/protocol/001 — Inbox verbs require an attested caller.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated real daemon process and JSON-lines hook socket.
+- **Agent:** none (capability-exporting `cat` stand-in).
+- **Asserts:** attested announce and empty fetch succeed; fetch, ack, list, announce and wait with no token explicitly refuse without exposing messages.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/002 — A different attested agent cannot acknowledge a message.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), raw PostMessage setup, hook socket and real fetch CLI.
+- **Agent:** none (two `cat` stand-ins).
+- **Asserts:** WrongAgent is explicit, the owner's message stays Queued, and its own fetch changes it to Acknowledged.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/003 — Legacy delivery ids are Unknown.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), hook socket and real ack CLI.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** an old `d-…` id returns Unknown and the CLI refuses to claim an acknowledgement.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/004 — Once hands a batch to the newest waiter and requires explicit ack.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket waiters.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** newest gets the complete rendered block, oldest remains armed, state becomes Fetched, owner ack moves it to Acknowledged, and repeated ack returns AlreadyAcknowledged.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/005 — The per-agent waiter cap supersedes the oldest.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine hook-socket waiters.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** waiter nine supersedes waiter one, armed stays at eight, and the newest waiter receives the next message.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/006 — Idle waiters survive the hook read timeout.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/007 — Waiter EOF removes its armed registration.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** armed moves two → one → zero as peers disconnect, and the next message stays Queued.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/008 — Legacy Unattested status producers cannot access inbox messages.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), raw legacy SessionStart and hook-socket verbs.
+- **Agent:** none (synthetic hook-only pane never issued a token).
+- **Asserts:** fetch and ack refuse without a token even for the legacy Unattested provenance class.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/009 — Waiters leave ordinary hook-ingest slots available.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live waiters across five daemon-owned panes.
+- **Agent:** none (five `cat` stand-ins).
+- **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the waiters removes their armed registrations.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/010 — Stream nack redelivers and stream ack confirms.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), native component's JSON-lines stream using a daemon-owned process identity.
+- **Agent:** none (`cat` stand-in identified as a Pi extension).
+- **Asserts:** rendered task is Fetched, nack returns it to the stream, ack changes it to Acknowledged, and EOF removes the stream's armed registration.
+- **Platform coverage:** mac+linux.
+
+#### Agent CLI
+
+##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI launched inside a daemon-owned scripted pane.
+- **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
+- **Asserts:** list shows Queued before fetch; fetch prints the session framing and complete message block; wire list and CLI list show Acknowledged afterward.
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/002 — Claude Once waiter wakes with exit two and stderr.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real wait CLI, hook JSON stdin and a real daemon.
+- **Agent:** none (`cat` stand-in; no Claude executable or credential).
+- **Asserts:** waiter arms, receives a rendered task, exits two with the block on stderr and empty stdout, and leaves the message Fetched pending ack.
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/003 — Waiter outside a deck or without a daemon is quiet.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated real CLI subprocesses.
+- **Agent:** none.
+- **Asserts:** missing pane identity and absent hook socket each cause exit zero with empty stdout and stderr.
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/004 — Non-delivery replies and old-daemon EOF never wake Claude.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI against a scripted hook endpoint.
+- **Agent:** none.
+- **Asserts:** Superseded, NotInDeck, Refused, invalid JSON and EOF each produce exit zero and empty output; request carries Once mode and the hook's session source.
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
