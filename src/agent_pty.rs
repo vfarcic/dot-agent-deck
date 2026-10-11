@@ -7259,6 +7259,49 @@ impl portable_pty::Child for IdleTestChild {
     }
 }
 
+/// PRD #1589 test seam: the PTY master behind
+/// [`AgentPtyRegistry::insert_idle_member_for_test`] — one that opens no
+/// device at all. A test gives an instance hundreds of members, and a real
+/// `openpty` per member exhausts macOS's system-wide PTY cap once nextest runs
+/// such tests side by side (`openpty` then fails with `ENXIO`). Writes vanish,
+/// reads see end-of-file, and a resize is accepted and forgotten.
+#[cfg(test)]
+struct IdleTestMaster;
+
+#[cfg(test)]
+impl portable_pty::MasterPty for IdleTestMaster {
+    fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+        Ok(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+
+    fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::empty()))
+    }
+
+    fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::sink()))
+    }
+
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
+}
+
 /// PRD #1589 (auditor SF1): a generation-scoped Closing admission state,
 /// returned by [`AgentPtyRegistry::begin_generation_close`]. While it lives, no
 /// respawn may replace the generation in its pane.
@@ -15578,8 +15621,9 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1589 test seam: register an inert member of orchestration
-    /// `instance` holding `pane_id` — a record with no process behind it, so a
-    /// test can give an instance hundreds of members.
+    /// `instance` holding `pane_id` — a record with no process and no PTY
+    /// behind it ([`IdleTestChild`], [`IdleTestMaster`]), so a test can give an
+    /// instance hundreds of members without opening a single PTY.
     #[cfg(test)]
     pub(crate) fn insert_idle_member_for_test(
         &self,
@@ -15587,7 +15631,11 @@ impl AgentPtyRegistry {
         instance: &str,
         is_start_role: bool,
     ) -> String {
-        let id = self.insert_test_agent_for_pane(Box::new(IdleTestChild), Some(pane_id));
+        let id = self.insert_test_agent_with_master(
+            Box::new(IdleTestChild),
+            Some(pane_id),
+            Box::new(IdleTestMaster),
+        );
         if let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),
@@ -15627,8 +15675,20 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             })
             .expect("openpty for a synthetic test agent");
-        let writer = pair
-            .master
+        self.insert_test_agent_with_master(child, pane_id_env, pair.master)
+    }
+
+    /// [`Self::insert_test_agent_for_pane`] over a caller-supplied `master`, so
+    /// [`Self::insert_idle_member_for_test`] can register a record that opens
+    /// no PTY.
+    #[cfg(test)]
+    fn insert_test_agent_with_master(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pane_id_env: Option<&str>,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+    ) -> String {
+        let writer = master
             .take_writer()
             .expect("take_writer for a synthetic test agent");
         let mut inner = self.inner.lock().unwrap();
@@ -15649,7 +15709,7 @@ impl AgentPtyRegistry {
                 // handle on Windows, which is what makes both backends take
                 // their documented `Child::kill` fallback here.
                 process_group: crate::platform::proc::AgentProcessGroup::adopt(None),
-                master: pair.master,
+                master,
                 pty_progress: pane_writer.pty_progress(),
                 writer: Arc::new(AsyncMutex::new(pane_writer)),
                 pane_retired,
@@ -17361,6 +17421,26 @@ mod tests {
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    /// PRD #1589: the idle-member seam opens no PTY. `close_agents`' tests give
+    /// one instance hundreds of members, and a PTY per member exhausted macOS's
+    /// system-wide cap on CI (`openpty` failing with `ENXIO`).
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_test_member_holds_no_pty() {
+        let registry = AgentPtyRegistry::new();
+        let ids: Vec<String> = (0..300)
+            .map(|n| registry.insert_idle_member_for_test(&format!("idle-{n}"), "idle", n == 0))
+            .collect();
+        let inner = registry.inner.lock().unwrap();
+        for id in &ids {
+            assert_eq!(
+                inner.agents[id].master.as_raw_fd(),
+                None,
+                "idle member {id} holds a PTY master"
+            );
+        }
+    }
 
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
     /// until it begins its write, and one that was cancelled first never

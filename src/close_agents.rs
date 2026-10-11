@@ -2868,6 +2868,12 @@ mod tests {
             .stop_agent(&dispatcher)
             .await
             .expect("stop the dispatcher");
+        // The reply says the dispatcher stopped, not that its pane id is free:
+        // a caller reusing the pane waits for the stop's cleanup to finish.
+        wait_until("the stopped dispatcher's pane is free", || {
+            !deck.registry.pane_close_in_flight("disp")
+        })
+        .await;
         deck.start("disp", "sleep 30", None).await;
         let _ = release.send(());
         let replaced = respawn
@@ -3073,6 +3079,12 @@ mod tests {
             .stop_agent(&dispatcher)
             .await
             .expect("stop the dispatcher");
+        // The reply says the dispatcher stopped, not that its pane id is free:
+        // a caller reusing the pane waits for the stop's cleanup to finish.
+        wait_until("the stopped dispatcher's pane is free", || {
+            !deck.registry.pane_close_in_flight("disp")
+        })
+        .await;
         deck.start("disp", "sleep 30", None).await;
         let _ = release.send(());
         let report = close.await.unwrap();

@@ -288,7 +288,7 @@ Otherwise ask **two numbers, in one prompt**, because they are different decisio
 1. **The total** — how many issues to work through altogether. This is a scope decision and it is the runner's alone. Do not assume "all", and do not offer "all" as the recommendation.
 2. **The parallelism** — how many units may run at once. **Recommend 2–3.**
 
-Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's branch as `dispatch` reported it, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed.
+Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's worktree path and branch as `dispatch` reported them, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed. `dispatch`'s success reply names both: `dispatch: spawned isolated … in <worktree path> on branch <branch>`; record that branch, not one rebuilt from the unit name. A reply with no `on branch` clause comes from an older build: take the branch from the `.listed[]` entry of `dot-agent-deck close --all --json` whose `worktree` is the path `dispatch` printed, comparing both after `realpath`, and record that.
 
 **The loop terminates on the total OR on exhaustion, whichever comes first, and exhaustion is the case that needs stating.** The total is a ceiling the runner asked for, not a quota that must be filled: a candidate can disappear between selection and dispatch (closed, assigned to someone else, a PR appeared — step 8's re-check rejects it), and the queue itself is finite. So:
 
@@ -508,7 +508,7 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 ```bash
 UNITS="$(mktemp)"; WORKTREES="$(mktemp)"; LEDGER="$(mktemp)"
-printf '%s\n' 'agent/dispatch-<name-1>' 'agent/dispatch-<name-2>' > "$LEDGER"  # step 5's ledger
+printf '%s\n' '<branch-1>' '<branch-2>' > "$LEDGER"  # the branches step 5's ledger recorded from dispatch's replies
 dot-agent-deck close --all --json > "$UNITS"          # lists; closes nothing
 dot-agent-deck worktree list --json > "$WORKTREES"    # PR state per worktree
 jq -r --slurpfile wt "$WORKTREES" --rawfile ledger "$LEDGER" '

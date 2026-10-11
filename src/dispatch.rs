@@ -959,15 +959,22 @@ pub async fn handle_dispatch(
                 // The base clause is appended rather than interpolated into both
                 // arms so a failed probe degrades to the pre-#674 sentence exactly,
                 // instead of leaving a dangling "cut from ".
+                //
+                // PRD #1589: the branch is named too, so a runner can record the
+                // branch each unit works on as dispatch created it — what
+                // `/issue-queue` intersects with the merged branches before a
+                // `close --all` — instead of reconstructing it from the name.
                 message: {
                     let opened = match &handle.kind {
                         SpawnKind::Orchestration { name: orch } => format!(
-                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                         SpawnKind::SingleAgent => format!(
-                            "{SPAWNED_OPENING} agent for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} agent for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                     };
                     let mut msg = match &base {
@@ -2273,6 +2280,16 @@ mod tests {
         assert!(
             result.message.contains("orchestration"),
             "the reported shape must say orchestration, got: {}",
+            result.message
+        );
+        // PRD #1589: the reply names the branch the unit works on, which is what
+        // `/issue-queue` records per unit for its `close --all` ledger.
+        assert!(
+            result.message.contains(&format!(
+                "in {} on branch agent/dispatch-team-unit",
+                worktree.display()
+            )),
+            "the success reply must name the worktree and its branch, got: {}",
             result.message
         );
 
