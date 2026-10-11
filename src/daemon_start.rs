@@ -35,6 +35,7 @@
 //! The remote half is sync, like [`crate::daemon_upgrade`]: its ssh calls block,
 //! so a desktop caller runs it inside `spawn_blocking`.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -350,6 +351,11 @@ pub struct RemoteDeck<E: SshExecutor> {
     /// install found in place of a missing default install is recorded
     /// ([`RemoteDeck::recording_to`]). `None` records nothing.
     record: Option<(PathBuf, RemoteEntry)>,
+    /// A Homebrew install [`find_homebrew`] found and `--version` verified,
+    /// with the version it reported, waiting to be recorded until it has also
+    /// answered the daemon check ([`probe_remote`]) — `connect` records its
+    /// find only after the `daemon hello` handshake too.
+    found: RefCell<Option<(RemoteBinaryPath, String)>>,
 }
 
 impl RemoteDeck<SystemSshExecutor> {
@@ -378,6 +384,7 @@ impl<E: SshExecutor> RemoteDeck<E> {
             port: SshDaemonPort::for_endpoint(executor, endpoint, binary),
             host: endpoint.describe(),
             record: None,
+            found: RefCell::new(None),
         }
     }
 
@@ -422,8 +429,21 @@ impl Default for StartTiming {
 /// `daemon endpoint` (issue #1174) answers the same question in exit codes.
 ///
 /// A deck that runs the default install, which is missing, is looked for in
-/// Homebrew first ([`find_homebrew`]) and asked through what that finds.
+/// Homebrew first ([`find_homebrew`]) and asked through what that finds. A
+/// find is recorded once it has answered this check.
 pub fn probe_remote<E: SshExecutor>(deck: &RemoteDeck<E>) -> DisconnectedReason {
+    let reason = check_remote(deck);
+    if matches!(
+        reason,
+        DisconnectedReason::NotRunning | DisconnectedReason::RunningNotConnected
+    ) {
+        record_found(deck);
+    }
+    reason
+}
+
+/// [`probe_remote`] before anything is recorded.
+fn check_remote<E: SshExecutor>(deck: &RemoteDeck<E>) -> DisconnectedReason {
     let reason = ask_remote(deck);
     match &reason {
         DisconnectedReason::Unknown(problem)
@@ -581,8 +601,8 @@ fn ssh_problem(host: &str, error: &SshError) -> StartProblem {
 /// Look for a Homebrew install of the deck when it runs the default install,
 /// which is missing, the way `connect` does (issue #1459, here since issue
 /// #1675): verify what is found with the same `--version` probe, run every
-/// later command through it, and record it in the deck list when the deck was
-/// given one ([`RemoteDeck::recording_to`]). `Ok(true)` when one was found and
+/// later command through it, and hold it for [`record_found`], which records
+/// it once it has answered the daemon check. `Ok(true)` when one was found and
 /// answered; `Ok(false)` when there is none (or the deck records its own
 /// binary, which is not searched past, as in `connect`); `Err` when looking or
 /// verifying failed.
@@ -602,6 +622,18 @@ fn find_homebrew(deck: &RemoteDeck<impl SshExecutor>) -> Result<bool, StartProbl
         .port
         .version()
         .map_err(|failure| version_problem(deck, failure))?;
+    *deck.found.borrow_mut() = Some((binary, version));
+    Ok(true)
+}
+
+/// Record the Homebrew install [`find_homebrew`] found in the deck list the
+/// deck was given ([`RemoteDeck::recording_to`]), now that it has answered the
+/// daemon check as well as `--version`, so the next check runs it straight
+/// away. Records at most once per find.
+fn record_found(deck: &RemoteDeck<impl SshExecutor>) {
+    let Some((binary, version)) = deck.found.borrow_mut().take() else {
+        return;
+    };
     if let Some((remotes_path, entry)) = &deck.record
         && let Err(error) =
             crate::remote::record_homebrew_binary(remotes_path, entry, binary, &version)
@@ -613,7 +645,6 @@ fn find_homebrew(deck: &RemoteDeck<impl SshExecutor>) -> Result<bool, StartProbl
             "found the deck's Homebrew binary but could not record it in the deck list"
         );
     }
-    Ok(true)
 }
 
 /// No deck binary to run on the host. A deck that runs the default install
@@ -1118,30 +1149,7 @@ mod tests {
     /// either client — goes straight to it.
     #[test]
     fn a_found_homebrew_install_is_recorded_for_the_next_check() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("remotes.toml");
-        let entry = RemoteEntry {
-            name: "build".into(),
-            kind: "ssh".into(),
-            host: "deploy@build-box".into(),
-            port: 2222,
-            key: None,
-            version: "0.40.0".into(),
-            added_at: "2026-10-01T00:00:00Z".into(),
-            upgraded_at: None,
-            last_connected: None,
-            install: None,
-            binary: None,
-            id: None,
-            user: None,
-            jump_host: None,
-            socket: None,
-        };
-        crate::remote::RemotesFile {
-            remotes: vec![entry.clone()],
-        }
-        .save(&path)
-        .unwrap();
+        let (_dir, path, entry) = deck_list_without_a_binary();
 
         let fake = FakeSsh::default();
         fake.probe
@@ -1173,6 +1181,68 @@ mod tests {
             commands(&next),
             [format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json")]
         );
+    }
+
+    /// PR #1679 review: a find that answers `--version` but not the daemon
+    /// check is not recorded — `connect` records only after its handshake
+    /// too — so the next check does not go straight to a binary that cannot
+    /// answer it.
+    #[test]
+    fn a_find_that_fails_the_daemon_check_is_not_recorded() {
+        let (_dir, path, entry) = deck_list_without_a_binary();
+        let fake = FakeSsh::default();
+        fake.probe.borrow_mut().extend([
+            missing_at_default(),
+            out(1, "", "error: something else answered"),
+        ]);
+        fake.brew
+            .borrow_mut()
+            .push_back(brew_finds("/opt/homebrew"));
+        fake.version.borrow_mut().push_back(version_ok());
+        let deck = deck(fake).recording_to(path.clone(), entry.clone());
+        let DisconnectedReason::Unknown(problem) = probe_remote(&deck) else {
+            panic!("a binary that fails the check cannot tell");
+        };
+        assert_eq!(problem.failure, StartFailure::CheckFailed, "{problem:?}");
+        assert_eq!(
+            commands(&deck).last().unwrap(),
+            &format!("{SOCKET_ENV}{BREW_BINARY} daemon probe --json")
+        );
+        let row = crate::remote::RemotesFile::load(&path)
+            .unwrap()
+            .remotes
+            .remove(0);
+        assert_eq!(row, entry, "the row is left as it was");
+    }
+
+    /// A deck list holding one row, for this module's endpoint, that records
+    /// no binary.
+    fn deck_list_without_a_binary() -> (tempfile::TempDir, PathBuf, RemoteEntry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let entry = RemoteEntry {
+            name: "build".into(),
+            kind: "ssh".into(),
+            host: "deploy@build-box".into(),
+            port: 2222,
+            key: None,
+            version: "0.40.0".into(),
+            added_at: "2026-10-01T00:00:00Z".into(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
+        };
+        crate::remote::RemotesFile {
+            remotes: vec![entry.clone()],
+        }
+        .save(&path)
+        .unwrap();
+        (dir, path, entry)
     }
 
     /// The control: a row that records its own binary is not searched past
