@@ -341,22 +341,28 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     counters, and which five is named, not positional: NEEDS INPUT and FAILED
     stay, because a person has to act on them, and IDLE and GROUPS give way.
   */
-  test.describe("at a 1200px window", () => {
-    test.use({ viewport: { width: 1200, height: 800 } });
-
-    /// Scenario: open the fleet dashboard in a 1200px window. NEEDS INPUT and FAILED are among the counters still shown, IDLE and GROUPS are not, and the counters stop short of the header's buttons.
+  test.describe("between 961px and 1260px", () => {
+    /// Scenario: open the fleet dashboard in a 1200px window, then narrow it to 961px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
     test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
+      await page.setViewportSize({ width: 1200, height: 800 });
       await openOverview(page, "fleet");
-      for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
-        await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at 1200px`).toBeVisible();
+      for (const width of [1200, 961]) {
+        await page.setViewportSize({ width, height: 800 });
+        for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
+          await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at ${width}px`).toBeVisible();
+        }
+        for (const name of ["idle", "groups"]) {
+          await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at ${width}px`).toBeHidden();
+        }
+        const layout = await page.evaluate(() => {
+          const counters = document.querySelector(".overview-instruments")?.getBoundingClientRect();
+          const actions = Array.from(document.querySelectorAll(".topbar .top-actions")).at(-1)?.getBoundingClientRect();
+          return { countersRight: counters?.right, actionsLeft: actions?.left, actionsRight: actions?.right, scroll: document.documentElement.scrollWidth, viewport: window.innerWidth };
+        });
+        expect(layout.countersRight, `the counters run under the header's buttons at ${width}px`).toBeLessThanOrEqual((layout.actionsLeft ?? 0) + 0.5);
+        expect(layout.actionsRight, `the header's buttons run off the window at ${width}px`).toBeLessThanOrEqual(layout.viewport + 0.5);
+        expect(layout.scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(layout.viewport);
       }
-      for (const name of ["idle", "groups"]) {
-        await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at 1200px`).toBeHidden();
-      }
-      const counters = await page.locator(".overview-instruments").boundingBox();
-      const actions = await page.locator(".topbar .top-actions").first().boundingBox();
-      expect(counters && actions, "the header did not lay out").toBeTruthy();
-      expect(counters!.x + counters!.width, "the counters run under the header's buttons").toBeLessThanOrEqual(actions!.x + 0.5);
     });
   });
 
