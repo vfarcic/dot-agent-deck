@@ -17,7 +17,7 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { UNREPORTED } from "../types";
+import { statusLabel, UNREPORTED } from "../types";
 import type {
   AgentPanePresentation,
   AgentSession,
@@ -405,7 +405,7 @@ export function AgentTile({
                 takes, and half of them are not verbs — `last seen passed` and
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
-              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${agent.status}` : agent.status}</span>
+              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${statusLabel(agent.status)}` : statusLabel(agent.status)}</span>
             </div>
             {renameDraft !== undefined ? (
               <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>

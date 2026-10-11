@@ -117,11 +117,11 @@ describe("terminalInputState", () => {
   });
 
   /**
-   * Scenario: a running agent nothing has been submitted to. `waiting` and
-   * `failed` are not gate statuses — an agent that failed a check still owns a
+   * Scenario: a running agent nothing has been submitted to. `needs_input`,
+   * `idle` and `failed` are not gate statuses — an agent that failed a check still owns a
    * live pane the operator may want to talk to.
    */
-  it.each(["running", "waiting", "failed"] satisfies AgentSession["status"][])("leaves a %s agent's input open", (status) => {
+  it.each(["running", "needs_input", "idle", "failed"] satisfies AgentSession["status"][])("leaves a %s agent's input open", (status) => {
     expect(terminalInputState(pane("write", status))).toMatchObject({ readOnly: false });
   });
 });

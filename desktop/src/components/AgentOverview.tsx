@@ -1,7 +1,7 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
+import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
@@ -126,7 +126,8 @@ export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): stri
  */
 const FIXTURE_DAEMON_STATUS: Partial<Record<AgentStatus, DesktopAgentDto["status"]>> = {
   running: "working",
-  waiting: "waiting_for_input",
+  needs_input: "waiting_for_input",
+  idle: "idle",
   failed: "error",
   blocked: "blocked",
 };
@@ -337,8 +338,11 @@ function roleIndexOf(agent: OverviewAgent): number {
   return agent.tab.kind === "orchestration" ? agent.tab.roleIndex : 0;
 }
 
-/** Statuses in the order an operator scans them: what needs attention first. */
-const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "blocked", "queued", "passed", "stopped"];
+/**
+ * Statuses in the order an operator scans them: what needs attention first.
+ * Idle comes after every state a person has to act on (issue #1676).
+ */
+const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "idle", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER
@@ -1438,8 +1442,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           <div className="run-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
             <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
-            <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
+            <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
             <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+            <OverviewInstrument label="IDLE" testId="overview-count-idle"><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
             <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
             {/*
               PRD #742 M4. The one instrument that is ALWAYS known, and it is
@@ -1760,7 +1765,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
         {deck.connected && deck.agents.length > 0 && (
           <div className="daemon-pips">{deck.counts.map((entry) => (
-            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
+            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
           ))}</div>
         )}
         {/*
@@ -2344,7 +2349,7 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
         <div className="overview-group-pips">{counts.map((entry) => (
-          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
+          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
         ))}</div>
         {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
         {stopControls && group.kind === "orchestration" && (
@@ -2465,7 +2470,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         return (
           <td className="overview-state" role="cell" key={column}>
             <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
-            <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+            <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
           </td>
         );
       case "displayName":

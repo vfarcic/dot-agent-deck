@@ -481,7 +481,7 @@ function groupCard(kind: OverviewGroupKind, id: string): HTMLElement {
 }
 
 /** Every fleet instrument in the header, in the order the top bar shows them. */
-const COUNTERS = ["agents", "running", "waiting", "failed", "groups"] as const;
+const COUNTERS = ["agents", "running", "needs-input", "failed", "idle", "groups"] as const;
 
 function counterText(): string[] {
   return COUNTERS.map((name) => screen.getByTestId(`overview-count-${name}`).querySelector("strong")?.textContent ?? "");
@@ -584,7 +584,7 @@ describe("AgentOverview", () => {
     }
     expect(rows(document.body)).toHaveLength(15);
     expect(screen.getAllByRole("article")).toHaveLength(4);
-    expect(counterText()).toEqual(["15", "6", "8", "1", "4"]);
+    expect(counterText()).toEqual(["15", "6", "2", "1", "6", "4"]);
     expect(screen.getByTestId("daemon-group")).toHaveAttribute("data-daemon-id", FIXTURE_DAEMON_ID);
   });
 
@@ -1982,7 +1982,7 @@ describe("AgentOverview", () => {
 
     renderOverview({ snapshot });
 
-    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—", "—"]);
     expect(screen.getByTestId("overview-disconnected")).toBeVisible();
     // And the header's status pips, which say the same thing in words.
     expect(document.querySelector(".daemon-pips")).toBeNull();
@@ -1993,7 +1993,7 @@ describe("AgentOverview", () => {
     snapshot.connection = { status: "loading", socketPath: FIXTURE_DAEMON_ID, message: "Connecting to the daemon" };
     renderOverview({ snapshot });
 
-    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—", "—"]);
     expect(screen.getByTestId("overview-loading")).toBeVisible();
   });
 
@@ -2028,7 +2028,7 @@ describe("AgentOverview", () => {
     // This snapshot carries the default fleet, so the counters are exactly
     // where "cannot read them" would be contradicted by a number.
     expect(snapshot.agents.length).toBeGreaterThan(0);
-    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—", "—"]);
   });
 
   /**
@@ -3004,7 +3004,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const fleet = [createFixtureSnapshot("disconnected"), createFixtureSnapshot("error")];
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
 
-    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—", "—"]);
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("0/2");
   });
 

@@ -248,7 +248,7 @@ heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running",
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
-status (working, thinking, waiting for input, idle, blocked, error), of an agent type (Claude Code,
+status (working, thinking, needs input, idle, blocked, error), of an agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
 contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
 all working agents, show Codex agents, show the agents on build box, show only agents waiting for

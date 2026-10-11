@@ -445,3 +445,64 @@ describe("agent details behind the experimental flag", () => {
     expect(setShownTerminals.mock.lastCall?.[0]).toContainEqual({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" });
   });
 });
+
+/**
+ * Issue #1676. The daemon tells an agent that finished its turn (`idle`) from
+ * one that is waiting on the user (`waiting_for_input`), and the TUI shows them
+ * as Idle and Needs Input. The desktop must too, on every screen that shows an
+ * agent's status, or an idle agent reads as one that needs you.
+ */
+describe("idle and needs input are two states (issue #1676)", () => {
+  beforeEach(() => {
+    terminalBuilt.mockClear();
+    window.localStorage.clear();
+  });
+
+  function liveRuntime() {
+    const snapshot = mapDesktopSnapshot({
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      agents: ([["1", "Resting", "idle"], ["2", "Asking", "waiting_for_input"], ["3", "Unheard", "unknown"]] as const).map(([id, displayName, status]) => ({ id, displayName, cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status, toolCount: 0, tab: { kind: "dashboard" as const } })),
+      protocolVersion: 8,
+      source: "daemon",
+    });
+    return runtime({ mode: "live", snapshot, fleet: [snapshot] });
+  }
+
+  /** The status word each agent's own status label reads, by agent name. */
+  function labels(cards: HTMLElement[], nameOf: (card: HTMLElement) => string | null | undefined): Record<string, string> {
+    return Object.fromEntries(cards.map((card) => [nameOf(card) ?? "", card.querySelector(".status-label")?.textContent ?? ""]));
+  }
+
+  /**
+   * Scenario: open the agent dashboard on a daemon with an idle agent, an agent
+   * waiting for the user and an agent in a status the daemon calls unknown. The
+   * rows read idle, needs input and idle, as the TUI's cards read Idle, Needs
+   * Input and Idle, and the header counts one needing input and two idle.
+   */
+  it("labels an idle agent and one that needs the user differently on the dashboard", () => {
+    render(<AppDeckShell runtime={liveRuntime()} initialView={{ kind: "overview" }} />);
+    const rows = screen.getAllByRole("row").filter((row) => row.classList.contains("overview-row"));
+
+    expect(labels(rows, (row) => row.querySelector(".overview-agent-name strong")?.textContent)).toEqual({ Resting: "idle", Asking: "needs input", Unheard: "idle" });
+    expect(screen.getByTestId("overview-count-needs-input")).toHaveTextContent("1");
+    expect(screen.getByTestId("overview-count-idle")).toHaveTextContent("2");
+  });
+
+  /**
+   * Scenario: open the deck with the same three agents, then open the agent
+   * that needs the user. Each tile's status reads idle or needs input, and the
+   * agent screen's header keeps saying needs input.
+   */
+  it("labels them differently on the deck's tiles and on the agent screen", () => {
+    const deck = liveRuntime();
+    const { unmount } = render(<DeckShell runtime={deck} />);
+    // Every tile is titled by its agent type, so they are read in the daemon's order.
+    const tiles = Array.from(document.querySelectorAll<HTMLElement>("article.agent-tile"));
+
+    expect(tiles.map((tile) => tile.querySelector(".status-label")?.textContent)).toEqual(["idle", "needs input", "idle"]);
+    unmount();
+
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: "deck-000000000000dec1", agentId: "2", from: "overview" }} />);
+    expect(within(screen.getByTestId("agent-pane-overlay")).getAllByText("needs input")[0]).toHaveClass("status-label");
+  });
+});
