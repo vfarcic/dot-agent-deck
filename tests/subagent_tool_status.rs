@@ -695,7 +695,7 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .clone()
 }
 
-/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, a queued SessionEnd of the ending spawn leaves alone a successor hydrated under the same key before it, and legacy shell promotion still works without the fields.
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, a queued SessionEnd of the ending spawn leaves alone a successor hydrated under the same key before it — its card, history, background and hook generation — even when the ending spawn's own card sits under another key, while that spawn's own end still restores a placeholder and closes its generation; and legacy shell promotion still works without the fields.
 #[spec("status/background/003")]
 #[test]
 fn background_003_snapshot_hydration_and_revision_ordering() {
@@ -1016,6 +1016,246 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
         json!(1),
         "the successor's own revision 1 is still accepted"
     );
+
+    // AU-15 and AU-16: the ending spawn's queued SessionEnd is judged against
+    // the card under its key BEFORE the same-agent reuse remap or any terminal
+    // generation bookkeeping, so a rejected end changes nothing.
+    let frame = |key: &str, pane: &str, agent: &str, kind: EventType, seconds: i64| {
+        let mut event: AgentEvent = serde_json::from_value(json!({
+            "session_id": key, "pane_id": pane, "agent_id": agent,
+            "agent_type": "claude_code", "event_type": "thinking",
+            "timestamp": chrono::DateTime::from_timestamp(seconds, 0).unwrap(),
+        }))
+        .unwrap();
+        event.event_type = kind;
+        event.metadata.insert(
+            PANE_GENERATION_METADATA_KEY.into(),
+            GenerationVerdict::Current.metadata_value().into(),
+        );
+        event
+    };
+    let cards = |state: &AppState| {
+        let mut cards: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|(key, card)| (key.clone(), card.agent_id.clone()))
+            .collect();
+        cards.sort();
+        cards
+    };
+
+    // AU-15: the ending spawn's card is filed under a stable key, its next
+    // conversation reports under the pane key, and the successor is hydrated
+    // under that pane key before the ending spawn's end is drained. The reuse
+    // guard must not spend the pane key — the successor's card — remapping the
+    // end onto the ending spawn's stable card.
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.apply_event(frame(
+        "stable-ending-card",
+        PANE,
+        "ending-spawn",
+        EventType::SessionStart,
+        1,
+    ));
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::SessionStart,
+        2,
+    ));
+    assert!(!state.sessions.contains_key(&placeholder));
+    let mut successor = state.sessions["stable-ending-card"].live_snapshot();
+    successor.tool_count = 5;
+    successor.first_prompts = vec!["the successor's prompt".into()];
+    successor.background =
+        serde_json::from_value(json!({"commands": 1, "subagents": 0, "since_ms": null})).ok();
+    successor.background_revision = Some(2);
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let before_cards = cards(&state);
+    let before = state.sessions[&placeholder].clone();
+    assert_eq!(before.agent_id.as_deref(), Some("successor-spawn"));
+    let mut end = frame(&placeholder, PANE, "ending-spawn", EventType::SessionEnd, 3);
+    end.background =
+        serde_json::from_value(json!({"commands": 0, "subagents": 0, "since_ms": null})).ok();
+    end.background_revision = Some(40);
+    state.apply_event(end);
+    assert_eq!(
+        cards(&state),
+        before_cards,
+        "AU-15: a SessionEnd for another spawn moves no card"
+    );
+    let after = &state.sessions[&placeholder];
+    assert_eq!(after.agent_id.as_deref(), Some("successor-spawn"));
+    assert_eq!(after.started_at, before.started_at);
+    assert_eq!(
+        after.tool_count, 5,
+        "AU-15: the successor keeps its history"
+    );
+    assert_eq!(after.first_prompts, before.first_prompts);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    let kept = serde_json::to_value(after.live_snapshot()).unwrap();
+    assert_eq!(
+        (
+            kept["background"]["commands"].clone(),
+            kept["background_revision"].clone()
+        ),
+        (json!(1), json!(2)),
+        "AU-15: the ending spawn's revision-40 clear is not seeded onto the successor: {kept}"
+    );
+
+    // AU-16: the successor is hydrated with a live hook generation under the
+    // same session key the ending spawn's end names. The rejected end must not
+    // close that generation, count a closure, or record the ending spawn's
+    // generation as ended.
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::Thinking,
+        1,
+    ));
+    let mut successor = state.sessions[&placeholder].live_snapshot();
+    successor.hook_generation = Some(dot_agent_deck::state::HookGeneration {
+        session_id: placeholder.clone(),
+        established_ms: 1000,
+    });
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let generation_before = state.pane_hook_session_entry(PANE);
+    assert_eq!(
+        generation_before.as_ref().map(|(id, _)| id.as_str()),
+        Some(placeholder.as_str())
+    );
+    let closures_before = state.pane_generation_closures(PANE);
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::SessionEnd,
+        2,
+    ));
+    assert_eq!(
+        state.sessions[&placeholder].agent_id.as_deref(),
+        Some("successor-spawn")
+    );
+    assert_eq!(
+        state.pane_hook_session_entry(PANE),
+        generation_before,
+        "AU-16: the successor's delivery generation survives the rejected end"
+    );
+    assert_eq!(
+        state.pane_generation_closures(PANE),
+        closures_before,
+        "AU-16: the rejected end counts no closure"
+    );
+    assert!(
+        !state.agent_generation_ended("ending-spawn"),
+        "AU-16: the rejected end records no generation as ended"
+    );
+
+    // The pane check: an end naming the key of a card on ANOTHER pane is
+    // re-keyed to its own pane and leaves that card alone, even when the card
+    // names the same agent.
+    let other_pane = format!("{PANE}-other");
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.register_pane(other_pane.clone());
+    state.apply_event(frame(
+        "shared-key",
+        &other_pane,
+        "ending-spawn",
+        EventType::Thinking,
+        1,
+    ));
+    let before = state.sessions["shared-key"].clone();
+    state.apply_event(frame(
+        "shared-key",
+        PANE,
+        "ending-spawn",
+        EventType::SessionEnd,
+        2,
+    ));
+    let after = state
+        .sessions
+        .get("shared-key")
+        .expect("another pane's card survives an end on this pane");
+    assert_eq!(after.pane_id.as_deref(), Some(other_pane.as_str()));
+    assert_eq!(after.agent_id, before.agent_id);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    assert_eq!(
+        state.pane_hook_session_id(&other_pane).as_deref(),
+        Some("shared-key"),
+        "the other pane's generation is not closed by this pane's end"
+    );
+    assert_eq!(state.pane_generation_closures(&other_pane), 0);
+
+    // Controls: the ending spawn's own end still removes its card, restores
+    // the pane's placeholder and closes its generation — under the key its
+    // card is filed under, and remapped from the pane key onto its stable card.
+    for stable in [false, true] {
+        let mut state = AppState::default();
+        state.register_pane(PANE.into());
+        let card_key = if stable {
+            "stable-ending-card"
+        } else {
+            placeholder.as_str()
+        };
+        state.apply_event(frame(
+            card_key,
+            PANE,
+            "ending-spawn",
+            EventType::SessionStart,
+            1,
+        ));
+        state.apply_event(frame(
+            &placeholder,
+            PANE,
+            "ending-spawn",
+            EventType::SessionStart,
+            2,
+        ));
+        assert_eq!(
+            cards(&state),
+            vec![(card_key.to_string(), Some("ending-spawn".into()))],
+            "stable={stable}: the pane-key frame lands on the ending spawn's card"
+        );
+        assert_eq!(
+            state.pane_hook_session_id(PANE).as_deref(),
+            Some(placeholder.as_str())
+        );
+        let closures_before = state.pane_generation_closures(PANE);
+        state.apply_event(frame(
+            &placeholder,
+            PANE,
+            "ending-spawn",
+            EventType::SessionEnd,
+            3,
+        ));
+        assert_eq!(
+            cards(&state),
+            vec![(placeholder.clone(), Some("ending-spawn".into()))],
+            "stable={stable}: the ending spawn's own end restores a bare placeholder"
+        );
+        assert!(state.sessions[&placeholder].recent_events.is_empty());
+        assert_eq!(state.pane_hook_session_id(PANE), None);
+        assert_eq!(state.pane_generation_closures(PANE), closures_before + 1);
+        assert!(state.agent_generation_ended("ending-spawn"));
+    }
 }
 
 /// Scenario: A background subagent raises a permission request after the turn ended, and only then does a TUI attach, restoring the card from the daemon's live snapshot as it arrives over the wire. When that subagent then stops, the attached TUI's card must leave Needs Input for Idle, as the daemon's does; the control is a snapshot from a daemon that sends no subagent attribution, whose card keeps today's Needs Input.

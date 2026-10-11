@@ -16283,6 +16283,39 @@ impl AppState {
             }
         }
 
+        // Issue #1678 (AU-13, AU-15, AU-16): a `SessionEnd` is the ENDING
+        // spawn's, so it may not end a card of another spawn's. A card filed
+        // under its key that names a different agent — a successor a client
+        // hydrated under the same key before draining this end, which a Current
+        // verdict does not refuse — is not this end's to touch, and the end is
+        // refused here, ahead of everything below that mutates on its behalf:
+        // the reuse guard's removal of the incoming key (which would remove the
+        // successor's card while remapping the end onto the ending spawn's own
+        // card under another key, AU-15), the terminal branch's generation
+        // bookkeeping (which would clear the successor's hook generation and
+        // count a closure that cancels a delivery to it, AU-16), and the
+        // terminal branch's remove, restore and revision seed (AU-13).
+        //
+        // The ending agent is the one the event names, else the one its token
+        // was attested to (`attested_agent` in the daemon, the daemon's marker
+        // in a client). A side that names nothing is not evidence of a
+        // different spawn, so an end from a producer naming no agent, or
+        // against a card naming none, proceeds as before. A card on another
+        // pane needs no check here when both sides name a pane: the
+        // qualification above has already re-keyed the end off that card.
+        if event.event_type == EventType::SessionEnd
+            && let Some(ending) = admission_agent
+                .as_deref()
+                .or_else(|| event.attested_owner())
+            && self
+                .sessions
+                .get(&event.session_id)
+                .and_then(|session| session.agent_id.as_deref())
+                .is_some_and(|held| held != ending)
+        {
+            return AppliedEvent::Rejected;
+        }
+
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -16852,33 +16885,10 @@ impl AppState {
             // there a dispatched worker lost its role name on its first
             // delegation.
             //
-            // Issue #1678 (AU-13): the end is the ENDING spawn's, so it removes,
-            // restores and seeds only a card of that spawn. A card filed under
-            // the key that names another agent — a successor a client hydrated
-            // under the same key before draining this end, which a Current
-            // verdict does not refuse — or that sits on another pane is not
-            // this end's to touch: removing it would cost the successor its
-            // card, identity and history, and the terminal copy below would
-            // seed this spawn's revision onto the successor's placeholder,
-            // where it would outrank the successor's own aggregates. The
-            // ending agent is the one the event names, else the one the daemon
-            // attested it to (the admission guard above for an absent
-            // `agent_id`); a side that names nothing is not evidence of a
-            // different spawn, so the end proceeds as before.
-            let ending_agent = event.agent_id.as_deref().or_else(|| event.attested_owner());
-            if self.sessions.get(&event.session_id).is_some_and(|session| {
-                let other_agent = matches!(
-                    (session.agent_id.as_deref(), ending_agent),
-                    (Some(held), Some(ending)) if held != ending
-                );
-                let other_pane = matches!(
-                    (session.pane_id.as_deref(), event.pane_id.as_deref()),
-                    (Some(held), Some(ending)) if held != ending
-                );
-                other_agent || other_pane
-            }) {
-                return AppliedEvent::Rejected;
-            }
+            // Issue #1678 (AU-13): a card of another spawn's under this key was
+            // refused ahead of the reuse guard (see there), so the card removed
+            // and restored here names the ending agent or no agent — unless the
+            // end itself names no agent, which that guard does not judge.
             let restored = self.sessions.get(&event.session_id).and_then(|session| {
                 session.pane_id.as_ref().map(|pid| {
                     self.pane_started_at.insert(pid.clone(), session.started_at);
@@ -25660,6 +25670,66 @@ while True:
             Some("8".into()),
         );
         assert_eq!(minted, placeholder_session_id("role-p"));
+    }
+
+    /// Issue #1678 (AU-16): a `SessionEnd` from the outgoing spawn, drained
+    /// after a successor was hydrated under the same key with the same hook
+    /// generation, is refused before the terminal branch's generation
+    /// bookkeeping — so the successor's generation stays ANNOUNCED, which is
+    /// the half of that state no public accessor shows
+    /// (`status/background/003` pins the rest).
+    #[test]
+    fn a_rejected_session_end_for_another_spawn_keeps_the_generation_announced() {
+        let pane = UNTAGGED_PANE;
+        let key = placeholder_session_id(pane);
+        let mut state = AppState::default();
+        state.register_pane(pane.into());
+        let mut start = untagged_event(&key, EventType::SessionStart);
+        start.agent_id = Some("ending-spawn".into());
+        start.timestamp = Utc::now() - chrono::Duration::seconds(10);
+        state.apply_event(start.clone());
+        assert!(state.pane_generation_announced.contains(pane));
+
+        let mut successor = state.sessions[&key].live_snapshot();
+        successor.hook_generation = Some(HookGeneration {
+            session_id: key.clone(),
+            established_ms: start.timestamp.timestamp_millis(),
+        });
+        state.seed_hydrated_session(
+            pane.into(),
+            None,
+            None,
+            Some("successor-spawn".into()),
+            Some(&successor),
+        );
+        assert_eq!(
+            state.sessions[&key].agent_id.as_deref(),
+            Some("successor-spawn")
+        );
+        assert!(state.pane_generation_announced.contains(pane));
+
+        let mut end = start;
+        end.event_type = EventType::SessionEnd;
+        end.timestamp += chrono::Duration::seconds(1);
+        end.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.into(),
+            crate::event::GenerationVerdict::Current
+                .metadata_value()
+                .into(),
+        );
+        state.apply_event(end);
+
+        assert_eq!(
+            state.sessions[&key].agent_id.as_deref(),
+            Some("successor-spawn")
+        );
+        assert_eq!(state.pane_hook_session_id(pane), Some(key));
+        assert!(
+            state.pane_generation_announced.contains(pane),
+            "the rejected end must leave the successor's generation announced"
+        );
+        assert_eq!(state.pane_generation_closures(pane), 0);
+        assert!(!state.agent_generation_ended("ending-spawn"));
     }
 
     #[test]
