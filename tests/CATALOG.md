@@ -1119,7 +1119,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/background/008 — Real interactive Haiku subagent work stays visible after the main Stop and clears on its paired stop (#1678).
 - **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
 - **Agent:** real interactive Claude Haiku plus one real Haiku subagent, onboarding/trust seeded and allowedTools Bash Agent.
-- **Asserts:** one background Agent runs three slow Bash steps writing unique start/completion sentinels; after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
+- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
 - **Does not assert:** exact Claude transcript phrasing, desktop, other agent integrations.
 
 ##### status/background/009 — A shell-activity sample that answers after its spawn was replaced touches neither the successor's card nor the broadcast (#1678).

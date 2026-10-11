@@ -220,17 +220,36 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     );
 }
 
-/// Scenario: Ask real interactive Haiku Claude to launch one Haiku subagent doing three slow Bash steps against a unique sentinel, then end the main turn immediately. The rendered card reads Idle with one background subagent (and may also count its commands), and loses the indicator only after that paired subagent's terminal hook and completion sentinel.
+/// Scenario: Ask real interactive Haiku Claude to launch one Haiku subagent doing three exact slow Bash steps against unique absolute start/completion sentinel paths in the fixture directory, then end the main turn immediately. The rendered card reads Idle with one background subagent (and may also count its commands), and loses the indicator only after that paired subagent's terminal hook and completion sentinel.
 #[spec("status/background/008")]
 #[test]
 fn background_008_real_background_subagent_clears_on_paired_stop() {
     skip_unless!(common::check_claude_available());
     const SENTINEL_BG: &str = "background-008-subagent-72841dca.txt";
     let (deck, events, agent_id) = background_live_fixture("background-008-haiku");
-    let prompt = format!(
-        "Your first and only tool call must be Agent, launching exactly one general-purpose subagent with model=haiku and run_in_background=true. Give it this exact directive: 'Use Bash for exactly three sequential steps: (1) printf started > {SENTINEL_BG}; ping -c 20 127.0.0.1 > /dev/null (2) ping -c 20 127.0.0.1 > /dev/null (3) ping -c 20 127.0.0.1 > /dev/null; printf done > {SENTINEL_BG}.done. Use timeout=90000 and run_in_background=false for each Bash call. Do not delegate. Then finish.' After Agent returns, immediately finish your own turn with STARTED. Do not wait, inspect files, call TaskOutput or launch anything else."
+    let sentinel = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_BG);
+    let completion_sentinel = sentinel.with_extension("txt.done");
+    let quote_path =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let first_command = format!(
+        "printf started > {}; ping -c 20 127.0.0.1 > /dev/null",
+        quote_path(&sentinel)
     );
-    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_BG);
+    let middle_command = "ping -c 20 127.0.0.1 > /dev/null";
+    let last_command = format!(
+        "ping -c 20 127.0.0.1 > /dev/null; printf done > {}",
+        quote_path(&completion_sentinel)
+    );
+    let prompt = format!(
+        "First call Agent exactly once: general-purpose, model=haiku, run_in_background=true. Pass this prompt verbatim: Use Bash for three sequential calls with timeout=90000 and run_in_background=false. Set command exactly to (1) `{first_command}` (2) `{middle_command}` (3) `{last_command}`. Write at these absolute sentinel paths; do not substitute /tmp/claude or another location. Do not alter commands, delegate or call other tools. Finish with DONE after call 3. End subagent prompt. After Agent returns immediately finish your main turn with STARTED. Do not wait, inspect, call TaskOutput or use other tools."
+    );
+    // The absolute path can wrap inside its basename in Claude's input box;
+    // use a short directive token to confirm the prompt rendered completely.
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, "timeout=90000");
     let started = events.wait_for(
         |event| {
             event.agent_id.as_deref() == Some(&agent_id)
@@ -253,10 +272,34 @@ fn background_008_real_background_subagent_clears_on_paired_stop() {
         },
         Duration::from_secs(90),
     );
-    assert!(
-        common::wait_for_path(&deck.workdir().join(SENTINEL_BG), Duration::from_secs(30)),
-        "subagent must really do its sentinel work"
-    );
+    if !common::wait_for_path(&sentinel, Duration::from_secs(30)) {
+        let bash_calls: Vec<_> = events
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.event_type == EventType::ToolStart
+                    && event.tool_name.as_deref() == Some("Bash")
+                    && event.timestamp >= submitted.timestamp
+            })
+            .map(|event| {
+                (
+                    event.session_id,
+                    event.cwd,
+                    event.metadata.get("bash_command").cloned(),
+                    event.tool_detail,
+                )
+            })
+            .collect();
+        panic!(
+            "{}",
+            common::redact_credentials_for_output(&format!(
+                "PRECONDITION NOT MET: subagent must really do its sentinel work at {} within 30s of main Stop. Expected first Bash command: {first_command}. Observed Bash hooks (session, cwd, full bash_command when supplied, tool_detail): {bash_calls:#?}\nFinal pane:\n{}",
+                sentinel.display(),
+                deck.snapshot_grid()
+            ))
+        );
+    }
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
     assert!(
@@ -282,12 +325,8 @@ fn background_008_real_background_subagent_clears_on_paired_stop() {
         Duration::from_secs(180),
     );
     assert!(
-        common::wait_for_file_trimmed_eq(
-            &deck.workdir().join(format!("{SENTINEL_BG}.done")),
-            "done",
-            Duration::from_secs(10)
-        )
-        .is_ok(),
+        common::wait_for_file_trimmed_eq(&completion_sentinel, "done", Duration::from_secs(10))
+            .is_ok(),
         "subagent completion sentinel is required"
     );
     assert!(
