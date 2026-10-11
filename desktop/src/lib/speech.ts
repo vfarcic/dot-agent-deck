@@ -29,8 +29,10 @@
  * its audio plays (audit A6). When the wording changed, the audio for the
  * sentence's `safe` form (the one naming the agent, right whichever pane is
  * open) is prepared and played instead: a sentence without the name is never
- * played once its agent's pane is no longer the open one. A refusal of that
- * second request is still never answered with the system voice (D9).
+ * played once its agent's pane is no longer the open one. When the wording
+ * became empty — another agent's pane opened, and that agent alone is read
+ * (issue #1667) — nothing is played. A refusal of that second request is
+ * still never answered with the system voice (D9).
  *
  * # "Is speaking" (D8)
  *
@@ -56,8 +58,9 @@ import type { DeckBridge, SpeechPlanDto } from "./bridge";
 /**
  * One way of saying a sentence. Resolves when it has been said or stopped.
  * `recheck`, when given, is asked right before the audio plays: it answers
- * the text to say instead when `text` is no longer the right wording, and
- * `undefined` otherwise. A voice that says `text` at once may ignore it.
+ * the text to say instead when `text` is no longer the right wording, `""`
+ * when nothing is to be said any more, and `undefined` otherwise. A voice
+ * that says `text` at once may ignore it.
  */
 export interface SpeechVoice {
   speak(text: string, signal: AbortSignal, recheck?: () => string | undefined): Promise<void>;
@@ -237,8 +240,10 @@ export class SpeechQueue {
         const text = word();
         if (text === "") return;
         const recheck = () => {
-          if (word() === text) return undefined;
-          return typeof entry === "object" ? entry.safe.trim() : word();
+          const now = word();
+          if (now === text) return undefined;
+          if (now === "") return "";
+          return typeof entry === "object" ? entry.safe.trim() : now;
         };
         try {
           await this.deps.provider.speak(text, signal, recheck);
@@ -361,7 +366,7 @@ export function providerPlaybackDeadlineMs(seconds: number, maxSeconds = MAX_PRO
  * Right before a clip plays, `recheck` is asked whether its text is still the
  * one to say; when it answers another, that text's audio is prepared and
  * played instead, without asking again (the queue answers a wording that is
- * right whatever happens next).
+ * right whatever happens next), and when it answers `""`, nothing is played.
  */
 export function providerVoice(
   fetchAudio: (text: string) => Promise<ArrayBuffer>,
@@ -385,7 +390,8 @@ export function providerVoice(
       let prepared = await prepare(text, signal);
       if (prepared === undefined) return;
       const instead = recheck?.();
-      if (instead !== undefined && instead !== "" && instead !== text) {
+      if (instead === "") return;
+      if (instead !== undefined && instead !== text) {
         prepared = await prepare(instead, signal);
         if (prepared === undefined) return;
       }

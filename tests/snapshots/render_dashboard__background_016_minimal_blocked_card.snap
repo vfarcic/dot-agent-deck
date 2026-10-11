@@ -1,0 +1,7 @@
+---
+source: tests/render_dashboard.rs
+expression: minimal
+---
+┌ 1 ClaudeCode · background ──────────────────────────────────────── ● Blocked ┐
+│⚠ Usage limit reached · Background: 1 command, 1 subagent · 4m                │
+└────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘

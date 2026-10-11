@@ -22,7 +22,21 @@ export const UNREPORTED = "Unavailable";
 
 export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
-export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped" | "blocked";
+/**
+ * The status an agent is shown in. `needs_input` and `idle` are the TUI's
+ * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
+ * finished its turn are two states, never one.
+ */
+export type AgentStatus = "queued" | "running" | "needs_input" | "idle" | "passed" | "failed" | "stopped" | "blocked";
+
+/**
+ * The words a status is shown as. Each is its own id except Needs input, whose
+ * id cannot carry a space; the TUI's cards say Needs Input and Idle for the
+ * same two states.
+ */
+export function statusLabel(status: AgentStatus): string {
+  return status === "needs_input" ? "needs input" : status;
+}
 
 /** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
 export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
@@ -39,6 +53,19 @@ export type AgentBlocked = {
   detectedAtMs: number;
   detail?: string;
   resetsAtMs?: number;
+};
+/**
+ * Issue #1678: the background work an agent left running after its turn ended,
+ * as the DAEMON counts it — commands still running in their own session and
+ * subagents started and not yet stopped. Present only with at least one count
+ * above zero; `sinceMs` is when the oldest counted item started on the daemon's
+ * clock, absent when the daemon has no start for any of them. The background
+ * aggregate carries counts and an instant, not subagent ids or command lines.
+ */
+export type AgentBackground = {
+  commands: number;
+  subagents: number;
+  sinceMs?: number;
 };
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
@@ -695,7 +722,7 @@ export interface AgentSession {
   status: AgentStatus;
   /**
    * HONEST. The daemon's own status word, before `status` merges Working
-   * with Thinking and Idle with Waiting for input — which the dashboard
+   * with Thinking — which the dashboard
    * filter keeps apart (issue #1496). Absent in fixture mode, whose agents
    * have only `status`.
    */
@@ -817,6 +844,13 @@ export interface AgentSession {
   authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
+  /**
+   * HONEST. Issue #1678: background work still running after the agent's turn
+   * ended, copied from the daemon's aggregate and validated at the bridge.
+   * Rendering goes through `displayBackgroundWork`, which words it exactly as
+   * the TUI card does.
+   */
+  background?: AgentBackground;
   /** HONEST. */
   rows: number;
   /** HONEST. */

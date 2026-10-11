@@ -137,7 +137,7 @@ impl fmt::Display for Screen {
 /// dashboard filter's two closed sets (issue #1496): what kind of agent a row
 /// is (an orchestration role, a single agent, or one of the dispatcher,
 /// schedule and schedule: issues modes) and what it is doing (working,
-/// thinking, waiting for input, idle, blocked, error). They are this app's own
+/// thinking, needs input, idle, blocked, error). They are this app's own
 /// vocabulary rather than names it observed, so they resolve against a fixed
 /// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
 /// form's resolves against the agent types the deck knows the same way.

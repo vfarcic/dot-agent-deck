@@ -81,6 +81,8 @@ fn realistic_thinking_event(pane_id: &str, agent_id: &str, cwd: &str, n: usize) 
         agent_version: Some("claude-code 1.2.3".to_string()),
         schema_version: Some(1),
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 

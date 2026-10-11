@@ -33,9 +33,8 @@ export type DashboardKind = "orchestration" | "single" | "dispatcher" | "schedul
 
 /**
  * The daemon's own status words the filter offers. They are kept apart here
- * even though the dashboard's status column merges Working with Thinking and
- * Idle with Waiting for input, because "show only agents waiting for input" is
- * not a request for idle ones.
+ * even though the dashboard's status column merges Working with Thinking,
+ * because "show only working agents" is not a request for thinking ones.
  */
 export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "idle" | "blocked" | "error";
 
@@ -61,7 +60,7 @@ export const DASHBOARD_KINDS: readonly { id: DashboardKind; label: string; mode?
 export const DASHBOARD_STATUSES: readonly { id: DashboardStatus; label: string }[] = [
   { id: "working", label: "Working" },
   { id: "thinking", label: "Thinking" },
-  { id: "waiting_for_input", label: "Waiting for input" },
+  { id: "waiting_for_input", label: "Needs input" },
   { id: "idle", label: "Idle" },
   { id: "blocked", label: "Blocked" },
   { id: "error", label: "Error" },
@@ -112,7 +111,8 @@ function kindOf(agent: DashboardFilterFacts): DashboardKind | undefined {
 /** The filter status for each status column, for a daemon word the filter does not offer by name. */
 const COLUMN_FILTER_STATUS: Partial<Record<AgentStatus, DashboardStatus>> = {
   running: "working",
-  waiting: "idle",
+  needs_input: "waiting_for_input",
+  idle: "idle",
   failed: "error",
   blocked: "blocked",
 };

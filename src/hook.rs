@@ -91,6 +91,11 @@ pub(crate) struct OpenCodeHookInput {
     response_markers: Option<Value>,
     #[serde(default, deserialize_with = "lenient_string_map")]
     response_headers: HashMap<String, String>,
+    // Issue #1678: the raw id of the child session a subagent's report comes
+    // from, set by the deck's plugin on `subagent.start` / `subagent.stop` and
+    // on that child's tool calls (`crate::opencode_manage`).
+    #[serde(default, deserialize_with = "lenient_string")]
+    subagent_id: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -565,9 +570,14 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // says so, and that it is absent on the main thread) and Codex
     // (`thread_spawn_subagent_hook_context` sets it for a thread-spawned
     // subagent and nothing else). Devin's hook input carries no such field.
-    let subagent_id = subagent_id
-        .filter(|id| !id.is_empty())
-        .filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
+    //
+    // Issue #1678: an EMPTY id is still a subagent's — the key's presence is
+    // the attribution, and the main thread sends no key at all. Dropping it
+    // turned such a call into a main-thread one that set Working on a card
+    // whose turn was over. The background-work tracker refuses to key on an
+    // empty or oversized id; the event keeps its attribution either way.
+    let subagent_id =
+        subagent_id.filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
     let from_subagent = subagent_id.is_some();
 
     let mut event_type = map_event_type(&hook_event_name)?;
@@ -783,6 +793,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     })
 }
 
@@ -876,6 +888,8 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::PermissionRequest),
         "permission.replied" => Some(EventType::Thinking),
+        "subagent.start" => Some(EventType::SubagentStart),
+        "subagent.stop" => Some(EventType::SubagentStop),
         _ => None,
     }
 }
@@ -888,8 +902,17 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
     let mut metadata = HashMap::new();
+    if input.event == "permission.replied" {
+        metadata.insert(
+            crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
+            crate::event::PERMISSION_STATE_REPLIED.to_string(),
+        );
+    }
     if matches!(event_type, EventType::PermissionRequest) {
-        metadata.insert("permission_state".to_string(), "pending".to_string());
+        metadata.insert(
+            crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
+            "pending".to_string(),
+        );
         metadata.insert(
             "tool_use_id".to_string(),
             format!(
@@ -897,6 +920,29 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
                 input.session_id,
                 Utc::now().timestamp_millis()
             ),
+        );
+    }
+
+    // Issue #1678: a child session's report is its subagent's (issue #1354),
+    // so it does not move the card's status and the daemon counts the child as
+    // background work after the turn ends. Only on the events the plugin tags:
+    // a child's lifecycle, tool calls and permission prompts. A child's
+    // answered prompt arrives as a `Thinking` marked replied, which ends that
+    // subagent's wait and nothing else (`AgentEvent::is_subagent_permission_reply`).
+    if let Some(subagent_id) = input.subagent_id.filter(|_| {
+        matches!(
+            input.event.as_str(),
+            "subagent.start"
+                | "subagent.stop"
+                | "tool.execute.before"
+                | "tool.execute.after"
+                | "permission.asked"
+                | "permission.replied"
+        )
+    }) {
+        metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            subagent_id,
         );
     }
 
@@ -955,6 +1001,8 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     })
 }
 
@@ -1024,6 +1072,8 @@ pub fn build_agent_event_cli(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -4232,6 +4282,66 @@ mod tests {
         );
     }
 
+    /// Issue #1678: the OpenCode plugin's `subagent.start` / `subagent.stop`
+    /// decode to `SubagentStart` / `SubagentStop` carrying the child session's
+    /// id as `SUBAGENT_ID_METADATA_KEY`, and a child's tool call and permission
+    /// prompt keep that attribution, its answered prompt marked replied. On any
+    /// other event the field attributes nothing, and a non-string one is
+    /// ignored.
+    #[test]
+    fn opencode_subagent_id_is_forwarded_on_child_session_reports_only() {
+        let decode = |payload: Value| {
+            build_opencode_event(serde_json::from_value(payload).unwrap())
+                .expect("a known OpenCode event")
+        };
+        let key = crate::event::SUBAGENT_ID_METADATA_KEY;
+        for (event, expected) in [
+            ("subagent.start", EventType::SubagentStart),
+            ("subagent.stop", EventType::SubagentStop),
+            ("tool.execute.before", EventType::ToolStart),
+            ("tool.execute.after", EventType::ToolEnd),
+            ("permission.asked", EventType::PermissionRequest),
+            ("permission.replied", EventType::Thinking),
+        ] {
+            let decoded = decode(serde_json::json!({
+                "session_id": "root", "event": event, "subagent_id": "child", "tool_name": "bash",
+            }));
+            assert_eq!(
+                decoded.is_subagent_permission_reply(),
+                event == "permission.replied",
+                "{event}"
+            );
+            assert_eq!(decoded.event_type, expected, "{event}");
+            assert_eq!(
+                decoded.metadata.get(key).map(String::as_str),
+                Some("child"),
+                "{event}"
+            );
+            assert_eq!(decoded.session_id, "root", "{event}");
+        }
+        for (event, status) in [
+            ("session.idle", None),
+            ("session.status", Some("busy")),
+            ("session.prompt", None),
+        ] {
+            let decoded = decode(serde_json::json!({
+                "session_id": "root", "event": event, "status": status, "subagent_id": "child",
+            }));
+            assert!(!decoded.is_from_subagent(), "{event}");
+        }
+        // The main thread's answered prompt is marked replied too, and stays
+        // the main thread's `Thinking`.
+        let main_reply =
+            decode(serde_json::json!({"session_id": "root", "event": "permission.replied"}));
+        assert!(!main_reply.is_from_subagent());
+        assert!(!main_reply.is_subagent_permission_reply());
+        let odd = decode(serde_json::json!({
+            "session_id": "root", "event": "tool.execute.before", "subagent_id": 7,
+        }));
+        assert!(!odd.is_from_subagent());
+        assert_eq!(odd.event_type, EventType::ToolStart);
+    }
+
     /// Issue #1354: the payload's `agent_id` — set by Claude Code and Codex
     /// only on a hook fired inside a subagent — is forwarded as
     /// `SUBAGENT_ID_METADATA_KEY` for exactly those two agents, and never
@@ -4271,13 +4381,15 @@ mod tests {
         let devin = build_event_typed(payload("a7c1".into()), AgentType::Devin).unwrap();
         assert!(!devin.is_from_subagent());
 
-        // An empty id, a non-string shape, and an absent key are all "main thread".
-        for odd in [
-            Value::from(""),
-            Value::from(7),
-            serde_json::json!({"id": "x"}),
-            Value::Null,
-        ] {
+        // Issue #1678: an empty id is a subagent's still — the key's presence
+        // is the attribution — and the tracker, not the hook, refuses to key on
+        // it.
+        let empty = build_event(payload(Value::from(""))).unwrap();
+        assert_eq!(empty.metadata.get(key).map(String::as_str), Some(""));
+        assert!(empty.is_from_subagent());
+
+        // A non-string shape and an absent key are "main thread".
+        for odd in [Value::from(7), serde_json::json!({"id": "x"}), Value::Null] {
             let event = build_event(payload(odd.clone())).unwrap();
             assert!(!event.is_from_subagent(), "agent_id = {odd}");
             assert_eq!(event.event_type, EventType::ToolStart, "agent_id = {odd}");
@@ -4326,6 +4438,349 @@ mod tests {
         assert_eq!(
             build_event(main).unwrap().event_type,
             EventType::QuotaBlocked
+        );
+    }
+}
+
+/// Issue #1678: an OpenCode subagent's (child session's) permission prompt,
+/// decoded by the real hook builder and applied by the daemon's reducer.
+#[cfg(test)]
+mod opencode_child_permission_tests {
+    use std::sync::Arc;
+
+    use super::build_opencode_event;
+    use crate::event::GenerationVerdict;
+    use crate::state::{AgentOwnership, AppState, Ownership, SessionStatus};
+
+    const PANE: &str = "oc-permission-pane";
+    const AGENT: &str = "oc-permission-agent";
+
+    struct OwnsPane;
+
+    impl AgentOwnership for OwnsPane {
+        fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership {
+            if pane_id == Some(PANE) && agent_id == Some(AGENT) {
+                Ownership::Owned
+            } else {
+                Ownership::Unclaimed
+            }
+        }
+
+        fn pane_generation_verdict(
+            &self,
+            pane_id: &str,
+            agent_id: &str,
+        ) -> Option<GenerationVerdict> {
+            (pane_id == PANE && agent_id == AGENT).then_some(GenerationVerdict::Current)
+        }
+    }
+
+    /// A daemon-side state owning the pane, and the oracle it holds weakly.
+    fn daemon() -> (AppState, Arc<dyn AgentOwnership>) {
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = Arc::new(OwnsPane);
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+        state.register_pane(PANE.into());
+        (state, ownership)
+    }
+
+    /// Feed one plugin payload (filed under `root`) through the hook builder.
+    fn send(state: &mut AppState, payload: serde_json::Value) {
+        let mut payload = payload;
+        payload["session_id"] = "root".into();
+        let mut event = build_opencode_event(serde_json::from_value(payload).unwrap())
+            .expect("a known OpenCode event");
+        event.pane_id = Some(PANE.into());
+        event.agent_id = Some(AGENT.into());
+        state.apply_event(event);
+    }
+
+    /// The card's status, and its published background subagent count.
+    fn card(state: &AppState) -> (SessionStatus, u32) {
+        let live = state.live_session_for(AGENT, Some(PANE)).expect("the card");
+        (
+            live.status,
+            live.background.map_or(0, |work| work.subagents),
+        )
+    }
+
+    /// The root's turn starts, a child session goes active, and the root's
+    /// turn ends with the child still running.
+    fn root_ended_with_child_running(state: &mut AppState) {
+        send(state, serde_json::json!({"event": "session.created"}));
+        send(
+            state,
+            serde_json::json!({"event": "session.status", "status": "busy"}),
+        );
+        send(
+            state,
+            serde_json::json!({"event": "subagent.start", "subagent_id": "child"}),
+        );
+        send(
+            state,
+            serde_json::json!({"event": "session.status", "status": "idle"}),
+        );
+        assert_eq!(card(state), (SessionStatus::Idle, 1), "precondition");
+    }
+
+    fn ask(subagent: Option<&str>) -> serde_json::Value {
+        let mut payload = serde_json::json!({"event": "permission.asked", "prompt": "Allow bash?"});
+        if let Some(id) = subagent {
+            payload["subagent_id"] = id.into();
+        }
+        payload
+    }
+
+    fn reply(subagent: Option<&str>) -> serde_json::Value {
+        let mut payload = serde_json::json!({"event": "permission.replied"});
+        if let Some(id) = subagent {
+            payload["subagent_id"] = id.into();
+        }
+        payload
+    }
+
+    /// Scenario: after the root's turn ended, a running child session asks for
+    /// permission and the user answers it. The card shows Needs Input and then
+    /// Idle again, the background subagent stays shown, and the root's turn is
+    /// not restarted: a later child report still leaves the card Idle.
+    #[test]
+    fn opencode_child_permission_reply_after_the_turn_ended_returns_the_card_to_idle() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        send(&mut state, ask(Some("child")));
+        assert_eq!(card(&state), (SessionStatus::WaitingForInput, 1));
+        send(&mut state, reply(Some("child")));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::Idle, 1),
+            "the answer ends the subagent's wait without restarting the root's turn"
+        );
+        // A reply with no wait outstanding changes nothing.
+        send(&mut state, reply(Some("child")));
+        assert_eq!(card(&state), (SessionStatus::Idle, 1));
+        send(
+            &mut state,
+            serde_json::json!({"event": "subagent.stop", "subagent_id": "child"}),
+        );
+        assert_eq!(card(&state), (SessionStatus::Idle, 0));
+    }
+
+    /// Scenario: after the root's turn ended, a running child asks for
+    /// permission and then fails (its stop) without the prompt being answered.
+    /// Its prompt goes with it: the card returns to Idle with no background.
+    #[test]
+    fn opencode_child_permission_without_a_reply_ends_with_the_child() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        send(&mut state, ask(Some("child")));
+        send(
+            &mut state,
+            serde_json::json!({"event": "subagent.stop", "subagent_id": "child"}),
+        );
+        assert_eq!(card(&state), (SessionStatus::Idle, 0));
+    }
+
+    /// Scenario: during the root's turn, the root and a child both ask for
+    /// permission, in either order, and the child's prompt is answered. The
+    /// root's own prompt is still waiting, so the card stays on Needs Input;
+    /// with only the child's prompt open, its answer returns the card to
+    /// Thinking.
+    #[test]
+    fn opencode_child_permission_reply_leaves_the_main_threads_wait() {
+        for child_first in [false, true] {
+            let (mut state, _ownership) = daemon();
+            send(&mut state, serde_json::json!({"event": "session.created"}));
+            send(
+                &mut state,
+                serde_json::json!({"event": "session.status", "status": "busy"}),
+            );
+            send(
+                &mut state,
+                serde_json::json!({"event": "subagent.start", "subagent_id": "child"}),
+            );
+            let order = if child_first {
+                [ask(Some("child")), ask(None)]
+            } else {
+                [ask(None), ask(Some("child"))]
+            };
+            for payload in order {
+                send(&mut state, payload);
+            }
+            send(&mut state, reply(Some("child")));
+            assert_eq!(
+                card(&state),
+                (SessionStatus::WaitingForInput, 0),
+                "child_first={child_first}: the main thread's prompt is still open"
+            );
+            send(
+                &mut state,
+                serde_json::json!({"event": "subagent.stop", "subagent_id": "child"}),
+            );
+            assert_eq!(card(&state).0, SessionStatus::WaitingForInput);
+        }
+
+        let (mut state, _ownership) = daemon();
+        send(&mut state, serde_json::json!({"event": "session.created"}));
+        send(
+            &mut state,
+            serde_json::json!({"event": "session.status", "status": "busy"}),
+        );
+        send(&mut state, ask(Some("child")));
+        send(&mut state, reply(Some("child")));
+        assert_eq!(card(&state), (SessionStatus::Thinking, 0));
+    }
+
+    fn tool_end(subagent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event": "tool.execute.after",
+            "tool_name": "bash",
+            "subagent_id": subagent,
+        })
+    }
+
+    /// Scenario (Qodo / Greptile on PR #1688): after the root's turn ended,
+    /// child A asks for permission and child B, which never asked, then
+    /// finishes a tool call. A's prompt is still unanswered, so the card stays
+    /// on Needs Input; A's own tool end (the control) then releases it to Idle.
+    #[test]
+    fn opencode_child_permission_another_childs_tool_end_keeps_the_prompt() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        send(
+            &mut state,
+            serde_json::json!({"event": "subagent.start", "subagent_id": "other"}),
+        );
+        send(&mut state, ask(Some("child")));
+        send(&mut state, tool_end("other"));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::WaitingForInput, 2),
+            "another child's tool end must not hide this child's prompt"
+        );
+        // A repeat, and one from a subagent the card never saw, change nothing.
+        send(&mut state, tool_end("other"));
+        send(&mut state, tool_end("stranger"));
+        assert_eq!(card(&state).0, SessionStatus::WaitingForInput);
+        send(&mut state, tool_end("child"));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::Idle, 2),
+            "the asking child's own tool end releases its share"
+        );
+    }
+
+    /// Scenario (Qodo / Greptile on PR #1688): during the root's turn the root
+    /// asks for permission, and a running child then finishes a tool call. The
+    /// root's prompt is the main thread's, which no subagent's report can
+    /// answer, so the card stays on Needs Input — also when the child had
+    /// joined the wait with a prompt of its own and its tool end releases it.
+    #[test]
+    fn opencode_child_permission_a_childs_tool_end_keeps_the_main_threads_prompt() {
+        for child_asked in [false, true] {
+            let (mut state, _ownership) = daemon();
+            send(&mut state, serde_json::json!({"event": "session.created"}));
+            send(
+                &mut state,
+                serde_json::json!({"event": "session.status", "status": "busy"}),
+            );
+            send(
+                &mut state,
+                serde_json::json!({"event": "subagent.start", "subagent_id": "child"}),
+            );
+            send(&mut state, ask(None));
+            if child_asked {
+                send(&mut state, ask(Some("child")));
+            }
+            send(&mut state, tool_end("child"));
+            assert_eq!(
+                card(&state).0,
+                SessionStatus::WaitingForInput,
+                "child_asked={child_asked}: the root's prompt is still open"
+            );
+        }
+    }
+
+    /// Scenario (audit AU-5): after the root's turn ended, two child sessions
+    /// whose ids are over the bound — each attributed to its own stand-in, and
+    /// never reported active — both ask for permission, and only the first is
+    /// answered. The second's prompt is still open, so the card stays on Needs
+    /// Input until it is answered too.
+    #[test]
+    fn opencode_child_permission_two_oversized_children_keep_their_own_prompts() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        let first = format!("oversized-id:300:{}", "0".repeat(16));
+        let second = format!("oversized-id:300:{}", "1".repeat(16));
+        send(&mut state, ask(Some(&first)));
+        send(&mut state, ask(Some(&second)));
+        send(&mut state, reply(Some(&first)));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::WaitingForInput, 1),
+            "the second oversized child's prompt is still open"
+        );
+        send(&mut state, reply(Some(&second)));
+        assert_eq!(card(&state), (SessionStatus::Idle, 1));
+    }
+
+    /// Scenario (audit AU-7, the mixed-version pairing): during the root's
+    /// turn the root and a child both ask for permission and only the child's
+    /// prompt is answered. A new reducer keeps the root's Needs Input. An
+    /// older client knows neither the subagent attribution on that answer nor
+    /// its `permission_state`, so it folds the same event as a plain Thinking —
+    /// modelled here by stripping both before the fold — and shows Thinking,
+    /// which is what it showed for that answer before issue #1678. This is the
+    /// accepted old-client display limitation docs/develop/background-work.md
+    /// records, not a contract break.
+    #[test]
+    fn opencode_child_permission_reply_an_older_client_folds_as_thinking() {
+        let events = || {
+            [
+                serde_json::json!({"event": "session.created"}),
+                serde_json::json!({"event": "session.status", "status": "busy"}),
+                ask(None),
+                ask(Some("child")),
+                reply(Some("child")),
+            ]
+            .map(|payload| {
+                let mut payload = payload;
+                payload["session_id"] = "root".into();
+                let mut event = build_opencode_event(serde_json::from_value(payload).unwrap())
+                    .expect("a known OpenCode event");
+                event.pane_id = Some(PANE.into());
+                event.agent_id = Some(AGENT.into());
+                event
+            })
+        };
+        let status = |state: &AppState| state.live_session_for(AGENT, Some(PANE)).unwrap().status;
+
+        let mut new_client = AppState::default();
+        new_client.register_pane(PANE.into());
+        for event in events() {
+            new_client.apply_event(event);
+        }
+        assert_eq!(status(&new_client), SessionStatus::WaitingForInput);
+
+        let mut old_client = AppState::default();
+        old_client.register_pane(PANE.into());
+        let mut stripped = 0;
+        for mut event in events() {
+            if event.is_subagent_permission_reply() {
+                stripped += 1;
+                event
+                    .metadata
+                    .remove(crate::event::PERMISSION_STATE_METADATA_KEY);
+                event
+                    .metadata
+                    .remove(crate::event::SUBAGENT_ID_METADATA_KEY);
+            }
+            old_client.apply_event(event);
+        }
+        assert_eq!(stripped, 1, "the child's answer is the tagged reply");
+        assert_eq!(
+            status(&old_client),
+            SessionStatus::Thinking,
+            "the old-client view of the answer is the legacy Thinking"
         );
     }
 }

@@ -12,20 +12,20 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 
 **Desktop:**
 
-![The desktop app's dashboard with four agents, each row starting with its status: waiting or running](/img/dashboard-desktop.png)
+![The desktop app's dashboard with four agents, each row starting with its status: idle, running, running and needs input](/img/dashboard-desktop.png)
 
 | TUI card | `daemon status` | Desktop app | Meaning | What to do |
 |---|---|---|---|---|
 | **Thinking** | `Thinking` | running | The agent is reasoning before it acts. | Nothing. |
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
-| **Needs Input** | `WaitingForInput` | waiting | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
-| **Idle** | `Idle` | waiting | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
+| **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
+| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. Work it left running is shown beside it; see [Work left running after a turn](#work-left-running-after-a-turn). | Give it the next prompt. |
 | **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
 
-A newer daemon can report a status this build does not know; the TUI shows it as **Idle** and the desktop app as **waiting**.
+A newer daemon can report a status this build does not know; both the TUI and the desktop app show it as **Idle**.
 
 ### Which agents report which status
 
@@ -35,12 +35,40 @@ The first five statuses come from each agent's hooks, plugin or extension, and h
 |---|---|---|---|---|---|
 | **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No |
 | **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
-| A subagent's permission prompt told apart from the main agent's | Yes | Yes | No | No | No |
+| A subagent's permission prompt told apart from the main agent's | Yes | Yes | Yes | No | No |
 
-- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **waiting**, **running** while the turn runs, and **waiting** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
+- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **idle**, **running** while the turn runs, **needs input** at a permission prompt, and **idle** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
-- Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
+- Where a subagent is told apart: when a subagent's permission prompt is settled — it is allowed and the call it asked about finishes, the subagent stops or fails without it being answered, or, for OpenCode, it is answered either way — the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running. While the main agent's own prompt or another subagent's is also waiting, the card stays on **Needs Input**, and another subagent finishing a tool call does not answer it.
+
+### Work left running after a turn
+
+An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. The card then reads **Idle**, because the agent is waiting for its next prompt, and a line under it says what is still running and for how long:
+
+```
+Background: 2 commands, 1 subagent · 3h 12m
+```
+
+- A kind with nothing running is left out (`Background: 1 subagent · 4m`), and the time is how long the oldest of them has been running.
+- The line goes away by itself when the last of them ends, and while the agent is in a turn (after you send it a prompt) it is not shown.
+- If the deck cannot tell how long something has been running, the line shows the counts without a time.
+- In the TUI the line is on the card, under `Dir:`. In the desktop app it is in the agent's pane, under the agent's command and model, and on its tile on the Daemons screen, in the same words. The Dashboard row shows the status only.
+
+A command that has been running for hours is easy to spot this way. To stop it, open the agent's pane and ask the agent to stop it, or stop it yourself in the pane.
+
+What each agent reports:
+
+| | Claude Code | Codex | OpenCode | Pi | Devin |
+|---|---|---|---|---|---|
+| Background commands | Yes | Yes | Yes | Yes | Yes |
+| Background subagents | Yes | Yes | Yes | No | No |
+
+- On Windows, background commands are not counted for any agent; subagents still are.
+- An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
+- The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
+- Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
+- A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.
 
 ### Blocked
 
@@ -56,6 +84,7 @@ If Blocked never appears for Claude Code or OpenCode, the hook or plugin that re
 
 - **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status.
 - **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit.
+- **`Background:`**: commands and subagents the agent left running after its turn ended, and for how long; see [Work left running after a turn](#work-left-running-after-a-turn).
 - **`Prmt:`**: the most recent prompt or prompts.
 - **Recent tool calls**: the last commands the agent ran.
 - **`Last:` and `Tools:`**: time since the agent's last activity and its total tool-call count, in the bottom-right border. Narrow cards shorten them to `2m · 14 tools`, then `2m · 14`, and the narrowest omit them.
@@ -71,7 +100,7 @@ The deck picks a density from how many cards it has to fit and the space availab
 | Compact | 1 | 1 |
 | Minimal | none | none |
 
-Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason takes the place of `Dir:`, and on an orphaned card `Orphaned — delegation unavailable` does. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
+Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason displaces `Dir:` when the card is too short to show both, and so do the `Background:` line on a card with work left running and `Orphaned — delegation unavailable` on an orphaned card. A Blocked or orphaned card that also has work left running keeps the reason on that row and adds the `Background:` line after it, separated by ` · ` (for example `⚠ Usage limit reached · Background: 1 command · 4m`), cut short with `…` when the card is too narrow for all of it. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
 
 ![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
 

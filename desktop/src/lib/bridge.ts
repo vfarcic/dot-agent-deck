@@ -16,6 +16,7 @@ import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListD
 import { speechAudioError } from "./speech";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
+  AgentBackground,
   AgentBlocked,
   AuthoringKind,
   AgentSession,
@@ -332,6 +333,14 @@ export interface DesktopAgentDto {
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * Issue #1678: the background work the agent left running after its turn
+   * ended — commands and subagents still going, and when the oldest started
+   * (epoch milliseconds, daemon clock). Absent when there is nothing to show
+   * and from a daemon predating the field. A TYPE ASSERTION, not a validated
+   * value: `agentFromDto` checks every number before anything renders it.
+   */
+  background?: { commands: number; subagents: number; sinceMs?: number };
   /**
    * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
    * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
@@ -2114,13 +2123,18 @@ const FIXTURE_UNRESOLVED_REFUSAL = "daemon returned error: unresolved: that path
  * The daemon's closed status vocabulary (src-tauri `session_status_name`),
  * mapped exhaustively — PR #416 review B1/M3. The record makes a NEW daemon
  * status a visible fallthrough here instead of a silent one, and the
- * fallthrough itself is "waiting", never a terminal state: the daemon's own
+ * fallthrough itself is "idle", never a terminal state: the daemon's own
  * `SessionStatus::Unknown` doc says it must be "rendered neutrally (like
  * Idle) so it never masquerades as an active state" — and a status this
  * build has never heard of gets the same treatment, because per PRD #162 a
  * newer daemon can add one without a protocol bump. The old substring
  * matcher sent "unknown" to "stopped", which locked a LIVE agent's terminal
  * read-only.
+ *
+ * Issue #1676: `waiting_for_input` and `idle` are two columns, the TUI's Needs
+ * Input and Idle. They used to share one, `waiting`, so an agent that had
+ * simply finished its turn read as one waiting on the user. `unknown` goes
+ * with `idle`, as it does in the TUI: nothing asked the user anything.
  */
 const DAEMON_STATUS: Record<string, AgentStatus> = {
   // `running` is what the Rust side emits for an agent with no hook state yet
@@ -2133,19 +2147,19 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   thinking: "running",
   working: "running",
   compacting: "running",
-  waiting_for_input: "waiting",
-  idle: "waiting",
+  waiting_for_input: "needs_input",
+  idle: "idle",
   error: "failed",
   // Issue #714: a distinct state, not `failed` — the agent is alive and its
   // terminal stays writable (only `stopped` locks it), but its provider refuses
   // it, so the tile has to say something different from a crashed agent.
   blocked: "blocked",
-  unknown: "waiting",
+  unknown: "idle",
 };
 
 /** The status column a daemon status word is shown in. */
 export function statusFromDaemon(status: string): AgentStatus {
-  return DAEMON_STATUS[status.toLowerCase()] ?? "waiting";
+  return DAEMON_STATUS[status.toLowerCase()] ?? "idle";
 }
 
 function roleFromAgent(agent: DesktopAgentDto, index: number): string {
@@ -2204,7 +2218,34 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
   };
 }
 
+/** The largest value the daemon's `u32` counts can take. */
+const U32_MAX = 0xffff_ffff;
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= U32_MAX;
+}
+
+/**
+ * Issue #1678: the tile's view of `DesktopAgentDto.background`, or `undefined`
+ * when there is nothing honest to show. The DTO is an assertion about a shape,
+ * so both counts must be integers in the daemon's `u32` range — anything else
+ * drops the whole reading rather than rendering a count the daemon did not send
+ * — and at least one must be above zero. A `sinceMs` that is not a finite
+ * number is dropped on its own: the counts stay true without a duration.
+ */
+export function backgroundFromDto(background: unknown): AgentBackground | undefined {
+  if (typeof background !== "object" || background === null) return undefined;
+  const { commands, subagents, sinceMs } = background as Record<string, unknown>;
+  if (!isCount(commands) || !isCount(subagents) || commands + subagents === 0) return undefined;
+  return {
+    commands,
+    subagents,
+    ...(typeof sinceMs === "number" && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+  };
+}
+
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
+  const background = backgroundFromDto(agent.background);
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
@@ -2264,6 +2305,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,

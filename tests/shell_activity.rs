@@ -533,6 +533,122 @@ fn bash_tool_descendant_row() -> ProcessInfo {
     }
 }
 
+/// Scenario: Classify fixture process tables with one command session containing many children, then two command sessions and an unmatched detached service. Distinct qualifying sessions are counted once each, nested terminal agents re-root the walk, and unknown root/session samples stay unknown rather than clearing work.
+#[spec("status/background/005")]
+#[test]
+fn background_005_scan_deduplicates_qualifying_sessions_and_reroots() {
+    use dot_agent_deck::platform::proc::qualifying_command_sessions;
+    use std::collections::HashSet;
+
+    let shape = dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
+    let mut table = backbone_rows(false);
+    table.push(bash_tool_descendant_row());
+    for pid in [63121, 63122] {
+        table.push(ProcessInfo {
+            pid,
+            ppid: 63120,
+            session_id: BASH_TOOL_SID,
+            has_controlling_tty: false,
+            session_leader: false,
+            command_line: CommandLine::NotSampled,
+        });
+    }
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID])),
+        "one session with many processes counts once"
+    );
+    let mut second = bash_tool_descendant_row();
+    second.pid = 64120;
+    second.session_id = 64118;
+    table.push(second);
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID, 64118])),
+        "the argv cross-check must visit every qualifying candidate"
+    );
+    table.push(ProcessInfo {
+        pid: 65120,
+        ppid: AGENT_PID,
+        session_id: 65118,
+        has_controlling_tty: false,
+        session_leader: true,
+        command_line: CommandLine::Read("unmatched-detached-service".into()),
+    });
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID, 64118])),
+        "a match must not admit another session whose argv fails"
+    );
+    // Removing one matched session leaves exactly one despite an unmatched
+    // candidate beside it; structural-only agents count all three sessions.
+    table.retain(|row| row.session_id != 64118);
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID]))
+    );
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        Some(HashSet::from([BASH_TOOL_SID, 65118]))
+    );
+    let nested = vec![
+        ProcessInfo {
+            pid: 1,
+            ppid: 0,
+            session_id: 1,
+            has_controlling_tty: true,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 2,
+            ppid: 1,
+            session_id: 2,
+            has_controlling_tty: true,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 3,
+            ppid: 2,
+            session_id: 2,
+            has_controlling_tty: true,
+            session_leader: false,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 4,
+            ppid: 3,
+            session_id: 4,
+            has_controlling_tty: false,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+    ];
+    assert_eq!(
+        qualifying_command_sessions(&nested[..3], 1, &[]),
+        Some(HashSet::new()),
+        "inner PTY agent is not itself a command"
+    );
+    assert_eq!(
+        qualifying_command_sessions(&nested, 1, &[]),
+        Some(HashSet::from([4])),
+        "inner agent's detached tool is a command"
+    );
+    assert_eq!(qualifying_command_sessions(&[], AGENT_PID, &[]), None);
+    assert_eq!(qualifying_command_sessions(&table, -1, &[]), None);
+    table
+        .iter_mut()
+        .find(|row| row.pid == AGENT_PID)
+        .unwrap()
+        .session_id = 0;
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        None,
+        "unknown observation must not become zero"
+    );
+}
+
 /// Scenario: builds three pairs of fixture tables from the measured
 /// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
 /// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone

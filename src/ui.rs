@@ -21804,11 +21804,14 @@ fn render_session_card(
     // survives every density (at Minimal it takes `Dir:`'s place), and ahead
     // of the prompt/tool rows because it is the fact that explains why those
     // rows keep advancing while the run has in fact stalled.
+    // The attention rows' text is kept whole until the background line below
+    // has decided whether it shares their row (Minimal density).
+    let mut attention: Vec<(String, Style)> = Vec::new();
     if is_orphaned {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+        attention.push((
+            "Orphaned — delegation unavailable".to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
-        )));
+        ));
     }
 
     // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
@@ -21844,10 +21847,42 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(&text, w),
+        attention.push((
+            text,
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
-        )));
+        ));
+    }
+
+    // Issue #1678: background work the agent left running after its turn
+    // ended, under the status rows and above the prompt. `fit_card_rows`
+    // sheds the separator, prompts and `Dir:` before a status row, but it
+    // cannot shrink a card below its status rows: Minimal has one content row,
+    // which a Blocked or orphaned reason already takes. There the reason keeps
+    // the row, since it needs the user's attention, and the background line is
+    // appended to it after ` · `, cut with `…` when the row runs out.
+    let background = if is_placeholder {
+        None
+    } else {
+        session
+            .background_work()
+            .and_then(|work| background_work_label(&work, now))
+    };
+    let plain = |(text, style): (String, Style)| {
+        Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
+    };
+    let shares_row = density == CardDensity::Minimal && !attention.is_empty();
+    let mut attention = attention.into_iter();
+    match background {
+        Some(text) if shares_row => {
+            let (reason, style) = attention.next().expect("checked non-empty");
+            status_lines.push(reason_with_background(&reason, style, &text, w));
+            status_lines.extend(attention.map(plain));
+        }
+        Some(text) => {
+            status_lines.extend(attention.map(plain));
+            status_lines.push(plain((text, text_primary())));
+        }
+        None => status_lines.extend(attention.map(plain)),
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -21894,6 +21929,73 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Issue #1678: a Minimal card's one content row when it has both a status
+/// reason (Blocked or orphaned) and background work — `reason · background`,
+/// cut with `…` at `width`, so the reason is kept whole first. The reason keeps
+/// its own style and the background part reads as it does on its own line.
+fn reason_with_background(
+    reason: &str,
+    style: Style,
+    background: &str,
+    width: usize,
+) -> Line<'static> {
+    let row = truncate_with_ellipsis(&format!("{reason} · {background}"), width);
+    let split = row
+        .char_indices()
+        .nth(reason.chars().count())
+        .map_or(row.len(), |(at, _)| at);
+    let (head, tail) = row.split_at(split);
+    let mut spans = vec![Span::styled(head.to_string(), style)];
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail.to_string(), text_primary()));
+    }
+    Line::from(spans)
+}
+
+/// How far ahead of `now` a background start may sit and still read as "just
+/// started" — the desktop's clock-skew tolerance (`relativeTo` in
+/// `desktop/src/lib/displayText.ts`), so both clients say the same thing.
+const BACKGROUND_CLOCK_SKEW_MS: i64 = 60_000;
+
+/// Issue #1678: the card's background-work line —
+/// `Background: 2 commands, 1 subagent · 3h 12m` — or `None` when nothing is
+/// counted. A zero kind is omitted and each count is singular or plural. The
+/// duration uses the `Last:` vocabulary ([`format_elapsed`]); a start up to
+/// [`BACKGROUND_CLOCK_SKEW_MS`] in the future reads as `0s`, and one further
+/// ahead, or missing, or one the subtraction cannot represent, drops the
+/// duration and keeps the counts. Never names a subagent or a command.
+fn background_work_label(
+    work: &crate::state::BackgroundWork,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    fn count(n: u32, unit: &str) -> Option<String> {
+        (n > 0).then(|| format!("{n} {unit}{}", if n == 1 { "" } else { "s" }))
+    }
+    let kinds: Vec<String> = [
+        count(work.commands, "command"),
+        count(work.subagents, "subagent"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    let elapsed = work
+        .since_ms
+        .and_then(|since| now.timestamp_millis().checked_sub(since))
+        .and_then(|ms| match ms {
+            ms if ms >= 0 => Some(ms),
+            ms if ms >= -BACKGROUND_CLOCK_SKEW_MS => Some(0),
+            _ => None,
+        })
+        .and_then(chrono::Duration::try_milliseconds)
+        .and_then(|elapsed| now.checked_sub_signed(elapsed))
+        .map(|since| format!(" · {}", format_elapsed(since, now)))
+        .unwrap_or_default();
+    Some(format!("Background: {}{elapsed}", kinds.join(", ")))
 }
 
 /// Which of a card's sheddable rows [`render_session_card`] draws.
@@ -29366,6 +29468,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event1.clone());
 
@@ -29389,6 +29493,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event2);
 
@@ -29466,6 +29572,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -29527,6 +29635,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event.clone());
 
@@ -29945,6 +30055,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30650,6 +30762,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
         state
@@ -30690,6 +30804,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30717,6 +30833,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30745,6 +30863,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -30761,6 +30881,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -30788,6 +30910,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -30804,6 +30928,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -30833,6 +30959,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -33490,6 +33618,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -34953,6 +35083,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -35048,6 +35180,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -35080,6 +35214,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -38377,6 +38513,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -38405,6 +38543,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -39037,6 +39177,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
@@ -39088,6 +39230,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(
             &mut unidentified_ui,
@@ -39590,6 +39734,8 @@ mod tests {
                     kind: crate::event::TargetKind::Pty,
                     writable: crate::event::Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             };
             self.runtime.block_on(async {
                 self.state.write().await.apply_event(event);
@@ -40788,6 +40934,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
 
         ui.send_retry_backoff
@@ -41343,6 +41491,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
             assert_eq!(
                 snapshot.pane_hook_session_id(pane_id),
@@ -41442,6 +41592,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -41473,6 +41625,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -41956,6 +42110,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         };
         synthetic(EventType::ShellBusy, false);
@@ -41978,6 +42134,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         ui.send_retry_backoff
@@ -42227,6 +42385,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
         slow_ui
@@ -42558,6 +42718,8 @@ mod tests {
                     kind: crate::event::TargetKind::Pty,
                     writable: crate::event::Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             });
         }
         snapshot
@@ -42628,6 +42790,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         assert_eq!(
@@ -42759,6 +42923,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         replacement_ui
             .send_retry_backoff
@@ -42807,6 +42973,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         assert_eq!(clear_controller.writes_for("same-agent"), 1);
@@ -42826,6 +42994,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         let clear_writes = clear_controller.writes_for("same-agent");
@@ -42881,6 +43051,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         // The lost-response shape: one wire request issued, no outcome learned,
@@ -42951,6 +43123,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
@@ -43203,6 +43377,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         let captured_sessions = expected_sessions.lock().unwrap().clone();
