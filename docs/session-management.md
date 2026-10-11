@@ -123,15 +123,15 @@ An agent you start yourself, outside the deck, still gets a card when its hooks 
 Before you start more agents on a deck, you can check how much room its machine has left. Both clients show the same figures for the machine the deck's daemon runs on. For a remote deck that is the remote machine, not the one you are sitting at.
 
 - **TUI:** in command mode, press `m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
-- **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a **Host of this deck** panel under its header. With several daemons shown, you see every machine at once. The panel refreshes at least every five seconds, and whenever the dashboard re-reads that daemon.
+- **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a small **Host** button beside the daemon's name. Its colour tells you at a glance how that machine is doing (see below), so with several daemons shown you can compare every machine at once. Click it, or reach it with `Tab` and press `Enter`, to open the **Host of this deck** figures; `Esc` or a click elsewhere closes them. The figures refresh at least every five seconds, and whenever the dashboard re-reads that daemon.
 
 **TUI:**
 
-![The Host of this deck overlay over an empty TUI dashboard: Working root and Worktree parent each 128 GiB free of 512 GiB total, Temp root 48 GiB free of 64 GiB total, load per core 0.42 across 16 cores, 18.5 GiB memory used, 43.5 GiB available, sample age 0 ms](/img/host-metrics-tui.png)
+![The Host of this deck overlay over an empty TUI dashboard: Working root and Worktree parent each 128 GiB free of 512 GiB total in green, Temp root 6 GiB free of 64 GiB total in yellow followed by (warning), load per core 0.42 across 16 cores and 43.5 GiB memory available in green, 18.5 GiB memory used, sample age 0 ms](/img/host-metrics-tui.png)
 
 **Desktop:**
 
-![The desktop app's dashboard with the Host of this deck panel under the daemon's header, showing the same figures](/img/host-metrics-desktop.png)
+![The desktop app's dashboard with the Host button beside the daemon's name, in amber and reading Host: warning, opened to show the same figures with the Temp root row in amber followed by (warning)](/img/host-metrics-desktop.png)
 
 What it shows:
 
@@ -144,9 +144,35 @@ What it shows:
 | **Memory used** / **Memory available** | The machine's memory in use and still available |
 | **Sample age** | How old the figures are, in milliseconds |
 
-A figure the machine cannot report reads `unknown`, never `0`. Memory is `unknown` for a deck on macOS.
+A figure the machine cannot report reads `unknown`, never `0`.
 
-When a deck's daemon is from a release before this feature, or runs on Windows, the overlay and the panel say **Host metrics are not available from this deck** instead of showing figures. Upgrade that daemon to see them (for a remote daemon in the desktop app, see [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)).
+### Warning and critical figures
+
+The deck judges each disk, its load and its available memory against its own machine's totals, and both clients colour the figure by the result: green when it is fine, yellow for a warning and red when it is critical. A warning or critical figure is also followed by the word `(warning)` or `(critical)`, so you do not need to tell the colours apart. In the desktop app the **Host** button takes the colour of the deck's worst figure and says it, for example **Host: critical**.
+
+| Figure | Warning | Critical |
+|---|---|---|
+| Disk (each row) | less than 15% of that disk free | less than 5% free |
+| Memory available | less than 20% of the machine's memory | less than 10% |
+| Load per core | above 0.8 | above 1.5 |
+
+A figure that reads `unknown` is never coloured. A deck whose daemon is from a release that does not judge its figures shows them uncoloured, and its desktop button stays neutral.
+
+You can change the limits for a deck in that deck's `config.toml`, on the machine its daemon runs on, under `[host_metrics]`. Each key is optional; a key you leave out keeps its default:
+
+```toml
+[host_metrics]
+disk_free_warn_percent = 15
+disk_free_critical_percent = 5
+memory_available_warn_percent = 20
+memory_available_critical_percent = 10
+load_per_core_warn = 0.8
+load_per_core_critical = 1.5
+```
+
+Or set one from the command line, for example `dot-agent-deck config set host_metrics.disk_free_warn_percent 20`. Percentages are from 0 to 100, and loads are 0 or more. A value that is not valid is ignored and that one limit keeps its default, which the daemon's log notes; so is a critical limit that is less strict than its warning. Changes apply within a few seconds, with no restart.
+
+When a deck's daemon is from a release before this feature, or runs on Windows, the overlay and the desktop popover say **Host metrics are not available from this deck** instead of showing figures. Upgrade that daemon to see them (for a remote daemon in the desktop app, see [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)).
 
 ## Resuming Sessions
 
