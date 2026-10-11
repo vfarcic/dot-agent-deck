@@ -932,7 +932,17 @@ export interface HostDiskUsage {
   role: string;
   freeBytes?: number;
   totalBytes?: number;
+  /** PRD #1258 — the daemon's level for this filesystem's free space. */
+  level?: HostLevel;
 }
+
+/**
+ * PRD #1258 — how healthy one host reading is, as the deck's daemon judged it
+ * against its own thresholds. The app colours from it and never recomputes it;
+ * a reading without one (an older daemon, or an absent number) is shown
+ * uncoloured, not as `ok`.
+ */
+export type HostLevel = "ok" | "warn" | "critical";
 
 /** PRD #1258 M4 — a deck's host sample; every reading but the age may be absent. */
 export interface HostMetrics {
@@ -941,6 +951,10 @@ export interface HostMetrics {
   cpuCount?: number;
   memoryUsedBytes?: number;
   memoryAvailableBytes?: number;
+  /** PRD #1258 — the daemon's level for {@link loadPerCpu}. */
+  loadLevel?: HostLevel;
+  /** PRD #1258 — the daemon's level for available memory as a share of the total. */
+  memoryLevel?: HostLevel;
   sampledAtMs: number;
   sampleAgeMs: number;
 }

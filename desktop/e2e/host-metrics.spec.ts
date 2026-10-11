@@ -1,4 +1,4 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { test } from "./support/load-budget";
 
 // Required contract: the existing snapshot IPC carries one daemon's facts at
@@ -7,12 +7,16 @@ const LOCAL = "deck-0000000000001258";
 const REMOTE = "deck-0000000000001259";
 const GiB = 1024 ** 3;
 
+type Level = "ok" | "warn" | "critical";
+
 interface HostMetrics {
-  disks: { role: string; freeBytes?: number; totalBytes?: number }[];
+  disks: { role: string; freeBytes?: number; totalBytes?: number; level?: Level }[];
   loadPerCpu?: number;
   cpuCount?: number;
   memoryUsedBytes?: number;
   memoryAvailableBytes?: number;
+  loadLevel?: Level;
+  memoryLevel?: Level;
   sampledAtMs: number;
   sampleAgeMs: number;
 }
@@ -110,15 +114,22 @@ async function overview(page: Page, local: HostMetricsReport, remote: HostMetric
   return { localCard, remoteCard };
 }
 
-/** Scenario: Two connected decks report distinct utilisation through bootstrap and snapshot events. The overview shows both hosts' disk roles, load, cores, memory and sample age at once, and a new remote sample changes only its own deck. */
+/** Open a deck's host popover from the button beside its name, and return its numbers. */
+async function openHost(card: Locator): Promise<Locator> {
+  await card.getByTestId("host-metrics-button").click();
+  const metrics = card.getByTestId("host-metrics");
+  await expect(metrics).toBeVisible();
+  return metrics;
+}
+
+/** Scenario: Two connected decks report distinct utilisation through bootstrap and snapshot events. Each deck has its own host button beside its name; opening one shows that host's disk roles, load, cores, memory and sample age, and a new remote sample changes only its own deck. */
 test("each connected deck shows its own host utilisation and sample age", async ({ page }) => {
   const { localCard, remoteCard } = await overview(page, available(), available(true));
   for (const [card, free, worktreeFree, tempFree, load, cores, used, memory, age] of [
     [localCard, 128, 64, 8, "0.75", 8, 12, 20, 1500],
     [remoteCard, 96, 48, 6, "1.25", 16, 24, 40, 2500],
   ] as const) {
-    const metrics = card.getByTestId("host-metrics");
-    await expect(metrics).toBeVisible();
+    const metrics = await openHost(card);
     await expect(metrics).toContainText("Host of this deck");
     await expect(metrics).toContainText("free");
     await expect(metrics).toContainText("total");
@@ -137,23 +148,29 @@ test("each connected deck shows its own host utilisation and sample age", async 
   updated.metrics.disks[0].freeBytes = 80 * GiB;
   updated.metrics.sampleAgeMs = 3500;
   await page.evaluate((payload) => (window as unknown as MockWindow).__dadHostMetricsSnapshot(payload), snapshot(REMOTE, updated));
+  // The remote popover is still the open one, and it shows the new sample.
   await expect(remoteCard.getByTestId("host-metrics")).toContainText(/Working root[^\n]*80(?:\.0+)? GiB/);
   await expect(remoteCard.getByTestId("host-metrics")).toContainText(/Sample age[^\n]*3500 ms/);
-  await expect(localCard.getByTestId("host-metrics")).toContainText(/Working root[^\n]*128(?:\.0+)? GiB/);
-  await expect(localCard.getByTestId("host-metrics")).toContainText(/Sample age[^\n]*1500 ms/);
+  const local = await openHost(localCard);
+  await expect(remoteCard.getByTestId("host-metrics")).toHaveCount(0);
+  await expect(local).toContainText(/Working root[^\n]*128(?:\.0+)? GiB/);
+  await expect(local).toContainText(/Sample age[^\n]*1500 ms/);
 });
 
-/** Scenario: A connected old daemon lacks host-metrics while another deck reports valid numbers. Its host section says “not available from this deck” without displaying zero readings, and the capable deck keeps its own numbers. */
+/** Scenario: A connected old daemon lacks host-metrics while another deck reports valid numbers. Its host button names that state, and opening it says “not available from this deck” without displaying zero readings, while the capable deck keeps its own numbers. */
 test("an old daemon says metrics are not available from this deck without zeros", async ({ page }) => {
   const { localCard, remoteCard } = await overview(page, available(), { status: "not-available" });
-  const unavailable = remoteCard.getByTestId("host-metrics");
-  await expect(unavailable).toBeVisible();
+  const button = remoteCard.getByTestId("host-metrics-button");
+  await expect(button).toHaveAttribute("aria-label", /not available from this deck/);
+  await expect(button).toHaveAttribute("data-level", "");
+  const unavailable = await openHost(remoteCard);
   await expect(unavailable).toContainText("Host of this deck");
   await expect(unavailable).toContainText("not available from this deck");
   await expect(unavailable).not.toContainText(/\b0(?:\.0+)?\s*(?:GiB|cores|ms)\b/);
   await expect(unavailable).not.toContainText("0.00");
-  await expect(localCard.getByTestId("host-metrics")).toContainText(/Working root[^\n]*128(?:\.0+)? GiB/);
-  await expect(localCard.getByTestId("host-metrics")).not.toContainText("not available from this deck");
+  const local = await openHost(localCard);
+  await expect(local).toContainText(/Working root[^\n]*128(?:\.0+)? GiB/);
+  await expect(local).not.toContainText("not available from this deck");
 });
 
 /** Scenario: A capable daemon returns unreadable individual fields with a known sample age. Every missing disk, load, core-count and memory value is visibly unknown instead of zero while the other deck remains measurable. */
@@ -163,12 +180,93 @@ test("absent host fields render unknown independently", async ({ page }) => {
     sampledAtMs: 1_700_000_000_000, sampleAgeMs: 1500,
   } };
   const { localCard } = await overview(page, unknown, available(true));
-  const metrics = localCard.getByTestId("host-metrics");
-  await expect(metrics).toBeVisible();
+  const metrics = await openHost(localCard);
   for (const label of ["Working root", "Worktree parent", "Temp root", "Load per core", "Memory used", "Memory available"]) {
     await expect(metrics).toContainText(new RegExp(`${label}[^\\n]*unknown`));
   }
   await expect(metrics).toContainText(/Load per core[^\n]*unknown[^\n]*unknown/);
   await expect(metrics).toContainText(/Sample age[^\n]*1500 ms/);
   await expect(metrics).not.toContainText(/\b0(?:\.0+)?\s*(?:GiB|cores)\b/);
+});
+
+/** A sample whose readings the daemon judged: one disk critical, one a warning, the load a warning and memory ok. */
+function judged(): HostMetricsReport {
+  return { status: "available", metrics: {
+    disks: [
+      { role: "working_root", freeBytes: 4 * GiB, totalBytes: 100 * GiB, level: "critical" },
+      { role: "worktree_parent", freeBytes: 10 * GiB, totalBytes: 100 * GiB, level: "warn" },
+      { role: "temp_root", freeBytes: 50 * GiB, totalBytes: 100 * GiB, level: "ok" },
+    ],
+    loadPerCpu: 1, cpuCount: 4, loadLevel: "warn",
+    memoryUsedBytes: 8 * GiB, memoryAvailableBytes: 8 * GiB, memoryLevel: "ok",
+    sampledAtMs: 1_700_000_000_000, sampleAgeMs: 10,
+  } };
+}
+
+/** Scenario: One deck reports a critical disk and a warning load, the other only ok readings. Each deck's host button is coloured by its worst level and says that level in words; in the open popover every non-ok value carries its colour class and its word, and an ok value carries its class and no word. */
+test("each deck's host button and values are coloured by the daemon's levels, with words", async ({ page }) => {
+  const okOnly = available(true);
+  if (okOnly.status !== "available") throw new Error("available fixture");
+  okOnly.metrics.disks.forEach((disk) => { disk.level = "ok"; });
+  okOnly.metrics.loadLevel = "ok";
+  okOnly.metrics.memoryLevel = "ok";
+  const { localCard, remoteCard } = await overview(page, judged(), okOnly);
+
+  const critical = localCard.getByTestId("host-metrics-button");
+  await expect(critical).toHaveAttribute("data-level", "critical");
+  await expect(critical).toHaveClass(/host-button-critical/);
+  await expect(critical).toHaveAttribute("aria-label", /: critical$/);
+  await expect(critical).toContainText("critical");
+  const ok = remoteCard.getByTestId("host-metrics-button");
+  await expect(ok).toHaveAttribute("data-level", "ok");
+  await expect(ok).toHaveClass(/host-button-ok/);
+  await expect(ok).toHaveAttribute("aria-label", /: ok$/);
+  // The two buttons are told apart by colour, and by more than colour.
+  const colour = (locator: Locator) => locator.evaluate((element) => getComputedStyle(element).backgroundColor);
+  expect(await colour(critical)).not.toBe(await colour(ok));
+
+  const metrics = await openHost(localCard);
+  const value = (label: string) => metrics.locator(".host-metrics-row", { hasText: label }).locator("dd");
+  await expect(value("Working root")).toHaveClass(/host-level-critical/);
+  await expect(value("Working root")).toHaveText("4 GiB free of 100 GiB total (critical)");
+  await expect(value("Worktree parent")).toHaveClass(/host-level-warn/);
+  await expect(value("Worktree parent")).toHaveText("10 GiB free of 100 GiB total (warning)");
+  await expect(value("Temp root")).toHaveClass(/host-level-ok/);
+  await expect(value("Temp root")).toHaveText("50 GiB free of 100 GiB total");
+  await expect(value("Load per core")).toHaveText("1.00 across 4 cores (warning)");
+  await expect(value("Memory available")).toHaveClass(/host-level-ok/);
+  await expect(value("Memory used")).not.toHaveClass(/host-level/);
+});
+
+/** Scenario: A deck whose daemon sends numbers but no levels — an older build — shows its button neutral, with no state in its name, and its values uncoloured rather than as ok. */
+test("a sample without levels leaves the button neutral and the values uncoloured", async ({ page }) => {
+  const { localCard } = await overview(page, available(), available(true));
+  const button = localCard.getByTestId("host-metrics-button");
+  await expect(button).toHaveAttribute("data-level", "");
+  await expect(button).toHaveClass(/host-button-none/);
+  await expect(button).toHaveAttribute("aria-label", "Host of this deck, Local daemon");
+  const metrics = await openHost(localCard);
+  await expect(metrics.locator("dd[class*='host-level']")).toHaveCount(0);
+});
+
+/** Scenario: Reach a deck's host button from the keyboard, open it with Enter and close it with Escape, which returns focus to the button; open it again and close it by pressing elsewhere on the page. */
+test("the host popover opens from the keyboard and closes on Escape and on an outside press", async ({ page }) => {
+  const { localCard } = await overview(page, judged(), available(true));
+  const button = localCard.getByTestId("host-metrics-button");
+  await button.focus();
+  await page.keyboard.press("Enter");
+  await expect(button).toHaveAttribute("aria-expanded", "true");
+  await expect(localCard.getByTestId("host-metrics-popover")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(localCard.getByTestId("host-metrics-popover")).toHaveCount(0);
+  await expect(button).toBeFocused();
+  await expect(button).toHaveAttribute("aria-expanded", "false");
+
+  await button.click();
+  await expect(localCard.getByTestId("host-metrics-popover")).toBeVisible();
+  // A press inside the popover keeps it open.
+  await localCard.getByTestId("host-metrics").click();
+  await expect(localCard.getByTestId("host-metrics-popover")).toBeVisible();
+  await page.mouse.click(5, 990);
+  await expect(localCard.getByTestId("host-metrics-popover")).toHaveCount(0);
 });

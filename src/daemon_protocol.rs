@@ -517,7 +517,11 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// no [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual — a cached
 /// capability set outliving a daemon replaced by an older build — fails
 /// closed: that daemon refuses the unknown variant and the client reports an
-/// error rather than numbers.
+/// error rather than numbers. The health levels added beside the numbers
+/// ([`HealthLevel`]: `DiskUsage::level`, `HostMetrics::load_level` and
+/// `memory_level`) are additive optional fields of that reply, rule 18's
+/// additive rung, so no bump either: an older client ignores them, and an
+/// older daemon omits them, which a client shows as an uncoloured number.
 ///
 /// # Where this constant is enforced
 ///
@@ -901,15 +905,48 @@ pub struct DiskUsage {
     pub free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
+    /// How healthy this filesystem's free space is, judged by the daemon
+    /// against its own thresholds ([`HealthLevel`]). Absent when either figure
+    /// is, and from a daemon that predates health levels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub level: Option<HealthLevel>,
+}
+
+/// How healthy one host reading is (PRD #1258), judged by the **daemon** against
+/// the thresholds in its config (`[host_metrics]`, see
+/// [`crate::host_metrics::HealthThresholds`]) and served beside the number.
+/// Clients colour and label from it and never recompute it, so every client of
+/// one deck agrees, and a deck's own thresholds apply to its own host.
+///
+/// Additive and optional on the wire: a daemon that predates it omits every
+/// level, and a client then shows the number with no colour — not as `ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthLevel {
+    Ok,
+    Warn,
+    Critical,
+}
+
+/// A level a client does not recognise — one a newer daemon added — reads as
+/// absent, so the reply still decodes and the number shows uncoloured.
+fn deserialize_health_level<'de, D>(deserializer: D) -> Result<Option<HealthLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// The daemon's answer to `host-metrics`: its own host, as of `sampled_at_ms`.
 ///
 /// Every reading degrades on its own: a field this host cannot read is absent,
-/// not zero. Memory is Linux-only today (`/proc/meminfo`); macOS reports it
-/// absent rather than reaching for the Mach host-statistics calls, which the
-/// `libc` crate marks deprecated in favour of a crate this project does not
-/// depend on.
+/// not zero. Memory is read from `/proc/meminfo` on Linux and from the Mach
+/// host statistics on macOS (see [`crate::host_metrics`]).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HostMetrics {
     #[serde(default)]
@@ -920,11 +957,27 @@ pub struct HostMetrics {
     pub load_per_cpu: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_count: Option<u32>,
-    /// `MemTotal - MemAvailable`.
+    /// Total memory less available memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_used_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_available_bytes: Option<u64>,
+    /// The daemon's [`HealthLevel`] for [`Self::load_per_cpu`]; absent when the
+    /// load is, and from a daemon that predates health levels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub load_level: Option<HealthLevel>,
+    /// The daemon's [`HealthLevel`] for available memory as a share of the
+    /// total (used + available); absent when either figure is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub memory_level: Option<HealthLevel>,
     /// Wall-clock epoch milliseconds the sample was taken at. Equal across
     /// replies served from one cached sample.
     pub sampled_at_ms: u64,

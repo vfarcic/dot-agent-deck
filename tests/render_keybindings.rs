@@ -111,7 +111,7 @@ fn help_001_overlay_reflects_active_bindings() {
     insta::assert_snapshot!(text);
 }
 
-/// Scenario: Build the same remapped `KeybindingConfig` (`toggle_layout` → `Alt+Shift+l`), render the production dashboard button bar against it, and snapshot it. The live bar must show the custom layout key and command mode's `[Back to Pane Ctrl+D]` affordance.
+/// Scenario: Build the same remapped `KeybindingConfig` (`toggle_layout` → `Alt+Shift+l`), render the production dashboard button bar against it, and snapshot it. The live bar must show the custom layout key and command mode's `[Back to Pane d/Ctrl+D]` affordance, with the plain letter the remapped layout action no longer has left off its button.
 #[spec("keybindings/hints/001")]
 #[test]
 fn hints_001_bar_reflects_active_bindings() {
@@ -125,8 +125,12 @@ fn hints_001_bar_reflects_active_bindings() {
         "the live button bar must render the remapped toggle_layout key\n{text}"
     );
     assert!(
-        text.contains("[Back to Pane Ctrl+D]"),
+        text.contains("[Back to Pane d/Ctrl+D]"),
         "the live command-mode bar must tell the user how to return to the pane\n{text}"
+    );
+    assert!(
+        text.contains("[Toggle Layout Alt+Shift+L]"),
+        "a remapped action has no plain letter, so its button shows the chord alone\n{text}"
     );
     insta::assert_snapshot!(text);
 }
@@ -273,7 +277,7 @@ fn remap_003_global_close_binding_survives_mode_gating() {
     }
 }
 
-/// Scenario: Render the exact production bottom-bar path in command mode, Help, and PaneInput using the same bindings. Command mode must show enabled Back-to-Pane and Close buttons, Help must render Close dimmed while the mode mapper keeps it inert, and PaneInput must show only the Command Mode return affordance.
+/// Scenario: Render the exact production bottom-bar path in command mode, Help, and PaneInput using the same bindings. Command mode must show enabled Back-to-Pane and Close buttons carrying their plain letters, Help must render Close dimmed, with its chord alone, while the mode mapper keeps it inert, and PaneInput must show only the Command Mode return affordance.
 #[spec("keybindings/hints/003")]
 #[test]
 fn hints_003_bar_reflects_mode_scoped_close() {
@@ -286,10 +290,10 @@ fn hints_003_bar_reflects_mode_scoped_close() {
     let help = buffer_to_text(&help_buffer);
     let pane_input = buffer_to_text(&pane_input_buffer);
 
-    assert!(normal.contains("[Back to Pane Ctrl+D]"), "{normal}");
-    assert!(normal.contains("[Close Ctrl+W]"), "{normal}");
+    assert!(normal.contains("[Back to Pane d/Ctrl+D]"), "{normal}");
+    assert!(normal.contains("[Close w/Ctrl+W]"), "{normal}");
     assert!(
-        !span_has_modifier(&normal_buffer, "[Close Ctrl+W]", Modifier::DIM),
+        !span_has_modifier(&normal_buffer, "[Close w/Ctrl+W]", Modifier::DIM),
         "command-mode Close must be enabled\n{normal}"
     );
     assert!(help.contains("[Command Mode Ctrl+D]"), "{help}");
@@ -305,4 +309,115 @@ fn hints_003_bar_reflects_mode_scoped_close() {
     );
     assert!(pane_input.contains("[Command Mode Ctrl+D]"), "{pane_input}");
     assert!(!pane_input.contains("[Close Ctrl+W]"), "{pane_input}");
+}
+
+/// Scenario: Read which plain letter each command-mode action answers to under
+/// the default keybindings and under several remaps. `d`, `n`, `w`, `t`, `e`
+/// and `z` answer for their `Ctrl+` chords; the split toggle gets no `l` and
+/// nothing gets a `c`; remapping an action, or binding its letter to another
+/// action, takes the letter away.
+#[spec("keybindings/letters/001")]
+#[test]
+fn letters_001_each_default_ctrl_action_has_its_plain_letter() {
+    let defaults = KeybindingConfig::default();
+    for (action, letter) in [
+        (KbAction::Dashboard, 'd'),
+        (KbAction::NewPane, 'n'),
+        (KbAction::ClosePane, 'w'),
+        (KbAction::ToggleLayout, 't'),
+        (KbAction::ToggleOrchestrationLock, 'e'),
+        (KbAction::ToggleZoom, 'z'),
+    ] {
+        assert_eq!(defaults.plain_alias(action), Some(letter), "{action:?}");
+    }
+    // `l` stays next tab: the split toggle keeps only Ctrl+L.
+    assert_eq!(
+        defaults.plain_alias(KbAction::ToggleOrchestrationSplit),
+        None
+    );
+    assert_eq!(defaults.notation(KbAction::MoveRight), "l");
+    // Ctrl+C is the quit trigger, not an action, so no letter answers for it.
+    let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(
+        dot_agent_deck::keybindings::ACTIONS
+            .iter()
+            .all(|spec| !defaults.matches_plain_alias(spec.action, &c)),
+        "no action answers to a plain c"
+    );
+    // Only actions that are not already letters get one.
+    assert_eq!(defaults.plain_alias(KbAction::MoveDown), None);
+
+    // A remap takes the alias away, even one to another Ctrl chord.
+    let (remapped, warnings) =
+        KeybindingConfig::from_toml_str("[global]\nnew_pane = \"Ctrl+o\"\ntoggle_zoom = \"F5\"\n")
+            .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(remapped.plain_alias(KbAction::NewPane), None);
+    assert_eq!(remapped.plain_alias(KbAction::ToggleZoom), None);
+    assert_eq!(remapped.plain_alias(KbAction::Dashboard), Some('d'));
+
+    // Restating the default is not a remap.
+    let (restated, _) =
+        KeybindingConfig::from_toml_str("[global]\ndashboard = \"Ctrl+D\"\n").unwrap();
+    assert_eq!(restated.plain_alias(KbAction::Dashboard), Some('d'));
+
+    // A letter bound to another action is that action's, not an alias.
+    let (conflict, warnings) = KeybindingConfig::from_toml_str(
+        "[dashboard]\nhost_metrics = \"d\"\nrename = \"t\"\nmove_down = \"Shift+w\"\n",
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(conflict.plain_alias(KbAction::Dashboard), None);
+    assert_eq!(conflict.plain_alias(KbAction::ToggleLayout), None);
+    // `W` is not `w`: a shifted letter leaves the plain one free.
+    assert_eq!(conflict.plain_alias(KbAction::ClosePane), Some('w'));
+}
+
+/// Scenario: Press plain `d`, `t`, `w`, `z` and `e` in command mode and in a
+/// pane, through the same key resolution the live deck uses. In command mode
+/// each performs its `Ctrl+` chord's command; in a pane each letter is typed
+/// into the agent unchanged. Shift and Alt forms of a letter are not aliases.
+#[spec("keybindings/letters/002")]
+#[test]
+fn letters_002_plain_letters_act_in_command_mode_and_type_in_a_pane() {
+    let config = KeybindingConfig::default();
+    let cases: [UiActionCase; 5] = [
+        ('d', "back to the pane", |a| {
+            matches!(a, UiAction::DetachToNormal)
+        }),
+        ('t', "toggle layout", |a| {
+            matches!(a, UiAction::ToggleLayout)
+        }),
+        ('w', "close", |a| matches!(a, UiAction::CloseSelected)),
+        ('z', "zoom", |a| matches!(a, UiAction::ToggleZoom)),
+        ('e', "orchestration lock", |a| {
+            matches!(a, UiAction::ToggleOrchestrationLock)
+        }),
+    ];
+    for (ch, label, expected) in cases {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let action = key_action_for_mode(&config, UiMode::Normal, &key)
+            .unwrap_or_else(|| panic!("command-mode {ch} must resolve {label}"));
+        assert!(expected(&action), "command-mode {ch} resolved {action:?}");
+        match key_action_for_mode(&config, UiMode::PaneInput, &key) {
+            Some(UiAction::ForwardToPane(bytes)) => assert_eq!(bytes, vec![ch as u8]),
+            other => panic!("pane-mode {ch} must be typed into the pane, got {other:?}"),
+        }
+        for mods in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert!(
+                key_action_for_mode(
+                    &config,
+                    UiMode::Normal,
+                    &KeyEvent::new(KeyCode::Char(ch), mods)
+                )
+                .is_none(),
+                "{mods:?}+{ch} must not be an alias"
+            );
+        }
+    }
+    // A remap removes the letter from command mode too.
+    let (remapped, _) =
+        KeybindingConfig::from_toml_str("[global]\ntoggle_layout = \"F6\"\n").unwrap();
+    let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+    assert!(key_action_for_mode(&remapped, UiMode::Normal, &t).is_none());
 }

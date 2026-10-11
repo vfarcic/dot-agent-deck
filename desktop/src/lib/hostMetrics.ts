@@ -1,3 +1,5 @@
+import type { HostLevel, HostMetricsReport } from "../types";
+
 /**
  * PRD #1258 M4 — the words and number formats the deck card uses for a deck's
  * host. They match the TUI's host overlay (`src/ui.rs`, `host_metrics_lines`)
@@ -10,6 +12,8 @@ export const HOST_SUBTITLE = "The machine this deck's daemon runs on";
 export const HOST_UNKNOWN = "unknown";
 export const HOST_NOT_AVAILABLE = "Host metrics are not available from this deck.";
 export const HOST_NOT_AVAILABLE_WHY = "Its daemon is an older version, or runs on Windows.";
+/** The deck header's host button text. */
+export const HOST_BUTTON_TEXT = "Host";
 
 const GIB = 1024 ** 3;
 
@@ -87,4 +91,55 @@ export function formatLoad(loadPerCpu: number | undefined, cpuCount: number | un
 /** `1500 ms` — the daemon's own figure, never rounded into something it did not say, up to {@link HOST_MAX_SHOWN_AGE_MS}. */
 export function formatSampleAge(ms: number): string {
   return `${Math.min(HOST_MAX_SHOWN_AGE_MS, Math.max(0, Math.round(ms)))} ms`;
+}
+
+const LEVELS: readonly HostLevel[] = ["ok", "warn", "critical"];
+
+/**
+ * `level` when it is one this app knows, else `undefined` — a level a newer
+ * daemon added reads as no level, so the value shows uncoloured rather than
+ * failing or claiming `ok`. The bridge already drops one it cannot decode;
+ * this keeps the webview honest whatever reaches it.
+ */
+export function hostLevel(level: unknown): HostLevel | undefined {
+  return LEVELS.find((known) => known === level);
+}
+
+/**
+ * The word written beside a non-ok value, so colour is never the only signal.
+ * The TUI's `host_metrics_level_word` returns the same words (CLAUDE.md rule 22).
+ */
+export function hostLevelWord(level: unknown): string | undefined {
+  switch (hostLevel(level)) {
+    case "warn": return "(warning)";
+    case "critical": return "(critical)";
+    default: return undefined;
+  }
+}
+
+/** The worst level among a deck's readings, or `undefined` when none carries one. */
+export function worstHostLevel(report: HostMetricsReport): HostLevel | undefined {
+  if (report.status !== "available") return undefined;
+  const { disks, loadLevel, memoryLevel } = report.metrics;
+  let worst: HostLevel | undefined;
+  for (const candidate of [...disks.map((disk) => disk.level), loadLevel, memoryLevel]) {
+    const level = hostLevel(candidate);
+    if (level !== undefined && (worst === undefined || LEVELS.indexOf(level) > LEVELS.indexOf(worst))) worst = level;
+  }
+  return worst;
+}
+
+/**
+ * The deck's host state in words, for the button's accessible name and
+ * tooltip: the worst level, or that the deck does not report its host.
+ * `undefined` when the deck reports numbers but no levels.
+ */
+export function hostStateWords(report: HostMetricsReport): string | undefined {
+  if (report.status !== "available") return "not available from this deck";
+  switch (worstHostLevel(report)) {
+    case "critical": return "critical";
+    case "warn": return "warning";
+    case "ok": return "ok";
+    default: return undefined;
+  }
 }

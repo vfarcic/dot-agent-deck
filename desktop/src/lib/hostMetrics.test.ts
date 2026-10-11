@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { fixedLikeRust, formatDisk, formatGib, formatLoad, formatSampleAge, HOST_MAX_SHOWN_AGE_MS, hostRoleLabel } from "./hostMetrics";
+import { fixedLikeRust, formatDisk, formatGib, formatLoad, formatSampleAge, HOST_MAX_SHOWN_AGE_MS, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "./hostMetrics";
+import type { HostMetricsReport } from "../types";
 
 const GiB = 1024 ** 3;
 
@@ -49,5 +50,45 @@ describe("host metrics wording (PRD #1258 M4)", () => {
     expect(hostRoleLabel("worktree_parent")).toBe("Worktree parent");
     expect(hostRoleLabel("temp_root")).toBe("Temp root");
     expect(hostRoleLabel("scratch")).toBe("scratch");
+  });
+});
+
+describe("host health levels (PRD #1258)", () => {
+  const report = (levels: { disks?: (string | undefined)[]; load?: string; memory?: string }): HostMetricsReport => ({
+    status: "available",
+    metrics: {
+      disks: (levels.disks ?? []).map((level) => ({ role: "working_root", freeBytes: 1, totalBytes: 2, level: level as never })),
+      loadLevel: levels.load as never,
+      memoryLevel: levels.memory as never,
+      sampledAtMs: 1,
+      sampleAgeMs: 0,
+    },
+  });
+
+  /** Scenario: the three known levels pass through, anything else — a level a newer daemon added, or no level — reads as none; only a warning and a critical value get a word. */
+  it("knows three levels and gives the two non-ok ones a word", () => {
+    expect(hostLevel("ok")).toBe("ok");
+    expect(hostLevel("warn")).toBe("warn");
+    expect(hostLevel("critical")).toBe("critical");
+    expect(hostLevel("dire")).toBeUndefined();
+    expect(hostLevel(undefined)).toBeUndefined();
+    expect(hostLevelWord("ok")).toBeUndefined();
+    expect(hostLevelWord("warn")).toBe("(warning)");
+    expect(hostLevelWord("critical")).toBe("(critical)");
+    expect(hostLevelWord("dire")).toBeUndefined();
+  });
+
+  /** Scenario: the worst level among the disks, the load and the memory is the deck's, an unknown level is ignored, a sample without levels has none, and a deck that does not report its host says so in words. */
+  it("takes the worst level across every reading", () => {
+    expect(worstHostLevel(report({ disks: ["ok", "warn"], load: "ok", memory: "ok" }))).toBe("warn");
+    expect(worstHostLevel(report({ disks: ["ok"], load: "ok", memory: "critical" }))).toBe("critical");
+    expect(worstHostLevel(report({ disks: ["dire", "ok"] }))).toBe("ok");
+    expect(worstHostLevel(report({ disks: [undefined] }))).toBeUndefined();
+    expect(worstHostLevel({ status: "not-available" })).toBeUndefined();
+    expect(hostStateWords(report({ load: "critical" }))).toBe("critical");
+    expect(hostStateWords(report({ load: "warn" }))).toBe("warning");
+    expect(hostStateWords(report({ load: "ok" }))).toBe("ok");
+    expect(hostStateWords(report({}))).toBeUndefined();
+    expect(hostStateWords({ status: "not-available" })).toBe("not available from this deck");
   });
 });

@@ -18,7 +18,7 @@ use common::TuiDeck;
 use spec::spec;
 
 /// Scenario: Launch the deck against the `minimal` fixture, wait for the
-/// empty dashboard, locate the `[New Agent Ctrl+N]` button in the bottom
+/// empty dashboard, locate the `[New Agent n/Ctrl+N]` button in the bottom
 /// button bar, and left-click it. The same directory picker that Ctrl+N
 /// opens (titled `Select Directory`) must appear — demonstrating
 /// click→action parity through the shared dispatch funnel.
@@ -26,7 +26,7 @@ use spec::spec;
 #[test]
 fn buttonbar_003_click_new_pane_opens_picker() {
     // PRD #127: render at a roomy full-screen width so the bottom bar shows the
-    // FULL `[New Agent Ctrl+N]` label. At the default 120 cols the bar correctly
+    // FULL `[New Agent n/Ctrl+N]` label. At the default 120 cols the bar correctly
     // collapses to shortcut-only chips once the always-shown Schedules
     // button is included (~133 cells > 120), so the labeled-button lookup would
     // miss. 200 cols fits the full labeled set (mirrors L1 buttonbar_005).
@@ -52,7 +52,7 @@ fn buttonbar_003_click_new_pane_opens_picker() {
 #[test]
 fn buttonbar_004_click_schedules_opens_manager() {
     // The bar button's label starts with `[Schedules` (e.g. `[Schedules s]`, mirroring
-    // the inline-shortcut convention of `[New Agent Ctrl+N]` / `[Help ?]`), so
+    // the inline-shortcut convention of `[New Agent n/Ctrl+N]` / `[Help ?]`), so
     // this black-box lookup finds it.
     let dir = common::harness_tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
@@ -95,7 +95,7 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
     deck.send_bytes(b"?");
     deck.wait_for_string("Create new agent");
 
@@ -113,7 +113,7 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     let (help_close_col, help_close_row) = deck.wait_for_in_grid("[Close]");
     deck.click(help_close_col + 1, help_close_row);
     deck.wait_for_absence("Create new agent");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
 
     let grid = deck.snapshot_grid();
     assert!(!grid.contains("Close selected agent?"), "{grid}");

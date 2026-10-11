@@ -21,7 +21,7 @@
 //! reaching into this module.
 
 use crate::daemon_protocol::{
-    DiskUsage, HostMetrics, ROLE_TEMP_ROOT, ROLE_WORKING_ROOT, ROLE_WORKTREE_PARENT,
+    DiskUsage, HealthLevel, HostMetrics, ROLE_TEMP_ROOT, ROLE_WORKING_ROOT, ROLE_WORKTREE_PARENT,
 };
 
 /// The 1-minute load average, or `None` where this platform does not publish
@@ -289,10 +289,19 @@ impl HostMetricsCache {
     }
 }
 
-/// Take one sample of this host, now. Blocking: a `statvfs` per role and two
-/// small file reads. Callers go through [`HostMetricsCache`], which runs it on
-/// a detached thread, one at a time.
+/// Take one sample of this host, now, and judge it against this deck's
+/// thresholds. Blocking: a `statvfs` per role, two small file reads and a read
+/// of the deck's `config.toml`. Callers go through [`HostMetricsCache`], which
+/// runs it on a detached thread, one at a time — so a changed threshold shows
+/// from the next sample, at most [`HOST_METRICS_MAX_AGE`] later.
 pub fn sample_host() -> HostMetrics {
+    let mut metrics = measure_host();
+    apply_health_levels(&mut metrics, &configured_thresholds());
+    metrics
+}
+
+/// The numbers of one sample, with no levels.
+fn measure_host() -> HostMetrics {
     #[cfg(feature = "e2e")]
     if let Some(fixed) = e2e_fixed_sample() {
         return fixed;
@@ -310,6 +319,7 @@ pub fn sample_host() -> HostMetrics {
                     role: role.to_string(),
                     free_bytes,
                     total_bytes,
+                    level: None,
                 }
             })
             .collect(),
@@ -319,6 +329,8 @@ pub fn sample_host() -> HostMetrics {
             .and_then(|n| u32::try_from(n.get()).ok()),
         memory_used_bytes,
         memory_available_bytes,
+        load_level: None,
+        memory_level: None,
         sampled_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -326,6 +338,233 @@ pub fn sample_host() -> HostMetrics {
             .unwrap_or(0),
         sample_age_ms: 0,
     }
+}
+
+/// The thresholds a deck judges its host by (PRD #1258), from the
+/// `[host_metrics]` table of its `config.toml`:
+///
+/// | key | default | the level is… |
+/// | --- | --- | --- |
+/// | `disk_free_warn_percent` | 15 | `warn` below this % of the filesystem free |
+/// | `disk_free_critical_percent` | 5 | `critical` below this % free |
+/// | `memory_available_warn_percent` | 20 | `warn` below this % of memory available |
+/// | `memory_available_critical_percent` | 10 | `critical` below this % available |
+/// | `load_per_core_warn` | 0.8 | `warn` above this 1-minute load per core |
+/// | `load_per_core_critical` | 1.5 | `critical` above this load per core |
+///
+/// Each value is checked on its own, and one that is not a number in range
+/// falls back to its default with a warning in the daemon's log, so a typo in
+/// one key never discards the others — nor the rest of `config.toml`. A pair
+/// whose critical threshold is less severe than its warn threshold falls back
+/// to both defaults, likewise with a warning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HealthThresholds {
+    pub disk_free_warn_percent: f64,
+    pub disk_free_critical_percent: f64,
+    pub memory_available_warn_percent: f64,
+    pub memory_available_critical_percent: f64,
+    pub load_per_core_warn: f64,
+    pub load_per_core_critical: f64,
+}
+
+impl Default for HealthThresholds {
+    fn default() -> Self {
+        Self {
+            disk_free_warn_percent: 15.0,
+            disk_free_critical_percent: 5.0,
+            memory_available_warn_percent: 20.0,
+            memory_available_critical_percent: 10.0,
+            load_per_core_warn: 0.8,
+            load_per_core_critical: 1.5,
+        }
+    }
+}
+
+/// The `[host_metrics]` keys [`HealthThresholds::from_table`] reads, in the
+/// order its table documents them.
+pub const HEALTH_THRESHOLD_KEYS: [&str; 6] = [
+    "disk_free_warn_percent",
+    "disk_free_critical_percent",
+    "memory_available_warn_percent",
+    "memory_available_critical_percent",
+    "load_per_core_warn",
+    "load_per_core_critical",
+];
+
+impl HealthThresholds {
+    /// Read the `[host_metrics]` table, returning the thresholds and one
+    /// warning per value that fell back to its default (or key that is not a
+    /// threshold). See the type's doc for the rules.
+    pub fn from_table(table: &toml::Table) -> (Self, Vec<String>) {
+        let mut thresholds = Self::default();
+        let mut warnings = Vec::new();
+        for (key, value) in table {
+            let Some(slot) = thresholds.slot(key) else {
+                warnings.push(format!(
+                    "[host_metrics] {key} is not a threshold; it is ignored (known keys: {})",
+                    HEALTH_THRESHOLD_KEYS.join(", ")
+                ));
+                continue;
+            };
+            let number = match value {
+                toml::Value::Integer(n) => Some(*n as f64),
+                toml::Value::Float(f) => Some(*f),
+                _ => None,
+            };
+            match number.filter(|n| Self::in_range(key, *n)) {
+                Some(n) => *slot = n,
+                None => warnings.push(format!(
+                    "[host_metrics] {key} = {value} is not {}; using the default {}",
+                    Self::range_text(key),
+                    Self::default().value(key)
+                )),
+            }
+        }
+        let d = Self::default();
+        let t = &mut thresholds;
+        let w = &mut warnings;
+        #[rustfmt::skip]
+        let pairs = [
+            ("disk_free", &mut t.disk_free_warn_percent, &mut t.disk_free_critical_percent, d.disk_free_warn_percent, d.disk_free_critical_percent, false),
+            ("memory_available", &mut t.memory_available_warn_percent, &mut t.memory_available_critical_percent, d.memory_available_warn_percent, d.memory_available_critical_percent, false),
+            ("load_per_core", &mut t.load_per_core_warn, &mut t.load_per_core_critical, d.load_per_core_warn, d.load_per_core_critical, true),
+        ];
+        for (name, warn, critical, default_warn, default_critical, above) in pairs {
+            let ordered = if above {
+                *critical >= *warn
+            } else {
+                *critical <= *warn
+            };
+            if !ordered {
+                w.push(format!(
+                    "[host_metrics] {name}: the critical threshold {critical} is less severe \
+                     than the warn threshold {warn}; using the defaults for both"
+                ));
+                (*warn, *critical) = (default_warn, default_critical);
+            }
+        }
+        (thresholds, warnings)
+    }
+
+    fn slot(&mut self, key: &str) -> Option<&mut f64> {
+        Some(match key {
+            "disk_free_warn_percent" => &mut self.disk_free_warn_percent,
+            "disk_free_critical_percent" => &mut self.disk_free_critical_percent,
+            "memory_available_warn_percent" => &mut self.memory_available_warn_percent,
+            "memory_available_critical_percent" => &mut self.memory_available_critical_percent,
+            "load_per_core_warn" => &mut self.load_per_core_warn,
+            "load_per_core_critical" => &mut self.load_per_core_critical,
+            _ => return None,
+        })
+    }
+
+    /// The threshold named `key` (one of [`HEALTH_THRESHOLD_KEYS`]), or NaN
+    /// for a name that is not one.
+    pub fn value(mut self, key: &str) -> f64 {
+        self.slot(key).map_or(f64::NAN, |v| *v)
+    }
+
+    fn is_percent(key: &str) -> bool {
+        key.ends_with("_percent")
+    }
+
+    /// Whether `value` is a usable threshold for `key`: a finite percentage in
+    /// `0..=100`, or a finite, non-negative load per core.
+    pub fn in_range(key: &str, value: f64) -> bool {
+        value.is_finite() && value >= 0.0 && (!Self::is_percent(key) || value <= 100.0)
+    }
+
+    fn range_text(key: &str) -> &'static str {
+        if Self::is_percent(key) {
+            "a number from 0 to 100"
+        } else {
+            "a number of 0 or more"
+        }
+    }
+}
+
+/// `critical` below `critical_below`, `warn` below `warn_below`, else `ok`.
+pub fn level_when_below(value: f64, warn_below: f64, critical_below: f64) -> HealthLevel {
+    if value < critical_below {
+        HealthLevel::Critical
+    } else if value < warn_below {
+        HealthLevel::Warn
+    } else {
+        HealthLevel::Ok
+    }
+}
+
+/// `critical` above `critical_above`, `warn` above `warn_above`, else `ok`.
+pub fn level_when_above(value: f64, warn_above: f64, critical_above: f64) -> HealthLevel {
+    if value > critical_above {
+        HealthLevel::Critical
+    } else if value > warn_above {
+        HealthLevel::Warn
+    } else {
+        HealthLevel::Ok
+    }
+}
+
+/// `part` as a percentage of `whole`, or `None` when `whole` is zero.
+fn percent_of(part: u64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 / whole as f64 * 100.0)
+}
+
+/// Set every level `metrics` can carry from its numbers and `thresholds`, and
+/// clear each one whose number is absent: a reading the daemon could not take
+/// has no level, never `ok`.
+pub fn apply_health_levels(metrics: &mut HostMetrics, thresholds: &HealthThresholds) {
+    for disk in &mut metrics.disks {
+        disk.level = disk
+            .free_bytes
+            .zip(disk.total_bytes)
+            .and_then(|(free, total)| percent_of(free, total))
+            .map(|percent| {
+                level_when_below(
+                    percent,
+                    thresholds.disk_free_warn_percent,
+                    thresholds.disk_free_critical_percent,
+                )
+            });
+    }
+    metrics.memory_level = metrics
+        .memory_used_bytes
+        .zip(metrics.memory_available_bytes)
+        .and_then(|(used, available)| percent_of(available, used.checked_add(available)?))
+        .map(|percent| {
+            level_when_below(
+                percent,
+                thresholds.memory_available_warn_percent,
+                thresholds.memory_available_critical_percent,
+            )
+        });
+    metrics.load_level = metrics
+        .load_per_cpu
+        .filter(|load| load.is_finite())
+        .map(|load| {
+            level_when_above(
+                load,
+                thresholds.load_per_core_warn,
+                thresholds.load_per_core_critical,
+            )
+        });
+}
+
+/// This deck's thresholds, read from its `config.toml` now. A warning is logged
+/// once per distinct set of warnings, not once per sample, so an open overlay
+/// polling a misconfigured deck does not fill the log.
+fn configured_thresholds() -> HealthThresholds {
+    static LAST_WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let (thresholds, warnings) =
+        HealthThresholds::from_table(&crate::config::DashboardConfig::load_bounded().host_metrics);
+    let mut last = LAST_WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    if *last != warnings {
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
+        *last = warnings;
+    }
+    thresholds
 }
 
 /// e2e seam for the docs screenshots: with the `e2e` feature, a sample given
@@ -446,9 +685,133 @@ fn read_memory() -> (Option<u64>, Option<u64>) {
     read_memory_from(std::path::Path::new("/proc/meminfo"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_memory() -> (Option<u64>, Option<u64>) {
     (None, None)
+}
+
+/// `(used, available)` bytes on macOS: the total from `sysctl hw.memsize` and
+/// the page counts from `host_statistics64(HOST_VM_INFO64)`, combined by
+/// [`macos_available_bytes`]. `used` is the total less that.
+///
+/// Both need the total, so an unreadable total leaves both absent; an
+/// unreadable page count leaves both absent too, rather than calling every
+/// byte available.
+#[cfg(target_os = "macos")]
+fn read_memory() -> (Option<u64>, Option<u64>) {
+    let Some(total) = macos_total_memory() else {
+        return (None, None);
+    };
+    let available = macos_vm_counts().and_then(|counts| macos_available_bytes(total, counts));
+    let used = available.and_then(|available| total.checked_sub(available));
+    (used, available)
+}
+
+/// `hw.memsize`: the machine's physical memory in bytes.
+#[cfg(target_os = "macos")]
+fn macos_total_memory() -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated and ours; `sysctlbyname` writes at
+    // most `len` bytes into `value`, which we own and sized to `len`, and
+    // updates `len` to what it wrote. No new value is set (null, 0).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>() && value > 0).then_some(value)
+}
+
+/// The page counts [`macos_available_bytes`] reads, already in the units it
+/// multiplies out.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy)]
+struct MacVmCounts {
+    page_size: u64,
+    internal: u64,
+    purgeable: u64,
+    wired: u64,
+    compressed: u64,
+}
+
+/// One `host_statistics64(HOST_VM_INFO64)` reading.
+///
+/// **`mach_host_self` comes from `libc`, which marks it deprecated** in favour
+/// of the `mach2` crate. The function itself is the system's and is fine; the
+/// note only points at a crate with fuller Mach bindings, and this is the one
+/// call that would need it, so allowing the lint is the smaller addition than
+/// a new dependency. The port is taken once per process: each call adds a
+/// reference to the same host port, which nothing here would release.
+#[cfg(target_os = "macos")]
+fn macos_vm_counts() -> Option<MacVmCounts> {
+    static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    // SAFETY: `mach_host_self` takes no arguments and returns a send right to
+    // this host's port.
+    #[allow(deprecated)]
+    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+    // SAFETY: a zeroed `vm_statistics64` is a valid value of a plain-integer
+    // struct. `host_statistics64` writes at most `count` integers into it —
+    // `count` starts at the struct's own size in integers — and sets `count`
+    // to what it wrote; fields an older kernel does not fill stay zero, and
+    // none of them is read here.
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let rc = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stats as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: `vm_page_size` is the kernel-initialised page size the
+    // statistics above count in; reading it has no precondition.
+    let page_size = unsafe { libc::vm_page_size } as u64;
+    Some(MacVmCounts {
+        page_size,
+        internal: u64::from(stats.internal_page_count),
+        purgeable: u64::from(stats.purgeable_count),
+        wired: u64::from(stats.wire_count),
+        compressed: u64::from(stats.compressor_page_count),
+    })
+}
+
+/// Available memory on macOS, in bytes: **the total less what Activity Monitor
+/// calls "Memory Used"**, which is App Memory + Wired Memory + Compressed, with
+/// App Memory = internal (anonymous) pages − purgeable pages:
+///
+/// ```text
+/// available = total − (internal − purgeable + wired + compressed) × page_size
+/// ```
+///
+/// What is left is free memory plus Activity Monitor's "Cached Files"
+/// (file-backed pages and purgeable memory), which the system reclaims before
+/// it has to compress or swap — the same meaning as Linux's `MemAvailable`.
+/// Summing free + inactive pages instead undercounts, because macOS keeps much
+/// of its reclaimable file cache on the active queue. Clamped into
+/// `0..=total`, since the page counts and the total are read separately and a
+/// few pages can move between the two reads. `None` when the arithmetic would
+/// overflow or no page size was reported.
+#[cfg(any(target_os = "macos", test))]
+fn macos_available_bytes(total: u64, counts: MacVmCounts) -> Option<u64> {
+    if counts.page_size == 0 {
+        return None;
+    }
+    let used_pages = counts
+        .internal
+        .saturating_sub(counts.purgeable)
+        .checked_add(counts.wired)?
+        .checked_add(counts.compressed)?;
+    let used = used_pages.checked_mul(counts.page_size)?;
+    Some(total.saturating_sub(used))
 }
 
 /// `(used, available)` bytes from a Linux `meminfo` file: `MemTotal -
@@ -500,6 +863,81 @@ mod tests {
             "machine_load_per_cpu() must measure the load here, got {load:?}"
         );
     }
+
+    /// PRD #1258: macOS reports its memory, read from `hw.memsize` and the Mach
+    /// host statistics, rather than leaving both figures unknown.
+    /// `build-macos` runs this; it is the only check that the Mach call
+    /// answers on a real Mac and that the figures are in bytes, not pages.
+    #[test]
+    fn the_memory_is_measurable_on_macos() {
+        let total = macos_total_memory().expect("hw.memsize reads on macOS");
+        let (used, available) = read_memory();
+        let (used, available) = (
+            used.expect("used memory reads on macOS"),
+            available.expect("available memory reads on macOS"),
+        );
+        assert!(
+            available <= total,
+            "available {available} must not exceed the total {total}"
+        );
+        assert_eq!(used + available, total, "used is the total less available");
+        // Every Mac running the tests has wired and app memory, so a reading
+        // that calls the whole machine available counted pages as bytes.
+        assert!(available < total, "available {available} == total {total}");
+        // A gigabyte is below any Mac CI runs on; a smaller total is a
+        // reading in the wrong unit.
+        assert!(total >= 1 << 30, "total {total} is not a byte count");
+    }
+}
+
+/// The macOS available-memory formula, run on every platform so a change to it
+/// is caught by the Linux tiers too.
+#[cfg(test)]
+mod macos_memory_formula_tests {
+    use super::*;
+
+    fn counts(internal: u64, purgeable: u64, wired: u64, compressed: u64) -> MacVmCounts {
+        MacVmCounts {
+            page_size: 16384,
+            internal,
+            purgeable,
+            wired,
+            compressed,
+        }
+    }
+
+    #[test]
+    fn available_is_the_total_less_app_wired_and_compressed() {
+        let page = 16384;
+        let total = 1000 * page;
+        // App memory 300 - 50 = 250 pages, wired 100, compressed 50: 400 used.
+        assert_eq!(
+            macos_available_bytes(total, counts(300, 50, 100, 50)),
+            Some(600 * page)
+        );
+        // Purgeable larger than internal does not go negative.
+        assert_eq!(
+            macos_available_bytes(total, counts(10, 50, 0, 0)),
+            Some(total)
+        );
+        // Counts that add up past the total clamp to zero available.
+        assert_eq!(macos_available_bytes(total, counts(2000, 0, 0, 0)), Some(0));
+        // No page size and an overflowing product are not readings.
+        assert_eq!(
+            macos_available_bytes(
+                total,
+                MacVmCounts {
+                    page_size: 0,
+                    ..counts(1, 0, 0, 0)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            macos_available_bytes(total, counts(u64::MAX, 0, 0, 0)),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +985,8 @@ mod single_flight_tests {
             cpu_count: Some(4),
             memory_used_bytes: None,
             memory_available_bytes: None,
+            load_level: None,
+            memory_level: None,
             sampled_at_ms,
             sample_age_ms: 0,
         }
@@ -845,5 +1285,203 @@ mod single_flight_tests {
             (Some(10 * 4096), Some(20 * 4096))
         );
         assert_eq!(disk_figures(u64::MAX, 10, 20), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod health_level_tests {
+    use super::*;
+    use spec::spec;
+
+    const GIB: u64 = 1 << 30;
+
+    fn disk(free: Option<u64>, total: Option<u64>) -> DiskUsage {
+        DiskUsage {
+            role: ROLE_WORKING_ROOT.to_string(),
+            free_bytes: free,
+            total_bytes: total,
+            level: Some(HealthLevel::Ok),
+        }
+    }
+
+    fn metrics(
+        disks: Vec<DiskUsage>,
+        load: Option<f64>,
+        used: Option<u64>,
+        available: Option<u64>,
+    ) -> HostMetrics {
+        HostMetrics {
+            disks,
+            load_per_cpu: load,
+            cpu_count: Some(4),
+            memory_used_bytes: used,
+            memory_available_bytes: available,
+            // Stale levels, to prove an absent number clears them.
+            load_level: Some(HealthLevel::Critical),
+            memory_level: Some(HealthLevel::Critical),
+            sampled_at_ms: 1,
+            sample_age_ms: 0,
+        }
+    }
+
+    /// Scenario: Judge readings exactly at, just past and short of each
+    /// default threshold; a value exactly at a threshold stays on the healthier
+    /// side, one past it moves a level, and every reading with an absent or
+    /// unusable number gets no level rather than `ok`.
+    #[spec("protocol/host-metrics/012")]
+    #[test]
+    fn protocol_host_metrics_012_level_boundaries_and_absent_numbers() {
+        use HealthLevel::{Critical, Ok, Warn};
+        let t = HealthThresholds::default();
+        // Disk free %: warn below 15, critical below 5.
+        for (free_percent, expected) in [
+            (100, Ok),
+            (15, Ok),
+            (14, Warn),
+            (5, Warn),
+            (4, Critical),
+            (0, Critical),
+        ] {
+            let mut m = metrics(vec![disk(Some(free_percent), Some(100))], None, None, None);
+            apply_health_levels(&mut m, &t);
+            assert_eq!(m.disks[0].level, Some(expected), "{free_percent}% free");
+        }
+        // Memory available % of used + available: warn below 20, critical below 10.
+        for (available, expected) in [(20, Ok), (19, Warn), (10, Warn), (9, Critical)] {
+            let mut m = metrics(
+                vec![],
+                None,
+                Some((100 - available) * GIB),
+                Some(available * GIB),
+            );
+            apply_health_levels(&mut m, &t);
+            assert_eq!(m.memory_level, Some(expected), "{available}% available");
+        }
+        // Load per core: warn above 0.8, critical above 1.5.
+        for (load, expected) in [
+            (0.0, Ok),
+            (0.8, Ok),
+            (0.81, Warn),
+            (1.5, Warn),
+            (1.51, Critical),
+        ] {
+            let mut m = metrics(vec![], Some(load), None, None);
+            apply_health_levels(&mut m, &t);
+            assert_eq!(m.load_level, Some(expected), "load {load}");
+        }
+
+        // Absent or unusable numbers have no level.
+        let mut m = metrics(
+            vec![
+                disk(None, Some(100)),
+                disk(Some(10), None),
+                disk(Some(0), Some(0)),
+            ],
+            Some(f64::NAN),
+            None,
+            Some(GIB),
+        );
+        apply_health_levels(&mut m, &t);
+        assert!(m.disks.iter().all(|d| d.level.is_none()), "{:?}", m.disks);
+        assert_eq!(m.load_level, None, "a non-finite load is not a reading");
+        assert_eq!(m.memory_level, None, "no used figure, so no total");
+        let mut m = metrics(vec![], None, None, None);
+        apply_health_levels(&mut m, &t);
+        assert_eq!((m.load_level, m.memory_level), (None, None));
+    }
+
+    fn table(toml: &str) -> toml::Table {
+        toml::from_str(toml).expect("test TOML parses")
+    }
+
+    /// Scenario: Read the `[host_metrics]` thresholds from a deck config: an
+    /// empty table gives the defaults, valid integers and floats are used,
+    /// and each invalid value — text, a negative, a percentage over 100, a
+    /// non-finite number — falls back to its own default with a warning that
+    /// names it, as do an unknown key and a pair whose critical threshold is
+    /// less severe than its warning.
+    #[spec("protocol/host-metrics/013")]
+    #[test]
+    fn protocol_host_metrics_013_thresholds_parse_and_invalid_values_fall_back() {
+        let defaults = HealthThresholds::default();
+        assert_eq!(
+            defaults,
+            HealthThresholds {
+                disk_free_warn_percent: 15.0,
+                disk_free_critical_percent: 5.0,
+                memory_available_warn_percent: 20.0,
+                memory_available_critical_percent: 10.0,
+                load_per_core_warn: 0.8,
+                load_per_core_critical: 1.5,
+            }
+        );
+        assert_eq!(HealthThresholds::from_table(&table("")), (defaults, vec![]));
+
+        let (t, warnings) = HealthThresholds::from_table(&table(
+            "disk_free_warn_percent = 25\ndisk_free_critical_percent = 7.5\n\
+             memory_available_warn_percent = 30\nmemory_available_critical_percent = 0\n\
+             load_per_core_warn = 1\nload_per_core_critical = 2.25\n",
+        ));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            t,
+            HealthThresholds {
+                disk_free_warn_percent: 25.0,
+                disk_free_critical_percent: 7.5,
+                memory_available_warn_percent: 30.0,
+                memory_available_critical_percent: 0.0,
+                load_per_core_warn: 1.0,
+                load_per_core_critical: 2.25,
+            }
+        );
+
+        // Each invalid value falls back to its own default; the valid ones
+        // beside it are kept.
+        let (t, warnings) = HealthThresholds::from_table(&table(
+            "disk_free_warn_percent = \"lots\"\ndisk_free_critical_percent = 3\n\
+             memory_available_warn_percent = 120\nload_per_core_warn = -1\n\
+             load_per_core_critical = nan\nload_per_core_typo = 1\n",
+        ));
+        assert_eq!(t.disk_free_warn_percent, 15.0);
+        assert_eq!(t.disk_free_critical_percent, 3.0);
+        assert_eq!(t.memory_available_warn_percent, 20.0);
+        assert_eq!(t.load_per_core_warn, 0.8);
+        assert_eq!(t.load_per_core_critical, 1.5);
+        for named in [
+            "disk_free_warn_percent",
+            "memory_available_warn_percent",
+            "load_per_core_warn",
+            "load_per_core_critical",
+            "load_per_core_typo",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(named)),
+                "no warning names {named}: {warnings:?}"
+            );
+        }
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+
+        // A critical threshold less severe than its warning resets the pair.
+        let (t, warnings) = HealthThresholds::from_table(&table(
+            "disk_free_warn_percent = 5\ndisk_free_critical_percent = 10\n\
+             load_per_core_warn = 2\nload_per_core_critical = 1\n",
+        ));
+        assert_eq!(
+            (t.disk_free_warn_percent, t.disk_free_critical_percent),
+            (15.0, 5.0)
+        );
+        assert_eq!((t.load_per_core_warn, t.load_per_core_critical), (0.8, 1.5));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("disk_free") && warnings[1].contains("load_per_core"));
+
+        // Equal thresholds are allowed: the level skips straight to critical.
+        let (t, warnings) = HealthThresholds::from_table(&table(
+            "load_per_core_warn = 1\nload_per_core_critical = 1\n",
+        ));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            level_when_above(1.01, t.load_per_core_warn, t.load_per_core_critical),
+            HealthLevel::Critical
+        );
     }
 }

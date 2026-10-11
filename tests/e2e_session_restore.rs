@@ -1530,7 +1530,7 @@ fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id()
                 && common::role_pane_left_edge(&grid, "coder").is_none()
                 // And the deck is in command mode, not the PaneInput the
                 // snapshot-restore block leaves behind.
-                && grid.contains("[New Agent Ctrl+N]")
+                && grid.contains("[New Agent n/Ctrl+N]")
                 && !grid.contains("[Command Mode Ctrl+D]")
         }),
         "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \

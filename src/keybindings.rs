@@ -417,6 +417,31 @@ impl Action {
     }
 }
 
+/// The actions whose default `Ctrl+<letter>` chord also answers to the plain
+/// letter **in command mode** (PRD #1258): `d` (dashboard / back to the pane),
+/// `n` (new agent, unless the selected card is waiting for a permission answer,
+/// when `n` denies it as before), `w` (close, with its confirmation), `t`
+/// (layout), `e` (orchestration lock, gated exactly as `Ctrl+E`) and `z`
+/// (zoom). In a pane every letter still goes to the agent, and the chords keep
+/// working everywhere they did.
+///
+/// Left out on purpose: the split toggle (`Ctrl+L`), because `l` is already
+/// the next-tab key, and `Ctrl+C`, which is the quit trigger and not an
+/// action.
+///
+/// The rule ([`KeybindingConfig::plain_alias`]): an action has its alias only
+/// while it is still on its default chord — a remapped action gets none — and
+/// only while no other action is bound to that letter. Deny permission's `n`
+/// is the one binding that shares a letter instead of taking it.
+pub const PLAIN_LETTER_ALIASES: [Action; 6] = [
+    Action::Dashboard,
+    Action::NewPane,
+    Action::ClosePane,
+    Action::ToggleLayout,
+    Action::ToggleOrchestrationLock,
+    Action::ToggleZoom,
+];
+
 /// A single parsed key binding.
 ///
 /// `chord == None` means the action is **unbound** (config value `""`): it is
@@ -654,6 +679,44 @@ impl KeybindingConfig {
     /// `true` iff `key` triggers `action` under this config.
     pub fn matches(&self, action: Action, key: &KeyEvent) -> bool {
         matches_binding(key, &self.binding(action))
+    }
+
+    /// The plain letter `action` also answers to in command mode, if it has
+    /// one under this config. See [`PLAIN_LETTER_ALIASES`] for the rule.
+    pub fn plain_alias(&self, action: Action) -> Option<char> {
+        if !PLAIN_LETTER_ALIASES.contains(&action) {
+            return None;
+        }
+        let default = parse_binding(action.default_notation()).ok()?;
+        // A remapped action gets no alias: the user chose its key.
+        if self.binding(action) != default {
+            return None;
+        }
+        let (KeyCode::Char(letter), KeyModifiers::CONTROL) = default.chord()? else {
+            return None;
+        };
+        let plain = normalize_chord(KeyCode::Char(letter), KeyModifiers::NONE);
+        let taken = ACTIONS.iter().any(|spec| {
+            spec.action != action
+                // `n` denies a pending permission and makes a new agent
+                // otherwise, so deny's own binding of `n` shares the letter
+                // rather than taking it.
+                && !(action == Action::NewPane && spec.action == Action::DenyPermission)
+                && self
+                    .binding(spec.action)
+                    .chord()
+                    .is_some_and(|(code, mods)| normalize_chord(code, mods) == plain)
+        });
+        (!taken).then_some(letter)
+    }
+
+    /// `true` iff `key` is `action`'s plain-letter alias ([`Self::plain_alias`]).
+    /// Only command mode reads it; a key with any modifier never matches.
+    pub fn matches_plain_alias(&self, action: Action, key: &KeyEvent) -> bool {
+        self.plain_alias(action).is_some_and(|letter| {
+            normalize_chord(key.code, key.modifiers)
+                == normalize_chord(KeyCode::Char(letter), KeyModifiers::NONE)
+        })
     }
 
     /// Find the (first, in canonical order) action triggered by `key`, if any.

@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
@@ -770,23 +770,31 @@ const FIXTURE_GIB = 1024 ** 3;
 
 /**
  * PRD #1258 M4 — a deck's host as its daemon reports it, so fixture-mode
- * screens (and the docs screenshots taken from them) show the host panel. The
- * numbers are fixed: a screenshot must not change between runs. `local` is
- * this machine's deck, `remote` a smaller build box.
+ * screens (and the docs screenshots taken from them) show the host button and
+ * its popover. The numbers are fixed: a screenshot must not change between
+ * runs. `local` is this machine's deck, `remote` a smaller build box.
+ *
+ * The levels are what a daemon with the default thresholds serves for these
+ * numbers — written out, because the app never computes a level itself: the
+ * local temp root at 9% free is a warning; the remote disks at 15% free are a
+ * warning, its load of 1.35 per core too, and its memory at 7% available is
+ * critical.
  */
 export function fixtureHostMetrics(host: "local" | "remote"): HostMetricsReport {
   const local = host === "local";
-  const disk = (role: string, free: number, total: number) => ({ role, freeBytes: free * FIXTURE_GIB, totalBytes: total * FIXTURE_GIB });
+  const disk = (role: string, free: number, total: number, level: HostLevel) => ({ role, freeBytes: free * FIXTURE_GIB, totalBytes: total * FIXTURE_GIB, level });
   return {
     status: "available",
     metrics: {
       disks: local
-        ? [disk("working_root", 128, 512), disk("worktree_parent", 128, 512), disk("temp_root", 48, 64)]
-        : [disk("working_root", 37.5, 256), disk("worktree_parent", 37.5, 256), disk("temp_root", 9.5, 32)],
+        ? [disk("working_root", 128, 512, "ok"), disk("worktree_parent", 128, 512, "ok"), disk("temp_root", 6, 64, "warn")]
+        : [disk("working_root", 37.5, 256, "warn"), disk("worktree_parent", 37.5, 256, "warn"), disk("temp_root", 9.5, 32, "ok")],
       loadPerCpu: local ? 0.42 : 1.35,
       cpuCount: local ? 16 : 8,
       memoryUsedBytes: (local ? 18.5 : 12) * FIXTURE_GIB,
-      memoryAvailableBytes: (local ? 43.5 : 4) * FIXTURE_GIB,
+      memoryAvailableBytes: (local ? 43.5 : 1) * FIXTURE_GIB,
+      loadLevel: local ? "ok" : "warn",
+      memoryLevel: local ? "ok" : "critical",
       sampledAtMs: 1_700_000_000_000,
       // The local deck's figures are the TUI `host-metrics` capture's
       // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`): change the two together.

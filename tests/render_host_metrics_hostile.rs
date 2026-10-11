@@ -32,12 +32,15 @@ fn report(roles: impl IntoIterator<Item = String>) -> HostMetricsReport {
                 role,
                 free_bytes: Some(1024_u64.pow(3)),
                 total_bytes: Some(2 * 1024_u64.pow(3)),
+                level: None,
             })
             .collect(),
         load_per_cpu: Some(0.5),
         cpu_count: Some(4),
         memory_used_bytes: None,
         memory_available_bytes: None,
+        load_level: None,
+        memory_level: None,
         sampled_at_ms: 1,
         sample_age_ms: 0,
     })

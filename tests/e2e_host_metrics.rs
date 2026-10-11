@@ -197,3 +197,74 @@ async fn protocol_host_metrics_002_socket_reuses_sample_until_max_age() {
     );
     clock_guard.abort();
 }
+
+/// Scenario: Give a socket-backed daemon a fixed host sample and a deck config
+/// that lowers the load's warn threshold and sets its critical threshold to
+/// text. The reply serves each disk's, the load's and the memory's level beside
+/// its number by the configured thresholds, falls back to the default for the
+/// invalid one, and leaves out the level of every reading whose number is
+/// absent.
+#[spec("protocol/host-metrics/014")]
+#[tokio::test]
+async fn protocol_host_metrics_014_levels_are_served_beside_their_numbers() {
+    const GIB: u64 = 1 << 30;
+    let root = test_temp::tempdir().expect("isolated config root");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[host_metrics]\nload_per_core_warn = 0.5\nload_per_core_critical = \"high\"\n",
+    )
+    .unwrap();
+    let sample = serde_json::json!({
+        "disks": [
+            { "role": "working_root", "free_bytes": 4 * GIB, "total_bytes": 100 * GIB },
+            { "role": "worktree_parent", "free_bytes": 10 * GIB, "total_bytes": 100 * GIB },
+            { "role": "temp_root", "free_bytes": 50 * GIB, "total_bytes": 100 * GIB },
+            { "role": "scratch", "total_bytes": 100 * GIB }
+        ],
+        "load_per_cpu": 0.6,
+        "cpu_count": 4,
+        "memory_available_bytes": GIB,
+        "sampled_at_ms": 1,
+        "sample_age_ms": 0
+    });
+    // SAFETY: nextest runs each test in its own process, and these are set
+    // before this test starts the server or any thread that reads them.
+    unsafe {
+        std::env::set_var("DOT_AGENT_DECK_CONFIG", &config);
+        std::env::set_var("DOT_AGENT_DECK_E2E_HOST_SAMPLE", sample.to_string());
+    }
+    let server = server();
+    let (response, wire) = request(&server, &AttachRequest::HostMetrics).await;
+    let levels: Vec<_> = wire["host_metrics"]["disks"]
+        .as_array()
+        .expect("disks")
+        .iter()
+        .map(|disk| disk.get("level").cloned())
+        .collect();
+    assert_eq!(
+        levels,
+        [
+            Some(serde_json::json!("critical")),
+            Some(serde_json::json!("warn")),
+            Some(serde_json::json!("ok")),
+            None,
+        ],
+        "4% free is critical, 10% a warning, 50% ok, and a disk with no free figure has no level"
+    );
+    assert_eq!(
+        wire["host_metrics"]["load_level"],
+        serde_json::json!("warn"),
+        "0.6 per core is past the configured 0.5, and short of the default 1.5 the invalid critical fell back to"
+    );
+    assert!(
+        wire["host_metrics"].get("memory_level").is_none(),
+        "no memory total, so no memory level: {wire}"
+    );
+    let metrics = response.host_metrics.expect("host-metrics payload");
+    assert_eq!(
+        metrics.load_per_cpu,
+        Some(0.6),
+        "the number is served as well"
+    );
+}

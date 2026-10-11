@@ -417,7 +417,7 @@ fn open_pane(deck: &TuiDeck, agent: &Agent, command: &str, last_command: &str) {
     // The transcript's first line is its prompt, which no card shows yet.
     deck.wait_for_string(&format!("> {}", agent.prompt));
     deck.send_keys(b"\x04"); // Ctrl+D -> back to the dashboard
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 }
 
 /// The daemon's record of the pane named `name`, once it has one that
@@ -566,7 +566,7 @@ fn stage_dashboard() -> DashboardScene {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // The cards' `Last:` ages. A card's last activity is a high-water mark
     // that starts at its pane's spawn, so every status event is stamped after
@@ -678,7 +678,7 @@ fn docs_screenshot_dashboard_empty() {
     html_dir();
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
-        grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
+        grid.contains("No active agents") && grid.contains("[New Agent n/Ctrl+N]")
     });
 }
 
@@ -875,7 +875,7 @@ const HOST_SAMPLE: &str = r#"{
     "disks": [
         {"role": "working_root", "free_bytes": 137438953472, "total_bytes": 549755813888},
         {"role": "worktree_parent", "free_bytes": 137438953472, "total_bytes": 549755813888},
-        {"role": "temp_root", "free_bytes": 51539607552, "total_bytes": 68719476736}
+        {"role": "temp_root", "free_bytes": 6442450944, "total_bytes": 68719476736}
     ],
     "load_per_cpu": 0.42,
     "cpu_count": 16,
@@ -887,7 +887,8 @@ const HOST_SAMPLE: &str = r#"{
 
 /// Scenario: Press `m` on the empty dashboard, with the daemon reporting a
 /// fixed host sample, so the Host of this deck overlay shows per-role disk,
-/// load per core, memory and a sample age of 0 ms.
+/// load per core, memory and a sample age of 0 ms, with the temp root's 9%
+/// free marked as a warning by the daemon's default thresholds.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_host_metrics() {
@@ -901,6 +902,7 @@ fn docs_screenshot_host_metrics() {
     capture(&deck, "host-metrics", |grid| {
         grid.contains("Host of this deck")
             && grid.contains("0.42 across 16 cores")
+            && grid.contains("(warning)")
             && grid.lines().any(|line| {
                 // The grid retains the overlay's right border after the value.
                 line.contains("Sample age") && line.trim_end_matches([' ', '│']).ends_with(" 0 ms")

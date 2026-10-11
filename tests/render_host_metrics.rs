@@ -257,3 +257,83 @@ fn dashboard_host_metrics_009_a_held_answer_shows_its_growing_age() {
         "the held time saturates, and the age stops at the ceiling both clients share"
     );
 }
+
+/// Scenario: Open the host overlay on a sample whose daemon judged one disk
+/// critical, one a warning, one ok and one not at all, the load a warning and
+/// memory ok. Each judged value is drawn in its level's terminal colour, a
+/// warning or critical value is followed by its word, an ok value has none,
+/// and a value with no level is drawn in the default colour.
+#[spec("dashboard/host-metrics/010")]
+#[test]
+fn dashboard_host_metrics_010_values_are_coloured_by_their_level_with_words() {
+    use ratatui::style::Color;
+    let gib = 1024_u64.pow(3);
+    let report = HostMetricsReport::Available(
+        serde_json::from_value(json!({
+            "disks": [
+                {"role": "working_root", "free_bytes": 4 * gib, "total_bytes": 100 * gib, "level": "critical"},
+                {"role": "worktree_parent", "free_bytes": 10 * gib, "total_bytes": 100 * gib, "level": "warn"},
+                {"role": "temp_root", "free_bytes": 50 * gib, "total_bytes": 100 * gib, "level": "ok"},
+                {"role": "scratch", "free_bytes": gib, "total_bytes": 2 * gib}
+            ],
+            "load_per_cpu": 1.0,
+            "cpu_count": 4,
+            "load_level": "warn",
+            "memory_used_bytes": 8 * gib,
+            "memory_available_bytes": 8 * gib,
+            "memory_level": "ok",
+            "sampled_at_ms": 1_700_000_000_000_u64,
+            "sample_age_ms": 10
+        }))
+        .expect("a judged daemon sample"),
+    );
+    let buffer = render_host_metrics_overlay_to_buffer(&report, 100, 32);
+    let rendered = text(&buffer);
+    assert_line_has(
+        &rendered,
+        "Working root",
+        &["4 GiB free of 100 GiB total (critical)"],
+    );
+    assert_line_has(
+        &rendered,
+        "Worktree parent",
+        &["10 GiB free of 100 GiB total (warning)"],
+    );
+    assert_line_has(
+        &rendered,
+        "Load per core",
+        &["1.00 across 4 cores (warning)"],
+    );
+    for plain in ["Temp root", "scratch", "Memory available", "Memory used"] {
+        let line = rendered.lines().find(|l| l.contains(plain)).unwrap();
+        assert!(!line.contains('('), "{plain} has no word: {line}");
+    }
+
+    // The colour of the first cell of each row's value.
+    let value_colour = |label: &str, value: &str| -> Color {
+        let area = buffer.area();
+        for y in area.y..area.bottom() {
+            let row: String = (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if row.contains(label)
+                && let Some(at) = row.find(value)
+            {
+                let x = area.x + row[..at].chars().count() as u16;
+                return buffer[(x, y)].fg;
+            }
+        }
+        panic!("no {label:?} row with {value:?}\n{rendered}");
+    };
+    assert_eq!(value_colour("Working root", "4 GiB"), Color::Red);
+    assert_eq!(value_colour("Working root", "(critical)"), Color::Red);
+    assert_eq!(value_colour("Worktree parent", "10 GiB"), Color::Yellow);
+    assert_eq!(value_colour("Temp root", "50 GiB"), Color::Green);
+    assert_eq!(value_colour("scratch", "1 GiB"), Color::Reset);
+    assert_eq!(value_colour("Load per core", "1.00"), Color::Yellow);
+    assert_eq!(value_colour("Memory available", "8 GiB"), Color::Green);
+    assert_eq!(value_colour("Memory used", "8 GiB"), Color::Reset);
+    // The labels stay in the default colour; only the value is judged.
+    assert_eq!(value_colour("Working root", "Working root"), Color::Reset);
+    insta::assert_snapshot!(rendered);
+}

@@ -55,9 +55,14 @@ desktopScenario("dashboard-filter", async (page) => {
 
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows
 // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
+// The host button beside the deck's name, opened: its popover is what the
+// image shows, with the temp root's warning.
 desktopScenario("host-metrics", async (page) => {
   await overview(page, "docs");
+  await expect(page.getByTestId("host-metrics-button")).toHaveAttribute("data-level", "warn");
+  await page.getByTestId("host-metrics-button").click();
   await expect(page.getByTestId("host-metrics")).toContainText("0.42 across 16 cores");
+  await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
   await expect(page.getByTestId("host-metrics")).toContainText("0 ms");
 });
 

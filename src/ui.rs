@@ -9633,6 +9633,12 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
+    // PRD #1258: `n` is a new agent whenever it did not just deny a permission
+    // — the plain-letter alias of `Ctrl+n`, resolved here rather than with the
+    // other letters because only this handler knows the selected card's status.
+    if kb.matches_plain_alias(KbAction::NewPane, &key) {
+        return Action::NewPane;
+    }
     // PRD #127 finding #4: open the "Schedules" manager dialog. Routed
     // through the keybinding registry (default `s`) so it is remappable and
     // shares one dispatch path with the `[Schedules s]` button-bar button
@@ -10765,10 +10771,41 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
         return None;
     }
-    match global_action(kb, key) {
+    let resolved = global_action(kb, key).or_else(|| {
+        (mode == UiMode::Normal)
+            .then(|| command_mode_alias_action(kb, key))
+            .flatten()
+    });
+    match resolved {
         Some(Action::CloseSelected) if mode != UiMode::Normal => None,
         other => other,
     }
+}
+
+/// PRD #1258: the global command a plain letter names in command mode — `d`,
+/// `t`, `z`, `w` and `e` for their `Ctrl+` chords, under the rule
+/// [`crate::keybindings::PLAIN_LETTER_ALIASES`] documents. Keyboard only, so it
+/// stays out of [`global_action`], which the mouse and the button bar share.
+///
+/// `n` is not here: it denies a pending permission when the selected card is
+/// waiting for one, which only the dashboard handler knows, so
+/// [`handle_normal_key`] resolves it after the deny check. The actions this
+/// returns are the chords' own, so the orchestration and zoom scoping at the
+/// live call site narrows a letter exactly as it narrows its chord.
+fn command_mode_alias_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    [
+        (KbAction::Dashboard, Action::DetachToNormal),
+        (KbAction::ToggleLayout, Action::ToggleLayout),
+        (KbAction::ToggleZoom, Action::ToggleZoom),
+        (KbAction::ClosePane, Action::CloseSelected),
+        (
+            KbAction::ToggleOrchestrationLock,
+            Action::ToggleOrchestrationLock,
+        ),
+    ]
+    .into_iter()
+    .find(|(kb_action, _)| kb.matches_plain_alias(*kb_action, key))
+    .map(|(_, action)| action)
 }
 
 /// Un-resolve an orchestration-scoped chord unless the active tab is an
@@ -18689,7 +18726,29 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
 /// strings, while a remap (e.g. `new_pane = "Alt+p"`) renders `Alt+P`. An
 /// unbound action renders `(unbound)` (via `display_notation`).
 fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> String {
-    let s = display_notation(keybindings, action);
+    title_case_chord(display_notation(keybindings, action))
+}
+
+/// PRD #1258: [`button_shortcut_label`] for a button in `mode`. In command mode
+/// an action with a plain-letter alias shows the letter beside its chord
+/// (`n/Ctrl+N`), because there the letter is the shorter way to the same
+/// command; in every other mode it shows the chord alone, the only key that
+/// works there.
+fn button_shortcut_label_for_mode(
+    keybindings: &KeybindingConfig,
+    action: KbAction,
+    mode: UiMode,
+) -> String {
+    let chord = button_shortcut_label(keybindings, action);
+    match keybindings.plain_alias(action) {
+        Some(letter) if mode == UiMode::Normal => format!("{letter}/{chord}"),
+        _ => chord,
+    }
+}
+
+/// Upper-case the final letter of a modifier combo (`Ctrl+n` → `Ctrl+N`); see
+/// [`button_shortcut_label`].
+fn title_case_chord(s: String) -> String {
     if let Some(plus) = s.rfind('+') {
         let (head, tail) = s.split_at(plus + 1);
         let mut tail_chars = tail.chars();
@@ -18761,7 +18820,7 @@ fn global_bar_buttons(
         // a toggle, so one button serves both trips.
         Button::new(
             g.dashboard_button,
-            button_shortcut_label(keybindings, KbAction::Dashboard),
+            button_shortcut_label_for_mode(keybindings, KbAction::Dashboard, mode),
             Action::DetachToNormal,
             true,
         ),
@@ -18769,7 +18828,7 @@ fn global_bar_buttons(
         // create the first pane, even with no panes / controller yet.
         Button::new(
             "New Agent",
-            button_shortcut_label(keybindings, KbAction::NewPane),
+            button_shortcut_label_for_mode(keybindings, KbAction::NewPane, mode),
             Action::NewPane,
             true,
         ),
@@ -18778,13 +18837,13 @@ fn global_bar_buttons(
         // click is the same silent no-op the key now is.
         Button::new(
             "Close",
-            button_shortcut_label(keybindings, KbAction::ClosePane),
+            button_shortcut_label_for_mode(keybindings, KbAction::ClosePane, mode),
             Action::CloseSelected,
             has_pane_control && g.close_available,
         ),
         Button::new(
             "Toggle Layout",
-            button_shortcut_label(keybindings, KbAction::ToggleLayout),
+            button_shortcut_label_for_mode(keybindings, KbAction::ToggleLayout, mode),
             Action::ToggleLayout,
             has_pane_control,
         ),
@@ -19849,12 +19908,18 @@ fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
 ///   hint now names the trip the user actually needs.
 fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> String {
     let g = ModeGlobals::for_mode(mode);
+    // PRD #1258: in command mode an aliased action shows its plain letter
+    // beside its chord, as the help overlay and the button bar do.
+    let hint = |action: KbAction| {
+        let chord = display_notation(keybindings, action);
+        match keybindings.plain_alias(action) {
+            Some(letter) if mode == UiMode::Normal => format!("{letter}/{chord}"),
+            _ => chord,
+        }
+    };
     // Only advertise close where close works.
     let close = if g.close_available {
-        format!(
-            "{}: close  ",
-            display_notation(keybindings, KbAction::ClosePane)
-        )
+        format!("{}: close  ", hint(KbAction::ClosePane))
     } else {
         String::new()
     };
@@ -19865,9 +19930,9 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> Strin
     // fixed string rather than a config-derived notation.
     format!(
         "{}: new  {close}{}: layout  {}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
-        display_notation(keybindings, KbAction::NewPane),
-        display_notation(keybindings, KbAction::ToggleLayout),
-        display_notation(keybindings, KbAction::Dashboard),
+        hint(KbAction::NewPane),
+        hint(KbAction::ToggleLayout),
+        hint(KbAction::Dashboard),
         jump_range_notation(keybindings),
         display_notation(keybindings, KbAction::Help),
         display_notation(keybindings, KbAction::Filter),
@@ -19960,21 +20025,33 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     // a key that no longer fires. Shared with the hints bar via
     // `display_notation` so the two renderers can't drift.
     let n = |action: KbAction| -> String { display_notation(keybindings, action) };
+    // PRD #1258: an action with a plain-letter alias lists the letter first
+    // (`n / Ctrl+n`). The letter works in command mode only — which is where
+    // this overlay opens — and the chord from any pane, as the heading says.
+    let lettered = |action: KbAction| -> String {
+        match keybindings.plain_alias(action) {
+            Some(letter) => format!("{letter} / {}", n(action)),
+            None => n(action),
+        }
+    };
 
     let left: Vec<Line> = vec![
-        Line::styled("  Global (works from any pane)", cyan),
+        Line::styled("  Global (chords work from any pane)", cyan),
         Line::from(""),
         // PRD #241 M4: the old "Command mode (dashboard)" named only the
         // outbound trip, so a user already in command mode read it as dead
         // text and could not find the way back to their pane (issue #88).
-        help_key_line(&n(KbAction::Dashboard), "Toggle command / pane"),
-        help_key_line(&n(KbAction::NewPane), "Create new agent"),
+        help_key_line(&lettered(KbAction::Dashboard), "Toggle command / pane"),
+        help_key_line(&lettered(KbAction::NewPane), "Create new agent"),
         // PRD #241 review F6: `close_pane` is NOT global any more — M1 scoped it
         // to command mode so the chord reaches the PTY as word-delete while you
         // are typing in a pane. It is listed under "Dashboard (command mode)"
         // below; leaving it here would document a key that does nothing where
         // the heading promises it works.
-        help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        help_key_line(
+            &lettered(KbAction::ToggleLayout),
+            "Toggle layout (stacked/tiled)",
+        ),
         // PRD #336: `toggle_orchestration_split` is NOT listed here, for the
         // same reason PRD #241 review F6 moved `close_pane` out — it is
         // command-mode only, so this heading's "works from any pane" promise
@@ -20009,7 +20086,10 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         help_key_line(&jump_range_notation(keybindings), "Jump to card N"),
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
         // PRD #241: command-mode only, and it asks before it destroys anything.
-        help_key_line(&n(KbAction::ClosePane), "Close selected agent (confirms)"),
+        help_key_line(
+            &lettered(KbAction::ClosePane),
+            "Close selected agent (confirms)",
+        ),
         // PRD #336: command-mode only and orchestration-tab only, so it sits
         // here rather than under "Global" (see the note there). The description
         // names the tab scope, and stays within the ~30 columns this field
@@ -20021,7 +20101,7 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         // PRD #313: same scope as the split above (command mode, orchestration
         // tab), so it sits in the same place. The description names the tab
         // scope and stays inside the ~30 columns this field renders.
-        help_key_line(&n(KbAction::ToggleZoom), "Zoom focused pane"),
+        help_key_line(&lettered(KbAction::ToggleZoom), "Zoom focused pane"),
         help_key_line(&n(KbAction::Filter), "Filter agents"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename agent"),
@@ -20192,6 +20272,18 @@ fn host_metrics_shown_age_ms(reported_ms: u64, held: std::time::Duration) -> u64
         .min(HOST_METRICS_MAX_SHOWN_AGE_MS)
 }
 
+/// PRD #1258: the word both clients write beside a host reading at `level`,
+/// so colour is never the only signal. `ok` needs none. The desktop's
+/// `hostLevelWord` returns the same words (CLAUDE.md rule 22).
+fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option<&'static str> {
+    use crate::daemon_protocol::HealthLevel;
+    match level {
+        HealthLevel::Ok => None,
+        HealthLevel::Warn => Some("(warning)"),
+        HealthLevel::Critical => Some("(critical)"),
+    }
+}
+
 /// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
 /// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
 /// TUI has held the answer, added to its sample age.
@@ -20204,6 +20296,26 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
             width = HOST_METRICS_LABEL_WIDTH
         ))
     };
+    // PRD #1258: a reading the daemon judged carries its level's colour, and a
+    // non-ok one its word as well, so the colour is never the only signal. No
+    // level — an older daemon, or an absent number — leaves the value plain.
+    let judged =
+        |label: &str, value: String, level: Option<crate::daemon_protocol::HealthLevel>| {
+            let Some(level) = level else {
+                return row(label, value);
+            };
+            let word = host_metrics_level_word(level).map_or_else(String::new, |w| format!(" {w}"));
+            Line::from(vec![
+                Span::raw(format!(
+                    "  {label:<width$} ",
+                    width = HOST_METRICS_LABEL_WIDTH
+                )),
+                Span::styled(
+                    format!("{value}{word}"),
+                    Style::default().fg(palette::health_color(level)),
+                ),
+            ])
+        };
     let mut lines = vec![Line::styled(
         "  Host of this deck",
         Style::default()
@@ -20244,13 +20356,14 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
                 .iter()
                 .take(crate::daemon_protocol::MAX_DISK_ROLES)
             {
-                lines.push(row(
+                lines.push(judged(
                     &host_metrics_role_label(&disk.role),
                     format!(
                         "{} free of {} total",
                         gib(disk.free_bytes),
                         gib(disk.total_bytes)
                     ),
+                    disk.level,
                 ));
             }
             // A non-finite load is not a reading; the desktop bridge drops it
@@ -20263,9 +20376,17 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
             let cores = metrics
                 .cpu_count
                 .map_or_else(|| format!("{UNKNOWN} cores"), |n| format!("{n} cores"));
-            lines.push(row("Load per core", format!("{load} across {cores}")));
+            lines.push(judged(
+                "Load per core",
+                format!("{load} across {cores}"),
+                metrics.load_level,
+            ));
             lines.push(row("Memory used", gib(metrics.memory_used_bytes)));
-            lines.push(row("Memory available", gib(metrics.memory_available_bytes)));
+            lines.push(judged(
+                "Memory available",
+                gib(metrics.memory_available_bytes),
+                metrics.memory_level,
+            ));
             lines.push(row(
                 "Sample age",
                 format!(
@@ -20287,7 +20408,8 @@ fn render_host_metrics_overlay(
 ) -> Vec<(Action, Rect)> {
     let lines = host_metrics_lines(view, held);
     let area = frame.area();
-    let popup_width = 64u16.min(area.width.saturating_sub(2));
+    // Wide enough for a disk row with its level word (PRD #1258).
+    let popup_width = 72u16.min(area.width.saturating_sub(2));
     // Body, then a blank row, the button row and the hint: plus the border.
     // Counted in `usize` and clamped before narrowing, so no line count can
     // overflow the `u16` (audit A2).
@@ -26549,21 +26671,25 @@ mod tests {
             "default `Ctrl+z` must resolve to Action::ToggleZoom, got {resolved:?}"
         );
 
-        // A PLAIN `z` must NOT resolve — it is an ordinary character and belongs
-        // to whatever the user is typing into. This is the inverse of the
-        // assertion this test carried before the binding moved, and it is the
-        // half that would break if someone "restored" the old default without
-        // also restoring its scoping.
+        // A PLAIN `z` typed into a pane must NOT resolve — it is an ordinary
+        // character and belongs to whatever the user is typing into. In command
+        // mode it is the zoom chord's plain-letter alias (PRD #1258), which the
+        // same `scope_zoom` narrows below exactly as it narrows the chord.
         let plain_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-        for mode in [UiMode::Normal, UiMode::PaneInput] {
-            assert!(
-                !matches!(
-                    key_action_for_mode(&kb, mode, &plain_z),
-                    Some(Action::ToggleZoom)
-                ),
-                "a plain `z` must not resolve to the zoom toggle ({mode:?})"
-            );
-        }
+        assert!(
+            !matches!(
+                key_action_for_mode(&kb, UiMode::PaneInput, &plain_z),
+                Some(Action::ToggleZoom)
+            ),
+            "a plain `z` in a pane must not resolve to the zoom toggle"
+        );
+        assert!(
+            matches!(
+                key_action_for_mode(&kb, UiMode::Normal, &plain_z),
+                Some(Action::ToggleZoom)
+            ),
+            "a plain `z` in command mode is the zoom toggle's alias"
+        );
 
         let zoom = || Some(Action::ToggleZoom);
 
@@ -31430,11 +31556,60 @@ mod tests {
                 Some(status.clone()),
                 &KeybindingConfig::default(),
             );
+            // PRD #1258: off a pending permission, `n` is the plain-letter
+            // alias of `Ctrl+n`.
             assert!(
-                matches!(result_n, Action::Continue),
-                "n on status {status:?} must no-op, got {result_n:?}"
+                matches!(result_n, Action::NewPane),
+                "n on status {status:?} must start a new agent, got {result_n:?}"
             );
         }
+    }
+
+    /// Scenario: In command mode, press plain `n` with the selected card
+    /// waiting for a permission answer and it denies the permission; press it
+    /// with the card in any other state, or with no card, and it opens the
+    /// new-agent flow as `Ctrl+n` does. With deny moved to another key, `n`
+    /// is a new agent even on a waiting card; with `new_pane` remapped, `n`
+    /// no longer starts one.
+    #[spec("keybindings/letters/003")]
+    #[test]
+    fn letters_003_n_denies_a_pending_permission_and_is_a_new_agent_otherwise() {
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        let press = |total: usize, status: Option<SessionStatus>, kb: &KeybindingConfig| {
+            handle_normal_key(n, &mut default_ui(), total, status, kb)
+        };
+        let defaults = KeybindingConfig::default();
+        assert!(matches!(
+            press(1, Some(SessionStatus::WaitingForInput), &defaults),
+            Action::SendPermissionResponse(false)
+        ));
+        for status in [
+            Some(SessionStatus::Working),
+            Some(SessionStatus::Idle),
+            None,
+        ] {
+            assert!(
+                matches!(press(1, status.clone(), &defaults), Action::NewPane),
+                "n on {status:?} must start a new agent"
+            );
+        }
+        assert!(matches!(press(0, None, &defaults), Action::NewPane));
+
+        let (deny_moved, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\ndeny_permission = \"x\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(
+            press(1, Some(SessionStatus::WaitingForInput), &deny_moved),
+            Action::NewPane
+        ));
+
+        let (new_moved, warnings) =
+            KeybindingConfig::from_toml_str("[global]\nnew_pane = \"Alt+n\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(
+            press(1, Some(SessionStatus::Idle), &new_moved),
+            Action::Continue
+        ));
     }
 
     #[test]
@@ -31458,7 +31633,8 @@ mod tests {
             None,
             &KeybindingConfig::default(),
         );
-        assert!(matches!(result_n, Action::Continue));
+        // PRD #1258: with no card to answer for, `n` is a new agent.
+        assert!(matches!(result_n, Action::NewPane));
         // Also exercise the case where `total > 0` but `selected_status` is
         // None (the selected session is missing from the snapshot — a race we
         // tolerate gracefully).

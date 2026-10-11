@@ -163,7 +163,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "host-metrics",
-        description: "The host of a deck: the TUI's Host of this deck overlay and the desktop Dashboard's panel, for one fixed sample.",
+        description: "The host of a deck: the TUI's Host of this deck overlay and the desktop Dashboard's Host button opened, for one fixed sample.",
         clients: &[Client::Tui, Client::Desktop],
     },
 ];

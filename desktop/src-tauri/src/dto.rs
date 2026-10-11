@@ -185,6 +185,13 @@ pub struct HostMetricsDto {
     pub memory_used_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_available_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for the load and for available memory,
+    /// passed through as it judged them; absent from a daemon that predates
+    /// levels, which the webview shows uncoloured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
     pub sampled_at_ms: u64,
     /// How old the sample is as this snapshot leaves the bridge: the age the
     /// daemon reported plus the time the bridge has held the answer since.
@@ -200,6 +207,9 @@ pub struct DiskUsageDto {
     pub free_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for this filesystem's free space.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
 }
 
 impl HostMetricsReportDto {
@@ -229,12 +239,15 @@ impl HostMetricsReportDto {
                             ),
                             free_bytes: disk.free_bytes,
                             total_bytes: disk.total_bytes,
+                            level: disk.level,
                         })
                         .collect(),
                     load_per_cpu: metrics.load_per_cpu.filter(|load| load.is_finite()),
                     cpu_count: metrics.cpu_count,
                     memory_used_bytes: metrics.memory_used_bytes,
                     memory_available_bytes: metrics.memory_available_bytes,
+                    load_level: metrics.load_level,
+                    memory_level: metrics.memory_level,
                     sampled_at_ms: metrics.sampled_at_ms,
                     sample_age_ms: metrics
                         .sample_age_ms
@@ -2947,16 +2960,19 @@ mod tests {
 
     /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
     /// the camelCase `hostMetrics` shape, with absent readings omitted rather
-    /// than zeroed and the time the bridge held the answer added to its age;
-    /// an incapable daemon is `not-available`.
+    /// than zeroed, the daemon's health levels passed through beside their
+    /// numbers (and absent where it sent none), and the time the bridge held
+    /// the answer added to its age; an incapable daemon is `not-available`.
     #[test]
     fn host_metrics_dto_keeps_absence_and_ages_a_held_answer() {
         use dot_agent_deck::daemon_client::HostMetricsReport;
         let metrics: dot_agent_deck::daemon_protocol::HostMetrics =
             serde_json::from_value(serde_json::json!({
-                "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20},
+                "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20,
+                           "level": "warn"},
                           {"role": "temp_root"}],
                 "cpu_count": 8,
+                "memory_level": "critical",
                 "sampled_at_ms": 1_700_000_000_000_u64,
                 "sample_age_ms": 1500
             }))
@@ -2970,9 +2986,11 @@ mod tests {
             serde_json::json!({
                 "status": "available",
                 "metrics": {
-                    "disks": [{"role": "working_root", "freeBytes": 10, "totalBytes": 20},
+                    "disks": [{"role": "working_root", "freeBytes": 10, "totalBytes": 20,
+                               "level": "warn"},
                               {"role": "temp_root"}],
                     "cpuCount": 8,
+                    "memoryLevel": "critical",
                     "sampledAtMs": 1_700_000_000_000_u64,
                     "sampleAgeMs": 1750
                 }
@@ -3002,11 +3020,13 @@ mod tests {
             role: "é".repeat(10_000),
             free_bytes: None,
             total_bytes: None,
+            level: None,
         }];
         disks.extend((0..1000).map(|i| DiskUsage {
             role: format!("role{i}"),
             free_bytes: None,
             total_bytes: None,
+            level: None,
         }));
         let dto = HostMetricsReportDto::from_report(
             &HostMetricsReport::Available(HostMetrics {
@@ -3015,6 +3035,8 @@ mod tests {
                 cpu_count: None,
                 memory_used_bytes: None,
                 memory_available_bytes: None,
+                load_level: None,
+                memory_level: None,
                 sampled_at_ms: 1,
                 sample_age_ms: 0,
             }),

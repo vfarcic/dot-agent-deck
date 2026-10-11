@@ -454,7 +454,7 @@ fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
         && grid.matches("Launch an agent to get started").count() == labels.len()
         && grid
             .lines()
-            .any(|line| line.starts_with(" COMMAND  [Back to Pane Ctrl+D]"))
+            .any(|line| line.starts_with(" COMMAND  [Back to Pane d/Ctrl+D]"))
         && grid.contains("[Filter /] [Rename r] [Generate g] [Schedules s]")
 }
 

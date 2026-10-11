@@ -606,7 +606,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### dashboard/host-metrics/008 — The overlay's words match the copy the desktop panel is tested against.
 - **Layer:** L1 (ratatui `TestBackend` reading `tests/fixtures/host-metrics-copy.json`).
 - **Agent:** none.
-- **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
+- **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order, including the `(warning)` and `(critical)` words of the sample the daemon judged and none for a level it does not know; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
 - **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
 - **Platform coverage:** mac+linux+windows.
 
@@ -615,6 +615,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none.
 - **Asserts:** an answer the daemon reported as 1500 ms old reads `1500 ms` as received, `4000 ms` after 2.5 s held and `3601500 ms` after an hour, the same reply age plus held time the desktop bridge shows (CLAUDE.md rule 22, PR #1672 review); a `u64::MAX` age plus held time saturates and reads the shared `9007199254740991 ms` ceiling.
 - **Does not assert:** the event loop's clock (the draw passes `Instant::now()` less the time the answer landed); the desktop's age, which its bridge computes (`HostMetricsReportDto::from_report`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/010 — Each judged value is coloured by its level, with a word beside every non-ok one.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, via `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** for a sample with disks judged `critical`, `warn`, `ok` and not at all, the load `warn` and memory `ok`, the value cells are red, yellow, green and the default colour, the load yellow and memory available green, while memory used and every label stay in the default colour; the critical and warning values end in `(critical)` and `(warning)` and no other row carries a word (PRD #1258); the snapshot pins the text.
+- **Does not assert:** the levels' computation (covered by `protocol/host-metrics/012`); the desktop's colours (`desktop/e2e/host-metrics.spec.ts`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/config-gen
@@ -1365,6 +1372,27 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Asserts:** a request gives up on the stuck sample after its bounded wait; with the sample confirmed stuck in its call and not yet released, dropping the runtime returns, so a sample that never finishes cannot hold up the daemon's exit (PR #1672 review; a sample on Tokio's blocking pool fails this, since a runtime drop joins its blocking jobs).
 - **Does not assert:** a real hung filesystem; the daemon's full stop path; how long the drop takes (the 30 s receive only bounds a broken build).
 - **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/012 — Health levels move at their thresholds, and an absent number has no level.
+- **Layer:** unit (`apply_health_levels` and the default `HealthThresholds` in `src/host_metrics.rs`).
+- **Agent:** none.
+- **Asserts:** disk free at 15 % and 5 % of its total, memory available at 20 % and 10 % of used + available, and load per core at 0.8 and 1.5 stay on the healthier side, and one step past each moves to `warn` or `critical` (PRD #1258); a disk missing either figure or with a zero total, a non-finite load and memory without a used figure get no level, clearing any level the sample carried.
+- **Does not assert:** where the thresholds come from (covered by `protocol/host-metrics/013`); the levels on the wire (covered by `protocol/host-metrics/014`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/013 — The `[host_metrics]` thresholds parse per value, and an invalid one falls back to its default.
+- **Layer:** unit (`HealthThresholds::from_table`).
+- **Agent:** none.
+- **Asserts:** an empty table gives the defaults 15/5, 20/10 and 0.8/1.5; integers and floats are used; text, a negative, a percentage over 100 and `nan` each fall back to their own default while the valid keys beside them are kept, and each, like an unknown key, yields a warning naming it; a pair whose critical threshold is less severe than its warning resets both with a warning; equal thresholds are accepted.
+- **Does not assert:** `config set` / `config get` and a non-table `host_metrics` (the `config.rs` unit test `host_metrics_thresholds_round_trip_and_are_validated_by_config_set`); the daemon's log output.
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/014 — The reply serves each reading's level beside its number, by the deck's thresholds.
+- **Layer:** L2 (synthetic socket, in-process `serve_attach`; a fixed host sample through `DOT_AGENT_DECK_E2E_HOST_SAMPLE` and a deck config through `DOT_AGENT_DECK_CONFIG`).
+- **Agent:** none.
+- **Asserts:** with `load_per_core_warn = 0.5` and an invalid `load_per_core_critical`, a host-metrics reply carries `level` `critical`, `warn` and `ok` on disks 4 %, 10 % and 50 % free, no `level` key on a disk with no free figure, `load_level` `warn` for 0.6 per core (the configured warn, and the default critical the invalid value fell back to), and no `memory_level` key when memory used is absent; the numbers are served too.
+- **Does not assert:** the clients' colours (covered by `dashboard/host-metrics/010` and the desktop's `host-metrics.spec.ts`); a real host's levels.
+- **Platform coverage:** mac+linux.
 
 #### protocol/live-target
 
@@ -3509,6 +3537,29 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
 - **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
+- **Platform coverage:** mac+linux+windows.
+
+#### keybindings/letters
+
+##### keybindings/letters/001 — Each default `Ctrl+<letter>` global action has its plain letter, and a remap or a conflict takes it away.
+- **Layer:** L1 (`KeybindingConfig::plain_alias` from parsed TOML).
+- **Agent:** none.
+- **Asserts:** under the defaults `dashboard`, `new_pane`, `close_pane`, `toggle_layout`, `toggle_orchestration_lock` and `toggle_zoom` answer to `d`, `n`, `w`, `t`, `e` and `z`; the split toggle gets no `l` (which stays `move_right`), no action answers to a plain `c`, and an action already on a letter gets none; remapping an action (even to another `Ctrl` chord) removes its letter while restating the default does not; binding the letter to another action removes it, and a shifted letter does not.
+- **Does not assert:** dispatch (covered by `keybindings/letters/002` and `/003`); the help overlay's rendering (covered by `dashboard/help/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/002 — A plain letter performs its command in command mode and is typed into the pane in pane mode.
+- **Layer:** L1 (in-process production key mapper, `key_action_for_mode`).
+- **Agent:** none.
+- **Asserts:** in `UiMode::Normal`, plain `d`, `t`, `w`, `z` and `e` resolve to `DetachToNormal`, `ToggleLayout`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `toggle_layout` is remapped, `t` resolves nothing.
+- **Does not assert:** the tab and experimental-flag scoping applied at the live call site (the same scoping as the chords, covered by `orchestration/lock/001` and `orchestration/layout/005`, `/007`); `n` (covered by `keybindings/letters/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/003 — `n` denies a pending permission, and starts a new agent otherwise.
+- **Layer:** unit (`handle_normal_key` in `src/ui.rs`).
+- **Agent:** none.
+- **Asserts:** with the selected card in `WaitingForInput`, `n` sends a deny; with it working, idle or unknown, or with no card, `n` returns `NewPane`; with `deny_permission` moved to another key, `n` is a new agent even on a waiting card; with `new_pane` remapped, `n` does nothing on an idle card.
+- **Does not assert:** the new-agent flow that follows (covered by its own tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/unbind
