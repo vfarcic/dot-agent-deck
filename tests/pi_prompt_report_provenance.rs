@@ -251,6 +251,8 @@ fn agent_event_008_an_unattested_declaration_grants_nothing() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         forged.metadata.insert(
             dot_agent_deck::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),

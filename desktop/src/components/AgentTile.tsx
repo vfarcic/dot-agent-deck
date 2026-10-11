@@ -30,7 +30,7 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
-import { displayUptime } from "../lib/displayText";
+import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
@@ -338,8 +338,17 @@ export function AgentTile({
      record's process may be gone, so it claims no running span; nor does a
      record with no spawn instant, which keeps `duration`'s own reading. */
   const counting = !held && agent.spawnedAtMs !== undefined;
-  const now = useTileClock(counting);
+  /* Issue #1678 — background work the agent left running after its turn, on
+     the same clock so its duration keeps counting between daemon events. A
+     held record's reading may be arbitrarily old, so it claims none: the work
+     it named may have ended long since, exactly as its process may have.
+     The words carry seconds below an hour and the tick is
+     `OVERVIEW_CLOCK_TICK_MS`, so between snapshots the reading advances in
+     steps of up to that tick; it never runs ahead of the real span. */
+  const background = held ? undefined : agent.background;
+  const now = useTileClock(counting || background?.sinceMs !== undefined);
   const uptime = counting ? displayUptime(agent.spawnedAtMs, now) : undefined;
+  const backgroundText = displayBackgroundWork(background, now);
   /**
    * The Reader is suppressed at overlay presentation (M1 difference 4, above)
    * AND whenever any pane is open over this screen (see `panePresent`). The
@@ -455,6 +464,11 @@ export function AgentTile({
                 explains. Not on a held record: that status is a past reading. */}
             {agent.status === "blocked" && !held && (
               <p className="agent-blocked-reason" data-testid={`blocked-reason-${agent.id}`}>{blockedReasonText(agent.blocked)}</p>
+            )}
+            {/* Issue #1678: the agent's turn is over and something it started
+                is still running — the TUI card's words, counts only. */}
+            {backgroundText && (
+              <p className="agent-background-work" data-testid={`background-work-${agent.id}`}>{backgroundText}</p>
             )}
           </div>
         </div>

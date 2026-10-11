@@ -92,6 +92,8 @@ fn tool_start(pane_id: &str) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 

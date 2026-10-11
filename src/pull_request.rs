@@ -398,6 +398,9 @@ pub(crate) fn report_event(session: &SessionState) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        // Issue #1678: no aggregate, so a client keeps the card's held one.
+        background: None,
+        background_revision: None,
     }
 }
 

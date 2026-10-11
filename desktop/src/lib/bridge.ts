@@ -17,6 +17,7 @@ import { speechAudioError } from "./speech";
 import { pullRequestFromDto } from "./pullRequest";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
+  AgentBackground,
   AgentBlocked,
   AuthoringKind,
   AgentSession,
@@ -324,6 +325,14 @@ export interface DesktopAgentDto {
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * Issue #1678: the background work the agent left running after its turn
+   * ended — commands and subagents still going, and when the oldest started
+   * (epoch milliseconds, daemon clock). Absent when there is nothing to show
+   * and from a daemon predating the field. A TYPE ASSERTION, not a validated
+   * value: `agentFromDto` checks every number before anything renders it.
+   */
+  background?: { commands: number; subagents: number; sinceMs?: number };
   /**
    * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
    * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
@@ -2223,7 +2232,34 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
   };
 }
 
+/** The largest value the daemon's `u32` counts can take. */
+const U32_MAX = 0xffff_ffff;
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= U32_MAX;
+}
+
+/**
+ * Issue #1678: the tile's view of `DesktopAgentDto.background`, or `undefined`
+ * when there is nothing honest to show. The DTO is an assertion about a shape,
+ * so both counts must be integers in the daemon's `u32` range — anything else
+ * drops the whole reading rather than rendering a count the daemon did not send
+ * — and at least one must be above zero. A `sinceMs` that is not a finite
+ * number is dropped on its own: the counts stay true without a duration.
+ */
+export function backgroundFromDto(background: unknown): AgentBackground | undefined {
+  if (typeof background !== "object" || background === null) return undefined;
+  const { commands, subagents, sinceMs } = background as Record<string, unknown>;
+  if (!isCount(commands) || !isCount(subagents) || commands + subagents === 0) return undefined;
+  return {
+    commands,
+    subagents,
+    ...(typeof sinceMs === "number" && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+  };
+}
+
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
+  const background = backgroundFromDto(agent.background);
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
@@ -2286,6 +2322,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
+    ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,

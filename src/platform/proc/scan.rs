@@ -273,30 +273,62 @@ pub fn descendant_shell_activity(
     root_pid: i32,
     shapes: &[ShellToolShape],
 ) -> Option<bool> {
-    let detached = detached_descendants(table, root_pid)?;
-    if detached.is_empty() {
-        return Some(false);
-    }
+    qualifying_command_sessions(table, root_pid, shapes).map(|sessions| !sessions.is_empty())
+}
+
+/// Issue #1678: the distinct POSIX sessions below `root_pid` that
+/// [`descendant_shell_activity`] counts as busy — the background-command count
+/// a card shows after its agent's turn ended.
+///
+/// Exactly the candidates the bool path accepts, deduplicated by session id:
+/// with no `shapes`, every detached descendant's session (the structural test);
+/// with `shapes`, each session-boundary candidate ([`shell_tool_candidates`])
+/// whose command line carries one of them — the cross-check applied to EVERY
+/// candidate, so a matched session never admits an unmatched one beside it.
+/// A process tree inside one session counts once, and the walk re-roots at a
+/// nested terminal session as [`detached_descendants`] does, so a wrapped
+/// agent's inner PTY is never itself a command.
+///
+/// `None` has [`descendant_shell_activity`]'s meaning — no answer — and must not
+/// be read as zero. Same table, same columns: it reads no command line or
+/// `/proc` entry the bool path did not (issue #862).
+pub fn qualifying_command_sessions(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+) -> Option<HashSet<i32>> {
+    let walk = walk_with_reference_session(table, root_pid)?;
+    // A row whose session id could not be read is unclassifiable, not
+    // "different" — counting it as different would turn an exit racing the
+    // sample into a false `Working`.
+    let detached = walk
+        .into_iter()
+        .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+        .map(|(row, _)| row);
     // The structural test has already answered. `shapes` is the optional argv
     // cross-check on top of it, and an empty `shapes` means the caller asked for
     // the structural test alone — in which case no command line is consulted at
     // all, which is why a pane whose agent kind has never been measured costs no
     // argv read even while it is busy.
     if shapes.is_empty() {
-        return Some(true);
+        return Some(detached.map(|row| row.session_id).collect());
     }
+    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
+    let mut sessions = HashSet::new();
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct
     // for the measured shape and the difference between reading one command
-    // line and reading a whole build tree's.
-    for pid in shell_tool_candidates(table, root_pid)? {
-        let Some(candidate) = table.iter().find(|row| row.pid == pid) else {
-            continue;
-        };
+    // line and reading a whole build tree's. The walk hands back the rows
+    // themselves, so no per-candidate table search is needed.
+    for candidate in detached.filter(|row| {
+        session_of
+            .get(&row.ppid)
+            .is_none_or(|parent_session| *parent_session != row.session_id)
+    }) {
         match &candidate.command_line {
             CommandLine::Read(argv) => {
                 if shapes.iter().any(|shape| shape.matches(argv)) {
-                    return Some(true);
+                    sessions.insert(candidate.session_id);
                 }
             }
             // Wanted and not obtained. Ordinary and expected: the process
@@ -307,8 +339,8 @@ pub fn descendant_shell_activity(
             // Should be unreachable, and it is the one case worth a log line.
             // The sampler fills the command line for exactly the pids
             // `shell_tool_candidates` reports (see `super::process_table`), and
-            // that is the very function this loop iterates, so reaching here
-            // means the table was sampled for different roots than it is being
+            // this loop visits that same boundary set, so reaching here means
+            // the table was sampled for different roots than it is being
             // classified for — which would suppress the signal *silently*, the
             // failure mode PRD #386 exists to end. Treated as "not a match"
             // rather than as a match, because inventing a busy reading from a
@@ -316,7 +348,7 @@ pub fn descendant_shell_activity(
             CommandLine::NotSampled => {
                 tracing::warn!(
                     root_pid,
-                    candidate_pid = pid,
+                    candidate_pid = candidate.pid,
                     "shell-activity: a detached descendant reached the argv cross-check with no \
                      command line sampled; the process-table sampler and the classifier disagree \
                      about which pids need one, so this pane's signal is suppressed"
@@ -325,7 +357,7 @@ pub fn descendant_shell_activity(
             }
         }
     }
-    Some(false)
+    Some(sessions)
 }
 
 /// The **structural half** of [`descendant_shell_activity`] on its own: the pids

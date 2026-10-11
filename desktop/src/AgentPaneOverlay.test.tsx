@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTileProps } from "./components/AgentTile";
 import { OVERVIEW_CLOCK_TICK_MS } from "./components/AgentOverview";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopSettingsDto } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
 
 /**
@@ -48,6 +48,7 @@ vi.mock("./components/AgentTile", async () => {
 });
 
 import { DeckShell as AppDeckShell } from "./App";
+import { AgentTile } from "./components/AgentTile";
 
 /** Existing deck-specific cases enter the deck explicitly after the app default changes. */
 function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
@@ -504,5 +505,108 @@ describe("idle and needs input are two states (issue #1676)", () => {
 
     render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: "deck-000000000000dec1", agentId: "2", from: "overview" }} />);
     expect(within(screen.getByTestId("agent-pane-overlay")).getAllByText("needs input")[0]).toHaveClass("status-label");
+  });
+});
+
+/**
+ * Issue #1678. After an agent's turn ends with work it started still running,
+ * the tile and the enlarged agent screen — one `AgentTile` header at two
+ * presentations — show the TUI card's words under the status, the duration
+ * keeps counting on the shared tile clock, and a held record claims none.
+ */
+describe("background work on the tile and the agent screen", () => {
+  const DECK_ID = "deck-000000000000dec1";
+
+  function backgroundSnapshot(background: DesktopAgentDto["background"], spawnedAtMs?: number) {
+    return mapDesktopSnapshot({
+      connection: { status: "connected", deckId: DECK_ID, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "idle", toolCount: 3, ...(spawnedAtMs === undefined ? {} : { spawnedAtMs }), ...(background ? { background } : {}), tab: { kind: "dashboard" } }],
+      protocolVersion: 8,
+      source: "daemon",
+    });
+  }
+
+  function liveRuntime(background: DesktopAgentDto["background"], spawnedAtMs?: number) {
+    const snapshot = backgroundSnapshot(background, spawnedAtMs);
+    return runtime({ mode: "live", snapshot, fleet: [snapshot] });
+  }
+
+  beforeEach(() => {
+    terminalBuilt.mockClear();
+    window.localStorage.clear();
+  });
+
+  /**
+   * Scenario: a live Idle agent left two commands and a subagent running,
+   * the oldest started 3h 12m ago. Its tile reads `Background: 2 commands, 1
+   * subagent · 3h 12m` beside the Idle status, and opening the agent screen
+   * shows the same line in the same words.
+   */
+  it("shows the TUI card's words on the tile and on the agent screen", () => {
+    const sinceMs = Date.now() - (3 * 3_600_000 + 12 * 60_000 + 5_000);
+    const deck = render(<DeckShell runtime={liveRuntime({ commands: 2, subagents: 1, sinceMs })} />);
+    const tile = screen.getByTestId("agent-tile-claude-code");
+    expect(within(tile).getByText("idle")).toHaveClass("status-label");
+    expect(within(tile).getByTestId("background-work-7")).toHaveTextContent("Background: 2 commands, 1 subagent · 3h 12m");
+    deck.unmount();
+
+    render(<DeckShell runtime={liveRuntime({ commands: 2, subagents: 1, sinceMs })} initialView={{ kind: "agent", deckId: DECK_ID, agentId: "7", from: "overview" }} />);
+    const pane = screen.getByTestId("agent-pane-overlay");
+    expect(within(pane).getByTestId("background-work-7")).toHaveTextContent("Background: 2 commands, 1 subagent · 3h 12m");
+  });
+
+  /** Scenario: the same agent with nothing left running shows no background line at all. */
+  it("shows nothing when the agent left nothing running", () => {
+    render(<DeckShell runtime={liveRuntime(undefined)} />);
+    expect(screen.queryByTestId("background-work-7")).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Background:/)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: an agent with no uptime to count left one command running a
+   * minute ago. Four minutes later, with no new snapshot, the tile reads
+   * `· 5m`: the background duration alone keeps the tile clock ticking.
+   */
+  it("keeps the duration counting on the tile clock with no uptime to count", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-29T09:00:00.000Z").getTime());
+      render(<DeckShell runtime={liveRuntime({ commands: 1, subagents: 0, sinceMs: Date.now() - 60_000 })} />);
+      const line = () => screen.getByTestId("background-work-7").textContent;
+      expect(line()).toBe("Background: 1 command · 1m");
+      act(() => { vi.advanceTimersByTime(4 * 60_000); });
+      expect(line()).toBe("Background: 1 command · 5m");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Scenario: the same agent rendered from a HELD record — the deck's last
+   * answer rather than its current one. Its status reads as a past reading and
+   * it claims no background work running now; the same agent live shows it.
+   */
+  it("claims no background work for a held record", () => {
+    const agent = backgroundSnapshot({ commands: 1, subagents: 2, sinceMs: Date.now() - 60_000 }).agents[0]!;
+    const props = {
+      agent,
+      presentation: "tile" as const,
+      showDetails: false,
+      mode: "live" as const,
+      selected: false,
+      tab: "terminal" as const,
+      evidence: [],
+      onSelect: vi.fn(),
+      onTabChange: vi.fn(),
+      onTerminalInput: vi.fn(async () => undefined),
+      onTerminalResize: vi.fn(async () => undefined),
+      onEvidenceSelect: vi.fn(),
+    };
+    const { rerender } = render(<AgentTile {...props} recordFreshness="held" />);
+    expect(screen.getByText("last seen: idle")).toBeInTheDocument();
+    expect(screen.queryByTestId("background-work-7")).not.toBeInTheDocument();
+
+    rerender(<AgentTile {...props} recordFreshness="live" />);
+    expect(screen.getByTestId("background-work-7")).toHaveTextContent("Background: 1 command, 2 subagents · 1m");
   });
 });

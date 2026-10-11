@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { READING_NOT_IN_THIS_RUNTIME, useReadingMode } from "./useReadingMode";
-import { NOT_ENABLED_RETRY_MS, READING_ON, type ReadingAgent } from "../lib/reading";
+import { NOT_ENABLED_RETRY_MS, READING_ON, READING_VOICE_KEY, readingKey, type ReadingAgent } from "../lib/reading";
 import { wordedNow, type SpeechText } from "../lib/speech";
 
 const PLANNER: ReadingAgent = { deckId: "deck-00000000000000a1", agentId: "planner", label: "Plan / architecture" };
@@ -131,5 +131,34 @@ describe("useReadingMode", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /** Scenario (issue #1667): the app's open pane changes from none to the planner's; the queued sentences of every other agent are dropped once, the planner's and reading's own are kept, a render with the same pane drops nothing more, and closing the pane drops nothing. */
+  it("drops other agents' queued sentences when an agent's pane opens", async () => {
+    const runtime = {
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceReadingStart: vi.fn(async () => ({ kind: "started" as const, session: 7 })),
+      voiceReadingStop: vi.fn(async () => undefined),
+      onVoiceReadingConsentOff: vi.fn(async () => () => undefined),
+      onVoiceReadingConsentOn: vi.fn(async () => () => undefined),
+    };
+    let open: { deckId: string; agentId: string } | undefined;
+    const hook = renderHook(() => useReadingMode(runtime, () => open));
+    const drop = vi.spyOn(hook.result.current.queue, "drop");
+    await act(async () => { await flush(); });
+    expect(drop).not.toHaveBeenCalled();
+    open = { deckId: PLANNER.deckId, agentId: PLANNER.agentId };
+    hook.rerender();
+    expect(drop).toHaveBeenCalledTimes(1);
+    const match = drop.mock.calls[0][0];
+    expect(match(readingKey({ ...PLANNER, agentId: "coder" }))).toBe(true);
+    expect(match(readingKey(PLANNER))).toBe(false);
+    expect(match(READING_VOICE_KEY)).toBe(false);
+    open = { ...open };
+    hook.rerender();
+    open = undefined;
+    hook.rerender();
+    expect(drop).toHaveBeenCalledTimes(1);
+    hook.unmount();
   });
 });

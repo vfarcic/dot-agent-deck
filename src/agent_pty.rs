@@ -3495,6 +3495,11 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
 pub struct ShellActivityCandidate {
     /// The pane's spawn-time `DOT_AGENT_DECK_PANE_ID`.
     pub pane_id: String,
+    /// Issue #1678 D7: the registry id of the spawn this candidate was resolved
+    /// for — the identity a sample is kept under, revalidated before it is
+    /// applied, and stamped on what the monitor emits, so an old spawn's late
+    /// sample never lands on a successor in the same pane.
+    pub agent_id: String,
     /// The pid of the pane's PTY child — the root of the descendant walk.
     pub shell_pid: i32,
     /// The argv cross-check shapes measured against *this* pane's agent kind.
@@ -10193,6 +10198,25 @@ impl AgentPtyRegistry {
             .unwrap_or(false)
     }
 
+    /// Issue #1678 (A3): whether `agent_id` has not departed the pane with
+    /// `pane_id_env` — the lifecycle half of the shell-activity monitor's spawn
+    /// identity, answered without sampling any process. A published record that
+    /// has not exited counts, and so does a spawn still reserved for exactly
+    /// that pane (R1): its child can already be reporting, and its hooks are
+    /// admitted ([`Self::generation_ownership`]), before its record is
+    /// published. A reservation that is abandoned without publishing stops
+    /// counting once it is released.
+    pub fn agent_is_live_on_pane(&self, agent_id: &str, pane_id_env: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .pending_spawns
+            .get(agent_id)
+            .is_some_and(|reserved| reserved.as_deref() == Some(pane_id_env))
+            || inner.agents.get(agent_id).is_some_and(|a| {
+                !a.exited.load(Ordering::SeqCst) && a.pane_id_env.as_deref() == Some(pane_id_env)
+            })
+    }
+
     /// PRD #127 C3: whether the pane with `pane_id_env` is backed by a live
     /// (non-exited) agent. The reuse path gates reuse on the liveness of the
     /// SPECIFIC delivery pane (the orchestrator role pane / single-agent pane)
@@ -15012,9 +15036,9 @@ impl AgentPtyRegistry {
         let inner = self.inner.lock().unwrap();
         inner
             .agents
-            .values()
-            .filter(|agent| !agent.exited.load(Ordering::SeqCst))
-            .filter_map(|agent| {
+            .iter()
+            .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|(agent_id, agent)| {
                 let pane_id = agent.pane_id_env.clone()?;
                 let shell_pid = agent.child.process_id()? as i32;
                 let key = shell_tool_shape_key(agent.agent_type.as_ref());
@@ -15025,6 +15049,7 @@ impl AgentPtyRegistry {
                     .collect();
                 Some(ShellActivityCandidate {
                     pane_id,
+                    agent_id: agent_id.clone(),
                     shell_pid,
                     shapes,
                 })
@@ -15057,17 +15082,45 @@ impl AgentPtyRegistry {
         candidates: &[ShellActivityCandidate],
         table: &[crate::platform::proc::ProcessInfo],
     ) -> Vec<(String, bool)> {
+        Self::classify_command_sessions(candidates, table)
+            .into_iter()
+            .map(|(candidate, sessions)| (candidate.pane_id.clone(), !sessions.is_empty()))
+            .collect()
+    }
+
+    /// Issue #1678 D4: [`Self::classify_shell_activity`] with the distinct
+    /// qualifying POSIX sessions behind each busy reading — the count a card
+    /// shows as background commands — paired with the candidate (and so the
+    /// spawn) it was classified for. A candidate the table cannot answer for is
+    /// dropped, never reported as zero.
+    pub fn classify_command_sessions<'c>(
+        candidates: &'c [ShellActivityCandidate],
+        table: &[crate::platform::proc::ProcessInfo],
+    ) -> Vec<(&'c ShellActivityCandidate, std::collections::HashSet<i32>)> {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let busy = crate::platform::proc::descendant_shell_activity(
+                let sessions = crate::platform::proc::qualifying_command_sessions(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
                 )?;
-                Some((candidate.pane_id.clone(), busy))
+                Some((candidate, sessions))
             })
             .collect()
+    }
+
+    /// Issue #1678 D7: is `candidate` still the pane's live spawn — the same
+    /// agent, not exited, on the same pane, with the same PTY child? Asked
+    /// under the state write lock right before a sample is applied, so a pane
+    /// replaced while the sample was in flight is left to the next one.
+    pub fn shell_activity_candidate_current(&self, candidate: &ShellActivityCandidate) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(&candidate.agent_id).is_some_and(|agent| {
+            !agent.exited.load(Ordering::SeqCst)
+                && agent.pane_id_env.as_deref() == Some(candidate.pane_id.as_str())
+                && agent.child.process_id().map(|pid| pid as i32) == Some(candidate.shell_pid)
+        })
     }
 
     /// PRD #370 M2 test-only seam: `inner` is private (by design — every
@@ -21434,6 +21487,8 @@ mod spawn_tests {
                 hook_generation: None,
                 pull_request: None,
                 pull_request_revision: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

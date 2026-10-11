@@ -753,6 +753,8 @@ fn session_start_event_with_origin(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -2775,6 +2777,8 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     };
 

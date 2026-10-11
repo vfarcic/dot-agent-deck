@@ -3907,6 +3907,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 
@@ -4017,6 +4019,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }));
         let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
 
@@ -4233,6 +4237,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 

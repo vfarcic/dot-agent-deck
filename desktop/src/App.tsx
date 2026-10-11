@@ -87,7 +87,8 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
-import type { ReadingAgent } from "./lib/reading";
+import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
+import { agentSpokenName } from "./lib/agentNames";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -766,7 +767,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
    * while it is on, every agent on the deck being viewed (every observed deck
-   * under All Decks). The voice panel reads them, on any screen. Handed over
+   * under All Decks). The voice panel reads them, on any screen, and narrows
+   * what is spoken to one agent while that agent's pane is open (issue
+   * #1667). Each is labelled as a sentence about it names it: an
+   * orchestration agent by the run's title and its name. Handed over
    * only once the settings are loaded, so the document being read is not
    * taken for the switch being turned.
    */
@@ -782,7 +786,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agent.displayName, incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the

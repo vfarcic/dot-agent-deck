@@ -321,6 +321,13 @@ impl AgentView {
     /// over-counts by one until the next reconcile re-seeds the fold from a
     /// fresh reply, which is bounded by [`RECONCILE_INTERVAL`].
     ///
+    /// Issue #1678's background-work aggregate is the other field a replay
+    /// could move, and it is NOT left to the reconcile: the daemon stamps every
+    /// aggregate with a per-spawn revision, and the shared fold ignores one
+    /// older than the revision it holds (the reply's, once installed). So an
+    /// event drained after a reply that already reflects a later revision
+    /// cannot bring finished background work back onto a tile.
+    ///
     /// Closing it properly needs the reply to carry a position in the event
     /// stream — a sequence number on the wire — which is a `PROTOCOL_VERSION`
     /// change and out of M4(b) by its scope fence. A transient +1 on a tool
@@ -412,7 +419,7 @@ impl AgentView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_agent_deck::event::{AgentEvent, AgentType};
+    use dot_agent_deck::event::{AgentEvent, AgentType, BackgroundWork};
     use dot_agent_deck::state::SessionStatus;
 
     /// One `ListAgents` reply carrying just these records — the shape every
@@ -460,6 +467,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -709,6 +718,8 @@ mod tests {
             hook_generation: None,
             pull_request: None,
             pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -754,6 +765,8 @@ mod tests {
             hook_generation: None,
             pull_request: None,
             pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -796,6 +809,8 @@ mod tests {
             hook_generation: None,
             pull_request: None,
             pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -934,5 +949,190 @@ mod tests {
         assert_eq!(view.schedule_revision(), Some(9));
         view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.schedule_revision(), None);
+    }
+
+    fn background(commands: u32, subagents: u32) -> BackgroundWork {
+        BackgroundWork {
+            commands,
+            subagents,
+            since_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    /// A record whose live snapshot is an ended turn carrying the daemon's
+    /// background aggregate at `revision`.
+    fn record_with_background(
+        id: &str,
+        pane_id: &str,
+        work: BackgroundWork,
+        revision: u64,
+    ) -> AgentRecord {
+        let mut record = record(id, pane_id);
+        record.live = Some(dot_agent_deck::state::SessionSnapshot {
+            output_set_status: false,
+            subagent_wait: None,
+            status: SessionStatus::Idle,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 3,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            last_activity_ms: Some(1_700_000_000_000),
+            blocked: None,
+            hook_generation: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: (!work.is_empty()).then_some(work),
+            background_revision: Some(revision),
+        });
+        record
+    }
+
+    fn carrying(mut event: AgentEvent, work: BackgroundWork, revision: u64) -> AgentEvent {
+        event.background = Some(work);
+        event.background_revision = Some(revision);
+        event
+    }
+
+    fn background_of(records: &[AgentRecord], id: &str) -> Option<BackgroundWork> {
+        records
+            .iter()
+            .find(|record| record.id == id)
+            .and_then(|record| record.live.as_ref())
+            .and_then(|live| live.background)
+    }
+
+    /// Scenario (issue #1678, the race the revision exists for): the daemon
+    /// broadcast "1 command" at revision 4 and then cleared it at revision 5,
+    /// and the desktop installed a reply already reflecting revision 5 before
+    /// it drained the revision-4 event (`install`'s double-apply). The replayed
+    /// older aggregate must not bring the finished command back onto the tile,
+    /// and the agent stays Idle.
+    #[test]
+    fn an_older_background_revision_replayed_after_install_does_not_resurrect_work() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                BackgroundWork::default(),
+                5,
+            )]),
+            now,
+        );
+        assert_eq!(background_of(&view.records(), "7"), None);
+
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellBusy),
+            background(1, 0),
+            4,
+        )));
+        let rendered = view.records();
+        assert_eq!(
+            background_of(&rendered, "7"),
+            None,
+            "a replayed older revision must not resurrect finished work"
+        );
+        assert_eq!(status_of(&rendered, "7"), Some(SessionStatus::Idle));
+    }
+
+    /// Scenario: after an install, events carrying NEWER revisions move the
+    /// tile's background work both ways — a subagent appears, then the daemon's
+    /// explicit zero clears it — an equal revision is idempotent, and a legacy
+    /// event carrying no aggregate leaves the copy alone rather than clearing it.
+    #[test]
+    fn newer_background_revisions_update_the_tile_and_a_legacy_event_does_not_clear_it() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                background(1, 0),
+                3,
+            )]),
+            now,
+        );
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 0)));
+
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::SubagentStart),
+            background(1, 1),
+            4,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // The same revision again (a double-apply) changes nothing.
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::SubagentStart),
+            background(1, 1),
+            4,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // An event from no aggregate at all — absent is not a clear.
+        view.apply(&BroadcastMsg::Event(event(
+            "pane-7",
+            "7",
+            EventType::SubagentStop,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // The daemon's explicit clear.
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellIdle),
+            BackgroundWork::default(),
+            5,
+        )));
+        let rendered = view.records();
+        assert_eq!(background_of(&rendered, "7"), None);
+        assert_eq!(
+            rendered[0]
+                .live
+                .as_ref()
+                .and_then(|live| live.background_revision),
+            Some(5)
+        );
+    }
+
+    /// Scenario: a shell frame from a daemon that tracks turn boundaries
+    /// (it carries the aggregate) keeps an ended turn Idle in the desktop's
+    /// fold, while one from an older daemon (no aggregate) promotes it to
+    /// Working exactly as before — the client half of design D6's gate.
+    #[test]
+    fn the_fold_promotes_a_shell_frame_only_when_it_carries_no_aggregate() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                BackgroundWork::default(),
+                1,
+            )]),
+            now,
+        );
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellBusy),
+            background(1, 0),
+            2,
+        )));
+        let rendered = view.records();
+        assert_eq!(status_of(&rendered, "7"), Some(SessionStatus::Idle));
+        assert_eq!(background_of(&rendered, "7"), Some(background(1, 0)));
+
+        let mut legacy = AgentView::default();
+        legacy.install(listing(vec![record("8", "pane-8")]), now);
+        legacy.apply(&BroadcastMsg::Event(event("pane-8", "8", EventType::Idle)));
+        legacy.apply(&BroadcastMsg::Event(event(
+            "pane-8",
+            "8",
+            EventType::ShellBusy,
+        )));
+        let rendered = legacy.records();
+        assert_eq!(status_of(&rendered, "8"), Some(SessionStatus::Working));
+        assert_eq!(background_of(&rendered, "8"), None);
     }
 }

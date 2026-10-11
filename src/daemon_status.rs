@@ -258,6 +258,8 @@ mod tests {
             hook_generation: None,
             pull_request: None,
             pull_request_revision: None,
+            background: None,
+            background_revision: None,
         }
     }
 

@@ -1,6 +1,7 @@
 import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, DeckListingOptions, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import type { VoiceDeckChoiceDto } from "./bridge";
 import { DISPLAY_LIMITS, deckName, displayIdentity, displayText } from "./displayText";
+import { orchestrationTitle } from "./agentNames";
 
 /**
  * PRD #1223 M4/M5 — the rules of the New agent flow, kept out of the component
@@ -314,7 +315,7 @@ export function liveOrchestrationTitles(fleet: DeckFleet, deckId: string): strin
     if (deck.connection.deckId !== deckId) continue;
     for (const agent of deck.agents) {
       if (agent.tab.kind !== "orchestration") continue;
-      titles.add(agent.tab.displayTitle ? agent.tab.displayTitle : agent.tab.name);
+      titles.add(orchestrationTitle(agent.tab));
     }
   }
   return [...titles];

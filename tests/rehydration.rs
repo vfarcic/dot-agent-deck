@@ -323,6 +323,8 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -2971,6 +2973,8 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         hook_generation: None,
         pull_request: None,
         pull_request_revision: None,
+        background: None,
+        background_revision: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3011,6 +3015,8 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     });
 
     let sessions: Vec<&SessionState> = state
@@ -3122,6 +3128,8 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         hook_generation: None,
                         pull_request: None,
                         pull_request_revision: None,
+                        background: None,
+                        background_revision: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3597,6 +3605,8 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
 
     // The daemon sees the whole history: the wrapper, Codex's announcement,

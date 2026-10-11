@@ -48,6 +48,8 @@ fn event_on_pane(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -1029,6 +1031,8 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
         hook_generation: None,
         pull_request: None,
         pull_request_revision: None,
+        background: None,
+        background_revision: None,
     };
     let early_key = "zz-early-session";
 
@@ -1314,6 +1318,8 @@ fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_car
         hook_generation: None,
         pull_request: None,
         pull_request_revision: None,
+        background: None,
+        background_revision: None,
     };
     let mut tui = AppState::default();
     let before_seed = Utc::now();

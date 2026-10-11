@@ -382,6 +382,8 @@ async fn session_start(cwd: &std::path::Path, pane_id: &str, agent_id: &str) -> 
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     dot_agent_deck::event::agent_event_line(
         &event,
