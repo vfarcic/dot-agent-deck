@@ -1974,6 +1974,8 @@ mod tests {
                     agent_version: None,
                     schema_version: None,
                     live_target: None,
+                    background: None,
+                    background_revision: None,
                 });
             assert_eq!(
                 self.state.read().await.pane_status_of(pane),

@@ -36,6 +36,7 @@ expression: text
         │  g                  Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
         │  y / n              Approve / deny permission                                                       │         
         │  s                  Schedules manager                                                               │         
+        │  u                  Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

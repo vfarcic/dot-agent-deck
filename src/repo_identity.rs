@@ -52,6 +52,16 @@ macro_rules! derive_repo_identity {
         pub const RELEASES_API_URL: &str =
             concat!("https://api.github.com/repos/", $slug, "/releases/latest");
 
+        /// GitHub API endpoint listing releases, prereleases and drafts
+        /// included, newest first. A copy on the prerelease channel looks up
+        /// its newest release here, because `releases/latest` never names a
+        /// prerelease ([`crate::version::ReleaseChannel`]).
+        pub const RELEASES_LIST_API_URL: &str = concat!(
+            "https://api.github.com/repos/",
+            $slug,
+            "/releases?per_page=100"
+        );
+
         /// Base URL release assets hang off — `remote add` downloads the
         /// matching binary onto a remote host from under here.
         pub const RELEASE_DOWNLOAD_BASE: &str =
@@ -113,6 +123,10 @@ mod tests {
         assert_eq!(
             RELEASES_API_URL,
             format!("https://api.github.com/repos/{SLUG}/releases/latest")
+        );
+        assert_eq!(
+            RELEASES_LIST_API_URL,
+            format!("https://api.github.com/repos/{SLUG}/releases?per_page=100")
         );
         assert_eq!(
             RELEASE_DOWNLOAD_BASE,

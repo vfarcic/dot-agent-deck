@@ -1615,20 +1615,8 @@ pub fn run_connect<R: BufRead, W: Write>(
         // Record a verified discovery for subsequent connects and `remote
         // doctor`. Do not clobber a concurrent move or upgrade of the row.
         if let Some(binary) = discovered_binary.take()
-            && let Err(e) = crate::deck_list::update(
-                remotes_path,
-                crate::deck_list::DeckRef::Name(&entry.name),
-                |row| {
-                    if crate::deck_list::address_key(row) == crate::deck_list::address_key(entry)
-                        && row.install == entry.install
-                        && row.binary == entry.binary
-                    {
-                        row.install = Some(crate::remote::INSTALL_HOMEBREW.to_string());
-                        row.binary = Some(binary);
-                        row.version = remote_version.clone();
-                    }
-                },
-            )
+            && let Err(e) =
+                crate::remote::record_homebrew_binary(remotes_path, entry, binary, &remote_version)
         {
             eprintln!(
                 "warning: connected to '{}' but could not record its Homebrew binary: {e}",

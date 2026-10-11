@@ -103,6 +103,11 @@ cron = "0.17.0"
 # `rand`: the whole requirement is "N bytes from the operating system", and a
 # userspace PRNG adds seeding and generator surface for nothing.
 getrandom = "0.4"
+# Issue #1635: SHA-256 of a downloaded release asset, checked against the
+# release's checksum manifest before `dot-agent-deck upgrade` replaces
+# anything. Already in this workspace's lockfile (the desktop crate's graph
+# carries 0.10.9), so the version resolves to code the workspace builds today.
+sha2 = "0.10"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of

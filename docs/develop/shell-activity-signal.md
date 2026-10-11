@@ -2,6 +2,8 @@
 
 This note exists because the "a pane reads `Working` while its agent's shell command runs" signal (PRD #370's goal, PRD #386's mechanism) is built on an **observed behaviour of Claude Code, not on a documented interface**. That coupling is fine — it is the only instrument available — but it has two failure modes that are invisible from inside this repo, and this page records what they are, what would detect them, and what is inference rather than measurement.
 
+Since issue #1678 the signal moves the status only on a pane whose agent has not reported its own turn boundaries; on a pane whose agent has, the same scan feeds the `Background:` count instead and the card follows the agent's turns. See [`background-work.md`](background-work.md).
+
 ## What the signal actually tests
 
 The daemon's `run_shell_activity_monitor` (`src/daemon.rs`) polls every live pane every 500 ms. Each tick first resolves the candidate panes under the registry lock (`AgentPtyRegistry::shell_activity_candidates`), then — only if there is at least one — samples the whole process table once (one `ps -A -w -w -o pid=,ppid=,tty=` per poll cycle, parsed once and reused across panes, plus a second `ps` for the handful of command lines the cross-check needs — see the cost section) and hands it to `descendant_shell_activity()` (`src/platform/proc/scan.rs`), which walks the pane's PTY child's transitive descendants and asks one structural question per candidate:

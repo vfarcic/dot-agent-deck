@@ -545,6 +545,30 @@ pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key marking the DAEMON's report that a spawn's process
+/// is gone, so the background work its card showed is over (issue #1678). It
+/// rides a [`EventType::ShellIdle`] naming the departed agent, its card's
+/// session key and its pane, stamped at the card's own last activity, carrying
+/// the explicit-zero aggregate with the advanced revision and the Displaced
+/// generation verdict ([`AgentEvent::is_background_retirement`]).
+///
+/// An attached client applies it to that agent's existing card on that pane
+/// and to nothing else: it creates, adopts, retires and re-keys no card and
+/// moves no status, so a successor on the same pane is out of its reach
+/// (`crate::state::AppState::apply_background_retirement`).
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` removes the key from every inbound hook event. Additive on the
+/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which
+/// v0.46.0's generation gate refuses before any status or card logic — read
+/// from that release's source, not observed in a running released binary
+/// (`status/background/015` models the gate).
+pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
+
+/// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.
+pub const BACKGROUND_RETIRED_METADATA_VALUE: &str = "spawn_exited";
+
 /// `AgentEvent.metadata` key carrying the DAEMON's verdict that a hook event is
 /// UNPROVEN (issues #601, #697): the hook-provenance gate admitted it for a pane
 /// (or a paneless agent) this daemon never issued a hook capability token for,
@@ -986,10 +1010,20 @@ pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
 /// hook CLI never sets it, so no
 /// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
 /// privilege: an event carrying it is kept from moving a card's status, with
-/// one exception that grants nothing a plain event lacks — a `SubagentStop`
+/// two exceptions that grant nothing a plain event lacks — a `SubagentStop`
 /// ends a `WaitingForInput` that only subagents of the same id raised (issue
-/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
+/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too,
+/// and so does that subagent's answered permission prompt (issue #1678,
+/// [`AgentEvent::is_subagent_permission_reply`]), which a plain `Thinking`
+/// would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
+/// Where a permission prompt stands, on the events the OpenCode hook builds
+/// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
+
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt.
+pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -1077,6 +1111,15 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   live PTY), else `process`/`history-only` for a standalone wrap. Native
 ///   PTY panes (Claude/OpenCode/Pi) omit it, which the UI reads as the
 ///   historical `live`/writable default. Absence never fails the decode.
+/// - **`background`** · object (`{ "commands": u32, "subagents": u32,
+///   "since_ms": i64 | null }`) · optional (**issue #1678**, added additively) ·
+///   the DAEMON's post-transition [`BackgroundWork`] for the card this event
+///   changed. Daemon-authored only: a producer's copy is stripped on arrival.
+///   `Some` with both counts zero is an explicit clear; absent means the event
+///   supplies no aggregate (a legacy event), not a clear.
+/// - **`background_revision`** · integer · optional (**issue #1678**) · the
+///   per-spawn revision of `background`; a client ignores an aggregate older
+///   than the one it holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -1141,6 +1184,46 @@ pub struct AgentEvent {
     /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// Issue #1678: the daemon's post-transition background-work aggregate for
+    /// the card this event changed — see [`BackgroundWork`]. Additive optional
+    /// (`#[serde(default)]` + `skip_serializing_if`), so no `PROTOCOL_VERSION`
+    /// bump: an older reader ignores the key and a newer one reads its absence
+    /// as "no aggregate supplied". Daemon-authored only; a producer's copy is
+    /// stripped before admission (`crate::daemon::admit_producer_event`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// Issue #1678: the revision of [`Self::background`] — a checked monotonic
+    /// per-spawn counter the daemon advances on every aggregate change, so a
+    /// client can refuse a replayed older aggregate. Same additive optional
+    /// shape as `background`, and stripped from producer frames the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_revision: Option<u64>,
+}
+
+/// Issue #1678: background work an agent left running after its turn ended —
+/// detached commands the shell-activity scan still sees, and subagents that
+/// started and have not stopped — as the DAEMON counts it. Clients copy it from
+/// snapshots and events and never reconstruct it from raw hook frames.
+///
+/// Counts are reported only while the agent's turn is over and the agent
+/// reports its own turn boundaries; while a turn is live both are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BackgroundWork {
+    /// Distinct qualifying POSIX sessions below the pane's agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest item still counted started, in epoch milliseconds on
+    /// the daemon's clock. `None` when the daemon has no start for any of them.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+impl BackgroundWork {
+    /// Whether there is anything to show: at least one counted item.
+    pub fn is_empty(&self) -> bool {
+        self.commands == 0 && self.subagents == 0
+    }
 }
 
 impl AgentEvent {
@@ -1162,6 +1245,21 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #1678: is this a subagent's answered permission prompt — a
+    /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
+    /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
+    /// the OpenCode hook builds from a child session's `permission.replied`?
+    /// It ends that subagent's share of a wait and says nothing about the main
+    /// thread. `false` for every event an older hook CLI builds.
+    pub fn is_subagent_permission_reply(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self.is_from_subagent()
+            && self
+                .metadata
+                .get(PERMISSION_STATE_METADATA_KEY)
+                .is_some_and(|state| state == PERMISSION_STATE_REPLIED)
     }
 
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
@@ -1188,6 +1286,20 @@ impl AgentEvent {
                 .metadata
                 .get(DAEMON_PANE_CLOSED_METADATA_KEY)
                 .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
+    /// Issue #1678: is this the daemon's report that the named spawn's
+    /// background work is over (see [`BACKGROUND_RETIRED_METADATA_KEY`])?
+    /// Requires the shell event type and both identities, so a malformed frame
+    /// is never read as a statement about no card in particular.
+    pub fn is_background_retirement(&self) -> bool {
+        self.event_type == EventType::ShellIdle
+            && self.pane_id.is_some()
+            && self.agent_id.is_some()
+            && self
+                .metadata
+                .get(BACKGROUND_RETIRED_METADATA_KEY)
+                .is_some_and(|v| v == BACKGROUND_RETIRED_METADATA_VALUE)
     }
 
     /// Issue #601: does this event carry the daemon's UNPROVEN marker (see
@@ -2848,6 +2960,8 @@ mod tests {
             agent_version: Some("codex-1.2.3".into()),
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -2882,6 +2996,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
@@ -3314,6 +3430,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(matches!(
