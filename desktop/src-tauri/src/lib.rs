@@ -6341,7 +6341,6 @@ fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
     )
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// The app's compiled context. One expansion of `generate_context!` only: on
 /// macOS each one embeds an `_EMBED_INFO_PLIST` symbol, so a second one in a
 /// test build fails to link.
@@ -6349,6 +6348,7 @@ pub(crate) fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Issue #1350: the decks a pre-#1350 build kept in `desktop.toml` move to
     // the shared `remotes.toml` here, once per launch and before anything below

@@ -591,9 +591,13 @@ impl Generations {
         self.loading.store(false, Ordering::SeqCst);
     }
 
-    /// The open's navigation failed, so no new page is coming: the page that
-    /// remains owns page effects again.
+    /// The open's navigation failed, so no new page is coming: the open is
+    /// undone and the page that remains owns page effects again, under the
+    /// generation its own open was answered with. Called under [`SESSION`],
+    /// where nothing else advances the numbers.
     pub fn open_failed(&self) {
+        self.page.fetch_sub(1, Ordering::SeqCst);
+        self.open.fetch_sub(1, Ordering::SeqCst);
         self.loading.store(false, Ordering::SeqCst);
     }
 
@@ -2822,12 +2826,16 @@ mod tests {
     #[test]
     fn a_failed_navigation_gives_page_effects_back_to_the_remaining_page() {
         let generations = Generations::new();
-        generations.begin();
+        let first = generations.begin();
         generations.page_started();
         generations.begin();
         assert_eq!(generations.page_token(), None);
         generations.open_failed();
-        assert!(generations.page_token().is_some());
+        assert_eq!(generations.current(), first, "the remaining page's open");
+        let page = generations
+            .page_token()
+            .expect("the remaining page's effects");
+        assert_eq!(page.open, first);
     }
 
     #[tokio::test]
