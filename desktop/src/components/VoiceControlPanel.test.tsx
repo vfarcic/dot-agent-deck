@@ -56,7 +56,7 @@ import {
 type ResolveVoice = ReturnType<typeof vi.fn<(utterance: string) => Promise<VoiceResultDto>>>;
 type VoiceStatusCall = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
 type VoiceStart = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
-type VoiceStop = ReturnType<typeof vi.fn<() => Promise<VoiceTranscriptionDto>>>;
+type VoiceStop = ReturnType<typeof vi.fn<(onSplit?: () => void) => Promise<VoiceTranscriptionDto>>>;
 type VoiceCancel = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
 
 interface VoiceControls {
@@ -3051,8 +3051,79 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
   });
 
-  /** Scenario: With a permission answer in the recording, hold voiceStop pending and start then finish a permission announcement before releasing it. That answer must not resolve, arm or send; as a control, speech starting only after voiceStop resolves must leave the old answer eligible. */
-  it.each(["before", "after"] as const)("question/desktop/017: speech starting %s voiceStop resolves belongs to the correct segment", async (when) => {
+  /** Scenario: With a permission answer in the recording, hold voiceStop pending and start then finish a permission announcement before the backend reports the recording split. That answer must not resolve, arm or send. Speech starting after the split — while the stopped utterance is still being transcribed, or once voiceStop has resolved — is not in that recording, so the old answer stays eligible and its countdown starts. */
+  it.each(["before the recording split", "after the split but before voiceStop resolves", "after voiceStop resolves"] as const)("question/desktop/017: speech starting %s belongs to the correct segment", async (when) => {
+    const question: PendingQuestionDto = {
+      id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
+      tool: { name: "Bash", detail: "touch x" },
+      questions: [{ prompt: "Allow Bash?", multiSelect: false, options: [
+        { index: 1, label: "Yes", role: "allow_once", answerable: true },
+        { index: 3, label: "No", role: "deny", answerable: true },
+      ] }],
+    };
+    const resolveVoiceQuestion = vi.fn(async (): Promise<QuestionResultDto> => ({
+      verdict: { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary: "Allow once — touch x" },
+      resolveMs: 1, backend: "stub",
+    }));
+    const sendVoiceAnswer = vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" }));
+    const h = await mount({
+      reading: "on", notice: "shown", openPane: true, silent: false, question,
+      questionBridge: { resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer: vi.fn(async () => undefined) },
+    });
+    h.deck.resolveVoice.mockImplementation(async (said) => result({ kind: "no_match", transcript: said, sentence: "Heard while the app was speaking — nothing dispatched." }));
+    let split: () => void = () => undefined;
+    const splitting = new Promise<void>((resolve) => { split = resolve; });
+    let release: () => void = () => undefined;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const stop = h.voice.voiceStop.getMockImplementation()!;
+    /* The backend splits the recording, reports it, and only then transcribes. */
+    h.voice.voiceStop.mockImplementationOnce(async (onSplit) => {
+      await splitting;
+      onSplit?.();
+      await pending;
+      return stop();
+    });
+    expect(h.spoken).toEqual([]);
+    h.steps.push({ outcome: heard("yes") });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+
+    const prompt = "Permission needed: say yes to allow Bash.";
+    const announce = async () => {
+      await act(async () => { h.sinks.get("planner")!({ kind: "permission", text: prompt }); });
+      await h.drain();
+      expect(h.spoken).toEqual([prompt]);
+      expect(h.finished).toEqual([prompt]);
+    };
+    if (when === "before the recording split") await announce();
+    await act(async () => { split(); });
+    await flush();
+    if (when === "after the split but before voiceStop resolves") {
+      await announce();
+      expect(resolveVoiceQuestion, "voiceStop is still pending while the app speaks").not.toHaveBeenCalled();
+    }
+    await act(async () => { release(); });
+    await flush();
+    await flush();
+    if (when === "after voiceStop resolves") await announce();
+
+    if (when === "before the recording split") {
+      expect(resolveVoiceQuestion, "speech before the split is in the stopped buffer and must not answer").not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "Always allow?" })).toBeNull();
+      expect(screen.queryByTestId("voice-question")).toBeNull();
+      expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+      expect(sendVoiceAnswer).not.toHaveBeenCalled();
+      expect(h.deck.sendTerminalInput).not.toHaveBeenCalled();
+    } else {
+      expect(resolveVoiceQuestion, "speech after the split is not in the stopped buffer and must not mark it").toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
+    }
+  });
+
+  /** Scenario: the backend never reports the recording split. A permission announcement that starts and finishes while voiceStop is pending still marks the stopped recording, so its "yes" is not taken: a missing split signal fails closed. */
+  it("question/desktop/017: without a split signal, speech before voiceStop resolves still overlaps", async () => {
     const question: PendingQuestionDto = {
       id: "q-1", kind: "permission", channel: "held", answerable: true, revision: 1,
       tool: { name: "Bash", detail: "touch x" },
@@ -3078,37 +3149,22 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
       await pending;
       return stop();
     });
-    expect(h.spoken).toEqual([]);
     h.steps.push({ outcome: heard("yes") });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
     expect(h.voice.voiceStop).toHaveBeenCalledTimes(1);
-    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
 
     const prompt = "Permission needed: say yes to allow Bash.";
-    const announce = async () => {
-      await act(async () => { h.sinks.get("planner")!({ kind: "permission", text: prompt }); });
-      await h.drain();
-      expect(h.spoken).toEqual([prompt]);
-      expect(h.finished).toEqual([prompt]);
-    };
-    if (when === "before") await announce();
+    await act(async () => { h.sinks.get("planner")!({ kind: "permission", text: prompt }); });
+    await h.drain();
+    expect(h.finished).toEqual([prompt]);
     await act(async () => { release(); });
     await flush();
     await flush();
-    if (when === "after") await announce();
 
-    if (when === "before") {
-      expect(resolveVoiceQuestion, "speech before voiceStop resolves is still in the stopped buffer and must not answer").not.toHaveBeenCalled();
-      expect(screen.queryByRole("dialog", { name: "Always allow?" })).toBeNull();
-      expect(screen.queryByTestId("voice-question")).toBeNull();
-      expect(h.reader.declareVoiceScreen.mock.calls.at(-1)![5]).toEqual({ reading: true, speaking: true });
-      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
-      expect(sendVoiceAnswer).not.toHaveBeenCalled();
-      expect(h.deck.sendTerminalInput).not.toHaveBeenCalled();
-    } else {
-      expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
-      expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s");
-    }
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
   });
 
   /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */
