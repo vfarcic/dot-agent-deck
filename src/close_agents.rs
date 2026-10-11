@@ -900,14 +900,17 @@ async fn facts(
             })
             .collect()
     };
-    // `--pane` on one role of an instance with other live roles.
+    // `--pane` on one role of an instance with other live roles — counting a
+    // sibling in its respawn window, which is lifted out of the records while
+    // its replacement starts and is still a teammate (review on PR #1681).
     let strands = target.by_pane
         && members.len() == 1
         && instance_of(&members[0].record).is_some_and(|instance| {
             registry
                 .agent_records()
-                .iter()
-                .any(|r| r.id != members[0].record.id && instance_of(r) == Some(instance))
+                .into_iter()
+                .chain(registry.respawning_members())
+                .any(|r| r.id != members[0].record.id && instance_of(&r) == Some(instance))
         });
     (
         TargetFacts {
@@ -1698,11 +1701,14 @@ async fn close_one(
         let freed = match (target.unit.as_ref(), worktree.as_ref()) {
             (Some(unit), Some(_)) => registry.dispatched_units().get(&unit.id).is_none(),
             (None, Some(worktree)) => {
-                worktrees
+                // The guard is a temporary of this statement alone, so it is
+                // released before the registry's own lock is taken and before
+                // any await (review on PR #1681).
+                let recorded = worktrees
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains_key(worktree)
-                    && !registry.dir_in_use(worktree)
+                    .contains_key(worktree);
+                recorded && !registry.dir_in_use(worktree)
             }
             (_, None) => false,
         };
@@ -3356,6 +3362,61 @@ mod tests {
         assert!(!wt.exists());
         assert!(!deck.live(&w));
         assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: review on PR #1681 — an orchestration's only worker is
+    /// restarting, paused in its respawn window, so the registry's records
+    /// hold the orchestrator alone. Closing the idle orchestrator of the
+    /// reported unit by `--pane` without `--force` is still refused as
+    /// stranding the team: the orchestrator keeps running, and the worker's
+    /// replacement lands once the respawn is let through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pane_close_counts_a_restarting_teammate_as_stranded() {
+        let deck = Deck::new().await;
+        let o = deck
+            .start("rs-o", "sleep 30", Some(("orch-rs", "orchestrator", true)))
+            .await;
+        let w = deck
+            .start("rs-w", "sleep 30", Some(("orch-rs", "coder", false)))
+            .await;
+        let id = deck.orch_unit("team-rs", ("disp", "nobody"), "orch-rs", "rs-o", &o);
+        deck.report_done("rs-o", &o);
+        let (respawn, release) = paused_respawn(&deck, "rs-w").await;
+        assert!(
+            deck.registry.agent_records().iter().all(|r| r.id != w),
+            "the worker is lifted out of the records in its respawn window"
+        );
+
+        let report = deck
+            .close(
+                CloseSelector::Pane {
+                    pane_id: "rs-o".into(),
+                },
+                None,
+                false,
+                false,
+            )
+            .await;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Refused, "{target:?}");
+        assert_eq!(
+            target.reason,
+            Some(CloseRefusalReason::StrandsOrchestration),
+            "{target:?}"
+        );
+        assert!(
+            deck.live(&o),
+            "the refused close left the orchestrator running"
+        );
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+
+        let _ = release.send(());
+        let replacement = respawn
+            .await
+            .unwrap()
+            .expect("the worker's replacement lands");
+        assert!(deck.live(&replacement));
         deck.shutdown().await;
     }
 

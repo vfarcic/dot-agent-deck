@@ -288,7 +288,7 @@ Otherwise ask **two numbers, in one prompt**, because they are different decisio
 1. **The total** — how many issues to work through altogether. This is a scope decision and it is the runner's alone. Do not assume "all", and do not offer "all" as the recommendation.
 2. **The parallelism** — how many units may run at once. **Recommend 2–3.**
 
-Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed.
+Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's branch as `dispatch` reported it, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed.
 
 **The loop terminates on the total OR on exhaustion, whichever comes first, and exhaustion is the case that needs stating.** The total is a ceiling the runner asked for, not a quota that must be filled: a candidate can disappear between selection and dispatch (closed, assigned to someone else, a PR appeared — step 8's re-check rejects it), and the queue itself is finite. So:
 
@@ -504,20 +504,22 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 **Run this step only when the runner asked for it in this run**, in words such as "close what merged" or "close the units when you are done". Closing a unit stops its agents, which cannot be resumed afterwards, and removes its worktree when that has no uncommitted changes; the branch is kept. When to close is the runner's decision, not this skill's ([`docs/closing-agents.md`](../../../docs/closing-agents.md)). Without the ask, leave every unit open and say in step 9's report that they are still open and that this step exists. The runner may ask for it at the end of the run, after step 10's units have reported back, or for each issue unit as soon as its PR merged; do what they asked.
 
-**Select the units of this run whose PRs merged**, joining the deck's list of closeable units with the PR state `worktree list` reports:
+**Select the units of this run whose PRs merged**, joining the deck's list of closeable units with the PR state `worktree list` reports and intersecting both with step 5's ledger. Write the branches the ledger records for this run's units to a file, one per line, first:
 
 ```bash
-UNITS="$(mktemp)"; WORKTREES="$(mktemp)"
+UNITS="$(mktemp)"; WORKTREES="$(mktemp)"; LEDGER="$(mktemp)"
+printf '%s\n' 'agent/dispatch-<name-1>' 'agent/dispatch-<name-2>' > "$LEDGER"  # step 5's ledger
 dot-agent-deck close --all --json > "$UNITS"          # lists; closes nothing
 dot-agent-deck worktree list --json > "$WORKTREES"    # PR state per worktree
-jq -r --slurpfile wt "$WORKTREES" '
-  ($wt[0].worktrees | map(select(.pr_state == "merged") | .branch)) as $merged
-  | .listed[] | select(.branch as $b | $merged | index($b))
+jq -r --slurpfile wt "$WORKTREES" --rawfile ledger "$LEDGER" '
+  ($ledger | split("\n") | map(select(length > 0))) as $run
+  | ($wt[0].worktrees | map(select(.pr_state == "merged") | .branch)) as $merged
+  | .listed[] | select(.branch as $b | ($run | index($b)) and ($merged | index($b)))
   | [.unit_id, .name, (.reported | tostring), .branch] | @tsv' "$UNITS"
 ```
 
-- **Join on the branch**, `agent/dispatch-<name>` in both documents. The two can spell the worktree path differently.
-- **Keep only units this run dispatched**, by intersecting with step 5's ledger. Run from this pane, `close --all` lists only the units this pane's agent dispatched, so another runner's units do not appear; the ledger narrows it to this run. If it lists none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
+- **Join on the branch**, `agent/dispatch-<name>` in all three. The two documents can spell the worktree path differently.
+- **Keep only units this run dispatched; the ledger is what does it.** Run from this pane, `close --all` lists every open unit this pane's agent dispatched, so another runner's units do not appear, but an earlier run's from this pane do; without the ledger the join would close those too. **Check the selection before you close anything**: every row is a unit the ledger names, and every ledger unit whose PR merged has a row. A ledger unit with no row is still to be explained — its PR is not merged, or it has left the deck. If the listing shows none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
 
 **Close each selected unit by its unit id, one at a time**, using the `unit_id` the join took from `.listed[]`:
 
