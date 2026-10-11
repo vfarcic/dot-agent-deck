@@ -99,6 +99,61 @@ finally:
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
+        let wanted = match name {
+            "Stop" => EventType::Idle,
+            "UserPromptSubmit" => EventType::Thinking,
+            "PreToolUse" => EventType::ToolStart,
+            "SessionStart" => EventType::SessionStart,
+            "SubagentStart" => EventType::SubagentStart,
+            "SubagentStop" => EventType::SubagentStop,
+            _ => panic!("unsupported fixture hook {name}"),
+        };
+        let subagent = payload
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.deliver(agent, &payload, wanted, subagent.as_deref())
+    }
+
+    /// Issue #1678: send one payload shaped like the deck's OpenCode plugin's
+    /// (`event` plus fields, `subagent_id` on a child session's report)
+    /// through the real `hook --agent opencode` CLI, and return its broadcast.
+    pub fn opencode(&self, event: &str, extra: Value) -> Value {
+        let mut payload =
+            json!({"session_id": SESSION, "event": event, "cwd": self.deck.workdir()});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let wanted = match event {
+            "session.created" => EventType::SessionStart,
+            "session.prompt" => EventType::Thinking,
+            "session.idle" => EventType::Idle,
+            "session.status" if payload["status"] == "idle" => EventType::Idle,
+            "tool.execute.before" => EventType::ToolStart,
+            "subagent.start" => EventType::SubagentStart,
+            "subagent.stop" => EventType::SubagentStop,
+            _ => panic!("unsupported fixture OpenCode event {event}"),
+        };
+        let subagent = payload
+            .get("subagent_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.deliver("opencode", &payload, wanted, subagent.as_deref())
+    }
+
+    fn deliver(
+        &self,
+        agent: &str,
+        payload: &Value,
+        wanted: EventType,
+        subagent: Option<&str>,
+    ) -> Value {
+        let name = payload
+            .get("hook_event_name")
+            .or_else(|| payload.get("event"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let before = self.events.snapshot().len();
         let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
             .args(["hook", "--agent", agent])
@@ -128,16 +183,6 @@ finally:
         );
         // Receipt barrier scoped to the actual event kind and subagent id;
         // monitor frames may interleave with hooks on the same stream.
-        let wanted = match name {
-            "Stop" => EventType::Idle,
-            "UserPromptSubmit" => EventType::Thinking,
-            "PreToolUse" => EventType::ToolStart,
-            "SessionStart" => EventType::SessionStart,
-            "SubagentStart" => EventType::SubagentStart,
-            "SubagentStop" => EventType::SubagentStop,
-            _ => panic!("unsupported fixture hook {name}"),
-        };
-        let subagent = payload.get("agent_id").and_then(Value::as_str);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(event) = self

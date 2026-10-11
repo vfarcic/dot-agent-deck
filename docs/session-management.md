@@ -62,9 +62,10 @@ What each agent reports:
 | | Claude Code | Codex | OpenCode | Pi | Devin |
 |---|---|---|---|---|---|
 | Background commands | Yes | Yes | Yes | Yes | Yes |
-| Background subagents | Yes | Yes | Not shown yet | No | No |
+| Background subagents | Yes | Yes | Yes | No | No |
 
 - On Windows, background commands are not counted for any agent; subagents still are.
+- An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
 - The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
 - Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
 - A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.

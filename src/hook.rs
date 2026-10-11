@@ -91,6 +91,11 @@ pub(crate) struct OpenCodeHookInput {
     response_markers: Option<Value>,
     #[serde(default, deserialize_with = "lenient_string_map")]
     response_headers: HashMap<String, String>,
+    // Issue #1678: the raw id of the child session a subagent's report comes
+    // from, set by the deck's plugin on `subagent.start` / `subagent.stop` and
+    // on that child's tool calls (`crate::opencode_manage`).
+    #[serde(default, deserialize_with = "lenient_string")]
+    subagent_id: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -883,6 +888,8 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "tool.execute.after" => Some(EventType::ToolEnd),
         "permission.asked" => Some(EventType::PermissionRequest),
         "permission.replied" => Some(EventType::Thinking),
+        "subagent.start" => Some(EventType::SubagentStart),
+        "subagent.stop" => Some(EventType::SubagentStop),
         _ => None,
     }
 }
@@ -904,6 +911,24 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
                 input.session_id,
                 Utc::now().timestamp_millis()
             ),
+        );
+    }
+
+    // Issue #1678: a child session's report is its subagent's (issue #1354),
+    // so it does not move the card's status and the daemon counts the child as
+    // background work after the turn ends. Only on the events the plugin tags.
+    if let Some(subagent_id) = input.subagent_id.filter(|_| {
+        matches!(
+            event_type,
+            EventType::SubagentStart
+                | EventType::SubagentStop
+                | EventType::ToolStart
+                | EventType::ToolEnd
+        )
+    }) {
+        metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            subagent_id,
         );
     }
 
@@ -4241,6 +4266,53 @@ mod tests {
             build_opencode_event(bare).unwrap().event_type,
             EventType::Error
         );
+    }
+
+    /// Issue #1678: the OpenCode plugin's `subagent.start` / `subagent.stop`
+    /// decode to `SubagentStart` / `SubagentStop` carrying the child session's
+    /// id as `SUBAGENT_ID_METADATA_KEY`, and a child's tool call keeps that
+    /// attribution. On any other event the field attributes nothing, and a
+    /// non-string one is ignored.
+    #[test]
+    fn opencode_subagent_id_is_forwarded_on_child_session_reports_only() {
+        let decode = |payload: Value| {
+            build_opencode_event(serde_json::from_value(payload).unwrap())
+                .expect("a known OpenCode event")
+        };
+        let key = crate::event::SUBAGENT_ID_METADATA_KEY;
+        for (event, expected) in [
+            ("subagent.start", EventType::SubagentStart),
+            ("subagent.stop", EventType::SubagentStop),
+            ("tool.execute.before", EventType::ToolStart),
+            ("tool.execute.after", EventType::ToolEnd),
+        ] {
+            let decoded = decode(serde_json::json!({
+                "session_id": "root", "event": event, "subagent_id": "child", "tool_name": "bash",
+            }));
+            assert_eq!(decoded.event_type, expected, "{event}");
+            assert_eq!(
+                decoded.metadata.get(key).map(String::as_str),
+                Some("child"),
+                "{event}"
+            );
+            assert_eq!(decoded.session_id, "root", "{event}");
+        }
+        for (event, status) in [
+            ("session.idle", None),
+            ("session.status", Some("busy")),
+            ("session.prompt", None),
+            ("permission.asked", None),
+        ] {
+            let decoded = decode(serde_json::json!({
+                "session_id": "root", "event": event, "status": status, "subagent_id": "child",
+            }));
+            assert!(!decoded.is_from_subagent(), "{event}");
+        }
+        let odd = decode(serde_json::json!({
+            "session_id": "root", "event": "tool.execute.before", "subagent_id": 7,
+        }));
+        assert!(!odd.is_from_subagent());
+        assert_eq!(odd.event_type, EventType::ToolStart);
     }
 
     /// Issue #1354: the payload's `agent_id` — set by Claude Code and Codex

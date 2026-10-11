@@ -193,6 +193,83 @@ fn background_002_subagent_pairing_bounds_and_codex_hooks() {
     }
 }
 
+/// Scenario: Send the payloads the deck's OpenCode plugin sends for a root session that starts a subagent's child session, through the real `hook --agent opencode` CLI. The child's start and tool call leave the live turn's status alone; after the root goes idle the card reads Idle with `Background: 1 subagent`, the child going busy again does not double-count, and the child going idle clears the line while the card stays Idle.
+#[spec("status/background/010")]
+#[test]
+fn background_010_opencode_child_session_counts_as_a_subagent() {
+    let f = Fixture::new(AgentType::OpenCode);
+    f.opencode("session.created", json!({}));
+    f.opencode(
+        "session.prompt",
+        json!({"prompt": "delegate the slow work"}),
+    );
+    f.opencode("subagent.start", json!({"subagent_id": "child-1"}));
+    let tool = f.opencode(
+        "tool.execute.before",
+        json!({"subagent_id": "child-1", "tool_name": "bash", "tool_input": {"command": "sleep 60"}}),
+    );
+    assert!(
+        tool["metadata"]
+            .get(dot_agent_deck::event::SUBAGENT_ID_METADATA_KEY)
+            .is_some(),
+        "a child session's tool call is its subagent's: {tool}"
+    );
+    let live = f.live();
+    assert_eq!(
+        live["status"],
+        json!("Thinking"),
+        "a child session's start and tool call do not move the live turn's status: {live}"
+    );
+    assert!(
+        live["background"].is_null(),
+        "work during the turn is not background: {live}"
+    );
+
+    let ended = f.opencode("session.status", json!({"status": "idle"}));
+    assert_eq!(
+        ended["background"]["subagents"],
+        json!(1),
+        "the root's idle broadcast carries the running child: {ended}"
+    );
+    f.assert_subagents(1);
+    assert_eq!(f.live()["status"], json!("Idle"));
+    assert!(
+        f.deck
+            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+                && grid.contains("Background: 1 subagent")),
+        "Idle and the background subagent must be visible:\n{}",
+        f.deck.snapshot_grid()
+    );
+    let original = f.live()["background"].clone();
+
+    f.opencode("subagent.start", json!({"subagent_id": "child-1"}));
+    f.opencode(
+        "tool.execute.before",
+        json!({"subagent_id": "child-1", "tool_name": "bash", "tool_input": {"command": "ls"}}),
+    );
+    assert_eq!(
+        f.assert_subagents(1)["background"],
+        original,
+        "the same child going busy again is not a second subagent"
+    );
+    assert_eq!(
+        f.live()["status"],
+        json!("Idle"),
+        "a background child's tool call does not turn the ended turn Working"
+    );
+
+    f.opencode("subagent.stop", json!({"subagent_id": "child-1"}));
+    f.assert_subagents(0);
+    assert_eq!(f.live()["status"], json!("Idle"));
+    assert!(
+        f.deck
+            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+                && !grid.contains("Background:")),
+        "the line clears when the child goes idle:\n{}",
+        f.deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Change a real stand-in pane's detached command count from one to two to one while its completed turn stays Idle. Each count change reaches subscribers once, identical Idle+busy samples do not spam events, and retiring the spawn while a command is live cannot transfer the old observation to a successor in that pane.
 #[spec("status/background/006")]
 #[test]

@@ -445,6 +445,7 @@ const flushSessions = () => {{
     closeSession(sessionId, info?.cwd, true, true);
   }}
   forgetAllReplyState();
+  activeSubagents.clear();
 }};
 
 const handleShutdown = () => {{
@@ -523,6 +524,71 @@ const forgetAllReplyState = () => {{
 const isChildSession = (sessionId) => {{
   const parent = sessionParents.get(sessionId);
   return parent !== undefined && parent !== "";
+}};
+
+// Issue #1678: a subagent's child session (one whose `parentID` is known) is
+// reported as that subagent's work, never as the main session's. Its going
+// active (`session.status` busy or retry) is a `subagent.start` naming the
+// child's raw id, and its going idle, failing or being deleted is the paired
+// `subagent.stop`, both filed under the session the child descends from. Only
+// a transition is sent: a child already active sends no second start, and one
+// that is not sends no stop, so a child that goes busy again later starts
+// again. Its other session events and its user message (the prompt it was
+// given) are not sent, and its tool calls carry `subagent_id`, so none of them
+// moves the card's status. A session whose ancestry is not known when it
+// reports is still treated as the main session's.
+//
+// Bounded: at most MAX_ACTIVE_SUBAGENTS children are reported active at once;
+// a child past that sends neither its start nor its stop.
+const MAX_ACTIVE_SUBAGENTS = 128;
+const MAX_ANCESTRY_DEPTH = 32;
+const activeSubagents = new Set();
+
+// The topmost known ancestor of `sessionId` (itself for a root), so a
+// grandchild's work is filed under the main session too.
+const rootSessionOf = (sessionId) => {{
+  let current = sessionId;
+  for (let depth = 0; depth < MAX_ANCESTRY_DEPTH && isChildSession(current); depth += 1) {{
+    current = sessionParents.get(current);
+  }}
+  return current;
+}};
+
+const subagentPayload = (event, childId, directory, rest) => {{
+  const props = event?.properties ?? {{}};
+  const cwd = props.info?.directory ?? props.directory ?? directory ?? process.cwd();
+  return {{
+    session_id: normalizeSessionId(rootSessionOf(childId), cwd),
+    subagent_id: childId,
+    cwd,
+    ...rest,
+  }};
+}};
+
+// A child session's own session event: a start or stop on a transition,
+// nothing otherwise.
+const handleChildSessionEvent = (event, childId, directory) => {{
+  const type = event?.type ?? "";
+  const status = event?.properties?.status?.type;
+  const active =
+    (type === "session.status" || type === "session.status.updated") &&
+    (status === "busy" || status === "retry");
+  const ended =
+    type === "session.idle" ||
+    type === "session.error" ||
+    type === "session.deleted" ||
+    ((type === "session.status" || type === "session.status.updated") && status === "idle");
+  if (active && !activeSubagents.has(childId) && activeSubagents.size < MAX_ACTIVE_SUBAGENTS) {{
+    activeSubagents.add(childId);
+    sendEvent(subagentPayload(event, childId, directory, {{ event: "subagent.start" }}));
+  }} else if (ended && activeSubagents.delete(childId)) {{
+    sendEvent(subagentPayload(event, childId, directory, {{ event: "subagent.stop" }}));
+  }}
+  if (type === "session.deleted") {{
+    forgetReplyState(childId);
+    sessionParents.delete(childId);
+    cancelAncestryLookup(childId);
+  }}
 }};
 
 // Record a session's ancestry from its info; a child's reply state is dropped.
@@ -737,7 +803,9 @@ const recordUserMessage = (event, directory) => {{
     return;
   }}
   const role = (info?.role ?? "").toLowerCase();
-  if (role !== "user") {{
+  // Issue #1678: a child session's user message is the prompt its subagent
+  // was given, not the user's.
+  if (role !== "user" || isChildSession(info?.sessionID)) {{
     messageRoles.delete(messageId);
     if (role === "assistant") {{
       recordAssistantMessage(info);
@@ -832,6 +900,11 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (eventType === "session.created" || eventType === "session.updated") {{
         noteSessionAncestry(event?.properties?.info);
       }}
+      const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
+      if (isChildSession(ownId)) {{
+        handleChildSessionEvent(event, ownId, directory);
+        return;
+      }}
       const payload = sessionPayload(event, directory);
       if (event?.type === "session.deleted") {{
         const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
@@ -856,6 +929,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
     }},
     "tool.execute.before": async (input, output) => {{
+      if (isChildSession(input?.sessionID)) {{
+        sendEvent(
+          subagentPayload(undefined, input.sessionID, directory, {{
+            event: "tool.execute.before",
+            tool_name: input?.tool,
+            tool_input: output?.args,
+          }})
+        );
+        return;
+      }}
       const sessionId = normalizeSessionId(
         defaultSessionId(input?.sessionID),
         directory
@@ -870,6 +953,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       }});
     }},
     "tool.execute.after": async (input) => {{
+      if (isChildSession(input?.sessionID)) {{
+        sendEvent(
+          subagentPayload(undefined, input.sessionID, directory, {{
+            event: "tool.execute.after",
+            tool_name: input?.tool,
+            tool_input: input?.args,
+          }})
+        );
+        return;
+      }}
       const sessionId = normalizeSessionId(
         defaultSessionId(input?.sessionID),
         directory
@@ -2643,8 +2736,8 @@ await send("session.idle", {{ sessionID: "s1" }});
     /// PRD #1497 audit AU-B1: a subagent's child session (`parentID` naming
     /// the root, same directory) streams its own assistant text interleaved
     /// with the root's turn and goes idle first. Its text never reaches any
-    /// report — not even the idle report the directory alias files under the
-    /// root's id — and the root's own final reply still arrives. A session
+    /// report — its going idle is a `subagent.stop`, not an idle report of the
+    /// root's (issue #1678) — and the root's own final reply still arrives. A session
     /// whose ancestry no session event named is asked of OpenCode's client:
     /// a root's reply is sent, a child's or an unanswerable one's is not.
     #[cfg(unix)]
@@ -2705,20 +2798,102 @@ for (const id of ["resumed", "lookup-child", "lookup-fails"]) {
         assert_eq!(
             replies,
             vec![
-                ("root".to_owned(), None),
-                ("root".to_owned(), None),
                 (
                     "root".to_owned(),
                     Some("ROOT_FINAL_SENTINEL: done.".to_owned())
                 ),
                 ("root".to_owned(), Some("LOOKUP_REPLY resumed".to_owned())),
                 ("root".to_owned(), None),
-                ("root".to_owned(), None),
             ],
-            "the child's two idle reports (filed under the root by the directory alias) carry \
-             nothing, the root's carries its own reply, and only the client-confirmed root is \
-             read: {payloads:#?}"
+            "a child's going idle — the known child's, and the one the client confirmed a child \
+             before it went idle — is no idle report of the root's (issue #1678), the root's \
+             carries its own reply, and only the client-confirmed root is read: {payloads:#?}"
         );
+    }
+
+    /// Scenario: Drive the generated OpenCode plugin under node with a root session that starts a child session (and a grandchild), as OpenCode's `task` tool does. The child's lifecycle reaches the deck as one `subagent.start` when it goes busy and one `subagent.stop` when it goes idle, fails or is deleted, filed under the root with the child's id; its creation, its prompt and its other session events are not sent as the root's, and its tool calls carry the child's id.
+    #[cfg(unix)]
+    #[spec("status/background/011")]
+    #[test]
+    fn background_011_opencode_plugin_pairs_a_child_sessions_lifecycle() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await status("root", "busy");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.updated", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("message.updated", { sessionID: "child", info: { id: "cu", sessionID: "child", role: "user" } });
+await send("message.part.updated", { sessionID: "child", part: { id: "cp", sessionID: "child", messageID: "cu", type: "text", text: "CHILD_PROMPT_SENTINEL" } });
+await status("child", "busy");
+await status("child", "retry");
+await status("child", "busy");
+await hooks["tool.execute.before"]({ sessionID: "child", tool: "bash" }, { args: { command: "sleep 60" } });
+await hooks["tool.execute.after"]({ sessionID: "child", tool: "bash", args: { command: "sleep 60" } });
+await send("session.created", { sessionID: "grandchild", info: { id: "grandchild", parentID: "child", directory: "/work" } });
+await status("grandchild", "busy");
+await status("root", "idle");
+await status("child", "idle");
+await send("session.idle", { sessionID: "child" });
+await status("child", "busy");
+await send("session.error", { sessionID: "child", error: { name: "APIError", data: { message: "boom" } } });
+await status("child", "idle");
+await send("session.deleted", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.deleted", { sessionID: "grandchild", info: { id: "grandchild", parentID: "child", directory: "/work" } });
+await status("root", "busy");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("CHILD_PROMPT_SENTINEL"),
+            "a child session's prompt reached the deck as the user's: {payloads:#?}"
+        );
+        let seen: Vec<(String, String, String)> = payloads
+            .iter()
+            .map(|p| {
+                let field = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
+                (field("session_id"), field("event"), field("subagent_id"))
+            })
+            .collect();
+        let row = |session: &str, event: &str, subagent: &str| {
+            (session.to_owned(), event.to_owned(), subagent.to_owned())
+        };
+        assert_eq!(
+            seen,
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "tool.execute.before", "child"),
+                row("root", "tool.execute.after", "child"),
+                row("root", "subagent.start", "grandchild"),
+                row("root", "session.status", ""),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.start", "child"),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.stop", "grandchild"),
+                row("root", "session.status", ""),
+                // The plugin's own flush as node exits.
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            assert_eq!(
+                event.is_from_subagent(),
+                payload.get("subagent_id").is_some(),
+                "{payload}"
+            );
+        }
     }
 
     /// PRD #1497 review: OpenCode's client never answers the ancestry lookup.

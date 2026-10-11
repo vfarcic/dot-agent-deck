@@ -1129,6 +1129,19 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the resumed (retained-sample) path's identity filter (`shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started`), the end-to-end replacement through the real binary (006), desktop.
 - **Platform coverage:** mac+linux.
 
+##### status/background/010 — An OpenCode child session counts as a background subagent and leaves the card's status alone (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned stand-in pane typed OpenCode, with payloads shaped like the deck's OpenCode plugin's through the real `hook --agent opencode` CLI.
+- **Asserts:** a child's `subagent.start` and tagged tool call leave a live turn on Thinking with no background; the root's idle broadcast carries 1 subagent and the rendered card reads Idle with Background: 1 subagent; the same child going busy again and calling a tool neither double-counts nor turns the card Working; the child's `subagent.stop` clears the line while the card stays Idle.
+- **Does not assert:** the plugin's mapping of OpenCode's own session events (011), a real OpenCode run, desktop.
+
+##### status/background/011 — The OpenCode plugin pairs a child session's lifecycle into one subagent start and stop (#1678).
+- **Layer:** unit, in-module (`src/opencode_manage.rs`, the generated plugin under node; fast tier, skipped without node).
+- **Agent:** none; OpenCode-shaped bus events and tool hooks fed to the plugin, payloads captured by a recorder script.
+- **Asserts:** a child's busy/retry/busy sends one `subagent.start` under the root with the child's id; its tool calls carry `subagent_id`; a grandchild is filed under the root; idle plus `session.idle` sends one stop; busy again starts again, and `session.error` stops it; deleting an inactive child sends nothing and deleting an active one stops it; the child's creation, update and prompt are never sent as the root's; every payload decodes, attributed to a subagent exactly when it carries `subagent_id`.
+- **Does not assert:** daemon tracking (010), a real OpenCode process.
+- **Platform coverage:** mac+linux.
+
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
 - **Layer:** L1 (each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
 - **Agent:** none (Claude Code- and Codex-shaped hook payloads, as `status/subagent/001`).
