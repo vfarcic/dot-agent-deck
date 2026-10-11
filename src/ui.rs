@@ -34676,12 +34676,19 @@ mod tests {
         // agent's `$PATH` cannot redirect, not by the bare name.
         let bin = crate::platform::paths::binary_name();
         let dispatch_verb = format!("{bin} dispatch <name>");
+        // PRD #1589: the seed teaches the `close` verb's mechanics, and leaves
+        // when to close to the user.
+        let close_verb = format!("{bin} close <name>");
+        let close_all = format!("{bin} close --all --yes");
         assert!(
             !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
             "the dispatcher seed must not name the deck by its bare name"
         );
         for required in [
             dispatch_verb.as_str(),
+            close_verb.as_str(),
+            close_all.as_str(),
+            "When to close is the user's decision",
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
