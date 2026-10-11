@@ -951,7 +951,14 @@ fn codex_spawn_prep(
     if let (Some(home), Some(binary_paths)) = (pinned_home.as_deref(), installed_binary.as_deref())
     {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-        match crate::codex_hooks_manage::trust_deck_hooks_for(home, &cwd, binary_paths) {
+        // The longer `hooks/list` wait: this launch is the one the trust is for
+        // (PRD #1631; see `SPAWN_HOOKS_LIST_TIMEOUT`).
+        match crate::codex_hooks_manage::trust_deck_hooks_for_within(
+            home,
+            &cwd,
+            binary_paths,
+            crate::codex_hooks_manage::SPAWN_HOOKS_LIST_TIMEOUT,
+        ) {
             // A zero that means "our own entry was unrecognisable" has already
             // warned from inside `trust_deck_hooks_in`; nothing here reports to a
             // user, so the count is all this path needs.

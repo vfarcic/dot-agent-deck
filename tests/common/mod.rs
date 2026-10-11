@@ -5662,12 +5662,20 @@ pub(crate) const OPENCODE_PROBE_PROMPT: &str =
     "Reply with only the number equal to 4000 plus 444. Do not use tools.";
 const OPENCODE_PROBE_ANSWER: &str = "4444";
 
-/// Upper bound on the [`check_opencode_available`] model probe.
+/// Upper bound on the [`check_opencode_available`] model probe on a quiet box;
+/// the probe waits [`load_scaled`] of it (issue #709's helper), so a quiet box
+/// still gives up after 60 s and a starved one waits up to [`MAX_LOAD_FACTOR`]
+/// times as long.
 ///
 /// 4.3 s warm, measured 2026-09-08 (`opencode run --model
 /// anthropic/claude-haiku-4-5-20251001` in a virgin HOME), so this is ~14x the
 /// observation — generous, because a cold OpenCode has a provider list to fetch
-/// and this must not become a flake source.
+/// and this must not become a flake source. Generous was still not enough on a
+/// starved box: during PRD #1631's lane-2 run `question_live_005`'s probe
+/// failed with "did not finish within 60s" at `io full` 70.7% of the window,
+/// and the same test passed alone. A flat ceiling cannot be generous enough
+/// there without being slow to fail on a quiet box, which is what scaling it
+/// avoids.
 ///
 /// FINITE, which the sibling [`check_codex_available`] probe is not. An
 /// unbounded probe that wedges spends the test's entire nextest kill window
@@ -5675,8 +5683,13 @@ const OPENCODE_PROBE_ANSWER: &str = "4444";
 /// `.config/nextest.toml`), after which the process is SIGKILLed — producing
 /// no skip, no failure message and no diagnostics whatever. 60 s leaves two
 /// thirds of the default window for the scenario the probe is only the gate
-/// for.
-const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// for. Scaled, it can reach 360 s, past that default window, so a test that
+/// keeps the default window loses its diagnostics to the kill once the box is
+/// starved enough to scale the probe past ~120 s — where the flat 60 s failed
+/// it anyway. When this was written, three OpenCode-probing tests kept the
+/// default: `prompt_voice_keys_005`, `reading_reply_004` and
+/// `status_blocked_023`.
+const OPENCODE_PROBE_BASE: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
 /// credentials cannot reach SKIPS with the model named rather than failing deep
@@ -5704,7 +5717,8 @@ fn opencode_model_probe() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not run the OpenCode model probe: {e}"))?;
 
-    let deadline = Instant::now() + OPENCODE_PROBE_TIMEOUT;
+    let ceiling = load_scaled(OPENCODE_PROBE_BASE);
+    let deadline = Instant::now() + ceiling;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -5728,7 +5742,7 @@ fn opencode_model_probe() -> Result<(), String> {
     // here and they need different fixes; #878/#921 is the cautionary case for
     // a diagnostic that picked one and asserted it.
     let observed = match status {
-        None => format!("did not finish within {OPENCODE_PROBE_TIMEOUT:?}"),
+        None => format!("did not finish within {ceiling:?}"),
         Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
         Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
     };

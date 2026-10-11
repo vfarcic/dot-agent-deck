@@ -5371,6 +5371,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** Codex's own writes to `config.toml` (`/hooks` in its UI), which take no part in the deck's lock; the Claude and Devin writers, which share the lock helper (`agent_hook_config::lock_config`) and its unit tests (`the_config_lock_*`, `stale_temp_pid_recognises_only_the_deck_temp_shape`) but have no multi-process test of their own.
 - **Platform coverage:** mac+linux+windows.
 
+##### codex/trust/009 — The wrapper's trust write waits for a `codex app-server` that is slow to answer (PRD #1631).
+- **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a deterministic `codex app-server` stand-in.
+- **Agent:** the `codex/trust/002` stand-in with a 6 s sleep after it reads `initialize`, which puts its `hooks/list` reply past the 5 s bound the daemon's startup install and `hooks install` use.
+- **Asserts:** the wrapper exits 0, the stand-in Codex is launched, and `[hooks.state]` in the pinned home's `config.toml` holds exactly the deck's listed key. RED before the fix: no `config.toml` was written, which against real Codex 0.160.0 is the "1 hook needs review before it can run" dialog `question/live/004` stopped on twice on a starved box.
+- **Does not assert:** the upper bound itself (`SPAWN_HOOKS_LIST_TIMEOUT`, 30 s), which a test would have to wait out; that the startup and CLI paths keep the 5 s bound; real Codex timing, which `question/live/004` exercises.
+- **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).

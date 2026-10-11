@@ -849,6 +849,27 @@ const CONFIG_TOML: &str = "config.toml";
 /// best-effort — a timeout returns `Err` and the caller degrades.
 const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the wrapper's trust write ([`crate::wrap`], right before it launches
+/// Codex in a deck pane) waits for `hooks/list`, in place of
+/// [`HOOKS_LIST_TIMEOUT`].
+///
+/// That launch is the one the trust is for, so giving up early costs more there:
+/// the hooks stay untrusted and Codex 0.160.0 stops on its "1 hook needs review
+/// before it can run" dialog, and a prompt typed into the pane goes nowhere
+/// until someone presses `t` there. Five seconds
+/// was not enough on a starved box. During PRD #1631's lane-2 run
+/// `question_live_004` met that dialog twice, and on the same box (`io full`
+/// 56–95%) `hooks/list` measured 3.4–27.7 s on a fresh Codex home and 0.19–2.1 s
+/// on one that had answered before, with almost all of the time spent before
+/// `initialize` answered. The wait returns as soon as the reply arrives, so a
+/// Codex that answers within the old 5 s waits no longer than before; what the
+/// wider ceiling costs is a pane whose
+/// Codex launches up to this much later when `codex app-server` never answers.
+/// The daemon's startup install and `hooks install` keep the shorter bound: the
+/// startup one sits before the daemon binds its sockets (issue #1665), and
+/// neither is about to launch Codex.
+pub const SPAWN_HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One hook as Codex itself reports it from `hooks/list`. The deck never computes
 /// these values: `current_hash` in particular is Codex's own canonicalization of
 /// the definition, so recording it (rather than a hand-rolled sha256) is what
@@ -972,6 +993,15 @@ pub struct HooksListing {
 /// returning. EVERY failure — codex absent, non-zero exit, protocol drift, timeout
 /// — is an `Err` so the caller degrades quietly (no spawn is ever blocked).
 pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
+    list_hooks_in_within(home, cwd, HOOKS_LIST_TIMEOUT)
+}
+
+/// [`list_hooks_in`] with the caller choosing how long to wait for the reply.
+fn list_hooks_in_within(
+    home: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::io::Result<HooksListing> {
     let mut child = Command::new("codex")
         .arg("app-server")
         .env("CODEX_HOME", home)
@@ -1027,7 +1057,7 @@ pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
                 }
             }
         });
-        read_hooks_list_reply(&rx, &mut stdin, Instant::now() + HOOKS_LIST_TIMEOUT)
+        read_hooks_list_reply(&rx, &mut stdin, Instant::now() + timeout)
     });
 
     drop(stdin);
@@ -1657,6 +1687,17 @@ pub fn trust_deck_hooks_for(
     cwd: &Path,
     binary_paths: &[String],
 ) -> std::io::Result<TrustOutcome> {
+    trust_deck_hooks_for_within(home, cwd, binary_paths, HOOKS_LIST_TIMEOUT)
+}
+
+/// [`trust_deck_hooks_for`] with the caller choosing how long to wait for Codex's
+/// `hooks/list` reply; the wrapper passes [`SPAWN_HOOKS_LIST_TIMEOUT`].
+pub fn trust_deck_hooks_for_within(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+    hooks_list_timeout: Duration,
+) -> std::io::Result<TrustOutcome> {
     let mut expected_commands: Vec<String> = Vec::new();
     for binary_path in binary_paths {
         let command = expected_hook_command(binary_path);
@@ -1667,7 +1708,7 @@ pub fn trust_deck_hooks_for(
     let Some(expected) = expected_commands.first().cloned() else {
         return Ok(TrustOutcome::NothingListed);
     };
-    let listing = list_hooks_in(home, cwd)?;
+    let listing = list_hooks_in_within(home, cwd, hooks_list_timeout)?;
     let entries = &listing.entries;
     let eligible = trust_eligible(entries, home, &expected_commands);
     // Issue #559: taken from the same eligible set the records are, so it can
