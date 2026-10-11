@@ -2022,6 +2022,16 @@ pub struct AppState {
     /// Issue #1635: the id of the check `upgrade_check` holds, so a check that
     /// started earlier never replaces it ([`crate::upgrade_dialog::publish`]).
     pub upgrade_check_id: u64,
+    /// Issue #1637, the daemon's side: which `dot-agent-deck` each agent's
+    /// hooks run, seeded by `daemon serve` from the startup installers and
+    /// updated from every hook line's stamp. Its
+    /// [`notices`](crate::hook_binary::HookBinaryState::notices) are what the
+    /// `Hello` reply and the `HookBinaryNotice` broadcast carry.
+    pub hook_binaries: crate::hook_binary::HookBinaryState,
+    /// Issue #1637, a client's side: the notices the daemon reported, seeded
+    /// from `Hello` and replaced by each `HookBinaryNotice` broadcast. Drawn as
+    /// one dashboard footer row while non-empty.
+    pub hook_binary_notices: Vec<crate::hook_binary::HookBinaryNotice>,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no
@@ -5840,6 +5850,7 @@ async fn wait_for_worker_event(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -6593,6 +6604,7 @@ async fn run_delegate_late_readiness_recovery(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -7810,6 +7822,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -8043,6 +8056,7 @@ pub(crate) async fn hold_readiness_buffer(
                     BroadcastMsg::Event(_)
                     | BroadcastMsg::OrchestrationSurface(_)
                     | BroadcastMsg::WorktreeKept(_)
+                    | BroadcastMsg::HookBinaryNotice(_)
                     | BroadcastMsg::Unknown,
                 ) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -8277,6 +8291,7 @@ pub(crate) async fn wait_for_prompt_submission(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;

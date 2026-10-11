@@ -2120,6 +2120,28 @@ impl DaemonClient {
         Ok(resp.guarded_send == Some(true))
     }
 
+    /// Issue #1637: the daemon's hook-binary notices, from one `Hello`
+    /// exchange. `Ok(None)` from a daemon that predates them.
+    pub async fn hook_binary_notices(
+        &self,
+    ) -> Result<Option<Vec<crate::hook_binary::HookBinaryNotice>>, ClientError> {
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await?;
+        // Sanitized here, like an `AgentRecord`: a remote or older daemon's
+        // notice reaches the terminal only through this.
+        Ok(resp
+            .hook_binary_notices
+            .map(|notices| crate::hook_binary::sanitize_notices(&notices)))
+    }
+
     /// PRD #819 M5: the daemon's advertised capability set for THIS endpoint,
     /// captured once at a handshake and cached for the life of the connection
     /// it describes.
@@ -3328,6 +3350,16 @@ impl EventSubscription {
                                     continue;
                                 }
                             }
+                        }
+                        // Issue #1637: a notice is daemon-composed text bound
+                        // for the dashboard footer; sanitize it at the wire
+                        // boundary, as `hook_binary_notices` does for `Hello`.
+                        Ok(BroadcastMsg::HookBinaryNotice(payload)) => {
+                            return Ok(Some(BroadcastMsg::HookBinaryNotice(
+                                crate::hook_binary::HookBinaryNotices {
+                                    notices: crate::hook_binary::sanitize_notices(&payload.notices),
+                                },
+                            )));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {

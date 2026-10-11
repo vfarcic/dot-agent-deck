@@ -1897,6 +1897,7 @@ impl EventCollector {
                     Ok(
                         BroadcastMsg::OrchestrationSurface(_)
                         | BroadcastMsg::WorktreeKept(_)
+                        | BroadcastMsg::HookBinaryNotice(_)
                         | BroadcastMsg::Unknown,
                     ) => {}
                     // A lagged receiver has lost events it will never see again;

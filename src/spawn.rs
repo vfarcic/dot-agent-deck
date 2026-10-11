@@ -2252,6 +2252,7 @@ fn drain_pre_write_events(
             Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             ) => {
                 continue;

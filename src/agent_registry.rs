@@ -381,7 +381,19 @@ pub struct AgentSpec {
     /// own installer here. `None` where the agent has no startup install step —
     /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
-    pub startup_auto_install: Option<fn()>,
+    ///
+    /// Issue #1637: it returns what the agent's hooks are pinned to afterwards,
+    /// so `daemon serve` can name the binary an agent's events come from before
+    /// any hook fires. The TUI ignores it.
+    pub startup_auto_install: Option<fn() -> Vec<crate::hook_binary::HookPin>>,
+    /// Issue #1637: what this agent's hook config pins NOW, read back without
+    /// installing, writing or taking over anything, for the daemon's periodic
+    /// [`crate::hook_binary::PinRefresh`]. `Some(pins)` when the config was
+    /// read, an empty list meaning it names no deck binary; `None` when it
+    /// could not be read (missing, unparseable, unreadable, or the agent is
+    /// not installed), which leaves the pins the daemon already knows. `None`
+    /// for an agent with no startup install step.
+    pub configured_pins: Option<fn() -> Option<Vec<crate::hook_binary::HookPin>>>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, as measured against the versions [`PromptKeys`] names. `None`
     /// where they are unmeasured (Devin) or there is no agent to press them at
@@ -559,6 +571,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(claude_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::hooks_manage::auto_install),
+    configured_pins: Some(crate::hooks_manage::configured_pins),
     // PRD #1541, measured on Claude Code 2.1.289: one ESC interrupts; one
     // Ctrl+U per WRAPPED row, and a single write of 64+ is ignored, so 32 per
     // write; an unbracketed write over 800 characters collapses to a paste.
@@ -596,6 +609,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(opencode_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::opencode_manage::auto_install),
+    configured_pins: Some(crate::opencode_manage::configured_pins),
     // PRD #1541, measured on OpenCode 1.18.34: ESC, ~300 ms, ESC interrupts;
     // one Ctrl+U per line; no paste collapse of an unbracketed write.
     prompt_keys: Some(PromptKeys {
@@ -629,6 +643,7 @@ pub static PI: AgentSpec = AgentSpec {
     materialize: Some(pi_materialize),
     // Pi materializes its extension at SPAWN time, not startup.
     startup_auto_install: None,
+    configured_pins: None,
     // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
     // line; no paste collapse of an unbracketed write.
     prompt_keys: Some(PromptKeys {
@@ -677,6 +692,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // basename isn't `codex` (`devbox run codex-big`), which the spawn-command
     // seam can't detect and which therefore got NO integration before.
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
+    configured_pins: Some(crate::codex_hooks_manage::configured_pins),
     // PRD #1541, measured on Codex 0.160.0: one ESC interrupts; one Ctrl+U per
     // line; an unbracketed write over 1000 characters collapses to a paste.
     prompt_keys: Some(PromptKeys {
@@ -736,6 +752,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     hook_uninstall: Some(devin_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
+    configured_pins: Some(crate::devin_hooks_manage::configured_pins),
     // PRD #1541: unsupported, not measured — Devin was logged out on the box
     // the key table was measured on, so none of its keys could be verified.
     prompt_keys: None,
@@ -760,6 +777,7 @@ pub static NONE: AgentSpec = AgentSpec {
     hook_uninstall: None,
     materialize: None,
     startup_auto_install: None,
+    configured_pins: None,
     // Not an agent: there is nothing to press keys at.
     prompt_keys: None,
 };
@@ -922,6 +940,22 @@ mod tests {
     /// (Codex), and the neutral placeholder carry `None` — so a future agent
     /// reusing `NativeHooks`/`Plugin` runs ITS OWN installer, never another
     /// agent's.
+    /// Issue #1637: every agent whose startup install reports a hook pin has a
+    /// read-back of the same config, so the daemon's periodic refresh sees a
+    /// pin change for every agent whose startup pin it knows, and none for an
+    /// agent it has none for.
+    #[test]
+    fn every_startup_install_has_a_configured_pins_read_back() {
+        for spec in ALL {
+            assert_eq!(
+                spec.startup_auto_install.is_some(),
+                spec.configured_pins.is_some(),
+                "{:?}",
+                spec.agent_type
+            );
+        }
+    }
+
     #[test]
     fn startup_auto_install_is_resolved_per_spec() {
         assert!(
