@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ConnectionView } from "../types";
 import { incompatibleRemedy } from "./connectionRemedy";
-import { outcomeView, stageLabel, stopSetCount, stopSetLines, upgradeEndedDeckSessions, upgradeOffered, type UpgradeOffer, type UpgradeOutcome, type UpgradeStopSet } from "./upgrade";
+import { localUpgradeAtStart, outcomeView, stageLabel, stopSetCount, stopSetLines, upgradeEndedDeckSessions, upgradeKindOf, upgradeOffered, type UpgradeOffer, type UpgradeOutcome, type UpgradeStopSet } from "./upgrade";
 
 const AT_STAKE: UpgradeStopSet = {
   agents: [
@@ -12,8 +12,8 @@ const AT_STAKE: UpgradeStopSet = {
   roles: [{ paneId: "3", role: "orchestrator", orchestration: "tdd", isOrchestrator: true }],
 };
 
-const connection = (deckKind: "local" | "remote", upgradeOffer?: UpgradeOffer): ConnectionView => ({
-  status: "connected",
+const connection = (deckKind: "local" | "remote", upgradeOffer?: UpgradeOffer, status: ConnectionView["status"] = "connected"): ConnectionView => ({
+  status,
   socketPath: "dev@build-box",
   deckKind,
   ...(upgradeOffer ? { upgradeOffer } : {}),
@@ -30,10 +30,52 @@ describe("upgradeOffered (PRD #1487 D8)", () => {
     ["remote", { kind: "daemon-newer", daemon: "0.46.0" }, false],
     ["remote", { kind: "unknown" }, false],
     ["remote", undefined, false],
-    // The local deck's remedy is Replace daemon, never Upgrade.
-    ["local", { kind: "offered", from: "0.44.0", to: "0.45.0" }, false],
+    // Issue #1636: the local deck is offered it too, while it is connected.
+    ["local", { kind: "offered", from: "0.44.0", to: "0.45.0" }, true],
+    ["local", { kind: "current" }, false],
+    ["local", { kind: "daemon-newer", daemon: "0.46.0" }, false],
+    ["local", { kind: "unknown" }, false],
   ] as const)("a %s deck with offer %j is offered: %s", (deckKind, offer, offered) => {
     expect(upgradeOffered(connection(deckKind, offer))).toBe(offered);
+  });
+
+  it("offers a refused local daemon Replace daemon rather than Upgrade, and a refused remote one Upgrade", () => {
+    const older = { kind: "offered", from: "0.44.0", to: "0.45.0" } as const;
+    expect(upgradeOffered(connection("local", older, "error"))).toBe(false);
+    expect(upgradeOffered(connection("remote", older, "error"))).toBe(true);
+  });
+
+  it("upgrades a remote deck by installing and the local deck by restarting onto this app's build", () => {
+    expect(upgradeKindOf({ deckKind: "remote" })).toBe("upgrade");
+    expect(upgradeKindOf({ deckKind: "local" })).toBe("local-upgrade");
+  });
+});
+
+describe("localUpgradeAtStart (issue #1636)", () => {
+  const older = { kind: "offered", from: "0.44.0", to: "0.45.0" } as const;
+  const deck = (connection: ConnectionView) => ({ connection });
+  const local = (overrides: Partial<ConnectionView> = {}): ConnectionView => ({ ...connection("local", older), deckId: "local:/run/attach.sock", daemonBuildVersion: "0.44.0-gabc1234", ...overrides });
+
+  it("picks the connected local deck whose daemon is older, keyed by its version", () => {
+    const found = localUpgradeAtStart([deck({ ...connection("remote", older), deckId: "ssh:build-box" }), deck(local())]);
+    expect(found?.connection.deckId).toBe("local:/run/attach.sock");
+    expect(found?.connection.upgradeOffer).toEqual(older);
+    expect(found?.key).toBe(localUpgradeAtStart([deck(local())])?.key);
+  });
+
+  it("leaves remote decks, current, newer, refused and unidentified local daemons alone", () => {
+    expect(localUpgradeAtStart([deck({ ...connection("remote", older), deckId: "ssh:build-box" })])).toBeUndefined();
+    expect(localUpgradeAtStart([deck(local({ upgradeOffer: { kind: "current" } }))])).toBeUndefined();
+    expect(localUpgradeAtStart([deck(local({ upgradeOffer: { kind: "daemon-newer", daemon: "0.46.0" } }))])).toBeUndefined();
+    expect(localUpgradeAtStart([deck(local({ status: "error" }))])).toBeUndefined();
+    expect(localUpgradeAtStart([deck(local({ deckId: undefined }))])).toBeUndefined();
+    expect(localUpgradeAtStart([])).toBeUndefined();
+  });
+
+  it("gives another daemon version another key, so it is upgraded on its own", () => {
+    const first = localUpgradeAtStart([deck(local())])?.key;
+    expect(localUpgradeAtStart([deck(local({ daemonBuildVersion: "0.44.0-gdef5678" }))])?.key).not.toBe(first);
+    expect(localUpgradeAtStart([deck(local({ upgradeOffer: { kind: "offered", from: "0.43.0", to: "0.45.0" } }))])?.key).not.toBe(first);
   });
 });
 
@@ -53,6 +95,7 @@ describe("stage labels", () => {
   it("say installing for an upgrade and preparing for a Replace", () => {
     expect(stageLabel("installing", "upgrade")).toBe("Installing the new version");
     expect(stageLabel("installing", "replace")).toBe("Preparing this app's daemon");
+    expect(stageLabel("installing", "local-upgrade")).toBe("Preparing this app's daemon");
     expect(stageLabel("restarting", "upgrade")).toBe("Restarting the daemon");
     expect(stageLabel("verifying", "replace")).toBe("Checking the new daemon answers");
   });
@@ -78,7 +121,7 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
   ];
 
   it.each(outcomes)("%s renders a title and at least one sentence, with no internals", (_name, outcome) => {
-    for (const kind of ["upgrade", "replace"] as const) {
+    for (const kind of ["upgrade", "local-upgrade", "replace"] as const) {
       const view = outcomeView(outcome, "build-box", kind);
       expect(view.title.length).toBeGreaterThan(0);
       expect(view.body.length).toBeGreaterThan(0);
@@ -111,6 +154,27 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     expect(view.list).toEqual(stopSetLines(AT_STAKE));
     expect(view.body.join(" ")).toContain("Press Upgrade again");
     expect(outcomeView(outcomes[2][1], "this machine", "replace").body.join(" ")).toContain("Press Replace daemon again");
+  });
+
+  it("words the local Upgrade as a restart on this machine that installs nothing", () => {
+    const restarted = outcomeView(outcomes[0][1], "Local daemon", "local-upgrade");
+    expect(restarted.title).toBe("Daemon upgraded");
+    expect(restarted.body[0]).toBe("The daemon on this machine now runs 0.45.0 (it was 0.44.0).");
+    const kept = outcomeView(outcomes[2][1], "Local daemon", "local-upgrade");
+    expect(kept.title).toBe("Daemon kept running");
+    expect(kept.body).toEqual(["The daemon keeps running 0.44.0, as you chose, so these keep running:", "Press Upgrade again when they have finished."]);
+    expect(kept.list).toEqual(stopSetLines(AT_STAKE));
+    const busy = outcomeView(outcomes[12][1], "Local daemon", "local-upgrade");
+    expect(busy.body[1]).toBe("Stop them, or let them finish, then press Upgrade again.");
+    expect(outcomeView(outcomes[6][1], "Local daemon", "local-upgrade").body).toEqual(["There was no daemon to upgrade. Start daemon starts the one that came with this app."]);
+    expect(outcomeView(outcomes[9][1], "Local daemon", "local-upgrade").title).toBe("Upgrade failed");
+    // Two arms only an install over SSH produces: the local deck installs
+    // nothing, and an older local daemon is replaced rather than asked.
+    const remoteOnly = new Set(["daemon too old", "installed build too old"]);
+    for (const [name, outcome] of outcomes) {
+      if (remoteOnly.has(name)) continue;
+      expect(outcomeView(outcome, "Local daemon", "local-upgrade").body.join(" ")).not.toMatch(/is installed|Local daemon/);
+    }
   });
 
   it("names what runs on an older daemon Replace would not stop, and how to finish", () => {

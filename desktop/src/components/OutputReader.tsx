@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, BookOpenText, Copy, X } from "lucide-react";
-import type { AgentSession } from "../types";
+import { statusLabel, type AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
 import { blockedReasonText } from "../lib/blockedReason";
 import { writeClipboardText } from "../lib/clipboard";
@@ -99,7 +99,7 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
             <BookOpenText size={15} aria-hidden="true" />
             <div>
               <strong>{agent.role}</strong>
-              <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+              <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
               {/* Issue #714: the reason, where the status is. */}
               {agent.status === "blocked" && <span className="agent-blocked-reason">{blockedReasonText(agent.blocked)}</span>}
             </div>

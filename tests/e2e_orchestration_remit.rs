@@ -556,6 +556,8 @@ fn inject_compacting(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic Compacting AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -660,6 +662,8 @@ fn prime_active_tool(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic ToolStart AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -717,6 +721,8 @@ fn inject_clear_session_start(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event)
         .expect("serialize synthetic clear-originated SessionStart AgentEvent");
@@ -1619,6 +1625,8 @@ fn synthetic_event(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -1818,6 +1826,8 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     common::write_hook_line(
         &daemon.hook_socket,

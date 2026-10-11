@@ -108,18 +108,50 @@ export const UPGRADE_ALREADY_RUNNING = "An upgrade of this daemon is already run
 
 /**
  * Which flow the dialog runs: **Upgrade** on a remote deck installs this app's
- * version on that machine; **Replace daemon** on the local deck starts the
- * build that came with this app. One procedure underneath, two ways to say it.
+ * version on that machine; **Upgrade** on the local deck (issue #1636) and
+ * **Replace daemon** on an incompatible local deck both start the build that
+ * came with this app. One procedure underneath, three ways to say it.
  */
-export type UpgradeKind = "upgrade" | "replace";
+export type UpgradeKind = "upgrade" | "local-upgrade" | "replace";
+
+type OfferedConnection = ConnectionView & { upgradeOffer: Extract<UpgradeOffer, { kind: "offered" }> };
 
 /**
  * Whether a deck's card, banner or screen shows **Upgrade** (PRD #1487 D8, D9):
- * a remote deck whose daemon the crate says is older than this app. The local
- * deck is never offered Upgrade — its remedy is Replace daemon.
+ * a deck whose daemon the crate says is older than this app. A remote deck is
+ * offered it whatever its status, beside the Incompatible daemon note too. The
+ * local deck is offered it only while it is connected (issue #1636): a refused
+ * local daemon's remedy is Replace daemon, the same restart under the name the
+ * note gives it.
  */
-export function upgradeOffered(connection: ConnectionView): connection is ConnectionView & { upgradeOffer: Extract<UpgradeOffer, { kind: "offered" }> } {
-  return connection.deckKind === "remote" && connection.upgradeOffer?.kind === "offered";
+export function upgradeOffered(connection: ConnectionView): connection is OfferedConnection {
+  if (connection.upgradeOffer?.kind !== "offered") return false;
+  return connection.deckKind === "remote" || connection.status === "connected";
+}
+
+/** Which Upgrade a deck offers: an install on a remote deck, a restart onto this app's build on the local one. */
+export function upgradeKindOf(connection: Pick<ConnectionView, "deckKind">): Extract<UpgradeKind, "upgrade" | "local-upgrade"> {
+  return connection.deckKind === "remote" ? "upgrade" : "local-upgrade";
+}
+
+/**
+ * Issue #1636: the local deck the app upgrades on its own, as the TUI does at
+ * launch — connected, compatible, and running an older release than this app.
+ * Returned with the key the app remembers it by, so one daemon version is
+ * upgraded (or asked about) at most once while the app runs: a Keep current
+ * daemon answer, or a failure, is not asked again in a loop. The key is the
+ * daemon's version and build rather than its process, so a daemon of that
+ * same version started again later is not either.
+ */
+export function localUpgradeAtStart(fleet: readonly { connection: ConnectionView }[]): { connection: OfferedConnection & { deckId: string }; key: string } | undefined {
+  for (const { connection } of fleet) {
+    if (connection.deckKind === "remote" || connection.deckId === undefined || !upgradeOffered(connection)) continue;
+    return {
+      connection: connection as OfferedConnection & { deckId: string },
+      key: `${connection.deckId}\n${connection.upgradeOffer.from}\n${connection.daemonBuildVersion ?? ""}`,
+    };
+  }
+  return undefined;
 }
 
 /** The stage list the progress view walks, in order. */
@@ -129,7 +161,7 @@ export const UPGRADE_STAGES: readonly UpgradeStage[] = ["installing", "restartin
 export function stageLabel(stage: UpgradeStage, kind: UpgradeKind): string {
   switch (stage) {
     case "installing":
-      return kind === "replace" ? "Preparing this app's daemon" : "Installing the new version";
+      return kind === "upgrade" ? "Installing the new version" : "Preparing this app's daemon";
     case "restarting":
       return "Restarting the daemon";
     case "verifying":
@@ -182,7 +214,10 @@ function sentenceStart(text: string): string {
  * as a blank dialog.
  */
 export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: UpgradeKind): OutcomeView {
-  const where = kind === "replace" ? "this machine" : deck;
+  /* The local deck installs nothing: the app starts the build it came with. */
+  const local = kind !== "upgrade";
+  const where = local ? "this machine" : deck;
+  const button = kind === "replace" ? "Replace daemon" : "Upgrade";
   switch (outcome.outcome) {
     case "restarted": {
       const stopped = outcome.stopped.agents.length + outcome.stopped.roles.length > 0;
@@ -197,7 +232,7 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
       };
     }
     case "installed-not-restarted": {
-      const installed = kind === "replace" ? "" : `${outcome.installedVersion} is installed on ${where}. `;
+      const installed = local ? "" : `${outcome.installedVersion} is installed on ${where}. `;
       const keeps = outcome.fromVersion ? `The daemon keeps running ${outcome.fromVersion}` : "The daemon keeps running";
       const reason = outcome.reason;
       switch (reason.kind) {
@@ -205,7 +240,7 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
           return {
             tone: "neutral",
             title: "Daemon kept running",
-            body: [`${installed}${keeps}, as you chose, so these keep running:`, kind === "replace" ? "Press Replace daemon again when they have finished." : "It switches to the new version the next time it restarts. Press Upgrade again when they have finished."],
+            body: [`${installed}${keeps}, as you chose, so these keep running:`, local ? `Press ${button} again when they have finished.` : "It switches to the new version the next time it restarts. Press Upgrade again when they have finished."],
             list: stopSetLines(reason.atStake),
           };
         case "no-one-to-ask":
@@ -231,8 +266,8 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
         case "no-daemon-running":
           return {
             tone: "neutral",
-            title: kind === "replace" ? "No daemon was running" : "Installed — no daemon was running",
-            body: [kind === "replace" ? "There was no daemon to replace. Start daemon starts the one that came with this app." : `${installed}No daemon was running there, so nothing was restarted; the next one to start runs the new version.`],
+            title: local ? "No daemon was running" : "Installed — no daemon was running",
+            body: [local ? `There was no daemon to ${kind === "replace" ? "replace" : "upgrade"}. Start daemon starts the one that came with this app.` : `${installed}No daemon was running there, so nothing was restarted; the next one to start runs the new version.`],
           };
         case "installed-build-too-old":
           return {
@@ -249,7 +284,7 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
             title: "Daemon kept running",
             body: [
               `${keeps}. It is too old to restart itself, so it is replaced only when nothing is running on it, and these are running:`,
-              `Stop them, or let them finish, then press ${kind === "replace" ? "Replace daemon" : "Upgrade"} again.`,
+              `Stop them, or let them finish, then press ${button} again.`,
             ],
             list: stopSetLines(reason.atStake),
           };
@@ -267,7 +302,7 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
       };
     case "failed": {
       const doing = outcome.stage === "installing"
-        ? (kind === "replace" ? "preparing this app's daemon" : "installing the new version")
+        ? (local ? "preparing this app's daemon" : "installing the new version")
         : outcome.stage === "restarting" ? "restarting the daemon" : "checking the restarted daemon";
       // A failed install can still have put the new version in place (the
       // hooks or the deck list failed after it landed), so "nothing changed"
@@ -279,14 +314,14 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
       const after = outcome.stage === "verifying"
         ? "The old daemon was asked to restart; Reconnect shows whatever is answering now."
         : outcome.oldDaemonGone === true
-          ? outcome.installedVersion && kind !== "replace"
+          ? outcome.installedVersion && !local
             ? `${sentenceStart(outcome.installedVersion)} is installed. ${mayHaveStopped}`
             : mayHaveStopped
-        : outcome.installedVersion && kind !== "replace"
+        : outcome.installedVersion && !local
           ? outcome.stage === "installing"
             ? `${sentenceStart(outcome.installedVersion)} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.`
             : `${sentenceStart(outcome.installedVersion)} is installed; the daemon that was running keeps running.`
-          : kind === "replace" && outcome.stage === "restarting"
+          : local && outcome.stage === "restarting"
             ? "Reconnect shows which daemon is answering now."
             : "The daemon that was running keeps running.";
       return {
@@ -304,7 +339,9 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
         body: [
           kind === "replace"
             ? "Replacing the daemon stopped unexpectedly, so it is not known whether the daemon was replaced."
-            : `The upgrade stopped unexpectedly, so it is not known whether the new version was installed on ${where} or the daemon restarted.`,
+            : local
+              ? "The upgrade stopped unexpectedly, so it is not known whether the daemon restarted."
+              : `The upgrade stopped unexpectedly, so it is not known whether the new version was installed on ${where} or the daemon restarted.`,
           `Reconnect shows which daemon is answering on ${where} now.`,
         ],
       };

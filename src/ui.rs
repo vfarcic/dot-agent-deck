@@ -373,6 +373,10 @@ pub enum UiMode {
     /// selection emits [`Action::ConfirmCloseSelected`] and performs the
     /// teardown. The selection index lives in `UiState::close_confirm`.
     CloseConfirm,
+    /// Issue #1635: the upgrade dialog, opened by the `open_upgrade` key
+    /// (default `u`) or a click on the footer's update badge. Its state lives
+    /// in `UiState::upgrade_dialog`.
+    Upgrade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2280,8 +2284,24 @@ struct UiState {
     keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
-    /// Populated by the background version-check task when a newer release is available.
-    update_available: Option<String>,
+    /// Issue #1635: the last release check's plans, mirrored from
+    /// `AppState::upgrade_check` each frame. Drives the footer badge and seeds
+    /// the upgrade dialog.
+    upgrade_check: Option<Arc<crate::upgrade_dialog::UpgradeCheck>>,
+    /// Issue #1635: the open upgrade dialog. Kept while an upgrade runs even
+    /// if `Ctrl+C` took the deck to the quit dialog, so the upgrade key
+    /// reopens it on the same run.
+    upgrade_dialog: Option<crate::upgrade_dialog::UpgradeDialog>,
+    /// Issue #1635: the upgrade that put this TUI's own copy's newer build on
+    /// disk, kept until the TUI restarts: that copy is no longer offered, and
+    /// the badge says to restart when nothing else is behind.
+    upgrade_installed: Option<crate::upgrade_dialog::RunResult>,
+    /// Issue #1635: where the running upgrade reports back. The upgrade runs
+    /// on a tokio task; the render loop drains this each frame.
+    upgrade_results: Option<std::sync::mpsc::Receiver<(usize, crate::upgrade_dialog::RunResult)>>,
+    /// Issue #1635: a dialog that ran an upgrade was closed, so the next frame
+    /// starts a fresh release check.
+    upgrade_recheck: bool,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
     /// The command-entry lock: while engaged, a keystroke aimed at a focused
@@ -2700,7 +2720,11 @@ impl UiState {
             config,
             keybindings,
             last_bell_status: HashMap::new(),
-            update_available: None,
+            upgrade_check: None,
+            upgrade_dialog: None,
+            upgrade_installed: None,
+            upgrade_results: None,
+            upgrade_recheck: false,
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             session_warnings: Vec::new(),
@@ -7052,6 +7076,12 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
+    /// (default `u`) and a click on the footer's update badge.
+    OpenUpgrade,
+    /// Issue #1635: a click on one of the upgrade dialog's buttons — mouse
+    /// parity for its keys.
+    UpgradeChoose(crate::upgrade_dialog::UpgradeChoice),
     /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
     /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
     /// with a blank context (same outcome as pressing `a`).
@@ -8399,6 +8429,161 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// Issue #1635: the upgrade dialog owns the keyboard while it is open.
+fn handle_upgrade_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    match ui.upgrade_dialog.as_mut() {
+        Some(dialog) => {
+            let effect = dialog.handle_key(key);
+            apply_upgrade_effect(ui, effect);
+        }
+        None => ui.mode = UiMode::Normal,
+    }
+    Action::Continue
+}
+
+/// Issue #1635: open the upgrade dialog on the last check's plans. A dialog
+/// kept because its upgrade was still running (or finished while the deck
+/// was elsewhere) is reopened instead, so its result is not lost. With no copy
+/// behind, the status bar says so in the core's words — or, once this TUI's
+/// own copy was installed, says to restart it.
+fn open_upgrade_dialog(ui: &mut UiState) {
+    if ui.upgrade_dialog.is_some() {
+        ui.mode = UiMode::Upgrade;
+        return;
+    }
+    let check = ui.upgrade_check.clone();
+    let installed = ui.upgrade_installed.clone();
+    let badge = crate::upgrade_dialog::badge(check.as_deref(), installed.as_ref(), "");
+    let message = match (check, badge) {
+        (Some(check), Some(badge)) if badge.offers_upgrade => {
+            let mut dialog = crate::upgrade_dialog::UpgradeDialog::new(check.plans.clone());
+            if let Some(installed) = installed {
+                // The first plan is always this TUI's own copy.
+                dialog = dialog.with_installed(0, installed);
+            }
+            ui.upgrade_dialog = Some(dialog);
+            ui.mode = UiMode::Upgrade;
+            return;
+        }
+        (_, Some(restart)) => restart.text.trim().to_string(),
+        (Some(check), None) => check
+            .plans
+            .first()
+            .map_or_else(String::new, |plan| plan.headline()),
+        (None, None) => "No newer release has been found.".to_string(),
+    };
+    // A version from the release check reaches the bar, so it is filtered as
+    // the dialog's lines are.
+    let message = crate::untrusted_text::strip_control_and_bidi(&message, false);
+    ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// Issue #1635: act on what a key or a click did in the upgrade dialog.
+fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect) {
+    use crate::upgrade_dialog::{Effect, RunResult};
+    match effect {
+        Effect::None => {}
+        Effect::Close => {
+            // After an upgrade, check again, as the desktop app does on Close.
+            if ui
+                .upgrade_dialog
+                .take()
+                .is_some_and(|dialog| dialog.ran_any())
+            {
+                ui.upgrade_recheck = true;
+            }
+            ui.mode = UiMode::Normal;
+        }
+        Effect::Run(index) => {
+            let Some((plan, this_tui)) = upgrade_job(ui, index) else {
+                return;
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    ui.upgrade_results = Some(rx);
+                    handle.spawn(async move {
+                        let result = crate::upgrade_dialog::run(plan, this_tui).await;
+                        let _ = tx.send((index, result));
+                    });
+                }
+                Err(e) => {
+                    if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                        dialog.finish(
+                            index,
+                            RunResult::from_error(&crate::self_upgrade::UpgradeError::Io(
+                                e.to_string(),
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Issue #1635: take the latest release check for the badge, and the result
+/// of an upgrade the dialog started. Once per frame.
+fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState) {
+    ui.upgrade_check = snapshot.upgrade_check.clone();
+    drain_upgrade_results(ui, state);
+}
+
+/// Issue #1635: what `Effect::Run(index)` upgrades: the plan the open dialog
+/// shows — never a newer check that arrived after it opened — and whether it
+/// is this TUI's own copy.
+fn upgrade_job(ui: &UiState, index: usize) -> Option<(crate::self_upgrade::UpgradePlan, bool)> {
+    let plan = ui.upgrade_dialog.as_ref()?.plans().get(index)?.clone();
+    // The first plan is always this TUI's own copy (`upgrade_dialog::check`).
+    Some((plan, index == 0))
+}
+
+/// Issue #1635: hand a finished upgrade's result to its dialog, and start the
+/// re-check a closed dialog asked for. Runs once per frame on the render
+/// thread; neither step blocks.
+fn drain_upgrade_results(ui: &mut UiState, state: &SharedState) {
+    use std::sync::mpsc::TryRecvError;
+    let received = match ui.upgrade_results.as_ref().map(|rx| rx.try_recv()) {
+        None | Some(Err(TryRecvError::Empty)) => None,
+        Some(Ok(finished)) => Some(finished),
+        Some(Err(TryRecvError::Disconnected)) => {
+            let index = match ui.upgrade_dialog.as_ref().map(|d| d.phase()) {
+                Some(crate::upgrade_dialog::Phase::Running(index)) => index,
+                _ => 0,
+            };
+            Some((
+                index,
+                crate::upgrade_dialog::RunResult::from_error(
+                    &crate::self_upgrade::UpgradeError::Io(
+                        "the upgrade stopped before it reported a result".to_string(),
+                    ),
+                ),
+            ))
+        }
+    };
+    if let Some((index, result)) = received {
+        ui.upgrade_results = None;
+        if result.tui_restart.is_some() {
+            ui.upgrade_installed = Some(result.clone());
+        }
+        if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+            dialog.finish(index, result);
+        }
+        if ui.mode != UiMode::Upgrade {
+            ui.status_message = Some((
+                "The upgrade finished. Open the upgrade dialog to see the result.".to_string(),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    if std::mem::take(&mut ui.upgrade_recheck)
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        let state = state.clone();
+        handle.spawn(async move { crate::upgrade_dialog::refresh(&state).await });
+    }
+}
+
 /// Open the project repository in the user's browser and build the status
 /// message for whichever way that went.
 ///
@@ -9420,6 +9605,11 @@ fn handle_normal_key(
     // so existing muscle memory keeps working while lowercase `s` is added.
     if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
+    }
+    // Issue #1635: open the upgrade dialog the footer badge names (default
+    // `u`), shared with a click on the badge.
+    if kb.matches(KbAction::OpenUpgrade, &key) {
+        return Action::OpenUpgrade;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -10473,7 +10663,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 /// about to happen. The modal owns the keyboard until it is answered; `Ctrl+C`
 /// keeps its own carve-out to the quit flow.
 fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if mode == UiMode::CloseConfirm {
+    // Issue #1635: the upgrade dialog owns the keyboard the same way, so a
+    // tab switch or a new pane cannot slip in under an upgrade's question.
+    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
         return None;
     }
     match global_action(kb, key) {
@@ -10779,7 +10971,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // Issue #142: the Schedules manager is a topmost modal as well.
         // The wheel over it belongs to ITS list (handled before this guard),
         // never to whatever pane the centered dialog happens to cover.
-        | UiMode::ScheduledTasks => true,
+        | UiMode::ScheduledTasks
+        // Issue #1635: the upgrade dialog is a topmost modal.
+        | UiMode::Upgrade => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -12393,6 +12587,13 @@ fn dispatch_action(
         // `s`/`S` key and the `[Schedules s]` button-bar button. Loads the
         // schedules from the global config and snapshots which currently have a
         // live tab/agent (for the status indicator), then switches mode.
+        Action::OpenUpgrade => open_upgrade_dialog(ui),
+        Action::UpgradeChoose(choice) => {
+            if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                let effect = dialog.choose(choice);
+                apply_upgrade_effect(ui, effect);
+            }
+        }
         Action::OpenScheduledTasks => {
             let tasks = config::LoadedSchedules::load().tasks;
             ui.scheduled_tasks = tasks;
@@ -13285,6 +13486,22 @@ fn handle_key_event(
             }
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
+            // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
+            // while an upgrade runs; the running upgrade's dialog is kept so the
+            // upgrade key reopens it on the same run.
+            UiMode::Upgrade if is_ctrl_c => {
+                if !ui
+                    .upgrade_dialog
+                    .as_ref()
+                    .is_some_and(crate::upgrade_dialog::UpgradeDialog::is_running)
+                {
+                    ui.upgrade_dialog = None;
+                }
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::Upgrade => handle_upgrade_key(key, ui),
         });
     }
 
@@ -14336,10 +14553,9 @@ pub fn run_tui(
 
         let snapshot = state.blocking_read().clone();
 
-        // Pick up version-check result once
-        if ui.update_available.is_none() {
-            ui.update_available = snapshot.update_available.clone();
-        }
+        // Issue #1635: the latest release check, and the result of an
+        // upgrade the dialog started.
+        sync_upgrade_state(&mut ui, &snapshot, &state);
 
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
@@ -15271,6 +15487,19 @@ pub fn run_tui(
                     continue;
                 }
 
+                // Issue #1635: the upgrade dialog's body scrolls with the
+                // wheel, one row a notch, as it does with PageUp/PageDown.
+                if is_scroll && ui.mode == UiMode::Upgrade {
+                    if let Some(dialog) = ui.upgrade_dialog.as_mut() {
+                        let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                        dialog.scroll_by(if up { -1 } else { 1 });
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // PRD #80 review FIX 5: when a blocking overlay (any modal, the
                 // directory picker, or the new-pane form) is the topmost layer,
                 // swallow scroll-wheel events so they don't scroll the pane
@@ -15433,6 +15662,9 @@ pub fn run_tui(
                         // buttons live in `modal_button_rects` and any miss is
                         // consumed here rather than reaching the pane behind it.
                         | UiMode::ScheduledTasks
+                        // Issue #1635: the upgrade dialog's buttons live in
+                        // `modal_button_rects` too.
+                        | UiMode::Upgrade
                 );
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
@@ -17333,6 +17565,14 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         // event loop).
         ui.close_confirm_displayed = true;
     }
+    if ui.mode == UiMode::Upgrade
+        && let Some(dialog) = ui.upgrade_dialog.as_mut()
+    {
+        ui.modal_button_rects = crate::upgrade_dialog::render(frame, dialog)
+            .into_iter()
+            .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
+            .collect();
+    }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
@@ -18859,15 +19099,23 @@ fn render_bottom_bar(
                     has_pane_control,
                     extra_buttons,
                 );
-                // Preserve the "update available" badge by right-aligning it
-                // after the bar when set (it's a separate notification, not the
-                // removed legend text).
-                if let Some(ref latest) = ui.update_available {
-                    let badge = format!(
-                        " Update available: v{latest} (current: v{}) ",
-                        env!("DAD_VERSION")
-                    );
-                    let bw = badge.chars().count() as u16;
+                // Issue #1635: the update badge, right-aligned after the bar when
+                // a copy on this machine is behind — the same words as the
+                // desktop app's notice, naming the key that opens the upgrade
+                // dialog — or, once this TUI's own copy was installed, the
+                // core's line saying to restart it. It is drawn over the bar's
+                // right end on cleared cells, so a disabled button beneath
+                // lends it none of its dimming, and its rect is hit-tested
+                // first, so a click on it never presses a covered button.
+                let mut rects = rects;
+                if let Some(badge) = crate::upgrade_dialog::badge(
+                    ui.upgrade_check.as_deref(),
+                    ui.upgrade_installed.as_ref(),
+                    &display_notation(&ui.keybindings, KbAction::OpenUpgrade),
+                ) {
+                    let bw =
+                        u16::try_from(unicode_width::UnicodeWidthStr::width(badge.text.as_str()))
+                            .unwrap_or(u16::MAX);
                     if bw < area.width {
                         let badge_area = Rect {
                             x: area.x + area.width - bw,
@@ -18875,9 +19123,10 @@ fn render_bottom_bar(
                             width: bw,
                             height: 1,
                         };
+                        frame.render_widget(Clear, badge_area);
                         frame.render_widget(
                             Paragraph::new(Line::styled(
-                                badge,
+                                badge.text,
                                 Style::default()
                                     .fg(Color::Black)
                                     .bg(Color::Yellow)
@@ -18885,6 +19134,7 @@ fn render_bottom_bar(
                             )),
                             badge_area,
                         );
+                        rects.insert(0, (Action::OpenUpgrade, badge_area));
                     }
                 }
                 ui.button_rects = rects;
@@ -19663,6 +19913,9 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
+        // Issue #1635: opens the upgrade dialog while the footer's update
+        // badge shows.
+        help_key_line(&n(KbAction::OpenUpgrade), "Upgrade (update badge)"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -21240,11 +21493,14 @@ fn render_session_card(
     // survives every density (at Minimal it takes `Dir:`'s place), and ahead
     // of the prompt/tool rows because it is the fact that explains why those
     // rows keep advancing while the run has in fact stalled.
+    // The attention rows' text is kept whole until the background line below
+    // has decided whether it shares their row (Minimal density).
+    let mut attention: Vec<(String, Style)> = Vec::new();
     if is_orphaned {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+        attention.push((
+            "Orphaned — delegation unavailable".to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
-        )));
+        ));
     }
 
     // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
@@ -21280,10 +21536,42 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(&text, w),
+        attention.push((
+            text,
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
-        )));
+        ));
+    }
+
+    // Issue #1678: background work the agent left running after its turn
+    // ended, under the status rows and above the prompt. `fit_card_rows`
+    // sheds the separator, prompts and `Dir:` before a status row, but it
+    // cannot shrink a card below its status rows: Minimal has one content row,
+    // which a Blocked or orphaned reason already takes. There the reason keeps
+    // the row, since it needs the user's attention, and the background line is
+    // appended to it after ` · `, cut with `…` when the row runs out.
+    let background = if is_placeholder {
+        None
+    } else {
+        session
+            .background_work()
+            .and_then(|work| background_work_label(&work, now))
+    };
+    let plain = |(text, style): (String, Style)| {
+        Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
+    };
+    let shares_row = density == CardDensity::Minimal && !attention.is_empty();
+    let mut attention = attention.into_iter();
+    match background {
+        Some(text) if shares_row => {
+            let (reason, style) = attention.next().expect("checked non-empty");
+            status_lines.push(reason_with_background(&reason, style, &text, w));
+            status_lines.extend(attention.map(plain));
+        }
+        Some(text) => {
+            status_lines.extend(attention.map(plain));
+            status_lines.push(plain((text, text_primary())));
+        }
+        None => status_lines.extend(attention.map(plain)),
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -21330,6 +21618,73 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Issue #1678: a Minimal card's one content row when it has both a status
+/// reason (Blocked or orphaned) and background work — `reason · background`,
+/// cut with `…` at `width`, so the reason is kept whole first. The reason keeps
+/// its own style and the background part reads as it does on its own line.
+fn reason_with_background(
+    reason: &str,
+    style: Style,
+    background: &str,
+    width: usize,
+) -> Line<'static> {
+    let row = truncate_with_ellipsis(&format!("{reason} · {background}"), width);
+    let split = row
+        .char_indices()
+        .nth(reason.chars().count())
+        .map_or(row.len(), |(at, _)| at);
+    let (head, tail) = row.split_at(split);
+    let mut spans = vec![Span::styled(head.to_string(), style)];
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail.to_string(), text_primary()));
+    }
+    Line::from(spans)
+}
+
+/// How far ahead of `now` a background start may sit and still read as "just
+/// started" — the desktop's clock-skew tolerance (`relativeTo` in
+/// `desktop/src/lib/displayText.ts`), so both clients say the same thing.
+const BACKGROUND_CLOCK_SKEW_MS: i64 = 60_000;
+
+/// Issue #1678: the card's background-work line —
+/// `Background: 2 commands, 1 subagent · 3h 12m` — or `None` when nothing is
+/// counted. A zero kind is omitted and each count is singular or plural. The
+/// duration uses the `Last:` vocabulary ([`format_elapsed`]); a start up to
+/// [`BACKGROUND_CLOCK_SKEW_MS`] in the future reads as `0s`, and one further
+/// ahead, or missing, or one the subtraction cannot represent, drops the
+/// duration and keeps the counts. Never names a subagent or a command.
+fn background_work_label(
+    work: &crate::state::BackgroundWork,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    fn count(n: u32, unit: &str) -> Option<String> {
+        (n > 0).then(|| format!("{n} {unit}{}", if n == 1 { "" } else { "s" }))
+    }
+    let kinds: Vec<String> = [
+        count(work.commands, "command"),
+        count(work.subagents, "subagent"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    let elapsed = work
+        .since_ms
+        .and_then(|since| now.timestamp_millis().checked_sub(since))
+        .and_then(|ms| match ms {
+            ms if ms >= 0 => Some(ms),
+            ms if ms >= -BACKGROUND_CLOCK_SKEW_MS => Some(0),
+            _ => None,
+        })
+        .and_then(chrono::Duration::try_milliseconds)
+        .and_then(|elapsed| now.checked_sub_signed(elapsed))
+        .map(|since| format!(" · {}", format_elapsed(since, now)))
+        .unwrap_or_default();
+    Some(format!("Background: {}{elapsed}", kinds.join(", ")))
 }
 
 /// Which of a card's sheddable rows [`render_session_card`] draws.
@@ -21831,6 +22186,19 @@ pub fn render_stop_confirm_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         render_stop_confirm(frame, selected, agent_count);
+    })
+}
+
+/// Issue #1635 (L1 `upgrade/dialog/*`): render the upgrade dialog into a
+/// standalone Buffer through the SAME [`crate::upgrade_dialog::render`] the
+/// live modal draws.
+pub fn render_upgrade_dialog_to_buffer(
+    dialog: &mut crate::upgrade_dialog::UpgradeDialog,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        crate::upgrade_dialog::render(frame, dialog);
     })
 }
 
@@ -28831,6 +29199,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event1.clone());
 
@@ -28854,6 +29224,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event2);
 
@@ -28931,6 +29303,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -28992,6 +29366,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event.clone());
 
@@ -29410,6 +29786,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30115,6 +30493,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
         state
@@ -30155,6 +30535,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30182,6 +30564,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30210,6 +30594,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -30226,6 +30612,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -30253,6 +30641,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -30269,6 +30659,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -30298,6 +30690,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -32955,6 +33349,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -34418,6 +34814,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -34513,6 +34911,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -34545,6 +34945,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -37841,6 +38243,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -37869,6 +38273,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -38501,6 +38907,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
@@ -38552,6 +38960,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(
             &mut unidentified_ui,
@@ -39054,6 +39464,8 @@ mod tests {
                     kind: crate::event::TargetKind::Pty,
                     writable: crate::event::Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             };
             self.runtime.block_on(async {
                 self.state.write().await.apply_event(event);
@@ -40252,6 +40664,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
 
         ui.send_retry_backoff
@@ -40807,6 +41221,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
             assert_eq!(
                 snapshot.pane_hook_session_id(pane_id),
@@ -40906,6 +41322,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -40937,6 +41355,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -41420,6 +41840,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         };
         synthetic(EventType::ShellBusy, false);
@@ -41442,6 +41864,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         ui.send_retry_backoff
@@ -41691,6 +42115,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
         slow_ui
@@ -42022,6 +42448,8 @@ mod tests {
                     kind: crate::event::TargetKind::Pty,
                     writable: crate::event::Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             });
         }
         snapshot
@@ -42092,6 +42520,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         assert_eq!(
@@ -42223,6 +42653,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         replacement_ui
             .send_retry_backoff
@@ -42271,6 +42703,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         assert_eq!(clear_controller.writes_for("same-agent"), 1);
@@ -42290,6 +42724,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         let clear_writes = clear_controller.writes_for("same-agent");
@@ -42345,6 +42781,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         // The lost-response shape: one wire request issued, no outcome learned,
@@ -42415,6 +42853,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
@@ -42667,6 +43107,8 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         let captured_sessions = expected_sessions.lock().unwrap().clone();
@@ -42880,7 +43322,8 @@ mod tests {
             | UiMode::QuitConfirm
             | UiMode::StopConfirm
             | UiMode::ScheduledTasks
-            | UiMode::CloseConfirm => mode,
+            | UiMode::CloseConfirm
+            | UiMode::Upgrade => mode,
         }
     }
 
@@ -42901,6 +43344,7 @@ mod tests {
             UiMode::StopConfirm,
             UiMode::ScheduledTasks,
             UiMode::CloseConfirm,
+            UiMode::Upgrade,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -45745,5 +46189,244 @@ mod hook_notice_tests {
         assert_eq!(truncate_middle(wide, wide.width()), wide);
         assert_eq!(truncate_end("abcdef", 4), "abc…");
         assert_eq!(truncate_middle("abcdefgh", 5), "ab…gh");
+    }
+}
+
+/// Issue #1635: the footer badge and the upgrade dialog as the TUI's own
+/// state drives them — the result of an upgrade, a re-check landing while the
+/// dialog is open, and the badge drawn over the button bar.
+#[cfg(test)]
+mod upgrade_dialog_tests {
+    use super::*;
+    use crate::self_upgrade::detect::Tools;
+    use crate::self_upgrade::{
+        CopyKind, InstallMethod, Installation, Outcome, PlanOptions, Platform, Provenance,
+        ProvenanceCheck, UpgradePlan, plan,
+    };
+    use crate::upgrade_dialog::{Effect, Phase, RunResult, UpgradeCheck};
+    use std::path::PathBuf;
+
+    const EXE: &str = "/home/u/.local/bin/dot-agent-deck";
+
+    fn cli_plan(latest: &str) -> UpgradePlan {
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: PathBuf::from(EXE),
+            version: "0.46.0".into(),
+            platform: Some(Platform::LinuxAmd64),
+            method: InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(EXE),
+            },
+            tools: Tools::default(),
+        };
+        let options = PlanOptions {
+            staging_root: PathBuf::from("/home/u/.local/state/dot-agent-deck/upgrade"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "no gh".into(),
+            },
+        };
+        plan::plan(&installation, &latest.into(), &options)
+    }
+
+    fn shared(check: Option<UpgradeCheck>) -> SharedState {
+        let state = SharedState::default();
+        state.blocking_write().upgrade_check = check.map(Arc::new);
+        state
+    }
+
+    /// One frame's worth of what the run loop does with the release check.
+    fn frame_sync(ui: &mut UiState, state: &SharedState) {
+        let snapshot = state.blocking_read().clone();
+        sync_upgrade_state(ui, &snapshot, state);
+    }
+
+    fn draw_dialog(ui: &mut UiState) {
+        let dialog = ui.upgrade_dialog.as_mut().expect("the dialog is open");
+        draw_to_buffer(120, 40, |frame| {
+            crate::upgrade_dialog::render(frame, dialog);
+        });
+    }
+
+    /// The bar as the deck draws it with no agent pane to control, where the
+    /// pane buttons are disabled and so dimmed.
+    fn draw_bar(ui: &mut UiState, width: u16) -> ratatui::buffer::Buffer {
+        draw_to_buffer(width, 1, |frame| {
+            render_bottom_bar(frame, ui, Rect::new(0, 0, width, 1), false, &[]);
+        })
+    }
+
+    /// The columns the badge occupies, found by its text at the bar's right
+    /// end.
+    fn badge_columns(buffer: &ratatui::buffer::Buffer, text: &str) -> std::ops::Range<u16> {
+        let width = buffer.area().width;
+        let len = u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap();
+        let start = width - len;
+        let shown: String = (start..width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(shown, text, "the badge is drawn at the bar's right end");
+        start..width
+    }
+
+    /// Scenario: The dialog is open at its first question for release A when the periodic re-check publishes release B through the usual per-frame sync. The badge follows B, but confirming the open dialog upgrades to A — the plan the user read — because the run takes its plan from the dialog, not from the newer check.
+    #[test]
+    fn upgrade_dialog_recheck_mid_dialog_runs_the_plan_the_user_read() {
+        let plan_a = cli_plan("0.47.0");
+        let plan_b = cli_plan("0.48.0");
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![plan_a.clone()],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Upgrade);
+        draw_dialog(&mut ui);
+        assert_eq!(
+            ui.upgrade_dialog.as_ref().unwrap().phase(),
+            Phase::Confirm(0)
+        );
+
+        state.blocking_write().upgrade_check = Some(Arc::new(UpgradeCheck {
+            plans: vec![plan_b.clone()],
+        }));
+        frame_sync(&mut ui, &state);
+        assert_eq!(
+            ui.upgrade_check.as_ref().map(|check| check.plans.clone()),
+            Some(vec![plan_b]),
+            "the badge follows the newer check"
+        );
+        draw_dialog(&mut ui);
+
+        let dialog = ui.upgrade_dialog.as_mut().unwrap();
+        dialog.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let effect = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(effect, Effect::Run(0));
+        let (plan, this_tui) = upgrade_job(&ui, 0).expect("a plan to run");
+        assert_eq!(plan, plan_a, "the run uses the plan the dialog showed");
+        assert!(this_tui);
+    }
+
+    /// Scenario: An upgrade of this TUI's own copy finishes with the core's "replaced" outcome and the dialog is closed. The badge no longer offers that copy; with nothing else behind it shows the core's restart line instead, and the upgrade key says the same in the status line rather than offering the copy again. A "staged" outcome keeps the offer.
+    #[test]
+    fn upgrade_dialog_installed_copy_turns_the_badge_into_a_restart_hint() {
+        let cli = cli_plan("0.47.0");
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![cli.clone()],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        let offered = draw_bar(&mut ui, 160);
+        let offer = crate::upgrade_dialog::badge_text(&cli.headline(), "u");
+        badge_columns(&offered, &offer);
+
+        let outcome = Outcome::Replaced {
+            path: PathBuf::from(EXE),
+            version: "0.47.0".into(),
+            provenance: Provenance::Skipped {
+                reason: "no gh".into(),
+            },
+            synced: true,
+        };
+        let restart = outcome.tui_restart_line("0.47.0").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.upgrade_results = Some(rx);
+        tx.send((0, RunResult::from_outcome(&cli, &outcome, true)))
+            .unwrap();
+        frame_sync(&mut ui, &state);
+        ui.status_message = None;
+
+        let bar = draw_bar(&mut ui, 160);
+        let hint = format!(" {} ", restart.render().trim());
+        badge_columns(&bar, &hint);
+        ui.upgrade_dialog = None;
+        ui.mode = UiMode::Normal;
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "nothing is offered");
+        let (status, _) = ui.status_message.clone().expect("the key answers");
+        assert_eq!(status, restart.render().trim());
+
+        // A staged upgrade still leaves the command to run: the offer stays.
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.upgrade_results = Some(rx);
+        let staged = Outcome::Staged {
+            path: PathBuf::from("/tmp/x"),
+            command: Some("sudo install /tmp/x /usr/local/bin/dot-agent-deck".into()),
+            version: "0.47.0".into(),
+            provenance: Provenance::Skipped {
+                reason: "no gh".into(),
+            },
+        };
+        tx.send((0, RunResult::from_outcome(&cli, &staged, true)))
+            .unwrap();
+        frame_sync(&mut ui, &state);
+        ui.status_message = None;
+        badge_columns(&draw_bar(&mut ui, 160), &offer);
+    }
+
+    /// Scenario: Every copy is current, but the version the running copy reports carries a terminal escape, a BEL and a bidi override. Pressing the upgrade key puts the core's "up to date" line in the status bar without any of them, and the bar as drawn shows none of them either.
+    #[test]
+    fn upgrade_dialog_up_to_date_status_line_drops_control_and_bidi() {
+        let hostile = "0.47.0\u{1b}]0;owned\u{7}\u{202e}";
+        let mut current = cli_plan("0.47.0");
+        current.installation.version = hostile.into();
+        current.action = crate::self_upgrade::PlanAction::UpToDate;
+        assert!(
+            current.headline().contains('\u{1b}'),
+            "the core passes the version through; the client filters it"
+        );
+        let state = shared(Some(UpgradeCheck {
+            plans: vec![current],
+        }));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        frame_sync(&mut ui, &state);
+        open_upgrade_dialog(&mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "nothing is offered");
+        let bad = |c: char| c.is_control() || c == '\u{202e}';
+        let (status, _) = ui.status_message.clone().expect("the key answers");
+        assert!(!status.chars().any(bad), "{status:?}");
+        assert!(
+            status.contains("is up to date (v0.47.0]0;owned)."),
+            "{status}"
+        );
+
+        let bar = draw_bar(&mut ui, 160);
+        let shown: String = (0..160).map(|x| bar[(x, 0)].symbol()).collect();
+        assert!(!shown.chars().any(bad), "{shown:?}");
+    }
+
+    /// Scenario: Draw the dashboard's button bar with the update badge over its right end, at several widths. No cell of the badge is dimmed by the disabled buttons it covers, and a click on any of its cells opens the upgrade dialog rather than pressing a button underneath.
+    #[test]
+    fn upgrade_dialog_badge_is_never_dimmed_and_clicks_never_reach_a_covered_button() {
+        let cli = cli_plan("0.47.0");
+        let offer = crate::upgrade_dialog::badge_text(&cli.headline(), "u");
+        let mut covered_dim = false;
+        for width in [90u16, 110, 130, 150, 170] {
+            let mut bare = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+            let under = draw_bar(&mut bare, width);
+            let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+            ui.upgrade_check = Some(Arc::new(UpgradeCheck {
+                plans: vec![cli.clone()],
+            }));
+            let bar = draw_bar(&mut ui, width);
+            for x in badge_columns(&bar, &offer) {
+                covered_dim |= under[(x, 0)].modifier.contains(Modifier::DIM);
+                assert!(
+                    !bar[(x, 0)].modifier.contains(Modifier::DIM),
+                    "badge cell {x} at width {width} is dimmed"
+                );
+                assert!(
+                    matches!(
+                        hit_test_button(&ui.button_rects, x, 0),
+                        Some(Action::OpenUpgrade)
+                    ),
+                    "a click on badge cell {x} at width {width} must open the dialog"
+                );
+            }
+        }
+        assert!(
+            covered_dim,
+            "at some width the badge covers a dimmed button, or this test proves nothing"
+        );
     }
 }

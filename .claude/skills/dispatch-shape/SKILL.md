@@ -1,6 +1,6 @@
 ---
 name: dispatch-shape
-description: Choose the shape of a unit you are about to dispatch in this repo — one agent (`--single`) or a team (`--orchestration '<name>'`) — from divisibility criteria instead of asking, and report the shape you chose with a one-line reason. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason — an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, or any other skill that dispatches. It is the maintainer's standing answer to the dispatcher prompt's shape question for this repo; the user's own word in the conversation still wins, and `/prd-queue` keeps its own per-PRD question.
+description: Choose the shape of a unit you are about to dispatch in this repo — one agent (`--single`) or a team (`--orchestration '<name>'`) — from divisibility criteria instead of asking, and report the shape you chose with a one-line reason. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason — an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, or any other skill that dispatches. It is the maintainer's standing answer to the dispatcher prompt's shape question for this repo; the user's own word in the conversation still wins, and `/prd-queue` keeps its own per-PRD question. Before the first dispatch, also run `/dispatch-base`, which brings the base every unit is cut from up to date.
 user-invocable: true
 ---
 
@@ -9,6 +9,10 @@ user-invocable: true
 A unit starts either as **one agent** or as a **multi-role orchestration**. In this repo, **choose it yourself, from the criteria below, and say which you chose and why.** Do not ask per unit, and do not fall back to a default without applying the test.
 
 This skill is where that decision is defined for **every** dispatch made in this repo — an ad-hoc request in a dispatcher pane ("start X as a separate line of work"), `/issue-queue`, or any other skill that dispatches — except the skills named under [Where this skill does not decide the shape](#where-this-skill-does-not-decide-the-shape), which carry a shape step of their own.
+
+## Before the first dispatch, bring the base up to date with `dispatch-base`
+
+**The shape is not the only thing a dispatch decides; the base is the other, and this skill does not define it.** Every unit is cut from the dispatcher checkout's `HEAD`, so before the first dispatch of a batch apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill: fetch, fast-forward `main` when there is no local work to move, otherwise leave the checkout alone and tell the user which precondition failed and how far `HEAD` is from `origin/main`, and after each dispatch read the `cut from <branch> at <sha>` clause in `dispatch`'s reply. That applies to an ad-hoc dispatch as much as to a queue, and it applies inside the skills listed under [Where this skill does not decide the shape](#where-this-skill-does-not-decide-the-shape) too: they carry their own shape step, not their own base step.
 
 ## This is the standing answer to the dispatcher prompt's question
 

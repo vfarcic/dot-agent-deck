@@ -2387,6 +2387,9 @@ fn install_probe_command() -> String {
     )
 }
 
+/// The most [`discover_homebrew_binary`] reads of the install probe's answer.
+const HOMEBREW_DISCOVERY_CAP: usize = 8 * 1024;
+
 /// Discover a Homebrew binary without changing the remote install. Used when
 /// `connect` finds that a legacy entry's default ~/.local/bin path is gone.
 /// The connect executor supplies its short SSH deadline; cap the answer as
@@ -2395,7 +2398,31 @@ pub(crate) fn discover_homebrew_binary(
     executor: &dyn SshExecutor,
     target: &SshTarget,
 ) -> Result<Option<RemoteBinaryPath>, SshError> {
-    let probe = executor.run_capped(target, &install_probe_command(), 8 * 1024)?;
+    homebrew_binary_from(executor.run_capped(
+        target,
+        &install_probe_command(),
+        HOMEBREW_DISCOVERY_CAP,
+    )?)
+}
+
+/// [`discover_homebrew_binary`] bounded by `deadline`, for an executor that
+/// carries no wall-clock bound of its own — the desktop's check and start of a
+/// deck's daemon (issue #1675).
+pub(crate) fn discover_homebrew_binary_within(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    deadline: std::time::Duration,
+) -> Result<Option<RemoteBinaryPath>, SshError> {
+    homebrew_binary_from(executor.run_capped_within(
+        target,
+        &install_probe_command(),
+        HOMEBREW_DISCOVERY_CAP,
+        deadline,
+    )?)
+}
+
+/// The Homebrew binary the install probe's answer names, if any.
+fn homebrew_binary_from(probe: CappedOutput) -> Result<Option<RemoteBinaryPath>, SshError> {
     if probe.truncated || probe.output.status != 0 {
         return Ok(None);
     }
@@ -2405,6 +2432,36 @@ pub(crate) fn discover_homebrew_binary(
     });
     Ok(prefix
         .and_then(|prefix| RemoteBinaryPath::try_from(format!("{prefix}/bin/dot-agent-deck")).ok()))
+}
+
+/// Record in the deck list at `remotes_path` a Homebrew binary found and
+/// verified for the deck-list row `entry` (issue #1459), reporting `version`,
+/// so the next check runs it straight away. `connect` and the desktop's check
+/// and start of a deck's daemon (issue #1675) both record through this.
+///
+/// The row is changed only while it still reaches the machine `entry` reached
+/// and records the install `entry` recorded, so a concurrent move or upgrade
+/// of the row is not written over.
+pub(crate) fn record_homebrew_binary(
+    remotes_path: &Path,
+    entry: &RemoteEntry,
+    binary: RemoteBinaryPath,
+    version: &str,
+) -> Result<Option<RemoteEntry>, RemoteConfigError> {
+    crate::deck_list::update(
+        remotes_path,
+        crate::deck_list::DeckRef::Name(&entry.name),
+        |row| {
+            if crate::deck_list::address_key(row) == crate::deck_list::address_key(entry)
+                && row.install == entry.install
+                && row.binary == entry.binary
+            {
+                row.install = Some(INSTALL_HOMEBREW.to_string());
+                row.binary = Some(binary);
+                row.version = version.to_string();
+            }
+        },
+    )
 }
 
 /// Find out how the deck is installed on the remote (issue #1372).

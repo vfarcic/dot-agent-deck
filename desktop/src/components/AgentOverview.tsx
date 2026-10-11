@@ -1,14 +1,14 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
+import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { upgradeOffered } from "../lib/upgrade";
+import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
@@ -127,7 +127,8 @@ export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): stri
  */
 const FIXTURE_DAEMON_STATUS: Partial<Record<AgentStatus, DesktopAgentDto["status"]>> = {
   running: "working",
-  waiting: "waiting_for_input",
+  needs_input: "waiting_for_input",
+  idle: "idle",
   failed: "error",
   blocked: "blocked",
 };
@@ -338,8 +339,11 @@ function roleIndexOf(agent: OverviewAgent): number {
   return agent.tab.kind === "orchestration" ? agent.tab.roleIndex : 0;
 }
 
-/** Statuses in the order an operator scans them: what needs attention first. */
-const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "blocked", "queued", "passed", "stopped"];
+/**
+ * Statuses in the order an operator scans them: what needs attention first.
+ * Idle comes after every state a person has to act on (issue #1676).
+ */
+const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "idle", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER
@@ -815,7 +819,7 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, notice }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -844,6 +848,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * voice surface reads the first and this screen serves the second.
    */
   newAgentVoice?: NewAgentVoiceChannel;
+  /** Issue #1635 — the app's newer-release banner, shown at the top of the dashboard. */
+  notice?: ReactNode;
 }) {
   const { fleet, snapshot, mode } = runtime;
   /*
@@ -1234,10 +1240,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
-     digit, and a field or terminal keeps its own. */
+     digit, and a field or terminal keeps its own. A modal over the dashboard —
+     this screen's own confirmations, or one the app opens, such as the
+     newer-release dialog (issue #1635) — keeps them, as it keeps the scroll
+     keys above. */
   useEffect(() => {
     if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      // A modal this screen does not own covers it too, such as the Upgrade
+      // dialog the shell opens on its own (issue #1636): a digit pressed in it
+      // must not open a row hidden behind it.
+      if (modalOpen()) return;
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
       if (!agent) return;
@@ -1427,15 +1440,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
-          <div className="run-instruments">
+          {/*
+            Issue #1676: which counters give way at a medium-width window is
+            named here, not left to their position. IDLE and GROUPS are the two
+            nobody has to act on; NEEDS INPUT and FAILED stay.
+          */}
+          <div className="run-instruments overview-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
             <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
-            <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
+            <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
             <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
-            <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
+            <OverviewInstrument label="IDLE" testId="overview-count-idle" optional><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
+            <OverviewInstrument label="GROUPS" testId="overview-count-groups" optional><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
             {/*
               PRD #742 M4. The one instrument that is ALWAYS known, and it is
-              what makes the four beside it readable: they are computed over the
+              what makes the counters beside it readable: they are computed over the
               decks that answered, so "how many answered" is the caveat that
               belongs next to them. It renders at one deck too — `1/1` is the
               honest reading of a single-deck fleet, and hiding it would mean
@@ -1483,6 +1502,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
 
         {/* Focusable (issue #1492): it is the dashboard's scroll region, and a region the keyboard cannot reach cannot be scrolled from it. */}
         <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef} tabIndex={0}>
+          {notice}
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
@@ -1524,10 +1544,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               /*
                 PRD #1487 D8/D9: Upgrade on THIS deck's card, offered only when
-                the crate says its daemon runs an older release than the app.
+                the crate says its daemon runs an older release than the app —
+                on the local deck too since issue #1636, as a restart onto this
+                app's build.
               */
               onUpgrade={runtime.upgradeDaemon && upgradeOffered(deck.snapshot.connection) && deck.snapshot.connection.deckId !== undefined
-                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: "upgrade", offer: deck.snapshot.connection.upgradeOffer })
+                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: upgradeKindOf(deck.snapshot.connection), offer: deck.snapshot.connection.upgradeOffer })
                 : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
@@ -1749,7 +1771,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
         {deck.connected && deck.agents.length > 0 && (
           <div className="daemon-pips">{deck.counts.map((entry) => (
-            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
+            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
           ))}</div>
         )}
         {/*
@@ -1758,7 +1780,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
-        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${deckName(connection)}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
+        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 
@@ -2336,7 +2358,7 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
         <div className="overview-group-pips">{counts.map((entry) => (
-          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
+          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
         ))}</div>
         {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
         {stopControls && group.kind === "orchestration" && (
@@ -2457,7 +2479,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         return (
           <td className="overview-state" role="cell" key={column}>
             <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
-            <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+            <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
           </td>
         );
       case "displayName":
@@ -2690,8 +2712,9 @@ function OverviewNote({ className, testId, icon, title, children }: { className?
   return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
 }
 
-function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
-  return <div className="instrument" data-testid={testId}><span>{label}</span>{children}</div>;
+/** `optional`: one of the counters a medium-width window hides to make room. */
+function OverviewInstrument({ label, children, testId, optional }: { label: string; children: ReactNode; testId?: string; optional?: boolean }) {
+  return <div className={optional ? "instrument instrument-optional" : "instrument"} data-testid={testId}><span>{label}</span>{children}</div>;
 }
 
 /**

@@ -566,7 +566,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* Issue #714: blocked shares failed's colour (a person has to act) but not its
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
-.agent-state-mark.status-waiting, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
+.agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -576,7 +576,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status-label.status-waiting, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
+/* Issue #1678: background work still running after the turn ended. Ink rather
+   than --muted, as the TUI draws it in its primary text colour: it is a reading
+   about now, not a label. */
+.agent-identity p.agent-background-work { color: var(--ink); }
+.status-label.status-needs_input, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
 /*
   Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:
   the live colour goes and the mark hollows out. Written after the per-status
@@ -1044,6 +1048,27 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
 /* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
 .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
+/* Issue #1635 — this machine's own copies: the rail's newer-release button, the dashboard banner, and the dialog's per-copy plans. */
+.rail-bottom .rail-update { color: var(--shell-teal); border-color: var(--shell-teal-edge); background: var(--shell-teal-surface); }
+.rail-bottom .rail-update:hover, .rail-bottom .rail-update:focus-visible { color: var(--shell-teal-text-strong); }
+.self-upgrade-banner { margin-bottom: 8px; }
+.self-upgrade-banner .self-upgrade-banner-open { width: auto; padding: 0 8px; border: 1px solid currentColor; font-size: 10px; font-weight: 600; }
+.self-upgrade-dialog { width: min(520px, 100%); max-height: 80vh; overflow: auto; }
+.self-upgrade-plan { margin: 12px 0 0; padding: 9px 11px; text-align: left; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.self-upgrade-plan h3 { margin: 0 0 5px; font-size: 11px; }
+.self-upgrade-lines p { margin: 4px 0; max-width: none; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.self-upgrade-command { margin: 4px 0; display: flex; align-items: flex-start; gap: 6px; }
+.self-upgrade-command code { flex: 1; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-sunken); color: var(--ink); font-size: 9px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.self-upgrade-command button { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-strong); cursor: pointer; }
+.self-upgrade-running { margin: 6px 0 0; display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 9.5px; }
+.self-upgrade-result { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.self-upgrade-result[data-ok="true"] .self-upgrade-lines p:first-child { color: var(--ink); font-weight: 600; }
+.self-upgrade-result[data-ok="false"] .self-upgrade-lines p:first-child { color: var(--red); }
+.self-upgrade-actions { margin-top: 14px; }
+.self-upgrade-actions > p { margin: 0 auto 10px; color: var(--ink); font-size: 10.5px; }
+.self-upgrade-actions > div { display: flex; justify-content: center; gap: 7px; }
+/* The actions block is the dialog's last child, so `.confirm-dialog > div:last-child` would lay its question and buttons out side by side. */
+.confirm-dialog.self-upgrade-dialog > div.self-upgrade-actions { display: block; }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step
@@ -1144,7 +1169,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
   .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
-  .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
+  .deck-instruments .instrument:nth-child(3), .deck-instruments .instrument:nth-child(5) { display: none; }
+  .overview-instruments .instrument-optional { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }
 
@@ -1426,7 +1452,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .count-running { color: var(--teal); }
-.count-waiting { color: var(--amber); }
+.count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }

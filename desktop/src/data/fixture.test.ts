@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { fixtureGroundedCommandText, fixtureVoiceCommands, resolveFixtureVoice } from "./fixture";
+import { fixtureGroundedCommandText, fixtureSelfUpgradeApi, fixtureVoiceCommands, resolveFixtureVoice } from "./fixture";
 
 const dictationSource = readFileSync(resolve("src-tauri/src/voice/dictation.rs"), "utf8");
 const outcomeSource = readFileSync(resolve("src-tauri/src/voice/outcome.rs"), "utf8");
@@ -342,5 +342,24 @@ describe("browser fixture reading rows (PRD #1497)", () => {
       expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, { reading: false, speaking: true }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
     }
     expect(resolveFixtureVoice("hush", "agent", true, false, false, false, off).outcome).toMatchObject({ kind: "dispatch", params: [{ value: "hush" }] });
+  });
+});
+
+// Issue #1635 — the `self-upgrade` docs screenshot's stand-in.
+describe("fixtureSelfUpgradeApi", () => {
+  it("is offered only when the page asks for it", () => {
+    expect(fixtureSelfUpgradeApi("?fixture=1&state=docs")).toBeUndefined();
+    expect(fixtureSelfUpgradeApi("?fixture=1&state=docs&selfupgrade=1")).toBeDefined();
+  });
+
+  it("plays a .dmg app and a Homebrew CLI one release behind, the app's headline as the notice", async () => {
+    const check = await fixtureSelfUpgradeApi("?selfupgrade=1")!.check();
+    expect(check.updateAvailable).toBe(true);
+    expect(check.installed).toBeNull();
+    expect(check.checkId).toBeGreaterThan(0);
+    expect(check.notice).toBe("Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)");
+    expect(check.app).toMatchObject({ action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?" });
+    expect(check.cli).toMatchObject({ action: "brew-upgrade", actionable: true, confirmQuestion: "Upgrade dot-agent-deck to v0.47.0?" });
+    expect(check.app.lines[0].text).toBe(check.app.headline);
   });
 });

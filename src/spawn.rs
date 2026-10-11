@@ -3136,6 +3136,8 @@ fn surface_spawned_pane(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }
@@ -3292,6 +3294,8 @@ pub(crate) fn surface_attach_stopped_agent(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }
@@ -4001,6 +4005,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
