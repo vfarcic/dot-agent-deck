@@ -841,6 +841,12 @@ pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 /// directory on every platform this builds for.
 pub const CAP_LAST_COMMAND: &str = "last-command";
 
+/// Capability string for [`AttachRequest::PostMessage`] (PRD #1666): a client
+/// hands a deck-generated message — a seed, an orchestrator's role context, the
+/// configuration prompt — to the daemon's inbox instead of typing it into the
+/// pane. Advertised on every platform: the arm is not `#[cfg]`-gated.
+pub const CAP_INBOX: &str = "inbox";
+
 /// Capability string for [`AttachRequest::SubscribeTurnReplies`] (PRD #1497):
 /// a stream of one agent's finished-turn replies, for the desktop's voice
 /// "reading on". Held by
@@ -1022,6 +1028,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
+    CAP_INBOX,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1038,6 +1045,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
+    CAP_INBOX,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2493,6 +2501,26 @@ pub enum AttachRequest {
     /// nothing.
     SeedLastCommand {
         command: String,
+    },
+    /// PRD #1666: post a deck-generated message to `pane_id`'s inbox, bound to
+    /// `expected_agent_id` (the pane's live agent when omitted). The reply
+    /// carries the message id on [`AttachResponse::id`]; a refusal (no such
+    /// agent, a full inbox, an oversized body) is `ok: false` with `error`.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INBOX`]**, on the same
+    /// no-bump basis as [`Self::SeedLastCommand`]: an older daemon has no such
+    /// variant and refuses it with the generic `malformed request: …`.
+    PostMessage {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_agent_id: Option<String>,
+        subject: String,
+        body: String,
+        /// The `.dot-agent-deck/` file that carries the full body, named when
+        /// the body is too long to hand over inline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spill_path: Option<String>,
+        origin: crate::inbox_hub::PostOrigin,
     },
     /// PRD #1487: restart this daemon — onto the build now installed at its own
     /// path ([`RestartSuccessor::Installed`]), or for a client that starts its
@@ -6693,8 +6721,70 @@ async fn handle_connection(
             }
             write_resp(&mut stream, &AttachResponse::ok()).await?
         }
+        AttachRequest::PostMessage {
+            pane_id,
+            expected_agent_id,
+            subject,
+            body,
+            spill_path,
+            origin,
+        } => {
+            let resp = post_message(
+                &registry,
+                &pane_id,
+                expected_agent_id.as_deref(),
+                subject,
+                body,
+                spill_path,
+                origin,
+            );
+            write_resp(&mut stream, &resp).await?
+        }
     }
     Ok(())
+}
+
+/// PRD #1666: [`AttachRequest::PostMessage`]'s handling — bind the message to
+/// the pane's live agent and post it to the inbox.
+fn post_message(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    expected_agent_id: Option<&str>,
+    subject: String,
+    body: String,
+    spill_path: Option<String>,
+    origin: crate::inbox_hub::PostOrigin,
+) -> AttachResponse {
+    let Some(live) = registry.pane_current_agent_id(pane_id) else {
+        return AttachResponse::err(format!(
+            "post-message: pane {pane_id} has no live agent; nothing was posted"
+        ));
+    };
+    if let Some(expected) = expected_agent_id
+        && expected != live
+    {
+        return AttachResponse::err(format!(
+            "post-message: pane {pane_id} is now occupied by another agent than {expected}; \
+             nothing was posted"
+        ));
+    }
+    let content = crate::inbox::Content {
+        from: crate::inbox::Sender::Deck {
+            reason: origin.reason().to_string(),
+        },
+        subject,
+        body,
+        body_trust: crate::inbox::BodyTrust::Trusted,
+        spill_path: spill_path.map(std::path::PathBuf::from),
+        id: None,
+    };
+    match registry
+        .inbox()
+        .post_direct(crate::inbox::Recipient::bound(pane_id, live), content)
+    {
+        Ok(id) => AttachResponse::with_id(id.to_string()),
+        Err(error) => AttachResponse::err(format!("post-message: {error}")),
+    }
 }
 
 /// Issue #1540: make `command` the deck's last command in memory — no I/O, so

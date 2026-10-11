@@ -203,13 +203,19 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
-    /// Acknowledge that a delegated task reached you, so the deck stops
-    /// re-sending its pointer. Run it with the delivery id your task file names
-    /// (`d-` plus 8 hex characters). Always exits 0: a failed acknowledgement
-    /// is harmless, and the task goes on either way.
+    /// Acknowledge a message the deck delivered to you (`m-…`), or that a
+    /// delegated task reached you (`d-…`, the id your task file names). Exits
+    /// non-zero only when the deck says it holds no such message for you; any
+    /// other failure to acknowledge is harmless, and the task goes on.
     Ack {
-        /// The delivery id from the task file, e.g. `d-7f3a9c21`.
+        /// The message id (`m-…`) or the delivery id from the task file
+        /// (`d-…`).
         delivery_id: String,
+    },
+    /// Read and manage this agent's dot-agent-deck inbox.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
     },
     /// Report an agent lifecycle state, a submitted prompt or a tool call so
     /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
@@ -691,6 +697,38 @@ enum WorktreeCmd {
 }
 
 #[derive(Subcommand)]
+enum InboxAction {
+    /// Print every message waiting for you, framed as from the deck, and
+    /// acknowledge them.
+    Fetch {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List your messages and their delivery states.
+    List {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+        /// From an orchestrator pane: every inbox in its orchestration.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Wait for messages on behalf of an agent's hook, plugin or extension.
+    /// Run by those components, not by hand.
+    Wait {
+        /// The agent the component belongs to (`claude-code`, `opencode`,
+        /// `pi`, `codex`, `devin`).
+        #[arg(long)]
+        agent: String,
+        /// Stay connected and print each message as a JSON line, reading
+        /// `{"ack":[…]}` / `{"nack":[…]}` lines from stdin.
+        #[arg(long)]
+        stream: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum HooksAction {
     /// Install hooks for an agent
     Install {
@@ -835,6 +873,25 @@ enum AckStream {
 /// still with exit 0: nothing proves the deck matched the ack, so the worker
 /// must not be told it did, and nothing proves it failed either, so the worker
 /// carries on.
+/// PRD #1666: whether the deck positively said it holds no message under the
+/// id for this agent — the one `ack` outcome that exits non-zero, so an agent
+/// that acknowledged the wrong id learns it. Every other failure to confirm
+/// stays a success, for the reason [`ack_report`] gives.
+fn ack_was_refused_by_id(reply: &AckReply) -> bool {
+    use dot_agent_deck::event::AckDelivery;
+    use dot_agent_deck::hook::SocketReply;
+    let AckReply::Socket(SocketReply::Line(line)) = reply else {
+        return false;
+    };
+    parse_signal_ack(line).is_some_and(|ack| {
+        ack.accepted
+            && matches!(
+                ack.delivery,
+                Some(AckDelivery::Unknown | AckDelivery::WrongAgent | AckDelivery::Undeliverable)
+            )
+    })
+}
+
 fn ack_report(reply: &AckReply) -> (AckStream, String) {
     use dot_agent_deck::event::AckDelivery;
     use dot_agent_deck::hook::SocketReply;
@@ -861,9 +918,22 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
                 Some(AckDelivery::Unknown) => (
                     AckStream::Stderr,
                     format!(
-                        "The deck has no delivery under that id for this pane (mistyped, or from \
-                         an earlier task), so it may send the task pointer again; {CARRY_ON}"
+                        "Unknown id: the deck has no delivery under that id for this pane \
+                         (mistyped, or from an earlier task), so it may send the task pointer \
+                         again; {CARRY_ON}"
                     ),
+                ),
+                Some(AckDelivery::WrongAgent) => (
+                    AckStream::Stderr,
+                    "That message is addressed to another agent (wrong_agent); it was not \
+                     acknowledged."
+                        .to_string(),
+                ),
+                Some(AckDelivery::Undeliverable) => (
+                    AckStream::Stderr,
+                    "That message is no longer deliverable (undeliverable); it was not \
+                     acknowledged."
+                        .to_string(),
                 ),
                 Some(_) => not_confirmed("the deck's reply was not one this build understands"),
                 None => not_confirmed("the deck did not say whether the delivery id matched"),
@@ -1508,9 +1578,15 @@ fn main() -> ExitCode {
             };
             send_signal_and_report_ack(&json, "work-done", "work-done report")
         }
+        Some(Commands::Inbox { action }) => match action {
+            InboxAction::Fetch { json } => dot_agent_deck::inbox_cli::fetch(json),
+            InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
+            InboxAction::Wait { agent, stream } => dot_agent_deck::inbox_cli::wait(&agent, stream),
+        },
         Some(Commands::Ack { delivery_id }) => {
             let reply = match (
-                dot_agent_deck::delegate_retry::is_valid_delivery_id(&delivery_id),
+                dot_agent_deck::delegate_retry::is_valid_delivery_id(&delivery_id)
+                    || dot_agent_deck::inbox::is_valid_message_id(&delivery_id),
                 std::env::var(DOT_AGENT_DECK_PANE_ID),
             ) {
                 (false, _) => AckReply::Malformed,
@@ -1537,7 +1613,11 @@ fn main() -> ExitCode {
                 AckStream::Stdout => println!("{message}"),
                 AckStream::Stderr => eprintln!("{message}"),
             }
-            ExitCode::SUCCESS
+            if ack_was_refused_by_id(&reply) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Some(Commands::AgentEvent {
             r#type,

@@ -859,6 +859,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // spawns is handed that path explicitly instead of re-resolving it from
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
+    // PRD #1666: the inbox, addressed by this deck's persisted id. A state
+    // directory that cannot hold the id costs it persistence, not the inbox.
+    {
+        let state_dir = crate::config::state_dir();
+        let deck = crate::inbox::DeckId::load_or_create(&state_dir).unwrap_or_else(|error| {
+            warn!(%error, "could not load or create the deck id; using one for this run only");
+            crate::inbox::DeckId::generate()
+        });
+        pty_registry.install_inbox(Arc::new(crate::inbox_hub::InboxHub::from_env(deck)));
+    }
+    let inbox_ticker = pty_registry.inbox().spawn_ticker();
     let state = daemon.state;
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
@@ -1207,6 +1218,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
     scheduler_handle.abort();
+    inbox_ticker.abort();
     if let Some(h) = orphan_handle {
         h.abort();
     }
@@ -3796,6 +3808,138 @@ pub(crate) fn handle_delivery_ack(
     outcome.into()
 }
 
+/// PRD #1666: the refusal code for an inbox request no token attests.
+const INBOX_UNATTESTED: &str = "unattested";
+const INBOX_UNATTESTED_MESSAGE: &str = "inbox requests need the hook capability token dot-agent-deck gave this pane's agent, \
+     and this one carried none the deck could check; run it from inside the agent's own pane";
+/// PRD #1666: the refusal code for an inbox request naming another agent.
+const INBOX_WRONG_AGENT: &str = "wrong_agent";
+const INBOX_WRONG_AGENT_MESSAGE: &str =
+    "this request names an agent other than the one its hook capability token was issued to";
+
+/// PRD #1666: `ack <m-id>` — acknowledge an inbox message for the agent the
+/// token attests.
+fn handle_inbox_ack(
+    registry: &AgentPtyRegistry,
+    signal: &crate::event::AckSignal,
+    agent_id: &str,
+) -> crate::event::AckDelivery {
+    if !crate::inbox::is_valid_message_id(&signal.delivery_id) {
+        warn!(
+            pane_id = %escape_id_for_log(&signal.pane_id),
+            id_len = signal.delivery_id.len(),
+            "Received an ack whose id is not shaped like an inbox message id; ignored"
+        );
+        return crate::event::AckDelivery::Unknown;
+    }
+    let outcome = registry.inbox().ack(
+        &signal.delivery_id,
+        &signal.pane_id,
+        agent_id,
+        crate::inbox::AckHow::Explicit,
+    );
+    info!(
+        pane_id = %escape_id_for_log(&signal.pane_id),
+        message_id = %signal.delivery_id,
+        outcome = ?outcome,
+        "Received inbox ack"
+    );
+    outcome.into()
+}
+
+/// PRD #1666: `inbox_fetch` — hand the attested agent its queued messages.
+fn handle_inbox_fetch(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> crate::event::InboxWaitReply {
+    use crate::event::InboxFetchConsumer;
+    use crate::inbox::{AckHow, Consumer};
+    let (consumer, how) = match req.consumer {
+        InboxFetchConsumer::Cli => (Consumer::FetchCli, AckHow::FetchedByCli),
+        InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
+        InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
+    };
+    let messages = registry.inbox().fetch(
+        &req.pane_id,
+        agent_id,
+        consumer,
+        req.max_chars,
+        req.ack.then_some(how),
+    );
+    info!(
+        pane_id = %escape_id_for_log(&req.pane_id),
+        consumer = ?req.consumer,
+        ack = req.ack,
+        count = messages.len(),
+        "Received inbox fetch"
+    );
+    crate::event::InboxWaitReply::messages(messages)
+}
+
+/// PRD #1666: `inbox_list` — the caller's own inbox, or with `all` an
+/// orchestrator's whole orchestration.
+async fn handle_inbox_list(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    req: &crate::event::InboxListRequest,
+    agent_id: &str,
+) -> Result<crate::event::InboxListReply, crate::event::InboxWaitReply> {
+    let hub = registry.inbox();
+    let panes: Vec<String> = if req.all {
+        let state = state.read().await;
+        if !state.orchestrator_pane_ids.contains(&req.pane_id) {
+            return Err(crate::event::InboxWaitReply::refused(
+                "not_orchestrator",
+                "only an orchestrator pane may list its orchestration's inboxes",
+            ));
+        }
+        let mut panes = vec![req.pane_id.clone()];
+        if let Some(identity) = state.pane_orchestration_map.get(&req.pane_id) {
+            let mut members: Vec<String> = state
+                .pane_orchestration_map
+                .iter()
+                .filter(|(pane, other)| *pane != &req.pane_id && other.id == identity.id)
+                .map(|(pane, _)| pane.clone())
+                .collect();
+            members.sort();
+            panes.extend(members);
+        }
+        panes
+    } else {
+        vec![req.pane_id.clone()]
+    };
+    Ok(crate::event::InboxListReply {
+        messages: panes.iter().flat_map(|pane| hub.list(pane)).collect(),
+        armed: hub.armed(&req.pane_id, agent_id),
+        wake: hub.announced_wake(&req.pane_id, agent_id),
+    })
+}
+
+/// [`HOOK_CONNECTION_IDLE_TIMEOUT`], or its override in milliseconds from
+/// [`HOOK_IDLE_TIMEOUT_ENV`]. The override is a TEST knob: it lets the e2e
+/// tests prove that an inbox waiter outlives the idle window without spending
+/// the production minute. A zero or unparsable value is ignored with a warning.
+fn hook_idle_timeout_from_env() -> Duration {
+    match std::env::var(HOOK_IDLE_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    variable = HOOK_IDLE_TIMEOUT_ENV,
+                    "ignoring a hook idle-timeout override that is not a positive number of \
+                     milliseconds"
+                );
+                HOOK_CONNECTION_IDLE_TIMEOUT
+            }
+        },
+        Err(_) => HOOK_CONNECTION_IDLE_TIMEOUT,
+    }
+}
+
+/// Test-only override of [`HOOK_CONNECTION_IDLE_TIMEOUT`], in milliseconds.
+const HOOK_IDLE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_HOOK_IDLE_TIMEOUT_MS";
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -3811,7 +3955,7 @@ async fn run_hook_loop(
         pty_registry,
         shutdown,
         worktree_registry,
-        HOOK_CONNECTION_IDLE_TIMEOUT,
+        hook_idle_timeout_from_env(),
     )
     .await
 }
@@ -3876,7 +4020,9 @@ async fn run_hook_loop_with_idle_timeout(
                     // what the semaphore counts. Holding it in the loop above
                     // instead would bound accepts rather than tasks, which is
                     // not the thing that grows.
-                    let _permit = permit;
+                    // PRD #1666: an `inbox_wait` connection gives its slot back
+                    // (`take`) when it moves into the waiter pool.
+                    let mut permit = Some(permit);
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. The write half now
                     // serves every `DaemonMessage` arm — `delegate` since PR
@@ -4081,7 +4227,145 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                             }
+                            // PRD #1666: the inbox verbs act only for an agent
+                            // the token ATTESTS. A pane never issued a token is
+                            // admitted above for its status events, but has no
+                            // agent this daemon can bind a message to.
+                            let attested_agent = match &provenance {
+                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                    Some(agent_id.clone())
+                                }
+                                _ => None,
+                            };
+                            if msg.requires_attested_agent() && attested_agent.is_none() {
+                                warn!(
+                                    verb = msg.verb(),
+                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                    "hook socket: refused an inbox request that no hook \
+                                     capability token attests"
+                                );
+                                if let Some(json) = msg.provenance_refusal_reply(
+                                    INBOX_UNATTESTED,
+                                    INBOX_UNATTESTED_MESSAGE,
+                                ) {
+                                    let line = format!("{json}\n");
+                                    let _ = write_half.write_all(line.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                }
+                                continue;
+                            }
+                            if let (Some(claimed), Some(attested)) =
+                                (msg.claimed_agent(), attested_agent.as_deref())
+                                && claimed != attested
+                            {
+                                warn!(
+                                    verb = msg.verb(),
+                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                    "hook socket: refused an inbox request naming an agent \
+                                     other than the one its token attests"
+                                );
+                                if let Some(json) = msg.provenance_refusal_reply(
+                                    INBOX_WRONG_AGENT,
+                                    INBOX_WRONG_AGENT_MESSAGE,
+                                ) {
+                                    let line = format!("{json}\n");
+                                    let _ = write_half.write_all(line.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                }
+                                continue;
+                            }
                             match msg {
+                                DaemonMessage::InboxWait(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let hub = Arc::clone(pty_registry.inbox());
+                                    if pty_registry.pane_current_agent_id(&req.pane_id).as_deref()
+                                        != Some(agent_id.as_str())
+                                    {
+                                        let reply = crate::event::InboxWaitReply::not_in_deck();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
+                                    info!(
+                                        pane_id = %escape_id_for_log(&req.pane_id),
+                                        mode = ?req.mode,
+                                        component = ?req.component,
+                                        source = ?req.session.as_ref().and_then(|s| s.source.as_deref()),
+                                        pid = ?req.pid,
+                                        "Received inbox wait"
+                                    );
+                                    // Out of the hook-ingest pool, and out of its
+                                    // idle timeout: a waiter is idle by design, and
+                                    // the waiter pool bounds it instead.
+                                    drop(permit.take());
+                                    crate::inbox_hub::serve_waiter(
+                                        hub,
+                                        req.pane_id,
+                                        agent_id,
+                                        req.mode,
+                                        req.component,
+                                        reader,
+                                        write_half,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                DaemonMessage::InboxAnnounce(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    pty_registry.inbox().announce(&req.pane_id, &agent_id, req.wake);
+                                    info!(
+                                        pane_id = %escape_id_for_log(&req.pane_id),
+                                        component = ?req.component,
+                                        wake = ?req.wake,
+                                        "Received inbox announce"
+                                    );
+                                    if let Ok(json) =
+                                        serde_json::to_string(&crate::event::SignalAck::accepted())
+                                    {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxFetch(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let reply = handle_inbox_fetch(&pty_registry, &req, &agent_id);
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxList(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let json = match handle_inbox_list(
+                                        &pty_registry,
+                                        &state,
+                                        &req,
+                                        &agent_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(reply) => serde_json::to_string(&reply),
+                                        Err(refusal) => serde_json::to_string(&refusal),
+                                    };
+                                    if let Ok(json) = json {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
                                         pane_id = %escape_id_for_log(&signal.pane_id),
@@ -4405,11 +4689,21 @@ async fn run_hook_loop_with_idle_timeout(
                                         } => Some(agent_id.as_str()),
                                         _ => None,
                                     };
-                                    let delivery = handle_delivery_ack(
-                                        &pty_registry,
-                                        &signal,
-                                        attested_agent_id,
-                                    );
+                                    // PRD #1666: a message id is the inbox's; a
+                                    // `d-` delivery id still belongs to the typed
+                                    // delivery's retry loop until that is retired.
+                                    let delivery = match attested_agent_id {
+                                        Some(agent_id)
+                                            if signal.delivery_id.starts_with("m-") =>
+                                        {
+                                            handle_inbox_ack(&pty_registry, &signal, agent_id)
+                                        }
+                                        _ => handle_delivery_ack(
+                                            &pty_registry,
+                                            &signal,
+                                            attested_agent_id,
+                                        ),
+                                    };
                                     if let Ok(json) = serde_json::to_string(
                                         &crate::event::SignalAck::acknowledged(delivery),
                                     ) {

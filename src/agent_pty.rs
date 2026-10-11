@@ -5535,6 +5535,8 @@ pub struct AgentPtyRegistry {
     turn_replies: crate::turn_reply::TurnReplyHub,
     /// Issue #1383: see [`Self::pending_deliveries`].
     pending_deliveries: crate::delegate_retry::PendingDeliveries,
+    /// PRD #1666: see [`AgentPtyRegistry::inbox`].
+    inbox: std::sync::OnceLock<Arc<crate::inbox_hub::InboxHub>>,
     /// Issue #1383 test seam: when set, the next [`Self::echo_watch`] reports
     /// that it reached its setup and waits there for the release — see
     /// [`Self::pause_next_echo_watch_for_test`].
@@ -7426,6 +7428,7 @@ impl AgentPtyRegistry {
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
             turn_replies: crate::turn_reply::TurnReplyHub::default(),
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
+            inbox: std::sync::OnceLock::new(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
             #[cfg(test)]
@@ -7441,6 +7444,30 @@ impl AgentPtyRegistry {
     /// `ack` and `work-done` handlers share this registry and nothing else.
     pub fn pending_deliveries(&self) -> &crate::delegate_retry::PendingDeliveries {
         &self.pending_deliveries
+    }
+
+    /// PRD #1666: this daemon's inbox. Held here for the reason
+    /// [`Self::pending_deliveries`] is: the hook loop, the attach server and
+    /// every producer share this registry and nothing else.
+    ///
+    /// A registry the daemon has not yet [installed](Self::install_inbox) an
+    /// inbox into (an in-process test) gets one under a fresh, unpersisted deck
+    /// id on first use.
+    pub fn inbox(&self) -> &Arc<crate::inbox_hub::InboxHub> {
+        self.inbox.get_or_init(|| {
+            Arc::new(crate::inbox_hub::InboxHub::from_env(
+                crate::inbox::DeckId::generate(),
+            ))
+        })
+    }
+
+    /// PRD #1666: install the daemon's inbox, built on its persisted deck id.
+    /// Must run before anything posts; a second install is refused with a
+    /// warning and the first inbox kept.
+    pub fn install_inbox(&self, hub: Arc<crate::inbox_hub::InboxHub>) {
+        if self.inbox.set(hub).is_err() {
+            tracing::warn!("an inbox was already in use; keeping it rather than replacing it");
+        }
     }
 
     /// Issue #714: the queue through which the daemon's hook loop asks its

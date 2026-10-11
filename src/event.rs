@@ -1543,6 +1543,28 @@ pub enum DaemonMessage {
     /// reports as harmless.
     #[serde(rename = "ack")]
     Ack(AckSignal),
+    /// PRD #1666: an agent-side inbox component (Claude's `asyncRewake`
+    /// waiter, the OpenCode plugin, the Pi extension) arms itself for the
+    /// pane's inbox. **Holds the connection**: the daemon moves it out of the
+    /// hook-ingest pool into the waiter pool, answers keepalives, and writes
+    /// the messages it hands over as [`InboxWaitReply`] lines. See
+    /// `crate::inbox_hub`.
+    #[serde(rename = "inbox_wait")]
+    InboxWait(InboxWaitRequest),
+    /// PRD #1666: a one-shot "this agent has an inbox component" from a hook
+    /// that does not hold a connection (Claude's `SessionStart`, Codex, Devin).
+    /// Answered with a [`SignalAck`].
+    #[serde(rename = "inbox_announce")]
+    InboxAnnounce(InboxAnnounceRequest),
+    /// PRD #1666: take the caller's queued messages, rendered, and (with
+    /// `ack`) acknowledge them in the same step. Answered with an
+    /// [`InboxWaitReply`] carrying `messages`.
+    #[serde(rename = "inbox_fetch")]
+    InboxFetch(InboxFetchRequest),
+    /// PRD #1666: list the caller's inbox (and with `all`, an orchestrator's
+    /// scope). Answered with an [`InboxListReply`].
+    #[serde(rename = "inbox_list")]
+    InboxList(InboxListRequest),
 }
 
 impl DaemonMessage {
@@ -1562,6 +1584,10 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => &s.pane_id,
             DaemonMessage::SpawnRole(s) => &s.pane_id,
             DaemonMessage::Ack(s) => &s.pane_id,
+            DaemonMessage::InboxWait(r) => &r.pane_id,
+            DaemonMessage::InboxAnnounce(r) => &r.pane_id,
+            DaemonMessage::InboxFetch(r) => &r.pane_id,
+            DaemonMessage::InboxList(r) => &r.pane_id,
         }
     }
 
@@ -1577,7 +1603,52 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => s.token.as_deref(),
             DaemonMessage::SpawnRole(s) => s.token.as_deref(),
             DaemonMessage::Ack(s) => s.token.as_deref(),
+            DaemonMessage::InboxWait(r) => r.token.as_deref(),
+            DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
+            DaemonMessage::InboxFetch(r) => r.token.as_deref(),
+            DaemonMessage::InboxList(r) => r.token.as_deref(),
         }
+    }
+
+    /// PRD #1666: whether this message may be acted on only for an agent its
+    /// token ATTESTS — every inbox verb, and an `ack` of an inbox message id.
+    /// A pane never issued a token is admitted by the provenance gate for its
+    /// status events, but has no agent an inbox message could be bound to.
+    pub fn requires_attested_agent(&self) -> bool {
+        match self {
+            DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxAnnounce(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxList(_) => true,
+            DaemonMessage::Ack(s) => s.delivery_id.starts_with("m-"),
+            DaemonMessage::Delegate(_)
+            | DaemonMessage::WorkDone(_)
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_) => false,
+        }
+    }
+
+    /// PRD #1666: the agent an inbox verb says it speaks for, when it says. The
+    /// daemon refuses one that differs from the agent its token attests.
+    pub fn claimed_agent(&self) -> Option<&str> {
+        let claimed = match self {
+            DaemonMessage::InboxWait(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
+            DaemonMessage::Delegate(_)
+            | DaemonMessage::WorkDone(_)
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::Ack(_) => None,
+        };
+        claimed.filter(|id| !id.is_empty())
     }
 
     /// The wire name of this verb, for logs. Matches the `#[serde(rename)]`
@@ -1592,6 +1663,10 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(_) => "restart_role",
             DaemonMessage::SpawnRole(_) => "spawn_role",
             DaemonMessage::Ack(_) => "ack",
+            DaemonMessage::InboxWait(_) => "inbox_wait",
+            DaemonMessage::InboxAnnounce(_) => "inbox_announce",
+            DaemonMessage::InboxFetch(_) => "inbox_fetch",
+            DaemonMessage::InboxList(_) => "inbox_list",
         }
     }
 
@@ -1639,8 +1714,18 @@ impl DaemonMessage {
             // and would tell a caller that guessed a pane id that the pane
             // exists.
             DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::InboxAnnounce(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
+            }
+            // An inbox refusal carries no `messages`, so a refused caller
+            // learns nothing about what the pane holds.
+            DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxList(_) => {
+                serde_json::to_string(&InboxWaitReply::refused(reason, message))
             }
         };
         json.ok()
@@ -1678,7 +1763,11 @@ impl DaemonMessage {
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::GetSeed(_)
-            | DaemonMessage::Ack(_) => None,
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxAnnounce(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxList(_) => None,
         }
     }
 }
@@ -1784,7 +1873,17 @@ pub enum AckDelivery {
     /// The pane's current delivery, with no retry pending to stop.
     NotPending,
     /// Not the pane's current delivery: mistyped, stale, or another agent's.
+    /// For a PRD #1666 message id: no such message (an old `d-…` id included).
     Unknown,
+    /// PRD #1666: the inbox message is now acknowledged — delivered.
+    Acknowledged,
+    /// PRD #1666: the message is an offer, and the caller now holds its claim.
+    Claimed,
+    /// PRD #1666: the message exists but is addressed to another agent; its
+    /// state is unchanged.
+    WrongAgent,
+    /// PRD #1666: too late — the message is already undeliverable.
+    Undeliverable,
     /// A value a later daemon added. Never written by this build; read so a
     /// new outcome does not make the whole ack unparseable.
     #[serde(other)]
@@ -1795,10 +1894,29 @@ impl AckDelivery {
     /// Whether the worker may be told its acknowledgement was recorded.
     pub fn recorded(self) -> bool {
         match self {
-            AckDelivery::Stopped | AckDelivery::AlreadyAcknowledged | AckDelivery::NotPending => {
-                true
-            }
-            AckDelivery::Unknown | AckDelivery::Unrecognised => false,
+            AckDelivery::Stopped
+            | AckDelivery::AlreadyAcknowledged
+            | AckDelivery::NotPending
+            | AckDelivery::Acknowledged
+            | AckDelivery::Claimed => true,
+            AckDelivery::Unknown
+            | AckDelivery::WrongAgent
+            | AckDelivery::Undeliverable
+            | AckDelivery::Unrecognised => false,
+        }
+    }
+}
+
+impl From<crate::inbox::AckOutcome> for AckDelivery {
+    fn from(outcome: crate::inbox::AckOutcome) -> Self {
+        use crate::inbox::AckOutcome;
+        match outcome {
+            AckOutcome::Acknowledged => AckDelivery::Acknowledged,
+            AckOutcome::Claimed { .. } => AckDelivery::Claimed,
+            AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
+            AckOutcome::WrongAgent => AckDelivery::WrongAgent,
+            AckOutcome::Undeliverable => AckDelivery::Undeliverable,
+            AckOutcome::Unknown => AckDelivery::Unknown,
         }
     }
 }
@@ -2724,8 +2842,9 @@ pub enum DispatchShape {
 pub struct AckSignal {
     pub pane_id: String,
     /// The delivery id from the task file, `^d-[0-9a-f]{8}$`
-    /// ([`crate::delegate_retry::is_valid_delivery_id`]). Validated by the daemon
-    /// before any lookup or log line.
+    /// ([`crate::delegate_retry::is_valid_delivery_id`]), or since PRD #1666 an
+    /// inbox message id (`m-…`, [`crate::inbox::is_valid_message_id`]).
+    /// Validated by the daemon before any lookup or log line.
     pub delivery_id: String,
     /// The sender's `DOT_AGENT_DECK_AGENT_ID`, so an older generation's ack cannot
     /// stop a newer generation's retry.
@@ -2734,6 +2853,260 @@ pub struct AckSignal {
     /// The hook capability token; see [`WorkDoneSignal::token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// PRD #1666: the inbox verbs on the hook socket
+// ---------------------------------------------------------------------------
+//
+// Additive on the unversioned hook socket. Like [`AckSignal`], none of these
+// payloads carries an [`AgentEvent`]'s required fields, so an older daemon that
+// does not know the tag rejects the line as malformed and answers nothing —
+// which every caller reads as "no inbox here".
+
+/// The agent-side component speaking for an agent's inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxComponent {
+    /// `dot-agent-deck inbox wait --agent claude-code`, run by Claude Code's
+    /// `asyncRewake` hook.
+    ClaudeWaiter,
+    /// The deck's synchronous Claude Code hook.
+    ClaudeHooks,
+    #[serde(rename = "opencode_plugin")]
+    OpenCodePlugin,
+    PiExtension,
+    CodexHooks,
+    DevinHooks,
+    /// A value a later CLI added. Read so a new component does not make the
+    /// whole request unparseable.
+    #[serde(other)]
+    Other,
+}
+
+impl InboxComponent {
+    /// How many characters of rendered messages one hand-over to this
+    /// component may carry. Claude caps hook output at 10,000 characters.
+    pub fn inline_budget(self) -> usize {
+        match self {
+            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => 9_000,
+            InboxComponent::CodexHooks => 9_000,
+            InboxComponent::OpenCodePlugin
+            | InboxComponent::PiExtension
+            | InboxComponent::DevinHooks
+            | InboxComponent::Other => 64 * 1024,
+        }
+    }
+}
+
+/// How an [`DaemonMessage::InboxWait`] connection consumes messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxWaitMode {
+    /// Single use: one batch, then the connection ends (Claude's waiter).
+    Once,
+    /// Long-lived: a batch line per hand-over, with `{"ack":[…]}` and
+    /// `{"nack":[…]}` lines written back on the same connection.
+    Stream,
+}
+
+/// What an [`DaemonMessage::InboxAnnounce`] says the agent can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxWake {
+    /// A component that wakes the agent itself (a waiter or plugin will arm).
+    Native,
+    /// Content is handed over at the end of a turn (Codex `Stop`).
+    TurnEnd,
+    /// Only the doorbell reaches this agent.
+    DoorbellOnly,
+}
+
+/// Who is fetching in an [`DaemonMessage::InboxFetch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxFetchConsumer {
+    /// `dot-agent-deck inbox fetch`.
+    Cli,
+    /// A turn-end hook (Codex `Stop`).
+    TurnEndHook,
+    /// A hook injecting the content after the doorbell (Claude
+    /// `UserPromptSubmit`).
+    DoorbellHook,
+}
+
+/// The hook's own session details, passed through for the log and for the
+/// daemon's `/clear` bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxWaitSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Payload of [`DaemonMessage::InboxWait`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxWaitRequest {
+    pub pane_id: String,
+    /// The caller's `DOT_AGENT_DECK_AGENT_ID`. The daemon acts on the agent the
+    /// token attests and refuses a request naming another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub component: InboxComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_version: Option<String>,
+    pub mode: InboxWaitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<InboxWaitSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// Payload of [`DaemonMessage::InboxAnnounce`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxAnnounceRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub component: InboxComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_version: Option<String>,
+    pub wake: InboxWake,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// Payload of [`DaemonMessage::InboxFetch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxFetchRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub consumer: InboxFetchConsumer,
+    /// The most characters of rendered messages the caller can take; `None`
+    /// is unlimited (the CLI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    /// Acknowledge what is handed over in the same step: the hand-over is
+    /// itself the delivery.
+    #[serde(default)]
+    pub ack: bool,
+}
+
+/// Payload of [`DaemonMessage::InboxList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxListRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// An orchestrator's whole scope rather than its own inbox.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// One message as handed to an agent: the rendered block plus what a
+/// component needs to acknowledge it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxDelivery {
+    pub id: String,
+    pub subject: String,
+    /// The sender label the block names.
+    pub from: String,
+    /// `[dot-agent-deck message <id> from <from>]` … `[end of dot-agent-deck
+    /// message <id>]`.
+    pub text: String,
+}
+
+/// The line written for [`DaemonMessage::InboxWait`] and
+/// [`DaemonMessage::InboxFetch`]: exactly one of its fields is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxWaitReply {
+    /// A hand-over (possibly empty, for a fetch with nothing waiting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<InboxDelivery>>,
+    /// A newer waiter for the same agent replaced this one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// The caller is not the live agent of a pane this deck manages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_in_deck: bool,
+    /// A refusal's stable code (`missing_token`, `unattested`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Sent on an idle waiter so both ends notice a dead peer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keepalive: bool,
+}
+
+impl InboxWaitReply {
+    pub fn messages(messages: Vec<InboxDelivery>) -> Self {
+        Self {
+            messages: Some(messages),
+            ..Self::default()
+        }
+    }
+
+    pub fn superseded() -> Self {
+        Self {
+            superseded: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn not_in_deck() -> Self {
+        Self {
+            not_in_deck: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn keepalive() -> Self {
+        Self {
+            keepalive: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// A line a [`InboxWaitMode::Stream`] component writes back: the ids it
+/// handed over (`ack`) or could not (`nack`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxStreamControl {
+    #[serde(default)]
+    pub ack: Vec<String>,
+    #[serde(default)]
+    pub nack: Vec<String>,
+}
+
+/// The answer to [`DaemonMessage::InboxList`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxListReply {
+    pub messages: Vec<crate::inbox::MessageSummary>,
+    /// Live `inbox wait` connections armed for the caller's agent.
+    pub armed: usize,
+    /// What the caller's component announced, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<InboxWake>,
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
