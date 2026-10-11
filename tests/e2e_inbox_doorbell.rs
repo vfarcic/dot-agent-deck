@@ -1,0 +1,332 @@
+#![cfg(all(feature = "e2e", unix))]
+
+mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+
+use inbox::*;
+use serde_json::json;
+use spec::spec;
+use std::time::Duration;
+
+/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must show exactly the fixed doorbell and a submission, while the task body remains only in the inbox; an empty inbox never rings.
+#[spec("inbox/doorbell/001")]
+#[test]
+fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
+    let daemon = daemon(&[]);
+    let pane = pane(&daemon, "idle");
+    status(&daemon, &pane, "idle", "codex");
+    unchanged(&pane, Duration::from_millis(300));
+    let id = enqueue(&daemon, &pane, BODY);
+    armed(&daemon, &pane, 0);
+    state(&daemon, &pane, &id, "queued");
+    ring(&daemon, &pane, &id);
+    assert_eq!(
+        bytes(&pane),
+        format!("{}\r", fixed_line(&id)).as_bytes(),
+        "exact fixed line, no body, paste markers, LF or extra submits"
+    );
+    assert_eq!(rings(&pane).len(), 1);
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: Queue one task before any status is reported, then report each busy or dialog status from each supported agent type. The pane must receive nothing until an Idle hook permits the fixed doorbell.
+#[spec("inbox/doorbell/002")]
+#[test]
+fn doorbell_002_unknown_dialogs_and_busy_states_never_ring() {
+    let daemon = daemon(&[]);
+    for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
+        let pane = pane(&daemon, agent_type);
+        let id = enqueue(&daemon, &pane, BODY);
+        unchanged(&pane, Duration::from_millis(350)); // Unknown: no hook yet.
+        assert!(
+            bytes(&pane).is_empty(),
+            "Unknown {agent_type} received input"
+        );
+        for event in [
+            "waiting_for_input",
+            "permission_request",
+            "thinking",
+            "tool_start",
+            "compacting",
+            "quota_blocked",
+        ] {
+            status(&daemon, &pane, event, agent_type);
+            unchanged(&pane, Duration::from_millis(350));
+            assert!(
+                bytes(&pane).is_empty(),
+                "{event}/{agent_type} must suppress doorbell"
+            );
+            state(&daemon, &pane, &id, "queued");
+        }
+        // Genuine work clears the sticky Blocked status before Idle.
+        status(&daemon, &pane, "thinking", agent_type);
+        status(&daemon, &pane, "idle", agent_type);
+        ring(&daemon, &pane, &id);
+        fetch(&daemon, &pane, true);
+    }
+}
+
+/// Scenario: Hold a native Stream waiter connected with its hand-over paused and a task still Queued. No doorbell may type even after native grace expires; dropping the waiter through EOF must release the fixed line for that same Queued task.
+#[spec("inbox/doorbell/003")]
+#[test]
+fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
+    // Test-only seam: preserve registration and EOF processing, but do not
+    // claim/deliver Queued work through waiters. Without it a live waiter
+    // immediately makes the message Fetched, which cannot prove the armed
+    // guard independently of the Queued guard.
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1")]);
+    let pane = pane(&daemon, "armed");
+    status(&daemon, &pane, "idle", "pi");
+    let wait = waiter(&daemon, &pane);
+    armed(&daemon, &pane, 1);
+    let id = enqueue(&daemon, &pane, BODY);
+    state(&daemon, &pane, &id, "queued");
+    unchanged(&pane, Duration::from_millis(1200));
+    assert!(
+        bytes(&pane).is_empty(),
+        "armed native waiter must suppress a Queued task's ring after grace"
+    );
+    drop(wait);
+    armed(&daemon, &pane, 0);
+    state(&daemon, &pane, &id, "queued");
+    ring(&daemon, &pane, &id);
+}
+
+/// Scenario: Announce a Native component without arming a waiter and queue a task for an Idle pane. The fixed line must remain absent during arm_grace, then ring if the component has still not armed; a TurnEnd announce gets no native grace.
+#[spec("inbox/doorbell/004")]
+#[test]
+fn doorbell_004_native_announce_gets_arm_grace() {
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "1200")]);
+    let pane = pane(&daemon, "native-grace");
+    status(&daemon, &pane, "idle", "claude_code");
+    announce(&daemon, &pane, "native");
+    let started = std::time::Instant::now();
+    let id = enqueue(&daemon, &pane, BODY);
+    unchanged(&pane, Duration::from_millis(500));
+    assert!(
+        bytes(&pane).is_empty(),
+        "Native announce must allow time to arm"
+    );
+    ring(&daemon, &pane, &id);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1100),
+        "native grace expired too early"
+    );
+
+    let turn_end = inbox::pane(&daemon, "turn-end");
+    status(&daemon, &turn_end, "idle", "codex");
+    announce(&daemon, &turn_end, "turn_end");
+    let id = enqueue(&daemon, &turn_end, BODY);
+    assert!(
+        common::wait_until(Duration::from_millis(1000), || !rings(&turn_end).is_empty()),
+        "TurnEnd is unarmed and must not inherit Native grace"
+    );
+    ring(&daemon, &turn_end, &id);
+}
+
+/// Scenario: Leave one Idle pane's task Queued across five accelerated ring intervals, then fetch it without ack. Rings must follow the configured increasing delays and final repeated delay; Fetched and later Acknowledged stop further rings.
+#[spec("inbox/doorbell/005")]
+#[test]
+fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
+    let daemon = daemon(&[
+        ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "300,500,700,900"),
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "30000"),
+    ]);
+    let pane = pane(&daemon, "schedule");
+    status(&daemon, &pane, "idle", "codex");
+    let id = enqueue(&daemon, &pane, BODY);
+    ring(&daemon, &pane, &id);
+    assert!(
+        common::wait_until(WAIT, || rings(&pane).len() >= 6),
+        "Queued task must re-ring through final repeated interval: {:?}",
+        rings(&pane)
+    );
+    let observed = rings(&pane);
+    for (pair, delay) in observed.windows(2).zip([0.3, 0.5, 0.7, 0.9, 0.9]) {
+        let elapsed = pair[1]["time"].as_f64().unwrap() - pair[0]["time"].as_f64().unwrap();
+        // 150ms pre-ring flush/submit can add delay; a lower bound pins the
+        // policy without treating a loaded machine as a functional failure.
+        assert!(
+            elapsed >= delay - 0.05,
+            "ring interval {elapsed}s shorter than {delay}s"
+        );
+    }
+    state(&daemon, &pane, &id, "queued");
+    fetch(&daemon, &pane, false);
+    state(&daemon, &pane, &id, "fetched");
+    let count = rings(&pane).len();
+    assert!(
+        !common::wait_until(Duration::from_millis(1800), || rings(&pane).len() != count),
+        "Fetched message must stop ring schedule"
+    );
+    let mut ack = request(&pane, "ack");
+    ack["delivery_id"] = json!(id);
+    hook(&daemon, ack);
+    state(&daemon, &pane, &id, "acknowledged");
+    unchanged(&pane, Duration::from_millis(1100));
+}
+
+/// Scenario: Queue three tasks while the pane is busy, then report Idle. One fixed line must cover the batch, carry a queued id, and a single fetch must return and acknowledge all three bodies.
+#[spec("inbox/doorbell/006")]
+#[test]
+fn doorbell_006_one_ring_coalesces_all_queued_messages() {
+    let daemon = daemon(&[]);
+    let pane = pane(&daemon, "coalesced");
+    status(&daemon, &pane, "thinking", "codex");
+    let ids: Vec<_> = (0..3)
+        .map(|n| enqueue(&daemon, &pane, &format!("{BODY}-{n}")))
+        .collect();
+    unchanged(&pane, Duration::from_millis(300));
+    assert!(bytes(&pane).is_empty());
+    status(&daemon, &pane, "idle", "codex");
+    assert!(
+        common::wait_until(WAIT, || !rings(&pane).is_empty()),
+        "batch never rang"
+    );
+    let observed = rings(&pane);
+    assert_eq!(observed.len(), 1, "one owed ring covers the whole batch");
+    let ringing_id = ids
+        .iter()
+        .find(|id| observed[0]["line"] == fixed_line(id))
+        .expect("ring must name a queued id");
+    ring(&daemon, &pane, ringing_id);
+    let fetched = fetch(&daemon, &pane, true).to_string();
+    for (n, id) in ids.iter().enumerate() {
+        assert!(
+            fetched.contains(id) && fetched.contains(&format!("{BODY}-{n}")),
+            "missing batch member: {fetched}"
+        );
+        state(&daemon, &pane, id, "acknowledged");
+    }
+    assert!(!common::wait_until(Duration::from_millis(500), || rings(
+        &pane
+    )
+    .len()
+        != 1));
+    assert!(!screen(&daemon, &pane).contains(BODY));
+}
+
+/// Scenario: Let each supported synthetic agent leave a doorbell outstanding until the next scheduled ring. Its exact input must contain a bare CR before the second fixed line, and one cleanup CR after another consumer fetches the task; neither CR creates a new message line.
+#[spec("inbox/doorbell/007")]
+#[test]
+fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
+    let daemon = daemon(&[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "1500")]);
+    for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
+        let pane = pane(&daemon, agent_type);
+        status(&daemon, &pane, "idle", agent_type);
+        let id = enqueue(&daemon, &pane, BODY);
+        ring(&daemon, &pane, &id);
+        assert!(
+            common::wait_until(WAIT, || rings(&pane).len() >= 2),
+            "second ring never submitted"
+        );
+        let line = fixed_line(&id);
+        assert_eq!(
+            bytes(&pane),
+            format!("{line}\r\r{line}\r").as_bytes(),
+            "{agent_type}: pre-ring must be exactly one bare CR"
+        );
+        fetch(&daemon, &pane, true);
+        state(&daemon, &pane, &id, "acknowledged");
+        let cleaned = format!("{line}\r\r{line}\r\r");
+        assert!(
+            common::wait_until(WAIT, || bytes(&pane) == cleaned.as_bytes()),
+            "{agent_type}: outstanding ring needs one cleanup CR; received={:?}",
+            bytes(&pane)
+        );
+        unchanged(&pane, Duration::from_millis(1800));
+        assert_eq!(rings(&pane).len(), 2);
+        assert_eq!(
+            turns(&pane)
+                .iter()
+                .filter(|turn| turn["line"] == "")
+                .count(),
+            2,
+            "pre-ring and cleanup CRs submit only empty composers"
+        );
+    }
+}
+
+/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity. Reporting the replacement Idle must not ring the old task; a newly bound task must still ring normally.
+#[spec("inbox/doorbell/008")]
+#[test]
+fn doorbell_008_respawn_never_rings_old_agents_message() {
+    let daemon = daemon(&[]);
+    let old = pane(&daemon, "respawn");
+    status(&daemon, &old, "idle", "codex");
+    let user = input(&daemon, &old, DRAFT);
+    let old_id = enqueue(&daemon, &old, BODY);
+    unchanged(&old, Duration::from_millis(350));
+    let reply = attach(&daemon, json!({"op":"stop-agent","id":old.agent}));
+    assert_eq!(reply["ok"], true, "stop old agent: {reply}");
+    drop(user);
+    for path in [
+        &old.capture,
+        &old.capture.with_extension("turns"),
+        &old.capture.with_extension("pid"),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+    let new = pane(&daemon, "respawn");
+    assert_ne!(old.agent, new.agent);
+    status(&daemon, &new, "idle", "codex");
+    unchanged(&new, Duration::from_millis(1200));
+    assert!(
+        bytes(&new).is_empty(),
+        "stale agent binding reached replacement"
+    );
+    let id = enqueue(&daemon, &new, BODY);
+    ring(&daemon, &new, &id);
+    assert!(
+        !screen(&daemon, &new).contains(&old_id),
+        "old message rang in replacement"
+    );
+}
+
+/// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits. Enter must submit the human draft separately, after which exactly the fixed doorbell arrives without blocking the user's input.
+#[spec("scheduler/dispatch/023")]
+#[test]
+fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
+    let daemon = daemon(&[]);
+    let pane = pane(&daemon, "worker-draft");
+    status(&daemon, &pane, "idle", "codex");
+    let mut user = input(&daemon, &pane, DRAFT);
+    let id = enqueue(&daemon, &pane, BODY);
+    unchanged(&pane, Duration::from_millis(500));
+    user.write("-still-typing");
+    assert!(
+        common::wait_until(WAIT, || screen(&daemon, &pane)
+            .contains(&format!("{DRAFT}-still-typing"))),
+        "waiting automatic writer blocked user keystrokes"
+    );
+    unchanged(&pane, Duration::from_millis(300));
+    assert!(rings(&pane).is_empty());
+    user.write("\r");
+    ring(&daemon, &pane, &id);
+    assert_eq!(
+        bytes(&pane),
+        format!("{DRAFT}-still-typing\r{}\r", fixed_line(&id)).as_bytes(),
+        "draft and doorbell must be separate submitted lines"
+    );
+}
+
+/// Scenario: Forward only terminal focus, mouse and query-response bytes into an Idle worker pane, then queue a task. These terminal reports must not count as a human draft, so the fixed doorbell reaches the pane without Enter.
+#[spec("scheduler/dispatch/023")]
+#[test]
+fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
+    let daemon = daemon(&[]);
+    let pane = pane(&daemon, "terminal-reports");
+    status(&daemon, &pane, "idle", "codex");
+    let reports =
+        "\x1b[<64;10;5M\x1b[I\x1b[10;5R\x1b[?1;2c\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1$r0m\x1b\\";
+    let _user = input(&daemon, &pane, reports);
+    let id = enqueue(&daemon, &pane, BODY);
+    let expected = format!("{reports}{}\r", fixed_line(&id));
+    assert!(
+        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
+        "terminal reports must not defer the doorbell: {:?}",
+        bytes(&pane)
+    );
+    assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
+}

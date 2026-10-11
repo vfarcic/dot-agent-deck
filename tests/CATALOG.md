@@ -3772,19 +3772,6 @@ without depending on the config struct API.
 - **Does not assert:** that the marker is authentic (it is not; the re-price is gated on the frozen launch record and can only make a write later, both pinned by `hold_readiness_buffer`'s unit tests); a real wrapper producing the two facts in this order across the 30 s window (`orchestration/delegate/026` runs the real wrapper on the pre-release upgrade); the scheduler seam (`scheduler/spawn/010`).
 - **Platform coverage:** mac+linux (unix-only — daemon-owned PTYs and a POSIX shell stand-in).
 
-##### orchestration/delegate/040 — A capped draft wait eventually delivers the real delegate pointer (issue #544).
-- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
-- **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; after a synthetic agent event gives the worker a renderable session, its card badge is not Error while the pointer is deferred and becomes Error after cap delivery.
-- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or that the card renders the notice text (a pre-existing gap for every `DeliveryNotice`). The notice detail is asserted at the sink by `scheduler/dispatch/023`.
-- **Platform coverage:** mac+linux.
-
-##### orchestration/delegate/041 — An attached worker draft delays a real delegate pointer until Enter (issue #544).
-- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
-- **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** the focused worker shows a draft while the pointer remains absent for three seconds; Enter leaves the draft and pointer as separate submitted lines in the worker PTY.
-- **Does not assert:** native agent editor behavior, retry policy, or any real-agent action on the task file.
-- **Platform coverage:** mac+linux.
 ##### orchestration/delegate/042 — A task pointer swallowed by a silent worker's boot is retried into the same process (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real deck TUI, daemon, delegate CLI, and managed worker PTY; no model or credential).
 - **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path. Enters raw mode with `TCSANOW` rather than `tty.setraw`'s flushing default, so a pointer that beats a slow start is not silently dropped before the scenario begins (see `orchestration/delegate/045`).
@@ -3944,13 +3931,6 @@ without depending on the config struct API.
 - **Why it exists:** the fast-tier `orchestration/work-done/007` drives the handler in-process; this covers the CLI → hook socket → daemon → file → screen path end to end (PR #1341 review). Confirmed red with the `save_full_report` call disabled.
 - **Does not assert:** the file-framing edge cases (unit-tested); the Filed path's framing through the real binary (the lane-2 `delegate_work_done_chain_claude` drives that write with a real agent); an orchestrator reading the file.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS).
-
-##### orchestration/work-done/010 — A deferred completion leaves the daemon responsive and releases after Ctrl+U (issue #544).
-- **Layer:** L2, lane 1, PTY-attached (real TUI, work-done CLI, agent-event CLI, and daemon status CLI).
-- **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** work-done feedback remains absent while an orchestrator draft is pending; a worker event requiring the daemon's state write lock is broadcast and daemon status completes promptly during the wait; Ctrl+U releases feedback without joining it to the cleared draft. A sibling sends two completions in arrival order during the same draft wait and checks that Ctrl+U releases both as separate, ordered turns.
-- **Does not assert:** the exact feedback prose, real-agent handling, or other hook callers' lock behavior.
-- **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/011 — A delegated worker's completion after an ABANDONED pane close is not reported to the orchestrator as work it never commissioned (issue #505).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, with the registry's own `begin_pane_close` / `finish_pane_close(_, false)` pair — the calls `StopAgent` makes when `close_agent` fails; `cat` stand-ins, no LLM and no `e2e` feature gate).
@@ -6838,11 +6818,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that a never-confirmed delivery is still retried on this path (the TUI half of that is `prompt/pane-input/041`; the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
 - **Platform coverage:** mac+linux+windows.
 
-##### scheduler/dispatch/023 — An unsent worker draft holds a production delegate pointer until the user submits it (issue #544).
-- **Layer:** fast integration (production `handle_delegate` into a real `cat` PTY).
-- **Agent:** none. The headline test's worker is `cat >/dev/null`, so its snapshot is the PTY's echo alone — the input bytes in the order the PTY received them — because `cat`'s write-back of a submitted line can land inside the echo of the next one on a starved machine; the sibling controls use plain `cat`.
-- **Asserts:** a draft typed through the attached writer remains separate from the delegate pointer; the pointer stays absent during a one-second unsent window while additional user keystrokes are written without waiting behind the delegate (and reach the PTY), and arrives after Enter as its own submitted line. Sibling controls assert Ctrl+U release, that forwarded terminal reports do not defer, that cap expiry delivers, publishes one `DeliveryNotice`, and clears the bit for a later first write, and that closing the target during the wait sends no pointer bytes.
-- **Does not assert:** an agent's native editor occupancy, a real agent's interpretation of the pointer, or the daemon-to-TUI rendering of the capped-delivery notice.
+##### scheduler/dispatch/023 — A human draft holds the fixed inbox doorbell until Enter.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
+- **Agent:** none (raw Python stand-in; no agent credential).
+- **Asserts:** while Queued work waits behind a draft, more human keystrokes reach the pane promptly; Enter submits the draft separately and releases only the fixed doorbell. A companion case forwards terminal reports and checks they do not defer the fixed line. Replaces the typed-pointer fast test and its obsolete capped-write siblings under PRD #1666; Ctrl+U/no-cap and identity cancellation are in `inbox/doorbell/008–010`.
+- **Does not assert:** producer routing from delegate (S5), a real agent editor, or model execution.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/024 — A spawn seed waits for a draft already in its target pane (issue #544).
@@ -7740,6 +7720,93 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI against a scripted hook endpoint.
 - **Agent:** none.
 - **Asserts:** Superseded, NotInDeck, Refused, invalid JSON and EOF each produce exit zero and empty output; request carries Once mode and the hook's session source.
+- **Platform coverage:** mac+linux.
+#### Fixed doorbell
+
+The typed-delivery entries `orchestration/delegate/040–041` and `orchestration/work-done/010` are retired; their attached draft and arrival-order outcomes now live in `inbox/doorbell/009–012`. `scheduler/dispatch/023` is rewritten in the binary harness. Terminal-report filtering is retained as a control there.
+
+##### inbox/doorbell/001 — Only an Idle, unarmed pane with Queued work gets the fixed submitted line.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** An empty inbox receives nothing; one queued task receives exactly the leading-space fixed line plus CR, with no body or paste markers, and stays Queued.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/002 — Unknown, busy, blocked and dialog statuses suppress the doorbell.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** Before any hook and during WaitingForInput, PermissionRequest, Thinking, Working, Compacting and Blocked, the pane receives no bytes; Idle releases the fixed line. Synthetic status events cover Claude Code, OpenCode, Pi, Codex and Devin.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/003 — An armed native waiter suppresses typing and EOF restores fallback.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` preserving registration/EOF but pausing native hand-over, the task remains Queued while armed and no bytes arrive beyond native grace; EOF drops armed to zero and the same still-Queued task rings. This isolates the armed guard from the separate Fetched guard.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/004 — Native announce gives a bounded arm grace period.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** With a shortened native grace, no bytes arrive early and fallback rings after grace; a TurnEnd announcement is unarmed and receives no native grace.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/005 — Queued work re-rings on schedule and fetching stops retries.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched stops the schedule before ack and Acknowledged keeps it stopped.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/006 — One ring covers every queued task.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** Three tasks queued before Idle yield one fixed line naming a queued id; one fetch returns all three and acknowledges them without typing any bodies.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/007 — Outstanding rings get pre-ring and cleanup bare CRs.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** For each supported synthetic agent type, byte capture is exactly first-line CR, bare CR, second-line CR, and one cleanup CR on fetch; no further ring or cleanup follows.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/008 — A replacement agent never receives its predecessor's doorbell.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; the Idle replacement receives no old line, but its newly bound task rings.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/009 — Enter releases a doorbell after an attached human draft.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** Real TUI keystrokes keep a task deferred; Enter produces separate visible submissions for the human draft and fixed line, without typing message content.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/010 — An unsent draft has no force-submit timeout.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** The real TUI holds a draft for fifteen accelerated legacy cap periods with the task Queued and no ring; Ctrl+U permits the fixed line without submitting the draft.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/011 — Cleanup CR respects a fresh human draft.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** After a ring, fetching through another consumer while the attached TUI holds a new draft sends no cleanup; Ctrl+U releases exactly one bare CR without a new ring or submitted draft.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/012 — A drafted batch coalesces and fetch preserves arrival order.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** Two reports wait behind a real TUI draft; clearing produces one fixed line and one fetch returns both bodies in order, with no body typed into the pane.
+- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
