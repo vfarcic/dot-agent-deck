@@ -2128,6 +2128,7 @@ impl DaemonClient {
             &AttachRequest::Hello {
                 client_version: crate::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .await?;
@@ -2191,6 +2192,7 @@ impl DaemonClient {
             &AttachRequest::Hello {
                 client_version: crate::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .await?;
@@ -2845,7 +2847,9 @@ impl DaemonClient {
     ///
     /// The capability is read from a `Hello` exchanged on this call rather
     /// than [`Self::capabilities`]' cache, so the version the error names is
-    /// the one that answered.
+    /// the one that answered, and the request goes on that same connection
+    /// (`Hello`'s `follow_on`), so the daemon that answers it is the one whose
+    /// reply advertised the verb.
     pub async fn close_agents(
         &self,
         selector: crate::daemon_protocol::CloseSelector,
@@ -2853,6 +2857,9 @@ impl DaemonClient {
         force: bool,
         dry_run: bool,
     ) -> Result<crate::daemon_protocol::CloseReport, CloseAgentsError> {
+        // One connection for the check and the request (review on PR #1681):
+        // a second connection could reach a daemon that replaced this one
+        // between them. `follow_on` keeps this one open for the request.
         let (mut rd, mut wr) = self
             .connect()
             .await
@@ -2863,6 +2870,7 @@ impl DaemonClient {
             &AttachRequest::Hello {
                 client_version: crate::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: true,
             },
         )
         .await
@@ -2874,17 +2882,14 @@ impl DaemonClient {
                     .unwrap_or_else(|| "handshake failed before close".into()),
             )));
         }
-        if !DaemonCapabilities::from_hello(&hello)
-            .supports(crate::daemon_protocol::CAP_CLOSE_AGENTS)
+        let capabilities = DaemonCapabilities::from_hello(&hello);
+        if !capabilities.supports(crate::daemon_protocol::CAP_CLOSE_AGENTS)
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         {
             return Err(CloseAgentsError::TooOld {
                 daemon_version: hello.daemon_version.or(hello.build_version),
             });
         }
-        let (mut rd, mut wr) = self
-            .connect()
-            .await
-            .map_err(CloseAgentsError::Unreachable)?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3240,6 +3245,7 @@ impl DaemonClient {
             &AttachRequest::Hello {
                 client_version: crate::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .await?;
@@ -4716,6 +4722,117 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(dir);
+    }
+
+    /// PRD #1589 (review on PR #1681) — the daemon at the endpoint is replaced,
+    /// by one that does not advertise `close-agents`, between the `Hello` that
+    /// advertised the verb and the request. The request still goes to the
+    /// daemon that advertised it, on that `Hello`'s connection, and the
+    /// replacement is never sent it.
+    #[cfg(unix)]
+    #[test]
+    fn close_agents_never_reaches_a_daemon_that_replaced_the_one_that_advertised_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build replaced-daemon runtime");
+        runtime.block_on(async {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("replaced-daemon.sock");
+                let listener = bind_attach_listener(&path).expect("bind the advertising daemon");
+                (dir, path, listener)
+            };
+            let older_requests = Arc::new(AtomicUsize::new(0));
+            let older_seen = older_requests.clone();
+            let server_path = path.clone();
+            // The daemon that advertises the verb answers one connection: it
+            // hands the endpoint to an older daemon before replying to `Hello`,
+            // then serves whatever follows on its own connection.
+            let newer = tokio::spawn(async move {
+                let mut stream = listener.accept().await.expect("accept the client");
+                drop(listener);
+                let (_, payload) = read_frame(&mut stream)
+                    .await
+                    .expect("read hello")
+                    .expect("the client sent a hello");
+                let hello: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(hello["op"], "hello");
+                assert_eq!(hello["follow_on"], true, "{hello}");
+                std::fs::remove_file(&server_path).expect("unlink the advertising daemon");
+                let older = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    bind_attach_listener(&server_path).expect("bind the older daemon")
+                };
+                let older_task = tokio::spawn(async move {
+                    while let Ok(Ok(mut stream)) =
+                        tokio::time::timeout(std::time::Duration::from_millis(500), older.accept())
+                            .await
+                    {
+                        if let Ok(Some(_)) = read_frame(&mut stream).await {
+                            older_seen.fetch_add(1, Ordering::SeqCst);
+                            let _ = crate::daemon_protocol::write_resp(
+                                &mut stream,
+                                &AttachResponse::err(
+                                    "malformed request: unknown variant `close-agents`",
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                });
+                crate::daemon_protocol::write_resp(
+                    &mut stream,
+                    &AttachResponse {
+                        capabilities: Some(vec![
+                            crate::daemon_protocol::CAP_CLOSE_AGENTS.to_string(),
+                            crate::daemon_protocol::CAP_HELLO_FOLLOW_ON.to_string(),
+                        ]),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    },
+                )
+                .await
+                .expect("reply to hello");
+                let (_, payload) = read_frame(&mut stream)
+                    .await
+                    .expect("read the follow-on request")
+                    .expect("the request came on the hello's connection");
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(request["op"], "close-agents", "{request}");
+                crate::daemon_protocol::write_resp(
+                    &mut stream,
+                    &AttachResponse {
+                        close_report: Some(crate::daemon_protocol::CloseReport {
+                            dry_run: true,
+                            ..Default::default()
+                        }),
+                        ..AttachResponse::ok()
+                    },
+                )
+                .await
+                .expect("reply to close-agents");
+                older_task.await.unwrap();
+            });
+            let report = DaemonClient::new(path)
+                .close_agents(
+                    crate::daemon_protocol::CloseSelector::AllUnits,
+                    None,
+                    false,
+                    true,
+                )
+                .await
+                .expect("the daemon that advertised the verb answers it");
+            assert!(report.dry_run);
+            newer.await.unwrap();
+            assert_eq!(
+                older_requests.load(Ordering::SeqCst),
+                0,
+                "the replacement daemon must never be sent the request"
+            );
+            drop(dir);
+        });
     }
 
     /// PRD #1589 — `close` is connect-only: with no daemon at the endpoint it

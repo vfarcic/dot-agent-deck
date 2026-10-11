@@ -89,7 +89,7 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 | Reason | What it means | What to do |
 |---|---|---|
 | `not-reported` | The unit has not reported back with `work-done --done`. It may still be working. | Wait for its report, or check its card. Pass `--force` to close it anyway. |
-| `busy` | One of the agents is Thinking, Working, Compacting, waiting for input (**Needs Input**) or Blocked. | Let it finish its turn, or answer it. Pass `--force` to close it anyway. |
+| `busy` | One of the agents is Thinking, Working, Compacting, waiting for input (**Needs Input**) or Blocked, or is Idle with commands or subagents still running in the background (the **Background:** line on its card). | Let it finish its turn, or answer it. Pass `--force` to close it anyway, which also stops that background work. |
 | `strands-orchestration` | `--pane` named one role of a running orchestration, which would leave the rest of the team without it. | Close the whole team with `--orchestration-of <PANE_ID>`, or pass `--force`. |
 | `not-your-unit` | An agent asked to close something it did not dispatch. | Close it yourself from a shell, or ask the dispatcher that started it. |
 | `own-pane` | An agent asked to close itself or its own team. | Close it from a shell or a client. |

@@ -4735,6 +4735,19 @@ impl AppState {
         self.pane_status(pane_id)
     }
 
+    /// PRD #1589 × issue #1678: the background work the card for `pane_id`
+    /// shows, as the daemon last published it — `None` when there is nothing to
+    /// show. An agent whose turn is over but whose commands or subagents still
+    /// run reads `Idle`, so the `close` verb's busy check reads this beside the
+    /// status.
+    pub fn pane_background_of(&self, pane_id: &str) -> Option<BackgroundWork> {
+        let session_id = self.pane_session_id(pane_id)?;
+        self.background_tracks
+            .get(&session_id)
+            .and_then(|track| track.published)
+            .filter(|work| !work.is_empty())
+    }
+
     /// Issue #447: [`Self::apply_event`], plus the one daemon-side consumer of
     /// a worker's `WaitingForInput`: open or close that worker's waiting
     /// episode, whose debounced notice tells the orchestrator that delegated to
@@ -26119,6 +26132,35 @@ while True:
 
     const CLI_PANE: &str = "cli-pane-454";
     const CLI_AGENT_ID: &str = "agent-454";
+
+    /// PRD #1589 × issue #1678: an agent whose turn is over reads `Idle` while
+    /// its background work still runs, and `pane_background_of` is what tells
+    /// the `close` verb's busy check about that work.
+    #[test]
+    fn pane_background_of_reports_the_work_an_idle_card_shows() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        state.apply_event(frame("session_start"));
+        state.apply_event(frame("idle"));
+        assert_eq!(state.pane_background_of(CLI_PANE), None, "nothing running");
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &[12345].into_iter().collect());
+        state.apply_event(frame("idle"));
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(SessionStatus::Idle));
+        let work = state
+            .pane_background_of(CLI_PANE)
+            .expect("the idle card's background work");
+        assert_eq!((work.commands, work.subagents), (1, 0));
+        assert_eq!(state.pane_background_of("another-pane"), None);
+    }
 
     /// Scenario: End two conversations on one managed pane, leaving commands and a subagent running in the second conversation's placeholder card. Ending that conversation, removing its pane's sessions, or applying a daemon pane-close must leave a restored same-agent card with no background work.
     #[spec("status/background/012")]

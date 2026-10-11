@@ -885,20 +885,20 @@ async fn facts(
     state: &SharedState,
     registry: &AgentPtyRegistry,
 ) -> (TargetFacts, Vec<Option<crate::state::SessionStatus>>) {
-    let statuses: Vec<Option<crate::state::SessionStatus>> = {
+    let (statuses, background) = {
         let state = state.read().await;
-        members
-            .iter()
-            .map(|m| {
-                if m.exited {
-                    return None;
-                }
-                m.record
-                    .pane_id_env
-                    .as_deref()
-                    .and_then(|p| state.pane_status_of(p))
-            })
-            .collect()
+        let live_panes = || {
+            members
+                .iter()
+                .map(|m| m.record.pane_id_env.as_deref().filter(|_| !m.exited))
+        };
+        let statuses: Vec<Option<crate::state::SessionStatus>> = live_panes()
+            .map(|p| p.and_then(|p| state.pane_status_of(p)))
+            .collect();
+        let background = live_panes()
+            .flatten()
+            .find_map(|p| state.pane_background_of(p));
+        (statuses, background)
     };
     // `--pane` on one role of an instance with other live roles — counting a
     // sibling in its respawn window, which is lifted out of the records while
@@ -916,6 +916,7 @@ async fn facts(
         TargetFacts {
             unit_reported: unit.map(|u| u.completed_at_ms.is_some()),
             statuses: statuses.iter().flatten().cloned().collect(),
+            background,
             strands_orchestration: strands,
         },
         statuses,

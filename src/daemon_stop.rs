@@ -1001,6 +1001,7 @@ async fn probe_daemon(address: &std::path::Path) -> Probe {
     let req = AttachRequest::Hello {
         client_version: crate::daemon_protocol::PROTOCOL_VERSION,
         client_build_version: None,
+        follow_on: false,
     };
     match tokio::time::timeout(
         WIRE_STOP_PROBE_TIMEOUT,

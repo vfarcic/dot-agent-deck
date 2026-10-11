@@ -30,6 +30,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use crate::event::BackgroundWork;
 use crate::state::SessionStatus;
 
 /// The most tombstones kept. A tombstone only turns "unknown unit" into
@@ -588,13 +589,9 @@ impl DispatchedUnits {
                 return Err(refused);
             }
         }
-        if matched {
-            // Only reachable for an agent: a person's candidates are every match.
-            return Err(Refused::new(
-                RefusalReason::NotYourUnit,
-                "that unit was not dispatched by this agent",
-            ));
-        }
+        // The caller's own ended unit answers before a sibling's live one of
+        // the same name: a dispatcher re-closing its unit is told it already
+        // ended, not that the name belongs to someone else (review on PR #1681).
         let owner = match caller {
             Caller::Person => None,
             Caller::Agent { agent_id, .. } => Some(agent_id.as_str()),
@@ -606,6 +603,13 @@ impl DispatchedUnits {
             .find(|t| t.slug == slug && owner.is_none_or(|o| t.dispatcher_agent_id == o))
         {
             return Err(already_ended(stone));
+        }
+        if matched {
+            // Only reachable for an agent: a person's candidates are every match.
+            return Err(Refused::new(
+                RefusalReason::NotYourUnit,
+                "that unit was not dispatched by this agent",
+            ));
         }
         Err(Refused::new(
             RefusalReason::UnknownUnit,
@@ -787,8 +791,28 @@ pub struct TargetFacts {
     pub unit_reported: Option<bool>,
     /// The status of each targeted pane that has a session.
     pub statuses: Vec<SessionStatus>,
+    /// The background work of the first targeted pane that has any (issue
+    /// #1678): an agent whose turn is over reads `Idle` while its commands or
+    /// subagents still run, so this, not the status, is what says it is busy.
+    pub background: Option<BackgroundWork>,
     /// `--pane` named one role of an orchestration with other live roles.
     pub strands_orchestration: bool,
+}
+
+/// `2 commands, 1 subagent` — the counts the card's `Background:` row shows,
+/// without its duration.
+fn background_counts(work: &BackgroundWork) -> String {
+    let count = |n: u32, unit: &str| {
+        (n > 0).then(|| format!("{n} {unit}{}", if n == 1 { "" } else { "s" }))
+    };
+    [
+        count(work.commands, "command"),
+        count(work.subagents, "subagent"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// The default (forceable) refusals that apply to a target, in the order they
@@ -805,6 +829,14 @@ pub fn default_refusals(facts: &TargetFacts) -> Vec<(RefusalReason, String)> {
     }
     if let Some(status) = facts.statuses.iter().find(|s| is_busy(s)) {
         out.push((RefusalReason::Busy, format!("was {status:?}")));
+    } else if let Some(work) = facts.background {
+        out.push((
+            RefusalReason::Busy,
+            format!(
+                "was Idle with background work running ({})",
+                background_counts(&work)
+            ),
+        ));
     }
     if facts.strands_orchestration {
         out.push((
@@ -935,6 +967,29 @@ mod tests {
                 .unwrap_err()
                 .reason,
             RefusalReason::AlreadyEnded
+        );
+    }
+
+    /// A dispatcher re-closing its own ended unit, while a sibling has a live
+    /// unit of the same name, is told it already ended — not that the name
+    /// belongs to someone else (review on PR #1681).
+    #[test]
+    fn an_own_tombstone_answers_before_a_siblings_live_unit_of_the_same_name() {
+        let mut units = DispatchedUnits::with_epoch("aaaaaa");
+        let mine = units.register(single("fix", "a", "p1", "1"));
+        units.end(&mine, EndReason::ClosedByVerb, 2);
+        units.register(single("fix", "b", "p2", "2"));
+        let refused = units
+            .resolve_name_all("fix", &agent("a"))
+            .expect_err("mine has ended");
+        assert_eq!(refused.reason, RefusalReason::AlreadyEnded);
+        // With no tombstone of its own, the sibling's name is still NotYourUnit.
+        assert_eq!(
+            units
+                .resolve_name_all("fix", &agent("c"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::NotYourUnit
         );
     }
 
@@ -1201,6 +1256,7 @@ mod tests {
         let facts = TargetFacts {
             unit_reported: Some(false),
             statuses: vec![SessionStatus::Idle],
+            background: None,
             strands_orchestration: false,
         };
         let by_name = default_refusals(&facts);
@@ -1211,6 +1267,7 @@ mod tests {
         let facts = TargetFacts {
             unit_reported: Some(true),
             statuses: vec![SessionStatus::Idle, SessionStatus::Working],
+            background: None,
             strands_orchestration: true,
         };
         let reasons: Vec<_> = default_refusals(&facts).into_iter().map(|r| r.0).collect();
@@ -1220,6 +1277,39 @@ mod tests {
         );
         // An ordinary pane has no report to check.
         assert!(default_refusals(&TargetFacts::default()).is_empty());
+    }
+
+    /// Issue #1678 keeps an agent whose turn is over `Idle` while its
+    /// background commands or subagents still run, so the busy refusal reads
+    /// the background work too: closing would kill that work.
+    #[test]
+    fn an_idle_agent_with_background_work_is_refused_as_busy() {
+        let facts = TargetFacts {
+            unit_reported: None,
+            statuses: vec![SessionStatus::Idle],
+            background: Some(BackgroundWork {
+                commands: 2,
+                subagents: 1,
+                since_ms: None,
+            }),
+            strands_orchestration: false,
+        };
+        assert_eq!(
+            default_refusals(&facts),
+            vec![(
+                RefusalReason::Busy,
+                "was Idle with background work running (2 commands, 1 subagent)".to_string()
+            )]
+        );
+        // A busy status names the status, not the background work.
+        let facts = TargetFacts {
+            statuses: vec![SessionStatus::Working],
+            ..facts
+        };
+        assert_eq!(
+            default_refusals(&facts),
+            vec![(RefusalReason::Busy, "was Working".to_string())]
+        );
     }
 
     #[test]

@@ -858,6 +858,13 @@ pub const CAP_TURN_REPLIES: &str = "turn-replies";
 /// platform: the dispatch arm is not `#[cfg]`-gated.
 pub const CAP_CLOSE_AGENTS: &str = "close-agents";
 
+/// Capability string for [`AttachRequest::Hello`]'s `follow_on` (PRD #1589,
+/// review on PR #1681): this daemon serves one more request on a connection
+/// whose `Hello` set it. [`crate::daemon_client::DaemonClient::close_agents`]
+/// sends its request that way, so the daemon that answers it is the one whose
+/// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
+pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1031,6 +1038,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1048,6 +1056,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2058,10 +2067,21 @@ pub enum AttachRequest {
     /// it — mirroring the server-policy on `client_version`. Older clients
     /// omit the field; deserialization tolerates that via
     /// `#[serde(default)]`.
+    ///
+    /// PRD #1589 (review on PR #1681): `follow_on` asks the daemon to keep the
+    /// connection open after the reply and serve ONE more request on it, so a
+    /// client can check a capability and send the verb it gates to the same
+    /// daemon — a second connection could reach a daemon that replaced it.
+    /// Honoured by a daemon that advertises [`CAP_HELLO_FOLLOW_ON`]; an older
+    /// one ignores the field and closes after the reply, as it always did, and
+    /// its reply does not advertise the capability, so a client that checks it
+    /// never writes the follow-on request.
     Hello {
         client_version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_build_version: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow_on: bool,
     },
     /// PRD #127 M1.3: re-read the global `schedules.toml` and diff/replace the
     /// daemon's registered scheduled-task set without a restart. The handler
@@ -3953,6 +3973,7 @@ pub async fn serve_attach_with_restart(
                         reuse_registry,
                         worktree_registry,
                         restart,
+                        true,
                     )
                     .await
                     {
@@ -5103,6 +5124,7 @@ async fn handle_connection(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     restart: Arc<crate::daemon_restart::RestartControl>,
+    follow_on_allowed: bool,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -6715,6 +6737,7 @@ async fn handle_connection(
         AttachRequest::Hello {
             client_version: _,
             client_build_version,
+            follow_on,
         } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
             // `client_version` — we always reply with our own
@@ -6784,6 +6807,26 @@ async fn handle_connection(
                 resp = resp.with_running_agents(summary);
             }
             write_resp(&mut stream, &resp).await?;
+            // PRD #1589 (review on PR #1681): serve one more request on this
+            // connection, so the verb a client gates on this reply reaches
+            // this daemon and no other. One only: the follow-on request is
+            // served as a fresh connection's first, without a follow-on of
+            // its own.
+            if follow_on && follow_on_allowed {
+                return Box::pin(handle_connection(
+                    stream,
+                    registry,
+                    event_tx,
+                    state,
+                    shutdown,
+                    scheduler,
+                    reuse_registry,
+                    worktree_registry,
+                    restart,
+                    false,
+                ))
+                .await;
+            }
         }
         AttachRequest::ReloadSchedules => {
             // PRD #127 M1.3: re-read the global config and diff/replace the
@@ -11362,6 +11405,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(env!("DAD_BUILD_ID").to_string()),
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11374,6 +11418,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, PROTOCOL_VERSION);
                 assert_eq!(client_build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
@@ -11391,6 +11436,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11412,6 +11458,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, 2);
                 assert!(client_build_version.is_none());

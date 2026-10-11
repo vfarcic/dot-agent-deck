@@ -157,6 +157,7 @@ impl Sandbox {
             &AttachRequest::Hello {
                 client_version: PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .expect("the started daemon must answer Hello at the configured deck socket")
