@@ -234,7 +234,7 @@ Without the offer, for example after `remote upgrade` kept the current daemon, t
 
 If the host has both a Homebrew install and `~/.local/bin/dot-agent-deck`, the command uses the Homebrew one, leaves the other file alone, and prints the `ssh … 'rm ~/.local/bin/dot-agent-deck'` command to remove it. Remove it, because an older `dot-agent-deck` client runs that path on `connect`.
 
-For an entry without a recorded binary path, `connect` first tries `~/.local/bin/dot-agent-deck`. If that copy is gone but Homebrew installed the deck, it finds and records the Homebrew binary, then connects without upgrading it. An older `dot-agent-deck` client always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's.
+For an entry without a recorded binary path, `connect` first tries `~/.local/bin/dot-agent-deck`. If that copy is gone but Homebrew installed the deck, it finds and records the Homebrew binary, then connects without upgrading it. The desktop app does the same when it checks a disconnected daemon and when you press **Start daemon**. An older `dot-agent-deck` client always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's.
 
 ## Check a remote's health
 

@@ -17,7 +17,7 @@ use dot_agent_deck::daemon_start::{
     DisconnectedAction, DisconnectedReason, RemoteDeck, StartFailure, StartOutcome, StartTiming,
     probe_local, probe_remote, start_local, start_remote,
 };
-use dot_agent_deck::remote::{RemoteBinaryPath, SystemSshExecutor};
+use dot_agent_deck::remote::{RemoteBinaryPath, RemoteEntry, RemotesFile, SystemSshExecutor};
 use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
 use spec::spec;
 use tempfile::TempDir;
@@ -59,6 +59,48 @@ impl Sandbox {
         RemoteDeck::for_endpoint(&endpoint, Some(&binary))
     }
 
+    /// Where the Homebrew stand-in installs the deck, and its `brew`.
+    fn brew_prefix(&self) -> PathBuf {
+        self.root.join("brew")
+    }
+
+    fn brew_bin(&self) -> PathBuf {
+        self.root.join("remote-path")
+    }
+
+    /// The deck as a deck-list row that records no binary — a legacy row, or
+    /// one the desktop added — so it runs the default install, recording what
+    /// a check finds in its place in the deck list at `remotes`.
+    fn unrecorded_deck(&self, remotes: &Path) -> RemoteDeck<SystemSshExecutor> {
+        let endpoint = RemoteEndpoint::new(
+            Hostname::parse("fixture.invalid").unwrap(),
+            RemoteSocketPath::parse(self.socket().to_str().unwrap()).unwrap(),
+        );
+        let entry = RemoteEntry {
+            name: "studio".into(),
+            kind: "ssh".into(),
+            host: "fixture.invalid".into(),
+            port: 22,
+            key: None,
+            version: "0.40.0".into(),
+            added_at: "2026-10-01T00:00:00Z".into(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: Some(self.socket().display().to_string()),
+        };
+        RemotesFile {
+            remotes: vec![entry.clone()],
+        }
+        .save(remotes)
+        .unwrap();
+        RemoteDeck::for_endpoint(&endpoint, None).recording_to(remotes.into(), entry)
+    }
+
     fn timing(&self) -> StartTiming {
         StartTiming {
             wait: WAIT,
@@ -72,7 +114,10 @@ impl Sandbox {
                 "HOME".into(),
                 self.root.join("remote-home").display().to_string(),
             ),
-            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", self.brew_bin().display()),
+            ),
             ("SHELL".into(), "/bin/sh".into()),
             (
                 "DOT_AGENT_DECK_ATTACH_SOCKET".into(),
@@ -329,6 +374,59 @@ fn remote_start_003_missing_install_and_unreachable_host_are_explained() {
             assert!(
                 sandbox.pids().is_empty(),
                 "failed starts must spawn no daemon"
+            );
+        },
+    );
+}
+
+/// Scenario: A host whose only install is Homebrew's, and a deck-list row that records no binary. The desktop's check finds the Homebrew binary instead of saying "not installed", Start daemon starts the real daemon through it at the configured socket, and the row now records the Homebrew binary.
+#[spec("remote/start/004")]
+#[test]
+fn remote_start_004_homebrew_only_host_is_found_started_and_recorded() {
+    in_sandbox(
+        "remote_start_004_homebrew_only_host_is_found_started_and_recorded",
+        |sandbox| {
+            // Move the install from ~/.local/bin to a Homebrew prefix, and put
+            // a `brew` that owns it on the remote shell's PATH.
+            let brewed = sandbox.brew_prefix().join("bin/dot-agent-deck");
+            fs::create_dir_all(brewed.parent().unwrap()).unwrap();
+            fs::rename(sandbox.installed(), &brewed).unwrap();
+            fs::create_dir_all(sandbox.brew_bin()).unwrap();
+            let prefix = quoted(&sandbox.brew_prefix());
+            script(
+                &sandbox.brew_bin().join("brew"),
+                &format!(
+                    "#!/bin/sh\ncase \"$*\" in\n'--prefix'|'--prefix dot-agent-deck') echo {prefix} ;;\n'list --formula dot-agent-deck') exit 0 ;;\n*) exit 1 ;;\nesac\n"
+                ),
+            );
+            let remotes = sandbox.root.join("client-home/remotes.toml");
+            let deck = sandbox.unrecorded_deck(&remotes);
+
+            let reason = probe_remote(&deck);
+            assert_eq!(reason, DisconnectedReason::NotRunning, "{reason:?}");
+            assert_eq!(reason.action(), DisconnectedAction::StartDaemon);
+            let row = RemotesFile::load(&remotes).unwrap().remotes.remove(0);
+            assert_eq!(row.install.as_deref(), Some("homebrew"));
+            assert_eq!(
+                row.binary.as_ref().map(|binary| binary.as_str()),
+                brewed.to_str()
+            );
+
+            // The start reads the row again, as the desktop does, and runs
+            // the recorded binary straight away.
+            let endpoint = RemoteEndpoint::new(
+                Hostname::parse("fixture.invalid").unwrap(),
+                RemoteSocketPath::parse(sandbox.socket().to_str().unwrap()).unwrap(),
+            );
+            let deck = RemoteDeck::for_endpoint(&endpoint, row.binary.as_ref());
+            assert_eq!(start_remote(&deck, sandbox.timing()), StartOutcome::Started);
+            assert_eq!(probe_remote(&deck), DisconnectedReason::RunningNotConnected);
+            assert_eq!(sandbox.hello().server_version, Some(PROTOCOL_VERSION));
+            sandbox.assert_one_daemon();
+            let ssh_log = fs::read_to_string(sandbox.root.join("ssh.log")).unwrap();
+            assert!(
+                !ssh_log.contains(".local/bin/dot-agent-deck daemon serve"),
+                "the start must run the Homebrew binary:\n{ssh_log}"
             );
         },
     );
