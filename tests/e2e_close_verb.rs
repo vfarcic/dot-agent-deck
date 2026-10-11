@@ -225,15 +225,11 @@ os.execvp("cat", ["cat"])
     }
 
     fn report_done(&self, terminal: &AgentRecord) {
+        let marker = format!("close-probe-completed-1589-{}", terminal.id);
         let output = self.cli(
             Some(terminal),
             Path::new(terminal.cwd.as_deref().expect("cwd")),
-            &[
-                "work-done",
-                "--done",
-                "--task",
-                "close-probe-completed-1589",
-            ],
+            &["work-done", "--done", "--task", &marker],
         );
         assert_exit("attested work-done --done setup", &output, 0);
         assert!(
@@ -243,7 +239,7 @@ os.execvp("cat", ["cat"])
                     .iter()
                     .any(|p| r.cwd.as_deref().is_some_and(|cwd| Path::new(cwd) == p))
                     && common::pane_search_key_on(self.deck.attach_socket_path(), &r.id)
-                        .contains("close-probe-completed-1589")
+                        .contains(&marker)
             })),
             "terminal completion never reached caller\nwork-done output: {}\nUnit PTY:\n{}\nDaemon log:\n{}\nGrid:\n{}",
             output_text(&output),
@@ -548,5 +544,141 @@ fn close_verb_007_team_still_resolves_after_orchestrator_stops() {
         output_text(&output)
     );
     test.assert_gone(&members);
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A dispatcher previews two completed single units with close --all,
+/// leaving both running. Confirming with --all --yes closes both and removes
+/// their clean worktrees while keeping the dispatcher alive.
+#[spec("dispatch/close-verb/009")]
+#[test]
+fn close_verb_009_all_yes_closes_the_previewed_units() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let first = test.dispatch(&caller, "bulk-first", false);
+    let second = test.dispatch(&caller, "bulk-second", false);
+    test.report_done(&first[0]);
+    test.report_done(&second[0]);
+
+    let preview = test.close(Some(&caller), &["--all", "--json"]);
+    assert_exit("preview all reported units", &preview, 0);
+    let json: serde_json::Value = serde_json::from_slice(&preview.stdout).expect("preview JSON");
+    let listed = json["listed"].as_array().expect("listed units");
+    assert_eq!(listed.len(), 2, "preview must list both units: {json}");
+    for name in ["bulk-first", "bulk-second"] {
+        assert!(
+            listed.iter().any(|unit| unit["name"] == name),
+            "preview omitted {name}: {json}"
+        );
+    }
+    assert_eq!(json["closed"], serde_json::json!([]), "{json}");
+    test.assert_present(&first);
+    test.assert_present(&second);
+    assert!(test.worktrees.iter().all(|path| path.exists()));
+
+    let output = test.close(Some(&caller), &["--all", "--yes", "--json"]);
+    assert_exit("confirmed bulk close", &output, 0);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("bulk close JSON");
+    let closed = json["closed"].as_array().expect("closed units");
+    assert_eq!(closed.len(), 2, "bulk close must close both units: {json}");
+    for unit in listed {
+        assert!(
+            closed
+                .iter()
+                .any(|entry| entry["unit_id"] == unit["unit_id"]),
+            "bulk close omitted a previewed unit: {json}"
+        );
+    }
+    test.assert_gone(&first);
+    test.assert_gone(&second);
+    assert!(
+        test.worktrees.iter().all(|path| !path.exists()),
+        "confirmed bulk close left a clean worktree behind: {json}"
+    );
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A completed single unit is closed by its pane id. Its clean
+/// worktree disappears, the JSON reply reports removed, and its branch remains.
+#[spec("dispatch/close-verb/010")]
+#[test]
+fn close_verb_010_pane_close_removes_the_single_units_worktree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "pane-cleanup", false);
+    test.report_done(&members[0]);
+    let output = test.close(
+        Some(&caller),
+        &[
+            "--pane",
+            members[0].pane_id_env.as_deref().expect("pane id"),
+            "--json",
+        ],
+    );
+    assert_exit("close reported single by pane", &output, 0);
+    test.assert_gone(&members);
+    assert!(
+        !test.worktrees[0].exists(),
+        "pane close left the clean single-unit worktree behind\n{}",
+        output_text(&output)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("pane close JSON");
+    let verdicts = json["worktrees"].as_array().expect("worktree verdicts");
+    assert_eq!(verdicts.len(), 1, "pane close must report cleanup: {json}");
+    assert_eq!(verdicts[0]["verdict"], "removed", "{json}");
+    assert_eq!(
+        verdicts[0]["path"],
+        test.worktrees[0].to_string_lossy().as_ref(),
+        "{json}"
+    );
+    let branch = common::fixture_git(test.deck.workdir(), test.deck.workdir())
+        .args([
+            "show-ref",
+            "--verify",
+            "refs/heads/agent/dispatch-pane-cleanup",
+        ])
+        .output()
+        .expect("check retained branch");
+    assert_exit("retained pane-closed dispatch branch", &branch, 0);
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A dispatcher lists two completed single units, then closes one
+/// using the stable unit id from that JSON listing. Only the selected unit and
+/// its worktree disappear; the other unit stays open.
+#[spec("dispatch/close-verb/011")]
+#[test]
+fn close_verb_011_unit_id_closes_only_the_selected_unit() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let selected = test.dispatch(&caller, "id-selected", false);
+    let other = test.dispatch(&caller, "id-other", false);
+    test.report_done(&selected[0]);
+    test.report_done(&other[0]);
+    let preview = test.close(Some(&caller), &["--all", "--json"]);
+    assert_exit("list unit ids", &preview, 0);
+    let json: serde_json::Value = serde_json::from_slice(&preview.stdout).expect("listing JSON");
+    let listed = json["listed"].as_array().expect("listed units");
+    assert_eq!(listed.len(), 2, "listing must contain both units: {json}");
+    let id = listed
+        .iter()
+        .find(|unit| unit["name"] == "id-selected")
+        .and_then(|unit| unit["unit_id"].as_str())
+        .expect("selected unit's stable id");
+    let output = test.close(Some(&caller), &["--unit-id", id, "--json"]);
+    assert_exit("close selected stable unit id", &output, 0);
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("unit-id close JSON");
+    let closed = json["closed"].as_array().expect("closed units");
+    assert_eq!(
+        closed.len(),
+        1,
+        "unit-id close must select one unit: {json}"
+    );
+    assert_eq!(closed[0]["unit_id"], id, "{json}");
+    test.assert_gone(&selected);
+    test.assert_present(&other);
+    assert!(!test.worktrees[0].exists(), "{json}");
+    assert!(test.worktrees[1].exists(), "{json}");
     test.assert_present(&[caller]);
 }

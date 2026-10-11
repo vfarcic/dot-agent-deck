@@ -4626,6 +4626,27 @@ without depending on the config struct API.
 - **Asserts:** the dispatcher invokes `dispatch --single`; the isolated unit discovers a committed sentinel whose full filename was absent from its prompt; its completion appears in the dispatcher's rendered pane; a subsequent directive causes that dispatcher to invoke `close <name>` itself; the unit's card and worktree disappear while the original dispatcher remains registered. Shares the genuine return-path setup with `dispatch/return/006`.
 - **Platform coverage:** mac+linux; credentialed tests run on the developer's machine and nowhere in CI.
 
+##### dispatch/close-verb/009 — Bulk confirmation closes the two completed units that a preview leaves running.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --all --json` lists both reported single units, exits 0 and stops nothing; `close --all --yes --json` exits 0 and reports those same ids closed, removes both agents and clean worktrees, and retains the dispatcher.
+- **Does not assert:** an interactive confirmation prompt or a concurrent change between preview and apply.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/010 — Closing a completed single unit by pane removes its clean worktree and reports the verdict.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --pane <pane> --json` exits 0, removes the completed single unit and its clean worktree before replying, reports `removed` for that path, keeps the dispatch branch and retains the dispatcher.
+- **Does not assert:** worktree retention while orchestration siblings still use it, or dirty-worktree cleanup (006).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/011 — A stable unit id from the bulk listing closes exactly the selected unit.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** a two-unit JSON listing supplies a stable `unit_id`; `close --unit-id <id> --json` exits 0 and reports only that id closed, removes its agent and worktree, and leaves the other unit, its worktree and the dispatcher alive.
+- **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/single
 
 ##### dispatch/single/001 — A `--single` unit runs the command its dispatcher was started with, as its dispatcher's agent, instead of the deck's `default_command` (issue #1602).
