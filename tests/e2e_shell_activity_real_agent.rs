@@ -98,6 +98,206 @@ fn command_lines_of(pids: &[i32]) -> std::collections::HashMap<i32, String> {
 }
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+fn background_live_fixture(suffix: &str) -> (TuiDeck, common::EventSub, String) {
+    let deck = TuiDeck::builder()
+        .with_imported_claude_credentials()
+        .launch_with_fixture("minimal");
+    assert!(deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)));
+    let cwd = deck.workdir().to_path_buf();
+    let mut paths = vec![cwd.to_string_lossy().into_owned()];
+    if let Ok(canonical) = cwd.canonicalize() {
+        paths.push(canonical.to_string_lossy().into_owned());
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &paths).unwrap();
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(suffix.as_bytes());
+    deck.send_keys(b"\t");
+    deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash Agent").as_bytes());
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    assert!(
+        deck.wait_for_grid_string_within("? for shortcuts", Duration::from_secs(120)),
+        "interactive Claude not ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| {
+            r.display_name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(suffix))
+        })
+        .unwrap()
+        .id;
+    (deck, events, id)
+}
+
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card stays Idle with one background command; kill only that command found in this test's descendant tree and watch the indicator disappear.
+#[spec("status/background/007")]
+#[test]
+fn background_007_real_background_command_clears_after_scoped_kill() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL_BG: &str = "background-007-ping-d960348b.txt";
+    let (deck, events, agent_id) = background_live_fixture("background-007-haiku");
+    let prompt = format!(
+        "Use Bash exactly once as your first action, with run_in_background=true, to execute exactly: ping -c 180 127.0.0.1 > {SENTINEL_BG} 2>&1. Do not use timeout. Do not call TaskOutput, wait, inspect or stop the command. Immediately finish your turn with the single word STARTED after Bash returns the background task id."
+    );
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_BG);
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::ToolStart
+                && event.tool_name.as_deref() == Some("Bash")
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    assert!(
+        common::wait_for_path(&deck.workdir().join(SENTINEL_BG), Duration::from_secs(10)),
+        "real command must write the sentinel"
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+            && grid.contains("Background: 1 command")
+            && !grid.contains("Working")),
+        "ended turn and live command must both be visible:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let root = std::process::id() as i32;
+    let table = process_table(&[root]).expect("Unix process sample");
+    let own_pids: Vec<_> = descendants(&table, root)
+        .into_iter()
+        .map(|row| row.pid)
+        .collect();
+    let argv = command_lines_of(&own_pids);
+    let shell = descendants(&table, root)
+        .into_iter()
+        .find(|row| {
+            row.session_leader
+                && !row.has_controlling_tty
+                && argv
+                    .get(&row.pid)
+                    .is_some_and(|line| line.contains(SENTINEL_BG))
+        })
+        .expect("a detached command in this test's own process tree carries the unique sentinel");
+    let ping = command_lines_of(
+        &descendants(&table, shell.pid)
+            .into_iter()
+            .map(|row| row.pid)
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .find(|(_, line)| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|executable| executable.ends_with("ping"))
+    })
+    .expect("the background shell has a real live ping")
+    .0;
+    dot_agent_deck::platform::proc::force_kill_pid(ping as u32).expect("kill this test's own ping");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Background:")),
+        "indicator did not clear after command ended:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Ask real interactive Haiku Claude to launch one Haiku subagent doing three slow Bash steps against a unique sentinel, then end the main turn immediately. The rendered card reads Idle with one background subagent (and may also count its commands), and loses the indicator only after that paired subagent's terminal hook and completion sentinel.
+#[spec("status/background/008")]
+#[test]
+fn background_008_real_background_subagent_clears_on_paired_stop() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL_BG: &str = "background-008-subagent-72841dca.txt";
+    let (deck, events, agent_id) = background_live_fixture("background-008-haiku");
+    let prompt = format!(
+        "Your first and only tool call must be Agent, launching exactly one general-purpose subagent with model=haiku and run_in_background=true. Give it this exact directive: 'Use Bash for exactly three sequential steps: (1) printf started > {SENTINEL_BG}; ping -c 20 127.0.0.1 > /dev/null (2) ping -c 20 127.0.0.1 > /dev/null (3) ping -c 20 127.0.0.1 > /dev/null; printf done > {SENTINEL_BG}.done. Use timeout=90000 and run_in_background=false for each Bash call. Do not delegate. Then finish.' After Agent returns, immediately finish your own turn with STARTED. Do not wait, inspect files, call TaskOutput or launch anything else."
+    );
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_BG);
+    let started = events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::SubagentStart
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    let subagent = started
+        .metadata
+        .get(dot_agent_deck::event::SUBAGENT_ID_METADATA_KEY)
+        .expect("native SubagentStart carries its identity")
+        .clone();
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    assert!(
+        common::wait_for_path(&deck.workdir().join(SENTINEL_BG), Duration::from_secs(30)),
+        "subagent must really do its sentinel work"
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+            && grid
+                .lines()
+                .any(|line| line.contains("Background:") && line.contains("1 subagent"))
+            && !grid.contains("Working")),
+        "subagent part must survive unpaired internal stops:\n{}",
+        deck.snapshot_grid()
+    );
+    // Ignore Claude's unpaired internal stops: only this start's id ends
+    // the work being asserted, even when another stop arrives first.
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::SubagentStop
+                && event
+                    .metadata
+                    .get(dot_agent_deck::event::SUBAGENT_ID_METADATA_KEY)
+                    == Some(&subagent)
+        },
+        Duration::from_secs(180),
+    );
+    assert!(
+        common::wait_for_file_trimmed_eq(
+            &deck.workdir().join(format!("{SENTINEL_BG}.done")),
+            "done",
+            Duration::from_secs(10)
+        )
+        .is_ok(),
+        "subagent completion sentinel is required"
+    );
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Background:")),
+        "paired SubagentStop must clear indicator:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 /// Unique so the prompt unambiguously names one real file rather than
 /// leaving the model to invent a command — the sentinel + directive-prompt
@@ -277,10 +477,10 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly, and confirm Claude Code accepted it (its `UserPromptSubmit` hook). After the native `ToolStart` hook fires, wait for the real, native `Idle` event (mapped from Claude Code's own `Stop` hook, never fabricated) so a PASS can only mean the bug path was genuinely exercised — a run where Claude ends the capped call with `ToolEnd` and no `Stop` fails loudly with a `PRECONDITION NOT MET` message rather than silently passing. Once the real `Idle` lands, switch to the dashboard and assert the pane's rendered card badge still reads `Working`, and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
+/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then ask for one default-settings ping lasting beyond the 120-second cap and writing a unique sentinel. Require its real Stop-mapped Idle hook (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
 #[spec("status/shell-activity/006")]
 #[test]
-fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working() {
+fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background() {
     skip_unless!(common::check_claude_available());
 
     let deck = TuiDeck::builder()
@@ -433,21 +633,17 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
 
-    // The load-bearing assertion: the badge must still read Working, not the
-    // stale Idle a bare `Stop -> EventType::Idle` mapping would have painted
-    // the instant the real Idle above landed — this IS the reported bug,
-    // reproduced or fixed, as the user sees it.
+    // The turn ended, while its command is still alive: both facts must be
+    // presented together rather than conflated into a Working badge.
     assert!(
-        deck.wait_for_grid_string_within("Working", Duration::from_secs(5)),
-        "the pane's badge did not read Working right after the native Idle landed — the \
-         reported bug (a >120s Bash call reads Idle while the command is still running) \
-         reproduced:\n{}",
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+            && grid.contains("Background: 1 command")),
+        "after the real Stop the card must read Idle with Background: 1 command:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        !deck.snapshot_grid().contains("Idle"),
-        "the pane's badge read Idle alongside Working right after the native Idle landed — an \
-         inconsistent render:\n{}",
+        !deck.snapshot_grid().contains("Working"),
+        "the ended turn was incorrectly promoted to Working:\n{}",
         deck.snapshot_grid()
     );
 

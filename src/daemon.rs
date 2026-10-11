@@ -1756,7 +1756,7 @@ pub async fn ingest_event(
     registry: &Arc<AgentPtyRegistry>,
     event: AgentEvent,
 ) {
-    ingest_event_unless(state, event_tx, registry, event, false, None, || false).await;
+    ingest_event_unless(state, event_tx, registry, event, false, None, |_| false).await;
 }
 
 /// [`ingest_event`] for a raw event the hook socket's provenance gate admitted
@@ -1805,7 +1805,7 @@ async fn ingest_hook_event(
         event,
         unproven,
         attested_agent.as_deref(),
-        replaced,
+        |_| replaced(),
     )
     .await;
     if !ingested {
@@ -1827,7 +1827,9 @@ async fn ingest_hook_event(
 /// [`ingest_event`], except that `stale` is asked once the `AppState` write
 /// lock is held, and a `true` drops the event before it is broadcast or
 /// applied. Asked under that lock so nothing the lock orders can slip between
-/// the verdict and the apply. Returns whether the event was ingested.
+/// the verdict and the apply — which is also why it gets the state: the
+/// shell-activity monitor records its sample there in the same hold (issue
+/// #1678). Returns whether the event was ingested.
 ///
 /// `unproven` and `attested_agent` as for [`ingest_hook_event`]; `false` and
 /// `None` for every event the daemon synthesises itself.
@@ -1838,10 +1840,10 @@ async fn ingest_event_unless(
     mut event: AgentEvent,
     unproven: bool,
     attested_agent: Option<&str>,
-    stale: impl FnOnce() -> bool,
+    stale: impl FnOnce(&mut crate::state::AppState) -> bool,
 ) -> bool {
     let mut state = state.write().await;
-    if stale() {
+    if stale(&mut state) {
         return false;
     }
     // Issue #770: half of the orphan verdict (and, round 3, all of the
@@ -1982,12 +1984,36 @@ async fn ingest_event_unless(
     } else {
         event.metadata.remove(crate::event::UNPROVEN_METADATA_KEY);
     }
-    let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    // Issue #1678: the aggregate is the daemon's alone, whatever arrived.
+    event.background = None;
+    event.background_revision = None;
+    // Issue #1678: apply FIRST, then broadcast — still under this one write-lock
+    // hold, so `SubscribeEventsWithSnapshot` ordering is unchanged — because the
+    // event that changes a card's background work has to carry the aggregate
+    // the apply computed. The broadcast copy is taken before the apply, so it
+    // is the same frame clients have always received, and it is sent whether
+    // or not the local apply accepts the event.
+    let mut broadcast = event.clone();
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
     // it like `daemon_owns_pane` above.
     state.apply_hook_event_watching_waiting(event, registry, attested_agent);
+    // Stamped on the frame that changed the aggregate, and on every shell frame
+    // of a pane that reports its own turns — the client's cue that the frame
+    // is background work and not a status (an older daemon never stamps one).
+    if let Some(applied) = state.take_applied_background()
+        && (applied.changed
+            || (applied.reporting
+                && matches!(
+                    broadcast.event_type,
+                    crate::event::EventType::ShellBusy | crate::event::EventType::ShellIdle
+                )))
+    {
+        broadcast.background = Some(applied.work);
+        broadcast.background_revision = Some(applied.revision);
+    }
+    let _ = event_tx.send(BroadcastMsg::Event(broadcast));
     // Issue #697: an outside agent's card evicted to make room for this one
     // reaches attached clients too, in order and under the same lock, so a
     // client that attached later than the daemon started — and so holds a
@@ -2070,7 +2096,9 @@ fn notify_orchestrator_of_quota_block(
 ///   and arming on it would move the parent's watch onto the subagent's log. The hook CLI applies the same
 ///   bounds, but a raw frame on the socket need not have come through it, and
 ///   these values are copied into the arm queue before anything else looks at
-///   them.
+///   them;
+/// * the daemon-authored background-work aggregate (`background`,
+///   `background_revision`, issue #1678) is stripped from every producer frame.
 fn admit_producer_event(event: &mut AgentEvent) {
     use crate::quota_block::{
         QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
@@ -2078,6 +2106,10 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    // Issue #1678: the background aggregate is the daemon's alone; a producer's
+    // copy would otherwise reach every attached client's card.
+    event.background = None;
+    event.background_revision = None;
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,
@@ -2379,7 +2411,11 @@ async fn report_codex_rollout_failure(
             .codex_rollout_arms()
             .supersedes(&agent_id, &turn_id)
     };
-    if !ingest_event_unless(state, event_tx, registry, event, false, None, superseded).await {
+    if !ingest_event_unless(state, event_tx, registry, event, false, None, |_| {
+        superseded()
+    })
+    .await
+    {
         tracing::debug!(
             agent_id = %escape_id_for_log(&agent_id),
             "codex rollout: dropped a failed turn that a newer turn superseded"
@@ -2478,6 +2514,8 @@ fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFail
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -2639,6 +2677,8 @@ fn install_delivery_notice_sink(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             };
             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
             guard.apply_daemon_report_event(event);
@@ -2679,6 +2719,51 @@ async fn run_shell_activity_monitor(
         async move { crate::platform::proc::process_table_async(&roots).await }
     })
     .await
+}
+
+/// Issue #1678 D7: the spawn a shell-activity reading belongs to — pane, registry
+/// agent and PTY child together — so a reading never outlives the spawn it was
+/// taken for, and a successor in the same pane starts from nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShellActivityKey {
+    pane_id: String,
+    agent_id: String,
+    shell_pid: i32,
+}
+
+impl ShellActivityKey {
+    fn of(candidate: &crate::agent_pty::ShellActivityCandidate) -> Self {
+        Self {
+            pane_id: candidate.pane_id.clone(),
+            agent_id: candidate.agent_id.clone(),
+            shell_pid: candidate.shell_pid,
+        }
+    }
+}
+
+/// What the shell-activity monitor last read for one spawn.
+#[derive(Debug, Clone)]
+struct ShellActivityReading {
+    busy: bool,
+    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4).
+    sessions: std::collections::HashSet<i32>,
+    /// Whether the spawn's turn had ended when it was last read, so the
+    /// monitor emits once when a turn ends with a command still running.
+    turn_ended: bool,
+}
+
+/// [`AgentPtyRegistry::classify_command_sessions`], owned, for the monitor loop.
+fn classify_owned(
+    candidates: &[crate::agent_pty::ShellActivityCandidate],
+    table: &[crate::platform::proc::ProcessInfo],
+) -> Vec<(
+    crate::agent_pty::ShellActivityCandidate,
+    std::collections::HashSet<i32>,
+)> {
+    AgentPtyRegistry::classify_command_sessions(candidates, table)
+        .into_iter()
+        .map(|(candidate, sessions)| (candidate.clone(), sessions))
+        .collect()
 }
 
 // ── The shell-activity poll's three time constants ──
@@ -2935,7 +3020,8 @@ async fn run_shell_activity_monitor_with<S, F>(
     S: Fn(&[i32]) -> F,
     F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
 {
-    let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut last_known: std::collections::HashMap<ShellActivityKey, ShellActivityReading> =
+        std::collections::HashMap::new();
     // The sample still in flight from an earlier tick, if any (#500 review, P1).
     //
     // This exists so a wedged `ps` cannot ACCUMULATE. The obvious shape —
@@ -3017,7 +3103,7 @@ async fn run_shell_activity_monitor_with<S, F>(
             // No pane, so no sample — and an empty reading rather than a
             // skipped tick, because "there are no panes" is a fact we just
             // established under the lock, not a failure to observe. Falling
-            // through with an empty snapshot lets the `retain` below clear
+            // through with an empty snapshot lets the departed-spawn sweep below clear
             // `last_known`, which is what makes a later reuse of the same pane
             // id start edge-detection from a clean slate.
             //
@@ -3103,15 +3189,14 @@ async fn run_shell_activity_monitor_with<S, F>(
                             .iter()
                             .filter(|current| {
                                 at_start.iter().any(|then| {
-                                    then.pane_id == current.pane_id
-                                        && then.shell_pid == current.shell_pid
+                                    ShellActivityKey::of(then) == ShellActivityKey::of(current)
                                 })
                             })
                             .cloned()
                             .collect();
-                        AgentPtyRegistry::classify_shell_activity(&unchanged, &table)
+                        classify_owned(&unchanged, &table)
                     } else {
-                        AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                        classify_owned(&candidates, &table)
                     }
                 }
                 // ── The load-bearing decision of issue #429 ──
@@ -3161,108 +3246,90 @@ async fn run_shell_activity_monitor_with<S, F>(
                 }
             }
         };
-        let seen: std::collections::HashSet<&str> = snapshot
-            .iter()
-            .map(|(pane_id, _)| pane_id.as_str())
+        // Issue #1678 D7: drop the readings of spawns that left the candidate
+        // set since the last poll (closed, respawned, exited) so a later reuse
+        // of the same pane starts edge-detection from a clean slate instead of
+        // inheriting a stale reading — keyed by spawn identity, so a successor
+        // in the same pane is never measured against its predecessor. A spawn
+        // that is still a candidate keeps its last known reading even when this
+        // sample could not answer for it (D4: unknown is not zero). Whatever a
+        // departed spawn left counted is no longer its background work.
+        let current: std::collections::HashSet<ShellActivityKey> =
+            candidates.iter().map(ShellActivityKey::of).collect();
+        let departed: Vec<ShellActivityKey> = last_known
+            .keys()
+            .filter(|key| !current.contains(*key))
+            .cloned()
             .collect();
-        // Drop panes that disappeared from the registry since the last poll
-        // (closed / respawned) so a later reuse of the same pane id starts
-        // edge-detection from a clean slate instead of inheriting a stale
-        // busy/idle reading.
-        last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
+        for key in departed {
+            last_known.remove(&key);
+            state
+                .write()
+                .await
+                .retire_background_spawn(&key.pane_id, &key.agent_id);
+        }
 
-        for (pane_id, busy) in snapshot {
-            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+        for (candidate, sessions) in snapshot {
+            let key = ShellActivityKey::of(&candidate);
+            let busy = !sessions.is_empty();
+            let previous = last_known.get(&key);
+            let busy_changed = previous.map(|seen| seen.busy) != Some(busy);
+            let sessions_changed = previous.is_none_or(|seen| seen.sessions != sessions);
+            let previously_ended = previous.is_some_and(|seen| seen.turn_ended);
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan
             // reads idle and whose reading did not just change has nothing to
             // report, so it never takes the state lock at all.
-            if !changed && !busy {
+            if !busy_changed && !sessions_changed && !busy {
                 continue;
             }
 
-            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware. A
-            // purely edge-triggered monitor emits exactly one `ShellBusy` per
-            // busy window — at the rising edge — which is the whole reported
-            // bug: Claude Code's Bash tool backgrounds a command at its 120s
-            // cap, the agent ends its turn, the real `Stop` hook maps to
-            // `EventType::Idle` (`src/hook.rs`) and knocks the pane back to
-            // `Idle` while the command runs on. The scan still reads busy, but
-            // it read busy *before* `Stop` too, so there is no new edge and
-            // nothing ever re-promotes: measured at ~9.7 minutes of wrong
-            // badge for a ~700s command.
+            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware for a
+            // pane whose agent does NOT report its own turns. A purely
+            // edge-triggered monitor emits exactly one `ShellBusy` per busy
+            // window — at the rising edge — so when Claude Code's Bash tool
+            // backgrounds a command at its 120s cap and the `Stop` hook lands as
+            // `Idle`, nothing ever re-promoted. So such a pane also re-emits when
+            // the scan reads busy AND the session's status has regressed to
+            // `Idle`/`Unknown`; `apply_event`'s `ShellBusy` arm still decides what
+            // (if anything) to promote. It cannot spam: one `ShellBusy` lands, the
+            // card reads `Working`, and the next poll sends nothing.
             //
-            // So also re-emit when the scan reads busy AND the session's
-            // status has actually regressed to `Idle`/`Unknown`. That is a
-            // monitor-side correction only — it adds no precedence rule and
-            // changes no wire format; `apply_event`'s `ShellBusy` arm still
-            // decides what (if anything) to promote, and still promotes
-            // exactly `Idle`/`Unknown`, so a real `WaitingForInput`/`Error`/
-            // `Thinking`/`Working` is never overridden by this signal.
-            //
-            // It cannot spam the pipeline either: the re-emit is conditioned
-            // on the very status the emitted event corrects. One `ShellBusy`
-            // lands, `apply_event` moves the session to `Working`, and the
-            // next poll reads `Working` and sends nothing — a steady-state
-            // busy pane is silent until something knocks it back to `Idle`
-            // again.
-            let (session_id, agent_id, status_regressed) = {
+            // Issue #1678: a pane whose agent DOES report its turns (D1) is the
+            // opposite case. Its card legitimately stays `Idle` after `Stop`, so
+            // that predicate would fire every 500 ms for as long as the command
+            // runs. It emits only when the sampled session set changes (the
+            // aggregate's command count or ages move), on a busy edge, and once
+            // when its turn ends while busy — the `ShellBusy` an older
+            // event-folding client has always received at that moment.
+            let (session_id, view, status_regressed) = {
                 let state = state.read().await;
-                let Some(session_id) = state.pane_hook_session_id(&pane_id) else {
+                let Some(session_id) = state.pane_hook_session_id(&candidate.pane_id) else {
+                    // A bare shell pane that never emitted an agent event has no
+                    // session to update. Its reading is still recorded, as before.
+                    last_known.insert(
+                        key,
+                        ShellActivityReading {
+                            busy,
+                            sessions,
+                            turn_ended: previously_ended,
+                        },
+                    );
                     continue;
                 };
-                // PRD #386 M6b: the pane's CURRENT CARD —
-                // NOT `sessions[session_id]`. Both values read below describe
-                // the session this event will actually land on, and that is
-                // the card, not the hook generation.
-                //
-                // `pane_hook_session_id` is the pane's latest hook GENERATION
-                // and is the authoritative value for `AgentEvent.session_id`
-                // (it is what the daemon's send guard compares against); it is
-                // NOT a key into `sessions`. A same-agent `/clear` / thread
-                // restart rolls that generation forward while `apply_event`'s
-                // same-agent reuse guard deliberately keeps the CARD under its
-                // stable id (see `AppState::apply_event`'s "ORIGINAL hook
-                // session_id" comment and `Self::pane_hook_session_id`'s doc),
-                // so after a rollover the two diverge and a
-                // `sessions[generation]` lookup MISSES. The card is therefore
-                // resolved with the same newest-by-`last_activity` rule the
-                // rest of the daemon uses for "which session owns this pane"
-                // (`pane_session_id`, the resolution behind `pane_writable`),
-                // which returns a real card id — so the `sessions` lookup here
-                // is keyed correctly by construction.
+                // PRD #386 M6b: the pane's CURRENT CARD — NOT
+                // `sessions[session_id]`. `pane_hook_session_id` is the pane's
+                // latest hook GENERATION and is the authoritative value for
+                // `AgentEvent.session_id` (it is what the daemon's send guard
+                // compares against); it is NOT a key into `sessions`, because a
+                // same-agent `/clear` rolls the generation forward while
+                // `apply_event`'s reuse guard keeps the card under its stable id.
+                // The card is resolved with the newest-by-`last_activity` rule
+                // the rest of the daemon uses (`pane_session_id`).
                 let card = state
-                    .pane_session_id(&pane_id)
+                    .pane_session_id(&candidate.pane_id)
                     .and_then(|card_id| state.sessions.get(&card_id));
-                // PRD #386 M6b: carry the pane's agent id. `apply_event`'s
-                // same-agent reuse guard matches an incoming event onto an
-                // existing card for the pane ONLY when the two `agent_id`s
-                // agree, and it is the client (not the daemon) where that
-                // matters: the DAEMON's card is keyed by the hook session id
-                // this event already carries, so it resolves either way, but
-                // an attached TUI mints its card at spawn time under a
-                // `pane-<id>` key with the spawn `agent_id` on it, and the
-                // real hook events are remapped onto THAT card. A synthesized
-                // event with `agent_id: None` failed the guard, missed the
-                // card, and created a SECOND, phantom session under the raw
-                // hook id — so the daemon read `Working` while the dashboard
-                // the user is looking at kept rendering the real card as
-                // `Idle` (plus a stray extra card). Measured directly: in a
-                // `006` run the TUI resolved every real event onto its card
-                // and ONLY `ShellBusy` onto a session of its own. A TUI that
-                // RECONNECTS reaches the same failure from the other
-                // direction: it keys the pane's card by the hydration-minted
-                // `pane-{pane_id}`, so the reuse guard is again the only
-                // thing that can remap the event onto it.
-                //
-                // Taken from the pane's own card rather than invented, so it
-                // is exactly the id that card was minted with; `None` when no
-                // card resolves yet, which is the pre-existing behaviour and
-                // no worse than it. Fails SAFE either way: emitting no agent
-                // id is only a missed remap, whereas emitting a WRONG one
-                // would route a live pane's shell status onto someone else's
-                // card.
-                let agent_id = card.and_then(|card| card.agent_id.clone());
+                let view = state.background_view(&candidate.pane_id, &candidate.agent_id);
                 // A pane with no card yet is left to the rising edge alone —
                 // there is no status to have regressed, and guessing one would
                 // emit on every tick until the session materializes.
@@ -3274,21 +3341,48 @@ async fn run_shell_activity_monitor_with<S, F>(
                                 | crate::state::SessionStatus::Unknown
                         )
                     });
-                (session_id, agent_id, regressed)
+                (session_id, view, regressed)
             };
 
-            if !changed && !status_regressed {
+            let emit = if view.reports_turn_boundaries {
+                busy_changed || sessions_changed || (busy && view.turn_ended && !previously_ended)
+            } else {
+                busy_changed || status_regressed
+            };
+            last_known.insert(
+                key.clone(),
+                ShellActivityReading {
+                    busy,
+                    sessions: sessions.clone(),
+                    turn_ended: view.turn_ended,
+                },
+            );
+
+            if !emit {
+                // Nothing to tell a client, but a changed set still moves the
+                // first-seen ages the aggregate will report once the pane's
+                // turn ends (D5) — recorded only for the spawn that was sampled.
+                if sessions_changed {
+                    let mut guard = state.write().await;
+                    if pty_registry.shell_activity_candidate_current(&candidate) {
+                        guard.observe_command_sessions(
+                            &candidate.pane_id,
+                            &candidate.agent_id,
+                            &sessions,
+                        );
+                    }
+                }
                 continue;
             }
 
-            if !changed {
+            if !busy_changed && !view.reports_turn_boundaries {
                 // Only ever the corrective re-emit — a transition logs
                 // nothing, and a steady-state busy pane reaches here at most
                 // once per regression, so this cannot become a per-tick line
                 // even at `RUST_LOG=debug`. It is the one place a "why is the
                 // badge still Idle?" investigation needs to look.
                 debug!(
-                    pane_id = %pane_id,
+                    pane_id = %candidate.pane_id,
                     "shell-activity: re-emitting ShellBusy — scan still reads busy while the \
                      session fell back to Idle/Unknown"
                 );
@@ -3312,21 +3406,50 @@ async fn run_shell_activity_monitor_with<S, F>(
                 timestamp: chrono::Utc::now(),
                 user_prompt: None,
                 metadata: std::collections::HashMap::new(),
-                pane_id: Some(pane_id),
-                // The pane's own agent id — see where it is read above. This
-                // is what lets an attached TUI resolve the event onto the
-                // card it already renders for this pane instead of minting a
-                // phantom session beside it.
-                agent_id,
+                pane_id: Some(candidate.pane_id.clone()),
+                // PRD #386 M6b: the pane's agent id, which is what lets an
+                // attached TUI resolve the event onto the card it already renders
+                // for this pane instead of minting a phantom session beside it.
+                // Issue #1678 D7: the id of the spawn that was SAMPLED, never
+                // that of whatever card holds the pane by now — the sample is
+                // revalidated against it below.
+                agent_id: Some(candidate.agent_id.clone()),
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             };
 
-            // One ordered ingestion step (broadcast + apply under a single
+            // One ordered ingestion step (apply + broadcast under a single
             // write-lock hold), exactly as the hook loop below does it — see
-            // `ingest_event` for the interleaving this closes.
-            ingest_event(&state, &event_tx, &pty_registry, event).await;
+            // `ingest_event` for the interleaving this closes. Issue #1678 D7:
+            // under that same hold, a sample whose spawn has been replaced or
+            // has exited is dropped before it touches anything, and the sampled
+            // set is recorded before the event that publishes it is applied.
+            let ingested = ingest_event_unless(
+                &state,
+                &event_tx,
+                &pty_registry,
+                event,
+                false,
+                None,
+                |state| {
+                    if !pty_registry.shell_activity_candidate_current(&candidate) {
+                        return true;
+                    }
+                    state.observe_command_sessions(
+                        &candidate.pane_id,
+                        &candidate.agent_id,
+                        &sessions,
+                    );
+                    false
+                },
+            )
+            .await;
+            if !ingested {
+                last_known.remove(&key);
+            }
         }
     }
 }
@@ -4840,6 +4963,8 @@ mod quota_admission_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -5617,6 +5742,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         assert!(forged.is_daemon_pane_closed(), "precondition");
         ingest_event(&state, &event_tx, &registry, forged).await;
@@ -5722,6 +5849,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -6128,6 +6257,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }))
             .expect("surface broadcast-only card");
         let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
@@ -7368,6 +7499,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         assert_eq!(
             state.read().await.sessions["sess-370"].status,
@@ -7421,7 +7554,7 @@ mod hook_ingestion_tests {
     /// Scenario: PRD #386 M6b's agent-id stamping across a session rollover —
     /// the EMITTED SHAPE rather than the local effect
     /// (`shell_activity_monitor_reflects_a_real_detached_shell_command` above
-    /// covers that). Spawn a real `/bin/sh` pane owned by `agent-21`, seed it a hook
+    /// covers that). Spawn a real `/bin/sh` pane, seed it a hook
     /// `SessionStart`, then seed a SECOND `SessionStart` under the SAME agent
     /// with a NEW hook session id — a same-agent `/clear` / thread restart, so
     /// the pane's hook generation rolls forward to `sess-21-gen2` while
@@ -7430,9 +7563,11 @@ mod hook_ingestion_tests {
     /// its broadcast, and type a `setsid`-detached `sleep` into the PTY (the
     /// topology PRD #386's descendant scan fires on). Every event
     /// it broadcasts must report the CURRENT hook generation as its
-    /// `session_id` AND carry `agent_id: Some("agent-21")` resolved from the
-    /// pane's card — an unstamped event cannot be remapped onto a reconnected
-    /// TUI's hydrated card and mints a phantom session instead.
+    /// `session_id` AND carry the owning agent's id — an unstamped event cannot
+    /// be remapped onto a reconnected TUI's hydrated card and mints a phantom
+    /// session instead. Since issue #1678 (D7) that id is the SAMPLED spawn's
+    /// registry id rather than whatever the pane's card carries, so the card is
+    /// seeded with the real spawn id, as every daemon-spawned agent's hooks are.
     ///
     /// **What #1159 changed here.** The detached child outlives the wait for the
     /// broadcast instead of being a `sleep 2` the `ShellBusy` had to be caught
@@ -7441,7 +7576,6 @@ mod hook_ingestion_tests {
     #[tokio::test]
     async fn shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover() {
         const PANE: &str = "pane-21";
-        const AGENT: &str = "agent-21";
         const GEN1: &str = "sess-21-gen1";
         const GEN2: &str = "sess-21-gen2";
 
@@ -7470,10 +7604,12 @@ mod hook_ingestion_tests {
             user_prompt: None,
             metadata: std::collections::HashMap::new(),
             pane_id: Some(PANE.to_string()),
-            agent_id: Some(AGENT.to_string()),
+            agent_id: Some(spawned.clone()),
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
 
         // Generation 1, then the same-agent restart that rolls the generation
@@ -7534,11 +7670,10 @@ mod hook_ingestion_tests {
             );
             assert_eq!(
                 event.agent_id.as_deref(),
-                Some(AGENT),
-                "the synthesized {:?} must carry the owning agent id resolved \
-                 from the pane's CARD; a `sessions[hook_generation]` lookup \
-                 misses after a same-agent restart and re-emits `None`, which \
-                 no hydrated TUI card can be remapped onto",
+                Some(spawned.as_str()),
+                "the synthesized {:?} must carry the sampled spawn's agent id \
+                 across a same-agent restart; an event with `None` cannot be \
+                 remapped onto any hydrated TUI card",
                 event.event_type
             );
             saw_busy = event.event_type == crate::event::EventType::ShellBusy;
@@ -7601,6 +7736,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         // One wedged sample, then honest ones. The sampler is the REAL
@@ -7753,6 +7890,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state
             .write()
@@ -7866,6 +8005,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         // `SessionStart` creates the card (and the `pane_hook_session_id`
         // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
@@ -7984,6 +8125,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         assert_eq!(
             state.read().await.sessions[SESSION].status,
@@ -8158,6 +8301,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state
             .write()
@@ -8318,6 +8463,180 @@ mod hook_ingestion_tests {
              table cannot be known to be B's — which under pid reuse is exactly how a \
              replacement pane inherits a departed one's descendants"
         );
+    }
+
+    /// Scenario: Run the shell-activity monitor with a stub sampler against a real reporting Claude pane whose turn has ended, and have the first sample replace that pane's agent with a successor before it answers busy for the old one. The late sample is dropped under the state lock: nothing is broadcast as busy, and the successor's card keeps its Idle status and no background work.
+    #[spec("status/background/009")]
+    #[tokio::test(start_paused = true)]
+    async fn background_009_a_late_sample_from_a_replaced_spawn_touches_nothing() {
+        const PANE: &str = "pane-1678";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |registry: &Arc<AgentPtyRegistry>| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/sh"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    agent_type: Some(AgentType::ClaudeCode),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn pane agent")
+        };
+        let old = spawn(&registry);
+        let old_pid = registry.child_pid(&old).expect("old spawn pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        state
+            .write()
+            .await
+            .set_agent_ownership(Arc::downgrade(&ownership));
+        let hook = |session: &str, agent: &str, event_type| AgentEvent {
+            session_id: session.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(agent.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        {
+            let mut guard = state.write().await;
+            guard.apply_event(hook(
+                "sess-old",
+                &old,
+                crate::event::EventType::SessionStart,
+            ));
+            guard.apply_event(hook("sess-old", &old, crate::event::EventType::Idle));
+        }
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let successor: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let monitor = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let successor = successor.clone();
+            async move {
+                let sampler_registry = registry.clone();
+                let sampler_state = state.clone();
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                    let _ = started_tx.send(());
+                    let first = samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let registry = sampler_registry.clone();
+                    let state = sampler_state.clone();
+                    let successor = successor.clone();
+                    let old = old.clone();
+                    async move {
+                        let leader = |pid: i32| crate::platform::proc::ProcessInfo {
+                            pid,
+                            ppid: 1,
+                            session_id: pid,
+                            has_controlling_tty: true,
+                            session_leader: true,
+                            command_line: crate::platform::proc::CommandLine::NotSampled,
+                        };
+                        if !first {
+                            // The successor, sampled for itself: idle.
+                            let pid = successor
+                                .lock()
+                                .unwrap()
+                                .as_deref()
+                                .and_then(|id| registry.child_pid(id))
+                                .map_or(0, |pid| pid as i32);
+                            return Some(vec![leader(pid)]);
+                        }
+                        // While this sample is in flight the pane's agent is
+                        // replaced and the successor reports its own ended turn.
+                        registry.close_agent(&old).expect("close the old spawn");
+                        let new = spawn(&registry);
+                        {
+                            let mut guard = state.write().await;
+                            guard.apply_event(hook(
+                                "sess-new",
+                                &new,
+                                crate::event::EventType::SessionStart,
+                            ));
+                            guard.apply_event(hook(
+                                "sess-new",
+                                &new,
+                                crate::event::EventType::Idle,
+                            ));
+                        }
+                        *successor.lock().unwrap() = Some(new);
+                        // ...and the sample answers busy for the OLD spawn, with
+                        // the measured Claude fingerprint on its detached shell.
+                        Some(vec![
+                            leader(old_pid),
+                            crate::platform::proc::ProcessInfo {
+                                pid: old_pid + 100_000,
+                                ppid: old_pid,
+                                session_id: old_pid + 100_000,
+                                has_controlling_tty: false,
+                                session_leader: true,
+                                command_line: crate::platform::proc::CommandLine::Read(
+                                    "bash -c sleep 9 shell-snapshots/snapshot-x && eval "
+                                        .to_string(),
+                                ),
+                            },
+                        ])
+                    }
+                })
+                .await
+            }
+        });
+
+        // The third sample can only start after the tick that classified the
+        // late answer, and the one after it, have finished.
+        for what in [
+            "the first sample",
+            "the successor's sample",
+            "a third sample",
+        ] {
+            next_sample_start(&mut started_rx, what).await;
+        }
+        monitor.abort();
+        let _ = monitor.await;
+
+        let new = successor
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("successor spawned");
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                assert_ne!(
+                    event.event_type,
+                    crate::event::EventType::ShellBusy,
+                    "the old spawn's late busy sample must not be broadcast: {event:?}"
+                );
+                assert!(
+                    event.background.is_none_or(|work| work.is_empty()),
+                    "no frame may carry the old spawn's command: {event:?}"
+                );
+            }
+        }
+        let guard = state.read().await;
+        let live = guard
+            .live_session_for(&new, Some(PANE))
+            .expect("the successor's card");
+        assert_eq!(live.status, crate::state::SessionStatus::Idle);
+        assert_eq!(
+            live.background, None,
+            "the successor must not inherit the old spawn's sample"
+        );
+        drop(guard);
+        registry.shutdown_all();
     }
 
     /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a
@@ -9883,6 +10202,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
             assert!(
                 guard
@@ -9948,6 +10269,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -11358,7 +11681,7 @@ mod hook_provenance_audit_tests {
                     event_of(line("reserved-card", Some(pane), None, "thinking", None)),
                     unproven,
                     attested,
-                    || false,
+                    |_| false,
                 )
                 .await;
                 let Ok(BroadcastMsg::Event(event)) = events.try_recv() else {
@@ -11609,7 +11932,7 @@ mod hook_provenance_audit_tests {
             work,
             false,
             Some(&old),
-            || false,
+            |_| false,
         )
         .await;
         let latched = registry.quota_block_current("audit-latch-pane", &new, epoch);
@@ -11660,7 +11983,7 @@ mod hook_provenance_audit_tests {
                 event_of(line(session, Some(PANE), None, kind, None)),
                 false,
                 Some(&old),
-                || false,
+                |_| false,
             )
             .await;
             let mut relayed = 0;
@@ -11871,7 +12194,7 @@ mod hook_provenance_audit_tests {
                 forged(),
                 unproven,
                 attested,
-                || false,
+                |_| false,
             )
             .await;
             let Ok(BroadcastMsg::Event(event)) = events.try_recv() else {

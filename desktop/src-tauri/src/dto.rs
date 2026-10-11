@@ -3395,6 +3395,8 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is

@@ -444,16 +444,39 @@ fn subagent_004_foreground_subagent_keeps_the_turn_working_and_its_prompt_answer
     }
 }
 
-/// Scenario: With the card's turn over (Idle), the daemon's shell-activity scan
-/// sets a synthetic Working (`ShellBusy`) for a detached shell command, a
-/// background subagent's tool call arrives, and the command then finishes
-/// (`ShellIdle`). The card must return to Idle, because the subagent's call says
-/// nothing about the main thread and must not take the synthetic Working over
-/// as its own and strand it. The control — a main-thread call in the same spot —
-/// is a real turn taking over, so the card stays Working through the `ShellIdle`.
+/// Scenario: After Claude's Stop, a new daemon's ShellBusy leaves the card Idle and supplies background work; a subagent's call cannot change the turn status. An old daemon's shell frames still promote to Working, and only a main-thread call may take that synthetic status over.
 #[spec("status/subagent/005")]
 #[test]
 fn subagent_005_subagent_call_does_not_strand_a_synthetic_shell_working() {
+    let mut reporting = apply_all(
+        "claude-code",
+        &[
+            (session_start(), EventType::SessionStart),
+            (stop(), EventType::Idle),
+        ],
+    );
+    let mut busy = serde_json::to_value(invoke_hook("claude-code", &stop())).unwrap();
+    busy["event_type"] = json!("shell_busy");
+    busy["background"] = json!({"commands": 1, "subagents": 0, "since_ms": null});
+    busy["background_revision"] = json!(1);
+    reporting.apply_event(serde_json::from_value(busy).unwrap());
+    assert_eq!(
+        status_of(&reporting),
+        SessionStatus::Idle,
+        "new-daemon ShellBusy must leave the ended turn Idle"
+    );
+    reporting.apply_event(invoke_hook(
+        "claude-code",
+        &subagent_pre_tool_use("toolu_bg_new", BACKGROUND_LS),
+    ));
+    assert_eq!(status_of(&reporting), SessionStatus::Idle);
+    assert_eq!(
+        serde_json::to_value(reporting.sessions[SESSION].live_snapshot()).unwrap()["background"]["commands"],
+        json!(1)
+    );
+
+    // An old daemon supplies no aggregate: preserve its synthetic-Working
+    // takeover protection even though this pane has genuine Claude hooks.
     for (trailing, from_subagent) in [
         (subagent_pre_tool_use("toolu_bg_1", BACKGROUND_LS), true),
         (main_pre_tool_use("toolu_main_2", BACKGROUND_LS), false),
@@ -668,6 +691,108 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .unwrap_or_else(|| panic!("no card for {PANE:?}; sessions: {:?}", state.sessions))
         .status
         .clone()
+}
+
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates. The card keeps the newest counts, clears on an explicit zero, and preserves legacy shell promotion when an older daemon omits the fields.
+#[spec("status/background/003")]
+#[test]
+fn background_003_snapshot_hydration_and_revision_ordering() {
+    let daemon = apply_all(
+        "claude-code",
+        &[
+            (session_start(), EventType::SessionStart),
+            (stop(), EventType::Idle),
+        ],
+    );
+    let mut wire = serde_json::to_value(daemon.sessions[SESSION].live_snapshot()).unwrap();
+    wire["background"] = json!({"commands": 2, "subagents": 1, "since_ms": 1700000000000_i64});
+    wire["background_revision"] = json!(8);
+    let mut tui = AppState::default();
+    tui.register_pane(PANE.into());
+    tui.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        None,
+        Some(&serde_json::from_value(wire.clone()).unwrap()),
+    );
+    let snapshot = |state: &AppState| {
+        serde_json::to_value(
+            state
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(PANE))
+                .unwrap()
+                .live_snapshot(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "snapshot hydration must retain background work"
+    );
+    assert_eq!(snapshot(&tui)["background_revision"], json!(8));
+    // Clients copy authoritative counts, never infer them from raw hooks.
+    tui.apply_event(invoke_hook(
+        "claude-code",
+        &with(base("SubagentStart"), json!({"agent_id": "raw-only"})),
+    ));
+    tui.apply_event(invoke_hook(
+        "claude-code",
+        &subagent_end("SubagentStop", "raw-only"),
+    ));
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "raw subagent hooks do not reconstruct the daemon aggregate"
+    );
+    let mut event = serde_json::to_value(invoke_hook("claude-code", &stop())).unwrap();
+    event["event_type"] = json!("shell_busy");
+    event["background"] = json!({"commands": 9, "subagents": 0, "since_ms": null});
+    event["background_revision"] = json!(7);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "stale replay cannot resurrect/replace newer work"
+    );
+    assert_eq!(pane_status_of(&tui), SessionStatus::Idle);
+    event["background"] = wire["background"].clone();
+    event["background_revision"] = json!(8);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert_eq!(snapshot(&tui)["background"], wire["background"]);
+    event["background"] = json!({"commands": 0, "subagents": 0, "since_ms": null});
+    event["background_revision"] = json!(9);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert!(
+        snapshot(&tui)["background"].is_null(),
+        "explicit zero clears the indicator"
+    );
+    event["background"] = wire["background"].clone();
+    event["background_revision"] = json!(8);
+    tui.apply_event(serde_json::from_value(event).unwrap());
+    assert!(
+        snapshot(&tui)["background"].is_null(),
+        "a finished item must not reappear from replay"
+    );
+
+    wire.as_object_mut().unwrap().remove("background");
+    wire.as_object_mut().unwrap().remove("background_revision");
+    let mut legacy = AppState::default();
+    legacy.register_pane(PANE.into());
+    legacy.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        None,
+        Some(&serde_json::from_value(wire).unwrap()),
+    );
+    assert!(snapshot(&legacy)["background"].is_null());
+    let mut old_busy = invoke_hook("claude-code", &stop());
+    old_busy.event_type = EventType::ShellBusy;
+    legacy.apply_event(old_busy);
+    assert_eq!(pane_status_of(&legacy), SessionStatus::Working);
 }
 
 /// Scenario: A background subagent raises a permission request after the turn ended, and only then does a TUI attach, restoring the card from the daemon's live snapshot as it arrives over the wire. When that subagent then stops, the attached TUI's card must leave Needs Input for Idle, as the daemon's does; the control is a snapshot from a daemon that sends no subagent attribution, whose card keeps today's Needs Input.

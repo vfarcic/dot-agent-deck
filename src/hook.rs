@@ -565,9 +565,14 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // says so, and that it is absent on the main thread) and Codex
     // (`thread_spawn_subagent_hook_context` sets it for a thread-spawned
     // subagent and nothing else). Devin's hook input carries no such field.
-    let subagent_id = subagent_id
-        .filter(|id| !id.is_empty())
-        .filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
+    //
+    // Issue #1678: an EMPTY id is still a subagent's — the key's presence is
+    // the attribution, and the main thread sends no key at all. Dropping it
+    // turned such a call into a main-thread one that set Working on a card
+    // whose turn was over. The background-work tracker refuses to key on an
+    // empty or oversized id; the event keeps its attribution either way.
+    let subagent_id =
+        subagent_id.filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
     let from_subagent = subagent_id.is_some();
 
     let mut event_type = map_event_type(&hook_event_name)?;
@@ -783,6 +788,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     })
 }
 
@@ -955,6 +962,8 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     })
 }
 
@@ -1024,6 +1033,8 @@ pub fn build_agent_event_cli(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -4271,13 +4282,15 @@ mod tests {
         let devin = build_event_typed(payload("a7c1".into()), AgentType::Devin).unwrap();
         assert!(!devin.is_from_subagent());
 
-        // An empty id, a non-string shape, and an absent key are all "main thread".
-        for odd in [
-            Value::from(""),
-            Value::from(7),
-            serde_json::json!({"id": "x"}),
-            Value::Null,
-        ] {
+        // Issue #1678: an empty id is a subagent's still — the key's presence
+        // is the attribution — and the tracker, not the hook, refuses to key on
+        // it.
+        let empty = build_event(payload(Value::from(""))).unwrap();
+        assert_eq!(empty.metadata.get(key).map(String::as_str), Some(""));
+        assert!(empty.is_from_subagent());
+
+        // A non-string shape and an absent key are "main thread".
+        for odd in [Value::from(7), serde_json::json!({"id": "x"}), Value::Null] {
             let event = build_event(payload(odd.clone())).unwrap();
             assert!(!event.is_from_subagent(), "agent_id = {odd}");
             assert_eq!(event.event_type, EventType::ToolStart, "agent_id = {odd}");

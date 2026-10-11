@@ -7,6 +7,7 @@ use tracing::warn;
 
 use crate::agent_pty::{AgentPtyRegistry, GuardedSendDetail};
 use crate::config_validation::{escape_id_for_log, sanitize_role_name};
+pub use crate::event::BackgroundWork;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
     GenerationVerdict, LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole,
@@ -107,6 +108,221 @@ fn strip_event_payload(event: &mut AgentEvent) {
 /// id forgotten while its prompt is still open would let the card leave the
 /// wait with that prompt pending.
 const MAX_SUBAGENT_IDS: usize = 128;
+
+/// Issue #1678: the longest subagent id, in UTF-8 bytes, the background-work
+/// tracker keys on. A longer one is not tracked at all rather than truncated —
+/// two ids sharing a prefix would collapse into one — but its event keeps its
+/// subagent attribution, so it never reads as a main-thread call.
+const MAX_TRACKED_SUBAGENT_ID_BYTES: usize = 256;
+
+/// Issue #1678: the daemon's private record of one card's background work —
+/// what [`BackgroundWork`] is computed from. Held in
+/// [`AppState::background_tracks`] keyed by card id, never on [`SessionState`]
+/// (fixtures build that by exhaustive literal), and only where the daemon's
+/// ownership oracle is installed: a client copies the daemon's aggregate and
+/// never reconstructs it.
+#[derive(Debug, Clone, Default)]
+struct BackgroundTrack {
+    /// The spawn this record describes; a card of another agent under the same
+    /// key starts a fresh record (process replacement resets everything).
+    agent_id: Option<String>,
+    /// D1: this spawn sent at least one genuine status report of its own, so its
+    /// turn boundaries — not the shell scan — decide the card's status.
+    reports_turn_boundaries: bool,
+    /// D2: the main thread's turn is over (independent of the status value).
+    turn_ended: bool,
+    /// D3: subagent id → daemon receipt time of its `SubagentStart` (epoch ms).
+    subagents: HashMap<String, i64>,
+    /// D4/D5: qualifying POSIX session id → when the daemon first sampled it.
+    commands: HashMap<i32, i64>,
+    /// The checked monotonic revision of [`Self::published`].
+    revision: u64,
+    /// The aggregate last published; `None` when there is nothing to show.
+    published: Option<BackgroundWork>,
+}
+
+impl BackgroundTrack {
+    fn for_agent(agent_id: Option<String>) -> Self {
+        Self {
+            agent_id,
+            ..Self::default()
+        }
+    }
+
+    /// D6: counts only while the turn is over on a pane that reports its own
+    /// turn boundaries; `None` when nothing is counted.
+    fn aggregate(&self) -> Option<BackgroundWork> {
+        if !(self.reports_turn_boundaries && self.turn_ended) {
+            return None;
+        }
+        let work = BackgroundWork {
+            commands: u32::try_from(self.commands.len()).unwrap_or(u32::MAX),
+            subagents: u32::try_from(self.subagents.len()).unwrap_or(u32::MAX),
+            since_ms: self
+                .commands
+                .values()
+                .chain(self.subagents.values())
+                .min()
+                .copied(),
+        };
+        (!work.is_empty()).then_some(work)
+    }
+
+    /// Recompute the aggregate and advance the revision when it changed.
+    /// Returns whether it changed.
+    fn republish(&mut self) -> bool {
+        let current = self.aggregate();
+        if current == self.published {
+            return false;
+        }
+        self.published = current;
+        // Never wraps: a u64 advanced once per change cannot overflow in any
+        // daemon's lifetime, and a wrapped revision would read as older.
+        if let Some(next) = self.revision.checked_add(1) {
+            self.revision = next;
+        }
+        true
+    }
+
+    /// D4/D5: replace the sampled command set with `sessions`, keeping the
+    /// first-seen time of every session still present.
+    fn observe_commands(&mut self, sessions: &HashSet<i32>, now_ms: i64) {
+        self.commands.retain(|sid, _| sessions.contains(sid));
+        for sid in sessions {
+            self.commands.entry(*sid).or_insert(now_ms);
+        }
+    }
+
+    /// D2/D3: what a genuine agent report says about the turn and its
+    /// subagents. Daemon-authored frames never reach here.
+    fn note_genuine_event(&mut self, event: &AgentEvent, new_conversation: bool, now_ms: i64) {
+        if new_conversation {
+            self.subagents.clear();
+        }
+        let subagent = event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY);
+        match event.event_type {
+            EventType::SubagentStart => {
+                if let Some(id) = subagent
+                    && !id.is_empty()
+                    && id.len() <= MAX_TRACKED_SUBAGENT_ID_BYTES
+                    && (self.subagents.contains_key(id) || self.subagents.len() < MAX_SUBAGENT_IDS)
+                {
+                    // A duplicate start keeps the original receipt time.
+                    self.subagents.entry(id.clone()).or_insert(now_ms);
+                }
+            }
+            // An unpaired stop (Claude sends internal ones) is a no-op here.
+            EventType::SubagentStop => {
+                if let Some(id) = subagent {
+                    self.subagents.remove(id);
+                }
+            }
+            // Subagent events never move the main thread's turn.
+            _ if subagent.is_some() => {}
+            EventType::Idle | EventType::QuotaBlocked => self.turn_ended = true,
+            // A terminal failure ends the turn (Claude's `StopFailure`, OpenCode's
+            // `session.error`); a failed tool call carries its tool and does not.
+            EventType::Error
+                if event.tool_name.is_none()
+                    && matches!(
+                        event.agent_type,
+                        AgentType::ClaudeCode | AgentType::OpenCode
+                    ) =>
+            {
+                self.turn_ended = true;
+            }
+            EventType::Thinking | EventType::ToolStart => self.turn_ended = false,
+            _ => {}
+        }
+    }
+
+    /// Stamp the current aggregate on `event` — the journal copy, and what
+    /// [`SessionState::live_snapshot`] reads back. Nothing before the first
+    /// change, so a card that never had background work snapshots as before.
+    fn stamp(&self, event: &mut AgentEvent) {
+        if self.revision > 0 {
+            event.background = Some(self.published.unwrap_or_default());
+            event.background_revision = Some(self.revision);
+        } else {
+            event.background = None;
+            event.background_revision = None;
+        }
+    }
+
+    fn applied(&self, changed: bool) -> AppliedBackground {
+        AppliedBackground {
+            work: self.published.unwrap_or_default(),
+            revision: self.revision,
+            changed,
+            reporting: self.reports_turn_boundaries,
+        }
+    }
+}
+
+/// Issue #1678: what the event [`AppState::apply_event`] last applied did to
+/// its card's background work, for the daemon's ingest to stamp on the
+/// broadcast copy — see [`AppState::take_applied_background`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppliedBackground {
+    /// The post-transition aggregate, zero counts when there is nothing to show.
+    pub work: BackgroundWork,
+    pub revision: u64,
+    /// The aggregate changed with this event.
+    pub changed: bool,
+    /// The card's spawn reports its own turn boundaries (D1).
+    pub reporting: bool,
+}
+
+/// Issue #1678: what the shell-activity monitor needs to know about a pane's
+/// background-work record — see [`AppState::background_view`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BackgroundView {
+    pub reports_turn_boundaries: bool,
+    pub turn_ended: bool,
+}
+
+/// Issue #1678 D1: is this a genuine status report from the agent itself — the
+/// evidence that its own turn boundaries decide its card? Everything the daemon
+/// authors (the shell pair, the card-surfacing start, delivery notices, quota
+/// lifts), the forward-compat catch-all, and what the Codex wrapper reads off
+/// output or announces at boot are not.
+fn is_genuine_turn_report(event: &AgentEvent) -> bool {
+    event.event_type != EventType::Unknown
+        && !event.is_daemon_synthetic()
+        && !event.is_wrapper_session_start()
+        && !event.is_wrapper_output_classified()
+        && !event.is_quota_block_lift()
+}
+
+/// Issue #1678: the newest background aggregate a card's journal carries, with
+/// its revision — the client's copy, forward-stamped like the live target.
+fn held_background(session: &SessionState) -> Option<(Option<BackgroundWork>, u64)> {
+    session
+        .recent_events
+        .iter()
+        .rev()
+        .find_map(|e| e.background_revision.map(|rev| (e.background, rev)))
+}
+
+/// Issue #1678: a client's fold of the daemon's aggregate onto `event` before it
+/// is journalled. An event carrying an aggregate at least as new as the held one
+/// keeps it (equal is idempotent); an older one, or none, inherits the held one,
+/// so a replay never resurrects finished work and the copy stays durable.
+fn fold_background_copy(session: &SessionState, event: &mut AgentEvent) {
+    let held = held_background(session);
+    match (event.background_revision, held) {
+        (Some(rev), Some((background, held_rev))) if rev < held_rev => {
+            event.background = background;
+            event.background_revision = Some(held_rev);
+        }
+        (Some(_), _) => {}
+        (None, Some((background, rev))) => {
+            event.background = background;
+            event.background_revision = Some(rev);
+        }
+        (None, None) => event.background = None,
+    }
+}
 
 /// Issue #697: one session [`AppState`] holds as UNPROVEN — see
 /// [`MAX_UNPROVEN_SESSIONS`].
@@ -941,6 +1157,18 @@ pub struct SessionSnapshot {
     /// ignores the key, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_generation: Option<HookGeneration>,
+    /// Issue #1678: the background work the agent left running after its turn
+    /// ended, as the daemon counts it — `None` when there is nothing to show.
+    /// Additive optional, the `blocked` precedent: an older reader ignores the
+    /// key, a newer one reads its absence as no background work, so no
+    /// `PROTOCOL_VERSION` bump. Restored by [`AppState::seed_hydrated_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// Issue #1678: the revision of [`Self::background`], present even when the
+    /// aggregate is empty once it has ever changed, so a client that hydrates
+    /// from this snapshot refuses a replayed older aggregate afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_revision: Option<u64>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1116,6 +1344,9 @@ impl SessionState {
             AgentType::None => None,
             ref other => Some(other.clone()),
         };
+        // Issue #1678: the background aggregate rides the journal, forward-
+        // stamped like the live target (see `held_background`).
+        let held = held_background(self);
         SessionSnapshot {
             status: self.status.clone(),
             agent_type,
@@ -1135,6 +1366,8 @@ impl SessionState {
             subagent_wait: self.subagent_wait.clone(),
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
+            background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
+            background_revision: held.map(|(_, revision)| revision),
         }
     }
 
@@ -1167,6 +1400,15 @@ impl SessionState {
     /// fixtures construct the struct by exhaustive literal.
     pub fn live_target(&self) -> Option<LiveTarget> {
         self.recent_events.iter().rev().find_map(|e| e.live_target)
+    }
+
+    /// Issue #1678: the background work this card shows — the daemon's
+    /// aggregate as the journal last carried it, `None` when there is nothing
+    /// to show.
+    pub fn background_work(&self) -> Option<BackgroundWork> {
+        held_background(self)
+            .and_then(|(background, _)| background)
+            .filter(|background| !background.is_empty())
     }
 
     /// PRD #20 M3: the write-semantics of this session's live target. A session
@@ -2025,6 +2267,14 @@ pub struct AppState {
     /// [`Self::resync_after_event_gap`]. A delivery's retry waits while it is
     /// set, because no confirmation can reach this state until it clears.
     event_stream_down: bool,
+    /// Issue #1678: the daemon's per-card background-work records, keyed by
+    /// card id — see [`BackgroundTrack`]. Filled only where the ownership
+    /// oracle is installed (the daemon); a record whose card is gone is dropped
+    /// after the event that removed it.
+    background_tracks: HashMap<String, BackgroundTrack>,
+    /// Issue #1678: what the last applied event did to its card's background
+    /// work — see [`Self::take_applied_background`].
+    applied_background: Option<AppliedBackground>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -10645,7 +10895,10 @@ struct PointerWriteSample {
 /// semantics into `recent_events`. Its `Idle` type and empty tool/prompt fields
 /// mean the card's activity renderers (`collect_recent_prompts`,
 /// `recent_tool_lines`) ignore it; only [`SessionState::live_target`] reads it.
-fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) -> AgentEvent {
+fn live_target_carrier_event(
+    session: &SessionState,
+    live_target: Option<LiveTarget>,
+) -> AgentEvent {
     AgentEvent {
         session_id: session.session_id.clone(),
         agent_type: session.agent_type.clone(),
@@ -10660,7 +10913,9 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
         agent_id: session.agent_id.clone(),
         agent_version: None,
         schema_version: None,
-        live_target: Some(live_target),
+        live_target,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -10754,12 +11009,34 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     if let Some(live_target) = snap.live_target {
         push_live_target_carrier(session, live_target);
     }
+    // Issue #1678: the daemon's background aggregate, re-seeded the same way —
+    // unless the card already holds a newer revision, which a replayed older
+    // snapshot must not overwrite.
+    if let Some(revision) = snap.background_revision
+        && held_background(session).is_none_or(|(_, held)| revision >= held)
+    {
+        let mut carrier = live_target_carrier_event(session, session.live_target());
+        carrier.background = Some(snap.background.unwrap_or_default());
+        carrier.background_revision = Some(revision);
+        push_journal_carrier(session, carrier);
+    }
 }
 
 /// Push a [`live_target_carrier_event`] onto `session`'s bounded journal,
 /// stamped at its current `last_activity`.
 fn push_live_target_carrier(session: &mut SessionState, live_target: LiveTarget) {
-    let carrier = live_target_carrier_event(session, live_target);
+    let mut carrier = live_target_carrier_event(session, Some(live_target));
+    // Issue #1678: the carrier is the newest journal entry, so it carries the
+    // background copy forward like any other event.
+    if let Some((background, revision)) = held_background(session) {
+        carrier.background = background;
+        carrier.background_revision = Some(revision);
+    }
+    push_journal_carrier(session, carrier);
+}
+
+/// Push an inert carrier event onto `session`'s bounded journal.
+fn push_journal_carrier(session: &mut SessionState, carrier: AgentEvent) {
     session.recent_events.push_back(carrier);
     if session.recent_events.len() > MAX_RECENT_EVENTS {
         session.recent_events.pop_front();
@@ -11115,6 +11392,12 @@ impl AppState {
             })
             .map(|s| {
                 let mut snapshot = s.live_snapshot();
+                // Issue #1678: the daemon's record is the authority, including
+                // a change no event carried (an exited spawn's work retired).
+                if let Some(track) = self.background_tracks.get(&s.session_id) {
+                    snapshot.background = track.published;
+                    snapshot.background_revision = (track.revision > 0).then_some(track.revision);
+                }
                 // Issue #532: the pane's generation, so a reconnecting TUI
                 // adopts the daemon's answer. See
                 // [`SessionSnapshot::hook_generation`].
@@ -11309,6 +11592,8 @@ impl AppState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -13843,6 +14128,8 @@ impl AppState {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
         events
@@ -15103,6 +15390,89 @@ impl AppState {
         let _ = self.apply_event_reporting(event, None);
     }
 
+    /// Issue #1678: what the event this state last applied did to its card's
+    /// background work, taken once — `None` when the event was refused, landed
+    /// on no tracked card, or this state is not the daemon's. The daemon's ingest
+    /// reads it under the same lock as the apply, to stamp the broadcast copy.
+    pub(crate) fn take_applied_background(&mut self) -> Option<AppliedBackground> {
+        self.applied_background.take()
+    }
+
+    /// Issue #1678: the card of `agent_id` on `pane_id` that a background record
+    /// would describe — the newest one, as [`Self::live_session_for`] picks.
+    fn background_card(&self, pane_id: &str, agent_id: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.pane_id.as_deref() == Some(pane_id) && s.agent_id.as_deref() == Some(agent_id)
+            })
+            .max_by(|(a_id, a), (b_id, b)| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a_id.cmp(b_id))
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Issue #1678: the shell-activity monitor's view of `agent_id`'s card on
+    /// `pane_id` — whether it reports its own turn boundaries (D1) and whether
+    /// its turn is over (D2). Default (neither) when there is no record.
+    pub(crate) fn background_view(&self, pane_id: &str, agent_id: &str) -> BackgroundView {
+        self.background_card(pane_id, agent_id)
+            .and_then(|card| self.background_tracks.get(&card))
+            .filter(|track| track.agent_id.as_deref() == Some(agent_id))
+            .map(|track| BackgroundView {
+                reports_turn_boundaries: track.reports_turn_boundaries,
+                turn_ended: track.turn_ended,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #1678 D4/D5: record the qualifying command sessions a valid sample
+    /// found below `agent_id`'s pane, keeping the first-seen time of each one
+    /// still present. Called by the monitor under the state write lock, before
+    /// the event that publishes the change is applied (or on its own when the
+    /// change cannot move the aggregate). Records nothing for a pane with no
+    /// card of that agent, or where this state is not the daemon's.
+    pub(crate) fn observe_command_sessions(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        sessions: &HashSet<i32>,
+    ) {
+        if self.agent_ownership.is_none() {
+            return;
+        }
+        let Some(card) = self.background_card(pane_id, agent_id) else {
+            return;
+        };
+        let track = self
+            .background_tracks
+            .entry(card)
+            .or_insert_with(|| BackgroundTrack::for_agent(Some(agent_id.to_string())));
+        if track.agent_id.as_deref() != Some(agent_id) {
+            *track = BackgroundTrack::for_agent(Some(agent_id.to_string()));
+        }
+        track.observe_commands(sessions, Utc::now().timestamp_millis());
+    }
+
+    /// Issue #1678 D3/D5: `agent_id`'s process on `pane_id` is gone, so nothing
+    /// it started is its background work any longer — without waiting for a
+    /// `SessionEnd` hook it may never send. Read back through
+    /// [`Self::live_session_for`]; no event carries it.
+    pub(crate) fn retire_background_spawn(&mut self, pane_id: &str, agent_id: &str) {
+        let Some(card) = self.background_card(pane_id, agent_id) else {
+            return;
+        };
+        if let Some(track) = self.background_tracks.get_mut(&card)
+            && track.agent_id.as_deref() == Some(agent_id)
+        {
+            track.commands.clear();
+            track.subagents.clear();
+            track.republish();
+        }
+    }
+
     /// [`Self::apply_event`], reporting what it did with the event — see
     /// [`AppliedEvent`]. The daemon's waiting-for-input watch is the one caller
     /// that needs the answer (issue #447).
@@ -15116,10 +15486,18 @@ impl AppState {
         attested_agent: Option<&str>,
     ) -> AppliedEvent {
         self.applied_unproven = false;
+        self.applied_background = None;
         let applied = self.apply_event_unsettled(event, attested_agent);
         // Issue #697: whatever the event removed, the unproven bookkeeping
         // follows it — see [`Self::settle_unproven`].
         self.settle_unproven(None);
+        // Issue #1678: a background record outlives no card — a pane close, an
+        // end or a retire takes the record with it.
+        if !self.background_tracks.is_empty() {
+            let sessions = &self.sessions;
+            self.background_tracks
+                .retain(|card_id, _| sessions.contains_key(card_id));
+        }
         if self.applied_unproven {
             self.enforce_unproven_journal_budget();
         }
@@ -15206,6 +15584,12 @@ impl AppState {
         }
         if let Some(detail) = event.tool_detail.as_mut() {
             *detail = crate::untrusted_text::sanitize_tool_text(detail);
+        }
+        // Issue #1678: in the daemon the background aggregate is computed here,
+        // never taken from the frame — whoever sent one.
+        if self.agent_ownership.is_some() {
+            event.background = None;
+            event.background_revision = None;
         }
 
         // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
@@ -16224,6 +16608,15 @@ impl AppState {
         // fork-time start can no longer take the generation off the wrapped
         // agent's native session. Issue #532 itself closed the ordinary-frame
         // half.
+        //
+        // Issue #1678 D3: the pane's conversation before this frame, read first,
+        // so a genuine `SessionStart` naming another one is recognised below as
+        // a new conversation.
+        let previous_generation = event
+            .pane_id
+            .as_ref()
+            .and_then(|pane_id| self.pane_hook_session.get(pane_id))
+            .map(|(id, _)| id.clone());
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
@@ -16552,7 +16945,52 @@ impl AppState {
         // arm reports for itself rather than being classified from outside,
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
-        let asserted_status = Self::apply_status_transition(session, &event, newest_before);
+        // Issue #1678: the daemon's background record for this card — the D1
+        // latch first, because it decides whether the shell pair may move the
+        // status at all. A client has none; for it a shell frame that carries
+        // the daemon's aggregate comes from a daemon that tracks turn
+        // boundaries, and one without it from an older daemon.
+        let genuine = is_genuine_turn_report(&event);
+        let carries_aggregate = event.background.is_some() || event.background_revision.is_some();
+        let mut track = if self.agent_ownership.is_some() && !unproven {
+            let track = self
+                .background_tracks
+                .entry(event.session_id.clone())
+                .or_insert_with(|| BackgroundTrack::for_agent(session.agent_id.clone()));
+            if track.agent_id != session.agent_id {
+                *track = BackgroundTrack::for_agent(session.agent_id.clone());
+            }
+            if genuine {
+                track.reports_turn_boundaries = true;
+            }
+            Some(track)
+        } else {
+            None
+        };
+        let shell_status_owned = match track.as_deref() {
+            Some(track) => track.reports_turn_boundaries,
+            None => carries_aggregate,
+        };
+
+        let asserted_status =
+            Self::apply_status_transition(session, &event, newest_before, shell_status_owned);
+
+        // Issue #1678: the post-transition aggregate, computed here under the
+        // caller's lock so the daemon broadcasts the event that changed it
+        // together with it; a client folds the daemon's copy instead.
+        if let Some(track) = track.as_mut() {
+            let now_ms = Utc::now().timestamp_millis();
+            if genuine {
+                let new_conversation = event.event_type == EventType::SessionStart
+                    && previous_generation.as_deref() != Some(incoming_session_id.as_str());
+                track.note_genuine_event(&event, new_conversation, now_ms);
+            }
+            let changed = track.republish();
+            track.stamp(&mut event);
+            self.applied_background = Some(track.applied(changed));
+        } else {
+            fold_background_copy(session, &mut event);
+        }
 
         // Issue #770: carry the daemon's orphaned-role verdict onto the card.
         // One-way: the marker only ever ARRIVES (see the field's doc comment for
@@ -16650,10 +17088,14 @@ impl AppState {
     /// `newest_before` is the session's `last_activity` as it stood BEFORE this
     /// frame advanced it: issue #1493's wrapper frames stamped older than it are
     /// stale and assert nothing.
+    /// `shell_status_owned` is issue #1678's D1 gate: the pane's agent reports
+    /// its own turn boundaries, so the shell-activity pair leaves the status
+    /// alone and only feeds the background-work aggregate.
     fn apply_status_transition(
         session: &mut SessionState,
         event: &AgentEvent,
         newest_before: DateTime<Utc>,
+        shell_status_owned: bool,
     ) -> bool {
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
@@ -16936,6 +17378,9 @@ impl AppState {
                 session.status = SessionStatus::Error;
                 true
             }
+            // Issue #1678: a pane whose agent reports its own turns stays where
+            // its agent put it; the scan's reading becomes background work.
+            EventType::ShellBusy | EventType::ShellIdle if shell_status_owned => false,
             EventType::ShellBusy => {
                 // PRD #370 M2: only promote a stale/no-opinion status — never
                 // clobber a real agent-emitted Thinking/Working/
@@ -17084,8 +17529,15 @@ impl AppState {
             session.shell_synthetic_working = false;
             return AppliedEvent::StatusAsserted;
         }
-        let asserted = Self::apply_status_transition(session, &event, newest_before);
+        let carries_aggregate = event.background.is_some() || event.background_revision.is_some();
+        let asserted =
+            Self::apply_status_transition(session, &event, newest_before, carries_aggregate);
         event.session_id = card_id.to_string();
+        // Issue #1678: the card keeps the daemon's background copy; an unproven
+        // report cannot supply one of its own.
+        event.background = None;
+        event.background_revision = None;
+        fold_background_copy(session, &mut event);
         // Qodo, PR #1559: the card's live target is not reporting state, so the
         // report carries the card's own — never one of its own, which would
         // let an unproven report make the card writable — and it stays durable
@@ -17138,6 +17590,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         fn start(session: &str, pane: &str, agent: &str, secs: i64) -> AgentEvent {
@@ -17868,6 +18322,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -17955,6 +18411,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -17975,6 +18433,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         // Even a report naming a DIFFERENT (stale) generation with a fresher
@@ -18034,6 +18494,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         fn launcher(session: &str, secs: i64) -> AgentEvent {
@@ -18807,6 +19269,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -18871,6 +19335,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         // The pending window: the owner read finds no published agent.
@@ -18939,6 +19405,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -20660,6 +21128,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -20822,6 +21292,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -20928,6 +21400,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -21037,6 +21511,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -21628,6 +22104,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
         for no_proof in [
@@ -21700,6 +22178,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -24650,6 +25130,8 @@ while True:
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -25103,6 +25585,8 @@ while True:
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -25979,6 +26463,8 @@ while True:
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -26163,6 +26649,8 @@ while True:
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -26632,6 +27120,8 @@ while True:
                 resets_at_ms: Some(9_000),
             }),
             hook_generation: None,
+            background: None,
+            background_revision: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -26697,6 +27187,8 @@ while True:
                 resets_at_ms,
             }),
             hook_generation: None,
+            background: None,
+            background_revision: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

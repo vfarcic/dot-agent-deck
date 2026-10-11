@@ -1014,12 +1014,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the falling edge (`ShellIdle` once the command completes — that is `004`'s job against a stand-in, not repeated here against a real agent), the >120s-cap user-visible badge scenario (`status/shell-activity/006`, M6b), or no-false-positive-at-idle (`status/shell-activity/007`, M6c). The soft sentinel-content check on the model's final reply is logged, not gating — matching the model's free-text reply is more phrasing-sensitive than the two typed events the test actually gates on.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
-##### status/shell-activity/006 — A real interactive Haiku Claude agent's Bash call that crosses Claude Code's 120s default timeout keeps the pane's rendered badge on `Working`, with the command genuinely still running — the reported bug, reproduced as the user actually sees it (PRD #386 M6b). [reel]
+##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Idle with Background: 1 command while the ping is still running (#1678). [reel]
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
 - **Agent:** a real interactive `claude --model claude-haiku-4-5-20251001 --allowedTools Bash` pane, spawned through the normal Ctrl+N new-pane flow with per-folder trust pre-seeded, exactly as a user would drive it.
-- **Asserts:** a directive prompt drives the agent to make exactly one Bash tool call running `ping -c 200 127.0.0.1 > <sentinel> 2>&1` — real, non-blocked foreground work lasting ~200s under **default** Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the reported case exactly. After the native `ToolStart`/`Bash` hook event confirms the call actually started, the test waits for the real, native `Idle` event — mapped from Claude Code's own `Stop` hook, never fabricated — for this agent, bounded at 157s (the PRD's own measured 127s `ToolStart`-to-`Idle` gap plus a 30s margin). Only once that `Idle` genuinely lands does the test switch to the dashboard (`Ctrl+D`) and assert the rendered card badge reads `Working` (not `Idle`) — sampled at the instant a broken monitor would have painted it `Idle`. It also independently proves the command is genuinely still running at that moment: `process_table()` + `descendants()`, walked from the test binary's own pid (never a global `ps` scan, so a concurrently running e2e test's own processes can't be mistaken for this one's), finds a live process carrying the sentinel text in its argv (the Bash-tool shell's `eval '<user command>'` segment) with a live `ping` process beneath it. A miss on either half — badge or process — means the fix did not land or a different bug (a stale badge next to a finished command) is passing as one. **A PASS therefore means the bug path was genuinely exercised** — this is the guarantee added for PRD #386's tester follow-up: previously the test sampled on a fixed wall-clock offset regardless of whether Claude Code's `Stop` hook had actually fired, so roughly two runs in three (when Claude ended the capped call with `ToolEnd` and no `Stop`) passed without the card ever having anything to recover from. If the real `Idle` does not land within the bound, the test now **fails loudly** with a `PRECONDITION NOT MET` message distinguishing "this run never exercised the bug path" from "the badge was actually wrong" — an inconclusive run is never reported as a pass.
+- **Asserts:** exactly one real Bash call runs ping -c 200 against a unique sentinel with default settings. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds; otherwise it fails explicitly with PRECONDITION NOT MET. Once Stop arrives, the rendered card reads Idle with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
 - **Does not assert:** anything about the discriminator's internals (`descendant_shell_activity`, `003`) or the pane primitive in isolation (`004`) — this test only observes the full pipeline's user-visible output. Does not assert what happens after the sample point (the eventual falling edge once the 200s ping finishes) or what the agent does with the "moved to background" tool result. A `PRECONDITION NOT MET` panic is not a badge assertion at all — it asserts nothing about `Working`/`Idle` and must be read as inconclusive (rerun), not as evidence the fix broke.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
+
 
 ##### status/shell-activity/007 — A real interactive Haiku Claude agent left at its idle prompt, with its real MCP servers alive as children, keeps the pane's rendered badge on `Idle` — no false positive against a live process table (PRD #386 M6c).
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
@@ -1066,11 +1067,66 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
 - **Platform coverage:** mac+linux.
 
-##### status/subagent/005 — A subagent's tool call between `ShellBusy` and `ShellIdle` does not strand the synthetic Working.
+##### status/subagent/005 — Reporting panes stay Idle on new-daemon shell activity, while old-daemon synthetic Working retains its takeover protection.
 - **Layer:** L1.
 - **Agent:** none (the `ShellBusy`/`ShellIdle` frames are daemon-synthesized in production and built directly here).
-- **Asserts:** from an Idle card, `ShellBusy` sets Working; a subagent `ToolStart` (through the real hook CLI) followed by `ShellIdle` returns the card to Idle. The control, a main-thread `ToolStart` in the same spot, takes the status over as real and the card stays Working through the `ShellIdle`.
+- **Asserts:** on a Claude-shaped pane after SessionStart and Stop, a ShellBusy carrying the daemon's aggregate leaves Idle and retains one background command, including after a subagent ToolStart. ShellBusy without that aggregate (an older daemon) still sets synthetic Working; a subagent ToolStart followed by ShellIdle returns Idle, while a main-thread ToolStart takes over and stays Working.
 - **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
+- **Platform coverage:** mac+linux.
+
+##### status/background/001 — An ended reporting turn stays Idle while a detached command runs (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned Python parent with real detached Bash sessions and Claude-shaped hooks through the real hook CLI.
+- **Asserts:** Stop leaves Idle; sampled command activity appears as Background: 1 command on the rendered card; a main prompt hides it; the next Stop broadcasts the retained command immediately; command exit clears it. A no-hook/no-aggregate legacy reducer still promotes ShellBusy to Working.
+- **Does not assert:** real Claude behavior (007), process-table classifier details (005), desktop.
+
+##### status/background/002 — Paired subagent identity, receipt age and bounded tracking (#1678).
+- **Layer:** L2 synthetic, daemon hook ingestion (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; real hook CLI with Claude- and Codex-shaped payloads.
+- **Asserts:** two starts before Stop become two background subagents on Stop's broadcast and snapshot; duplicate start preserves oldest receipt time; three unpaired stops and a duplicate stop leave counts intact; paired stops remove only their ids; empty and oversized ids (including UTF-8 byte bounds) cannot become main-thread tool events; 128-entry cap; a clear starts a fresh conversation.
+- **Does not assert:** real Agent tool behavior (008), permission-wait resolution (status/subagent/006 and 007), desktop.
+
+##### status/background/003 — Snapshot hydration and revision ordering prevent replay resurrection (#1678).
+- **Layer:** L1 protocol/fold, fast tier (`subagent_tool_status.rs`).
+- **Agent:** none; serialized daemon snapshots and events applied to a fresh TUI AppState.
+- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
+- **Does not assert:** daemon admission/producer stripping, rendered layout (004), desktop replay.
+
+##### status/background/004 — The TUI card shows background kinds, counts and oldest elapsed span (#1678).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Idle card rendered through the production card seam.
+- **Asserts:** exact Background: 2 commands, 1 subagent · 3h 12m; singular and zero-kind omission; clock skew within 60 seconds clamps elapsed to zero; beyond tolerance, invalid or absent timestamp omits duration while keeping counts; zero counts hide the line; narrow card retains a background row.
+- **Does not assert:** live clock ticking, process scans or hook ingestion, desktop.
+
+##### status/background/005 — Count distinct qualifying POSIX sessions using every candidate's argv cross-check (#1678).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures with the measured Claude fingerprint.
+- **Asserts:** many processes in one session count once; two matching sessions count twice; unmatched detached service is excluded even beside a match; nested terminal session re-rooting excludes the inner agent but includes its actual tool; unknown/missing root or session yields None.
+- **Does not assert:** monitor timing, OS sampling cost or background turn classification.
+
+##### status/background/006 — Monitor publishes count-only edges without Idle+busy spam and retires spawn observations (#1678).
+- **Layer:** L2 synthetic (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned stand-in with independently controlled real detached commands.
+- **Asserts:** subscribers receive count changes 1→2→1 despite unchanged busy=true; Idle+busy produces no repeated identical shell event for three seconds; replacing the spawn in the same pane cannot give its successor the old command aggregate or restamp observations with its identity.
+- **Does not assert:** a deterministically paused scan crossing replacement (there is no exposed deferred-sampler seam); real agent subprocess lifetime (007); desktop.
+
+##### status/background/007 — Real interactive Haiku background Bash work stays visible after Stop and clears on scoped kill (#1678). [reel]
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Idle and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears while Idle remains.
+- **Does not assert:** capped default-timeout behavior (status/shell-activity/006), subagents (008), desktop.
+
+##### status/background/008 — Real interactive Haiku subagent work stays visible after the main Stop and clears on its paired stop (#1678).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku plus one real Haiku subagent, onboarding/trust seeded and allowedTools Bash Agent.
+- **Asserts:** one background Agent runs three slow Bash steps writing unique start/completion sentinels; after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
+- **Does not assert:** exact Claude transcript phrasing, desktop, other agent integrations.
+
+##### status/background/009 — A shell-activity sample that answers after its spawn was replaced touches neither the successor's card nor the broadcast (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, `run_shell_activity_monitor_with` with a stub sampler on tokio's paused clock; fast tier).
+- **Agent:** none; two real `/bin/sh` spawns supply live pids, with Claude-shaped `SessionStart`/`Idle` frames applied to an ownership-backed daemon state.
+- **Asserts:** while the first sample is in flight the pane's agent is closed and a successor reports its own ended turn; the sample then answers busy for the old spawn with the measured Claude fingerprint. No `ShellBusy` and no non-empty aggregate is broadcast, and the successor's live snapshot reads Idle with no background work, because the monitor revalidates the sampled spawn under the state lock before it applies or broadcasts anything.
+- **Does not assert:** the resumed (retained-sample) path's identity filter (`shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started`), the end-to-end replacement through the real binary (006), desktop.
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).

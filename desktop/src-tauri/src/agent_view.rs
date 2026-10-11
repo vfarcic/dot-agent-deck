@@ -460,6 +460,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -654,6 +656,8 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -697,6 +701,8 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -737,6 +743,8 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();

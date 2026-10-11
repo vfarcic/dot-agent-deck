@@ -59,6 +59,116 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
+/// Scenario: Hydrate Idle cards with background commands and subagents, then render wide and narrow cards at a fixed clock. The visible line uses the shared singular/plural and elapsed vocabulary, omits zero kinds and invalid durations, and disappears without background work.
+#[spec("status/background/004")]
+#[test]
+fn background_004_card_counts_elapsed_skew_and_narrow_layout() {
+    let now = render_now();
+    let cases = [
+        (
+            2,
+            1,
+            Some(now.timestamp_millis() - 11_520_000),
+            "Background: 2 commands, 1 subagent · 3h 12m",
+        ),
+        (
+            1,
+            0,
+            Some(now.timestamp_millis() - 240_000),
+            "Background: 1 command · 4m",
+        ),
+        (
+            0,
+            1,
+            Some(now.timestamp_millis() - 240_000),
+            "Background: 1 subagent · 4m",
+        ),
+        (
+            0,
+            2,
+            Some(now.timestamp_millis() + 30_000),
+            "Background: 2 subagents · 0s",
+        ),
+        (
+            1,
+            0,
+            Some(now.timestamp_millis() + 60_001),
+            "Background: 1 command",
+        ),
+        (1, 0, Some(i64::MIN), "Background: 1 command"),
+        (1, 0, None, "Background: 1 command"),
+        (0, 0, None, ""),
+    ];
+    let mut visible_lines = Vec::new();
+    for (commands, subagents, since_ms, expected) in cases {
+        let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "Idle", "agent_type": "claude_code", "tool_count": 0,
+            "last_activity_ms": now.timestamp_millis(),
+            "background": {"commands": commands, "subagents": subagents, "since_ms": since_ms},
+            "background_revision": 1,
+        }))
+        .unwrap();
+        let mut state = AppState::default();
+        state.register_pane("background-card".into());
+        state.seed_hydrated_session("background-card".into(), None, None, None, Some(&snapshot));
+        let session = state.sessions.values().next().unwrap();
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            now,
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        if commands == 2 && subagents == 1 {
+            insta::assert_snapshot!("background_004_mixed_card", rendered);
+        }
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("Background:"))
+            .map(|line| line.trim_matches(['│', ' ']).to_string())
+            .unwrap_or_else(|| "<none>".into());
+        visible_lines.push(line);
+        // Narrow geometry still allocates a row for the indicator and keeps
+        // its count legible rather than dropping the row for lack of budget.
+        let narrow = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            now,
+            false,
+            32,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        if !expected.is_empty() {
+            assert!(
+                narrow.contains("Background:"),
+                "narrow card lost its background row:\n{narrow}"
+            );
+        } else {
+            assert!(
+                !narrow.contains("Background:"),
+                "zero counts must be hidden"
+            );
+        }
+    }
+    insta::assert_snapshot!(visible_lines.join("\n"), @"
+    Background: 2 commands, 1 subagent · 3h 12m
+    Background: 1 command · 4m
+    Background: 1 subagent · 4m
+    Background: 2 subagents · 0s
+    Background: 1 command
+    Background: 1 command
+    Background: 1 command
+    <none>
+    ");
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title must carry the card number, display name, and status
@@ -300,6 +410,8 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_activity_ms,
             blocked: None,
             hook_generation: None,
+            background: None,
+            background_revision: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());
@@ -1026,6 +1138,8 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -2133,6 +2247,8 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     });
 
     // The card list the dashboard would build for this pane.
@@ -2205,6 +2321,8 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
     for (name, detail) in [
@@ -2227,6 +2345,8 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
     }
     SessionState {
@@ -2604,6 +2724,8 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     });
     let poisoned = state
         .sessions
@@ -2742,6 +2864,8 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state
             .sessions
@@ -3109,6 +3233,8 @@ fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state
             .sessions
