@@ -170,15 +170,16 @@ let shuttingDown = false;
 // Issue #1678: the longest session or message id, in UTF-8 bytes, the plugin
 // keeps in its child-session, alias and reply records — the daemon's own bound
 // on a tracked subagent id. A longer session id is recognised by a fixed-size
-// stand-in (sessionKey), never by a cut-down copy, so two long ids sharing a
-// prefix do not collapse into one (the stand-in holds a 64-bit digest of the
-// whole id, so two ids of the same length can still share one, with
-// negligible probability). Stand-ins begin with OVERSIZED_ID_PREFIX, and an id
-// that itself begins with it is held by a stand-in too, so no stand-in equals
-// an id held as itself. A child held by a stand-in is never reported active
-// (no `subagent.start` or `subagent.stop`); its tool calls and permission
-// prompts still carry subagent attribution, as its stand-in, so each such
-// child's prompt is its own.
+// stand-in (sessionKey), never by a cut-down copy: the stand-in is derived
+// from the whole id, so ids that differ only past a cut are not merged by
+// truncation. It is a 64-bit digest, not a collision-free one: two ids of the
+// same length can still share a stand-in, with negligible probability.
+// Stand-ins begin with OVERSIZED_ID_PREFIX, and an id that itself begins with
+// it is held by a stand-in too, so no stand-in equals an id held as itself. A
+// child held by a stand-in is never reported active (no `subagent.start` or
+// `subagent.stop`); its tool calls and permission prompts still carry subagent
+// attribution, as its stand-in, so such children's prompts are told apart
+// unless their stand-ins coincide.
 const MAX_ID_BYTES = 256;
 const OVERSIZED_ID_PREFIX = "oversized-id:";
 const utf8Length = (text) =>

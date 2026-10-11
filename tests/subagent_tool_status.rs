@@ -32,7 +32,9 @@ use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dot_agent_deck::event::{AgentEvent, EventType};
+use dot_agent_deck::event::{
+    AgentEvent, EventType, GenerationVerdict, PANE_GENERATION_METADATA_KEY,
+};
 use dot_agent_deck::state::{AppState, SessionStatus};
 use serde_json::{Value, json};
 use spec::spec;
@@ -693,7 +695,7 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .clone()
 }
 
-/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, and legacy shell promotion still works without the fields.
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, a queued SessionEnd of the ending spawn leaves alone a successor hydrated under the same key before it, and legacy shell promotion still works without the fields.
 #[spec("status/background/003")]
 #[test]
 fn background_003_snapshot_hydration_and_revision_ordering() {
@@ -928,6 +930,91 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
         failures.is_empty(),
         "SessionEnd must preserve the client's terminal replay barrier:\n{}",
         failures.join("\n")
+    );
+
+    // AU-13: the successor is hydrated under the SAME key before the ending
+    // spawn's queued SessionEnd (Current verdict, revision 40) is drained. That
+    // end is the ending spawn's; it must not remove, restore or seed the
+    // successor's card.
+    let placeholder = format!("pane-{PANE}");
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    let ending: AgentEvent = serde_json::from_value(json!({
+        "session_id": placeholder, "pane_id": PANE, "agent_id": "ending-spawn",
+        "agent_type": "claude_code", "event_type": "idle",
+        "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5),
+        "background": {"commands": 0, "subagents": 1, "since_ms": null},
+        "background_revision": 39
+    }))
+    .unwrap();
+    state.apply_event(ending.clone());
+    assert_eq!(
+        state.sessions[&placeholder].agent_id.as_deref(),
+        Some("ending-spawn")
+    );
+    let mut successor = state.sessions[&placeholder].live_snapshot();
+    successor.tool_count = 7;
+    successor.first_prompts = vec!["the successor's prompt".into()];
+    successor.last_user_prompt = Some("the successor's prompt".into());
+    successor.background =
+        serde_json::from_value(json!({"commands": 1, "subagents": 0, "since_ms": null})).ok();
+    successor.background_revision = Some(1);
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let before = state.sessions[&placeholder].clone();
+    assert_eq!(before.agent_id.as_deref(), Some("successor-spawn"));
+    let mut end = ending;
+    end.event_type = EventType::SessionEnd;
+    end.timestamp += chrono::Duration::seconds(1);
+    end.background =
+        serde_json::from_value(json!({"commands": 0, "subagents": 0, "since_ms": null})).ok();
+    end.background_revision = Some(40);
+    end.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.into(),
+        GenerationVerdict::Current.metadata_value().into(),
+    );
+    state.apply_event(end);
+    let after = state
+        .sessions
+        .get(&placeholder)
+        .expect("the successor keeps its card");
+    assert_eq!(after.agent_id.as_deref(), Some("successor-spawn"));
+    assert_eq!(after.started_at, before.started_at);
+    assert_eq!(after.tool_count, 7, "the successor keeps its history");
+    assert_eq!(after.first_prompts, before.first_prompts);
+    assert_eq!(after.last_user_prompt, before.last_user_prompt);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    let kept = snapshot(&state);
+    assert_eq!(
+        (
+            kept["background"]["commands"].clone(),
+            kept["background_revision"].clone()
+        ),
+        (json!(1), json!(1)),
+        "the ending spawn's revision-40 clear is not seeded onto the successor: {kept}"
+    );
+    let mut own: AgentEvent = serde_json::from_value(json!({
+        "session_id": placeholder, "pane_id": PANE, "agent_id": "successor-spawn",
+        "agent_type": "claude_code", "event_type": "idle",
+        "timestamp": chrono::Utc::now(),
+        "background": {"commands": 1, "subagents": 1, "since_ms": null},
+        "background_revision": 1
+    }))
+    .unwrap();
+    own.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.into(),
+        GenerationVerdict::Current.metadata_value().into(),
+    );
+    state.apply_event(own);
+    assert_eq!(
+        snapshot(&state)["background"]["subagents"],
+        json!(1),
+        "the successor's own revision 1 is still accepted"
     );
 }
 

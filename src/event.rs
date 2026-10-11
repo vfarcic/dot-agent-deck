@@ -560,8 +560,10 @@ pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 /// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
 /// event is broadcast straight onto the fan-out and never ingested, and
 /// `ingest_event` removes the key from every inbound hook event. Additive on the
-/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which its
-/// generation gate refuses before any status or card logic.
+/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which
+/// v0.46.0's generation gate refuses before any status or card logic — read
+/// from that release's source, not observed in a running released binary
+/// (`status/background/015` models the gate).
 pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
 
 /// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.
