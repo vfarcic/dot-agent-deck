@@ -1209,7 +1209,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Layer:** unit (the daemon's `HostMetricsCache` with an injected sampler that never finishes, paused Tokio clock).
 - **Agent:** none.
 - **Asserts:** eight concurrent requests on a cold cache whose sample never finishes start exactly one sample and all answer without one exactly `HOST_METRICS_SAMPLE_WAIT` later; a request waiting when the sample lands gets it at age 0 and starts none; a cache hit inside the max age starts none; after expiry, eight more requests during a second stuck sample start one more, the seven that did not start it answer at once with the last sample at its true age, and the one that did answers after the wait with the age that includes it (PRD #1258 audit A1).
-- **Does not assert:** a real hung filesystem; the production sampler's `spawn_blocking` (counted by construction: one per sampler start); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Does not assert:** a real hung filesystem; the production sampler's detached thread (counted by construction: one per sampler start; its effect on shutdown is `protocol/host-metrics/011`); socket transport (covered by `protocol/host-metrics/001`–`002`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### protocol/host-metrics/006 — A zero fragment size leaves free disk absent rather than zero.
@@ -1244,7 +1244,14 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Layer:** unit (the daemon's `HostMetricsCache` with a scripted sampler on current-thread Tokio runtimes, event-sequenced).
 - **Agent:** none.
 - **Asserts:** a sample that panics on the refresh task, a refresh task dropped when its runtime shuts down, and a sampler that panics inside the request that started it each clear the in-flight marker; every request waiting on the refresh returns without a sample, released by the refresh ending rather than by the bounded wait (set to an hour here); a request that joined the refresh started none; the next request starts exactly one refresh and answers with its sample (PRD #1258 audit A1 follow-up).
-- **Does not assert:** the production sampler's `spawn_blocking` (whose panic surfaces as a failed sample, not a panic); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Does not assert:** the production sampler's detached thread (whose panic surfaces as a failed sample, not a panic); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/011 — Dropping the daemon's runtime does not wait on a stuck sample.
+- **Layer:** unit (the daemon's `HostMetricsCache` with the production `detached_sampler` around a sample that blocks until released, on a multi-thread Tokio runtime like `#[tokio::main]`'s, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a request gives up on the stuck sample after its bounded wait; with the sample confirmed stuck in its call and not yet released, dropping the runtime returns, so a sample that never finishes cannot hold up the daemon's exit (PR #1672 review; a sample on Tokio's blocking pool fails this, since a runtime drop joins its blocking jobs).
+- **Does not assert:** a real hung filesystem; the daemon's full stop path; how long the drop takes (the 30 s receive only bounds a broken build).
 - **Platform coverage:** mac+linux+windows.
 
 #### protocol/live-target

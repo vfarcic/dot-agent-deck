@@ -98,9 +98,38 @@ pub const HOST_METRICS_SAMPLE_WAIT: std::time::Duration = std::time::Duration::f
 type SampleFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<HostMetrics>> + Send>>;
 
-/// Starts one sample. Production runs [`sample_host`] on Tokio's blocking pool;
-/// tests inject one they can hold open.
+/// Starts one sample. Production runs [`sample_host`] on a detached thread
+/// ([`detached_sampler`]); tests inject one they can hold open.
 type Sampler = std::sync::Arc<dyn Fn() -> SampleFuture + Send + Sync>;
+
+/// A [`Sampler`] that runs `sample` on a thread of its own, detached, and
+/// resolves when that thread reports.
+///
+/// **Not Tokio's blocking pool, on purpose** (PR #1672 review). The daemon's
+/// runtime is `#[tokio::main]`, and dropping a runtime joins every blocking
+/// job it spawned, with no deadline. A `statvfs` stuck on a hung NFS or FUSE
+/// mount would then hold the daemon's exit — a stop, an idle shutdown or a
+/// supervised restart — after every agent had already been drained. A detached
+/// thread is joined by nobody: the process exits around it. The cache stays
+/// single-flight either way, so a mount that never answers holds this one
+/// thread and no more. A `sample` that panics drops its sender, which reads
+/// as a failed sample, as a panicked blocking job did.
+fn detached_sampler(sample: std::sync::Arc<dyn Fn() -> HostMetrics + Send + Sync>) -> Sampler {
+    std::sync::Arc::new(move || -> SampleFuture {
+        let sample = std::sync::Arc::clone(&sample);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("host-metrics-sample".into())
+            .spawn(move || {
+                let _ = tx.send(sample());
+            });
+        Box::pin(async move {
+            // Dropping the handle detaches the thread.
+            spawned.ok()?;
+            rx.await.ok()
+        })
+    })
+}
 
 /// The daemon's one host sample, reused for [`HOST_METRICS_MAX_AGE`].
 ///
@@ -189,9 +218,7 @@ impl Drop for RefreshDone {
 impl HostMetricsCache {
     pub fn new() -> Self {
         Self::with_sampler(
-            std::sync::Arc::new(|| -> SampleFuture {
-                Box::pin(async { tokio::task::spawn_blocking(sample_host).await.ok() })
-            }),
+            detached_sampler(std::sync::Arc::new(sample_host)),
             HOST_METRICS_SAMPLE_WAIT,
         )
     }
@@ -264,7 +291,7 @@ impl HostMetricsCache {
 
 /// Take one sample of this host, now. Blocking: a `statvfs` per role and two
 /// small file reads. Callers go through [`HostMetricsCache`], which runs it on
-/// Tokio's blocking pool, one at a time.
+/// a detached thread, one at a time.
 pub fn sample_host() -> HostMetrics {
     #[cfg(feature = "e2e")]
     if let Some(fixed) = e2e_fixed_sample() {
@@ -319,13 +346,16 @@ fn e2e_fixed_sample() -> Option<HostMetrics> {
 /// - **`working_root`** is the daemon's startup cwd
 ///   ([`crate::project_resolve::daemon_startup_cwd`]): captured once by
 ///   `run_daemon_with`, so the answer does not move if the process's cwd does,
-///   and it is the directory the deck was started from — the checkout its
-///   agents work in. A daemon is not otherwise told a "project root": agent
+///   and it is the directory the deck was started from. That is often the
+///   checkout its agents work in, but not necessarily: an agent's cwd is its
+///   own, and a dispatch worktree follows the directory of the agent that
+///   dispatched it. A daemon is not otherwise told a "project root": agent
 ///   cwds are per pane and come and go, and a configured `working_dir` belongs
 ///   to a schedule. A server started without `run_daemon_with` (a test harness)
 ///   never captured one, so it falls back to the process's current cwd.
 /// - **`worktree_parent`** is that root's parent, where the
-///   `../<repo>-dispatch-*` worktrees land (`CLAUDE.md` rule 14).
+///   `../<repo>-dispatch-*` worktrees land (`CLAUDE.md` rule 14) when they are
+///   dispatched from that root.
 /// - **`temp_root`** is the e2e harness's base: `DAD_E2E_TMPDIR` when set and
 ///   non-empty, else `/var/tmp/dad-e2e-<uid>` on Unix — the same two rungs
 ///   [`crate::config_write_guard::default_test_roots`] names, read the same way.
@@ -745,6 +775,61 @@ mod single_flight_tests {
                 "the next request started one refresh"
             );
         });
+    }
+
+    /// Scenario: The production sampler runs a sample that never returns, as a
+    /// statvfs on a hung mount would; a request on the daemon's kind of runtime
+    /// gives up after its bounded wait, and dropping that runtime then finishes
+    /// while the sample is still stuck, so the stuck sample cannot hold up the
+    /// daemon's exit.
+    #[spec("protocol/host-metrics/011")]
+    #[test]
+    fn protocol_host_metrics_011_runtime_shutdown_does_not_wait_on_a_stuck_sample() {
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (release, released_rx) = std::sync::mpsc::channel::<()>();
+        let released_rx = Mutex::new(released_rx);
+        let stuck: Arc<dyn Fn() -> HostMetrics + Send + Sync> = Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            // Returns once the test releases it, or once the sender is dropped
+            // by a failing test, so no thread outlives the test binary's work.
+            let _ = released_rx.lock().unwrap().recv();
+            sample(1)
+        });
+        let cache = Arc::new(HostMetricsCache::with_sampler(
+            detached_sampler(stuck),
+            HOST_METRICS_SAMPLE_WAIT,
+        ));
+
+        // `#[tokio::main]` builds a multi-thread runtime; this is that kind.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime");
+        let reply = rt.block_on({
+            let cache = Arc::clone(&cache);
+            async move { cache.read().await }
+        });
+        assert_eq!(reply, None, "the request gave up on the stuck sample");
+        entered
+            .recv()
+            .expect("the sample started and is now stuck in its call");
+
+        // Dropping the runtime is what the daemon's exit does. It must finish
+        // while the sample is still stuck: nothing has been released yet.
+        let (dropped_tx, dropped) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            drop(rt);
+            let _ = dropped_tx.send(());
+        });
+        // Bounds a hang in a broken build; no assertion is made about how long
+        // a drop takes.
+        let outcome = dropped.recv_timeout(std::time::Duration::from_secs(30));
+        release.send(()).unwrap();
+        assert!(
+            outcome.is_ok(),
+            "dropping the runtime waited on the stuck sample: {outcome:?}"
+        );
     }
 
     /// Scenario: A statvfs result with a zero fragment size yields neither a
