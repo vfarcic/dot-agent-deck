@@ -86,6 +86,10 @@ pub enum RefusalReason {
     UnknownPane,
     /// `--orchestration-of` named a pane that is not an orchestration role.
     NotAnOrchestration,
+    /// The selector names more entries, or longer ones, than one request may
+    /// (`crate::close_agents::MAX_SELECTOR_ENTRIES` and its siblings). The
+    /// whole request is refused before anything is resolved or stopped.
+    SelectorTooLarge,
     /// A reason from a newer daemon this build does not know.
     #[serde(other)]
     Unknown,
@@ -117,6 +121,7 @@ impl RefusalReason {
             RefusalReason::BulkRequiresDryRun => "bulk-requires-dry-run",
             RefusalReason::UnknownPane => "unknown-pane",
             RefusalReason::NotAnOrchestration => "not-an-orchestration",
+            RefusalReason::SelectorTooLarge => "selector-too-large",
             RefusalReason::Unknown => "unknown",
         }
     }
@@ -140,6 +145,19 @@ pub enum UnitKind {
     /// `pane spawn` and `clear = true` respawns, where a frozen list of agent
     /// ids would not. The terminal pane and generation are the ones a
     /// completion must come from: the orchestrator role the task went to.
+    ///
+    /// **Invariant (PRD #1589 D5):** a respawn of the terminal generation — a
+    /// new agent replacing the orchestrator in its pane while the instance
+    /// lives on — must move `terminal_agent_id` to the replacement, or
+    /// [`DispatchedUnits::mark_completed`] stops matching and the unit can then
+    /// only be closed with `--force`. The registry's respawn seam does that
+    /// ([`DispatchedUnits::note_generation_replaced`]). No user-facing route
+    /// respawns the orchestrator role today — `clear = true` delegation and
+    /// `pane restart` target workers only, and `pane spawn` refuses the start
+    /// role — but the low-level registry respawn
+    /// (`AgentPtyRegistry::respawn_agent_for_pane`) can replace any pane, and
+    /// a route that replaces the orchestrator by any other means owes the same
+    /// update.
     Orchestration {
         orchestration_id: String,
         name: String,
@@ -348,13 +366,19 @@ pub struct DispatchedUnits {
     tombstones: VecDeque<Tombstone>,
 }
 
+/// How many hex characters of OS randomness a daemon's epoch keeps: 64 bits.
+///
+/// The epoch is what stops a unit id a previous daemon issued — one a script
+/// held across `daemon restart` — from naming a unit of this daemon, whose
+/// counter starts at 1 again. With the six characters it started with, two
+/// epochs matched one time in about 16.7 million (auditor B4 note); at 64 bits
+/// a match is not a case that occurs.
+pub const EPOCH_HEX_CHARS: usize = 16;
+
 impl Default for DispatchedUnits {
     fn default() -> Self {
-        // Six hex characters of OS randomness: a collision between two
-        // daemons' epochs only matters for the "the daemon restarted" hint,
-        // and even then the counter rarely lines up.
         let token = crate::hook_provenance::mint();
-        Self::with_epoch(&token[..6])
+        Self::with_epoch(&token[..EPOCH_HEX_CHARS])
     }
 }
 
@@ -393,12 +417,6 @@ impl DispatchedUnits {
         id
     }
 
-    /// Undo a [`Self::register`] whose spawn did not go ahead. Leaves no
-    /// tombstone: the unit never existed.
-    pub fn rollback(&mut self, id: &str) {
-        self.live.retain(|u| u.id != id);
-    }
-
     pub fn get(&self, id: &str) -> Option<&DispatchedUnit> {
         self.live.iter().find(|u| u.id == id)
     }
@@ -432,6 +450,10 @@ impl DispatchedUnits {
     /// role of an orchestration never matches, because only the terminal
     /// generation does. Idempotent: a duplicate report keeps the first time.
     /// Returns the unit id it marked, if any.
+    ///
+    /// Compares against the terminal generation recorded at registration; see
+    /// the invariant on [`UnitKind::Orchestration`] for the respawn that would
+    /// have to update it.
     pub fn mark_completed(
         &mut self,
         pane_id: &str,
@@ -444,6 +466,39 @@ impl DispatchedUnits {
             .find(|u| u.kind.terminal() == (pane_id, sender_agent_id))?;
         if unit.completed_at_ms.is_none() {
             unit.completed_at_ms = Some(now_ms);
+        }
+        Some(unit.id.clone())
+    }
+
+    /// PRD #1589 D5: the generation `old_agent_id` in `pane_id` was replaced
+    /// in place by `new_agent_id` (a respawn). A unit bound to the old
+    /// generation — a single unit that IS it, or an orchestration whose
+    /// terminal generation it was — follows it, so the replacement's attested
+    /// completion still marks the unit and a close still reaches it. The
+    /// completion mark is kept: a respawn is not new work (see the module
+    /// note for the follow-up that is). Returns the unit id it moved, if any.
+    pub fn note_generation_replaced(
+        &mut self,
+        pane_id: &str,
+        old_agent_id: &str,
+        new_agent_id: &str,
+    ) -> Option<String> {
+        let unit = self.live.iter_mut().find(|u| match &u.kind {
+            UnitKind::Single {
+                pane_id: p,
+                agent_id: a,
+            } => p == pane_id && a == old_agent_id,
+            UnitKind::Orchestration {
+                terminal_pane_id: p,
+                terminal_agent_id: a,
+                ..
+            } => p == pane_id && a == old_agent_id,
+        })?;
+        match &mut unit.kind {
+            UnitKind::Single { agent_id, .. } => *agent_id = new_agent_id.to_string(),
+            UnitKind::Orchestration {
+                terminal_agent_id, ..
+            } => *terminal_agent_id = new_agent_id.to_string(),
         }
         Some(unit.id.clone())
     }
@@ -534,7 +589,8 @@ impl DispatchedUnits {
         ))
     }
 
-    /// Resolve a daemon-issued unit id, as `close --all --yes` applies them.
+    /// Resolve a daemon-issued unit id, as `close --all --yes` and `close
+    /// --unit-id` apply them.
     /// Authority is checked separately ([`authorize`]); this only finds it.
     pub fn resolve_id(&self, id: &str) -> Result<&DispatchedUnit, Refused> {
         if let Some(unit) = self.get(id) {
@@ -859,6 +915,60 @@ mod tests {
         assert_eq!(units.resolve_name("fix", &agent("a")).unwrap().id, new);
     }
 
+    /// Scenario: two records built the way the daemon builds them carry
+    /// epochs of [`EPOCH_HEX_CHARS`] random hex characters each, so a unit id
+    /// one daemon issued is foreign to the other rather than resolving there.
+    #[test]
+    fn a_daemon_epoch_is_sixty_four_bits_of_randomness() {
+        let mut first = DispatchedUnits::default();
+        let second = DispatchedUnits::default();
+        let id = first.register(single("fix", "a", "p1", "1"));
+        let epoch = id
+            .strip_prefix("u-")
+            .and_then(|rest| rest.rsplit_once('-'))
+            .map(|(epoch, _)| epoch)
+            .expect("u-<epoch>-<n>");
+        assert_eq!(epoch.len(), EPOCH_HEX_CHARS, "{id}");
+        assert!(epoch.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+        assert!(second.is_foreign_id(&id), "{id}");
+    }
+
+    /// Scenario: the orchestrator a unit's task went to is replaced in its
+    /// pane. The replacement's attested completion marks the unit and the old
+    /// generation's no longer does; a single unit follows its agent the same
+    /// way, and a replacement in some other pane moves nothing.
+    #[test]
+    fn a_replaced_terminal_generation_moves_the_unit_with_it() {
+        let mut units = DispatchedUnits::with_epoch("aaaaaa");
+        let team = units.register(NewUnit {
+            kind: UnitKind::Orchestration {
+                orchestration_id: "orch-1".into(),
+                name: "team".into(),
+                terminal_pane_id: "o-0".into(),
+                terminal_agent_id: "10".into(),
+            },
+            ..single("team", "a", "unused", "unused")
+        });
+        let one = units.register(single("fix", "a", "p1", "1"));
+        assert_eq!(units.note_generation_replaced("other", "10", "11"), None);
+        assert_eq!(
+            units.note_generation_replaced("o-0", "10", "11"),
+            Some(team.clone())
+        );
+        assert_eq!(units.mark_completed("o-0", "10", 5), None);
+        assert_eq!(units.mark_completed("o-0", "11", 5), Some(team));
+        assert_eq!(
+            units.note_generation_replaced("p1", "1", "2"),
+            Some(one.clone())
+        );
+        assert_eq!(
+            units
+                .unit_of_generation(Some("p1"), "2", None)
+                .map(|u| &u.id),
+            Some(&one)
+        );
+    }
+
     #[test]
     fn stale_ids_from_a_previous_daemon_are_unknown_with_a_restart_hint() {
         let mut before = DispatchedUnits::with_epoch("aaaaaa");
@@ -1029,20 +1139,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_leaves_no_trace() {
-        let mut units = DispatchedUnits::with_epoch("aaaaaa");
-        let id = units.register(single("fix", "a", "p1", "1"));
-        units.rollback(&id);
-        assert_eq!(
-            units
-                .resolve_name("fix", &Caller::Person)
-                .unwrap_err()
-                .reason,
-            RefusalReason::UnknownUnit
-        );
-    }
-
-    #[test]
     fn every_session_status_against_the_busy_set() {
         let table = [
             (SessionStatus::Thinking, true),
@@ -1102,6 +1198,7 @@ mod tests {
             Ambiguous,
             AlreadyEnded,
             BulkRequiresDryRun,
+            SelectorTooLarge,
         ] {
             assert!(!r.forceable(), "{r:?}");
         }
@@ -1114,6 +1211,7 @@ mod tests {
             RefusalReason::StrandsOrchestration,
             RefusalReason::BulkRequiresDryRun,
             RefusalReason::NotYourUnit,
+            RefusalReason::SelectorTooLarge,
         ] {
             assert_eq!(
                 serde_json::to_value(r).unwrap(),

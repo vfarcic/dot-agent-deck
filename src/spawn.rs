@@ -1129,6 +1129,9 @@ async fn spawn_with_unit(
                 // registry stores `pane_id_env = None` for it, so a
                 // pane-keyed write could never route to the pane the
                 // role map claimed to have.
+                // PRD #1589 (auditor S1): not for a role a close already took
+                // down since it was published — re-checked under the write
+                // guard below, which the close's unregister needs too.
                 if let Some(state) = state.filter(|_| {
                     crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
                         tracing::warn!(
@@ -1144,39 +1147,48 @@ async fn spawn_with_unit(
                     let title_cwd =
                         crate::state::orchestration_title_cwd_key(&req.working_dir).await;
                     let mut state = state.write().await;
-                    // Issue #962: the daemon holds the run title itself, beside
-                    // the role maps, so a `clear = true` worker re-created later
-                    // does not have to find a live sibling to read it from.
-                    // Already admitted before the loop (issue #1339), so this
-                    // keeps the claimed title rather than checking it again.
-                    state.record_orchestration_title(
-                        &identity,
-                        display_title.as_deref(),
-                        &title_cwd,
-                    );
-                    state.register_orchestration_role(
-                        &pane_id,
-                        &role.role_name,
-                        // `orch_idx`: this path's authority on which role is
-                        // the orchestrator — the pane that receives the
-                        // orchestrator context and the caller's task below. It
-                        // is the same rule (`project_config::orchestrator_index`)
-                        // the `Ctrl+n` tab sends in its membership, so both
-                        // `AttachRequest::StartAgent` and this path register the
-                        // same one pane for one config (issue #523).
-                        idx == orch_idx,
-                        identity.clone(),
-                        Some(req.working_dir.as_str()),
-                    );
-                    if let Some(tx) = event_tx {
-                        state.announce_unproven_evictions(tx);
-                    }
-                    // Issue #1395: the orchestrator's own context file, for its
-                    // `ListAgents` record and for removal when this ends.
-                    if idx == orch_idx
-                        && let Some(path) = context_path.clone()
-                    {
-                        state.record_orchestration_context(&identity, path);
+                    if !registry.generation_registered(&id) {
+                        tracing::info!(
+                            agent_id = %id,
+                            role = %role.role_name,
+                            "spawn: the role was closed before it was registered; \
+                             registering nothing for it"
+                        );
+                    } else {
+                        // Issue #962: the daemon holds the run title itself, beside
+                        // the role maps, so a `clear = true` worker re-created later
+                        // does not have to find a live sibling to read it from.
+                        // Already admitted before the loop (issue #1339), so this
+                        // keeps the claimed title rather than checking it again.
+                        state.record_orchestration_title(
+                            &identity,
+                            display_title.as_deref(),
+                            &title_cwd,
+                        );
+                        state.register_orchestration_role(
+                            &pane_id,
+                            &role.role_name,
+                            // `orch_idx`: this path's authority on which role is
+                            // the orchestrator — the pane that receives the
+                            // orchestrator context and the caller's task below. It
+                            // is the same rule (`project_config::orchestrator_index`)
+                            // the `Ctrl+n` tab sends in its membership, so both
+                            // `AttachRequest::StartAgent` and this path register the
+                            // same one pane for one config (issue #523).
+                            idx == orch_idx,
+                            identity.clone(),
+                            Some(req.working_dir.as_str()),
+                        );
+                        if let Some(tx) = event_tx {
+                            state.announce_unproven_evictions(tx);
+                        }
+                        // Issue #1395: the orchestrator's own context file, for its
+                        // `ListAgents` record and for removal when this ends.
+                        if idx == orch_idx
+                            && let Some(path) = context_path.clone()
+                        {
+                            state.record_orchestration_context(&identity, path);
+                        }
                     }
                 }
                 agents.push(SpawnedAgent {

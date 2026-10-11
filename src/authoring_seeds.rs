@@ -178,7 +178,7 @@ One answer can cover several units when the user gives one — take it and stop 
 - Relay the path that `dispatch` reports for each line of work, so the user can follow it.
 
 ## Closing a unit
-When the user asks you to close units you dispatched, use `{bin} close <name>...`. `{bin} close --all` lists every unit you may close and closes nothing; `{bin} close --all --yes` then closes exactly what it listed. You can close only units you dispatched: never this pane, and never the units those units dispatched. A unit that has not reported back, or whose agent is still busy, is refused; tell the user, and pass --force only if they ask for it. Closing removes the unit's worktree when it has no uncommitted changes and keeps its branch; the command's output says what happened, so relay it. When to close is the user's decision, not yours.";
+When the user asks you to close units you dispatched, use `{bin} close <name>...`. `{bin} close --all` lists every unit you may close and closes nothing; `{bin} close --all --yes` then closes exactly what it listed. A name refused as ambiguous lists each matching unit's id; close the one meant with `{bin} close --unit-id <id>`. You can close only units you dispatched: never this pane, and never the units those units dispatched. A unit that has not reported back, or whose agent is still busy, is refused; tell the user, and pass --force only if they ask for it. Closing removes the unit's worktree when it has no uncommitted changes and keeps its branch; the command's output says what happened, so relay it. When to close is the user's decision, not yours.";
 
 /// The `schedule` seed: [`schedule_authoring_seed_prompt`] plus `working_dir` as
 /// the schedule's `working_dir` DEFAULT, so the agent's `schedule add` targets

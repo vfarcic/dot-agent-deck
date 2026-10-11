@@ -144,6 +144,9 @@ impl AmbientIdentity {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CloseArgs {
     pub units: Vec<String>,
+    /// `--unit-id`: units by the daemon-issued id a listing or an `ambiguous`
+    /// refusal printed.
+    pub unit_ids: Vec<String>,
     pub pane: Option<String>,
     pub orchestration_of: Option<String>,
     pub all: bool,
@@ -158,16 +161,22 @@ impl CloseArgs {
     /// given; this reports it again for a caller that built the struct itself.
     pub fn selector(&self) -> Result<CloseSelector, String> {
         let given = usize::from(!self.units.is_empty())
+            + usize::from(!self.unit_ids.is_empty())
             + usize::from(self.pane.is_some())
             + usize::from(self.orchestration_of.is_some())
             + usize::from(self.all);
         if given != 1 {
             return Err(
-                "name what to close: unit names, --pane, --orchestration-of or --all".to_string(),
+                "name what to close: unit names, --unit-id, --pane, --orchestration-of or --all"
+                    .to_string(),
             );
         }
         Ok(if self.all {
             CloseSelector::AllUnits
+        } else if !self.unit_ids.is_empty() {
+            CloseSelector::UnitIds {
+                ids: self.unit_ids.clone(),
+            }
         } else if let Some(pane_id) = &self.pane {
             CloseSelector::Pane {
                 pane_id: pane_id.clone(),
@@ -205,9 +214,10 @@ pub async fn run_close(
     };
     let claim = identity.claim();
     let bulk = selector == CloseSelector::AllUnits;
-    // `--all` alone is a preview: the daemon refuses a bulk selector that is
-    // not a dry run, so this only spells out what it will enforce anyway.
-    let dry_run = args.dry_run || (bulk && !args.yes);
+    // `--all` is always sent as a preview, `--yes` or not: the daemon refuses
+    // a bulk selector that is not a dry run, and `--all --yes` applies by the
+    // ids this preview lists, in a second request (auditor S2).
+    let dry_run = args.dry_run || bulk;
     let first = match client
         .close_agents(selector, claim.clone(), args.force, dry_run)
         .await
@@ -237,6 +247,12 @@ pub async fn run_close(
         Ok(applied) => render(&applied, Some(&first), args.json),
         Err(e) => client_error_output(args.json, &e),
     }
+}
+
+/// The output for an identity [`ambient_identity`] refused, honouring
+/// `--json` like every other error (reviewer N3).
+pub fn identity_error_output(json: bool, message: String) -> CloseOutput {
+    error_output(json, message, EXIT_REFUSED)
 }
 
 fn error_output(json: bool, message: String, code: u8) -> CloseOutput {
@@ -457,6 +473,12 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
             )
         })
         .collect();
+    if report.truncated {
+        out.push_str(&format!(
+            "listed only the first {} units; more are running. Close these, then list again.\n",
+            listed.len() + closed.len() + refused.len()
+        ));
+    }
     if report.dry_run {
         if listed.is_empty() && refused.is_empty() {
             out.push_str("nothing to close\n");
@@ -805,6 +827,57 @@ mod tests {
             "bidi override must be escaped: {text}"
         );
         assert!(text.contains("evil\\nname"), "{text}");
+    }
+
+    /// Scenario: `--unit-id` names units by the ids a listing printed and
+    /// sends them as the id selector, alone or with several ids; combined with
+    /// any other selector it is refused before anything is sent.
+    #[test]
+    fn unit_ids_select_by_id_and_exclude_every_other_selector() {
+        let args = CloseArgs {
+            unit_ids: vec!["u-abc-1".into(), "u-abc-2".into()],
+            ..CloseArgs::default()
+        };
+        assert_eq!(
+            args.selector(),
+            Ok(CloseSelector::UnitIds {
+                ids: vec!["u-abc-1".into(), "u-abc-2".into()]
+            })
+        );
+        for other in [
+            CloseArgs {
+                units: vec!["a".into()],
+                ..args.clone()
+            },
+            CloseArgs {
+                pane: Some("p".into()),
+                ..args.clone()
+            },
+            CloseArgs {
+                orchestration_of: Some("p".into()),
+                ..args.clone()
+            },
+            CloseArgs {
+                all: true,
+                ..args.clone()
+            },
+        ] {
+            assert!(other.selector().is_err(), "{other:?}");
+        }
+    }
+
+    /// Scenario: a shell carrying part of a deck pane's identity runs `close
+    /// --json`; the refusal is printed as JSON on stdout as well as on stderr,
+    /// with exit status 1.
+    #[test]
+    fn an_identity_refusal_honours_json() {
+        let out = identity_error_output(true, "refused: partial identity".into());
+        assert_eq!(out.code, EXIT_REFUSED);
+        let value: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(value["error"], "refused: partial identity");
+        assert_eq!(value["exit_code"], 1);
+        assert!(out.stderr.contains("partial identity"));
+        assert!(identity_error_output(false, "x".into()).stdout.is_empty());
     }
 
     #[test]

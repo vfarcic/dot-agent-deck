@@ -8940,25 +8940,30 @@ async fn dispatch_one_owned(
                     // permanent breakage issue #606 reports.
                     if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
                         let mut state = state.write().await;
-                        // Issue #962: a close that completed took this pane's
-                        // identity with it, and if it was the last pane mapping
-                        // to it the title went too. Put back the record read
-                        // when the delegate arrived, under ITS cwd.
-                        if let Some(held) = recorded_title.as_ref() {
-                            state.record_orchestration_title(
-                                &identity,
-                                held.display_title.as_deref(),
-                                &held.cwd,
+                        // PRD #1589 (auditor S1): not for a re-created agent a
+                        // close already took down — it unregistered the pane
+                        // after removing the record this reads.
+                        if registry.generation_registered(&new_agent_id) {
+                            // Issue #962: a close that completed took this pane's
+                            // identity with it, and if it was the last pane mapping
+                            // to it the title went too. Put back the record read
+                            // when the delegate arrived, under ITS cwd.
+                            if let Some(held) = recorded_title.as_ref() {
+                                state.record_orchestration_title(
+                                    &identity,
+                                    held.display_title.as_deref(),
+                                    &held.cwd,
+                                );
+                            }
+                            state.register_orchestration_role(
+                                &pane_id,
+                                &target_role,
+                                false,
+                                identity,
+                                cwd.as_deref(),
                             );
+                            state.announce_unproven_evictions(&event_tx);
                         }
-                        state.register_orchestration_role(
-                            &pane_id,
-                            &target_role,
-                            false,
-                            identity,
-                            cwd.as_deref(),
-                        );
-                        state.announce_unproven_evictions(&event_tx);
                     }
                 }
                 // Issue #962: the replacement holds the title from here on (a
@@ -14288,8 +14293,17 @@ pub async fn handle_restart_role_with_state(
                 let cwd = resolved.cwd.clone();
                 let title = resolved.title.clone();
                 let event_tx = event_tx.clone();
+                let registry = registry.clone();
+                let new_agent_id = new_agent_id.clone();
                 tokio::spawn(async move {
                     let mut state = state.write().await;
+                    // PRD #1589 (auditor S1): a close that took the re-created
+                    // agent down before this detached task got the guard has
+                    // already unregistered the pane; registering it again would
+                    // resurrect the role for a closed pane.
+                    if !registry.generation_registered(&new_agent_id) {
+                        return;
+                    }
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
                     // makes — a close that took the last pane mapping to this
                     // identity pruned its title too (Qodo, PR #1336).
@@ -14528,8 +14542,25 @@ pub async fn handle_spawn_role_with_state(
     // spawn of the same role won the race in the window between the
     // read-guard check above and here, close the just-spawned agent rather
     // than registering a second live pane for the role.
+    registry.before_role_registration().await;
     {
         let mut state_guard = state.write().await;
+        // PRD #1589 (auditor S1): a `close` of this instance that took the
+        // just-published generation down while this handler waited for the
+        // guard removed its record first, and unregisters the pane under this
+        // same guard after. Registering it now would re-create the role, and
+        // broadcasting it a card, for a pane already closed — so neither
+        // happens, and the spawn is reported as not having gone ahead.
+        if !registry.generation_registered(&agent_id) {
+            return SpawnRoleResponse {
+                spawned: false,
+                error: Some(format!(
+                    "role `{}` was closed before its spawn finished registering",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        }
         let still_live =
             state_guard.delegate_targets(&signal.pane_id, std::slice::from_ref(&signal.role));
         if !still_live.is_empty() {
@@ -14562,32 +14593,34 @@ pub async fn handle_spawn_role_with_state(
             resolved.cwd.as_deref(),
         );
         state_guard.announce_unproven_evictions(event_tx);
-    }
 
-    // Best-effort, like `surface_spawned_orchestration`'s own
-    // `let _ = event_tx.send(...)` (`src/spawn.rs`): a live TUI merging
-    // this into an already-open orchestration tab is issue #868's job,
-    // not this one's — this just needs to emit the broadcast correctly.
-    let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
-        name: orchestration_name,
-        cwd: resolved.cwd.clone().unwrap_or_default(),
-        display_title: resolved.display_title.clone(),
-        // Carry the calling orchestration's own instance token so the TUI's
-        // tab-growth match (`TabManager::orchestration_tab_index_for`) can
-        // tell two same-name, same-cwd orchestration instances apart instead
-        // of merging this role into whichever tab happens to match the bare
-        // `(cwd, name)` tuple first.
-        orchestration_id,
-        roles: vec![OrchestrationSurfaceRole {
-            pane_id: pane_id.clone(),
-            role_index: resolved.role_index,
-            role_name: signal.role.clone(),
-            is_start_role: false,
-        }],
-        // Issue #1395: a spawned role is never the start role, which alone
-        // carries the context path.
-        context_path: None,
-    }));
+        // Best-effort, like `surface_spawned_orchestration`'s own
+        // `let _ = event_tx.send(...)` (`src/spawn.rs`): a live TUI merging
+        // this into an already-open orchestration tab is issue #868's job,
+        // not this one's — this just needs to emit the broadcast correctly.
+        // Under the guard (PRD #1589, auditor S1), so it precedes the removal
+        // broadcast of any close that unregisters this pane after it.
+        let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
+            name: orchestration_name,
+            cwd: resolved.cwd.clone().unwrap_or_default(),
+            display_title: resolved.display_title.clone(),
+            // Carry the calling orchestration's own instance token so the TUI's
+            // tab-growth match (`TabManager::orchestration_tab_index_for`) can
+            // tell two same-name, same-cwd orchestration instances apart instead
+            // of merging this role into whichever tab happens to match the bare
+            // `(cwd, name)` tuple first.
+            orchestration_id,
+            roles: vec![OrchestrationSurfaceRole {
+                pane_id: pane_id.clone(),
+                role_index: resolved.role_index,
+                role_name: signal.role.clone(),
+                is_start_role: false,
+            }],
+            // Issue #1395: a spawned role is never the start role, which alone
+            // carries the context path.
+            context_path: None,
+        }));
+    }
 
     SpawnRoleResponse {
         spawned: true,

@@ -129,6 +129,17 @@ pub const MAX_ENDED_INSTANCES: usize = 256;
 pub const INSTANCE_CLOSING_REASON: &str =
     "the orchestration is being closed; no new pane may join it";
 
+/// PRD #1589: the orchestration instance token a membership names, if any.
+pub fn orchestration_instance_of(membership: Option<&TabMembership>) -> Option<&str> {
+    match membership {
+        Some(TabMembership::Orchestration {
+            orchestration_id: Some(id),
+            ..
+        }) => Some(id),
+        _ => None,
+    }
+}
+
 /// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
 /// `daemon serve` captures its parent pid at startup and gracefully exits once
 /// it is orphaned (parent becomes `init`/pid 1, or otherwise changes). OFF by
@@ -5604,6 +5615,14 @@ pub struct AgentPtyRegistry {
     /// child is terminated — see [`Self::pause_next_respawn_for_test`].
     #[cfg(test)]
     respawn_pause: RespawnPause,
+    /// PRD #1589 test seam: see
+    /// [`Self::pause_next_role_registration_for_test`].
+    #[cfg(test)]
+    role_registration_pause: RespawnPause,
+    /// PRD #1589 test seam: see
+    /// [`Self::pause_next_close_revalidation_for_test`].
+    #[cfg(test)]
+    close_revalidation_pause: RespawnPause,
 }
 
 /// See [`AgentPtyRegistry::pause_next_publish_for_test`].
@@ -5649,9 +5668,11 @@ impl Drop for RespawnTicket<'_> {
             .unwrap_or_else(|p| p.into_inner());
         inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
         inner.respawning_dirs.remove(&self.agent_id);
-        if inner.respawns_in_flight == 0 {
-            self.registry.respawns_settled.notify_waiters();
-        }
+        inner.respawning_members.remove(&self.agent_id);
+        // Every settle, not only the last: a close waits for the respawns of
+        // ONE instance (PRD #1589), and re-reads what it waits for on each
+        // wake, as `freeze_admission` re-reads the count.
+        self.registry.respawns_settled.notify_waiters();
     }
 }
 
@@ -7020,6 +7041,13 @@ struct RegistryInner {
     /// Inserted under the lock that removes the record and released by
     /// [`RespawnTicket`], which outlives the replacement's publication.
     respawning_dirs: HashMap<String, Vec<PathBuf>>,
+    /// PRD #1589 (auditor B1/B2): the record each pane in its respawn window
+    /// had when it was lifted out, keyed by the old generation's agent id —
+    /// inserted and released with [`Self::respawning_dirs`]. A close reads it
+    /// to see the members it cannot enumerate from `agents` in that window: an
+    /// orchestration whose only remaining role is mid-respawn has no record,
+    /// and is not therefore gone.
+    respawning_members: HashMap<String, AgentRecord>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -7503,6 +7531,7 @@ impl AgentPtyRegistry {
                 closing_instances: HashSet::new(),
                 ended_instances: VecDeque::new(),
                 respawning_dirs: HashMap::new(),
+                respawning_members: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
             }),
@@ -7539,6 +7568,10 @@ impl AgentPtyRegistry {
             respawns_settled: Notify::new(),
             #[cfg(test)]
             respawn_pause: Mutex::new(None),
+            #[cfg(test)]
+            role_registration_pause: Mutex::new(None),
+            #[cfg(test)]
+            close_revalidation_pause: Mutex::new(None),
         }
     }
 
@@ -12967,10 +13000,26 @@ impl AgentPtyRegistry {
                 }
                 return Err(AgentPtyError::NotFound(pane_id_env.to_string()));
             }
+            // PRD #1589 D4 (auditor B2): a pane of an orchestration instance a
+            // `close` is taking down, or has finished, is not respawned. Under
+            // the same lock hold as the removal below, and the close opens its
+            // admission state under this lock too, so a respawn either sees the
+            // close and leaves the running generation exactly as it was, or is
+            // admitted first and counted in `respawning_members`, where the
+            // close finds it and waits for it to settle. Refusing at the fresh
+            // spawn instead — which also happens — would come after the old
+            // child was terminated: a refused respawn that destroyed its pane.
+            if let Some(instance) = inner.agents.get(&agent_id).and_then(|a| {
+                orchestration_instance_of(a.tab_membership.as_ref()).map(str::to_string)
+            }) && Self::instance_refuses_spawns_locked(&inner, &instance)
+            {
+                return Err(AgentPtyError::Spawn(INSTANCE_CLOSING_REASON.into()));
+            }
             let removed = inner
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
+            let removed_record = Self::cleanup_record(&agent_id, &removed);
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
             // `spawn_agent` resets what a new occupant must not inherit. The
@@ -12982,6 +13031,9 @@ impl AgentPtyRegistry {
             // has neither a record nor a reservation. Released with the ticket.
             let dirs = removed.rooted_dirs().collect();
             inner.respawning_dirs.insert(agent_id.clone(), dirs);
+            inner
+                .respawning_members
+                .insert(agent_id.clone(), removed_record);
             // LAST in this lock hold, and nothing that can fail comes between
             // it and the ticket below (PRD #1487 final audit F3): a panic after
             // the increment and before the ticket exists would leak the count,
@@ -13256,6 +13308,23 @@ impl AgentPtyRegistry {
             agent.agent_type = Some(observed);
             agent.badge_command = previous_badge_command;
         }
+        // PRD #1589 D5: a dispatched unit bound to the replaced generation — a
+        // single unit's agent, or an orchestration's terminal generation —
+        // follows it to the replacement, so the replacement's completion marks
+        // the unit and a close of the unit reaches it. Before the ticket is
+        // released, so a close waiting on this respawn reads the moved unit.
+        if let Some(unit_id) = self.dispatched_units().note_generation_replaced(
+            pane_id_env,
+            &in_flight.agent_id,
+            &new_agent_id,
+        ) {
+            tracing::debug!(
+                unit_id = %unit_id,
+                pane_id = %pane_id_env,
+                agent_id = %new_agent_id,
+                "respawn: the dispatched unit follows its replaced generation"
+            );
+        }
         Ok(new_agent_id)
     }
 
@@ -13378,6 +13447,17 @@ impl AgentPtyRegistry {
         // in the daemon log without a 30 s wait filling it with 600 lines.
         let mut reported_slow = false;
         loop {
+            // PRD #1589 D4 (auditor B2): a pane of an instance a `close` is
+            // taking down, or has finished, is not re-created. Checked on every
+            // round, so queued clear work waiting here for a pane's close does
+            // not wait out a whole-instance close and then recreate the role;
+            // the create leg's reservation refuses it as well, and this answers
+            // without spending the wait first.
+            if let Some(instance) = orchestration_instance_of(identity.tab_membership.as_ref())
+                && self.is_instance_closing(instance)
+            {
+                return Err(AgentPtyError::Spawn(INSTANCE_CLOSING_REASON.into()));
+            }
             while self.pane_close_in_flight(pane_id_env) && tokio::time::Instant::now() < deadline {
                 if !reported_slow && waited_from.elapsed() >= PANE_CLOSE_SETTLE_TIMEOUT {
                     reported_slow = true;
@@ -16132,6 +16212,105 @@ impl AgentPtyRegistry {
             instance: instance.to_string(),
             finished: false,
         })
+    }
+
+    /// PRD #1589 (auditor B1/B2): the records of every pane in its respawn
+    /// window — lifted out of `agents` and not yet replaced — keyed by the
+    /// replaced generation's agent id. Those are members a close cannot
+    /// enumerate from the registry's records and must not read as gone.
+    pub fn respawning_members(&self) -> Vec<AgentRecord> {
+        let inner = self.inner.lock().unwrap();
+        let mut members: Vec<AgentRecord> = inner.respawning_members.values().cloned().collect();
+        members.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
+        members
+    }
+
+    /// PRD #1589 (auditor B1/B2): wait, at most `timeout`, until none of the
+    /// respawns of the generations in `agent_ids` is still in its window.
+    /// `true` once they have all settled — replaced, or failed — and `false`
+    /// on timeout.
+    pub async fn wait_respawns_settled(&self, agent_ids: &[String], timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Registered before the set is read, so a respawn that settles in
+            // between cannot be missed.
+            let settled = self.respawns_settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            let pending = {
+                let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                agent_ids
+                    .iter()
+                    .any(|id| inner.respawning_members.contains_key(id))
+            };
+            if !pending {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// PRD #1589 (auditor S1): whether the generation `agent_id` is still in
+    /// this registry — live or exited, but not removed. A handler that
+    /// published a generation and then registers its role, or broadcasts its
+    /// start, checks this under the state WRITE guard first: a close removes
+    /// the record before it takes that guard to unregister the pane, so a
+    /// registration that sees the record lands before the close's unregister,
+    /// and one that does not see it is of a generation already closed.
+    pub fn generation_registered(&self, agent_id: &str) -> bool {
+        self.inner.lock().unwrap().agents.contains_key(agent_id)
+    }
+
+    /// PRD #1589 test seam: the next handler that published a generation and
+    /// is about to register its role (or broadcast its start) reports on the
+    /// returned receiver and waits for the returned sender first — the window
+    /// auditor S1 found.
+    #[cfg(test)]
+    pub(crate) fn pause_next_role_registration_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.role_registration_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Where [`Self::pause_next_role_registration_for_test`] waits. A no-op
+    /// outside tests.
+    pub(crate) async fn before_role_registration(&self) {
+        #[cfg(test)]
+        {
+            let pause = self.role_registration_pause.lock().unwrap().take();
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
+    }
+
+    /// PRD #1589 test seam: the next close that has taken its holds reports
+    /// on the returned receiver and waits for the returned sender before it
+    /// re-validates its caller and refusals (D11's after-holds window).
+    #[cfg(test)]
+    pub(crate) fn pause_next_close_revalidation_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.close_revalidation_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Where [`Self::pause_next_close_revalidation_for_test`] waits.
+    #[cfg(test)]
+    pub(crate) async fn before_close_revalidation(&self) {
+        let pause = self.close_revalidation_pause.lock().unwrap().take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
     }
 
     /// PRD #1589 test seam: make the next [`Self::close_agent`] of `agent_id`

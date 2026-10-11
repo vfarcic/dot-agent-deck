@@ -205,10 +205,11 @@ enum Commands {
     },
     /// Close dispatched units, one agent, or one orchestration.
     ///
-    /// Name units by the name they were dispatched under, or close one pane
-    /// with --pane, or every role of an orchestration with --orchestration-of.
-    /// --all lists every unit you may close and closes nothing; --all --yes
-    /// lists them, then closes exactly those.
+    /// Name units by the name they were dispatched under, or by the unit id a
+    /// listing printed with --unit-id, or close one pane with --pane, or every
+    /// role of an orchestration with --orchestration-of. --all lists every
+    /// unit you may close and closes nothing; --all --yes lists them, then
+    /// closes exactly those.
     ///
     /// Refused unless --force: a dispatched unit that has not reported
     /// `work-done --done`, an agent that is mid-turn, and one role of a live
@@ -221,8 +222,17 @@ enum Commands {
     /// daemon is running.
     Close {
         /// Dispatched units to close, by the name given to `dispatch`.
-        #[arg(conflicts_with_all = ["pane", "orchestration_of", "all"])]
+        #[arg(conflicts_with_all = ["unit_ids", "pane", "orchestration_of", "all"])]
         units: Vec<String>,
+        /// Dispatched units to close, by the unit id `close --all` (or an
+        /// `ambiguous` refusal) printed. Repeat it, or give several ids.
+        #[arg(
+            long = "unit-id",
+            value_name = "ID",
+            num_args = 1..,
+            conflicts_with_all = ["pane", "orchestration_of", "all"]
+        )]
+        unit_ids: Vec<String>,
         /// Close the one agent in this pane.
         #[arg(long, value_name = "PANE_ID", conflicts_with_all = ["orchestration_of", "all"])]
         pane: Option<String>,
@@ -1666,6 +1676,7 @@ fn main() -> ExitCode {
         }
         Some(Commands::Close {
             units,
+            unit_ids,
             pane,
             orchestration_of,
             all,
@@ -1676,6 +1687,7 @@ fn main() -> ExitCode {
         }) => {
             let args = dot_agent_deck::close_cli::CloseArgs {
                 units,
+                unit_ids,
                 pane,
                 orchestration_of,
                 all,
@@ -3402,8 +3414,10 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
     let identity = match dot_agent_deck::close_cli::ambient_identity() {
         Ok(identity) => identity,
         Err(message) => {
-            eprintln!("close: {message}");
-            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+            let output = dot_agent_deck::close_cli::identity_error_output(args.json, message);
+            print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
+            return ExitCode::from(output.code);
         }
     };
     let client = DaemonClient::new(client_attach_socket_path());

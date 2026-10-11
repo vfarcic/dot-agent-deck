@@ -2973,6 +2973,10 @@ pub struct CloseReport {
     /// bulk selector came without `dry_run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<CloseRefusal>,
+    /// `--all` listed only the first `crate::close_agents::MAX_LISTED_TARGETS`
+    /// units: more were live. Additive (auditor S4); absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// One entry per resolved target, or per selector entry that did not
     /// resolve.
     #[serde(default)]
@@ -6078,62 +6082,90 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // panes (and a legacy `TabMembership::Mode` pane)
                     // don't participate in delegate dispatch.
-                    if let (Some(pane_id), Some(meta)) =
-                        (pane_id_env.as_deref(), orchestration_meta)
+                    //
+                    // PRD #1589 (auditor S1): registration and the start's
+                    // broadcast run under ONE state write guard, and only for a
+                    // generation still in the registry. A `close` that took this
+                    // generation down in the window since it was published
+                    // removed its record before taking this guard to unregister
+                    // the pane, so a start that sees the record registers and
+                    // announces ahead of that unregister and its removal
+                    // broadcast, and one that does not see it registers and
+                    // announces nothing — it would re-create a role and a card
+                    // for a pane already closed.
+                    registry.before_role_registration().await;
                     {
-                        // Shared with the daemon-internal spawn path
-                        // (`crate::spawn::spawn`) — see
-                        // [`crate::state::AppState::register_orchestration_role`]
-                        // for why this must not be inlined again. The identity
-                        // is the one the title check above scoped by
-                        // (`OrchestrationSpawnMeta::identity`).
-                        let identity = meta.identity();
                         let mut state = state.write().await;
-                        state.register_orchestration_role(
-                            pane_id,
-                            &meta.role_name,
-                            meta.is_start_role,
-                            identity.clone(),
-                            cwd_for_state.as_deref(),
-                        );
-                        // Issue #697: outside cards the registration dropped
-                        // leave every attached client's view too.
-                        state.announce_unproven_evictions(&event_tx);
-                        // Issue #555: the registered pane holds the title from
-                        // here on, so this start's in-flight claim ends — under
-                        // the same guard, so there is no instant in which
-                        // neither holds it.
-                        if title_claim.is_some() {
-                            state.release_orchestration_title_claim(&identity);
+                        if !registry.generation_registered(&id) {
+                            if let Some(identity) = title_claim.as_ref() {
+                                state.release_orchestration_title_claim(identity);
+                            }
+                            info!(
+                                agent_id = %id,
+                                "start: the agent was closed before its start was registered; \
+                                 registering and announcing nothing for it"
+                            );
+                        } else {
+                            if let (Some(pane_id), Some(meta)) =
+                                (pane_id_env.as_deref(), orchestration_meta)
+                            {
+                                // Shared with the daemon-internal spawn path
+                                // (`crate::spawn::spawn`) — see
+                                // [`crate::state::AppState::register_orchestration_role`]
+                                // for why this must not be inlined again. The
+                                // identity is the one the title check above
+                                // scoped by (`OrchestrationSpawnMeta::identity`).
+                                let identity = meta.identity();
+                                state.register_orchestration_role(
+                                    pane_id,
+                                    &meta.role_name,
+                                    meta.is_start_role,
+                                    identity.clone(),
+                                    cwd_for_state.as_deref(),
+                                );
+                                // Issue #697: outside cards the registration
+                                // dropped leave every attached client's view too.
+                                state.announce_unproven_evictions(&event_tx);
+                                // Issue #555: the registered pane holds the title
+                                // from here on, so this start's in-flight claim
+                                // ends — under the same guard, so there is no
+                                // instant in which neither holds it.
+                                if title_claim.is_some() {
+                                    state.release_orchestration_title_claim(&identity);
+                                }
+                                // Issue #1395: only the start role carries the
+                                // coordinator's context, so only it records the
+                                // file.
+                                if meta.is_start_role
+                                    && let Some(path) = prepared_context_path
+                                {
+                                    state.record_orchestration_context(&identity, path);
+                                }
+                            }
+                            // PRD #1223: announce the start to every attached
+                            // TUI, not only to the client that sent it — a
+                            // desktop start was otherwise invisible to an
+                            // already-attached TUI. After the record is published
+                            // and the role registered, before the reply. See
+                            // `crate::spawn::surface_attach_started_agent` for
+                            // what is emitted and why the sending TUI is
+                            // unaffected.
+                            if let Some(mut record) = registry.agent_record_any(&id) {
+                                // Issue #1395 item 1: the start role's surface
+                                // carries the context file recorded just above,
+                                // so a live tab re-arms from its own file.
+                                // Stamped from daemon state only — the
+                                // `ListAgents` rule — never from the request.
+                                state.attach_orchestrator_context_paths(std::slice::from_mut(
+                                    &mut record,
+                                ));
+                                crate::spawn::surface_attach_started_agent(
+                                    &event_tx,
+                                    &record,
+                                    command.as_deref(),
+                                );
+                            }
                         }
-                        // Issue #1395: only the start role carries the
-                        // coordinator's context, so only it records the file.
-                        if meta.is_start_role
-                            && let Some(path) = prepared_context_path
-                        {
-                            state.record_orchestration_context(&identity, path);
-                        }
-                    }
-                    // PRD #1223: announce the start to every attached TUI, not
-                    // only to the client that sent it — a desktop start was
-                    // otherwise invisible to an already-attached TUI. After the
-                    // record is published and the role registered, before the
-                    // reply. See `crate::spawn::surface_attach_started_agent`
-                    // for what is emitted and why the sending TUI is unaffected.
-                    if let Some(mut record) = registry.agent_record_any(&id) {
-                        // Issue #1395 item 1: the start role's surface carries
-                        // the context file recorded just above, so a live tab
-                        // re-arms from its own file. Stamped from daemon state
-                        // only — the `ListAgents` rule — never from the request.
-                        state
-                            .read()
-                            .await
-                            .attach_orchestrator_context_paths(std::slice::from_mut(&mut record));
-                        crate::spawn::surface_attach_started_agent(
-                            &event_tx,
-                            &record,
-                            command.as_deref(),
-                        );
                     }
                     // Issue #1540: the start is accepted, so a form start's
                     // command becomes the deck's last command — in memory
@@ -6253,7 +6285,11 @@ async fn handle_connection(
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
             // PRD #1589: the teardown itself is shared with `CloseAgents`, which
             // takes the same steps in the same order — see
-            // [`stop_agent_steps`]. Behaviour here is unchanged.
+            // [`stop_agent_steps`]. The existing teardown is unchanged. What the
+            // extraction added is the unit-lifecycle end: a stop that removes a
+            // dispatched unit's last pane now also ends that unit, which touches
+            // only the daemon's in-memory dispatched-units record — nothing a
+            // client of this request, older or newer, reads.
             let close_outcome = stop_agent_steps(
                 &id,
                 stopping_record.as_ref(),

@@ -28,6 +28,7 @@
 //! same-uid process, which can drop its identity and ask as a person, send a
 //! raw `StopAgent`, or read another agent's token (`docs/develop/hook-provenance.md`).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,55 @@ pub const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// set that keeps changing is a spawn that reserved before the close and is
 /// still publishing; each round takes a hold on what appeared.
 const MEMBERSHIP_ROUNDS: usize = 4;
+
+/// PRD #1589 (auditor S4): the most entries a selector may name. Names and ids
+/// are typed or copied out of a listing, so a few hundred is far past any real
+/// request while keeping the work and the report one request can cause small.
+/// A larger selector is refused whole ([`CloseRefusalReason::SelectorTooLarge`])
+/// before anything is resolved or stopped; this bound is also what keeps the
+/// report for an accepted request well inside the attach frame.
+pub const MAX_SELECTOR_ENTRIES: usize = 256;
+
+/// PRD #1589 (auditor S4): the longest single selector entry, in bytes. A
+/// dispatch name is recorded at 120 characters, a unit id and a pane id are far
+/// shorter.
+pub const MAX_SELECTOR_ENTRY_BYTES: usize = 512;
+
+/// PRD #1589 (auditor S4): the most bytes all of a selector's entries may add up
+/// to.
+pub const MAX_SELECTOR_BYTES: usize = 32 * 1024;
+
+/// PRD #1589 (auditor S4): the most units `--all` lists in one report, and the
+/// most candidates an `ambiguous` refusal lists. A daemon holding more live
+/// units than this lists the first ones and says the listing was cut short
+/// ([`CloseReport::truncated`]).
+pub const MAX_LISTED_TARGETS: usize = MAX_SELECTOR_ENTRIES;
+
+/// The whole-request refusal for a selector past the limits above, or `None`.
+fn selector_too_large(selector: &CloseSelector) -> Option<CloseRefusal> {
+    let entries: Vec<&str> = match selector {
+        CloseSelector::Units(units) => units.names.iter().map(String::as_str).collect(),
+        CloseSelector::UnitIds { ids } => ids.iter().map(String::as_str).collect(),
+        CloseSelector::Pane { pane_id } | CloseSelector::OrchestrationOf { pane_id } => {
+            vec![pane_id.as_str()]
+        }
+        CloseSelector::AllUnits => Vec::new(),
+    };
+    let total: usize = entries.iter().map(|e| e.len()).sum();
+    let too_long = entries.iter().any(|e| e.len() > MAX_SELECTOR_ENTRY_BYTES);
+    if entries.len() <= MAX_SELECTOR_ENTRIES && !too_long && total <= MAX_SELECTOR_BYTES {
+        return None;
+    }
+    Some(CloseRefusal {
+        reason: CloseRefusalReason::SelectorTooLarge,
+        message: format!(
+            "refused: a close names at most {MAX_SELECTOR_ENTRIES} entries of at most \
+             {MAX_SELECTOR_ENTRY_BYTES} bytes each, {MAX_SELECTOR_BYTES} bytes in all; this one \
+             names {} entries, {total} bytes. Nothing was closed; close them in smaller batches.",
+            entries.len()
+        ),
+    })
+}
 
 /// The person-or-agent label for logs and reports.
 fn caller_label(caller: &Caller) -> String {
@@ -211,6 +261,21 @@ fn enumerate(scope: &Scope, registry: &AgentPtyRegistry) -> Vec<Member> {
     members
 }
 
+/// PRD #1589 (auditor B1/B2): the members of `scope` that are in their
+/// respawn window — lifted out of the registry's records and not yet replaced.
+/// [`enumerate`] cannot see them, and a target whose only members are here is
+/// not gone.
+fn respawning(scope: &Scope, registry: &AgentPtyRegistry) -> Vec<AgentRecord> {
+    registry
+        .respawning_members()
+        .into_iter()
+        .filter(|record| match scope {
+            Scope::Instance(id) => instance_of(record) == Some(id.as_str()),
+            Scope::Generation(id) => &record.id == id,
+        })
+        .collect()
+}
+
 /// The unit a unit-less target belongs to, if any — so a dispatched unit
 /// reached through `--pane` or `--orchestration-of` meets the same refusals as
 /// by name (auditor B4).
@@ -244,13 +309,11 @@ fn resolve(
     let mut refused = Vec::new();
     match selector {
         CloseSelector::Units(units) => {
-            let mut seen_slugs = Vec::new();
+            let mut seen_slugs = HashSet::new();
             for name in &units.names {
-                let slug = crate::dispatched_units::slug_of(name);
-                if seen_slugs.contains(&slug) {
+                if !seen_slugs.insert(crate::dispatched_units::slug_of(name)) {
                     continue;
                 }
-                seen_slugs.push(slug);
                 // Resolve under the record's lock, then let it go before the
                 // candidates' panes are read from the registry.
                 let resolution = {
@@ -279,6 +342,7 @@ fn resolve(
                         let mut target = CloseTarget::refused(name, r.reason, r.message);
                         target.candidates = candidates
                             .iter()
+                            .take(MAX_LISTED_TARGETS)
                             .map(|u| AmbiguousCandidate {
                                 unit_id: u.id.clone(),
                                 name: u.name.clone(),
@@ -292,12 +356,11 @@ fn resolve(
             }
         }
         CloseSelector::UnitIds { ids } => {
-            let mut seen = Vec::new();
+            let mut seen = HashSet::new();
             for id in ids {
-                if seen.contains(id) {
+                if !seen.insert(id.as_str()) {
                     continue;
                 }
-                seen.push(id.clone());
                 match registry.dispatched_units().resolve_id(id) {
                     Ok(unit) => resolved.push(Resolved {
                         selector: id.clone(),
@@ -367,16 +430,8 @@ fn resolve(
             }
         }
     }
-    let mut keys = Vec::new();
-    resolved.retain(|r| {
-        let key = r.dedupe_key();
-        if keys.contains(&key) {
-            false
-        } else {
-            keys.push(key);
-            true
-        }
-    });
+    let mut keys = HashSet::new();
+    resolved.retain(|r| keys.insert(r.dedupe_key()));
     (resolved, refused)
 }
 
@@ -567,8 +622,19 @@ pub async fn handle_close_agents(
         dry_run,
         forced: force,
         refused: None,
+        truncated: false,
         targets: Vec::new(),
     };
+    // Before anything is resolved, and before the caller's claim costs a
+    // registry walk: a selector this large is refused whole (auditor S4).
+    if let Some(refusal) = selector_too_large(&selector) {
+        tracing::info!(
+            reason = refusal.reason.code(),
+            "close: refused the whole request — the selector is too large"
+        );
+        report.refused = Some(refusal);
+        return report;
+    }
     if selector == CloseSelector::AllUnits && !dry_run {
         report.refused = Some(CloseRefusal {
             reason: CloseRefusalReason::BulkRequiresDryRun,
@@ -589,7 +655,12 @@ pub async fn handle_close_agents(
             return report;
         }
     };
-    let (resolved, refused) = resolve(&selector, &caller, registry);
+    let (mut resolved, refused) = resolve(&selector, &caller, registry);
+    if resolved.len() > MAX_LISTED_TARGETS {
+        // Only `--all` can get here: every other selector is bounded above.
+        resolved.truncate(MAX_LISTED_TARGETS);
+        report.truncated = true;
+    }
     report.targets.extend(refused);
     for target in resolved {
         let entry = close_one(
@@ -599,6 +670,70 @@ pub async fn handle_close_agents(
         report.targets.push(entry);
     }
     report
+}
+
+/// The member a respawn lifted out and that never came back: its record is
+/// gone and no generation holds its pane. Its child was terminated by the
+/// respawn, which the close's admission state then refused a replacement.
+fn aborted_respawn_member(record: AgentRecord) -> Member {
+    Member {
+        record,
+        exited: true,
+    }
+}
+
+/// Whether any generation holds `pane_id` now, live or retired.
+fn pane_held(pane_id: &str, registry: &AgentPtyRegistry) -> bool {
+    registry.pane_current_agent_id(pane_id).is_some()
+        || registry.agent_id_for_pane_any(pane_id).is_some()
+}
+
+/// PRD #1589 (auditor B1): end `unit` only once nothing of it remains — no
+/// record, no respawn in its window, and for an orchestration no pane of its
+/// instance in the role maps either, the rule `stop_agent_steps` ends a unit
+/// by. A close that stopped every member has normally ended the unit already,
+/// through that seam; this covers a close with nothing left to stop.
+async fn end_unit_if_nothing_remains(
+    unit: &DispatchedUnit,
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+) {
+    if registry.dispatched_units().get(&unit.id).is_none() {
+        return;
+    }
+    let scope = scope_of_unit(unit);
+    if !enumerate(&scope, registry).is_empty() || !respawning(&scope, registry).is_empty() {
+        return;
+    }
+    if let Some(instance) = unit.kind.orchestration_id() {
+        // The instance's admission state is finished, so nothing can join it
+        // any more: a role still registered for a pane no generation holds is
+        // a dead registration (a respawn whose replacement failed before this
+        // close, say), not a member. Take it down, so it neither routes a
+        // delegate to nothing nor keeps the unit from ending.
+        let mut state = state.write().await;
+        let dead: Vec<String> = state
+            .pane_orchestration_map
+            .iter()
+            .filter(|(pane, identity)| identity.id == instance && !pane_held(pane, registry))
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane in &dead {
+            state.unregister_pane(pane);
+        }
+        let in_state = state
+            .pane_orchestration_map
+            .values()
+            .any(|identity| identity.id == instance);
+        if in_state {
+            return;
+        }
+    }
+    registry.dispatched_units().end(
+        &unit.id,
+        EndReason::ClosedByVerb,
+        chrono::Utc::now().timestamp_millis(),
+    );
 }
 
 /// Steps 3 to 6 for one target.
@@ -613,7 +748,17 @@ async fn close_one(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     worktrees: &WorktreeRegistry,
 ) -> CloseTarget {
-    let members = enumerate(&target.scope, registry);
+    // A member in its respawn window counts as one for authority, the
+    // refusals and the listing: it is still part of the target (auditor B1).
+    let mut members = enumerate(&target.scope, registry);
+    members.extend(
+        respawning(&target.scope, registry)
+            .into_iter()
+            .map(|record| Member {
+                record,
+                exited: false,
+            }),
+    );
     let (target_facts, statuses) =
         facts(target, target.unit.as_ref(), &members, state, registry).await;
     let mut out = base_target(target, target.unit.as_ref(), &members, &statuses, registry);
@@ -626,24 +771,11 @@ async fn close_one(
         out.would_refuse = refusals.iter().map(|(r, _)| *r).collect();
         return out;
     }
-    if members.is_empty() {
-        // A unit whose records are all gone: nothing to stop. End it, so its
-        // name stops resolving, and clean its worktree up.
-        if let Some(unit) = target.unit.as_ref() {
-            registry.dispatched_units().end(
-                &unit.id,
-                EndReason::ClosedByVerb,
-                chrono::Utc::now().timestamp_millis(),
-            );
-            out.worktree_verdict =
-                Some(cleanup_worktree(unit.worktree.clone(), registry, worktrees, event_tx).await);
-        }
-        out.outcome = CloseOutcome::Closed;
-        return out;
-    }
 
     // Step 5a: the Closing admission state — for the unit, and for an
-    // orchestration instance taken whole.
+    // orchestration instance taken whole. Taken for a target with no records
+    // left as much as for one with many (auditor B1): an empty snapshot is not
+    // proof the target is gone.
     let unit_prior = match target.unit.as_ref() {
         Some(unit) if !target.by_pane => {
             match registry.dispatched_units().begin_closing(&unit.id) {
@@ -677,20 +809,67 @@ async fn close_one(
         Scope::Generation(_) => None,
     };
 
+    // Step 5a′: respawns admitted before the admission state opened (auditor
+    // B1/B2). Read after it opened: from here on a respawn of a member is
+    // refused before it touches the running generation, so this set only
+    // shrinks. Each has terminated, or is terminating, its old child; its
+    // replacement is refused by the admission state unless it was published
+    // before, in which case it is an ordinary member below. Waited out rather
+    // than read as stopped, so the report says what became of each.
+    let pending = respawning(&target.scope, registry);
+    let mut aborted: Vec<Member> = Vec::new();
+    if !pending.is_empty() {
+        if matches!(target.scope, Scope::Generation(_)) {
+            // No instance admission state guards a single generation, so a
+            // replacement would land; refuse rather than race it.
+            restore_unit(registry);
+            out.outcome = CloseOutcome::Failed;
+            out.error = Some(
+                "this agent is being replaced in its pane right now; close it again in a moment"
+                    .to_string(),
+            );
+            return out;
+        }
+        let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
+        if !registry
+            .wait_respawns_settled(&ids, crate::agent_pty::RESPAWN_SETTLE_TIMEOUT)
+            .await
+        {
+            drop(instance_guard);
+            restore_unit(registry);
+            out.outcome = CloseOutcome::Failed;
+            out.error = Some(
+                "a role of this orchestration is still being replaced in its pane; nothing was \
+                 closed"
+                    .to_string(),
+            );
+            return out;
+        }
+        aborted = pending
+            .into_iter()
+            .filter(|record| {
+                record
+                    .pane_id_env
+                    .as_deref()
+                    .is_none_or(|pane| !pane_held(pane, registry))
+            })
+            .map(aborted_respawn_member)
+            .collect();
+    }
+
     // Step 5b: a cleanup hold on every member generation, re-enumerating until
     // the membership is stable. New members are refused from here on, so this
     // converges; one that reserved before the close began is seen and held.
     let mut holds: Vec<(String, crate::agent_pty::PaneCleanupHold)> = Vec::new();
-    let mut held: Vec<String> = Vec::new();
-    let mut members = members;
+    let mut held: HashSet<String> = HashSet::new();
+    let mut members = enumerate(&target.scope, registry);
     let mut stable = false;
     for _ in 0..MEMBERSHIP_ROUNDS {
         let mut preflight_error = None;
         for member in &members {
-            if held.contains(&member.record.id) {
+            if !held.insert(member.record.id.clone()) {
                 continue;
             }
-            held.push(member.record.id.clone());
             let Some(pane) = member.record.pane_id_env.as_deref() else {
                 continue;
             };
@@ -735,8 +914,11 @@ async fn close_one(
         out.error = Some("the orchestration kept changing while it was being closed".to_string());
         return out;
     }
+    #[cfg(test)]
+    registry.before_close_revalidation().await;
 
-    // Step 5c: re-validate everything decided before the holds.
+    // Step 5c: re-validate everything decided before the holds — for a target
+    // whose members are all gone as much as for any other (auditor B1).
     let unit_now = target
         .unit
         .as_ref()
@@ -747,6 +929,7 @@ async fn close_one(
         .iter()
         .zip(now_statuses.iter())
         .map(|(m, s)| pane_report(m, s.as_ref()))
+        .chain(aborted.iter().map(|m| pane_report(m, None)))
         .collect();
     let release = |holds, guard, registry: &AgentPtyRegistry| {
         drop::<Vec<(String, crate::agent_pty::PaneCleanupHold)>>(holds);
@@ -762,7 +945,8 @@ async fn close_one(
         );
         return out;
     }
-    if let Err(refusal) = authorize_target(caller, target, &members) {
+    let all_members: Vec<Member> = members.iter().chain(aborted.iter()).cloned().collect();
+    if let Err(refusal) = authorize_target(caller, target, &all_members) {
         release(holds, instance_guard, registry);
         refuse(&mut out, refusal.reason, refusal.message);
         return out;
@@ -786,7 +970,7 @@ async fn close_one(
     // Step 5d: disclose, #1109-style — one line, naming the caller, the
     // selector and every pane, and at `warn!` with what was overridden when
     // forced.
-    let lines: Vec<String> = members
+    let lines: Vec<String> = all_members
         .iter()
         .map(|m| crate::daemon_stop::teardown_agent_line(&m.record))
         .collect();
@@ -848,11 +1032,26 @@ async fn close_one(
         }
     }
     drop(holds);
-    let stopped_any = survivors.len() < members.len();
+    // A respawn this close refused left its pane with no agent and its role
+    // still registered: take the registration down the way a stop does, and
+    // tell the clients the pane is gone.
+    for (offset, member) in aborted.iter().enumerate() {
+        if let Some(pane) = member.record.pane_id_env.as_deref()
+            && !pane_held(pane, registry)
+        {
+            state.write().await.unregister_pane(pane);
+            crate::spawn::surface_attach_stopped_agent(event_tx, &member.record, pane);
+        }
+        out.panes[members.len() + offset].stopped = Some(true);
+    }
+    let stopped_any = survivors.len() < members.len() + aborted.len();
     if survivors.is_empty() {
         out.outcome = CloseOutcome::Closed;
         if let Some(guard) = instance_guard.as_mut() {
             guard.finish();
+        }
+        if let Some(unit) = target.unit.as_ref() {
+            end_unit_if_nothing_remains(unit, registry, state).await;
         }
     } else if stopped_any {
         out.outcome = CloseOutcome::PartiallyClosed;
@@ -867,10 +1066,14 @@ async fn close_one(
     // `--pane`) stays live.
     restore_unit(registry);
 
-    // Step 6: the worktree, once nothing of the target is left in it. Only for
-    // a whole target: one role closed by `--pane` leaves its siblings rooted
-    // there.
-    if out.outcome == CloseOutcome::Closed && !target.by_pane {
+    // Step 6: the worktree, once this close freed it — decided by what the
+    // stop left, never by the selector that reached it (auditor S3). A unit's
+    // worktree is freed when the unit ended, which a single agent closed by
+    // `--pane` does and one role of a live orchestration does not; the
+    // removal's own directory hold still answers still-in-use if anything
+    // else is rooted there. A target no unit owns gets a verdict only for a
+    // worktree the deck recorded and nothing else is using.
+    if out.outcome == CloseOutcome::Closed {
         let worktree = target
             .unit
             .as_ref()
@@ -880,17 +1083,20 @@ async fn close_one(
                     .first()
                     .and_then(|m| crate::issue_dispatch_run::worktree_of_record(&m.record))
             });
-        if let Some(worktree) = worktree {
-            let recorded = worktrees
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&worktree);
-            // An ordinary pane's cwd is not a worktree this deck created; only
-            // a recorded one, or any unit's, gets a verdict.
-            if recorded || target.unit.is_some() {
-                out.worktree_verdict =
-                    Some(cleanup_worktree(worktree, registry, worktrees, event_tx).await);
+        let freed = match (target.unit.as_ref(), worktree.as_ref()) {
+            (Some(unit), Some(_)) => registry.dispatched_units().get(&unit.id).is_none(),
+            (None, Some(worktree)) => {
+                worktrees
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(worktree)
+                    && !registry.dir_in_use(worktree)
             }
+            (_, None) => false,
+        };
+        if freed && let Some(worktree) = worktree {
+            out.worktree_verdict =
+                Some(cleanup_worktree(worktree, registry, worktrees, event_tx).await);
         }
     }
     drop(instance_guard);
@@ -974,6 +1180,7 @@ mod tests {
         state: SharedState,
         worktrees: WorktreeRegistry,
         client: DaemonClient,
+        event_tx: broadcast::Sender<BroadcastMsg>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -982,7 +1189,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let sock = dir.path().join("attach.sock");
             let registry = Arc::new(AgentPtyRegistry::new());
-            let (event_tx, _rx) = broadcast::channel(64);
+            let (event_tx, _rx) = broadcast::channel(1024);
             let state: SharedState =
                 Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
             let worktrees = crate::issue_dispatch_run::new_worktree_registry();
@@ -991,6 +1198,7 @@ mod tests {
                 let registry = registry.clone();
                 let state = state.clone();
                 let worktrees = worktrees.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let _ = serve_attach_with_counter(
                         listener,
@@ -1013,8 +1221,15 @@ mod tests {
                 state,
                 worktrees,
                 client,
+                event_tx,
                 server,
             }
+        }
+
+        /// A second client on the same socket, for a request run alongside
+        /// another.
+        fn other_client(&self) -> DaemonClient {
+            DaemonClient::new(self.dir.path().join("attach.sock"))
         }
 
         async fn start(
@@ -1023,7 +1238,17 @@ mod tests {
             command: &str,
             orch: Option<(&str, &str, bool)>,
         ) -> String {
-            let cwd = self.dir.path().to_string_lossy().into_owned();
+            self.start_in(pane, command, orch, self.dir.path()).await
+        }
+
+        async fn start_in(
+            &self,
+            pane: &str,
+            command: &str,
+            orch: Option<(&str, &str, bool)>,
+            cwd: &std::path::Path,
+        ) -> String {
+            let cwd = cwd.to_string_lossy().into_owned();
             let tab_membership = orch.map(|(id, role, start)| TabMembership::Orchestration {
                 name: "team".to_string(),
                 role_index: usize::from(!start),
@@ -1253,7 +1478,35 @@ mod tests {
             report.targets[0].reason,
             Some(CloseRefusalReason::NotYourUnit)
         );
+        // The successor exits too (auditor N1). The predecessor's record is
+        // still registered, so a fallback to "the pane's last occupant" would
+        // hand the unit back to it; it must stay refused, even with --force.
+        deck.client
+            .stop_agent(&new)
+            .await
+            .expect("stop the successor");
+        assert!(!deck.live(&new), "the successor is gone");
+        assert!(
+            deck.registry.agent_record_any(&old).is_some(),
+            "the predecessor's record is retained, so the refusal below is not \
+             merely a missing record"
+        );
+        let report = deck
+            .close(by_name("u1"), Some(old_claim), true, false)
+            .await;
+        assert_eq!(
+            report.refused.map(|r| r.reason),
+            Some(CloseRefusalReason::Superseded)
+        );
+        assert!(report.targets.is_empty(), "nothing is resolved or stopped");
         assert!(deck.live(&unit_agent));
+        assert!(
+            deck.registry
+                .dispatched_units()
+                .live()
+                .any(|u| u.name == "u1"),
+            "the unit stays live"
+        );
         deck.shutdown().await;
     }
 
@@ -1782,5 +2035,675 @@ mod tests {
             WorktreeVerdictKind::Removed
         );
         assert!(!wt.exists());
+    }
+
+    /// A dispatched orchestration `orch` with a live orchestrator and worker,
+    /// registered as unit `name`. Returns (orchestrator, worker, unit id).
+    async fn orchestration(
+        deck: &Deck,
+        name: &str,
+        orch: &str,
+        dispatcher: (&str, &str),
+    ) -> (String, String, String) {
+        let o = deck
+            .start(
+                &format!("{orch}-o"),
+                "sleep 30",
+                Some((orch, "orchestrator", true)),
+            )
+            .await;
+        let w = deck
+            .start(
+                &format!("{orch}-w"),
+                "sleep 30",
+                Some((orch, "coder", false)),
+            )
+            .await;
+        let id = deck.orch_unit(name, dispatcher, orch, &format!("{orch}-o"), &o);
+        (o, w, id)
+    }
+
+    /// Start a respawn of `pane` that pauses once it has lifted the old record
+    /// out, and wait until it has.
+    async fn paused_respawn(
+        deck: &Deck,
+        pane: &str,
+    ) -> (
+        tokio::task::JoinHandle<Result<String, crate::agent_pty::AgentPtyError>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, release) = deck.registry.pause_next_respawn_for_test();
+        let registry = deck.registry.clone();
+        let pane = pane.to_string();
+        let respawn =
+            tokio::spawn(async move { registry.respawn_agent_for_pane(&pane, "sleep 30").await });
+        reached.await.expect("the respawn reaches its window");
+        (respawn, release)
+    }
+
+    /// A close run in the background, through a second client.
+    fn close_in_background(
+        deck: &Deck,
+        selector: CloseSelector,
+        caller: Option<CallerClaim>,
+        force: bool,
+    ) -> tokio::task::JoinHandle<CloseReport> {
+        let client = deck.other_client();
+        tokio::spawn(async move {
+            client
+                .close_agents(selector, caller, force, false)
+                .await
+                .expect("a report")
+        })
+    }
+
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn mapped_in_state(state: &crate::state::AppState, pane: &str) -> bool {
+        state.pane_orchestration_map.contains_key(pane)
+    }
+
+    /// Scenario: auditor B1 — an orchestration's orchestrator was stopped
+    /// first, and its only remaining worker is mid-respawn, so the registry
+    /// holds no record of the unit at all. Closing it by name waits for the
+    /// respawn instead of reading the empty snapshot as "gone"; the respawn's
+    /// replacement is refused, the report names the worker as stopped, the
+    /// worker's role registration is taken down, and no agent comes back in
+    /// the pane behind the ended unit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unit_whose_last_worker_is_mid_respawn_does_not_resurrect() {
+        let deck = Deck::new().await;
+        let (o, _w, id) = orchestration(&deck, "team-b1", "orch-b1", ("disp", "nobody")).await;
+        deck.report_done("orch-b1-o", &o);
+        deck.client
+            .stop_agent(&o)
+            .await
+            .expect("stop the orchestrator");
+        let (respawn, release) = paused_respawn(&deck, "orch-b1-w").await;
+        assert!(enumerate(&Scope::Instance("orch-b1".into()), &deck.registry).is_empty());
+
+        let close = close_in_background(&deck, by_name("team-b1"), None, false);
+        wait_until("the close opens the instance's admission state", || {
+            deck.registry.is_instance_closing("orch-b1")
+        })
+        .await;
+        let _ = release.send(());
+        let err = respawn
+            .await
+            .unwrap()
+            .expect_err("the replacement is refused");
+        assert!(
+            err.to_string()
+                .contains(crate::agent_pty::INSTANCE_CLOSING_REASON),
+            "{err}"
+        );
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(target.panes.len(), 1, "{target:?}");
+        assert_eq!(target.panes[0].pane_id.as_deref(), Some("orch-b1-w"));
+        assert_eq!(target.panes[0].stopped, Some(true));
+        assert!(deck.registry.pane_current_agent_id("orch-b1-w").is_none());
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1-w"));
+        // A queued respawn after the close cannot bring it back either.
+        assert!(deck.registry.is_instance_closing("orch-b1"));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor B1 — the same empty-snapshot unit, never reported.
+    /// A close without --force is refused not-reported (it used to be closed
+    /// outright), the unit stays live and closeable, and --force then closes
+    /// it, taking the dead worker's role registration down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_snapshot_unit_still_meets_the_default_refusals() {
+        let deck = Deck::new().await;
+        let (o, _w, id) = orchestration(&deck, "team-b1r", "orch-b1r", ("disp", "nobody")).await;
+        deck.client
+            .stop_agent(&o)
+            .await
+            .expect("stop the orchestrator");
+        let (respawn, release) = paused_respawn(&deck, "orch-b1r-w").await;
+        let close = close_in_background(&deck, by_name("team-b1r"), None, false);
+        wait_until("the close opens the instance's admission state", || {
+            deck.registry.is_instance_closing("orch-b1r")
+        })
+        .await;
+        let _ = release.send(());
+        let _ = respawn.await.unwrap();
+        let report = close.await.unwrap();
+        assert_eq!(
+            report.targets[0].reason,
+            Some(CloseRefusalReason::NotReported),
+            "{:?}",
+            report.targets[0]
+        );
+        assert!(
+            deck.registry.dispatched_units().get(&id).is_some(),
+            "a refused unit is not tombstoned"
+        );
+        assert!(!deck.registry.is_instance_closing("orch-b1r"));
+
+        let report = deck.close(by_name("team-b1r"), None, true, false).await;
+        assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        assert!(!mapped_in_state(&*deck.state.read().await, "orch-b1r-w"));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor B1 — while a close waits for the unit's respawning
+    /// worker, the dispatcher that asked is replaced in its pane. The close is
+    /// refused superseded once it re-validates, and the unit is not ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_superseded_while_a_respawn_settles_is_refused() {
+        let deck = Deck::new().await;
+        let dispatcher = deck.start("disp", "sleep 30", None).await;
+        let (o, _w, id) = orchestration(&deck, "team-b1s", "orch-b1s", ("disp", &dispatcher)).await;
+        deck.report_done("orch-b1s-o", &o);
+        deck.client
+            .stop_agent(&o)
+            .await
+            .expect("stop the orchestrator");
+        let claim = deck.claim("disp", &dispatcher);
+        let (respawn, release) = paused_respawn(&deck, "orch-b1s-w").await;
+        let close = close_in_background(&deck, by_name("team-b1s"), Some(claim), false);
+        wait_until("the close opens the instance's admission state", || {
+            deck.registry.is_instance_closing("orch-b1s")
+        })
+        .await;
+        deck.client
+            .stop_agent(&dispatcher)
+            .await
+            .expect("stop the dispatcher");
+        deck.start("disp", "sleep 30", None).await;
+        let _ = release.send(());
+        let _ = respawn.await.unwrap();
+        let report = close.await.unwrap();
+        assert_eq!(
+            report.targets[0].reason,
+            Some(CloseRefusalReason::Superseded),
+            "{:?}",
+            report.targets[0]
+        );
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor B2 — while a close holds an instance, a respawn of
+    /// its healthy worker is refused before it touches the running agent: the
+    /// worker keeps its generation and its record, the recovering wrapper is
+    /// refused the same way, and a worker of another instance still respawns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_respawn_into_a_closing_instance_leaves_the_worker_running() {
+        let deck = Deck::new().await;
+        let (_o, w, _id) = orchestration(&deck, "team-b2", "orch-b2", ("disp", "nobody")).await;
+        let other_dir = deck.dir.path().join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = deck
+            .start_in(
+                "other-w",
+                "sleep 30",
+                Some(("orch-other", "coder", false)),
+                &other_dir,
+            )
+            .await;
+        let guard = deck
+            .registry
+            .begin_instance_close("orch-b2")
+            .expect("begins");
+        let err = deck
+            .registry
+            .respawn_agent_for_pane("orch-b2-w", "sleep 30")
+            .await
+            .expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains(crate::agent_pty::INSTANCE_CLOSING_REASON),
+            "{err}"
+        );
+        assert!(deck.live(&w), "the original generation is still running");
+        assert_eq!(
+            deck.registry.pane_current_agent_id("orch-b2-w").as_deref(),
+            Some(w.as_str())
+        );
+        let identity = crate::agent_pty::PaneRecreateIdentity {
+            cwd: Some(deck.dir.path().to_string_lossy().into_owned()),
+            display_name: Some("coder".into()),
+            tab_membership: deck.registry.agent_record_any(&w).unwrap().tab_membership,
+            agent_type: None,
+            env: Vec::new(),
+        };
+        let started = tokio::time::Instant::now();
+        deck.registry
+            .respawn_or_recreate_agent_for_pane("orch-b2-w", "sleep 30", &identity)
+            .await
+            .expect_err("the recovering wrapper is refused too");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(deck.live(&w));
+        let replaced = deck
+            .registry
+            .respawn_agent_for_pane("other-w", "sleep 30")
+            .await
+            .expect("another instance still respawns");
+        assert_ne!(replaced, other);
+        drop(guard);
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor B2 — a worker's respawn is admitted just before a
+    /// close of its unit begins. The close waits for it, the replacement is
+    /// refused, and the report accounts for the worker as stopped beside the
+    /// orchestrator it stopped itself; nothing is left running in the unit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_respawn_admitted_before_the_close_is_in_its_report() {
+        let deck = Deck::new().await;
+        let (o, _w, id) = orchestration(&deck, "team-b2a", "orch-b2a", ("disp", "nobody")).await;
+        deck.report_done("orch-b2a-o", &o);
+        let (respawn, release) = paused_respawn(&deck, "orch-b2a-w").await;
+        let close = close_in_background(&deck, by_name("team-b2a"), None, false);
+        wait_until("the close opens the instance's admission state", || {
+            deck.registry.is_instance_closing("orch-b2a")
+        })
+        .await;
+        let _ = release.send(());
+        let _ = respawn.await.unwrap();
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        let panes: Vec<(Option<&str>, Option<bool>)> = target
+            .panes
+            .iter()
+            .map(|p| (p.pane_id.as_deref(), p.stopped))
+            .collect();
+        assert_eq!(
+            panes,
+            vec![
+                (Some("orch-b2a-o"), Some(true)),
+                (Some("orch-b2a-w"), Some(true))
+            ]
+        );
+        assert!(!deck.live(&o));
+        assert!(deck.registry.pane_current_agent_id("orch-b2a-w").is_none());
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S1 — a role's start has published its generation and
+    /// is about to register it when a close of its orchestration takes it
+    /// down. When the start resumes it registers no role and announces no
+    /// card for the closed pane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_resuming_after_its_close_registers_nothing() {
+        let deck = Deck::new().await;
+        let o = deck
+            .start("s1-o", "sleep 30", Some(("orch-s1", "orchestrator", true)))
+            .await;
+        deck.orch_unit("team-s1", ("disp", "nobody"), "orch-s1", "s1-o", &o);
+        deck.report_done("s1-o", &o);
+        let mut events = deck.event_tx.subscribe();
+        let (reached, release) = deck.registry.pause_next_role_registration_for_test();
+        let client = deck.other_client();
+        let cwd = deck.dir.path().to_string_lossy().into_owned();
+        let start = tokio::spawn(async move {
+            client
+                .start_agent(StartAgentOptions {
+                    command: Some("sleep 30".to_string()),
+                    cwd: Some(cwd.clone()),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "s1-w".to_string())],
+                    tab_membership: Some(TabMembership::Orchestration {
+                        name: "team".to_string(),
+                        role_index: 1,
+                        role_name: "coder".to_string(),
+                        is_start_role: false,
+                        orchestration_cwd: Some(cwd),
+                        display_title: None,
+                        orchestration_id: Some("orch-s1".to_string()),
+                    }),
+                    ..StartAgentOptions::default()
+                })
+                .await
+        });
+        reached.await.expect("the start publishes and pauses");
+        let worker = deck
+            .registry
+            .pane_current_agent_id("s1-w")
+            .expect("published");
+        let report = deck.close(by_name("team-s1"), None, false, false).await;
+        assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
+        assert!(
+            report.targets[0]
+                .panes
+                .iter()
+                .any(|p| p.agent_id == worker && p.stopped == Some(true))
+        );
+        let _ = release.send(());
+        let _ = start.await.unwrap();
+        assert!(!mapped_in_state(&*deck.state.read().await, "s1-w"));
+        assert!(!deck.live(&worker));
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::OrchestrationSurface(surface) = msg {
+                assert!(
+                    surface.roles.iter().all(|r| r.pane_id != "s1-w"),
+                    "a card was announced for the closed pane: {surface:?}"
+                );
+            }
+        }
+        deck.shutdown().await;
+    }
+
+    /// Scenario: D11's after-holds window — a dispatcher's close has taken its
+    /// holds when the dispatcher is replaced in its pane. Re-validation refuses
+    /// it superseded, and the unit's agent is left running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_superseded_after_the_holds_is_refused() {
+        let deck = Deck::new().await;
+        let dispatcher = deck.start("disp", "sleep 30", None).await;
+        let unit_agent = deck.start("unit", "sleep 30", None).await;
+        let id = deck.single_unit("u1", ("disp", &dispatcher), "unit", &unit_agent);
+        deck.report_done("unit", &unit_agent);
+        let claim = deck.claim("disp", &dispatcher);
+        let (reached, release) = deck.registry.pause_next_close_revalidation_for_test();
+        let close = close_in_background(&deck, by_name("u1"), Some(claim), false);
+        reached.await.expect("the close takes its holds");
+        deck.client
+            .stop_agent(&dispatcher)
+            .await
+            .expect("stop the dispatcher");
+        deck.start("disp", "sleep 30", None).await;
+        let _ = release.send(());
+        let report = close.await.unwrap();
+        assert_eq!(
+            report.targets[0].reason,
+            Some(CloseRefusalReason::Superseded),
+            "{:?}",
+            report.targets[0]
+        );
+        assert!(deck.live(&unit_agent));
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S2 — `close --all` lists and stops nothing, so does
+    /// `--all --yes --dry-run`, and `--all --yes` previews and then closes
+    /// exactly the units its preview listed, by id.
+    #[tokio::test]
+    async fn all_yes_previews_then_applies_exactly_the_listed_ids() {
+        let deck = Deck::new().await;
+        let a = deck.start("ua", "sleep 30", None).await;
+        let b = deck.start("ub", "sleep 30", None).await;
+        let ida = deck.single_unit("ua", ("disp", "nobody"), "ua", &a);
+        let idb = deck.single_unit("ub", ("disp", "nobody"), "ub", &b);
+        deck.report_done("ua", &a);
+        deck.report_done("ub", &b);
+        let person = crate::close_cli::AmbientIdentity::Person;
+        let all = crate::close_cli::CloseArgs {
+            all: true,
+            json: true,
+            ..Default::default()
+        };
+        let out = crate::close_cli::run_close(&deck.client, &all, &person).await;
+        assert_eq!(out.code, crate::close_cli::EXIT_OK, "{out:?}");
+        assert!(deck.live(&a) && deck.live(&b));
+        let dry = crate::close_cli::CloseArgs {
+            yes: true,
+            dry_run: true,
+            ..all.clone()
+        };
+        let out = crate::close_cli::run_close(&deck.client, &dry, &person).await;
+        assert_eq!(out.code, crate::close_cli::EXIT_OK, "{out:?}");
+        assert!(deck.live(&a) && deck.live(&b));
+
+        let yes = crate::close_cli::CloseArgs {
+            yes: true,
+            ..all.clone()
+        };
+        let out = crate::close_cli::run_close(&deck.client, &yes, &person).await;
+        assert_eq!(out.code, crate::close_cli::EXIT_OK, "{out:?}");
+        let json: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        let ids = |v: &serde_json::Value| {
+            let mut ids: Vec<String> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["unit_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut expected = vec![ida, idb];
+        expected.sort();
+        assert_eq!(ids(&json["preview"]["listed"]), expected);
+        assert_eq!(ids(&json["closed"]), expected);
+        assert!(!deck.live(&a) && !deck.live(&b));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: one name matches two live units, and the refusal lists both
+    /// ids. Closing by one of those ids with `--unit-id` closes exactly that
+    /// unit and leaves the other running.
+    #[tokio::test]
+    async fn an_ambiguous_names_candidate_id_closes_exactly_that_unit() {
+        let deck = Deck::new().await;
+        let a = deck.start("unit-a", "sleep 30", None).await;
+        let b = deck.start("unit-b", "sleep 30", None).await;
+        deck.single_unit("fix", ("disp", "nobody"), "unit-a", &a);
+        deck.single_unit("fix", ("disp", "nobody"), "unit-b", &b);
+        deck.report_done("unit-a", &a);
+        deck.report_done("unit-b", &b);
+        let report = deck.close(by_name("fix"), None, false, false).await;
+        let candidate = report.targets[0].candidates[0].unit_id.clone();
+        let args = crate::close_cli::CloseArgs {
+            unit_ids: vec![candidate.clone()],
+            ..Default::default()
+        };
+        let out = crate::close_cli::run_close(
+            &deck.client,
+            &args,
+            &crate::close_cli::AmbientIdentity::Person,
+        )
+        .await;
+        assert_eq!(out.code, crate::close_cli::EXIT_OK, "{out:?}");
+        assert!(out.stdout.contains(&candidate), "{}", out.stdout);
+        assert!(!deck.live(&a));
+        assert!(deck.live(&b), "the other candidate is untouched");
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S4 — a selector naming more ids than a request may,
+    /// or one entry far longer than any name, is refused whole and quickly: no
+    /// target is resolved, nothing is stopped, and the report stays small.
+    #[tokio::test]
+    async fn an_oversized_selector_is_refused_whole() {
+        let deck = Deck::new().await;
+        let unit_agent = deck.start("unit", "sleep 30", None).await;
+        let id = deck.single_unit("u1", ("disp", "nobody"), "unit", &unit_agent);
+        deck.report_done("unit", &unit_agent);
+        let mut ids: Vec<String> = (0..MAX_SELECTOR_ENTRIES + 1)
+            .map(|n| format!("u-unknown-{n}"))
+            .collect();
+        ids.push(id.clone());
+        let started = std::time::Instant::now();
+        for selector in [
+            CloseSelector::UnitIds { ids },
+            CloseSelector::Units(UnitSelector {
+                names: vec!["u1".into(), "x".repeat(MAX_SELECTOR_ENTRY_BYTES + 1)],
+            }),
+        ] {
+            let report = deck.close(selector, None, true, false).await;
+            assert_eq!(
+                report.refused.as_ref().map(|r| r.reason),
+                Some(CloseRefusalReason::SelectorTooLarge)
+            );
+            assert!(report.targets.is_empty());
+            assert!(serde_json::to_string(&report).unwrap().len() < 1024);
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(deck.live(&unit_agent), "nothing is stopped");
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+        assert_eq!(
+            CloseRefusalReason::SelectorTooLarge.code(),
+            "selector-too-large"
+        );
+        deck.shutdown().await;
+    }
+
+    /// Scenario: PRD #1589 D5 — the orchestrator a unit's task went to is
+    /// replaced in its pane by a registry respawn. The replacement's
+    /// completion marks the unit; the old generation's no longer would.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_respawned_terminal_generation_still_completes_its_unit() {
+        let deck = Deck::new().await;
+        let (o, _w, id) = orchestration(&deck, "team-d5", "orch-d5", ("disp", "nobody")).await;
+        let new = deck
+            .registry
+            .respawn_agent_for_pane("orch-d5-o", "sleep 30")
+            .await
+            .expect("respawn the orchestrator");
+        {
+            let mut units = deck.registry.dispatched_units();
+            assert_eq!(units.mark_completed("orch-d5-o", &o, 2), None);
+            assert_eq!(units.mark_completed("orch-d5-o", &new, 2), Some(id));
+        }
+        deck.shutdown().await;
+    }
+
+    /// A dispatched single unit whose agent runs in a real, clean worktree
+    /// the daemon recorded, as `dispatch` leaves one.
+    async fn single_in_worktree(deck: &Deck, name: &str) -> (String, String, PathBuf) {
+        let repo = deck.dir.path().join(format!("repo-{name}"));
+        let wt = deck.dir.path().join(format!("repo-{name}-dispatch"));
+        init_repo_with_worktree(deck.dir.path(), &repo, &wt);
+        crate::issue_dispatch_run::record_worktree(
+            &deck.worktrees,
+            &wt,
+            &repo,
+            crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        );
+        let agent = deck.start_in(name, "sleep 30", None, &wt).await;
+        let id = deck.registry.dispatched_units().register(NewUnit {
+            name: name.to_string(),
+            worktree: wt.clone(),
+            branch: "wt".to_string(),
+            clone_dir: repo,
+            dispatcher: Dispatcher {
+                pane_id: "disp".into(),
+                agent_id: "nobody".into(),
+            },
+            kind: UnitKind::Single {
+                pane_id: name.to_string(),
+                agent_id: agent.clone(),
+            },
+            dispatched_at_ms: 1,
+        });
+        deck.report_done(name, &agent);
+        (agent, id, wt)
+    }
+
+    /// Scenario: auditor S3 / reviewer SF1 — a dispatched single unit closed
+    /// by `--pane` ends the unit and removes its clean worktree with a verdict,
+    /// exactly as closing it by name does.
+    #[tokio::test]
+    async fn a_single_unit_closed_by_pane_cleans_its_worktree() {
+        let deck = Deck::new().await;
+        let (agent, id, wt) = single_in_worktree(&deck, "solo").await;
+        let report = deck
+            .close(
+                CloseSelector::Pane {
+                    pane_id: "solo".into(),
+                },
+                None,
+                false,
+                false,
+            )
+            .await;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(WorktreeVerdictKind::Removed),
+            "{target:?}"
+        );
+        assert!(!wt.exists());
+        assert!(!deck.live(&agent));
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Scenario: auditor S3 — an orchestration's roles share one worktree.
+    /// Closing one role by `--pane --force` while its sibling still runs there
+    /// removes nothing and reports no verdict; closing the last role by
+    /// `--pane` ends the unit and removes the worktree.
+    #[tokio::test]
+    async fn the_last_role_closed_by_pane_cleans_the_shared_worktree() {
+        let deck = Deck::new().await;
+        let repo = deck.dir.path().join("repo-team");
+        let wt = deck.dir.path().join("repo-team-dispatch");
+        init_repo_with_worktree(deck.dir.path(), &repo, &wt);
+        crate::issue_dispatch_run::record_worktree(
+            &deck.worktrees,
+            &wt,
+            &repo,
+            crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        );
+        let o = deck
+            .start_in(
+                "t-o",
+                "sleep 30",
+                Some(("orch-s3", "orchestrator", true)),
+                &wt,
+            )
+            .await;
+        let w = deck
+            .start_in("t-w", "sleep 30", Some(("orch-s3", "coder", false)), &wt)
+            .await;
+        let id = deck.registry.dispatched_units().register(NewUnit {
+            name: "team-s3".into(),
+            worktree: wt.clone(),
+            branch: "wt".into(),
+            clone_dir: repo,
+            dispatcher: Dispatcher {
+                pane_id: "disp".into(),
+                agent_id: "nobody".into(),
+            },
+            kind: UnitKind::Orchestration {
+                orchestration_id: "orch-s3".into(),
+                name: "team".into(),
+                terminal_pane_id: "t-o".into(),
+                terminal_agent_id: o.clone(),
+            },
+            dispatched_at_ms: 1,
+        });
+        deck.report_done("t-o", &o);
+        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+
+        let report = deck.close(pane("t-o"), None, true, false).await;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(
+            target.forced_over,
+            vec![CloseRefusalReason::StrandsOrchestration]
+        );
+        assert_eq!(target.worktree_verdict, None, "a sibling still uses it");
+        assert!(wt.exists());
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+
+        let report = deck.close(pane("t-w"), None, false, false).await;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(WorktreeVerdictKind::Removed),
+            "{target:?}"
+        );
+        assert!(!wt.exists());
+        assert!(!deck.live(&w));
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
     }
 }

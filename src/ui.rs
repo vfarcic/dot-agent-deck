@@ -34680,6 +34680,7 @@ mod tests {
         // when to close to the user.
         let close_verb = format!("{bin} close <name>");
         let close_all = format!("{bin} close --all --yes");
+        let close_by_id = format!("{bin} close --unit-id <id>");
         assert!(
             !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
             "the dispatcher seed must not name the deck by its bare name"
@@ -34688,6 +34689,7 @@ mod tests {
             dispatch_verb.as_str(),
             close_verb.as_str(),
             close_all.as_str(),
+            close_by_id.as_str(),
             "When to close is the user's decision",
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
