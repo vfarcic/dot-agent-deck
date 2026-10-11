@@ -1,22 +1,47 @@
 use serde::Deserialize;
 
-use crate::repo_identity;
-
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
-fn current_version() -> semver::Version {
+/// Which releases a copy is offered.
+///
+/// `Stable` copies are offered only stable releases: GitHub's
+/// `releases/latest`, which never names a prerelease or a draft. `Prerelease`
+/// copies — the `dot-agent-deck-beta` Homebrew formula, or any build whose own
+/// version is a SemVer prerelease — are offered the highest version among every
+/// published release, prereleases included, so a beta sees the next beta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseChannel {
+    Stable,
+    Prerelease,
+}
+
+impl ReleaseChannel {
+    /// The channel a copy reporting `version` (with or without a leading `v`)
+    /// follows on its version alone: `Prerelease` when it carries a SemVer
+    /// prerelease suffix (`0.47.0-beta.1`), `Stable` otherwise, unparseable
+    /// included.
+    pub fn of_version(version: &str) -> Self {
+        let version = version.strip_prefix('v').unwrap_or(version);
+        match semver::Version::parse(version) {
+            Ok(parsed) if !parsed.pre.is_empty() => Self::Prerelease,
+            _ => Self::Stable,
+        }
+    }
+}
+
+pub(crate) fn current_version() -> semver::Version {
     semver::Version::parse(env!("DAD_VERSION")).expect("DAD_VERSION is valid semver")
 }
 
-fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
-    let stripped = latest_tag
-        .strip_prefix('v')
-        .or_else(|| latest_tag.strip_prefix('V'))
-        .unwrap_or(latest_tag);
-    let latest = semver::Version::parse(stripped).ok()?;
+pub(crate) fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> {
+    let latest = parse_tag(latest_tag)?;
     if latest > *current {
         Some(latest.to_string())
     } else {
@@ -24,43 +49,124 @@ fn should_notify(current: &semver::Version, latest_tag: &str) -> Option<String> 
     }
 }
 
-async fn fetch_latest_version() -> Option<String> {
+fn parse_tag(tag: &str) -> Option<semver::Version> {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    semver::Version::parse(stripped).ok()
+}
+
+/// What a release lookup found, as tags. Each is `None` when the lookup did
+/// not read it or nothing of that kind is published.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReleaseTags {
+    /// The newest stable release.
+    pub stable: Option<String>,
+    /// The highest version published, a prerelease included.
+    pub newest: Option<String>,
+    /// The newest prerelease ([`newest_prerelease_tag`]).
+    pub prerelease: Option<String>,
+}
+
+/// Look up the releases a machine's copies need: `latest_url` (a GitHub
+/// `releases/latest` endpoint) for the newest stable release when `stable`,
+/// and `list_url` (a GitHub `releases` list endpoint) for the highest
+/// version and the newest prerelease when `list`. Without `stable`, the
+/// newest stable release is taken from the list when it was read. Every
+/// client's release check goes through `crate::self_upgrade` to here: the
+/// TUI's badge, `dot-agent-deck upgrade` and the desktop app.
+pub(crate) async fn fetch_release_tags(
+    latest_url: &str,
+    list_url: &str,
+    stable: bool,
+    list: bool,
+) -> Result<ReleaseTags, String> {
+    let mut tags = ReleaseTags::default();
+    if stable {
+        tags.stable = Some(stable_tag(get_json(latest_url).await?)?);
+    }
+    if list {
+        let releases = get_json::<Vec<GitHubRelease>>(list_url).await?;
+        tags.newest = Some(newest_tag(&releases)?);
+        tags.prerelease = newest_prerelease_tag(&releases);
+        if tags.stable.is_none() {
+            tags.stable = newest_stable_tag(&releases);
+        }
+    }
+    Ok(tags)
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(api_url: &str) -> Result<T, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get(repo_identity::RELEASES_API_URL)
+        .get(api_url)
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),
         )
         .send()
         .await
-        .ok()?;
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("{api_url} answered {}", resp.status()));
+    }
 
-    let release: GitHubRelease = resp.json().await.ok()?;
-    Some(release.tag_name)
+    resp.json().await.map_err(|e| e.to_string())
 }
 
-/// Returns the latest version string if a newer release exists, `None` otherwise.
-/// All errors are silently swallowed — this must never block or crash the app.
-///
-/// An `e2e` build does not ask. The L2 harness drives the real binary on a
-/// machine with network access, so whether the badge appears depended on
-/// whether GitHub answered that runner's unauthenticated request; when it
-/// did, the badge covered the right end of the footer that tests match on
-/// (`visibility_001` on PR #1617's CI). Gated on the feature rather than an
-/// env var for the reason `effective_current_exe` in `src/platform/paths.rs` gives: a
-/// release build carries no switch to turn the check off.
-pub async fn check_for_update() -> Option<String> {
-    if cfg!(feature = "e2e") {
-        return None;
+/// `release`'s tag when it is a stable release. `releases/latest` never
+/// answers with a prerelease or a draft; this holds the stable channel to that
+/// in our own code rather than only in GitHub's.
+fn stable_tag(release: GitHubRelease) -> Result<String, String> {
+    let is_prerelease = parse_tag(&release.tag_name).is_some_and(|v| !v.pre.is_empty());
+    if release.draft || release.prerelease || is_prerelease {
+        return Err(format!("`{}` is not a stable release", release.tag_name));
     }
-    let current = current_version();
-    let tag = fetch_latest_version().await?;
-    should_notify(&current, &tag)
+    Ok(release.tag_name)
+}
+
+/// The tag with the highest version among `releases`, prereleases included and
+/// drafts skipped. A tag that is not a version is ignored.
+fn newest_tag(releases: &[GitHubRelease]) -> Result<String, String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
+        .ok_or_else(|| "no published release names a version".to_string())
+}
+
+/// The tag with the highest version among `releases` that is a stable
+/// release: neither a draft, nor marked a prerelease, nor carrying a SemVer
+/// prerelease suffix. `None` when no such release is listed.
+fn newest_stable_tag(releases: &[GitHubRelease]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .filter(|(version, _)| version.pre.is_empty())
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
+}
+
+/// The tag with the highest version among `releases` that carries a SemVer
+/// prerelease suffix, drafts skipped: what the `dot-agent-deck-beta` Homebrew
+/// formula receives (`release.yml`'s "Detect channel" routes a version with a
+/// `-` in it there). `None` when no such release is listed.
+fn newest_prerelease_tag(releases: &[GitHubRelease]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| Some((parse_tag(&release.tag_name)?, &release.tag_name)))
+        .filter(|(version, _)| !version.pre.is_empty())
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag.clone())
 }
 
 /// Pull the version number out of `dot-agent-deck --version` output.
@@ -128,6 +234,105 @@ mod tests {
         let current = semver::Version::new(0, 1, 0);
         assert_eq!(should_notify(&current, "v0.2.0"), Some("0.2.0".into()));
         assert_eq!(should_notify(&current, "V0.2.0"), Some("0.2.0".into()));
+    }
+
+    fn release(tag: &str, draft: bool, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.into(),
+            draft,
+            prerelease,
+        }
+    }
+
+    /// The shape of GitHub's `releases` list: newest first, with a draft, a
+    /// newer prerelease than any stable, and the stable line below it.
+    fn release_list() -> Vec<GitHubRelease> {
+        serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.48.0-beta.1", "draft": true, "prerelease": true},
+                {"tag_name": "v0.47.0-beta.2", "draft": false, "prerelease": true},
+                {"tag_name": "v0.47.0-beta.10", "draft": false, "prerelease": true},
+                {"tag_name": "nightly", "draft": false, "prerelease": true},
+                {"tag_name": "v0.46.0", "draft": false, "prerelease": false},
+                {"tag_name": "v0.45.0", "draft": false, "prerelease": false}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_channel_of_version() {
+        assert_eq!(
+            ReleaseChannel::of_version("0.47.0-beta.1"),
+            ReleaseChannel::Prerelease
+        );
+        assert_eq!(
+            ReleaseChannel::of_version("v0.25.0-alpha.0"),
+            ReleaseChannel::Prerelease
+        );
+        assert_eq!(ReleaseChannel::of_version("0.46.0"), ReleaseChannel::Stable);
+        assert_eq!(
+            ReleaseChannel::of_version("garbage"),
+            ReleaseChannel::Stable
+        );
+    }
+
+    #[test]
+    fn test_newest_tag_includes_prereleases_by_semver_and_skips_drafts() {
+        assert_eq!(newest_tag(&release_list()).unwrap(), "v0.47.0-beta.10");
+        let mut list = release_list();
+        list.push(release("v0.47.0", false, false));
+        assert_eq!(newest_tag(&list).unwrap(), "v0.47.0", "a newer stable wins");
+        assert!(newest_tag(&[release("v0.49.0", true, false)]).is_err());
+    }
+
+    #[test]
+    fn test_newest_prerelease_tag_ignores_stables_and_drafts() {
+        assert_eq!(
+            newest_prerelease_tag(&release_list()).as_deref(),
+            Some("v0.47.0-beta.10")
+        );
+        let mut list = release_list();
+        list.push(release("v0.47.0", false, false));
+        assert_eq!(
+            newest_prerelease_tag(&list).as_deref(),
+            Some("v0.47.0-beta.10"),
+            "a newer stable is not a prerelease"
+        );
+        assert_eq!(
+            newest_prerelease_tag(&[
+                release("v0.46.0", false, false),
+                release("v0.48.0-beta.1", true, true)
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_newest_stable_tag_skips_prereleases_and_drafts() {
+        assert_eq!(
+            newest_stable_tag(&release_list()).as_deref(),
+            Some("v0.46.0")
+        );
+        let mut list = release_list();
+        list.push(release("v0.47.0", true, false));
+        list.push(release("v0.47.1", false, true));
+        assert_eq!(newest_stable_tag(&list).as_deref(), Some("v0.46.0"));
+        assert_eq!(
+            newest_stable_tag(&[release("v0.47.0-rc.1", false, false)]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_stable_channel_is_never_offered_a_prerelease() {
+        assert_eq!(
+            stable_tag(release("v0.46.0", false, false)).unwrap(),
+            "v0.46.0"
+        );
+        assert!(stable_tag(release("v0.47.0-beta.2", false, false)).is_err());
+        assert!(stable_tag(release("v0.47.0", false, true)).is_err());
+        assert!(stable_tag(release("v0.47.0", true, false)).is_err());
     }
 
     #[test]

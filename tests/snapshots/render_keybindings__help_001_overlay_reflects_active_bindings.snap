@@ -1,9 +1,7 @@
 ---
 source: tests/render_keybindings.rs
-assertion_line: 111
 expression: text
 ---
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -38,6 +36,7 @@ expression: text
         │  y / n              Approve / deny permission                                                       │         
         │  s                  Schedules manager                                                               │         
         │  o                  Open pull request                                                               │         
+        │  u                  Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

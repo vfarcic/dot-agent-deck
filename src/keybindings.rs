@@ -94,6 +94,8 @@ pub enum Action {
     OpenScheduledTasks,
     /// PRD #1401: open the selected card's pull request in the system browser.
     OpenPullRequest,
+    /// Issue #1635: open the upgrade dialog the footer's update badge names.
+    OpenUpgrade,
     ScrollPaneUp,
     ScrollPaneDown,
 }
@@ -343,6 +345,16 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_pull_request",
         default: "o",
         description: "Open pull request",
+    },
+    // Issue #1635: open the upgrade dialog the footer's update badge names.
+    // Default `u`, free in command mode; the badge and the help overlay read
+    // the active binding, so a rebind shows there too.
+    ActionSpec {
+        action: Action::OpenUpgrade,
+        section: Section::Dashboard,
+        name: "open_upgrade",
+        default: "u",
+        description: "Upgrade",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back

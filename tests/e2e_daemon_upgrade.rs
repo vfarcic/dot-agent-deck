@@ -20,9 +20,10 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
 use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery, RestartDaemonRequest};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, CAP_RESTART_DAEMON, RestartDaemonReply, RestartRefusalReason,
-    RestartStopSet, RestartSuccessor,
+    AttachRequest, AttachResponse, CAP_RESTART_DAEMON, RestartAgent, RestartDaemonReply,
+    RestartRefusalReason, RestartStopSet, RestartSuccessor,
 };
+use dot_agent_deck::daemon_restart::{RemoteRestartReport, encode_stop_set_hex};
 use spec::spec;
 use tempfile::TempDir;
 
@@ -290,6 +291,49 @@ impl InstalledDaemon {
             GatedQuery::Answered(reply) => reply,
             GatedQuery::Unsupported => panic!("new daemon must advertise {CAP_RESTART_DAEMON}"),
         }
+    }
+
+    /// Run this build's `daemon restart-installed --json --confirm-stdin`
+    /// against this daemon, as the ssh route does, with
+    /// `confirm`'s JSON on its stdin, and parse the report it prints.
+    fn restart_installed_via_stdin(&self, confirm: &RestartStopSet) -> RemoteRestartReport {
+        use std::io::Write;
+        let home = self._dir.path().join("home");
+        // The retained build rather than the install target: the target's
+        // wrapper records every run but `--version` as the successor.
+        let mut child = Command::new(&self.retained)
+            .args(["daemon", "restart-installed", "--json", "--confirm-stdin"])
+            .current_dir(&home)
+            .env_clear()
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )
+            .env("DOT_AGENT_DECK_SOCKET", self._dir.path().join("hook.sock"))
+            .env("DOT_AGENT_DECK_ATTACH_SOCKET", &self.attach)
+            .env("DOT_AGENT_DECK_STATE_DIR", self._dir.path().join("state"))
+            .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run restart-installed");
+        let json = serde_json::to_vec(confirm).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&json);
+        });
+        let output = child.wait_with_output().expect("restart-installed output");
+        writer.join().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "restart-installed failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"))
     }
 
     fn assert_untouched(&mut self, expected: &[AgentRecord]) {
@@ -695,4 +739,35 @@ fn wire_restart_008_a_second_signal_during_successor_verification_exits() {
         !common::wait_until(Duration::from_secs(2), || daemon.successor_pid.exists()),
         "no successor starts after the forced exit"
     );
+}
+
+/// Scenario: With stand-in agents and roles alive, run `daemon restart-installed --confirm-stdin` and write a confirmation to its stdin that names 600 agents, too large for the 128 KiB command-line limit once hex-encoded. The daemon reads the whole set and answers that it is stale, disclosing the real three, and nothing stops. Sending the disclosed set the same way restarts the daemon (issue #1619).
+#[spec("lifecycle/wire-restart/009")]
+#[test]
+fn wire_restart_009_restart_installed_reads_a_confirmation_too_large_for_the_command_line() {
+    let mut daemon = InstalledDaemon::spawn();
+    let agents = daemon.seed_live_set();
+    let oversized = RestartStopSet {
+        agents: (0..600)
+            .map(|i| RestartAgent {
+                id: format!("agent-{i:04}-0123456789abcdef"),
+                label: format!("claude: refactor the module at index {i}"),
+                pane_id: Some(format!("pane-{i}")),
+                cwd: Some(format!("/home/someone/work/repository-{i}/worktree")),
+            })
+            .collect(),
+        roles: Vec::new(),
+    };
+    assert!(encode_stop_set_hex(&oversized).len() > 128 * 1024);
+
+    let report = daemon.restart_installed_via_stdin(&oversized);
+    assert!(report.running && !report.unsupported, "{report:?}");
+    let fresh = needs_confirmation(report.reply.expect("the daemon answered"), true);
+    assert_full_set(&fresh, &agents);
+    daemon.assert_untouched(&agents);
+
+    let report = daemon.restart_installed_via_stdin(&fresh);
+    let stopping = accepted(report.reply.expect("the daemon answered"));
+    assert_full_set(&stopping, &agents);
+    daemon.assert_replaced();
 }

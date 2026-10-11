@@ -1,9 +1,7 @@
 ---
 source: tests/render_help_overlay.rs
-assertion_line: 97
 expression: buf
 ---
-                                                                                                              
                                                                                                               
                                                                                                               
                                                                                                               
@@ -46,6 +44,7 @@ expression: buf
    │  y / n              approve / deny permission                                                       │    
    │  s                  schedules manager                                                               │    
    │  o                  open pull request                                                               │    
+   │  u                  upgrade (update badge)                                                          │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    

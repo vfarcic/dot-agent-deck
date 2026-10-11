@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
+    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree_from, record_worktree,
     remove_worktree, run_git_capture, run_git_status,
 };
 use crate::scheduler::StderrNotifier;
@@ -415,41 +415,89 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
     }
 }
 
-/// Human-readable description of the commit a dispatch is about to cut its
-/// worktree from — `"main at c701932"`, or `"detached HEAD at c701932"`.
+/// The commit a dispatch cuts its worktree from, read once from the caller's
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchBase {
+    /// The full sha `HEAD` resolved to. [`create_dispatch_worktree`] passes it
+    /// to `git worktree add` as the start-point, so this IS the unit's base.
+    sha: String,
+    /// What the success line reports — `"main at c701932"`, or
+    /// `"detached HEAD at c701932"` — naming the same commit as [`Self::sha`].
+    description: String,
+}
+
+/// Read the commit a dispatch is about to cut its worktree from.
 ///
-/// Issue #674: `dispatch` takes no base or branch option. [`create_worktree`]
-/// runs `git worktree add <dir> -b <branch>` with no start-point, which git
-/// resolves to the CALLER's `HEAD`, so the freshness of the caller's checkout is
-/// the only thing deciding where a unit starts — and nothing in the dispatch
-/// output named it. A stale or simply unexpected base (a feature branch the user
+/// Issue #674: `dispatch` takes no base or branch option and cuts every unit
+/// from the CALLER's `HEAD`, so the freshness of the caller's checkout is the
+/// only thing deciding where a unit starts — and nothing in the dispatch output
+/// named it. A stale or simply unexpected base (a feature branch the user
 /// happened to be standing on) was therefore invisible at the one moment the
 /// user is looking: three units cut from a `main` six commits behind
 /// `origin/main` reported exactly the same success line as three cut from a
 /// current one.
 ///
-/// Deliberately best-effort and `Option`: this is a reporting nicety on a path
-/// that has already done the real work, so a probe that fails must drop the
-/// clause rather than fail the dispatch. Read BEFORE the worktree is created,
-/// which is the state `git worktree add` will actually resolve.
-async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
+/// Issue #1643: `HEAD` is resolved to a full sha HERE, once, and that sha is
+/// both what the clause reports and what the worktree is cut from (see
+/// [`create_dispatch_worktree`]). Before, git resolved `HEAD` a second time
+/// inside `git worktree add`, so a `HEAD` that moved in between left the reply
+/// naming one commit and the unit starting from another. The branch NAME in the
+/// description is read separately and is a label; the sha is the base.
+///
+/// Deliberately best-effort and `Option`: this is a reporting nicety, so a
+/// probe that fails drops the clause rather than failing the dispatch, and the
+/// worktree is then cut without a start-point, as it always was.
+async fn resolve_dispatch_base(clone_dir: &Path) -> Option<DispatchBase> {
     let clone = clone_dir.to_string_lossy();
+    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--verify", "HEAD^{commit}"])
+        .await
+        .ok()?;
+    let sha = sha.trim();
+    // Abbreviated from the sha just read, never from a fresh `HEAD`, so the
+    // short form cannot name a different commit than the full one.
+    let short = run_git_capture(&["-C", &clone, "rev-parse", "--short", sha])
+        .await
+        .ok()?;
     let head = run_git_capture(&["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .ok()?;
-    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--short", "HEAD"])
-        .await
-        .ok()?;
-    let (head, sha) = (head.trim(), sha.trim());
-    if head.is_empty() || sha.is_empty() {
+    let (head, short) = (head.trim(), short.trim());
+    if sha.is_empty() || short.is_empty() || head.is_empty() {
         return None;
     }
     // `rev-parse --abbrev-ref HEAD` answers the literal string `HEAD` when the
     // checkout is detached, which as a branch name would read as a lie.
-    if head == "HEAD" {
-        return Some(format!("detached HEAD at {sha}"));
-    }
-    Some(format!("{head} at {sha}"))
+    let description = if head == "HEAD" {
+        format!("detached HEAD at {short}")
+    } else {
+        format!("{head} at {short}")
+    };
+    Some(DispatchBase {
+        sha: sha.to_string(),
+        description,
+    })
+}
+
+/// Create a dispatch's worktree from `base` — the commit the success line will
+/// report — rather than from whatever `HEAD` is by the time `git worktree add`
+/// runs (issue #1643). With no base (the probe failed) git resolves `HEAD`
+/// itself, which is what every dispatch did before.
+async fn create_dispatch_worktree(
+    clone_dir: &Path,
+    paths: &DispatchPaths,
+    name: &str,
+    base: Option<&DispatchBase>,
+) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        false,
+        Creator::dispatch(name),
+        base.map(|b| b.sha.as_str()),
+    )
+    .await
 }
 
 /// Whether `dir` is the top of its git working tree — where a unit cut from it
@@ -768,20 +816,11 @@ pub async fn handle_dispatch(
         }
     };
 
-    // Captured before the worktree exists, so it names the state `git worktree
-    // add` resolves its (absent) start-point against. See
-    // [`describe_dispatch_base`] for why this is reported at all.
-    let base = describe_dispatch_base(&clone_dir).await;
+    // Read once, and the worktree is cut from exactly this sha, so the base the
+    // reply names is the unit's base. See [`resolve_dispatch_base`].
+    let base = resolve_dispatch_base(&clone_dir).await;
 
-    match create_worktree(
-        &clone_dir,
-        &paths.worktree_dir,
-        &paths.branch,
-        false,
-        Creator::dispatch(name),
-    )
-    .await
-    {
+    match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref()).await {
         Ok(WorktreeCreation::Created) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
@@ -931,7 +970,7 @@ pub async fn handle_dispatch(
                         ),
                     };
                     let mut msg = match &base {
-                        Some(base) => format!("{opened}, cut from {base}"),
+                        Some(base) => format!("{opened}, cut from {}", base.description),
                         None => opened,
                     };
                     // Only for an orchestration: a `--single` dispatch consulted no
@@ -1089,7 +1128,7 @@ async fn rollback_dispatched_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::issue_dispatch_run::{new_worktree_registry, take_worktree};
+    use crate::issue_dispatch_run::{create_worktree, new_worktree_registry, take_worktree};
 
     /// Build a real git repo with one commit, so the `git worktree` primitives
     /// under test operate on a genuine repo rather than a stubbed one.
@@ -1174,19 +1213,83 @@ mod tests {
         init_repo_in(tmp.path(), &repo);
         git_in(tmp.path(), &repo, &["checkout", "-q", "-b", "feature-x"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
             .expect("a healthy repo must yield a base");
 
-        let sha = String::from_utf8(
-            crate::git_env::fixture_git(&repo, tmp.path())
-                .args(["rev-parse", "--short", "HEAD"])
-                .output()
-                .expect("git available")
-                .stdout,
-        )
-        .unwrap();
-        assert_eq!(base, format!("feature-x at {}", sha.trim()));
+        assert_eq!(
+            base.description,
+            format!(
+                "feature-x at {}",
+                git_out(tmp.path(), &repo, &["rev-parse", "--short", "HEAD"])
+            )
+        );
+        assert_eq!(base.sha, git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]));
+    }
+
+    /// `git` in `repo`, trimmed stdout.
+    fn git_out(sandbox_root: &Path, repo: &Path, args: &[&str]) -> String {
+        let out = crate::git_env::fixture_git(repo, sandbox_root)
+            .args(args)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Issue #1643: the base the reply names must be the base the unit is cut
+    /// from, even when the caller's `HEAD` moves after it was read. Before the
+    /// fix, `git worktree add -b` got no start-point and read `HEAD` a second
+    /// time, so a commit landing in between put the unit on the NEW commit
+    /// while the reply named the old one.
+    #[tokio::test]
+    async fn dispatch_worktree_is_cut_from_the_reported_base_when_head_moves() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "race");
+
+        let base = resolve_dispatch_base(&repo)
+            .await
+            .expect("a healthy repo must yield a base");
+        // `HEAD` moves between the probe and the worktree creation.
+        git_in(
+            tmp.path(),
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "moved"],
+        );
+        let moved = git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]);
+        assert_ne!(moved, base.sha, "the premise: HEAD really moved");
+
+        assert_eq!(
+            create_dispatch_worktree(&repo, &paths, "race", Some(&base)).await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            base.sha,
+            "the unit must start at the reported base ({}), not at the moved HEAD",
+            base.description
+        );
+    }
+
+    /// With no base (the probe failed), the worktree is still cut, from the
+    /// caller's `HEAD`, exactly as before issue #1643.
+    #[tokio::test]
+    async fn dispatch_worktree_without_a_base_is_cut_from_head() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "no-base");
+
+        assert_eq!(
+            create_dispatch_worktree(&repo, &paths, "no-base", None).await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            git_out(tmp.path(), &repo, &["rev-parse", "HEAD"])
+        );
     }
 
     /// Issue #1602 (PR #1603 review): the root of a repository is where a
@@ -1217,9 +1320,10 @@ mod tests {
         init_repo_in(tmp.path(), &repo);
         git_in(tmp.path(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
-            .expect("a detached checkout is still a healthy repo");
+            .expect("a detached checkout is still a healthy repo")
+            .description;
 
         assert!(
             base.starts_with("detached HEAD at "),
@@ -1237,7 +1341,7 @@ mod tests {
         let not_a_repo = tmp.path().join("plain-dir");
         std::fs::create_dir_all(&not_a_repo).unwrap();
 
-        assert_eq!(describe_dispatch_base(&not_a_repo).await, None);
+        assert_eq!(resolve_dispatch_base(&not_a_repo).await, None);
     }
 
     // --- slug + path derivation ---

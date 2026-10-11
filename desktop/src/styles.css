@@ -1039,6 +1039,27 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
 /* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
 .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
+/* Issue #1635 — this machine's own copies: the rail's newer-release button, the dashboard banner, and the dialog's per-copy plans. */
+.rail-bottom .rail-update { color: var(--shell-teal); border-color: var(--shell-teal-edge); background: var(--shell-teal-surface); }
+.rail-bottom .rail-update:hover, .rail-bottom .rail-update:focus-visible { color: var(--shell-teal-text-strong); }
+.self-upgrade-banner { margin-bottom: 8px; }
+.self-upgrade-banner .self-upgrade-banner-open { width: auto; padding: 0 8px; border: 1px solid currentColor; font-size: 10px; font-weight: 600; }
+.self-upgrade-dialog { width: min(520px, 100%); max-height: 80vh; overflow: auto; }
+.self-upgrade-plan { margin: 12px 0 0; padding: 9px 11px; text-align: left; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.self-upgrade-plan h3 { margin: 0 0 5px; font-size: 11px; }
+.self-upgrade-lines p { margin: 4px 0; max-width: none; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.self-upgrade-command { margin: 4px 0; display: flex; align-items: flex-start; gap: 6px; }
+.self-upgrade-command code { flex: 1; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-sunken); color: var(--ink); font-size: 9px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.self-upgrade-command button { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-strong); cursor: pointer; }
+.self-upgrade-running { margin: 6px 0 0; display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 9.5px; }
+.self-upgrade-result { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.self-upgrade-result[data-ok="true"] .self-upgrade-lines p:first-child { color: var(--ink); font-weight: 600; }
+.self-upgrade-result[data-ok="false"] .self-upgrade-lines p:first-child { color: var(--red); }
+.self-upgrade-actions { margin-top: 14px; }
+.self-upgrade-actions > p { margin: 0 auto 10px; color: var(--ink); font-size: 10.5px; }
+.self-upgrade-actions > div { display: flex; justify-content: center; gap: 7px; }
+/* The actions block is the dialog's last child, so `.confirm-dialog > div:last-child` would lay its question and buttons out side by side. */
+.confirm-dialog.self-upgrade-dialog > div.self-upgrade-actions { display: block; }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step

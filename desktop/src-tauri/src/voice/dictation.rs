@@ -100,11 +100,15 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// in a panic.
 ///
 /// **"go ahead" is absent from this list and is still a send phrase**, which is
-/// worth saying because the two halves read like a contradiction.
-/// `submit_prompt`'s own description names it, so a bare *"go ahead"* is
-/// answered by the model rather than here — and the model is told it means
-/// send. This list decides who answers an utterance, never what happens to it,
-/// which is why linkage-check rule 14 runs one way only. The worry that kept it out — an
+/// worth saying because the two halves read like a contradiction. This list is
+/// answered on EVERY screen — refused with the row's hint off the agent screen
+/// — and a bare *"go ahead"* is `start_new_agent`'s over the New agent dialog,
+/// which that refusal would take from it. So `submit_prompt`'s other
+/// `heard_as_whole` entries, *"go ahead"* among them, are answered locally only
+/// where the row is callable, and reach the model everywhere else
+/// (`outcome::local_intercept`, issue #1246). This list decides who answers an
+/// utterance, never what happens to it, which is why linkage-check rule 14 runs
+/// one way only. The worry that kept it out — an
 /// agent that has just asked *"shall I proceed?"* makes *"go ahead"* an answer
 /// the user wants **typed** — is real, and keeping it out does not serve it:
 /// [`strip_opening`] always strips at least one introducing token, so no

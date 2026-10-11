@@ -44,6 +44,14 @@
 //! cannot be resolved (a dangling symlink), is refused rather than guessed at.
 //! The result must lie under one canonicalized root.
 //!
+//! So must the destination's own directory entry: its parent resolved the same
+//! way, with the final name appended unresolved. Every guarded writer acts on
+//! that entry and not only on what it names — a temp file and a backup are
+//! created beside it, a rename replaces it, a removal unlinks it — and none of
+//! those follows a final symlink. Judging only the resolved destination let a
+//! symlink outside the owned root that points inside it pass, and the publish
+//! then renamed over the outside symlink (#1614).
+//!
 //! # What it is not
 //!
 //! Best-effort protection against **accidental** misconfiguration — a test
@@ -92,18 +100,33 @@ fn check_config_write(dest: &Path) -> io::Result<()> {
     let Some(roots) = armed_roots()? else {
         return Ok(());
     };
+    check_within_roots(dest, &roots)
+}
+
+/// The armed half of [`check_config_write`], over explicit canonical `roots`.
+/// Both where an open of `dest` lands and where its own directory entry lives
+/// must be under one of them (#1614).
+fn check_within_roots(dest: &Path, roots: &[PathBuf]) -> io::Result<()> {
     let resolved = resolve_for_containment(dest)?;
-    if roots.iter().any(|root| resolved.starts_with(root)) {
+    let entry = resolve_entry(dest)?;
+    let (outside, how) = if !within(&resolved, roots) {
+        (resolved, "resolves to")
+    } else if !within(&entry, roots) {
+        (
+            entry,
+            "its directory entry, which a temp file, rename or removal acts on, is",
+        )
+    } else {
         return Ok(());
-    }
+    };
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "refusing to write agent config at {} (resolves to {}): this is a test process and \
+            "refusing to write agent config at {} ({how} {}): this is a test process and \
              the path is outside its owned root ({}). Point HOME / CODEX_HOME / XDG_CONFIG_HOME \
              / PI_CODING_AGENT_DIR at a directory under {ROOT_ENV}.",
             dest.display(),
-            resolved.display(),
+            outside.display(),
             roots
                 .iter()
                 .map(|root| root.display().to_string())
@@ -111,6 +134,25 @@ fn check_config_write(dest: &Path) -> io::Result<()> {
                 .join(", ")
         ),
     ))
+}
+
+fn within(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+/// Where `dest`'s own directory entry lives: its parent resolved by
+/// [`resolve_for_containment`], with the final name appended unresolved. It
+/// differs from the resolved destination only when the final component is a
+/// symlink. A path that does not end in a name (`/`, a trailing `..`) has no
+/// such entry to replace, so it is judged by its resolution alone.
+fn resolve_entry(dest: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(dest)?;
+    match (absolute.parent(), absolute.components().next_back()) {
+        (Some(parent), Some(Component::Normal(name))) => {
+            Ok(resolve_for_containment(parent)?.join(name))
+        }
+        _ => resolve_for_containment(&absolute),
+    }
 }
 
 /// `None` when containment is not armed; otherwise the canonical owned roots,
@@ -254,7 +296,7 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
     }
 }
 
-// Unix-only: the one test needs a symlink.
+// Unix-only: the tests need symlinks.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -276,6 +318,43 @@ mod tests {
         std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).unwrap();
         assert!(resolve_for_containment(&root.join("dangling/file")).is_err());
         assert!(running_under_test_runner());
+    }
+
+    /// Scenario: a destination symlink outside the owned root that points into
+    /// it is refused, because a rename or temp file acts on the outside entry
+    /// (#1614). A symlink inside the root that points inside it still passes,
+    /// and one that points out of it is still refused.
+    #[test]
+    fn a_final_symlink_is_judged_by_its_own_entry_as_well_as_its_target() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let base = std::fs::canonicalize(fixture.path()).unwrap();
+        let owned = base.join("owned");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(owned.join("hooks.json"), "{}").unwrap();
+        std::fs::write(outside.join("hooks.json"), "{}").unwrap();
+        let roots = [owned.clone()];
+
+        let inward = outside.join("inward.json");
+        std::os::unix::fs::symlink(owned.join("hooks.json"), &inward).unwrap();
+        let err = check_within_roots(&inward, &roots).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("directory entry"),
+            "the refusal names the entry: {err}"
+        );
+
+        let local = owned.join("local.json");
+        std::os::unix::fs::symlink(owned.join("hooks.json"), &local).unwrap();
+        check_within_roots(&local, &roots).expect("a symlink within the root");
+        check_within_roots(&owned.join("hooks.json"), &roots).expect("a plain file");
+        check_within_roots(&owned.join("new/hooks.json"), &roots).expect("a missing file");
+
+        let outward = owned.join("outward.json");
+        std::os::unix::fs::symlink(outside.join("hooks.json"), &outward).unwrap();
+        assert!(check_within_roots(&outward, &roots).is_err());
+        assert!(check_within_roots(&outside.join("hooks.json"), &roots).is_err());
     }
 
     /// Scenario: a root that names a file, a missing path or a relative path

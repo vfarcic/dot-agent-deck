@@ -480,3 +480,89 @@ fn remote_connect_002_declining_upgrade_preserves_existing_behavior() {
         assert!(!terminal.output().contains("Restart now?"));
     }
 }
+
+/// Scenario: Connect over a PTY to an older idle remote that has both a legacy `~/.local/bin` copy and a Homebrew install, with a deck-list row that recorded neither, and answer y at Upgrade and connect. `brew upgrade` lands the new build and then its `hooks install` fails. The incomplete upgrade is reported, and the session that opens runs the Homebrew binary just upgraded rather than the old local copy (issue #1604).
+#[spec("remote/connect/004")]
+#[test]
+fn remote_connect_004_partial_upgrade_connects_to_the_upgraded_homebrew_binary() {
+    let remote = Remote::new();
+    let root = remote.dir.path();
+    let prefix = root.join("brew-prefix");
+    let keg = prefix.join("Cellar/dot-agent-deck/current/bin/dot-agent-deck");
+    let linked = prefix.join("bin/dot-agent-deck");
+    fs::create_dir_all(keg.parent().unwrap()).unwrap();
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    // Homebrew starts on the same old build as the legacy copy.
+    script(&keg, &fs::read_to_string(&remote.installed).unwrap());
+    std::os::unix::fs::symlink(&keg, &linked).unwrap();
+    // What `brew upgrade` lands: the new build, whose hook install fails.
+    let upgraded: String = fs::read_to_string(root.join("payload"))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.contains("= hooks ]") {
+                "if [ \"$1\" = hooks ]; then echo 'hooks: settings.json is not writable' >&2; exit 3; fi".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let staged = root.join("brew-upgraded");
+    script(&staged, &upgraded);
+    let brew = format!(
+        "#!/bin/sh\ncase \"$1\" in\n--prefix) if [ \"$2\" = dot-agent-deck ]; then echo {keg_dir}; elif [ -z \"$2\" ]; then echo {prefix}; else exit 1; fi ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck ] ;;\nupgrade) cp {staged} {keg}.new && mv {keg}.new {keg} ;;\n*) exit 1 ;;\nesac\n",
+        keg_dir = quoted(keg.parent().unwrap().parent().unwrap()),
+        prefix = quoted(&prefix),
+        staged = quoted(&staged),
+        keg = quoted(&keg),
+    );
+    script(&prefix.join("bin/brew"), &brew);
+    // Found on the non-interactive PATH, as a custom prefix is.
+    script(&root.join("stubs/brew"), &brew);
+
+    let mut terminal = remote.tty(&["connect", DECK]);
+    terminal.wait("Upgrade and connect? [y/N]");
+    terminal.send("y\n");
+    terminal.wait("No active agents");
+
+    let text = terminal.output();
+    assert!(
+        text.contains("reinstalling the hooks failed")
+            && text.contains(&format!(
+                "Run `dot-agent-deck remote upgrade {DECK}` again to finish."
+            )),
+        "connect must still report the incomplete upgrade: {text}"
+    );
+    let version = |binary: &std::path::Path| {
+        let out = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    assert_eq!(
+        version(&linked),
+        format!("dot-agent-deck {}", remote.version),
+        "Homebrew's copy was upgraded"
+    );
+    assert_eq!(
+        version(&remote.installed),
+        format!("dot-agent-deck {OLD_VERSION}"),
+        "the legacy copy is still the old build"
+    );
+    let ssh_log = fs::read_to_string(root.join("ssh.log")).unwrap();
+    let session = ssh_log
+        .lines()
+        .filter(|line| line.contains("DOT_AGENT_DECK_VIA_DAEMON=1"))
+        .collect::<Vec<_>>();
+    let linked = linked.display().to_string();
+    assert!(
+        !session.is_empty()
+            && session
+                .iter()
+                .all(|line| line.trim_end().ends_with(&linked)),
+        "the session must run the upgraded Homebrew binary {linked}, not the legacy copy: {session:?}"
+    );
+}

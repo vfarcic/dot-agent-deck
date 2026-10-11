@@ -488,6 +488,7 @@ impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
                 reason,
                 installed_version,
                 old_daemon_gone,
+                ..
             } => Self::Failed {
                 stage: *stage,
                 reason: text(reason),
@@ -939,6 +940,7 @@ mod tests {
             reason: "ssh: connect timed out".into(),
             installed_version: None,
             old_daemon_gone: false,
+            installed_binary: None,
         }))
         .unwrap();
         assert_eq!(failed["outcome"], "failed");
@@ -1026,6 +1028,7 @@ mod tests {
     #[test]
     fn only_an_outcome_whose_old_daemon_may_be_gone_ends_the_decks_sessions() {
         let failed = |stage, old_daemon_gone| UpgradeOutcome::Failed {
+            installed_binary: None,
             stage,
             reason: "r".into(),
             installed_version: Some("0.45.0".into()),
