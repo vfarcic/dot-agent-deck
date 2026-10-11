@@ -19,7 +19,9 @@ import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
+import { orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
+import { HookBinaryNotices } from "./HookBinaryNotice";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -232,7 +234,7 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
         id,
         key: id === undefined ? anonymousOrchestrationKey(agent) : groupKey("orchestration", id),
         kind: "orchestration" as const,
-        title: agent.tab.displayTitle || agent.tab.name,
+        title: orchestrationTitle(agent.tab),
         subtitle: agent.tab.displayTitle ? agent.tab.name : undefined,
         agents: [],
       };
@@ -1782,6 +1784,9 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
+
+      {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
+      {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
 
       <div className="daemon-group-body">
         <DaemonBody

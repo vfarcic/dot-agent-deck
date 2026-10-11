@@ -1,0 +1,5 @@
+---
+source: tests/hook_stale_notice.rs
+expression: row
+---
+⚠ Claude Code… hooks run 0.45.1; deck 0.46.0 — Run: brew upgrade dot-agent-deck

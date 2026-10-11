@@ -54,6 +54,7 @@ import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
+import { HookBinaryNotices } from "./components/HookBinaryNotice";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
@@ -85,7 +86,8 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
-import type { ReadingAgent } from "./lib/reading";
+import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
+import { agentSpokenName } from "./lib/agentNames";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -687,7 +689,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
    * while it is on, every agent on the deck being viewed (every observed deck
-   * under All Decks). The voice panel reads them, on any screen. Handed over
+   * under All Decks). The voice panel reads them, on any screen, and narrows
+   * what is spoken to one agent while that agent's pane is open (issue
+   * #1667). Each is labelled as a sentence about it names it: an
+   * orchestration agent by the run's title and its name. Handed over
    * only once the settings are loaded, so the document being read is not
    * taken for the switch being turned.
    */
@@ -703,7 +708,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agent.displayName, incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the
@@ -2221,6 +2226,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
             {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
+
+        {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. Not the banner above — the connection is fine. */}
+        {!allDecks && <HookBinaryNotices notices={snapshot.connection.hookBinaryNotices} />}
 
         {allDecks && (
           <section className="workspace-section" aria-label="Select a daemon">

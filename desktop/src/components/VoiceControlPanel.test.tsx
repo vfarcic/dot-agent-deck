@@ -2872,17 +2872,19 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
   });
 
-  /** Scenario (decision 4): with the Planner's pane open, the Planner's summary is said without its name and another agent's names it. */
-  it("drops the name of the agent whose pane is open", async () => {
-    const h = await mount({ reading: "on", notice: "shown", openPane: true });
+  /** Scenario (decision 4, issue #1667): with the Planner's pane open, the Planner's summary is said without its name, and another agent's summary and error are not said at all, while every agent stays subscribed. */
+  it("reads only the agent whose pane is open, without its name", async () => {
+    const h = await mount({ reading: "on", notice: "shown", openPane: true, silent: false });
     const other = h.agents.find((agent) => agent !== "planner")!;
     await act(async () => {
-      h.sinks.get("planner")!({ kind: "turn", text: "Planner: planned.", bare: "Planned." });
       h.sinks.get(other)!({ kind: "turn", text: `${other}: built.`, bare: "Built." });
+      h.sinks.get("planner")!({ kind: "turn", text: "Planner: planned.", bare: "Planned." });
+      h.sinks.get(other)!({ kind: "blocked", text: `The ${other} stopped with an error.`, bare: "Stopped with an error." });
     });
-    await flush();
-    expect(h.spoken[0]).toBe("Planned.");
+    await h.drain();
+    expect(h.spoken).toEqual(["Planned."]);
     expect(h.reader.voiceReadingStart).toHaveBeenCalledTimes(h.agents.length);
+    expect(h.stopped).toEqual([]);
   });
 
   /** Scenario (decision 1): Settings → Voice names the switch Reading, and turning it on there reads the deck's agents and says the one-time notice, as saying "reading on" does. */

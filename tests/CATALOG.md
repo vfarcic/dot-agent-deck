@@ -1819,7 +1819,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 
 The per-agent prompt keys the deck serves for voice control of the open agent's prompt (PRD #1541): interrupt the turn, clear the prompt, delete characters. Each test reads the keys from the daemon's own `ListAgents` answer (`AgentRecord::prompt_keys`) and writes them as raw `KIND_STREAM_IN` frames on an attach stream to the agent — the desktop's terminal-write path — rather than as keystrokes through the TUI. File: `tests/e2e_prompt_keys_live.rs` (lane 2).
 
-Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; with a ChatGPT-subscription login set `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` and `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the defaults are refused by that login, and the preflights say so).
+Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; Codex picks its default from the login's auth mode (issue #656); with a ChatGPT-subscription login and no Anthropic key set `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the OpenCode default is refused by that login, and the preflight says so).
 
 Measured while writing these, against Claude Code 2.1.289 through this path, and worth knowing for whoever sends the clear key: **separate writes are not separate reads.** Two writes of 32 `Ctrl+U` sent back to back left Claude's prompt untouched, exactly as one write of 64 does (Claude ignores a read holding 64 or more); two 250 ms apart did too on a box at load 174; two 1 s apart cleared it; a single write of 32 always did. `DEL` × 100 in one write was exact, and on 2026-10-04 so were single writes of 400 and 800 `DEL`s against Claude Code 2.1.289, Codex 0.160.0 and OpenCode 1.18.34. The paste-collapse threshold applies to what the agent reads, not to one write: an 8-character write followed at once by an 800-character one was read by Claude as one 808-character paste and collapsed, so 003 writes its long dictation only once the prompt before it is on screen. An `Enter` written in the same burst as the text before it is taken as part of a paste and inserts a newline, so the tests let typed text settle before `Enter`.
 
@@ -2420,6 +2420,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/009 — Same-release stamped hooks update the card without a stale-binary notice.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; synthetic Claude hook lines.
+- **Asserts:** session, Working and Idle states render after stamped hooks; Hello carries no notice for either the daemon's build or an equal release triple with a different build id and a different sender path.
+- **Does not assert:** a real agent producing the stamps, or an older release's notice.
+- **Platform coverage:** mac+linux.
+
 #### hooks/ingest
 
 ##### hooks/ingest/001 — An over-long hook line is refused at the production cap rather than buffered, and the daemon keeps serving (issues #903 / #319).
@@ -2595,6 +2602,78 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
+
+##### hooks/install/015 — Automatic startup takes over an older pin only from a newer installed durable copy.
+- **Layer:** fast real-binary subprocess integration, isolated HOME under `CARGO_TARGET_TMPDIR`.
+- **Agent:** none; version-reporting shell stubs stand in for the old and newer installed pins.
+- **Asserts:** a real copy in HOME's `.local/bin` replaces the `0.0.1` pin in place, leaves one deck handler per installed event and preserves the user's handler slot and matcher; a `999.0.0` pin is kept.
+- **Does not assert:** ties, failed version probes or other agents' writers (unit-covered).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/016 — A newer temporary copy on PATH cannot take over a durable old pin.
+- **Layer:** fast real-binary subprocess integration, isolated HOME.
+- **Agent:** none; old pin reports `0.0.1`.
+- **Asserts:** automatic startup from a scratch copy on PATH keeps the old binary, one handler per installed event and the user's shared rule.
+- **Does not assert:** other ephemeral classifiers or explicit installation.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/017 — Automatic startup refuses to pin a translocated sidecar and names /Applications.
+- **Layer:** fast real-binary subprocess integration.
+- **Agent:** none.
+- **Asserts:** a real copy under an `AppTranslocation` bundle-shaped path with no fallback writes no Claude settings and logs the move-to-Applications remedy.
+- **Does not assert:** macOS's actual translocation machinery, or the absolute `/Volumes/<name>` prefix, covered by `platform::paths::tests::step_3_refuses_a_mounted_or_translocated_copy`.
+- **Platform coverage:** mac+linux.
+
+#### hooks/stale
+
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and both versions survive and no cut-down command is shown; an empty list draws nothing.
+- **Does not assert:** the dashboard's placement or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hook.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, resized to 80 columns the row still names the agent, `0.0.1` and this deck's version with no cut-off remedy, and back at full width a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Does not assert:** a real Claude emitting hooks, desktop rendering, takeover from an eligible binary, or a `brew upgrade` command (the sandbox's installed link makes the remedy this deck's own `hooks install`; `hooks/stale/006` covers the Homebrew row in L1); the built target binary and separate HOME keep takeover ineligible.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hooks.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
+- **Does not assert:** TUI rendering or real-agent work.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice. [reel]
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** real Claude Code, interactive Haiku `claude-haiku-4-5-20251001`, with imported credentials, seeded project trust and Bash allowed.
+- **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
+- **Does not assert:** an actual old release binary, the desktop strip, or model-specific prose; the wrapper changes stamp metadata but preserves event content and provenance.
+- **Platform coverage:** mac+linux; local credentials required, never CI.
+
+##### hooks/stale/005 — A command remedy is shown only beside the agents and both versions.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows the agents and both versions with the whole upgrade-or-reinstall advice, no part of the command and no clipped `⚠ Cl…` lead; at 300 columns it shows the command whole beside the full sentence.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/006 — A short command stays whole on a narrow row, with the facts shortened instead.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** at 80 and 100 columns, the two-agent Homebrew notice shows `Run: brew upgrade dot-agent-deck` whole, the first agent and both versions, fits the row, and shows no cut-off upgrade-or-reinstall advice.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/007 — The count of further notices survives a narrow row.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** with two notices, the row ends with `(+1 more)` at 40, 80 and 180 columns, and at 80 it still names the first agent and both versions.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
 
 ### Pane / agent lifecycle
 
@@ -5921,7 +6000,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
-- **Agent:** real interactive bare `codex` using `gpt-5.1-codex-mini`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
+- **Agent:** real interactive bare `codex` using `common::codex_test_model()`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
 - **Asserts:** the interactive pane becomes ready, accepts a typed prompt, uses the shell to list the fixture and writes a proof file naming `codex_sentinel_a7c91f.txt`; after detach, the visible Codex card has traversed Thinking → Idle.
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
@@ -5954,7 +6033,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/worker/001 — A real wrapped Codex orchestration worker receives a delegated task, does the work, and signals work-done (PRD #20 parity gap #12).
 - **Layer:** L2 headless in-process daemon plus a real interactive Codex PTY; runtime-skipped unless `check_codex_available` verifies the CLI, persisted auth, and model access.
-- **Agent:** real `gpt-5.1-codex-mini` Codex configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
+- **Agent:** real Codex on `common::codex_test_model()` configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
 - **Asserts:** Codex auto-submits the daemon-injected single-line `worker-task-coder.md` pointer, reads the delegated task, creates `codex_worker_sentinel_c81f2a.txt` with exact known contents, and runs the task footer's `dot-agent-deck work-done` command so the daemon writes `.dot-agent-deck/work-done-coder.md`.
 - **Does not assert:** exact model phrasing, token usage, or dashboard rendering (covered by `codex/live/001`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
@@ -7804,7 +7883,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion. [reel]
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, genuine Codex Stop hook and rollout tailer).
-- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; ChatGPT-login hosts can override the model with `DOT_AGENT_DECK_CODEX_TEST_MODEL`.
+- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; the model follows the login's auth mode and `DOT_AGENT_DECK_CODEX_TEST_MODEL` overrides it.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Codex; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window spanning multiple rollout polls, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
