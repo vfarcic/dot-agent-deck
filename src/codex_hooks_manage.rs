@@ -863,8 +863,14 @@ const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// on one that had answered before, with almost all of the time spent before
 /// `initialize` answered. The wait returns as soon as the reply arrives, so a
 /// Codex that answers within the old 5 s waits no longer than before; what the
-/// wider ceiling costs is a pane whose
-/// Codex launches up to this much later when `codex app-server` never answers.
+/// wider ceiling costs is a pane whose Codex launches up to this much later when
+/// `codex app-server` answers slowly or never. A delegate that respawned that
+/// pane can then pay for it twice: its readiness fallback
+/// (`crate::state::SESSION_START_WAIT_TIMEOUT`, also 30 s) is counted from the
+/// respawn, so when this wait takes most of its 30 s the fallback can expire
+/// before Codex has drawn its interface, and the task pointer is typed into a
+/// pane Codex is not yet reading. That is the fixed-timer readiness problem
+/// tracked in #1663 (and #1662 for Pi), which this bound does not address.
 /// The daemon's startup install and `hooks install` keep the shorter bound: the
 /// startup one sits before the daemon binds its sockets (issue #1665), and
 /// neither is about to launch Codex.
