@@ -3115,8 +3115,10 @@ async fn run_shell_activity_monitor_with<S, F>(
         // fact, not a process-table reading: a spawn can exit before its first
         // valid sample, on a platform whose sampler always answers `None`, or
         // while another pane keeps sampling in a failure episode, and its
-        // subagents would otherwise stay counted. A still-live spawn is never
-        // touched here, so an unknown sample keeps its commands (D4). The
+        // subagents would otherwise stay counted. A spawn the registry still
+        // holds live on its pane — published and not exited, or reserved for
+        // that pane and not yet published (R1) — is not touched here, so an
+        // unknown sample keeps its commands (D4). The
         // retirement reaches attached clients as the daemon's report, sent
         // under the same write lock that applied it.
         let departed_work = {
@@ -8664,7 +8666,7 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: Let a reporting pane exit with a background subagent before its first successful command sample, while sampling is unsupported, or during another pane's failure/backoff episode. The exited card loses its background indicator in every case, while the still-live pane retains its subagent across unknown samples.
+    /// Scenario: Let a reporting pane exit with a background subagent before its first successful command sample, while sampling is unsupported, or during another pane's failure/backoff episode. Also poll while an attested child's publication is paused, with and without Stop: its subagent must survive publication without a retirement broadcast, while a reservation that is actually abandoned and exited spawns lose their work.
     #[spec("status/background/013")]
     #[tokio::test(start_paused = true)]
     async fn background_013_exit_retirement_does_not_depend_on_command_samples() {
@@ -8810,9 +8812,381 @@ mod hook_ingestion_tests {
             drop(guard);
             registry.shutdown_all();
         }
+        for ended_before_publication in [false, true] {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = crate::test_temp::tempdir().unwrap();
+            let identity = temp.path().join("identity");
+            let script = temp.path().join("pending-worker.sh");
+            crate::test_isolation::write_script(&script, "#!/bin/sh\nprintf '%s\\n%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" \"$DOT_AGENT_DECK_PANE_CAPABILITY\" > \"$BACKGROUND_TEST_IDENTITY\"\nexec /bin/cat\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (reached, release) = registry.pause_next_publish_for_test();
+            let spawning = tokio::task::spawn_blocking({
+                let registry = registry.clone();
+                move || {
+                    registry.spawn_agent(SpawnOptions {
+                        command: Some(script.to_str().unwrap()),
+                        env: vec![
+                            (DOT_AGENT_DECK_PANE_ID.into(), "pending-background".into()),
+                            (
+                                "BACKGROUND_TEST_IDENTITY".into(),
+                                identity.to_string_lossy().into_owned(),
+                            ),
+                        ],
+                        agent_type: Some(AgentType::ClaudeCode),
+                        ..Default::default()
+                    })
+                }
+            });
+            tokio::task::spawn_blocking(move || {
+                reached
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("child forked before publication")
+            })
+            .await
+            .unwrap();
+            let identity = temp.path().join("identity");
+            let (agent, token) = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&identity) {
+                        let lines: Vec<_> = text.lines().collect();
+                        if lines.len() == 2 && !lines[0].is_empty() && !lines[1].is_empty() {
+                            break (lines[0].to_string(), lines[1].to_string());
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child identity deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                registry.hook_token_of(&agent).is_none(),
+                "no RunningAgent is published yet"
+            );
+            let (abandoned, abandoned_token) =
+                registry.reserve_spawn_for_test(Some("abandoned-background"));
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            state
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+            let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            for (pane, id, capability, ended) in [
+                (
+                    "pending-background",
+                    &agent,
+                    &token,
+                    ended_before_publication,
+                ),
+                ("abandoned-background", &abandoned, &abandoned_token, true),
+            ] {
+                use crate::hook_provenance::{Provenance, classify_event};
+                assert!(
+                    matches!(
+                        classify_event(Some(pane), Some(id), Some(capability), &*registry),
+                        Provenance::Attested { .. }
+                    ),
+                    "reserved child's reports are attested"
+                );
+                for kind in ["session_start", "subagent_start", "idle"] {
+                    if kind == "idle" && !ended {
+                        continue;
+                    }
+                    let mut event: AgentEvent = serde_json::from_value(serde_json::json!({
+                        "session_id": pane, "pane_id": pane, "agent_id": id,
+                        "agent_type": "claude_code", "event_type": kind, "timestamp": chrono::Utc::now()
+                    })).unwrap();
+                    if kind == "subagent_start" {
+                        event.metadata.insert(
+                            crate::event::SUBAGENT_ID_METADATA_KEY.into(),
+                            "pending-child".into(),
+                        );
+                    }
+                    ingest_hook_event(&state, &event_tx, &registry, event, false, Some(id.clone()))
+                        .await;
+                }
+            }
+            while events.try_recv().is_ok() {}
+            let monitor = tokio::spawn(run_shell_activity_monitor_with(
+                registry.clone(),
+                state.clone(),
+                event_tx.clone(),
+                |_roots| async { None },
+            ));
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            while let Ok(BroadcastMsg::Event(event)) = events.try_recv() {
+                if event.is_background_retirement() {
+                    failures.push(format!("pending Stop={ended_before_publication}: admitted reservation received a premature retirement: agent={:?}, background={:?}, revision={:?}", event.agent_id, event.background, event.background_revision));
+                }
+            }
+            if ended_before_publication {
+                let before = state
+                    .read()
+                    .await
+                    .live_session_for(&agent, Some("pending-background"))
+                    .unwrap();
+                if before.background.as_ref().map(|b| b.subagents) != Some(1) {
+                    failures.push(format!(
+                        "pending Stop=true: unpublished card lost its subagent: {:?}",
+                        before.background
+                    ));
+                }
+            }
+            let reserved = state
+                .read()
+                .await
+                .live_session_for(&abandoned, Some("abandoned-background"))
+                .unwrap();
+            if reserved.background.as_ref().map(|b| b.subagents) != Some(1) {
+                failures.push(format!("pending Stop={ended_before_publication}: reservation lost its subagent before abandonment: {:?}", reserved.background));
+            }
+            release.send(()).unwrap();
+            let published = tokio::time::timeout(Duration::from_secs(30), spawning)
+                .await
+                .expect("publication deadline")
+                .unwrap()
+                .unwrap();
+            assert_eq!(published, agent);
+            let idle: AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "pending-background", "pane_id": "pending-background", "agent_id": agent,
+                "agent_type": "claude_code", "event_type": "idle", "timestamp": chrono::Utc::now()
+            })).unwrap();
+            ingest_hook_event(
+                &state,
+                &event_tx,
+                &registry,
+                idle,
+                false,
+                Some(agent.clone()),
+            )
+            .await;
+            registry.release_spawn_for_test(&abandoned);
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            monitor.abort();
+            let _ = monitor.await;
+            let mut abandoned_clear = false;
+            while let Ok(message) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = message
+                    && event.is_background_retirement()
+                {
+                    if event.agent_id.as_deref() == Some(abandoned.as_str()) {
+                        abandoned_clear = event
+                            .background
+                            .as_ref()
+                            .is_some_and(|b| b.commands == 0 && b.subagents == 0);
+                    } else if event.agent_id.as_deref() == Some(agent.as_str()) {
+                        failures.push(format!("pending Stop={ended_before_publication}: published spawn received a retirement"));
+                    }
+                }
+            }
+            if !abandoned_clear {
+                failures.push(format!("pending Stop={ended_before_publication}: removing the abandoned reservation must emit its explicit-zero clear"));
+            }
+            let guard = state.read().await;
+            let after = guard
+                .live_session_for(&agent, Some("pending-background"))
+                .unwrap();
+            if after.background.as_ref().map(|b| b.subagents) != Some(1) {
+                failures.push(format!("pending Stop={ended_before_publication}: published card lost its admitted subagent: {:?}", after.background));
+            }
+            assert!(
+                guard
+                    .live_session_for(&abandoned, Some("abandoned-background"))
+                    .unwrap()
+                    .background
+                    .is_none(),
+                "an abandoned reservation must retire once removed"
+            );
+            drop(guard);
+            registry.shutdown_all();
+        }
         assert!(
             failures.is_empty(),
-            "spawn retirement must be independent of sampling success:\n{}",
+            "spawn retirement must distinguish pending admission from departure:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Scenario: A background-bearing spawn exits before any successor reserves its pane, and the daemon serializes its retirement. A client hydrates a newer successor before draining that frame without the retirement marker: the frame must make no legacy generation claim, preserve the successor's card, and mint no departed card.
+    #[spec("status/background/015")]
+    #[tokio::test]
+    async fn background_015_retirement_is_safe_for_a_marker_unaware_client() {
+        use crate::event::{EventType, GenerationVerdict};
+        use crate::state::AppState;
+
+        let pane = "legacy-retirement-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+                agent_type: Some(AgentType::ClaudeCode),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut daemon = AppState::default();
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        daemon.set_agent_ownership(Arc::downgrade(&ownership));
+        for kind in ["session_start", "subagent_start", "idle"] {
+            let mut event: AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "departed-conversation", "pane_id": pane, "agent_id": agent,
+                "agent_type": "claude_code", "event_type": kind,
+                "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5)
+            }))
+            .unwrap();
+            if kind == "subagent_start" {
+                event.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.into(),
+                    "legacy-child".into(),
+                );
+            }
+            daemon.apply_event(event);
+        }
+        assert_eq!(
+            daemon
+                .live_session_for(&agent, Some(pane))
+                .unwrap()
+                .background
+                .unwrap()
+                .subagents,
+            1
+        );
+        // Retain the exited registry record and reserve no successor until
+        // after the retirement is authored, matching the queue/hydration race.
+        unsafe {
+            libc::kill(registry.child_pid(&agent).unwrap() as i32, libc::SIGKILL);
+        }
+        tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let agent = agent.clone();
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while registry.agent_is_live(&agent) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "legacy fixture exit deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let retired = daemon.retire_departed_background_spawns(|pane, agent| {
+            registry.agent_is_live_on_pane(agent, pane)
+        });
+        assert_eq!(retired.len(), 1, "daemon authors exactly one clear");
+        let wire = serde_json::to_value(&retired[0]).unwrap();
+        let carrier: AgentEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert!(carrier.is_background_retirement());
+        assert_eq!(carrier.event_type, EventType::ShellIdle);
+        assert_eq!(carrier.background.as_ref().unwrap().subagents, 0);
+        let mut failures = Vec::new();
+        if carrier.pane_generation_verdict() != Some(GenerationVerdict::Displaced) {
+            failures.push(format!("serialized retirement must carry the legacy non-claiming Displaced verdict; got {:?}", carrier.pane_generation_verdict()));
+        }
+
+        let mut successor = daemon.live_session_for(&agent, Some(pane)).unwrap();
+        successor.background = None;
+        successor.background_revision = None;
+        successor.last_activity_ms = Some(chrono::Utc::now().timestamp_millis());
+        // Verified against v0.46.0 src/state.rs:14949-14953 (Displaced
+        // admission), 14703-14710 (Current supersedes), 15542-15569
+        // (pane retirement), and 16093-16125 (card creation). For this
+        // marker-less ShellIdle, the current fold reaches the same generation
+        // gates before status/card mutation. Removing the background fields
+        // additionally models v0.46's serde ignoring unknown additive fields.
+        for ignore_background in [false, true] {
+            for shared_key in [false, true] {
+                let mut client = AppState::default();
+                client.register_pane(pane.into());
+                client.seed_hydrated_session(
+                    pane.into(),
+                    None,
+                    None,
+                    Some("legacy-successor".into()),
+                    Some(&successor),
+                );
+                let installed_key = client.sessions.keys().next().unwrap().clone();
+                let successor_key = if shared_key {
+                    "departed-conversation".into()
+                } else {
+                    installed_key.clone()
+                };
+                if shared_key {
+                    let mut card = client.sessions.remove(&installed_key).unwrap();
+                    card.session_id = successor_key.clone();
+                    client.sessions.insert(successor_key.clone(), card);
+                }
+                let before =
+                    serde_json::to_value(client.sessions[&successor_key].live_snapshot()).unwrap();
+                let mut legacy_wire = wire.clone();
+                legacy_wire["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(crate::event::BACKGROUND_RETIRED_METADATA_KEY);
+                if ignore_background {
+                    legacy_wire.as_object_mut().unwrap().remove("background");
+                    legacy_wire
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("background_revision");
+                }
+                let legacy_carrier: AgentEvent = serde_json::from_value(legacy_wire).unwrap();
+                assert!(!legacy_carrier.is_background_retirement());
+                // Positive control: v0.46's early Displaced rejection and
+                // this tree's must both leave the hydrated successor intact.
+                let mut control = client.clone();
+                let mut displaced = legacy_carrier.clone();
+                displaced.metadata.insert(
+                    crate::event::PANE_GENERATION_METADATA_KEY.into(),
+                    crate::event::PANE_GENERATION_DISPLACED.into(),
+                );
+                control.apply_event(displaced);
+                assert_eq!(control.sessions.len(), 1);
+                assert_eq!(
+                    control.sessions[&successor_key].agent_id.as_deref(),
+                    Some("legacy-successor")
+                );
+                client.apply_event(legacy_carrier);
+                let kept = client
+                    .sessions
+                    .get(&successor_key)
+                    .filter(|card| card.agent_id.as_deref() == Some("legacy-successor"));
+                let minted_departed = client
+                    .sessions
+                    .values()
+                    .any(|card| card.agent_id.as_deref() == Some(agent.as_str()));
+                if let Some(kept) = kept.filter(|_| !minted_departed) {
+                    assert_eq!(client.sessions.len(), 1);
+                    assert_eq!(
+                        serde_json::to_value(kept.live_snapshot()).unwrap(),
+                        before,
+                        "retirement must preserve the successor's live fields"
+                    );
+                } else {
+                    failures.push(format!("marker-unaware replay ignore_background={ignore_background}, shared_key={shared_key}: successor was evicted or departed card minted; cards={:?}", client.sessions.values().map(|card| (&card.session_id, &card.agent_id)).collect::<Vec<_>>()));
+                }
+            }
+        }
+        registry.shutdown_all();
+        assert!(
+            failures.is_empty(),
+            "retirement must be safe when the client ignores its marker:\n{}",
             failures.join("\n")
         );
     }

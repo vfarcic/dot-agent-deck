@@ -99,16 +99,48 @@ fn strip_event_payload(event: &mut AgentEvent) {
     event.metadata = HashMap::new();
 }
 
-/// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id —
-/// the whole bound on what a wait tracks, at a few kilobytes per session for
-/// ordinary ids. Up to this many subagents a wait is exact: a re-ask from an
-/// id it holds is the same subagent, and a stop from an id it does not hold
-/// is one that never asked or whose share it already resolved
-/// ([`SubagentWait::resolved`]). Subagents that join past this many are counted in
-/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an
-/// id forgotten while its prompt is still open would let the card leave the
-/// wait with that prompt pending.
+/// Issue #697: the most subagent ids each of a [`SubagentWait`]'s two lists
+/// holds — the pending ones ([`SubagentWait::subagent_ids`]) and, issue #1678,
+/// the resolved ones ([`SubagentWait::resolved`]) — so a wait remembers at most
+/// twice this many ids, each at most [`MAX_WAIT_SUBAGENT_ID_BYTES`] long
+/// ([`wait_subagent_id`]). Up to this many subagents a wait is exact: a re-ask
+/// from an id it holds is the same subagent, and a stop from an id it does not
+/// hold is one that never asked or whose share it already resolved. Pending
+/// subagents that join past this many are counted in
+/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an id
+/// forgotten while its prompt is still open would let the card leave the wait
+/// with that prompt pending. A resolved id is forgotten, oldest first.
 const MAX_SUBAGENT_IDS: usize = 128;
+
+/// Issue #1678 (AU-9): the longest subagent id, in UTF-8 bytes, a
+/// [`SubagentWait`] holds as itself; a longer one is held by
+/// [`wait_subagent_id`]'s stand-in.
+const MAX_WAIT_SUBAGENT_ID_BYTES: usize = 256;
+
+/// Issue #1678 (AU-9): how a [`SubagentWait`] holds subagent `id`. An id of at
+/// most [`MAX_WAIT_SUBAGENT_ID_BYTES`] is held as itself; a longer one by a
+/// fixed-size stand-in, `oversized-id:<length>:<digest>`, built the way the
+/// OpenCode plugin builds its stand-ins (`sessionKey` in
+/// `crate::opencode_manage`): the id's length in UTF-16 code units and a 64-bit
+/// digest of all of it. Never a cut-down copy, so two long ids sharing a prefix
+/// stay apart (two of one length with one digest would share a stand-in, which
+/// is possible but improbable), and the ask and the answer or stop of one
+/// subagent map to the same stand-in. Applied where the reducer admits and
+/// matches ids, which a daemon and a client both run, so it covers every
+/// producer's events, not only the plugin's. The event itself keeps its
+/// subagent attribution as sent.
+fn wait_subagent_id(id: &str) -> std::borrow::Cow<'_, str> {
+    if id.len() <= MAX_WAIT_SUBAGENT_ID_BYTES {
+        return std::borrow::Cow::Borrowed(id);
+    }
+    let (mut a, mut b, mut units) = (0x811c_9dc5_u32, 0x9e37_79b9_u32, 0_usize);
+    for unit in id.encode_utf16() {
+        a = (a ^ u32::from(unit)).wrapping_mul(0x0100_0193);
+        b = (b ^ u32::from(unit)).wrapping_mul(0x5bd1_e995);
+        units += 1;
+    }
+    std::borrow::Cow::Owned(format!("oversized-id:{units}:{a:08x}{b:08x}"))
+}
 
 /// Issue #1678: the longest subagent id, in UTF-8 bytes, the background-work
 /// tracker keys on. A longer one is not tracked at all rather than truncated —
@@ -1357,6 +1389,39 @@ pub struct SubagentWait {
     pub resolved: Vec<String>,
 }
 
+impl SubagentWait {
+    /// Issue #1678 (AU-9): this wait within the bounds the reducer keeps —
+    /// for one hydrated from a snapshot, which may come from an older daemon
+    /// that held ids as sent, or from any writer at all. Ids are held as
+    /// [`wait_subagent_id`] holds them, so a later answer or stop still matches;
+    /// pending ids past [`MAX_SUBAGENT_IDS`] are counted in [`Self::overflow`]
+    /// rather than forgotten, and only the newest [`MAX_SUBAGENT_IDS`] resolved
+    /// ids are kept.
+    fn bounded(mut self) -> Self {
+        let hold = |ids: Vec<String>| -> Vec<String> {
+            let mut seen = std::collections::HashSet::new();
+            ids.into_iter()
+                .map(|id| wait_subagent_id(&id).into_owned())
+                .filter(|id| seen.insert(id.clone()))
+                .collect()
+        };
+        self.subagent_ids = hold(self.subagent_ids);
+        if self.subagent_ids.len() > MAX_SUBAGENT_IDS {
+            let past = self.subagent_ids.len() - MAX_SUBAGENT_IDS;
+            self.subagent_ids.truncate(MAX_SUBAGENT_IDS);
+            self.overflow = self
+                .overflow
+                .saturating_add(u32::try_from(past).unwrap_or(u32::MAX));
+        }
+        let mut resolved = hold(self.resolved);
+        resolved.retain(|id| !self.subagent_ids.contains(id));
+        let excess = resolved.len().saturating_sub(MAX_SUBAGENT_IDS);
+        resolved.drain(..excess);
+        self.resolved = resolved;
+        self
+    }
+}
+
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
@@ -1380,6 +1445,8 @@ fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
     let Some(wait) = session.subagent_wait.as_mut() else {
         return false;
     };
+    let ended = wait_subagent_id(ended);
+    let ended = ended.as_ref();
     if wait.subagent_ids.iter().any(|id| id == ended) {
         wait.subagent_ids.retain(|id| id != ended);
         if wait.resolved.len() >= MAX_SUBAGENT_IDS {
@@ -11074,7 +11141,7 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     };
     // Issue #1364: likewise the subagents a wait belongs to.
     session.subagent_wait = if snap.status == SessionStatus::WaitingForInput {
-        snap.subagent_wait.clone()
+        snap.subagent_wait.clone().map(SubagentWait::bounded)
     } else {
         None
     };
@@ -15598,9 +15665,12 @@ impl AppState {
     /// daemon's [`AgentEvent::is_background_retirement`] report, carrying the
     /// explicit-zero aggregate with the advanced revision, already journalled on
     /// the daemon's own card. It names the departed agent, its card's key and
-    /// its pane, and is stamped at the card's last activity, so it can never
-    /// read as newer than a successor's frames; clients apply it to that card
-    /// alone ([`Self::apply_background_retirement`]).
+    /// its pane, and carries the Displaced generation verdict whatever the
+    /// registry says, so a client unaware of the marker refuses it before any
+    /// status or card logic. A client that knows the marker applies it to that
+    /// agent's card alone ([`Self::apply_background_retirement`]), by pane and
+    /// agent id; the card's last activity as its timestamp only orders it for
+    /// an older client.
     pub(crate) fn retire_departed_background_spawns(
         &mut self,
         is_live: impl Fn(&str, &str) -> bool,
@@ -15634,14 +15704,25 @@ impl AppState {
                 crate::event::BACKGROUND_RETIRED_METADATA_KEY.to_string(),
                 crate::event::BACKGROUND_RETIRED_METADATA_VALUE.to_string(),
             );
+            // R3: always the non-claiming verdict, never the registry's. An
+            // exited spawn whose pane nobody has reserved yet is still the
+            // pane's Current generation, and a client that does not know the
+            // marker folds this as a plain `ShellIdle`, which with a Current
+            // stamp supersedes whatever successor it hydrated meanwhile.
+            // Displaced is refused before any status or card logic there; a
+            // client that knows the marker resolves the report by pane and
+            // agent id before it reads any verdict.
+            event.metadata.insert(
+                crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+                crate::event::GenerationVerdict::Displaced
+                    .metadata_value()
+                    .to_string(),
+            );
             track.stamp(&mut event);
             let mut journal = live_target_carrier_event(session, session.live_target());
             track.stamp(&mut journal);
             push_journal_carrier(session, journal);
             events.push(event);
-        }
-        for event in &mut events {
-            self.stamp_pane_generation(event);
         }
         events
     }
@@ -15652,8 +15733,11 @@ impl AppState {
     /// when that is it, else that agent's newest card there — and only moves
     /// that card's background copy, by revision like every other copy. A card
     /// already gone is not rebuilt, a successor's card is never touched, and no
-    /// status, generation or card set changes. The daemon applies its own report
-    /// when it makes it and refuses one arriving from anywhere else.
+    /// status, generation or card set changes. It reads no generation verdict,
+    /// so the Displaced stamp the daemon puts on the report (for older clients)
+    /// does not stop it here. The daemon applies its own report when it makes
+    /// it; the refusal below for a daemon is belt-and-suspenders behind
+    /// `ingest_event`, which strips the marker from every inbound frame first.
     fn apply_background_retirement(&mut self, event: &AgentEvent) -> AppliedEvent {
         if self.agent_ownership.is_some() {
             return AppliedEvent::Rejected;
@@ -16773,6 +16857,17 @@ impl AppState {
                     )
                 })
             });
+            // Issue #1678 (R2): the ending spawn's card's newest background copy,
+            // scoped to that spawn, so the placeholder restored below can keep
+            // the replay barrier (see the restore).
+            let ended_held = self
+                .sessions
+                .get(&event.session_id)
+                .filter(|session| {
+                    session.agent_id.is_some()
+                        && (event.agent_id.is_none() || event.agent_id == session.agent_id)
+                })
+                .and_then(held_background);
             self.sessions.remove(&event.session_id);
             // Issue #1678 (A2): the conversation's background record ends with
             // it, explicitly — not by whether a card is still filed under its
@@ -16785,6 +16880,24 @@ impl AppState {
                     self.applied_background = Some(track.applied(changed));
                     track
                 });
+            // The terminal copy is the daemon's own record when it has one,
+            // else the aggregate the daemon stamped on this `SessionEnd` (a
+            // client's case: it has no record, and the daemon's ingest strips a
+            // producer's fields before its own apply). Ordered by revision
+            // against what the card already held; nothing is reconstructed.
+            let ending = match self.applied_background {
+                Some(applied) if ended_track.is_some() => {
+                    (applied.revision > 0).then_some((Some(applied.work), applied.revision))
+                }
+                _ => event
+                    .background_revision
+                    .map(|revision| (Some(event.background.unwrap_or_default()), revision)),
+            };
+            let terminal_background = match (ended_held, ending) {
+                (Some(held), Some(ending)) if held.1 > ending.1 => Some(held),
+                (_, Some(ending)) => Some(ending),
+                (_, None) => None,
+            };
             // Restore a placeholder card so the pane remains visible on the dashboard.
             if let Some((pane_id, cwd, agent_id, display_name)) = restored
                 && self.managed_pane_ids.contains(&pane_id)
@@ -16793,11 +16906,27 @@ impl AppState {
                 // placeholder; `agent_type` is unknown post-end and gets
                 // re-populated when the next `SessionStart` hook arrives
                 // for this pane. Same default behavior as before M2.13.
+                let agent_id_of_ended = agent_id.clone();
                 let placeholder_id = self.insert_placeholder_session(pane_id, cwd, None, agent_id);
                 if let Some(name) = display_name
                     && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
                 {
                     placeholder.display_name = Some(name);
+                }
+                // Issue #1678 (R2): the same spawn's restored placeholder holds
+                // the ending card's newest copy, so an older snapshot or frame
+                // of that spawn cannot resurrect the work after its terminal
+                // clear. Another spawn's card starts its own revision domain.
+                if let Some((background, revision)) = terminal_background
+                    && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
+                    && placeholder.agent_id.is_some()
+                    && placeholder.agent_id == agent_id_of_ended
+                    && held_background(placeholder).is_none_or(|(_, held)| held < revision)
+                {
+                    let mut carrier = live_target_carrier_event(placeholder, None);
+                    carrier.background = background;
+                    carrier.background_revision = Some(revision);
+                    push_journal_carrier(placeholder, carrier);
                 }
                 // The same spawn's next conversation continues the ended
                 // record's revision, so nothing it publishes can read as older
@@ -17566,7 +17695,7 @@ impl AppState {
                 let subagent_id = event
                     .metadata
                     .get(crate::event::SUBAGENT_ID_METADATA_KEY)
-                    .cloned();
+                    .map(|id| wait_subagent_id(id).into_owned());
                 session.subagent_wait = match subagent_id {
                     None => None,
                     Some(id) if session.status != SessionStatus::WaitingForInput => {
@@ -27484,6 +27613,170 @@ while True:
         assert_eq!(status(&state), SessionStatus::WaitingForInput);
         state.apply_event(subagent_event(EventType::SubagentStop, "a", 6));
         assert_eq!(status(&state), SessionStatus::Thinking);
+    }
+
+    /// Issue #1678 (AU-9): a wait's identities are bounded in bytes, not only
+    /// in count. One short-id subagent keeps the wait open while 128 others
+    /// each ask with a large id and are answered one after another; the wait
+    /// then holds bounded stand-ins for them, still matches each answer to its
+    /// own ask, and keeps the event's attribution as sent. A raw producer frame
+    /// (the hook socket's JSON) and a snapshot from a daemon that held ids as
+    /// sent are bounded the same way.
+    #[test]
+    fn subagent_wait_bounds_the_bytes_of_the_ids_it_holds() {
+        let held_bytes = |wait: &SubagentWait| -> usize {
+            wait.subagent_ids
+                .iter()
+                .chain(&wait.resolved)
+                .map(String::len)
+                .sum()
+        };
+        let large = |i: usize| format!("{i:04}-{}", "x".repeat(8 * 1024));
+        let answer = |id: &str, secs: i64| {
+            let mut event = subagent_event(EventType::Thinking, id, secs);
+            event.metadata.insert(
+                crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
+                crate::event::PERMISSION_STATE_REPLIED.to_string(),
+            );
+            event
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        state.apply_event(subagent_event(EventType::PermissionRequest, "anchor", 2));
+        for i in 0..MAX_SUBAGENT_IDS {
+            state.apply_event(subagent_event(EventType::PermissionRequest, &large(i), 3));
+            let wait = state.sessions["gen-q"].subagent_wait.clone().unwrap();
+            assert_eq!(
+                wait.subagent_ids.len(),
+                2,
+                "anchor plus the asking subagent"
+            );
+            state.apply_event(answer(&large(i), 4));
+            assert_eq!(
+                state.sessions["gen-q"].status,
+                SessionStatus::WaitingForInput,
+                "the anchor's prompt is still open"
+            );
+        }
+        let session = &state.sessions["gen-q"];
+        let wait = session.subagent_wait.clone().unwrap();
+        assert_eq!(wait.subagent_ids, vec!["anchor".to_string()]);
+        assert_eq!(
+            wait.overflow, 0,
+            "every large id was matched to its own ask"
+        );
+        assert_eq!(wait.resolved.len(), MAX_SUBAGENT_IDS);
+        assert!(
+            wait.resolved
+                .iter()
+                .all(|id| id.len() <= MAX_WAIT_SUBAGENT_ID_BYTES),
+            "a large id is held by a bounded stand-in"
+        );
+        let distinct: std::collections::HashSet<_> = wait.resolved.iter().collect();
+        assert_eq!(distinct.len(), MAX_SUBAGENT_IDS, "stand-ins stay distinct");
+        assert!(
+            held_bytes(&wait) <= (2 * MAX_SUBAGENT_IDS) * MAX_WAIT_SUBAGENT_ID_BYTES,
+            "the ids a wait holds are bounded in bytes: {}",
+            held_bytes(&wait)
+        );
+        assert!(
+            session.recent_events.back().is_some_and(|event| event
+                .metadata
+                .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                == Some(&large(MAX_SUBAGENT_IDS - 1))),
+            "the event keeps its attribution as sent"
+        );
+        // A repeated answer from a resolved large id resolves nothing more.
+        state.apply_event(answer(&large(MAX_SUBAGENT_IDS - 1), 5));
+        assert_eq!(
+            state.sessions["gen-q"].status,
+            SessionStatus::WaitingForInput
+        );
+        state.apply_event(subagent_event(EventType::SubagentStop, "anchor", 6));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+
+        // A raw producer frame, as the hook socket reads it, with a 1 MiB id:
+        // held by its stand-in, and its own stop still ends the wait.
+        let huge = "y".repeat(1024 * 1024);
+        let raw = |kind: &str, secs: i64| -> AgentEvent {
+            serde_json::from_value(serde_json::json!({
+                "session_id": "gen-q", "pane_id": "pane-q", "agent_id": "agent-q",
+                "agent_type": "codex", "event_type": kind,
+                "timestamp": DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+                "metadata": {crate::event::SUBAGENT_ID_METADATA_KEY: huge},
+            }))
+            .unwrap()
+        };
+        state.apply_event(raw("permission_request", 7));
+        let wait = state.sessions["gen-q"].subagent_wait.clone().unwrap();
+        assert_eq!(
+            wait.subagent_ids,
+            vec![wait_subagent_id(&huge).into_owned()]
+        );
+        assert!(held_bytes(&wait) <= MAX_WAIT_SUBAGENT_ID_BYTES);
+        state.apply_event(raw("subagent_stop", 8));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+
+        // A snapshot from a daemon that held ids as sent hydrates bounded, and
+        // the hydrated wait still matches the subagent's stop.
+        let mut snapshot = state.sessions["gen-q"].live_snapshot();
+        snapshot.status = SessionStatus::WaitingForInput;
+        snapshot.subagent_wait = Some(SubagentWait {
+            subagent_ids: (0..=MAX_SUBAGENT_IDS).map(large).collect(),
+            resume_idle: true,
+            overflow: 0,
+            resolved: (0..MAX_SUBAGENT_IDS * 2).map(|i| large(i + 1000)).collect(),
+        });
+        let mut client = AppState::default();
+        client.register_pane("pane-q".to_string());
+        client.seed_hydrated_session(
+            "pane-q".to_string(),
+            None,
+            None,
+            Some("agent-q".to_string()),
+            Some(&snapshot),
+        );
+        let card = client
+            .sessions
+            .values()
+            .find(|card| card.pane_id.as_deref() == Some("pane-q"))
+            .unwrap();
+        let wait = card.subagent_wait.clone().unwrap();
+        assert_eq!(wait.subagent_ids.len(), MAX_SUBAGENT_IDS);
+        assert_eq!(
+            wait.overflow, 1,
+            "a pending id past the cap is counted, not forgotten"
+        );
+        assert_eq!(wait.resolved.len(), MAX_SUBAGENT_IDS);
+        assert!(held_bytes(&wait) <= (2 * MAX_SUBAGENT_IDS) * MAX_WAIT_SUBAGENT_ID_BYTES);
+        assert_eq!(
+            wait.subagent_ids[0],
+            wait_subagent_id(&large(0)).into_owned()
+        );
+    }
+
+    /// Issue #1678 (AU-9): a long id's stand-in is the one the OpenCode plugin
+    /// builds for the same id (`sessionKey`), and a short id is held as itself.
+    #[test]
+    fn wait_subagent_id_matches_the_plugin_stand_in() {
+        assert_eq!(wait_subagent_id("short-id"), "short-id");
+        let fits = "a".repeat(MAX_WAIT_SUBAGENT_ID_BYTES);
+        assert_eq!(wait_subagent_id(&fits), fits.as_str());
+        // Computed with the plugin's own `sessionKey` under Node.
+        assert_eq!(
+            wait_subagent_id(&"a".repeat(MAX_WAIT_SUBAGENT_ID_BYTES + 1)),
+            "oversized-id:257:1470c82cefa73cb8"
+        );
+        assert_eq!(
+            wait_subagent_id(&"\u{e9}".repeat(200)),
+            "oversized-id:200:2d2dc29daae36109"
+        );
+        assert_ne!(
+            wait_subagent_id(&format!("{}b", "a".repeat(300))),
+            wait_subagent_id(&format!("{}c", "a".repeat(300))),
+            "two long ids sharing a prefix stay apart"
+        );
     }
 
     /// Issue #697 control: under the cap the wait behaves as before — it ends

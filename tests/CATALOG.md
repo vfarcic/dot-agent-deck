@@ -1089,7 +1089,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/background/003 — Snapshot hydration and revision ordering prevent replay resurrection (#1678).
 - **Layer:** L1 protocol/fold, fast tier (`subagent_tool_status.rs`).
 - **Agent:** none; serialized daemon snapshots and events applied to a fresh TUI AppState.
-- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; reseeding an existing placeholder preserves its newer clear or nonempty reading; a kept non-placeholder card accepts a newer background revision despite equal/older activity; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
+- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; reseeding an existing placeholder preserves its newer clear or nonempty reading; a kept non-placeholder card accepts a newer background revision despite equal/older activity; SessionEnd's revision-4 clear survives same-spawn placeholder restoration and revision-3 snapshot/event replay, while a successor accepts its own revision 1; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
 - **Does not assert:** daemon admission/producer stripping, rendered layout (004), desktop replay.
 
 ##### status/background/004 — The TUI card shows background kinds, counts and oldest elapsed span (#1678).
@@ -1152,7 +1152,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/background/013 — Spawn retirement works before a valid sample and during unsupported or failed sampling (#1678).
 - **Layer:** unit, in-module (`src/daemon.rs`, paused-clock monitor sampler, fast tier).
 - **Agent:** none; real shell stand-ins with synthetic Claude subagent/Stop reports.
-- **Asserts:** an exact-pid exit without SessionEnd clears the departed card before any valid sample; a None sampler with another live pane does not prevent retirement; a prior valid sample followed by another pane's sampling failure/backoff does not prevent retirement. Unknown samples retain the still-live pane's subagent.
+- **Asserts:** an exact-pid exit without SessionEnd clears the departed card before any valid sample; a None sampler with another live pane does not prevent retirement; a prior valid sample followed by another pane's sampling failure/backoff does not prevent retirement. Unknown samples retain the still-live pane's subagent. Attested SessionStart/SubagentStart reports during paused spawn publication, with or without Stop, survive monitor polls and publication without a premature retirement broadcast; an abandoned reservation retires once released.
 - **Does not assert:** native Windows process execution (the None sampler models its observation shape), PTY-attached rendering (014), real agents.
 - **Platform coverage:** mac+linux.
 
@@ -1161,6 +1161,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none; Python parent exits naturally on a fixture sentinel, with Claude-shaped subagent/Stop hooks.
 - **Asserts:** a visible background subagent clears after the parent exits without SessionEnd; subscribers receive an explicit-zero aggregate with a higher revision and the departed agent's identity. A successor in the same pane holds its own subagent, including after replaying the departed clear through the client fold.
 - **Does not assert:** retirement without valid command samples (013), real agent behavior, desktop rendering.
+- **Platform coverage:** mac+linux.
+
+##### status/background/015 — Retirement cannot claim a generation on a client unaware of its marker (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, real registry and serialized daemon retirement carrier; fast tier).
+- **Agent:** none; real shell stand-in with synthetic Claude subagent/Stop reports.
+- **Asserts:** an exited spawn with no successor reservation produces an explicit-zero ShellIdle carrying the legacy non-claiming Displaced verdict; after newer successor hydration, replaying that serialized carrier without its retirement marker preserves the successor and mints no departed card, for distinct and shared session keys and with additive background fields retained or ignored. An explicitly Displaced control preserves the successor.
+- **Does not assert:** execution of the released v0.46 binary, cross-version delegate/hook flows, real agents, or PTY rendering. The marker-less generation gates were checked against v0.46.0's source.
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).

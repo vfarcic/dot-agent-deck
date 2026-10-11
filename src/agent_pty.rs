@@ -10198,16 +10198,21 @@ impl AgentPtyRegistry {
             .unwrap_or(false)
     }
 
-    /// Issue #1678 (A3): whether `agent_id` is a live (non-exited) agent on the
-    /// pane with `pane_id_env` — the lifecycle half of the shell-activity
-    /// monitor's spawn identity, answered without sampling any process.
+    /// Issue #1678 (A3): whether `agent_id` has not departed the pane with
+    /// `pane_id_env` — the lifecycle half of the shell-activity monitor's spawn
+    /// identity, answered without sampling any process. A published record that
+    /// has not exited counts, and so does a spawn still reserved for exactly
+    /// that pane (R1): its child can already be reporting, and its hooks are
+    /// admitted ([`Self::generation_ownership`]), before its record is
+    /// published. A reservation that is abandoned without publishing stops
+    /// counting once it is released.
     pub fn agent_is_live_on_pane(&self, agent_id: &str, pane_id_env: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .agents
+        let inner = self.inner.lock().unwrap();
+        inner
+            .pending_spawns
             .get(agent_id)
-            .is_some_and(|a| {
+            .is_some_and(|reserved| reserved.as_deref() == Some(pane_id_env))
+            || inner.agents.get(agent_id).is_some_and(|a| {
                 !a.exited.load(Ordering::SeqCst) && a.pane_id_env.as_deref() == Some(pane_id_env)
             })
     }

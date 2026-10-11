@@ -548,9 +548,9 @@ pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 /// `AgentEvent.metadata` key marking the DAEMON's report that a spawn's process
 /// is gone, so the background work its card showed is over (issue #1678). It
 /// rides a [`EventType::ShellIdle`] naming the departed agent, its card's
-/// session key and its pane, stamped at the card's own last activity, and
-/// carrying the explicit-zero aggregate with the advanced revision
-/// ([`AgentEvent::is_background_retirement`]).
+/// session key and its pane, stamped at the card's own last activity, carrying
+/// the explicit-zero aggregate with the advanced revision and the Displaced
+/// generation verdict ([`AgentEvent::is_background_retirement`]).
 ///
 /// An attached client applies it to that agent's existing card on that pane
 /// and to nothing else: it creates, adopts, retires and re-keys no card and
@@ -560,7 +560,8 @@ pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 /// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
 /// event is broadcast straight onto the fan-out and never ingested, and
 /// `ingest_event` removes the key from every inbound hook event. Additive on the
-/// wire: an older client reads a plain `ShellIdle` for the departed card.
+/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which its
+/// generation gate refuses before any status or card logic.
 pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
 
 /// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.

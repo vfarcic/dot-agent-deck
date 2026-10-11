@@ -693,7 +693,7 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .clone()
 }
 
-/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, while legacy shell promotion still works without the fields.
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, and legacy shell promotion still works without the fields.
 #[spec("status/background/003")]
 #[test]
 fn background_003_snapshot_hydration_and_revision_ordering() {
@@ -850,6 +850,83 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
     assert!(
         failures.is_empty(),
         "hydration must merge background by revision, independently of activity:\n{}",
+        failures.join("\n")
+    );
+
+    let mut failures = Vec::new();
+    for replay in ["snapshot", "event"] {
+        let mut state = AppState::default();
+        state.register_pane(PANE.into());
+        let mut held: AgentEvent = serde_json::from_value(json!({
+            "session_id": SESSION, "pane_id": PANE, "agent_id": "ending-spawn",
+            "agent_type": "claude_code", "event_type": "idle",
+            "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5),
+            "background": {"commands": 0, "subagents": 1, "since_ms": null},
+            "background_revision": 3
+        }))
+        .unwrap();
+        state.apply_event(held.clone());
+        let older_snapshot = state.sessions.values().next().unwrap().live_snapshot();
+        let mut end = held.clone();
+        end.event_type = EventType::SessionEnd;
+        end.timestamp += chrono::Duration::seconds(1);
+        end.background = serde_json::from_value(json!({
+            "commands": 0, "subagents": 0, "since_ms": null
+        }))
+        .ok();
+        end.background_revision = Some(4);
+        state.apply_event(end);
+        let placeholder = format!("pane-{PANE}");
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(
+            state.sessions[&placeholder].agent_id.as_deref(),
+            Some("ending-spawn")
+        );
+        let terminal = snapshot(&state);
+        if !terminal["background"].is_null() || terminal["background_revision"] != json!(4) {
+            failures.push(format!(
+                "{replay}: terminal clear must hold revision 4; got background={}, revision={}",
+                terminal["background"], terminal["background_revision"]
+            ));
+        }
+        match replay {
+            "snapshot" => state.seed_hydrated_session(
+                PANE.into(),
+                None,
+                None,
+                Some("ending-spawn".into()),
+                Some(&older_snapshot),
+            ),
+            "event" => {
+                held.event_type = EventType::ShellBusy;
+                state.apply_event(held.clone());
+            }
+            _ => unreachable!(),
+        }
+        let after = snapshot(&state);
+        if !after["background"].is_null() || after["background_revision"] != json!(4) {
+            failures.push(format!("{replay}: rev-3 replay resurrected work after terminal rev-4 clear; got background={}, revision={}", after["background"], after["background_revision"]));
+        }
+
+        // The pane's next process has its own ordering domain: revision 1
+        // from that spawn must not be suppressed by the old spawn's clear.
+        state.insert_placeholder_session(PANE.into(), None, None, Some("successor-spawn".into()));
+        held.session_id = placeholder;
+        held.agent_id = Some("successor-spawn".into());
+        held.event_type = EventType::Idle;
+        held.timestamp = chrono::Utc::now();
+        held.background_revision = Some(1);
+        state.apply_event(held);
+        assert_eq!(
+            snapshot(&state)["background"]["subagents"],
+            json!(1),
+            "{replay}: successor accepts its own revision 1"
+        );
+        assert_eq!(snapshot(&state)["background_revision"], json!(1));
+    }
+    assert!(
+        failures.is_empty(),
+        "SessionEnd must preserve the client's terminal replay barrier:\n{}",
         failures.join("\n")
     );
 }
