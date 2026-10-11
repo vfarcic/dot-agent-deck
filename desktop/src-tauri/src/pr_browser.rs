@@ -591,6 +591,12 @@ impl Generations {
         self.loading.store(false, Ordering::SeqCst);
     }
 
+    /// The open's navigation failed, so no new page is coming: the page that
+    /// remains owns page effects again.
+    pub fn open_failed(&self) {
+        self.loading.store(false, Ordering::SeqCst);
+    }
+
     /// The page was put back in place (sign-out): effects asked for before
     /// are not about it.
     pub fn retire_page(&self) {
@@ -805,7 +811,11 @@ pub async fn open<R: Runtime>(
     admit_open(&CLEARING)?;
     let generation = GENERATIONS.begin();
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-        webview.navigate(url).map_err(|error| error.to_string())?;
+        if let Err(error) = webview.navigate(url) {
+            // The replaced page stays; its effects are its own again.
+            GENERATIONS.open_failed();
+            return Err(error.to_string());
+        }
         place(&webview, bounds)?;
         let _ = webview.show();
         let _ = webview.set_focus();
@@ -2807,6 +2817,19 @@ mod tests {
     /// same webview, before the new page has started loading. The close is
     /// the old page's, so it is dropped; once the new page starts, its own
     /// effects run.
+    /// Scenario: a reused webview's navigation fails, so the old page stays;
+    /// its Escape and navigation effects must not stay suppressed.
+    #[test]
+    fn a_failed_navigation_gives_page_effects_back_to_the_remaining_page() {
+        let generations = Generations::new();
+        generations.begin();
+        generations.page_started();
+        generations.begin();
+        assert_eq!(generations.page_token(), None);
+        generations.open_failed();
+        assert!(generations.page_token().is_some());
+    }
+
     #[tokio::test]
     async fn a_page_effect_asked_before_the_new_page_starts_is_dropped() {
         let session = tokio::sync::Mutex::const_new(());
