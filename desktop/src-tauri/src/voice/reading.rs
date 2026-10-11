@@ -315,8 +315,6 @@ impl TurnEventSource for DaemonTurnEvents {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     Reply(FinalReply),
-    /// A status whose event time is not known.
-    Status(TurnEvent),
     /// A status and the timestamp of the event it came from, in milliseconds
     /// since the Unix epoch ([`status_incoming`]), which times a permission
     /// prompt's notification against its hook ([`PERMISSION_NOTICE_WINDOW`]).
@@ -440,9 +438,7 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// A notification nothing is owed for — a Claude Code too old for the
 /// permission hook, a prompt whose hook's debt lapsed, or one stamped before
 /// every hook still owed — is announced. Neither an answer nor the turn's
-/// progress pays a debt: the answered prompt's notification still comes. A
-/// status with no event time ([`Incoming::Status`]) owes, and pays, with no
-/// window.
+/// progress pays a debt: the answered prompt's notification still comes.
 ///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
@@ -452,9 +448,8 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
     // The announced permission hooks whose notification has not come, oldest
-    // first, each with its event's timestamp when known.
-    let mut notices_owed: std::collections::VecDeque<Option<i64>> =
-        std::collections::VecDeque::new();
+    // first, each as its event's timestamp.
+    let mut notices_owed: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
     loop {
         let next = match held.as_ref().map(|(_, until)| *until) {
             Some(until) => tokio::select! {
@@ -471,15 +466,17 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
         let recent = announced
             .filter(|(_, until)| now < *until)
             .map(|(what, _)| what);
-        // The status's event timestamp, when known.
-        let at = match &next {
-            Some(Some(Incoming::StatusAt(_, at))) => Some(*at),
+        // Debts lapsed by this status's event time are no longer owed.
+        if let Some(Some(Incoming::StatusAt(_, at))) = &next {
+            notices_owed.retain(|hook| !notice_lapsed(*hook, *at));
+        }
+        // The oldest debt a permission notification pays, if it pays one.
+        let paid = match &next {
+            Some(Some(Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, at))) => {
+                notices_owed.iter().position(|hook| notice_pays(*hook, *at))
+            }
             _ => None,
         };
-        // Debts lapsed by this event's time are no longer owed.
-        if let Some(at) = at {
-            notices_owed.retain(|owed| owed.is_none_or(|hook| !notice_lapsed(hook, at)));
-        }
         let mut emit = Vec::new();
         let release_held =
             |held: &mut Option<(String, Instant)>,
@@ -510,10 +507,7 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                 release_held(&mut held, &mut emit, &mut announced);
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
-            Some(Some(
-                Incoming::Status(TurnEvent::Blocked { cause })
-                | Incoming::StatusAt(TurnEvent::Blocked { cause }, _),
-            )) => {
+            Some(Some(Incoming::StatusAt(TurnEvent::Blocked { cause }, _))) => {
                 match (held.is_some(), cause, recent) {
                     // The usage limit replaces the held failed reply.
                     (true, BlockCause::Quota, _) => {
@@ -546,15 +540,12 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
             }
             // The notification of the oldest prompt already announced that it
             // can belong to.
-            Some(Some(
-                Incoming::Status(TurnEvent::PermissionNotice { .. })
-                | Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, _),
-            )) if notices_owed.iter().any(|hook| notice_pays(*hook, at)) => {
-                if let Some(paid) = notices_owed.iter().position(|hook| notice_pays(*hook, at)) {
-                    notices_owed.remove(paid);
-                }
+            Some(Some(Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, _)))
+                if let Some(paid) = paid =>
+            {
+                notices_owed.remove(paid);
             }
-            Some(Some(Incoming::Status(status) | Incoming::StatusAt(status, _))) => {
+            Some(Some(Incoming::StatusAt(status, at))) => {
                 release_held(&mut held, &mut emit, &mut announced);
                 if let TurnEvent::Permission { .. } = status {
                     notices_owed.push_back(at);
@@ -580,12 +571,9 @@ fn notice_lapsed(hook: i64, notice: i64) -> bool {
 
 /// Whether a notification at `notice` can be the one a permission hook at
 /// `hook` owes: stamped no earlier than the hook and within
-/// [`PERMISSION_NOTICE_WINDOW`] of it. Either time unknown pays with no window.
-fn notice_pays(hook: Option<i64>, notice: Option<i64>) -> bool {
-    match (hook, notice) {
-        (Some(hook), Some(notice)) => notice >= hook && !notice_lapsed(hook, notice),
-        _ => true,
-    }
+/// [`PERMISSION_NOTICE_WINDOW`] of it.
+fn notice_pays(hook: i64, notice: i64) -> bool {
+    notice >= hook && !notice_lapsed(hook, notice)
 }
 
 /// What [`coalesce`] last announced of a failed turn.
@@ -1259,7 +1247,7 @@ mod tests {
     }
 
     fn blocked(cause: BlockCause) -> Incoming {
-        Incoming::Status(TurnEvent::Blocked { cause })
+        Incoming::StatusAt(TurnEvent::Blocked { cause }, 0)
     }
 
     /// Feed `script` into [`coalesce`], waiting `gap` of (paused) time after
