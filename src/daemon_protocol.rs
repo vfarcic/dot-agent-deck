@@ -1647,6 +1647,19 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// mattered.
 const CLOSE_PREVIEW_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// PRD #1589 (review on PR #1681): how long the daemon waits for the request
+/// that follows a `Hello { follow_on: true }` reply — header and payload both —
+/// before dropping the connection. The one sender, `DaemonClient::close_agents`,
+/// writes that request as soon as it has read the reply, so this is the same
+/// "the peer cannot be doing its part" bound as [`CLIENT_WRITE_TIMEOUT`]; it
+/// keeps a stalled peer from holding a client-count slot, and with it idle
+/// shutdown. The first frame on a connection stays unbounded, as it always was.
+#[cfg(not(test))]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Short under unit test, so the stall tests observe the release quickly.
+#[cfg(test)]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Wire I/O
 // ---------------------------------------------------------------------------
@@ -3973,7 +3986,7 @@ pub async fn serve_attach_with_restart(
                         reuse_registry,
                         worktree_registry,
                         restart,
-                        true,
+                        None,
                     )
                     .await
                     {
@@ -5124,11 +5137,18 @@ async fn handle_connection(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     restart: Arc<crate::daemon_restart::RestartControl>,
-    follow_on_allowed: bool,
+    follow_on_frame: Option<(u8, Vec<u8>)>,
 ) -> io::Result<()> {
-    let frame = match read_frame(&mut stream).await? {
+    // PRD #1589: `follow_on_frame` is a `Hello` follow-on's frame, already read
+    // under [`FOLLOW_ON_READ_TIMEOUT`]; it is served as a fresh connection's
+    // first, and may not ask for a follow-on of its own.
+    let follow_on_allowed = follow_on_frame.is_none();
+    let frame = match follow_on_frame {
         Some(f) => f,
-        None => return Ok(()),
+        None => match read_frame(&mut stream).await? {
+            Some(f) => f,
+            None => return Ok(()),
+        },
     };
     // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
     // that means "shut the daemon down now." It comes before any
@@ -6813,6 +6833,26 @@ async fn handle_connection(
             // served as a fresh connection's first, without a follow-on of
             // its own.
             if follow_on && follow_on_allowed {
+                // Bounded (review on PR #1681): a peer that goes silent here,
+                // or sends a header and withholds the payload, would otherwise
+                // hold this connection's client-count slot — deferring idle
+                // shutdown — and the frame's allocation. Only the read is
+                // bounded; serving the request may legitimately take longer.
+                let frame =
+                    match tokio::time::timeout(FOLLOW_ON_READ_TIMEOUT, read_frame(&mut stream))
+                        .await
+                    {
+                        Ok(Ok(Some(frame))) => frame,
+                        Ok(Ok(None)) => return Ok(()),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            warn!(
+                                timeout = ?FOLLOW_ON_READ_TIMEOUT,
+                                "no follow-on request arrived after Hello; dropping the connection"
+                            );
+                            return Ok(());
+                        }
+                    };
                 return Box::pin(handle_connection(
                     stream,
                     registry,
@@ -6823,7 +6863,7 @@ async fn handle_connection(
                     reuse_registry,
                     worktree_registry,
                     restart,
-                    false,
+                    Some(frame),
                 ))
                 .await;
             }
@@ -12879,5 +12919,163 @@ mod tests {
             std::collections::BTreeSet::from([first, second]),
             "both agents survived"
         );
+    }
+
+    /// An in-process attach server and the client count it keeps, for the
+    /// follow-on stall tests below.
+    #[cfg(unix)]
+    async fn follow_on_stall_server() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    Arc::new(AgentPtyRegistry::new()),
+                    event_tx,
+                    counter,
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // The probe connection is itself counted; wait for it to drain.
+            if tokio::net::UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        (dir, sock, counter, server)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_client_count(
+        counter: &std::sync::atomic::AtomicUsize,
+        want: usize,
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let now = counter.load(std::sync::atomic::Ordering::SeqCst);
+            if now == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client count stayed at {now}, expected {want} within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Opens a connection, sends `Hello { follow_on: true }` and reads its
+    /// reply, leaving the daemon waiting for the follow-on.
+    #[cfg(unix)]
+    async fn hello_awaiting_follow_on(sock: &std::path::Path) -> tokio::net::UnixStream {
+        let mut s = tokio::net::UnixStream::connect(sock)
+            .await
+            .expect("connect");
+        let hello = serde_json::to_vec(&AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: true,
+        })
+        .unwrap();
+        write_frame(&mut s, KIND_REQ, &hello).await.expect("hello");
+        let (kind, payload) = read_frame(&mut s).await.unwrap().expect("a reply");
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).unwrap();
+        assert!(resp.ok, "{:?}", resp.error);
+        s
+    }
+
+    /// While a stalled follow-on holds its slot, and after, a fresh client is
+    /// still answered.
+    #[cfg(unix)]
+    async fn assert_serviceable(sock: &std::path::Path) {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::daemon_client::DaemonClient::new(sock.to_path_buf()).list_agents(),
+        )
+        .await
+        .expect("another client is answered within 5 s")
+        .expect("ListAgents succeeds");
+        assert!(resp.is_empty());
+    }
+
+    /// Runs one stall: `stall` leaves the connection open after the Hello
+    /// reply without completing a follow-on frame. The daemon must drop the
+    /// connection — releasing its client-count slot — within the follow-on
+    /// deadline, and serve another client throughout.
+    #[cfg(unix)]
+    async fn a_stalled_follow_on_releases_its_slot(stall: &[u8]) {
+        let (_dir, sock, counter, server) = follow_on_stall_server().await;
+        let started = tokio::time::Instant::now();
+        let mut s = hello_awaiting_follow_on(&sock).await;
+        s.write_all(stall).await.expect("write the stall");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stalled peer holds a slot"
+        );
+        assert_serviceable(&sock).await;
+
+        // The slack covers scheduling on a loaded box, not the deadline.
+        wait_for_client_count(&counter, 0, FOLLOW_ON_READ_TIMEOUT + Duration::from_secs(4)).await;
+        assert!(
+            started.elapsed() >= FOLLOW_ON_READ_TIMEOUT,
+            "the slot is held until the deadline, not dropped early"
+        );
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the daemon closed the stalled connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the daemon closed the stalled connection");
+        assert_serviceable(&sock).await;
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        server.abort();
+    }
+
+    /// Scenario: a client sends `Hello { follow_on: true }`, reads the reply
+    /// and then sends nothing. The daemon drops that connection once the
+    /// follow-on deadline passes, so its client count returns to zero, and
+    /// answers another client meanwhile (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_peer_after_a_follow_on_hello_is_dropped_at_the_deadline() {
+        a_stalled_follow_on_releases_its_slot(&[]).await;
+    }
+
+    /// Scenario: after a `Hello { follow_on: true }` reply, a client sends a
+    /// frame header declaring a 1 KiB payload, a few bytes of it, and then
+    /// nothing. The daemon drops the connection at the follow-on deadline
+    /// rather than waiting for the rest (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_truncated_follow_on_payload_is_dropped_at_the_deadline() {
+        let mut stall = vec![KIND_REQ];
+        stall.extend_from_slice(&1024u32.to_be_bytes());
+        stall.extend_from_slice(b"{\"op\":");
+        a_stalled_follow_on_releases_its_slot(&stall).await;
     }
 }

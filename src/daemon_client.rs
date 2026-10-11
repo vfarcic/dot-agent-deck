@@ -4634,7 +4634,9 @@ mod tests {
     /// request never reaches the socket: unlike `focus-gained`'s silent
     /// withhold, a person who typed `close` must be told nothing was closed.
     /// Against both older shapes: no capabilities at all, and a set without
-    /// `close-agents`.
+    /// `close-agents`. And against both partial sets (review on PR #1681,
+    /// AU-M2): `close-agents` without `hello-follow-on`, and the reverse — the
+    /// verb goes only on a connection whose reply advertised both.
     #[cfg(unix)]
     #[test]
     fn close_agents_is_refused_hard_by_a_daemon_that_does_not_advertise_it() {
@@ -4651,11 +4653,15 @@ mod tests {
                 crate::daemon_protocol::CAP_FOCUS_GAINED,
             ]))
             .await;
+            close_agents_withheld_inner(Some(&[crate::daemon_protocol::CAP_CLOSE_AGENTS])).await;
+            close_agents_withheld_inner(Some(&[crate::daemon_protocol::CAP_HELLO_FOLLOW_ON])).await;
         });
     }
 
     #[cfg(unix)]
     async fn close_agents_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        use tokio::io::AsyncReadExt;
+
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().unwrap();
@@ -4665,6 +4671,8 @@ mod tests {
         };
         let other_requests = Arc::new(AtomicUsize::new(0));
         let server_other_requests = other_requests.clone();
+        let follow_on_bytes = Arc::new(AtomicUsize::new(0));
+        let server_follow_on_bytes = follow_on_bytes.clone();
         let server = tokio::spawn(async move {
             while let Ok(Ok(mut stream)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
@@ -4677,7 +4685,8 @@ mod tests {
                 };
                 let request: serde_json::Value =
                     serde_json::from_slice(&payload).expect("decode older-daemon request");
-                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                let is_hello = request.get("op").and_then(|op| op.as_str()) == Some("hello");
+                let response = if is_hello {
                     AttachResponse {
                         capabilities: advertised
                             .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
@@ -4691,9 +4700,22 @@ mod tests {
                 crate::daemon_protocol::write_resp(&mut stream, &response)
                     .await
                     .expect("write older-daemon response");
+                // Keep the hello's connection open, as a daemon serving a
+                // follow-on would, and count whatever the client writes on it
+                // until it hangs up.
+                if is_hello {
+                    let mut rest = Vec::new();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        stream.read_to_end(&mut rest),
+                    )
+                    .await;
+                    server_follow_on_bytes.fetch_add(rest.len(), Ordering::SeqCst);
+                }
             }
         });
         let client = DaemonClient::new(path);
+        let started = std::time::Instant::now();
         let err = client
             .close_agents(
                 crate::daemon_protocol::CloseSelector::Units(
@@ -4707,6 +4729,11 @@ mod tests {
             )
             .await
             .expect_err("an older daemon must be a hard error, not a silent withhold");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "advertised {advertised:?}: TooOld must not wait on the open connection, took {:?}",
+            started.elapsed()
+        );
         match &err {
             CloseAgentsError::TooOld { daemon_version } => {
                 assert_eq!(daemon_version.as_deref(), Some("0.40.2"));
@@ -4721,6 +4748,11 @@ mod tests {
         );
         drop(client);
         server.await.unwrap();
+        assert_eq!(
+            follow_on_bytes.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: no follow-on bytes may follow the handshake"
+        );
         drop(dir);
     }
 

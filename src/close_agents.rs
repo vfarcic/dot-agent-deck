@@ -1985,6 +1985,33 @@ mod tests {
             );
         }
 
+        /// Leaves `pane`'s agent `Idle` with a background command running —
+        /// what its card shows (issue #1678) — the way the daemon's
+        /// shell-activity monitor records one.
+        async fn idle_with_background(&self, pane: &str, agent: &str) {
+            let mut state = self.state.write().await;
+            let frame = |event_type: &str| {
+                serde_json::from_value::<crate::event::AgentEvent>(serde_json::json!({
+                    "session_id": format!("{pane}-session"), "pane_id": pane,
+                    "agent_id": agent, "agent_type": "claude_code",
+                    "event_type": event_type, "timestamp": chrono::Utc::now()
+                }))
+                .expect("a hook frame")
+            };
+            state.apply_event(frame("session_start"));
+            state.apply_event(frame("idle"));
+            state.observe_command_sessions(pane, agent, &[12345].into_iter().collect());
+            state.apply_event(frame("idle"));
+            assert_eq!(
+                state.pane_status_of(pane),
+                Some(crate::state::SessionStatus::Idle)
+            );
+            assert!(
+                state.pane_background_of(pane).is_some(),
+                "the background work must have landed for the busy check to read it"
+            );
+        }
+
         async fn close(
             &self,
             selector: CloseSelector,
@@ -2190,6 +2217,164 @@ mod tests {
         assert!(deck.live(&dispatcher), "the dispatcher is untouched");
         // A finished instance takes no new pane.
         assert!(deck.registry.is_instance_closing("orch-1"));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: a dispatched orchestration has reported done and every role
+    /// reads Idle, but its worker still has a background command running.
+    /// Named by dispatch name, by unit id or by `--orchestration-of`, a dry run
+    /// lists it as busy, the default close is refused busy and stops nothing,
+    /// and --force closes it, recording the busy refusal it overrode (review on
+    /// PR #1681, AU-M2).
+    #[tokio::test]
+    async fn an_idle_worker_with_background_work_refuses_the_close_through_every_selector() {
+        for spelling in ["name", "unit-id", "orchestration-of"] {
+            let deck = Deck::new().await;
+            let dispatcher = deck.start("disp", "sleep 30", None).await;
+            let orch = deck
+                .start(
+                    "o-orch",
+                    "sleep 30",
+                    Some(("orch-bg", "orchestrator", true)),
+                )
+                .await;
+            let worker = deck
+                .start("o-coder", "sleep 30", Some(("orch-bg", "coder", false)))
+                .await;
+            let id = deck.orch_unit("team-bg", ("disp", &dispatcher), "orch-bg", "o-orch", &orch);
+            deck.report_done("o-orch", &orch);
+            deck.idle_with_background("o-coder", &worker).await;
+            let claim = deck.claim("disp", &dispatcher);
+            let selector = match spelling {
+                "name" => by_name("team-bg"),
+                "unit-id" => CloseSelector::UnitIds { ids: vec![id] },
+                _ => CloseSelector::OrchestrationOf {
+                    pane_id: "o-coder".into(),
+                },
+            };
+
+            let report = deck
+                .close(selector.clone(), Some(claim.clone()), false, true)
+                .await;
+            let target = &report.targets[0];
+            assert_eq!(
+                target.outcome,
+                CloseOutcome::Listed,
+                "{spelling}: {target:?}"
+            );
+            assert_eq!(
+                target.would_refuse,
+                vec![CloseRefusalReason::Busy],
+                "{spelling}: the dry run names the background work as busy"
+            );
+
+            let report = deck
+                .close(selector.clone(), Some(claim.clone()), false, false)
+                .await;
+            let target = &report.targets[0];
+            assert_eq!(
+                target.outcome,
+                CloseOutcome::Refused,
+                "{spelling}: {target:?}"
+            );
+            assert_eq!(target.reason, Some(CloseRefusalReason::Busy), "{spelling}");
+            assert!(
+                target
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("background work")),
+                "{spelling}: the refusal names the background work: {target:?}"
+            );
+            assert!(
+                deck.live(&orch) && deck.live(&worker),
+                "{spelling}: no pane may be stopped"
+            );
+
+            let report = deck.close(selector, Some(claim), true, false).await;
+            let target = &report.targets[0];
+            assert_eq!(
+                target.outcome,
+                CloseOutcome::Closed,
+                "{spelling}: {target:?}"
+            );
+            assert_eq!(
+                target.forced_over,
+                vec![CloseRefusalReason::Busy],
+                "{spelling}"
+            );
+            assert!(!deck.live(&orch) && !deck.live(&worker), "{spelling}");
+            assert!(
+                deck.live(&dispatcher),
+                "{spelling}: the dispatcher is untouched"
+            );
+            deck.shutdown().await;
+        }
+    }
+
+    /// Scenario: a raw client sends `Hello { follow_on: true }` and then, on the
+    /// same connection, a `CloseAgents` carrying a claim whose token this daemon
+    /// never minted. The follow-on is refused not-attested and the unit's agent
+    /// keeps running: the connection that asked for a follow-on gains no
+    /// authority from it (review on PR #1681, AU-M2).
+    #[tokio::test]
+    async fn a_forged_claim_on_a_follow_on_is_refused_not_attested() {
+        use crate::daemon_protocol::{
+            AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, read_frame, write_frame,
+        };
+
+        let deck = Deck::new().await;
+        let dispatcher = deck.start("disp", "sleep 30", None).await;
+        let unit_agent = deck.start("unit", "sleep 30", None).await;
+        deck.single_unit("u1", ("disp", &dispatcher), "unit", &unit_agent);
+        deck.report_done("unit", &unit_agent);
+
+        let mut s = tokio::net::UnixStream::connect(deck.dir.path().join("attach.sock"))
+            .await
+            .expect("connect");
+        let mut send = async |request: &AttachRequest| {
+            let payload = serde_json::to_vec(request).unwrap();
+            write_frame(&mut s, KIND_REQ, &payload)
+                .await
+                .expect("write the request");
+            let (kind, payload) = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut s))
+                .await
+                .expect("the daemon answers")
+                .expect("the reply reads")
+                .expect("the connection is open");
+            assert_eq!(kind, KIND_RESP);
+            serde_json::from_slice::<AttachResponse>(&payload).expect("a response")
+        };
+        let hello = send(&AttachRequest::Hello {
+            client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: true,
+        })
+        .await;
+        assert!(hello.ok, "{:?}", hello.error);
+        let resp = send(&AttachRequest::CloseAgents {
+            selector: by_name("u1"),
+            caller: Some(CallerClaim {
+                pane_id: "disp".to_string(),
+                token: "0".repeat(crate::hook_provenance::TOKEN_LEN),
+            }),
+            force: true,
+            dry_run: false,
+        })
+        .await;
+        let report = resp.close_report.expect("a close report");
+        assert_eq!(
+            report.refused.map(|r| r.reason),
+            Some(CloseRefusalReason::NotAttested)
+        );
+        assert!(report.targets.is_empty());
+        assert!(deck.live(&unit_agent), "nothing may be stopped");
+        assert!(
+            deck.registry
+                .dispatched_units()
+                .live()
+                .any(|u| u.name == "u1"),
+            "the unit stays live"
+        );
         deck.shutdown().await;
     }
 
