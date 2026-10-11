@@ -1,5 +1,7 @@
 //! L1 rendering of the persistent stale hook binary notice.
-use dot_agent_deck::hook_binary::{HookBinaryNotice, HookBinaryReason};
+use dot_agent_deck::hook_binary::{
+    HookBinaryNotice, HookBinaryReason, REMEDY_UPGRADE_OR_REINSTALL,
+};
 use dot_agent_deck::ui::render_hook_notice_to_buffer;
 use spec::spec;
 
@@ -15,7 +17,7 @@ fn text(notices: &[HookBinaryNotice], width: u16) -> String {
 /// Scenario: Render a stale hook notice at full width, at 120 and at 60
 /// columns, then render an empty notice list. Full width names both agents, the
 /// binary, both versions and the command; at 120 the path is shortened from the
-/// middle; at 60 the row keeps the agents and the old version and shows no
+/// middle; at 60 the row keeps the agents and both versions and shows no
 /// cut-down command; an empty list draws nothing.
 #[spec("hooks/stale/001")]
 #[test]
@@ -51,8 +53,7 @@ fn stale_001_notice_names_the_binary_and_preserves_the_remedy() {
         "path did not truncate: {middle}"
     );
     let narrow = text(&[notice], 60);
-    assert!(narrow.contains("…"), "notice should truncate: {narrow}");
-    for part in ["Claude Code", "Codex", "0.45.1"] {
+    for part in ["Claude Code", "Codex", "0.45.1", "0.46.0"] {
         assert!(narrow.contains(part), "missing {part:?}: {narrow}");
     }
     assert!(
@@ -66,8 +67,9 @@ fn stale_001_notice_names_the_binary_and_preserves_the_remedy() {
 /// Scenario (Qodo on #1656): Render a two-agent stale notice whose remedy is
 /// the long `hooks install` command at 160 columns, where the command alone
 /// fits but not beside the sentence naming the agents and both versions. The
-/// row shows that sentence and the upgrade-or-reinstall advice instead of a
-/// clipped `Cl…` lead before the command; at 300 columns it shows the command.
+/// row shows the agents and both versions with the whole upgrade-or-reinstall
+/// advice instead of a clipped `Cl…` lead before the command; at 300 columns
+/// it shows the full sentence and the command.
 #[spec("hooks/stale/005")]
 #[test]
 fn stale_005_a_command_is_shown_only_beside_the_agents_and_versions() {
@@ -93,11 +95,12 @@ fn stale_005_a_command_is_shown_only_beside_the_agents_and_versions() {
         "Claude Code, Codex",
         "0.45.1",
         "0.46.0",
-        "Upgrade the dot-agent-deck",
+        REMEDY_UPGRADE_OR_REINSTALL,
     ] {
         assert!(row.contains(part), "missing {part:?}: {row}");
     }
     assert!(!row.contains("hooks install --agent"), "{row}");
+    assert!(!row.contains("⚠ Cl…"), "{row}");
     insta::assert_snapshot!("hook_notice_command_without_room_for_facts", row);
     let wide = text(std::slice::from_ref(&notice), 300);
     assert!(wide.contains(&format!("Run: {command}")), "{wide}");
@@ -105,4 +108,62 @@ fn stale_005_a_command_is_shown_only_beside_the_agents_and_versions() {
         wide.contains("Claude Code, Codex hooks run dot-agent-deck 0.45.1"),
         "{wide}"
     );
+}
+
+fn homebrew_notice() -> HookBinaryNotice {
+    HookBinaryNotice {
+        binary: "/opt/homebrew/bin/dot-agent-deck".into(),
+        agents: vec!["Claude Code".into(), "Codex".into()],
+        version: Some("0.45.1".into()),
+        daemon_version: "0.46.0".into(),
+        reason: HookBinaryReason::Older,
+        remedy: "Run:".into(),
+        command: Some("brew upgrade dot-agent-deck".into()),
+    }
+}
+
+/// Scenario (Qodo on #1656): Render the two-agent Homebrew notice at 80 and
+/// at 100 columns, where the sentence naming the agents and both versions does
+/// not fit beside the command. Each row shows `Run: brew upgrade
+/// dot-agent-deck` whole and both versions, with the facts shortened instead,
+/// and no cut-off upgrade-or-reinstall advice.
+#[spec("hooks/stale/006")]
+#[test]
+fn stale_006_a_short_command_stays_whole_on_a_narrow_row() {
+    let notice = homebrew_notice();
+    for width in [80u16, 100] {
+        let row = text(std::slice::from_ref(&notice), width);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(row.as_str()) <= width as usize,
+            "{width}: {row}"
+        );
+        for part in [
+            "Claude Code",
+            "0.45.1",
+            "0.46.0",
+            "Run: brew upgrade dot-agent-deck",
+        ] {
+            assert!(row.contains(part), "{width}: missing {part:?}: {row}");
+        }
+        assert!(!row.contains("Upgrade the"), "{width}: {row}");
+        insta::assert_snapshot!(format!("hook_notice_homebrew_{width}"), row);
+    }
+}
+
+/// Scenario (Qodo on #1656): Render two stale notices at 80 columns. The row
+/// draws the first notice and ends with `(+1 more)`, which is never cut to
+/// make room for the notice or its remedy.
+#[spec("hooks/stale/007")]
+#[test]
+fn stale_007_the_count_of_further_notices_survives_a_narrow_row() {
+    let notices = [homebrew_notice(), homebrew_notice()];
+    for width in [40u16, 80, 180] {
+        let row = text(&notices, width);
+        assert!(row.ends_with(" (+1 more)"), "{width}: {row}");
+    }
+    let row = text(&notices, 80);
+    for part in ["Claude Code", "0.45.1", "0.46.0"] {
+        assert!(row.contains(part), "missing {part:?}: {row}");
+    }
+    insta::assert_snapshot!("hook_notice_two_notices_80", text(&notices, 80));
 }

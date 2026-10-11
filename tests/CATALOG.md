@@ -2626,18 +2626,18 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 #### hooks/stale
 
-##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and old version at 60 columns.
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
 - **Layer:** L1 render buffer and insta snapshots.
 - **Agent:** none.
-- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and the old version survive and no cut-down command is shown; an empty list draws nothing.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and both versions survive and no cut-down command is shown; an empty list draws nothing.
 - **Does not assert:** the dashboard's placement or daemon transport.
 - **Platform coverage:** portable.
 
 ##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
 - **Layer:** L2 PTY-attached, lane 1.
 - **Agent:** none; old executable stub and synthetic Claude hook.
-- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, and a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
-- **Does not assert:** a real Claude emitting hooks, desktop rendering, or takeover from an eligible binary; the built target binary and separate HOME keep takeover ineligible.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, resized to 80 columns the row still names the agent, `0.0.1` and this deck's version with no cut-off remedy, and back at full width a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Does not assert:** a real Claude emitting hooks, desktop rendering, takeover from an eligible binary, or a `brew upgrade` command (the sandbox's installed link makes the remedy this deck's own `hooks install`; `hooks/stale/006` covers the Homebrew row in L1); the built target binary and separate HOME keep takeover ineligible.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
@@ -2657,7 +2657,21 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### hooks/stale/005 — A command remedy is shown only beside the agents and both versions.
 - **Layer:** L1 render buffer and insta snapshot.
 - **Agent:** none.
-- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows that sentence and the upgrade-or-reinstall advice and no part of the command; at 300 columns it shows the command whole beside the sentence.
+- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows the agents and both versions with the whole upgrade-or-reinstall advice, no part of the command and no clipped `⚠ Cl…` lead; at 300 columns it shows the command whole beside the full sentence.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/006 — A short command stays whole on a narrow row, with the facts shortened instead.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** at 80 and 100 columns, the two-agent Homebrew notice shows `Run: brew upgrade dot-agent-deck` whole, the first agent and both versions, fits the row, and shows no cut-off upgrade-or-reinstall advice.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/007 — The count of further notices survives a narrow row.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** with two notices, the row ends with `(+1 more)` at 40, 80 and 180 columns, and at 80 it still names the first agent and both versions.
 - **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
 - **Platform coverage:** portable.
 

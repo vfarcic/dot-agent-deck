@@ -21,16 +21,17 @@ fn event(event_type: &str) -> serde_json::Value {
 }
 
 /// Scenario: Start the real dashboard with Claude hooks pinned to an older
-/// stub. Its startup notice names the pin and version; a stamp-less hook then
-/// updates the same visible row live to explain that version reporting is missing,
-/// even when the host has no deck installed on PATH.
+/// stub. Its startup notice names the pin and version, and still names the agent
+/// and both versions, with no cut-off remedy, once the terminal is resized to 80
+/// columns; back at full width, a stamp-less hook then updates the same visible
+/// row live to explain that version reporting is missing.
 #[spec("hooks/stale/002")]
 #[test]
 fn hooks_stale_002_startup_notice_updates_live_for_an_unreported_hook() {
     let fixture = StaleHome::new();
     // Keep the host's installed deck and login-shell profile out of the
     // scenario; the fixture supplies its own installed link to the cargo build.
-    let deck = TuiDeck::builder()
+    let mut deck = TuiDeck::builder()
         .with_pty_size(420, 28)
         .with_env("HOME", fixture.home.to_string_lossy())
         .with_env("PATH", fixture.home.to_string_lossy())
@@ -61,6 +62,29 @@ fn hooks_stale_002_startup_notice_updates_live_for_an_unreported_hook() {
             .any(|n| n.binary == fixture.pin.to_string_lossy()
                 && n.reason == HookBinaryReason::Older)
     );
+
+    // At 80 columns the `hooks install` remedy fits neither whole nor beside
+    // the facts, so the row keeps the agent and both versions and shows no
+    // cut-off remedy (Qodo on #1656).
+    deck.resize(80, 28);
+    let narrow = |grid: &str| {
+        grid.lines().any(|row| {
+            row.contains("Claude Code") && row.contains("0.0.1") && row.contains("this deck is")
+        })
+    };
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), narrow),
+        "agent and both versions missing at 80 columns:\n{}",
+        deck.snapshot_grid()
+    );
+    let grid = deck.snapshot_grid();
+    let row = grid.lines().find(|row| row.contains("0.0.1")).unwrap();
+    assert!(
+        !row.contains("Run:") && !row.contains("Upgrade the"),
+        "{row}"
+    );
+    deck.resize(420, 28);
+    deck.wait_for_string(fixture.pin.to_str().unwrap());
 
     write_hook_line(deck.hook_socket_path(), &event("session_start").to_string()).unwrap();
     deck.wait_for_string("stale1637");

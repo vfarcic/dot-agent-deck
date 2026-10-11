@@ -2,4 +2,4 @@
 source: tests/hook_stale_notice.rs
 expression: row
 ---
-⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (…); this deck is 0.46.0 — Upgrade the dot-agent-deck the hooks run, or run `hooks install` from the copy …
+⚠ Claude Code, Codex hooks run 0.45.1; deck 0.46.0 — Upgrade the dot-agent-deck the hooks run, or run `hooks install` from the copy you want the hooks to use.
