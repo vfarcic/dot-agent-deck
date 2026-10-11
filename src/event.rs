@@ -986,10 +986,20 @@ pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
 /// hook CLI never sets it, so no
 /// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
 /// privilege: an event carrying it is kept from moving a card's status, with
-/// one exception that grants nothing a plain event lacks — a `SubagentStop`
+/// two exceptions that grant nothing a plain event lacks — a `SubagentStop`
 /// ends a `WaitingForInput` that only subagents of the same id raised (issue
-/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
+/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too,
+/// and so does that subagent's answered permission prompt (issue #1678,
+/// [`AgentEvent::is_subagent_permission_reply`]), which a plain `Thinking`
+/// would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
+/// Where a permission prompt stands, on the events the OpenCode hook builds
+/// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
+
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt.
+pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -1211,6 +1221,21 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #1678: is this a subagent's answered permission prompt — a
+    /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
+    /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
+    /// the OpenCode hook builds from a child session's `permission.replied`?
+    /// It ends that subagent's share of a wait and says nothing about the main
+    /// thread. `false` for every event an older hook CLI builds.
+    pub fn is_subagent_permission_reply(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self.is_from_subagent()
+            && self
+                .metadata
+                .get(PERMISSION_STATE_METADATA_KEY)
+                .is_some_and(|state| state == PERMISSION_STATE_REPLIED)
     }
 
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a

@@ -1328,6 +1328,39 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+/// Issue #1364: subagent `ended` no longer holds the card's wait — it stopped,
+/// or (issue #1678) its permission prompt was answered. When the wait is
+/// subagents' alone and that subagent is one of them, it is taken off; once
+/// none is left the wait is over and the card resumes as [`SubagentWait`]
+/// says, which is the only case that answers `true`. Anything else — no wait,
+/// a main-thread wait, a subagent the wait does not name — changes nothing.
+fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
+    if session.status != SessionStatus::WaitingForInput {
+        return false;
+    }
+    let Some(wait) = session.subagent_wait.as_mut() else {
+        return false;
+    };
+    // Issue #697: an id the wait does not hold is one of the subagents counted
+    // past the cap (see `SubagentWait::overflow`).
+    if wait.subagent_ids.iter().any(|id| id == ended) {
+        wait.subagent_ids.retain(|id| id != ended);
+    } else if wait.overflow > 0 {
+        wait.overflow -= 1;
+    } else {
+        return false;
+    }
+    let released = wait.subagent_ids.is_empty() && wait.overflow == 0;
+    if released {
+        session.status = if wait.resume_idle {
+            SessionStatus::Idle
+        } else {
+            SessionStatus::Thinking
+        };
+    }
+    released
+}
+
 impl SessionState {
     /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
     /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
@@ -17240,6 +17273,15 @@ impl AppState {
                 session.active_tool = None;
                 true
             }
+            // Issue #1678: a subagent's answered permission prompt (an OpenCode
+            // child session's `permission.replied`) ends that subagent's share
+            // of the wait, as its `SubagentStop` would; it is not the main
+            // thread thinking, so it leaves any other status, the active tool
+            // and the main thread's own wait alone.
+            EventType::Thinking if event.is_subagent_permission_reply() => event
+                .metadata
+                .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                .is_some_and(|answered| release_subagent_wait(session, answered)),
             EventType::Thinking => {
                 session.status = SessionStatus::Thinking;
                 session.active_tool = None;
@@ -17346,31 +17388,11 @@ impl AppState {
             // When the card's wait is that subagent's alone — every subagent
             // that raised it has now stopped — the wait is over; see
             // [`SubagentWait`] for what the card resumes to.
-            EventType::SubagentStop
-                if session.status == SessionStatus::WaitingForInput
-                    && let Some(ended) =
-                        event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
-                    && let Some(wait) = session.subagent_wait.as_mut()
-                    && (wait.subagent_ids.contains(ended) || wait.overflow > 0) =>
-            {
-                // Issue #697: an id the wait does not hold is one of the
-                // subagents counted past the cap (see `SubagentWait::overflow`).
-                if wait.subagent_ids.contains(ended) {
-                    wait.subagent_ids.retain(|id| id != ended);
-                } else {
-                    wait.overflow -= 1;
-                }
-                let asserted = wait.subagent_ids.is_empty() && wait.overflow == 0;
-                if asserted {
-                    session.status = if wait.resume_idle {
-                        SessionStatus::Idle
-                    } else {
-                        SessionStatus::Thinking
-                    };
-                }
-                asserted
-            }
-            EventType::SubagentStart | EventType::SubagentStop => {
+            EventType::SubagentStop => event
+                .metadata
+                .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                .is_some_and(|ended| release_subagent_wait(session, ended)),
+            EventType::SubagentStart => {
                 // Informational — recorded in recent_events but no status change
                 false
             }

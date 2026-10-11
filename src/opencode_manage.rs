@@ -154,10 +154,50 @@ globalThis[DAD_GUARD] = true;
 
 const BINARY_PATH = {binary_path_json};
 const knownSessions = new Map();
+// Pending user messages, by message id, until their text part arrives: at most
+// MAX_PENDING_USER_MESSAGES, the oldest forgotten first (its prompt is then not
+// reported).
 const messageRoles = new Map();
 const directorySessions = new Map();
+// Session id -> the directory's first session it is reported as. At most
+// MAX_SESSION_ALIASES, the oldest forgotten first: a forgotten alias is worked
+// out again from directorySessions the next time its session reports.
 const sessionAliases = new Map();
+const MAX_PENDING_USER_MESSAGES = 64;
+const MAX_SESSION_ALIASES = 256;
 let shuttingDown = false;
+
+// Issue #1678: the longest session or message id, in UTF-8 bytes, the plugin
+// keeps in its child-session, alias and reply records — the daemon's own bound
+// on a tracked subagent id. A longer child id is recognised by a fixed-size
+// stand-in (sessionKey), never by a cut-down copy, so two long ids sharing a
+// prefix stay apart; it is never reported active (no `subagent.start` or
+// `subagent.stop`), and its tool calls and permission prompts still carry
+// subagent attribution, as OVERSIZED_SUBAGENT_ID.
+const MAX_ID_BYTES = 256;
+const OVERSIZED_SUBAGENT_ID = "oversized-subagent-id";
+const utf8Length = (text) =>
+  typeof Buffer !== "undefined" ? Buffer.byteLength(text, "utf8") : new TextEncoder().encode(text).length;
+const idFits = (id) =>
+  typeof id === "string" && id.length > 0 && id.length <= MAX_ID_BYTES && utf8Length(id) <= MAX_ID_BYTES;
+const digest = (text) => {{
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  for (let i = 0; i < text.length; i += 1) {{
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x5bd1e995);
+  }}
+  return (a >>> 0).toString(16) + (b >>> 0).toString(16);
+}};
+// How the plugin holds session id `id`: the id itself when it fits in
+// MAX_ID_BYTES, otherwise a fixed-size stand-in derived from all of it.
+const sessionKey = (id) => {{
+  if (typeof id !== "string" || !id) {{
+    return undefined;
+  }}
+  return idFits(id) ? id : "\u0000" + id.length + ":" + digest(id);
+}};
 
 // PRD #1497: the assistant's reply, for the deck's voice "reading on". The text
 // parts of each assistant message are kept as they stream in (the full text
@@ -232,7 +272,9 @@ const normalizeSessionId = (sessionId, directory) => {{
   if (sessionId && sessionId !== "unknown") {{
     const existing = directorySessions.get(dirKey);
     if (existing && existing !== sessionId) {{
-      sessionAliases.set(sessionId, existing);
+      if (idFits(sessionId)) {{
+        rememberBounded(sessionAliases, sessionId, existing, MAX_SESSION_ALIASES);
+      }}
       return existing;
     }}
     directorySessions.set(dirKey, sessionId);
@@ -375,15 +417,16 @@ const sessionPayload = (event, directory) => {{
   }};
 }};
 
+const permissionPrompt = (props) =>
+  props.prompt ??
+  props.title ??
+  props.message ??
+  props.text ??
+  props.question ??
+  "";
+
 const permissionPayload = (event, directory) => {{
   const props = event?.properties ?? {{}};
-  const prompt =
-    props.prompt ??
-    props.title ??
-    props.message ??
-    props.text ??
-    props.question ??
-    "";
   const cwd = directory ?? process.cwd();
   return {{
     session_id: normalizeSessionId(
@@ -391,7 +434,7 @@ const permissionPayload = (event, directory) => {{
       cwd
     ),
     event: event?.type ?? "permission.unknown",
-    prompt,
+    prompt: permissionPrompt(props),
     cwd,
   }};
 }};
@@ -441,11 +484,22 @@ const closeSession = (sessionId, directory, emitEvent = true, removeAlias = true
 }};
 
 const flushSessions = () => {{
+  // A child still active when OpenCode goes away ends with it: its stop is
+  // sent under the session its start was, before that session closes.
+  for (const [childId, route] of activeSubagents.entries()) {{
+    sendEvent({{
+      session_id: route.sessionId,
+      subagent_id: childId,
+      event: "subagent.stop",
+      cwd: route.cwd,
+    }});
+  }}
+  activeSubagents.clear();
+  childRoutes.clear();
   for (const [sessionId, info] of knownSessions.entries()) {{
     closeSession(sessionId, info?.cwd, true, true);
   }}
   forgetAllReplyState();
-  activeSubagents.clear();
 }};
 
 const handleShutdown = () => {{
@@ -485,15 +539,15 @@ const clipBytes = (text, budget) => {{
 }};
 
 // Insert or refresh `key` in a Map (with `value`) or a Set, as its newest
-// entry, forgetting the oldest past MAX_REPLY_SESSIONS.
-const rememberBounded = (collection, key, value) => {{
+// entry, forgetting the oldest past `cap` (MAX_REPLY_SESSIONS unless given).
+const rememberBounded = (collection, key, value, cap = MAX_REPLY_SESSIONS) => {{
   collection.delete(key);
   if (collection instanceof Map) {{
     collection.set(key, value);
   }} else {{
     collection.add(key);
   }}
-  while (collection.size > MAX_REPLY_SESSIONS) {{
+  while (collection.size > cap) {{
     collection.delete(collection.keys().next().value);
   }}
 }};
@@ -521,11 +575,6 @@ const forgetAllReplyState = () => {{
   sessionParents.clear();
 }};
 
-const isChildSession = (sessionId) => {{
-  const parent = sessionParents.get(sessionId);
-  return parent !== undefined && parent !== "";
-}};
-
 // Issue #1678: a subagent's child session (one whose `parentID` is known) is
 // reported as that subagent's work, never as the main session's. Its going
 // active (`session.status` busy or retry) is a `subagent.start` naming the
@@ -534,32 +583,71 @@ const isChildSession = (sessionId) => {{
 // a transition is sent: a child already active sends no second start, and one
 // that is not sends no stop, so a child that goes busy again later starts
 // again. Its other session events and its user message (the prompt it was
-// given) are not sent, and its tool calls carry `subagent_id`, so none of them
-// moves the card's status. A session whose ancestry is not known when it
-// reports is still treated as the main session's.
+// given) are not sent, and its tool calls and permission prompts carry
+// `subagent_id`, so none of them moves the card's status. A session whose
+// ancestry is not known when it reports is still treated as the main
+// session's.
+//
+// Where a child's reports go is kept apart from sessionParents, which forgets
+// its oldest entries as other sessions are created: an active child is held in
+// activeSubagents with the session its start was filed under until it stops,
+// and the MAX_REPLY_SESSIONS children seen most recently in childRoutes, so
+// neither is taken for the main session because its ancestry was forgotten.
+// Both are keyed by sessionKey.
 //
 // Bounded: at most MAX_ACTIVE_SUBAGENTS children are reported active at once;
 // a child past that sends neither its start nor its stop.
 const MAX_ACTIVE_SUBAGENTS = 128;
 const MAX_ANCESTRY_DEPTH = 32;
-const activeSubagents = new Set();
+// Child key -> {{ root, sessionId, cwd }}: the root it descends from, and the
+// session id and directory its `subagent.start` was sent with.
+const activeSubagents = new Map();
+// Child key -> the root it descends from.
+const childRoutes = new Map();
 
-// The topmost known ancestor of `sessionId` (itself for a root), so a
-// grandchild's work is filed under the main session too.
-const rootSessionOf = (sessionId) => {{
-  let current = sessionId;
-  for (let depth = 0; depth < MAX_ANCESTRY_DEPTH && isChildSession(current); depth += 1) {{
-    current = sessionParents.get(current);
+const routeOf = (key) => activeSubagents.get(key)?.root ?? childRoutes.get(key);
+
+const isChildSession = (sessionId) => {{
+  const key = sessionKey(sessionId);
+  if (key === undefined) {{
+    return false;
   }}
-  return current;
+  const parent = sessionParents.get(key);
+  if (parent !== undefined) {{
+    return parent !== "";
+  }}
+  return activeSubagents.has(key) || childRoutes.has(key);
 }};
+
+// The root `key` descends from (itself for a root), so a grandchild's work is
+// filed under the main session too. Walks the known ancestry; where that is
+// broken (an ancestor not known, or forgotten) the route recorded for `key`,
+// or for the ancestor the walk stopped at, is used.
+const rootKeyOf = (key) => {{
+  let current = key;
+  for (let depth = 0; depth < MAX_ANCESTRY_DEPTH; depth += 1) {{
+    const parent = sessionParents.get(current);
+    if (parent === "") {{
+      return current;
+    }}
+    if (parent === undefined) {{
+      break;
+    }}
+    current = parent;
+  }}
+  return routeOf(key) ?? routeOf(current) ?? current;
+}};
+
+// What a child's report is attributed to: its own id, or OVERSIZED_SUBAGENT_ID
+// for one longer than MAX_ID_BYTES.
+const subagentAttribution = (childId) => (idFits(childId) ? childId : OVERSIZED_SUBAGENT_ID);
 
 const subagentPayload = (event, childId, directory, rest) => {{
   const props = event?.properties ?? {{}};
   const cwd = props.info?.directory ?? props.directory ?? directory ?? process.cwd();
   return {{
-    session_id: normalizeSessionId(rootSessionOf(childId), cwd),
-    subagent_id: childId,
+    session_id: normalizeSessionId(rootKeyOf(sessionKey(childId)), cwd),
+    subagent_id: subagentAttribution(childId),
     cwd,
     ...rest,
   }};
@@ -568,6 +656,7 @@ const subagentPayload = (event, childId, directory, rest) => {{
 // A child session's own session event: a start or stop on a transition,
 // nothing otherwise.
 const handleChildSessionEvent = (event, childId, directory) => {{
+  const key = sessionKey(childId);
   const type = event?.type ?? "";
   const status = event?.properties?.status?.type;
   const active =
@@ -578,28 +667,62 @@ const handleChildSessionEvent = (event, childId, directory) => {{
     type === "session.error" ||
     type === "session.deleted" ||
     ((type === "session.status" || type === "session.status.updated") && status === "idle");
-  if (active && !activeSubagents.has(childId) && activeSubagents.size < MAX_ACTIVE_SUBAGENTS) {{
-    activeSubagents.add(childId);
-    sendEvent(subagentPayload(event, childId, directory, {{ event: "subagent.start" }}));
-  }} else if (ended && activeSubagents.delete(childId)) {{
-    sendEvent(subagentPayload(event, childId, directory, {{ event: "subagent.stop" }}));
+  const root = rootKeyOf(key);
+  const running = activeSubagents.get(key);
+  if (
+    active &&
+    !running &&
+    idFits(childId) &&
+    activeSubagents.size < MAX_ACTIVE_SUBAGENTS
+  ) {{
+    const payload = subagentPayload(event, childId, directory, {{ event: "subagent.start" }});
+    activeSubagents.set(key, {{ root, sessionId: payload.session_id, cwd: payload.cwd }});
+    childRoutes.delete(key);
+    sendEvent(payload);
+  }} else if (ended && running) {{
+    activeSubagents.delete(key);
+    sendEvent({{
+      session_id: running.sessionId,
+      subagent_id: childId,
+      event: "subagent.stop",
+      cwd: running.cwd,
+    }});
   }}
   if (type === "session.deleted") {{
     forgetReplyState(childId);
-    sessionParents.delete(childId);
+    sessionParents.delete(key);
+    childRoutes.delete(key);
     cancelAncestryLookup(childId);
+  }} else if (!activeSubagents.has(key)) {{
+    rememberBounded(childRoutes, key, root);
   }}
 }};
 
-// Record a session's ancestry from its info; a child's reply state is dropped.
+// Drop the user messages still waiting for their text that child `key` sent:
+// they are the prompt its subagent was given, not the user's.
+const forgetChildPrompts = (key) => {{
+  for (const [messageId, info] of messageRoles.entries()) {{
+    if (info?.rawSessionKey === key) {{
+      messageRoles.delete(messageId);
+    }}
+  }}
+}};
+
+// Record a session's ancestry from its info; a child's reply state and pending
+// prompts are dropped, and where its reports go is recorded.
 const noteSessionAncestry = (info) => {{
-  if (!info || typeof info.id !== "string" || !info.id) {{
+  const key = sessionKey(info?.id);
+  if (key === undefined) {{
     return;
   }}
-  const parent = typeof info.parentID === "string" ? info.parentID : "";
-  rememberBounded(sessionParents, info.id, parent);
+  const parent = typeof info.parentID === "string" && info.parentID ? sessionKey(info.parentID) : "";
+  rememberBounded(sessionParents, key, parent);
   if (parent) {{
     forgetReplyState(info.id);
+    forgetChildPrompts(key);
+    if (!activeSubagents.has(key)) {{
+      rememberBounded(childRoutes, key, rootKeyOf(key));
+    }}
   }}
 }};
 
@@ -625,7 +748,7 @@ const cancelAncestryLookup = (sessionId) => {{
 const lookUpAncestry = (sessionId) => {{
   const sessions = sessionClient?.session;
   if (
-    !sessionId ||
+    !idFits(sessionId) ||
     sessionParents.has(sessionId) ||
     ancestryLookups.has(sessionId) ||
     unsettledAncestryLookups >= MAX_ANCESTRY_LOOKUPS ||
@@ -697,7 +820,7 @@ const replyMessage = (messageId, sessionId) => {{
 
 const recordAssistantMessage = (info) => {{
   const sessionId = info?.sessionID;
-  if (!sessionId || !info.id || isChildSession(sessionId)) {{
+  if (!idFits(sessionId) || !idFits(info.id) || isChildSession(sessionId)) {{
     return;
   }}
   // Asked now, so the answer is usually in by the time the turn goes idle.
@@ -711,10 +834,10 @@ const recordAssistantMessage = (info) => {{
 }};
 
 const recordReplyPart = (part) => {{
-  if (part?.type !== "text" || part.synthetic || part.ignored || !part.id || !part.messageID) {{
+  if (part?.type !== "text" || part.synthetic || part.ignored || !idFits(part.id) || !idFits(part.messageID)) {{
     return;
   }}
-  if (isChildSession(part.sessionID)) {{
+  if ((part.sessionID !== undefined && !idFits(part.sessionID)) || isChildSession(part.sessionID)) {{
     return;
   }}
   const message = replyMessage(part.messageID, part.sessionID);
@@ -749,7 +872,7 @@ const recordReplyDelta = (props) => {{
 }};
 
 const recordTurnError = (sessionId, error) => {{
-  if (!sessionId || isChildSession(sessionId)) {{
+  if (!idFits(sessionId) || isChildSession(sessionId)) {{
     return;
   }}
   rememberBounded(error?.name === "MessageAbortedError" ? abortedTurns : failedTurns, sessionId);
@@ -784,7 +907,7 @@ const takeReply = (sessionId) => {{
   if (!message || aborted) {{
     return {{}};
   }}
-  if (sessionParents.get(sessionId) !== "") {{
+  if (sessionParents.get(sessionKey(sessionId)) !== "") {{
     lookUpAncestry(sessionId);
     return {{}};
   }}
@@ -799,7 +922,7 @@ const isIdleReport = (payload) =>
 const recordUserMessage = (event, directory) => {{
   const info = event?.properties?.info;
   const messageId = info?.id;
-  if (!messageId) {{
+  if (!idFits(messageId)) {{
     return;
   }}
   const role = (info?.role ?? "").toLowerCase();
@@ -813,10 +936,18 @@ const recordUserMessage = (event, directory) => {{
     return;
   }}
   const dir = info?.directory ?? directory ?? process.cwd();
-  messageRoles.set(messageId, {{
-    role,
-    sessionId: normalizeSessionId(info.sessionID ?? null, dir),
-  }});
+  // The session that sent it is kept as well, so a message whose session is
+  // only later known to be a child is still recognised as the child's.
+  rememberBounded(
+    messageRoles,
+    messageId,
+    {{
+      role,
+      sessionId: normalizeSessionId(info.sessionID ?? null, dir),
+      rawSessionKey: sessionKey(info.sessionID),
+    }},
+    MAX_PENDING_USER_MESSAGES
+  );
 }};
 
 const emitUserPrompt = (sessionId, prompt, directory) => {{
@@ -845,6 +976,12 @@ const handleMessagePartUpdated = (event, directory) => {{
     return;
   }}
   if (!part.text) {{
+    return;
+  }}
+  // Issue #1678: its session may have become known as a child since the
+  // message was recorded.
+  if (isChildSession(info.rawSessionKey) || isChildSession(part.sessionID)) {{
+    messageRoles.delete(part.messageID);
     return;
   }}
   const sessionId = normalizeSessionId(
@@ -885,6 +1022,19 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         return;
       }}
       if (eventType === "permission.asked" || eventType === "permission.replied") {{
+        // Issue #1678: a child session's prompt is its subagent's, filed under
+        // the root with the child's id, like its tool calls.
+        const props = event?.properties ?? {{}};
+        const askingId = props.sessionID ?? props.sessionId;
+        if (isChildSession(askingId)) {{
+          sendEvent(
+            subagentPayload(undefined, askingId, directory, {{
+              event: eventType,
+              prompt: permissionPrompt(props),
+            }})
+          );
+          return;
+        }}
         const payload = permissionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);
         sendEvent(payload);
@@ -910,7 +1060,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
         if (deletedId) {{
           forgetReplyState(deletedId);
-          sessionParents.delete(deletedId);
+          sessionParents.delete(sessionKey(deletedId));
           cancelAncestryLookup(deletedId);
         }}
         closeSession(payload.session_id, payload.cwd, false, false);
@@ -2894,6 +3044,286 @@ await status("root", "busy");
                 "{payload}"
             );
         }
+    }
+
+    /// `(session_id, event, subagent_id)` of each payload, for comparing a
+    /// driver's whole output at once.
+    #[cfg(unix)]
+    fn payload_rows(payloads: &[serde_json::Value]) -> Vec<(String, String, String)> {
+        payloads
+            .iter()
+            .map(|p| {
+                let field = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
+                (field("session_id"), field("event"), field("subagent_id"))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn row(session: &str, event: &str, subagent: &str) -> (String, String, String) {
+        (session.to_owned(), event.to_owned(), subagent.to_owned())
+    }
+
+    /// Issue #1678 audit AU-1: a child that is running while 256 other child
+    /// sessions are created (pushing its ancestry out of the plugin's bounded
+    /// record) still reports as the subagent it is. Its tool calls keep its
+    /// id, its going idle is the stop paired with its start (once, though it
+    /// goes idle twice), and nothing is left active for the exit flush to stop.
+    /// A grandchild it starts afterwards is filed under the root too.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_keeps_an_active_childs_route_when_its_ancestry_is_forgotten() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+await created("root");
+await status("root", "busy");
+await created("child", "root");
+await status("child", "busy");
+for (let i = 0; i < 256; i += 1) {
+  await created("churn-" + i, "root");
+}
+await hooks["tool.execute.before"]({ sessionID: "child", tool: "bash" }, { args: { command: "ls" } });
+await hooks["tool.execute.after"]({ sessionID: "child", tool: "bash", args: { command: "ls" } });
+await created("grandchild", "child");
+await status("grandchild", "busy");
+await status("child", "idle");
+await send("session.idle", { sessionID: "child" });
+await status("grandchild", "idle");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "tool.execute.before", "child"),
+                row("root", "tool.execute.after", "child"),
+                row("root", "subagent.start", "grandchild"),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.stop", "grandchild"),
+                // The plugin's own flush as node exits: no child is left to stop.
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+    }
+
+    /// Issue #1678 audit AU-2: a known child's permission prompt and its answer
+    /// are filed under the root with the child's id — decoded as that
+    /// subagent's `PermissionRequest` and its answered prompt — while the
+    /// root's own prompt stays the main thread's.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await send("permission.asked", { sessionID: "child", title: "CHILD_ASK" });
+await send("permission.replied", { sessionID: "child" });
+await send("permission.asked", { sessionID: "root", title: "ROOT_ASK" });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "permission.asked", "child"),
+                row("root", "permission.replied", "child"),
+                row("root", "permission.asked", ""),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        let decoded: Vec<crate::event::AgentEvent> = payloads
+            .iter()
+            .map(|p| {
+                crate::hook::build_opencode_event(serde_json::from_value(p.clone()).unwrap())
+                    .expect("every payload maps to an event")
+            })
+            .collect();
+        assert_eq!(payloads[2]["prompt"], "CHILD_ASK");
+        assert_eq!(
+            decoded[2].event_type,
+            crate::event::EventType::PermissionRequest
+        );
+        assert!(decoded[2].is_from_subagent());
+        assert!(decoded[3].is_subagent_permission_reply());
+        assert!(!decoded[4].is_from_subagent());
+    }
+
+    /// Issue #1678 audit AU-3: a child's user message recorded before its
+    /// `session.created` named its parent, whose text arrives afterwards, is
+    /// the prompt its subagent was given and is not reported as the user's.
+    /// The root's own prompt still is.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_drops_a_childs_prompt_recorded_before_its_ancestry() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const user = (sessionID, id) => send("message.updated", { sessionID, info: { id, sessionID, role: "user", directory: "/work" } });
+const text = (sessionID, messageID, t) => send("message.part.updated", { sessionID, part: { id: messageID + "-p", sessionID, messageID, type: "text", text: t } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await user("child", "cu");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await text("child", "cu", "CHILD_INTERNAL_PROMPT_SENTINEL");
+await user("late-child", "lu");
+await send("session.updated", { sessionID: "late-child", info: { id: "late-child", parentID: "root", directory: "/work" } });
+await text("late-child", "lu", "LATE_CHILD_PROMPT_SENTINEL");
+await user("root", "ru");
+await text("root", "ru", "ROOT_PROMPT");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("PROMPT_SENTINEL"),
+            "a child's prompt was reported as the user's: {payloads:#?}"
+        );
+        let prompts: Vec<&str> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .map(|p| p["prompt"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(prompts, vec!["ROOT_PROMPT"], "{payloads:#?}");
+    }
+
+    /// Issue #1678 audit AU-4: a child session id over 256 UTF-8 bytes (by
+    /// length, and by multi-byte characters under 256 characters) is never
+    /// reported active and never sent, yet its tool call and permission prompt
+    /// still carry subagent attribution. Another long id sharing all but its
+    /// last character is not taken for that child. A 256-byte id is a child
+    /// like any other. At most 64 user messages wait for their text: the
+    /// oldest one's prompt is then not reported, the newest one's is.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_bounds_the_ids_and_messages_it_holds() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+const tool = (sessionID) => hooks["tool.execute.before"]({ sessionID, tool: "bash" }, { args: { command: "ls" } });
+await created("root");
+const long = "x".repeat(299) + "a";
+const wide = "é".repeat(129);
+const fits = "y".repeat(256);
+for (const id of [long, wide, fits]) {
+  await created(id, "root");
+  await status(id, "busy");
+  await tool(id);
+  await send("permission.asked", { sessionID: id, title: "ask" });
+  await status(id, "idle");
+}
+await tool("x".repeat(299) + "b");
+for (let i = 0; i < 65; i += 1) {
+  await send("message.updated", { sessionID: "root", info: { id: "m" + i, sessionID: "root", role: "user" } });
+}
+for (const i of [0, 64]) {
+  await send("message.part.updated", { sessionID: "root", part: { id: "p" + i, sessionID: "root", messageID: "m" + i, type: "text", text: "PROMPT_" + i } });
+}
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let fits = "y".repeat(256);
+        let oversized = "oversized-subagent-id";
+        let expected = {
+            let mut rows = vec![row("root", "session.created", "")];
+            for _ in 0..2 {
+                rows.push(row("root", "tool.execute.before", oversized));
+                rows.push(row("root", "permission.asked", oversized));
+            }
+            rows.extend([
+                row("root", "subagent.start", &fits),
+                row("root", "tool.execute.before", &fits),
+                row("root", "permission.asked", &fits),
+                row("root", "subagent.stop", &fits),
+                row("root", "tool.execute.before", ""),
+                row("root", "session.prompt", ""),
+                row("root", "session.deleted", ""),
+            ]);
+            rows
+        };
+        assert_eq!(payload_rows(&payloads), expected, "{payloads:#?}");
+        let longest = payloads
+            .iter()
+            .flat_map(|p| p.as_object().unwrap().values())
+            .filter_map(|v| v.as_str())
+            .map(str::len)
+            .max();
+        assert_eq!(longest, Some(256), "no field carries an id over the bound");
+        let prompt = payloads.iter().find(|p| p["event"] == "session.prompt");
+        assert_eq!(prompt.map(|p| &p["prompt"]), Some(&"PROMPT_64".into()));
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            assert_eq!(
+                event.is_from_subagent(),
+                payload.get("subagent_id").is_some(),
+                "{payload}"
+            );
+        }
+    }
+
+    /// Issue #1678 review #2: OpenCode disposing its instance while a child is
+    /// still running stops that child, under the session its start was filed
+    /// under, before the root's session closes; the exit flush that follows
+    /// stops nothing twice.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_stops_its_active_children_when_disposed() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+await send("server.instance.disposed", {});
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "session.status", ""),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
     }
 
     /// PRD #1497 review: OpenCode's client never answers the ancestry lookup.
