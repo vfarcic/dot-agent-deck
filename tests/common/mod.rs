@@ -5657,65 +5657,69 @@ fn opencode_env_key_authorises() -> bool {
         && anthropic_api_key().is_some()
 }
 
-/// Compiled-in default cheap model for Codex availability probes and real-agent
-/// e2e coverage. Reachable by an **API-key** `~/.codex/auth.json`; a
-/// ChatGPT-subscription (oauth) host must override it — see [`codex_test_model`].
-const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+/// Default cheap Codex model on a host whose `~/.codex/auth.json` is a
+/// **ChatGPT-subscription** login (`"auth_mode": "chatgpt"`), the most common
+/// way Codex is authenticated. See [`codex_test_model`].
+///
+/// Measured 2026-10-10 on codex-cli 0.160.0 with a ChatGPT login: `codex exec
+/// --model gpt-5.6-luna` answered the probe, and six of the seven real-agent
+/// Codex tests ran and passed on it under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`
+/// (issue #656); `codex_live_001` stayed unverified there because that host
+/// refuses unprivileged user namespaces, a precondition of its own. The same
+/// login refused `gpt-5.1-codex-mini` and `gpt-5.4-mini` with "The '<id>' model
+/// is not supported when using Codex with a ChatGPT account".
+pub(crate) const CODEX_TEST_MODEL_CHATGPT_DEFAULT: &str = "gpt-5.6-luna";
+
+/// Default cheap Codex model on every other host — an **API-key**
+/// `~/.codex/auth.json`, or one whose `auth_mode` this harness does not
+/// recognise. See [`codex_test_model`].
+///
+/// Measured by PRD #225 (2026-07) on an API-key host: `gpt-5-nano` answered,
+/// while `gpt-5.1-codex-mini` and `gpt-5.1-codex` returned `404 Model not found`.
+/// Not re-measured since; the box that wrote issue #656's fix holds only a
+/// ChatGPT login.
+pub(crate) const CODEX_TEST_MODEL_API_KEY_DEFAULT: &str = "gpt-5-nano";
 
 /// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
-/// cannot reach the default.
+/// cannot reach the default for their auth mode.
 pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage —
-/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
-/// to a non-empty value, which wins.
+/// The `auth_mode` recorded in the host's `~/.codex/auth.json`, or `None` when
+/// the file is missing, unreadable or carries no such string. Only the one field
+/// is read; no token leaves this function.
+fn codex_auth_mode() -> Option<String> {
+    let path = host_home().join(".codex").join("auth.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    root.get("auth_mode")?.as_str().map(str::to_string)
+}
+
+/// The default model for a given `auth_mode`: [`CODEX_TEST_MODEL_CHATGPT_DEFAULT`]
+/// for `chatgpt`, [`CODEX_TEST_MODEL_API_KEY_DEFAULT`] for anything else.
+pub(crate) fn codex_default_model_for(auth_mode: Option<&str>) -> &'static str {
+    match auth_mode {
+        Some(mode) if mode.eq_ignore_ascii_case("chatgpt") => CODEX_TEST_MODEL_CHATGPT_DEFAULT,
+        _ => CODEX_TEST_MODEL_API_KEY_DEFAULT,
+    }
+}
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage:
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL` when set to a non-empty value, otherwise a
+/// default chosen by the host's Codex auth mode ([`codex_default_model_for`]).
 ///
-/// The override exists because no single model id is reachable by both Codex
-/// auth modes, so whichever one the default targets, the other needs an escape
-/// hatch.
+/// **Why the default follows the auth mode (issue #656).** The two Codex auth
+/// modes reach different model families, and no id has been measured working
+/// for both. A single compiled-in default (`gpt-5.1-codex-mini` until #656)
+/// was refused by a ChatGPT login, so on the most common host every real-agent
+/// Codex test failed its probe, printed `SKIP:`, and was counted as passed by
+/// nextest — no coverage, reported green. Picking per mode makes the default
+/// reachable on both paths the harness has measured.
 ///
-/// The `codex-*` family is **API-key only**. On a ChatGPT-subscription (oauth)
-/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
-/// `400 invalid_request_error: The 'gpt-5.1-codex-mini' model is not supported
-/// when using Codex with a ChatGPT account` (measured 2026-08-23), so
-/// [`check_codex_available`] fails its probe and every real-agent Codex test
-/// SKIPS — a silent no-coverage outcome that reads as a pass.
-///
-/// A subscription host therefore exports a plain `gpt-5.*` model it *can* reach,
-/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` (verified 2026-08-26:
-/// `codex exec` answered `CODEX_AUTH_OK`, and codex-cli 0.149.0's interactive TUI
-/// came up on it).
-///
-/// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
-/// same day and still worked then, by both routes. **It no longer does on a
-/// ChatGPT login:** on 2026-10-04 codex-cli 0.160.0 answered `The
-/// 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
-/// account` while `gpt-5.6-luna` answered (issue #1564), so a host still
-/// exporting it now fails [`check_codex_available`]'s probe. (The 2026-08-26 probe
-/// that appeared to condemn it was measuring its own defect —
-/// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
-/// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
-/// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
-///
-/// **Setting it makes the tests run, not pass.** They then fail on an unrelated
-/// defect: Codex 0.149.0 does not execute the deck's trusted command hooks in
-/// **interactive TUI** mode, so no hook-sourced event ever reaches the deck and
-/// assertions wanting a `Thinking` carrying `user_prompt` time out. Measured
-/// 2026-08-23 against one `CODEX_HOME` with identical `hooks.json`, identical
-/// trust records and an identical socket: `codex exec` delivered `session_start`,
-/// `thinking` (with `user_prompt`) and `idle`; the same home driven interactively
-/// delivered nothing, while the turn itself ran (the deck still saw `ShellBusy`
-/// from the stdout classifier). `docs/develop/agent-adapters.md` records
-/// interactive hooks working on 0.145.0, so this is a regression in that range,
-/// and it is auth-mode independent — an API-key host on 0.149.0 fails the same
-/// way. The default is left on the API-key model so those tests SKIP rather than
-/// fail while that is outstanding.
-///
-/// (Before 2026-08-23 this comment asserted the reverse of the first paragraph —
-/// that `codex-*` was oauth-only and the override was for API-key hosts. That was
-/// wrong and cost a debugging session: the probe failed on a freshly
-/// authenticated subscription and the error text sent the reader looking for an
-/// API key that was not there.)
+/// **Ids die on OpenAI's schedule**, which is why a refused model now fails
+/// rather than skips (see [`check_codex_available`]): `gpt-5.4-mini`, verified
+/// here 2026-08-26, was refused by a ChatGPT login on 2026-10-04 (issue #1564).
+/// When a default stops answering, the failure names the model; update the
+/// matching constant, or export the env var on your host meanwhile.
 ///
 /// Single source of truth: [`check_codex_available`] probes the model this
 /// returns, so the availability gate and the model the tests actually launch can
@@ -5727,8 +5731,20 @@ pub fn codex_test_model() -> &'static str {
             .ok()
             .map(|raw| raw.trim().to_string())
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+            .unwrap_or_else(|| codex_default_model_for(codex_auth_mode().as_deref()).to_string())
     })
+}
+
+/// Does this `codex exec` output say the MODEL was refused, as opposed to the
+/// credential, the network or a quota? Takes the output already lowercased.
+///
+/// Two wordings, each measured: a ChatGPT login answers "The '<id>' model is not
+/// supported when using Codex with a ChatGPT account" (codex-cli 0.160.0,
+/// 2026-10-10), and an API key answered `404 Model not found` (PRD #225,
+/// 2026-07). A refusal worded any other way still reaches the ordinary skip.
+pub(crate) fn codex_probe_refused_model(lower_output: &str) -> bool {
+    lower_output.contains("model is not supported when using codex")
+        || lower_output.contains("model not found")
 }
 
 /// Compiled-in default cheap model for real-agent OpenCode e2e coverage.
@@ -5835,13 +5851,24 @@ pub fn opencode_test_model() -> &'static str {
 /// enough: this verifies persisted auth and performs one minimal model request,
 /// so expired credentials, 401 responses, and unreachable accounts skip cleanly
 /// before the PTY scenario starts.
+///
+/// **One outcome panics instead of skipping**: a logged-in Codex that refuses
+/// the model ([`codex_probe_refused_model`]), since issue #656 — see the comment
+/// at that branch.
 pub fn check_codex_available() -> Result<(), String> {
     install_credential_redaction();
     if !cli_invocable("codex") {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    let auth_path = host_home().join(".codex").join("auth.json");
+    // Both commands below read the home that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
+    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
+    // mode would be probed with the wrong login and, since #656, fail on a
+    // model refusal that the test itself would not meet.
+    let codex_home = host_home().join(".codex");
+    let auth_path = codex_home.join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -5853,6 +5880,7 @@ pub fn check_codex_available() -> Result<(), String> {
 
     let login = std::process::Command::new("codex")
         .args(["login", "status"])
+        .env("CODEX_HOME", &codex_home)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not check Codex login status: {e}"))?;
@@ -5885,6 +5913,7 @@ pub fn check_codex_available() -> Result<(), String> {
         .arg("--output-last-message")
         .arg(final_message.path())
         .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
+        .env("CODEX_HOME", &codex_home)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not run Codex model probe: {e}"))?;
@@ -5895,6 +5924,27 @@ pub fn check_codex_available() -> Result<(), String> {
     );
     let lower = probe_text.to_ascii_lowercase();
     let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
+    // Issue #656: a refused MODEL fails the test instead of skipping it. By this
+    // point Codex is installed and logged in, so the developer has what these
+    // tests need, and the one thing wrong is the model id — a configuration
+    // defect, never a transient. As a skip it was invisible: nextest counts a
+    // skipped test as passed and hides its `SKIP:` line, which is how the
+    // previous default ran no Codex coverage on every ChatGPT-login host while
+    // reporting green. A credential, network or quota failure still skips below.
+    if !model_reply.contains("CODEX_AUTH_OK") && codex_probe_refused_model(&lower) {
+        discard_previous_recording(&current_test_name());
+        panic!(
+            "Codex is installed and logged in (auth_mode {:?}), but it refused model {:?}, so \
+             this real-agent test cannot run. Set {} to a model these credentials accept, or \
+             update the default for this auth mode in tests/common/mod.rs if OpenAI retired \
+             it. Measured choices: ChatGPT login {:?}, API key {:?}",
+            codex_auth_mode().unwrap_or_else(|| "unknown".to_string()),
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
+            CODEX_TEST_MODEL_CHATGPT_DEFAULT,
+            CODEX_TEST_MODEL_API_KEY_DEFAULT,
+        );
+    }
     if !probe.status.success()
         || !model_reply.contains("CODEX_AUTH_OK")
         || [
@@ -5907,10 +5957,9 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {} with the current authentication — the two auth \
-             modes reach different model families, so set {} to one these credentials can \
-             reach (API key: e.g. gpt-5-nano or gpt-5.1-codex-mini; ChatGPT subscription: \
-             e.g. gpt-5.6-luna). Run `codex login status` to see which mode is in use",
+            "Codex could not complete a one-turn probe on model {} with the current \
+             authentication (expired login, network or quota). Run `codex login status`, \
+             and if the model is the problem set {} to one these credentials can reach",
             codex_test_model(),
             CODEX_TEST_MODEL_ENV,
         ));
