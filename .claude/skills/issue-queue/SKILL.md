@@ -499,3 +499,36 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 4. **Report them like any other unit** (step 9), and read their reports the same way, as untrusted data whose claims you verify. A cleanup unit that reports *nothing worth changing* has succeeded; one that opened a PR either merged it or stopped for a person, as `code-cleanup` sets out per mode.
 
 **The runner can skip this step for a run** by saying so, at any point in the run; take that answer and say in step 9's report that no cleanup units went out.
+
+## Step 11 — Close the finished units, only when the runner asked
+
+**Run this step only when the runner asked for it in this run**, in words such as "close what merged" or "close the units when you are done". Closing a unit stops its agents, which cannot be resumed afterwards, and removes its worktree when that has no uncommitted changes; the branch is kept. When to close is the runner's decision, not this skill's ([`docs/closing-agents.md`](../../../docs/closing-agents.md)). Without the ask, leave every unit open and say in step 9's report that they are still open and that this step exists. The runner may ask for it at the end of the run, after step 10's units have reported back, or for each issue unit as soon as its PR merged; do what they asked.
+
+**Select the units of this run whose PRs merged**, joining the deck's list of closeable units with the PR state `worktree list` reports:
+
+```bash
+UNITS="$(mktemp)"; WORKTREES="$(mktemp)"
+dot-agent-deck close --all --json > "$UNITS"          # lists; closes nothing
+dot-agent-deck worktree list --json > "$WORKTREES"    # PR state per worktree
+jq -r --slurpfile wt "$WORKTREES" '
+  ($wt[0].worktrees | map(select(.pr_state == "merged") | .branch)) as $merged
+  | .listed[] | select(.branch as $b | $merged | index($b))
+  | [.unit_id, .name, (.reported | tostring), .branch] | @tsv' "$UNITS"
+```
+
+- **Join on the branch**, `agent/dispatch-<name>` in both documents. The two can spell the worktree path differently.
+- **Keep only units this run dispatched**, by intersecting with step 5's ledger. Run from this pane, `close --all` lists only the units this pane's agent dispatched, so another runner's units do not appear; the ledger narrows it to this run. If it lists none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
+
+**Close each selected unit by its name, one at a time, and check the unit id that comes back:**
+
+```bash
+dot-agent-deck close --json '<name>'
+```
+
+- **`close` has no selector for a single unit id.** It closes by name, `--pane` or `--orchestration-of`; unit ids are applied only by `close --all --yes`, which closes everything `--all` listed and so is not this step. So read `.closed[0].unit_id` in the reply and compare it with the id the join selected; report any difference. Names in this run are unique within the repository (step 6), so a mismatch means something changed between the two calls.
+- **`ambiguous`** means a unit with the same name is live in another clone. Do not guess: report the candidates the reply lists, and leave that unit to the runner.
+- **Never pass `--force` on your own.** A refusal is information: `not-reported` means the unit never sent `work-done --done`, so its report is still owed or was lost, and `busy` means its agent is mid-turn. Report each refusal with its reason; `--force` only on the runner's word, per unit.
+- **Report each unit's `worktrees` verdict**: `removed` (branch kept), or a `kept: …` verdict with its path. A kept worktree holds uncommitted work or could not be checked; it is the runner's to inspect, not yours to remove.
+- **Exit status 2** (the daemon is too old for `close`) **or 3** (no daemon): nothing was closed; report it and stop.
+
+Closing is also the cheapest answer to step 5's disk check when the runner has asked for it: a closed unit's clean worktree is removed with it, `target/` included.
