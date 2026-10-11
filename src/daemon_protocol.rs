@@ -3070,7 +3070,9 @@ pub struct CloseTarget {
     pub candidates: Vec<AmbiguousCandidate>,
     /// One of this entry's lists — `candidates`, a candidate's `panes`,
     /// `open_descendants` or `panes` — was cut short: there was more than the
-    /// report lists (auditor S3). Additive; absent means `false`.
+    /// report lists (auditor S3). Also set when a report too large for its
+    /// size bound shortened this entry's long fields, each ending in `…`
+    /// (auditor SF3). Additive; absent means `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }

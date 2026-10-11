@@ -129,6 +129,11 @@ pub const MAX_ENDED_INSTANCES: usize = 256;
 pub const INSTANCE_CLOSING_REASON: &str =
     "the orchestration is being closed; no new pane may join it";
 
+/// PRD #1589 (auditor SF1): the refusal a respawn of a generation under close
+/// gets — refused before the running generation is touched.
+pub const GENERATION_CLOSING_REASON: &str =
+    "the agent is being closed; it is not replaced in its pane";
+
 /// PRD #1589: the orchestration instance token a membership names, if any.
 pub fn orchestration_instance_of(membership: Option<&TabMembership>) -> Option<&str> {
     match membership {
@@ -7034,6 +7039,14 @@ struct RegistryInner {
     /// Held under this lock so the check is atomic with the reservation and
     /// with the publish.
     closing_instances: HashSet<String>,
+    /// PRD #1589 (auditor SF1): generations (agent ids) a `close` of one
+    /// generation is taking down — a single unit's agent, or one pane closed by
+    /// `--pane`. While one is here, `respawn_agent_for_pane` refuses to replace
+    /// it, under the same lock hold as the removal it would make, so a respawn
+    /// either was admitted first (and is in [`Self::respawning_members`], where
+    /// the close finds it and waits) or is refused with the running generation
+    /// untouched. The generation-scope analogue of [`Self::closing_instances`].
+    closing_generations: HashSet<String>,
     /// PRD #1589 D4: instances a `close` finished, refused for the daemon's
     /// lifetime so queued role work cannot resurrect one. Bounded
     /// ([`MAX_ENDED_INSTANCES`]); instance tokens are never reused, so an
@@ -7202,6 +7215,61 @@ impl Drop for DirRemovalHold<'_> {
         {
             inner.removal_holds.swap_remove(at);
         }
+    }
+}
+
+/// PRD #1589 test seam: a child that has already exited and needs nothing to
+/// reap it — the process behind [`AgentPtyRegistry::insert_idle_member_for_test`].
+#[cfg(test)]
+#[derive(Debug)]
+struct IdleTestChild;
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for IdleTestChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(IdleTestChild)
+    }
+}
+
+#[cfg(test)]
+impl portable_pty::Child for IdleTestChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Ok(portable_pty::ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
+/// PRD #1589 (auditor SF1): a generation-scoped Closing admission state,
+/// returned by [`AgentPtyRegistry::begin_generation_close`]. While it lives, no
+/// respawn may replace the generation in its pane.
+pub struct GenerationCloseGuard {
+    registry: Arc<AgentPtyRegistry>,
+    agent_id: String,
+}
+
+impl Drop for GenerationCloseGuard {
+    fn drop(&mut self) {
+        let mut inner = match self.registry.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.closing_generations.remove(&self.agent_id);
     }
 }
 
@@ -7536,6 +7604,7 @@ impl AgentPtyRegistry {
                 pending_spawn_dirs: HashMap::new(),
                 removal_holds: Vec::new(),
                 closing_instances: HashSet::new(),
+                closing_generations: HashSet::new(),
                 ended_instances: VecDeque::new(),
                 respawning_dirs: HashMap::new(),
                 respawning_members: HashMap::new(),
@@ -13031,6 +13100,14 @@ impl AgentPtyRegistry {
             {
                 return Err(AgentPtyError::Spawn(INSTANCE_CLOSING_REASON.into()));
             }
+            // PRD #1589 (auditor SF1): the same rule for one generation a close
+            // is taking down — a single unit's agent, or a pane closed by
+            // `--pane`. Under this lock hold, so the close's read of the
+            // respawns in flight, made after it opened its admission state,
+            // sees every respawn that got past here.
+            if inner.closing_generations.contains(&agent_id) {
+                return Err(AgentPtyError::Spawn(GENERATION_CLOSING_REASON.into()));
+            }
             let removed = inner
                 .agents
                 .remove(&agent_id)
@@ -15496,6 +15573,36 @@ impl AgentPtyRegistry {
         self.insert_test_agent_for_pane(child, None)
     }
 
+    /// PRD #1589 test seam: register an inert member of orchestration
+    /// `instance` holding `pane_id` — a record with no process behind it, so a
+    /// test can give an instance hundreds of members.
+    #[cfg(test)]
+    pub(crate) fn insert_idle_member_for_test(
+        &self,
+        pane_id: &str,
+        instance: &str,
+        is_start_role: bool,
+    ) -> String {
+        let id = self.insert_test_agent_for_pane(Box::new(IdleTestChild), Some(pane_id));
+        if let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&id) {
+            agent.tab_membership = Some(TabMembership::Orchestration {
+                name: "team".to_string(),
+                role_index: usize::from(!is_start_role),
+                role_name: if is_start_role {
+                    "orchestrator"
+                } else {
+                    "worker"
+                }
+                .to_string(),
+                is_start_role,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: Some(instance.to_string()),
+            });
+        }
+        id
+    }
+
     /// [`Self::insert_test_agent`] with a `pane_id_env`, so a test can assert on
     /// how the teardown paths NAME an agent rather than only on what they do to
     /// it — issue #1118's give-up warning identifies each un-reaped child by pid
@@ -16258,6 +16365,91 @@ impl AgentPtyRegistry {
             instance: instance.to_string(),
             finished: false,
         })
+    }
+
+    /// PRD #1589 (auditor SF1): open the generation-scoped Closing admission
+    /// state for `agent_id`. Until the returned guard is dropped, a respawn
+    /// refuses to replace that generation (see
+    /// [`RegistryInner::closing_generations`]). `None` when another close
+    /// already holds it.
+    pub fn begin_generation_close(
+        self: &Arc<Self>,
+        agent_id: &str,
+    ) -> Option<GenerationCloseGuard> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.closing_generations.insert(agent_id.to_string()) {
+            return None;
+        }
+        Some(GenerationCloseGuard {
+            registry: Arc::clone(self),
+            agent_id: agent_id.to_string(),
+        })
+    }
+
+    /// PRD #1589: whether a close holds the generation `agent_id` right now.
+    pub fn is_generation_closing(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .closing_generations
+            .contains(agent_id)
+    }
+
+    /// PRD #1589 (auditor SF2): the pane ids of the records — live or exited —
+    /// that are the generation `agent_id` or a member of the orchestration
+    /// `instance`, orchestrator first and then in spawn order: at most `limit`
+    /// of them, each cloned only once `admit` accepted it, stopping at the
+    /// first it refuses; and whether any was left out. Read without cloning a
+    /// record, and keeping at most `limit + 1` borrowed entries while it
+    /// walks, so a report that lists a unit's panes costs what it lists rather
+    /// than what the registry holds.
+    pub fn member_panes(
+        &self,
+        agent_id: Option<&str>,
+        instance: Option<&str>,
+        limit: usize,
+        mut admit: impl FnMut(&str) -> bool,
+    ) -> (Vec<String>, bool) {
+        let inner = self.inner.lock().unwrap();
+        let mut first: std::collections::BTreeSet<(bool, u64, &str, &str)> =
+            std::collections::BTreeSet::new();
+        let mut more = false;
+        for (id, agent) in &inner.agents {
+            let Some(pane) = agent.pane_id_env.as_deref() else {
+                continue;
+            };
+            let member = agent_id == Some(id.as_str())
+                || (instance.is_some()
+                    && orchestration_instance_of(agent.tab_membership.as_ref()) == instance);
+            if !member {
+                continue;
+            }
+            let orchestrator = matches!(
+                agent.tab_membership,
+                Some(TabMembership::Orchestration {
+                    is_start_role: true,
+                    ..
+                })
+            );
+            first.insert((
+                !orchestrator,
+                id.parse::<u64>().unwrap_or(u64::MAX),
+                id.as_str(),
+                pane,
+            ));
+            if first.len() > limit {
+                first.pop_last();
+                more = true;
+            }
+        }
+        let mut panes = Vec::new();
+        for (_, _, _, pane) in first {
+            if !admit(pane) {
+                return (panes, true);
+            }
+            panes.push(pane.to_string());
+        }
+        (panes, more)
     }
 
     /// PRD #1589 (auditor B1/B2): the records of every pane in its respawn
