@@ -525,7 +525,7 @@ jq -r --slurpfile wt "$WORKTREES" '
 dot-agent-deck close --json --unit-id '<unit_id>'
 ```
 
-- **By unit id, not by name.** A unit id names exactly the unit the listing showed and is never reused, so the close cannot reach a different unit that took the name in between, and a name live in another clone cannot make it `ambiguous`. Read `.closed[0].unit_id` in the reply to confirm which unit closed.
+- **By unit id, not by name.** A unit id names exactly the unit the listing showed and is never reused while the daemon runs, so the close cannot reach a different unit that took the name in between, and a name live in another clone cannot make it `ambiguous`. Read `.closed[0].unit_id` in the reply to confirm which unit closed.
 - **`already-ended`** means the unit ended between the listing and the close (a person closed it, say); report it. **`unknown-unit`** with a restart hint means the daemon restarted since the listing; nothing was closed, so report it and stop.
 - **Never pass `--force` on your own.** A refusal is information: `not-reported` means the unit never sent `work-done --done`, so its report is still owed or was lost, and `busy` means its agent is mid-turn. Report each refusal with its reason; `--force` only on the runner's word, per unit.
 - **Report each unit's `worktrees` verdict**: `removed` (branch kept), or a `kept: …` verdict with its path. A kept worktree holds uncommitted work or could not be checked; it is the runner's to inspect, not yours to remove.

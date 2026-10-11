@@ -25,7 +25,7 @@ dot-agent-deck close --all
 dot-agent-deck close --all --yes
 ```
 
-That lists the units again and then closes exactly the units in that list, by their unit ids, so a unit started in the meantime is not swept up. A listed unit marked `would be refused` is refused again unless you add `--force`. If more than 256 units are running, `--all` lists the first 256 and says so; close those, then list again.
+That lists the units again and then closes exactly the units in that list, by their unit ids, so a unit started in the meantime is not swept up. A listed unit marked `would be refused` is refused again unless you add `--force`. If more than 256 units are running, `--all` lists the first 256 and says so; close those, then list again. `--all --yes` closes the 256 it listed and says that more are still running.
 
 To close one unit by the id a list printed, use `--unit-id`:
 
@@ -71,7 +71,7 @@ dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
 | Argument | What it closes |
 |---|---|
 | `<UNIT>...` | The dispatched units with these names: the name given to `dispatch`. A unit started as an orchestration is closed whole, orchestrator first. |
-| `--unit-id <ID>...` | The dispatched units with these unit ids, as `--all` or an `ambiguous` refusal printed them. A unit id names one unit and is never reused, so it cannot reach a different unit that took the same name later. Unit ids do not survive a daemon restart. |
+| `--unit-id <ID>...` | The dispatched units with these unit ids, as `--all` or an `ambiguous` refusal printed them. A unit id names one unit and the daemon never reuses it while it runs, so it cannot reach a different unit that took the same name later. Unit ids do not survive a daemon restart, and an id from before a restart is very unlikely to match a unit of the new daemon. |
 | `--pane <PANE_ID>` | The one agent in this pane. |
 | `--orchestration-of <PANE_ID>` | Every role of the orchestration this pane belongs to, orchestrator first. |
 | `--all` | Nothing: it lists every unit you may close. |
@@ -136,7 +136,7 @@ To clean up worktrees the deck no longer knows about, such as after a daemon res
 | `2` | The running daemon is too old for `close`. Nothing was closed. |
 | `3` | No daemon is running. Nothing was closed. |
 
-`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry names the unit in `name` and gives its `unit_id`. In `closed`, `refused` and `worktrees`, a unit id the deck does not know is `null`, and a refusal of the whole command, rather than of one unit, is an entry in `refused` whose `name` and `unit_id` are both `null`. Entries in `listed` always carry `panes`, and carry `name`, `unit_id`, `reported`, `completed_at_ms`, `worktree`, `branch` and `clone` only when there is something to report, leaving each one out rather than setting it to `null`: `completed_at_ms`, for example, is missing for a unit that has not finished. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units.
+`--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry names the unit in `name` and gives its `unit_id`. In `closed`, `refused` and `worktrees`, a unit id the deck does not know is `null`, and a refusal of the whole command, rather than of one unit, is an entry in `refused` whose `name` and `unit_id` are both `null`. Entries in `listed` always carry `panes`, and carry `name`, `unit_id`, `reported`, `completed_at_ms`, `worktree`, `branch` and `clone` only when there is something to report, leaving each one out rather than setting it to `null`: `completed_at_ms`, for example, is missing for a unit that has not finished. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units. An entry of the report's `targets`, and of `listed`, carries its own `truncated: true` when one of its lists — the candidates of an `ambiguous` refusal, their panes, the units it left open, or its panes — shows only part of what there was; the human output says so under that entry.
 
 A script that closes the units whose pull requests merged can join `close --all --json` with `dot-agent-deck worktree list --json`, which reports each worktree's PR state, on the branch, and close each selected unit with `close --unit-id` and the `unit_id` from `listed`.
 
