@@ -448,9 +448,8 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
 // ---------------------------------------------------------------------------
 // M6b, catalog `status/shell-activity/006` — the reported bug, reproduced as
 // the user actually sees it: a real Bash call crossing Claude Code's 120s
-// default timeout must keep the pane's rendered badge on `Working`, not the
-// stale `Idle` the bare `Stop -> EventType::Idle` mapping would otherwise
-// paint the instant the agent's turn ends at the cap.
+// default timeout must show the ended turn as `Idle` together with its
+// still-live command as `Background: 1 command`.
 // ---------------------------------------------------------------------------
 
 const PANE_NAME_SUFFIX_006: &str = "shell-activity-006-haiku";
@@ -477,7 +476,7 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then ask for one default-settings ping lasting beyond the 120-second cap and writing a unique sentinel. Require its real Stop-mapped Idle hook (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
+/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
 #[spec("status/shell-activity/006")]
 #[test]
 fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background() {
@@ -545,11 +544,13 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
     let agent_id = record.id;
 
     let prompt = format!(
-        "Call the Bash tool now, as your very first action, with no preceding text or \
-         explanation. Use the Bash tool exactly once, with default settings — do not pass a \
-         timeout parameter and do not set run_in_background — to run this single command: ping \
-         -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Do not run any other command and do \
-         not alter this command in any way."
+        "Use Bash exactly once as your first action. Set command to exactly: ping \
+         -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Omit both timeout and \
+         run_in_background; let Bash use its default foreground timeout and automatically \
+         move the command to the background if it reaches that timeout. This is a local \
+         loopback ping whose output must be written to the named file. As soon as Bash \
+         returns, immediately finish your turn with the single word STARTED. Do not call \
+         TaskOutput, wait, inspect files, stop the command, or use any other tool."
     );
     let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_006);
     eprintln!(
@@ -558,29 +559,27 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
     );
 
     // Precondition: the real Bash tool call actually started, under default
-    // settings — the native ToolStart hook event, not a fabricated one. A
-    // timeout here is a harness flake (the model never issued the Bash tool
-    // call at all), not a badge regression; the custom message says so
-    // explicitly so a red run here is never misread as BADGE WRONG. The prompt
-    // is known to have been submitted by this point (`submit_claude_prompt`
-    // above), so a timeout here is the model, not a lost prompt — before issue
-    // #701 the two were indistinguishable, with only a SessionStart in
-    // `observed events` either way.
+    // settings — the native ToolStart hook event, not a fabricated one. The
+    // prompt was acknowledged by `submit_claude_prompt`; include both native
+    // events and the pane on failure to distinguish prompt adherence, a tool
+    // permission prompt, and a hook-delivery failure.
     let tool_start = match events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
                 && event.event_type == EventType::ToolStart
                 && event.tool_name.as_deref() == Some("Bash")
+                && event.timestamp >= submitted.timestamp
         },
         Duration::from_secs(120),
     ) {
         Some(ev) => ev,
         None => panic!(
             "PRECONDITION NOT MET: no ToolStart/Bash event observed for agent {agent_id:?} \
-             within 120s of the prompt being submitted — the model never issued the Bash tool \
-             call at all. This is a harness flake (prompt adherence), NOT a badge regression: \
-             rerun rather than reading this as BADGE WRONG. Observed events: {:#?}",
-            events.snapshot()
+             within 120s of the acknowledged prompt. Diagnose prompt adherence, tool \
+             permissions and hook delivery before reading this as a badge regression. \
+             Observed events: {:#?}\nFinal pane:\n{}",
+            events.snapshot(),
+            common::redact_credentials_for_output(&deck.snapshot_grid())
         ),
     };
     eprintln!(
@@ -588,21 +587,17 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
         tool_start.timestamp
     );
 
-    // The precondition this test exists to gate on. Roughly a third of runs
-    // reach the moment that actually exercises Defect A: the rest end with
-    // Claude Code's `ToolEnd` and no `Stop`, in which case the card never
-    // leaves `Working` and the badge assertion below would hold whether or
-    // not the fix works at all. Waiting for the real, native `Idle` (mapped
-    // from the agent's own `Stop` hook, never fabricated by this test) turns
-    // the old implicit timing assumption (ToolStart + a fixed offset) into an
-    // explicit causal one: this run only counts as a PASS of the bug path if
-    // the Idle that Defect A's fix has to correct actually landed.
+    // Require the real, native Stop after this call starts. The directive to
+    // finish immediately when Bash returns avoids leaving Claude to decide
+    // whether to poll the background task instead of ending its main turn.
     let idle_wait_timeout =
         Duration::from_secs(MEASURED_TOOL_START_TO_IDLE_SECS + IDLE_WAIT_MARGIN_SECS);
     let idle_event = events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
                 && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && event.timestamp >= tool_start.timestamp
         },
         idle_wait_timeout,
     );
@@ -610,13 +605,20 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
         panic!(
             "PRECONDITION NOT MET: no native Stop-mapped Idle event observed for pane \
              {PANE_NAME_SUFFIX_006:?} within {idle_wait_timeout:?} of ToolStart — this run never \
-             exercises the bug path (Claude Code most likely ended the capped Bash call with \
-             ToolEnd and no Stop, which is common — roughly 2 runs in 3 by the tester's own \
-             measurement). This is an inconclusive run, NOT a badge regression: rerun rather than \
-             reading this as BADGE WRONG. Observed events: {:#?}",
-            events.snapshot()
+             exercises the ended-turn bug path. Diagnose why Claude did not finish its \
+             turn after Bash returned. Observed events: {:#?}\nFinal pane:\n{}",
+            events.snapshot(),
+            deck.snapshot_grid()
         );
     };
+    assert!(
+        (idle_event.timestamp - tool_start.timestamp).num_milliseconds() >= 120_000,
+        "native Stop arrived before the 120s cap; this run did not exercise the capped \
+         foreground call: ToolStart={:?}, Idle={:?}\n{}",
+        tool_start.timestamp,
+        idle_event.timestamp,
+        deck.snapshot_grid()
+    );
     eprintln!(
         "shell-activity-006: native Idle observed at {:?}, {}ms after ToolStart — this run \
          genuinely exercises the bug path",
