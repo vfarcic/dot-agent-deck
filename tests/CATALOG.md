@@ -579,6 +579,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none.
 - **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric sample-age row after `m`; Escape removes the overlay and restores the empty dashboard.
 - **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
+- **Timing:** the first wait (the empty dashboard painting after the lazy daemon spawn) has a load-scaled ceiling: 30 s on an idle box, up to 120 s. The deck's daemon-start bound is set 5 s under that ceiling, so a daemon that never binds still prints its error before the wait ends. A starved run once spent 13.6 s on the daemon's pre-bind alone and overran the fixed 30 s (issue #1665).
 - **Platform coverage:** mac+linux.
 
 ##### dashboard/host-metrics/005 — A role carrying control characters and a bidi override renders scrubbed.
