@@ -25117,8 +25117,17 @@ mod spawn_tests {
             sent.detail,
             GuardedSendDetail::Outcome(GuardedSend::Applied)
         );
+        // The reported wait is the sum of the draft-poll sleeps, so it is at
+        // least one poll and never more than the time since the write was
+        // spawned. Not a fixed 400 ms floor: at load ~37 on 16 cores this test
+        // measured a single poll (200.9 ms, 215 ms) in two of three isolated
+        // runs (PR #1672) while still passing the "must wait" check above —
+        // consistent with the spawned write reaching its first draft check
+        // late on a starved runtime, which a floor tied to the test's own
+        // sleep cannot allow for.
         assert!(
-            sent.deferred >= Duration::from_millis(400) && sent.deferred <= started.elapsed(),
+            sent.deferred >= crate::draft_deferral::DRAFT_POLL_INTERVAL
+                && sent.deferred <= started.elapsed(),
             "the reported wait is the time spent waiting: {:?}",
             sent.deferred
         );
