@@ -5525,6 +5525,10 @@ pub struct AgentPtyRegistry {
     /// that a partial close is reported from.
     #[cfg(test)]
     close_failures: Mutex<HashSet<String>>,
+    /// PRD #1589 test seam: records visited projecting a unit's panes for a
+    /// report. See [`Self::member_visits_for_test`].
+    #[cfg(test)]
+    member_visits: std::sync::atomic::AtomicUsize,
     /// PRD #1589: the units `dispatch` started. See
     /// [`crate::dispatched_units`]. Lives here, beside `dispatch_returns`, for
     /// the same reason: the dispatch path, the hook loop's `work-done` arm and
@@ -7638,6 +7642,8 @@ impl AgentPtyRegistry {
             publish_pause: Mutex::new(None),
             #[cfg(test)]
             close_failures: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            member_visits: std::sync::atomic::AtomicUsize::new(0),
             respawns_settled: Notify::new(),
             #[cfg(test)]
             respawn_pause: Mutex::new(None),
@@ -16384,7 +16390,8 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1589: whether a close holds the generation `agent_id` right now.
-    pub fn is_generation_closing(&self, agent_id: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_generation_closing(&self, agent_id: &str) -> bool {
         self.inner
             .lock()
             .unwrap()
@@ -16392,33 +16399,36 @@ impl AgentPtyRegistry {
             .contains(agent_id)
     }
 
-    /// PRD #1589 (auditor SF2): the pane ids of the records — live or exited —
-    /// that are the generation `agent_id` or a member of the orchestration
-    /// `instance`, orchestrator first and then in spawn order: at most `limit`
-    /// of them, each cloned only once `admit` accepted it, stopping at the
-    /// first it refuses; and whether any was left out. Read without cloning a
-    /// record, and keeping at most `limit + 1` borrowed entries while it
-    /// walks, so a report that lists a unit's panes costs what it lists rather
-    /// than what the registry holds.
-    pub fn member_panes(
-        &self,
-        agent_id: Option<&str>,
-        instance: Option<&str>,
-        limit: usize,
-        mut admit: impl FnMut(&str) -> bool,
-    ) -> (Vec<String>, bool) {
+    /// PRD #1589 (auditor SF5): the pane id of the record — live or exited —
+    /// of the generation `agent_id`, read by its key rather than by walking
+    /// the registry.
+    pub fn generation_pane(&self, agent_id: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        #[cfg(test)]
+        self.member_visits.fetch_add(1, Ordering::Relaxed);
+        inner.agents.get(agent_id)?.pane_id_env.clone()
+    }
+
+    /// PRD #1589 (auditor SF2/SF5): the pane ids of the records — live or
+    /// exited — that are members of the orchestration `instance`, orchestrator
+    /// first and then in spawn order: at most `limit` of them, and whether any
+    /// was left out. It walks every record in the registry, keeping at most
+    /// `limit + 1` borrowed entries while it does and cloning only the ones it
+    /// returns. A close report keeps the result for the rest of its request
+    /// (`close_agents::PaneProjections`) rather than calling this once per
+    /// candidate that lists the instance.
+    pub fn instance_panes(&self, instance: &str, limit: usize) -> (Vec<String>, bool) {
         let inner = self.inner.lock().unwrap();
         let mut first: std::collections::BTreeSet<(bool, u64, &str, &str)> =
             std::collections::BTreeSet::new();
         let mut more = false;
         for (id, agent) in &inner.agents {
+            #[cfg(test)]
+            self.member_visits.fetch_add(1, Ordering::Relaxed);
             let Some(pane) = agent.pane_id_env.as_deref() else {
                 continue;
             };
-            let member = agent_id == Some(id.as_str())
-                || (instance.is_some()
-                    && orchestration_instance_of(agent.tab_membership.as_ref()) == instance);
-            if !member {
+            if orchestration_instance_of(agent.tab_membership.as_ref()) != Some(instance) {
                 continue;
             }
             let orchestrator = matches!(
@@ -16439,14 +16449,18 @@ impl AgentPtyRegistry {
                 more = true;
             }
         }
-        let mut panes = Vec::new();
-        for (_, _, _, pane) in first {
-            if !admit(pane) {
-                return (panes, true);
-            }
-            panes.push(pane.to_string());
-        }
+        let panes = first
+            .into_iter()
+            .map(|(_, _, _, pane)| pane.to_string())
+            .collect();
         (panes, more)
+    }
+
+    /// PRD #1589 test seam: how many registry records
+    /// [`Self::generation_pane`] and [`Self::instance_panes`] have visited.
+    #[cfg(test)]
+    pub(crate) fn member_visits_for_test(&self) -> usize {
+        self.member_visits.load(Ordering::Relaxed)
     }
 
     /// PRD #1589 (auditor B1/B2): the records of every pane in its respawn

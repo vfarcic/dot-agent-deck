@@ -28,7 +28,7 @@
 //! same-uid process, which can drop its identity and ask as a person, send a
 //! raw `StopAgent`, or read another agent's token (`docs/develop/hook-provenance.md`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,8 +317,9 @@ fn shed_lists(target: &mut CloseTarget) {
     target.truncated |= had;
 }
 
-/// Shorten every string field of `target` to [`CLIPPED_FIELD_CHARS`]
-/// characters and its survivors to [`CLIPPED_SURVIVORS`].
+/// Shorten every string field of `target` but `unit_id` to
+/// [`CLIPPED_FIELD_CHARS`] characters and its survivors to
+/// [`CLIPPED_SURVIVORS`].
 fn clip_fields(target: &mut CloseTarget) {
     fn clip(s: &mut String) -> bool {
         match s.char_indices().nth(CLIPPED_FIELD_CHARS) {
@@ -340,8 +341,9 @@ fn clip_fields(target: &mut CloseTarget) {
     }
     cut |= clip(&mut target.selector);
     cut |= clip(&mut target.kind);
+    // `unit_id` is never shortened: it is the key a caller re-targets with
+    // `close --unit-id` (reviewer R1).
     for field in [
-        &mut target.unit_id,
         &mut target.name,
         &mut target.message,
         &mut target.error,
@@ -574,6 +576,7 @@ fn resolve(
     match selector {
         CloseSelector::Units(units) => {
             let mut seen_slugs = HashSet::new();
+            let mut projections = PaneProjections::default();
             for name in &units.names {
                 if !seen_slugs.insert(crate::dispatched_units::slug_of(name)) {
                     continue;
@@ -637,7 +640,8 @@ fn resolve(
                         target.candidates = candidates
                             .into_iter()
                             .map(|(mut candidate, scope)| {
-                                let (panes, more) = scope_panes(&scope, registry, budget);
+                                let (panes, more) =
+                                    scope_panes(&scope, registry, budget, &mut projections);
                                 candidate.panes = panes;
                                 target.truncated |= more;
                                 candidate
@@ -764,23 +768,72 @@ fn scope_of_unit(unit: &DispatchedUnit) -> Scope {
     }
 }
 
+/// PRD #1589 (auditor SF5): the most pane ids one request's
+/// [`PaneProjections`] keeps. Four instances' worth of a full listing.
+const MAX_CACHED_PANES: usize = 4 * MAX_LISTED_TARGETS;
+
+/// PRD #1589 (auditor SF5): one request's projections of orchestration
+/// instances' panes, so candidates that share an instance walk the registry
+/// for it once rather than once each. Each projection holds at most
+/// [`MAX_LISTED_TARGETS`] pane ids and the cache at most [`MAX_CACHED_PANES`]:
+/// one that would take it past that empties it first. What it holds is
+/// charged to a report's budget each time it is copied into one. It is a
+/// report's view only; what a close stops is read separately.
+#[derive(Default)]
+struct PaneProjections {
+    instances: HashMap<String, (Vec<String>, bool)>,
+    panes: usize,
+}
+
+impl PaneProjections {
+    fn instance(&mut self, instance: &str, registry: &AgentPtyRegistry) -> &(Vec<String>, bool) {
+        if !self.instances.contains_key(instance) {
+            let projection = registry.instance_panes(instance, MAX_LISTED_TARGETS);
+            if self.panes + projection.0.len() > MAX_CACHED_PANES {
+                self.instances.clear();
+                self.panes = 0;
+            }
+            self.panes += projection.0.len();
+            self.instances.insert(instance.to_string(), projection);
+        }
+        &self.instances[instance]
+    }
+}
+
 /// The panes of `scope`'s records for a candidate's report entry: at most
-/// [`MAX_LISTED_TARGETS`], each charged to `budget` before it is cloned, read
-/// without cloning a registry record; and whether any was left out (auditor
-/// SF2).
+/// [`MAX_LISTED_TARGETS`], each charged to `budget` before it is copied into
+/// the entry; and whether any was left out (auditor SF2). A spent budget lists
+/// none and reads nothing from the registry, and says the list was cut
+/// whether or not the scope had panes (auditor SF5).
 fn scope_panes(
     scope: &Scope,
     registry: &AgentPtyRegistry,
     budget: &mut ReportBudget,
+    projections: &mut PaneProjections,
 ) -> (Vec<String>, bool) {
-    let (agent_id, instance) = match scope {
-        Scope::Generation(id) => (Some(id.as_str()), None),
-        Scope::Instance(id) => (None, Some(id.as_str())),
-    };
+    if budget.exhausted() {
+        return (Vec::new(), true);
+    }
     // A pane id is one array element: its JSON and a comma.
-    registry.member_panes(agent_id, instance, MAX_LISTED_TARGETS, |pane| {
-        budget.take(json_len(pane) + 1)
-    })
+    let cost = |pane: &str| json_len(pane) + 1;
+    match scope {
+        Scope::Generation(id) => match registry.generation_pane(id) {
+            None => (Vec::new(), false),
+            Some(pane) if budget.take(cost(&pane)) => (vec![pane], false),
+            Some(_) => (Vec::new(), true),
+        },
+        Scope::Instance(id) => {
+            let (listed, more) = projections.instance(id, registry);
+            let mut panes = Vec::new();
+            for pane in listed {
+                if !budget.take(cost(pane)) {
+                    return (panes, true);
+                }
+                panes.push(pane.clone());
+            }
+            (panes, *more)
+        }
+    }
 }
 
 /// Step 3: may `caller` close this target?
@@ -1606,7 +1659,7 @@ async fn close_one(
                 CloseOutcome::Failed
             };
             out.error = Some(
-                "the unit moved to a new agent while it was being closed, and that agent is                  still running — close it again"
+                "the unit moved to a new agent while it was being closed, and that agent is still running — close it again"
                     .to_string(),
             );
         }
@@ -3638,11 +3691,11 @@ mod tests {
         let report = close.await.unwrap();
         let entry = &report.targets[0];
         assert_ne!(entry.outcome, CloseOutcome::Closed, "{entry:?}");
-        assert!(
-            entry
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("still running")),
+        assert_eq!(
+            entry.error.as_deref(),
+            Some(
+                "the unit moved to a new agent while it was being closed, and that agent is still running — close it again"
+            ),
             "{entry:?}"
         );
         assert!(deck.live(&b));
@@ -3877,6 +3930,102 @@ mod tests {
         );
     }
 
+    /// Scenario: auditor SF5 — one ambiguous name shared by 40 units of one
+    /// orchestration that has 300 roles. Every candidate lists that
+    /// orchestration's panes, and the registry is walked for them once, not
+    /// once per candidate.
+    #[tokio::test]
+    async fn candidates_sharing_an_instance_walk_the_registry_once() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        for n in 0..300 {
+            registry.insert_idle_member_for_test(&format!("big-{n}"), "big", n == 0);
+        }
+        let names = vec!["dup".to_string()];
+        shared_names(&registry, &names, 40, "big");
+        let before = registry.member_visits_for_test();
+        let (_, refused, _) = resolve(
+            &CloseSelector::Units(UnitSelector { names }),
+            &Caller::Person,
+            &registry,
+            &mut ReportBudget::new(),
+        );
+        let candidates = &refused[0].candidates;
+        assert_eq!(candidates.len(), 40);
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.panes.len() == MAX_LISTED_TARGETS)
+        );
+        assert_eq!(
+            registry.member_visits_for_test() - before,
+            300,
+            "one walk of the 300 records"
+        );
+    }
+
+    /// Scenario: auditor SF5 — one ambiguous name shared by 10 units, each of
+    /// its own 20-role orchestration, resolved with a report budget that holds
+    /// every candidate but the panes of only three and a half of them. The
+    /// fourth candidate's panes are cut where the budget ran out, the six
+    /// after it list none, the target is marked truncated, and the registry is
+    /// not walked again for any of those six.
+    #[tokio::test]
+    async fn a_spent_budget_walks_the_registry_no_further() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        for c in 0..10 {
+            let instance = format!("inst-{c}");
+            for n in 0..20 {
+                registry.insert_idle_member_for_test(&format!("i{c}-{n}"), &instance, n == 0);
+            }
+            shared_names(&registry, &["dup".to_string()], 1, &instance);
+        }
+        let records = 200;
+        let selector = CloseSelector::Units(UnitSelector {
+            names: vec!["dup".to_string()],
+        });
+        let (_, whole, _) = resolve(
+            &selector,
+            &Caller::Person,
+            &registry,
+            &mut ReportBudget::new(),
+        );
+        let candidates = &whole[0].candidates;
+        assert_eq!(candidates.len(), 10);
+        let headers: usize = candidates
+            .iter()
+            .map(|c| {
+                NESTED_ENTRY_OVERHEAD
+                    + json_len(&c.unit_id)
+                    + json_len(&c.name)
+                    + json_len(&c.worktree)
+            })
+            .sum();
+        let panes_of =
+            |c: &AmbiguousCandidate| -> usize { c.panes.iter().map(|p| json_len(p) + 1).sum() };
+        let room = headers
+            + candidates[..3].iter().map(panes_of).sum::<usize>()
+            + panes_of(&candidates[3]) / 2;
+        let before = registry.member_visits_for_test();
+        let (_, cut, _) = resolve(
+            &selector,
+            &Caller::Person,
+            &registry,
+            &mut ReportBudget { remaining: room },
+        );
+        let target = &cut[0];
+        assert!(target.truncated);
+        assert_eq!(target.candidates.len(), 10, "every header fit");
+        assert!(target.candidates[..3].iter().all(|c| c.panes.len() == 20));
+        assert!(!target.candidates[3].panes.is_empty());
+        assert!(target.candidates[3].panes.len() < 20);
+        assert!(target.candidates[4..].iter().all(|c| c.panes.is_empty()));
+        assert_eq!(
+            registry.member_visits_for_test() - before,
+            4 * records,
+            "walked for the four candidates the budget reached, and no further"
+        );
+    }
+
     /// Scenario: auditor SF2 — an orchestration with 300 roles is closed whole
     /// by a person with --force. Every one of the 300 roles is stopped, while
     /// the report lists the first 256 panes, orchestrator first, and marks
@@ -3917,12 +4066,23 @@ mod tests {
         deck.shutdown().await;
     }
 
-    /// A target whose every string field is `chars` control characters long,
-    /// and whose survivors and nested lists hold `copies` entries each.
+    /// The longest unit id the ledger mints: `u-<epoch>-<u64::MAX>`.
+    fn longest_unit_id() -> String {
+        format!(
+            "u-{}-{}",
+            "f".repeat(crate::dispatched_units::EPOCH_HEX_CHARS),
+            u64::MAX
+        )
+    }
+
+    /// A target whose every string field but its unit id is `chars` control
+    /// characters long, and whose survivors and nested lists hold `copies`
+    /// entries each. The unit id is the longest the ledger mints, since a
+    /// report never shortens it.
     fn bloated_target(chars: usize, copies: usize) -> CloseTarget {
         let big = "\u{1}".repeat(chars);
         let mut t = CloseTarget::refused(&big, CloseRefusalReason::Unknown, big.clone());
-        t.unit_id = Some(big.clone());
+        t.unit_id = Some(longest_unit_id());
         t.name = Some(big.clone());
         t.kind = big.clone();
         t.error = Some(big.clone());
@@ -3980,6 +4140,11 @@ mod tests {
         shed_lists(&mut target);
         clip_fields(&mut target);
         assert!(target.truncated);
+        assert_eq!(
+            target.unit_id.as_deref(),
+            Some(longest_unit_id().as_str()),
+            "a unit id is never shortened (reviewer R1)"
+        );
         let envelope = json_len(&CloseReport {
             dry_run: true,
             forced: true,
