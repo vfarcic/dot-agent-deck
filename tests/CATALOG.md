@@ -2626,10 +2626,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 #### hooks/stale
 
-##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, preserving the remedy at 60 columns.
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and old version at 60 columns.
 - **Layer:** L1 render buffer and insta snapshots.
 - **Agent:** none.
-- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the upgrade command survives; an empty list draws nothing.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and the old version survive and no cut-down command is shown; an empty list draws nothing.
 - **Does not assert:** the dashboard's placement or daemon transport.
 - **Platform coverage:** portable.
 
@@ -2653,6 +2653,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
 - **Does not assert:** an actual old release binary, the desktop strip, or model-specific prose; the wrapper changes stamp metadata but preserves event content and provenance.
 - **Platform coverage:** mac+linux; local credentials required, never CI.
+
+##### hooks/stale/005 — A command remedy is shown only beside the agents and both versions.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows that sentence and the upgrade-or-reinstall advice and no part of the command; at 300 columns it shows the command whole beside the sentence.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
 
 ### Pane / agent lifecycle
 
