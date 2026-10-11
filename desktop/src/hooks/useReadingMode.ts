@@ -7,11 +7,15 @@
  * recording overlaps the work on the previous utterance (PR #1451), so a
  * segment runs from one `voiceStop` to the next — {@link UseReadingMode.takeSegment}
  * is called at each — and the queue's `speaking` going true marks the open
- * segment as overlapped. Where the backend splits the recording inside
- * `voiceStop` is not known here, so speech that starts at any time before
- * `voiceStop` resolves also marks the segment it stopped (PRD #1631): it may
- * be in that segment's buffer. It marks the next one too, which may hold it. "Is it speaking now" would be the wrong question: a
- * recording of the app's own voice ends after the voice does. Nor does the
+ * segment as overlapped. Speech that starts before the backend has split the
+ * recording inside `voiceStop` also marks the segment it stopped (PRD #1631):
+ * it may be in that segment's buffer. Speech that starts after the split,
+ * while the stopped segment is still being transcribed, is not in it and marks
+ * only the next one. The backend reports the split as it happens; when that
+ * report is late or never comes, the stopped segment stays open until
+ * `voiceStop` settles, so a missing report counts the whole stop against it.
+ * "Is it speaking now" would be the wrong question: a recording of the app's
+ * own voice ends after the voice does. Nor does the
  * next `voiceStart` begin a segment when it carries on with the kept device:
  * that recording began at the `voiceStop`, so speech that started and ended
  * while the previous utterance was worked on is in it. A fresh open begins its
@@ -33,9 +37,10 @@ export interface StoppedSegment {
   /** Whether the app spoke during the segment so far. */
   overlapped: () => boolean;
   /**
-   * `voiceStop` settled: the app's speech no longer reaches this segment.
-   * Answers whether the app spoke during it, speech that started while
-   * `voiceStop` was pending included.
+   * The backend split the recording, or `voiceStop` settled, whichever came
+   * first: the app's speech no longer reaches this segment. Answers whether
+   * the app spoke during it, speech that started before this call included.
+   * Called again, it answers the same and marks nothing more.
    */
   close: () => boolean;
 }
@@ -46,7 +51,8 @@ export interface UseReadingMode {
   /**
    * End the current recording segment, called as its `voiceStop` begins, and
    * start the next. The stopped segment keeps being marked by the app's speech
-   * until its {@link StoppedSegment.close}.
+   * until its {@link StoppedSegment.close}, at the backend's split or when
+   * `voiceStop` settles.
    */
   takeSegment: () => StoppedSegment;
   /**
@@ -165,11 +171,13 @@ export function useReadingMode(
       const stopped = { spoke: spoke.current || queue.speaking };
       stopping.current = stopped;
       spoke.current = queue.speaking;
+      let closed: boolean | undefined;
       return {
-        overlapped: () => stopped.spoke,
+        overlapped: () => closed ?? stopped.spoke,
         close: () => {
           if (stopping.current === stopped) stopping.current = null;
-          return stopped.spoke;
+          closed ??= stopped.spoke;
+          return closed;
         },
       };
     },

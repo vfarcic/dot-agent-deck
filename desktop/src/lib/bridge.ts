@@ -1939,8 +1939,14 @@ export interface DeckBridge {
    * Stop transcribes rather than handing back a buffer, so no audio crosses the
    * IPC boundary — see the Rust command's own note. What arrives here is a
    * transcript and nothing else.
+   *
+   * `onSplit` is called once the backend has split the recording — the audio
+   * this stop transcribes ends there, and anything heard afterwards is the next
+   * utterance's — before transcription starts (PRD #1631). A runtime that
+   * cannot say when it split need not call it; the caller then treats the
+   * split as happening when this resolves.
    */
-  voiceStop(): Promise<VoiceTranscriptionDto>;
+  voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto>;
   /**
    * What the microphone is doing, and whether one is offered at all
    * (`desktop_voice_status`).
@@ -3188,9 +3194,10 @@ class FixtureDeckBridge implements DeckBridge {
     return fixtureVoiceStatus({ state: "recording", available: true, backend: "remote" });
   }
 
-  async voiceStop(): Promise<VoiceTranscriptionDto> {
+  async voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto> {
     const available = await this.voiceAvailable();
     this.microphone.recording = false;
+    onSplit?.();
     // Re-armed for the NEXT activation, which the pipeline opens by itself: the
     // cycle ends by listening again, so this is what lets the script's second
     // line be heard without a second press.
@@ -4844,9 +4851,12 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<VoiceStatusDto>("desktop_voice_start");
   }
 
-  async voiceStop(): Promise<VoiceTranscriptionDto> {
+  async voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceTranscriptionDto>("desktop_voice_stop");
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<null>();
+    channel.onmessage = () => onSplit?.();
+    return invoke<VoiceTranscriptionDto>("desktop_voice_stop", { onSplit: channel });
   }
 
   async voiceStatus(): Promise<VoiceStatusDto> {

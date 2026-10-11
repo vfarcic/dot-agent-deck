@@ -3153,27 +3153,60 @@ async fn desktop_voice_start(
 }
 
 /// Close the microphone and transcribe what it heard. Recording →
-/// transcribing → done or failed.
+/// transcribing → done or failed. `on_split` gets one message once the
+/// recording is split, before transcription ([`stop_and_transcribe`]).
 #[tauri::command]
 async fn desktop_voice_stop(
     webview: Webview,
     voice_state: State<'_, VoiceState>,
+    on_split: Channel<()>,
 ) -> Result<voice::VoiceTranscription, String> {
     ensure_main_webview(&webview)?;
-    // Blocking, like the open in `desktop_voice_start`: closing the device
-    // joins its thread, and a driver that is slow to let go would otherwise
-    // park a runtime worker for as long as it takes.
-    let hold = voice_state.hold.clone();
-    let audio = tauri::async_runtime::spawn_blocking(move || hold.stop())
+    stop_and_transcribe(
+        &voice_state.hold,
+        // A webview that has gone away cannot be told; the stop goes on, and
+        // a webview that missed the message closes its segment when this
+        // command answers instead.
+        move || {
+            let _ = on_split.send(());
+        },
+        || {
+            voice::transcriber_for(
+                &voice_speech_settings(),
+                Arc::new(KeychainSecretStore::new()),
+            )
+        },
+    )
+    .await
+}
+
+/// [`desktop_voice_stop`]'s work: close the microphone, call `split`, then
+/// transcribe with the backend `transcriber` builds.
+///
+/// `split` runs once the recording has been split — this utterance's audio
+/// taken, the kept device (PR #1451) recording the next one — and before
+/// transcription starts (PRD #1631). The webview
+/// counts the app's own speech against this utterance only until then: speech
+/// that starts after the split is not in this audio, however long the
+/// transcription takes. A stop the device refuses never calls it.
+async fn stop_and_transcribe(
+    hold: &voice::VoiceHold,
+    split: impl FnOnce(),
+    transcriber: impl FnOnce() -> Box<dyn voice::Transcriber>,
+) -> Result<voice::VoiceTranscription, String> {
+    // Blocking, like the open in `desktop_voice_start`: a device the length
+    // cap closed is let go here, which joins its thread, and a driver that is
+    // slow to let go would otherwise park a runtime worker for as long as it
+    // takes.
+    let stopping = hold.clone();
+    let audio = tauri::async_runtime::spawn_blocking(move || stopping.stop())
         .await
         .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
         .map_err(report_capture_error)?;
-    let transcriber = voice::transcriber_for(
-        &voice_speech_settings(),
-        Arc::new(KeychainSecretStore::new()),
-    );
+    split();
+    let transcriber = transcriber();
     let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
-    voice_state.hold.settle(result.outcome.is_heard());
+    hold.settle(result.outcome.is_heard());
     Ok(result)
 }
 
@@ -7962,6 +7995,93 @@ mod tests {
             stopped,
             counts,
         )
+    }
+
+    /// PRD #1631 (review M2): the stop tells the webview the recording split
+    /// once this utterance's audio is taken, and before the transcription
+    /// starts, so speech the app starts while transcribing is
+    /// not counted against this utterance.
+    #[tokio::test]
+    async fn voice_stop_reports_the_split_once_the_utterance_is_taken() {
+        struct Ordered {
+            inner: voice::StubTranscriber,
+            order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl voice::Transcriber for Ordered {
+            fn transcribe<'a>(
+                &'a self,
+                audio: &'a voice::Pcm16,
+            ) -> voice::transcribe::TranscribeFuture<'a> {
+                self.order.lock().unwrap().push("transcribe");
+                self.inner.transcribe(audio)
+            }
+            fn backend_name(&self) -> &'static str {
+                self.inner.backend_name()
+            }
+        }
+
+        // Real (synthesised) speech, so the audio gate in front of the
+        // transcriber lets it through and the transcriber is called.
+        let speech: Vec<f32> = include_bytes!("voice/fixtures/speech/stop-john.pcm")
+            .chunks_exact(2)
+            .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+            .collect();
+        let hold = voice::VoiceHold::with_parts(
+            Arc::new(voice::CaptureSession::new(Arc::new(
+                voice::StubSource::new(
+                    voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1),
+                    speech,
+                ),
+            ))),
+            Arc::new(voice::WakeLock::new(Arc::new(voice::StubInhibitor::new()))),
+        );
+        hold.start().expect("the stub device opens");
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let split = {
+            let order = Arc::clone(&order);
+            let hold = hold.clone();
+            move || {
+                // `stop` moves the session to Transcribing under the lock it
+                // takes the utterance's audio under.
+                assert_eq!(
+                    hold.status().state,
+                    voice::CaptureState::Transcribing,
+                    "the utterance is taken at the split"
+                );
+                order.lock().unwrap().push("split");
+            }
+        };
+        let transcriber = {
+            let order = Arc::clone(&order);
+            move || -> Box<dyn voice::Transcriber> {
+                Box::new(Ordered {
+                    inner: voice::StubTranscriber::hearing("yes"),
+                    order,
+                })
+            }
+        };
+
+        let result = stop_and_transcribe(&hold, split, transcriber)
+            .await
+            .expect("the stop transcribes");
+
+        assert!(result.outcome.is_heard());
+        assert_eq!(*order.lock().unwrap(), ["split", "transcribe"]);
+    }
+
+    /// A stop the device refuses — nothing is recording — reports no split.
+    #[tokio::test]
+    async fn a_refused_voice_stop_reports_no_split() {
+        let (voice_state, _stopped, _counts) = stub_voice_state(1.0);
+        let mut split = false;
+        let refused = stop_and_transcribe(
+            &voice_state.hold,
+            || split = true,
+            || -> Box<dyn voice::Transcriber> { Box::new(voice::StubTranscriber::hearing("yes")) },
+        )
+        .await;
+        assert!(refused.is_err(), "nothing was recording: {refused:?}");
+        assert!(!split);
     }
 
     /// PRD #802 audit blocker: the app exiting releases the microphone.

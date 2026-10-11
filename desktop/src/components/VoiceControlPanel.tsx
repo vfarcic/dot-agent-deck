@@ -3171,16 +3171,21 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PRD #1497 D8 — the segment ends here, and the next one starts. */
     const segment = reader.takeSegment();
     overlappedRef.current = segment.overlapped();
+    /* PRD #1631 — the app's speech that starts before the backend splits the
+       recording may be in this utterance and counts against it; speech that
+       starts during the transcription after the split does not. The segment
+       closes at the split signal, or when `voiceStop` settles if that signal
+       is late or never comes, so a missing signal counts the whole stop. */
+    const closeSegment = () => {
+      const overlapped = segment.close();
+      if (ours()) overlappedRef.current = overlapped;
+    };
     try {
       let transcription;
       try {
-        transcription = await voiceStop();
+        transcription = await voiceStop(closeSegment);
       } finally {
-        /* PRD #1631 — the backend splits the recording somewhere inside
-           `voiceStop`, so the app's speech that starts before it resolves
-           may be in this utterance and counts against it. */
-        const overlapped = segment.close();
-        if (ours()) overlappedRef.current = overlapped;
+        closeSegment();
       }
       if (!ours()) return;
       /* PR #1451's hand test — a segment with no words in it says NOTHING.

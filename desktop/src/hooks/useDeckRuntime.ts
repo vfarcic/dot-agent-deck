@@ -412,7 +412,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const cancelVoiceAnswer = useCallback((lease: string) => bridge.cancelVoiceAnswer(lease), [bridge]);
   const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
-  const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
+  const voiceStop = useCallback((onSplit?: () => void) => bridge.voiceStop(onSplit), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
   const voiceCancel = useCallback(() => bridge.voiceCancel(), [bridge]);
   // PRD #1497 — reading's speech and its turn sentences.

@@ -1536,8 +1536,12 @@ export interface DeckRuntimeState {
   ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
-  /** Close the microphone and transcribe what it heard. No audio crosses the boundary. */
-  voiceStop?: () => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
+  /**
+   * Close the microphone and transcribe what it heard. No audio crosses the
+   * boundary. `onSplit` is called once the backend has split the recording,
+   * before it transcribes (PRD #1631).
+   */
+  voiceStop?: (onSplit?: () => void) => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
   /**
    * What the microphone is doing, and whether one is offered at all.
    *
