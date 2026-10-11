@@ -6240,6 +6240,10 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_echo_watch_for_test`].
     #[cfg(test)]
     echo_watch_pause: EchoWatchPause,
+    /// Issue #544 test seam: how many times a first write has gone to sleep
+    /// waiting for a pending draft — see [`Self::draft_polls_for_test`].
+    #[cfg(test)]
+    draft_polls: tokio::sync::watch::Sender<u64>,
     /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
     /// child is forked and waits, before it takes the publishing lock — see
     /// [`Self::pause_next_publish_for_test`].
@@ -8022,6 +8026,8 @@ impl AgentPtyRegistry {
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
+            #[cfg(test)]
+            draft_polls: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
             respawns_settled: Notify::new(),
@@ -10617,6 +10623,16 @@ impl AgentPtyRegistry {
         (reached_rx, release_tx)
     }
 
+    /// Issue #544 test seam: a running count of the draft polls first writes
+    /// have begun — one per sleep while the draft is pending. A count that
+    /// has moved says a write is inside its draft wait, which no clock the
+    /// test reads can say: a starved runtime can start the write long after
+    /// the test armed its own timer.
+    #[cfg(test)]
+    pub(crate) fn draft_polls_for_test(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.draft_polls.subscribe()
+    }
+
     /// PRD #1487 audit A2 test seam: park the next spawn after its child is
     /// forked and before it takes the lock that publishes it. The first
     /// receiver yields once the spawn is parked; sending on (or dropping) the
@@ -12601,6 +12617,8 @@ impl AgentPtyRegistry {
                 if let Some(hold) = park.as_deref_mut() {
                     hold.park();
                 }
+                #[cfg(test)]
+                self.draft_polls.send_modify(|polls| *polls += 1);
                 let slept = Instant::now();
                 tokio::time::sleep(after).await;
                 deferred += slept.elapsed();
@@ -25305,15 +25323,25 @@ mod spawn_tests {
                 writer.write_all(bytes).expect("type");
             }
         };
+        let mut draft_polls = registry.draft_polls_for_test();
         type_bytes(b"draft").await;
+        // That the immediate entry did not wait is read off the draft polls,
+        // not a clock: a wall-clock bound is also a bound on how starved the
+        // runner is (a cold, loaded run overran 2 s). The timeout is only a
+        // hang guard, kept under the 60 s cap a draft wait would run to.
         let immediate = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             registry.write_and_submit_guarded(PANE, "IMMEDIATE", &agent, || async { true }),
         )
         .await
-        .expect("the immediate entry must not wait for the draft")
+        .expect("the immediate entry must not wait out the draft cap")
         .expect("immediate write");
         assert_eq!(immediate, GuardedSend::Applied);
+        assert_eq!(
+            *draft_polls.borrow_and_update(),
+            0,
+            "the immediate entry waited for the draft"
+        );
 
         type_bytes(b"second draft").await;
         let started = Instant::now();
@@ -25332,6 +25360,19 @@ mod spawn_tests {
                     .await
             })
         };
+        // The window opens once the write is asleep in its draft wait, not
+        // when it was spawned. A runtime starved between the two started the
+        // write's first poll ~400 ms into a window armed at the spawn, so the
+        // Ctrl+U landed during it and one 200 ms poll was all it reported.
+        // Opened here, the draft stays pending for 600 ms of a wait that has
+        // already begun, and a stall can only lengthen the poll it lands in.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            draft_polls.wait_for(|polls| *polls >= 1),
+        )
+        .await
+        .expect("the first write must wait for the draft")
+        .expect("the registry keeps its seam");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
             !waiting.is_finished(),
@@ -25398,6 +25439,7 @@ mod spawn_tests {
         assert!(began.elapsed() < Duration::from_secs(2));
         drop(held);
 
+        let mut draft_polls = registry.draft_polls_for_test();
         let type_bytes = |bytes: &'static [u8]| {
             let registry = Arc::clone(&registry);
             let agent = agent.clone();
@@ -25424,6 +25466,15 @@ mod spawn_tests {
                     .await
             })
         };
+        // Opened once the write is asleep in its draft wait, for the reason
+        // given in `only_the_first_write_entry_waits_for_a_pending_draft`.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            draft_polls.wait_for(|polls| *polls >= 1),
+        )
+        .await
+        .expect("the first write waits for the draft")
+        .expect("the registry keeps its seam");
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             !waiting.is_finished(),
