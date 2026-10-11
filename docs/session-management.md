@@ -20,7 +20,7 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
 | **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
-| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
+| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. Work it left running is shown beside it; see [Work left running after a turn](#work-left-running-after-a-turn). | Give it the next prompt. |
 | **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
@@ -42,6 +42,33 @@ The first five statuses come from each agent's hooks, plugin or extension, and h
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
 - Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
 
+### Work left running after a turn
+
+An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. The card then reads **Idle**, because the agent is waiting for its next prompt, and a line under it says what is still running and for how long:
+
+```
+Background: 2 commands, 1 subagent · 3h 12m
+```
+
+- A kind with nothing running is left out (`Background: 1 subagent · 4m`), and the time is how long the oldest of them has been running.
+- The line goes away by itself when the last of them ends, and while the agent is in a turn (after you send it a prompt) it is not shown.
+- If the deck cannot tell how long something has been running, the line shows the counts without a time.
+- In the TUI the line is on the card, under `Dir:`. In the desktop app it is in the agent's pane, under the agent's command and model, and on its tile on the Daemons screen, in the same words. The Dashboard row shows the status only.
+
+A command that has been running for hours is easy to spot this way. To stop it, open the agent's pane and ask the agent to stop it, or stop it yourself in the pane.
+
+What each agent reports:
+
+| | Claude Code | Codex | OpenCode | Pi | Devin |
+|---|---|---|---|---|---|
+| Background commands | Yes | Yes | Yes | Yes | Yes |
+| Background subagents | Yes | Yes | Not shown yet | No | No |
+
+- On Windows, background commands are not counted for any agent; subagents still are.
+- The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
+- Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
+- A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.
+
 ### Blocked
 
 In the TUI, a line under `Dir:` says which limit was hit and, when the provider says, when it resets. In the desktop app, the reason is shown in the agent's pane. The status stays until the agent shows it is working again (a new prompt, a tool call or a permission prompt from the main agent) or its pane restarts. There is no timer: a spent credit pool does not reset by itself. A subagent hitting a limit does not turn the card Blocked.
@@ -56,6 +83,7 @@ If Blocked never appears for Claude Code or OpenCode, the hook or plugin that re
 
 - **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status.
 - **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit.
+- **`Background:`**: commands and subagents the agent left running after its turn ended, and for how long; see [Work left running after a turn](#work-left-running-after-a-turn).
 - **`Prmt:`**: the most recent prompt or prompts.
 - **Recent tool calls**: the last commands the agent ran.
 - **`Last:` and `Tools:`**: time since the agent's last activity and its total tool-call count, in the bottom-right border. Narrow cards shorten them to `2m · 14 tools`, then `2m · 14`, and the narrowest omit them.
@@ -71,7 +99,7 @@ The deck picks a density from how many cards it has to fit and the space availab
 | Compact | 1 | 1 |
 | Minimal | none | none |
 
-Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason takes the place of `Dir:`, and on an orphaned card `Orphaned — delegation unavailable` does. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
+Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason takes the place of `Dir:`, on a card with work left running the `Background:` line does, and on an orphaned card `Orphaned — delegation unavailable` does. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
 
 ![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
 

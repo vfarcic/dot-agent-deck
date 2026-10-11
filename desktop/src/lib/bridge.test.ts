@@ -1038,6 +1038,41 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Issue #1678. The daemon's background aggregate reaches the tile as counts
+   * and an instant, and the bridge checks every number first: the DTO is an
+   * assertion about a shape, so a count that is not a non-negative integer in
+   * the daemon's `u32` range drops the whole reading, and a `sinceMs` that is
+   * not a finite number drops only the duration.
+   */
+  it("background work crosses the bridge only as validated counts and an instant", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const withBackground = (background: unknown) => {
+      const dto = structuredClone(snapshot);
+      dto.agents[0].status = "idle";
+      dto.agents[0].background = background as DesktopAgentDto["background"];
+      return mapDesktopSnapshot(dto).agents[0]?.background;
+    };
+
+    expect(withBackground({ commands: 2, subagents: 1, sinceMs: 1_700_000_000_000 })).toEqual({ commands: 2, subagents: 1, sinceMs: 1_700_000_000_000 });
+    expect(withBackground({ commands: 0, subagents: 1 })).toEqual({ commands: 0, subagents: 1 });
+    expect(withBackground({ commands: 0xffff_ffff, subagents: 0 })).toEqual({ commands: 0xffff_ffff, subagents: 0 });
+    // Absent, and the daemon's explicit zero, both show nothing.
+    expect(withBackground(undefined)).toBeUndefined();
+    expect(withBackground({ commands: 0, subagents: 0, sinceMs: 1 })).toBeUndefined();
+    // A count the daemon could not have sent drops the reading.
+    for (const bad of [-1, 1.5, 0x1_0000_0000, Number.NaN, Number.POSITIVE_INFINITY, "2", null]) {
+      expect(withBackground({ commands: bad, subagents: 1 })).toBeUndefined();
+      expect(withBackground({ commands: 1, subagents: bad })).toBeUndefined();
+    }
+    expect(withBackground("2 commands")).toBeUndefined();
+    expect(withBackground(null)).toBeUndefined();
+    // An unusable instant drops the duration and keeps the counts.
+    for (const bad of [Number.NaN, Number.NEGATIVE_INFINITY, "1700000000000", null]) {
+      expect(withBackground({ commands: 1, subagents: 0, sinceMs: bad })).toEqual({ commands: 1, subagents: 0 });
+    }
+  });
+
+  /**
    * Issue #714. A quota-blocked agent is alive and its provider refuses it: it
    * must read as neither `failed` (nothing crashed) nor `waiting` (that is what
    * hid it), keep its reason beside the status and only there, and put the run

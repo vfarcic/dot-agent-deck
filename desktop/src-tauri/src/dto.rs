@@ -550,6 +550,17 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// Issue #1678: the background work the agent left running after its turn
+    /// ended — commands and subagents still going, and since when — copied
+    /// from `SessionSnapshot.background`. The daemon computes it; nothing here
+    /// derives it from events or recounts it.
+    ///
+    /// Absent when there is nothing to show (no count above zero), when the
+    /// record carries no live snapshot, and from a daemon predating the field.
+    /// `since_ms` is NOT clamped here, for the reason `last_activity_ms` gives:
+    /// the webview owns the clock the comparison is made against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<DesktopBackground>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
     /// copied through, bounded by [`map_prompt_keys`], and never resolved from
@@ -619,6 +630,22 @@ pub struct DesktopDeleteCharKey {
     pub bytes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
+}
+
+/// Issue #1678: the webview's view of a `BackgroundWork` — counts only. No
+/// subagent id, command line or hook text reaches the webview, because the
+/// daemon's aggregate carries none.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBackground {
+    /// Commands still running in their own session below the agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest counted item started, epoch milliseconds on the
+    /// daemon's clock; absent when the daemon has no start for any of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -1741,6 +1768,15 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
                 .filter(|detail| !detail.is_empty()),
             resets_at_ms: reason.resets_at_ms,
         });
+    // Issue #1678: the daemon's aggregate, only when it has something to show.
+    let background = live
+        .and_then(|snapshot| snapshot.background)
+        .filter(|work| !work.is_empty())
+        .map(|work| DesktopBackground {
+            commands: work.commands,
+            subagents: work.subagents,
+            since_ms: work.since_ms,
+        });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
     // event.
@@ -1771,6 +1807,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        background,
         prompt_keys,
         authoring_kind: record.authoring_kind,
         tab,
@@ -3872,6 +3909,61 @@ mod tests {
                 .get("blocked")
                 .is_none()
         );
+    }
+
+    /// Issue #1678: the daemon's background aggregate reaches the webview as
+    /// counts and an instant under `background`, unclamped; an empty aggregate
+    /// (the daemon's explicit clear) and a record with no live snapshot both
+    /// leave the key off the wire.
+    #[test]
+    fn background_work_maps_from_the_live_snapshot() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = SessionStatus::Idle;
+        live.background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 2,
+            subagents: 1,
+            since_ms: Some(1_756_684_800_123),
+        });
+        live.background_revision = Some(7);
+        let mapped = map_agent(record.clone());
+        assert_eq!(
+            mapped.background,
+            Some(DesktopBackground {
+                commands: 2,
+                subagents: 1,
+                since_ms: Some(1_756_684_800_123),
+            })
+        );
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 2, "subagents": 1, "sinceMs": 1_756_684_800_123i64 })
+        );
+
+        // No start instant: the key is omitted, the counts stay.
+        record.live.as_mut().unwrap().background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 0,
+            subagents: 3,
+            since_ms: None,
+        });
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 0, "subagents": 3 })
+        );
+
+        // The daemon's explicit clear shows nothing.
+        record.live.as_mut().unwrap().background =
+            Some(dot_agent_deck::event::BackgroundWork::default());
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert!(value.get("background").is_none());
+
+        // Nor does a record with no live snapshot, or an older daemon's.
+        record.live.as_mut().unwrap().background = None;
+        assert!(map_agent(record.clone()).background.is_none());
+        record.live = None;
+        assert!(map_agent(record).background.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
