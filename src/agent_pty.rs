@@ -7051,8 +7051,8 @@ struct RegistryInner {
     /// the close finds it and waits) or is refused with the running generation
     /// untouched. The generation-scope analogue of [`Self::closing_instances`].
     closing_generations: HashSet<String>,
-    /// PRD #1589 D4: instances a `close` finished, refused for the daemon's
-    /// lifetime so queued role work cannot resurrect one. Bounded
+    /// PRD #1589 D4: instances a `close` finished, refused while they remain
+    /// in this history so queued role work cannot resurrect one. Bounded
     /// ([`MAX_ENDED_INSTANCES`]); instance tokens are never reused, so an
     /// evicted entry can only ever be matched by a stale request.
     ended_instances: VecDeque<String>,
@@ -7281,7 +7281,8 @@ impl Drop for GenerationCloseGuard {
 /// [`AgentPtyRegistry::begin_instance_close`]. While it lives, no pane may join
 /// the instance. Dropped unfinished — a close that refused in preflight, or one
 /// that left survivors — the instance takes spawns again; dropped after
-/// [`Self::finish`], it refuses them for the daemon's lifetime.
+/// [`Self::finish`], it refuses them while the instance remains in the
+/// bounded finished-instance history ([`MAX_ENDED_INSTANCES`]).
 pub struct InstanceCloseGuard {
     registry: Arc<AgentPtyRegistry>,
     instance: String,
@@ -16352,8 +16353,10 @@ impl AgentPtyRegistry {
     /// PRD #1589 D4: open the instance-scoped Closing admission state for
     /// `instance`. Until the returned guard is dropped, no pane may join the
     /// instance (see [`RegistryInner::closing_instances`]); a guard that was
-    /// [`InstanceCloseGuard::finish`]ed keeps refusing for the daemon's
-    /// lifetime, so queued role work cannot resurrect a closed instance.
+    /// [`InstanceCloseGuard::finish`]ed keeps refusing while the instance
+    /// remains in the bounded finished-instance history
+    /// ([`MAX_ENDED_INSTANCES`]), so queued role work cannot resurrect a
+    /// closed instance.
     ///
     /// `None` when another close already holds the instance, or one finished
     /// it.
@@ -16414,9 +16417,10 @@ impl AgentPtyRegistry {
     /// first and then in spawn order: at most `limit` of them, and whether any
     /// was left out. It walks every record in the registry, keeping at most
     /// `limit + 1` borrowed entries while it does and cloning only the ones it
-    /// returns. A close report keeps the result for the rest of its request
-    /// (`close_agents::PaneProjections`) rather than calling this once per
-    /// candidate that lists the instance.
+    /// returns. A close report reuses the result while it is resident in its
+    /// per-request cache (`close_agents::PaneProjections`), which clears when
+    /// a new projection would take it past 1,024 retained pane ids, rather
+    /// than calling this once per candidate that lists the instance.
     pub fn instance_panes(&self, instance: &str, limit: usize) -> (Vec<String>, bool) {
         let inner = self.inner.lock().unwrap();
         let mut first: std::collections::BTreeSet<(bool, u64, &str, &str)> =
@@ -16589,9 +16593,9 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1589: record `instance` as finished, so it refuses every spawn
-    /// and respawn into it for the daemon's lifetime. Bounded by
-    /// [`MAX_ENDED_INSTANCES`]; an instance already recorded is not recorded
-    /// twice.
+    /// and respawn into it while the token remains in the bounded
+    /// finished-instance history ([`MAX_ENDED_INSTANCES`]; the oldest is
+    /// evicted first). An instance already recorded is not recorded twice.
     fn mark_instance_ended_locked(inner: &mut RegistryInner, instance: &str) {
         if inner.ended_instances.iter().any(|ended| ended == instance) {
             return;

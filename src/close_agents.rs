@@ -773,10 +773,12 @@ fn scope_of_unit(unit: &DispatchedUnit) -> Scope {
 const MAX_CACHED_PANES: usize = 4 * MAX_LISTED_TARGETS;
 
 /// PRD #1589 (auditor SF5): one request's projections of orchestration
-/// instances' panes, so candidates that share an instance walk the registry
-/// for it once rather than once each. Each projection holds at most
-/// [`MAX_LISTED_TARGETS`] pane ids and the cache at most [`MAX_CACHED_PANES`]:
-/// one that would take it past that empties it first. What it holds is
+/// instances' panes, so candidates that share an instance reuse its
+/// projection while it is resident here rather than walking the registry once
+/// each. Each projection holds at most [`MAX_LISTED_TARGETS`] pane ids and the
+/// cache at most [`MAX_CACHED_PANES`]: a new projection that would take it past
+/// that clears it first, so an instance projected before the clear is walked
+/// again if a later candidate lists it. What it holds is
 /// charged to a report's budget each time it is copied into one. It is a
 /// report's view only; what a close stops is read separately.
 #[derive(Default)]
