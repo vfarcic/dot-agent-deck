@@ -2596,6 +2596,11 @@ struct UiState {
     /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
     /// (tests), and the form then seeds from [`Self::last_command`] as before.
     last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
+    /// PRD #1401: the number of the latest pull request launch from `o`. A
+    /// launch's outcome reaches the status line only while it is still the
+    /// latest, so a slow earlier launch never overwrites a later one's
+    /// ([`drain_pull_request_launch`]).
+    pull_request_launch: u64,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2747,6 +2752,7 @@ impl UiState {
             last_command: None,
             pending_last_command: None,
             last_command_reader: None,
+            pull_request_launch: 0,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -8184,6 +8190,22 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     ));
 }
 
+/// PRD #1401: put how the latest `o` launch settled on the status line. The
+/// browser is watched off the UI thread, so its outcome is queued in the
+/// shared state and drained here, the way [`drain_worktree_kept`] drains its
+/// report. An outcome for an earlier launch is dropped.
+fn drain_pull_request_launch(state: &SharedState, ui: &mut UiState) {
+    if state.blocking_read().pending_pull_request_launch.is_none() {
+        return;
+    }
+    let Some((launch, message)) = state.blocking_write().take_pull_request_launch() else {
+        return;
+    };
+    if launch == ui.pull_request_launch {
+        ui.status_message = Some((message, std::time::Instant::now()));
+    }
+}
+
 /// Issue #717: what the dialog (and, after the close, the status line) says
 /// about a worktree that will be kept. Two sentences, because the probe has two
 /// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
@@ -11768,9 +11790,19 @@ fn dispatch_action(
                 .map(|pr| pr.url.clone());
             match url {
                 Some(url) => {
+                    // The browser is watched off this thread; its outcome comes
+                    // back through `drain_pull_request_launch`.
+                    ui.pull_request_launch += 1;
+                    let launch = ui.pull_request_launch;
+                    let settled = state.clone();
                     let message = crate::system_browser::open_pull_request(
                         &url,
                         &crate::system_browser::BrowserEnv::from_process(),
+                        move |message| {
+                            settled
+                                .blocking_write()
+                                .queue_pull_request_launch(launch, message);
+                        },
                     );
                     ui.status_message = Some((message, std::time::Instant::now()));
                 }
@@ -14463,6 +14495,9 @@ pub fn run_tui(
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
         drain_worktree_kept(&state, &mut ui);
+        // PRD #1401: how the latest `o` launch settled, from the thread that
+        // watches the browser.
+        drain_pull_request_launch(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -24334,6 +24369,33 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #1401: the `o` key's browser is watched off the UI thread, and its
+    /// outcome reaches the status line through the render loop's drain — but
+    /// only for the latest launch, so a slow earlier one never overwrites it.
+    #[test]
+    fn a_pull_request_launch_outcome_reaches_the_status_line_only_while_latest() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(ui.status_message.as_ref().unwrap().0, "Opening B");
+        assert!(state.blocking_read().pending_pull_request_launch.is_none());
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
     }
 
     /// Scenario: Open the schedule manager with no configured entries and

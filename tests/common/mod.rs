@@ -1281,6 +1281,17 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
+        // PRD #1401: the deck lazy-starts its daemon and polls for it for a
+        // fixed 15 s, which an I/O stall can outlast while the daemon is
+        // healthy (`session/pr/005` failed twice there). The `e2e` build reads
+        // this override and only ever lengthens the budget, so an idle box
+        // keeps exactly 15 s. A test may override it via `with_env`.
+        final_env.insert(
+            dot_agent_deck::daemon_attach::TEST_DAEMON_START_TIMEOUT_ENV.into(),
+            load_scaled(dot_agent_deck::daemon_attach::DAEMON_START_POLL_TIMEOUT)
+                .as_millis()
+                .to_string(),
+        );
         // PRD #1487: `env_clear` above drops the test runner's own signal, so
         // pin the agent-config containment contract explicitly — every config
         // writer in the deck, its daemon and their children refuses a

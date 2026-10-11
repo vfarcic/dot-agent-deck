@@ -826,11 +826,20 @@ pub fn scroll<R: Runtime>(app: &AppHandle<R>, scroll: Scroll) -> Result<(), Stri
 }
 
 /// Open in browser: the page on screen in the system browser, then close —
-/// in that order and only on success ([`handoff_page`]).
-pub fn open_external<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+/// in that order and only on success ([`handoff_page`]). The launch is
+/// watched for up to [`LAUNCH_GRACE`], so it runs on the blocking pool rather
+/// than holding up the async runtime, and the caller still awaits its outcome.
+///
+/// [`LAUNCH_GRACE`]: dot_agent_deck::system_browser::LAUNCH_GRACE
+pub async fn open_external<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let webview = open_webview(app)?;
     let url = webview.url().map_err(|error| error.to_string())?;
-    handoff_page(&url, system_browser, || close_browser(app))
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handoff_page(&url, system_browser, || close_browser(&app))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The toolbar's Close, `Escape` in the app, and voice's "close".

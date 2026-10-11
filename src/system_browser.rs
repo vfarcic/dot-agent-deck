@@ -23,10 +23,10 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long [`open_pull_request`] watches a launched browser or opener for a
-/// failing exit before reporting how the launch went. A browser that is still
-/// running then — one that stays in the foreground — counts as launched, and
-/// is reaped off the caller's thread.
+/// How long [`open_pull_request`] watches a launched browser or opener, off
+/// the caller's thread, for a failing exit before reporting how the launch
+/// went. A browser that is still running then — one that stays in the
+/// foreground — counts as launched, and is reaped in the background.
 pub const LAUNCH_GRACE: Duration = Duration::from_millis(500);
 
 /// The `https://github.com/<owner>/<repo>/pull/<number>` form of `raw`, rebuilt
@@ -210,11 +210,18 @@ pub fn watch_launch(mut child: Child, program: &str, grace: Duration) -> Result<
 /// `open`, `start`), the first one that can be started, watched like a
 /// `BROWSER` program ([`watch_launch`]).
 pub fn open_with_platform_opener(url: &str, grace: Duration) -> Result<Launched, String> {
+    let (child, program) = spawn_platform_opener(url)?;
+    watch_launch(child, &program, grace)
+}
+
+/// Start the first of the platform's openers for `url` that can be started,
+/// and name it.
+fn spawn_platform_opener(url: &str) -> Result<(Child, String), String> {
     let mut last_error = None;
     for mut command in open::commands(url) {
         let program = command.get_program().to_string_lossy().into_owned();
         match spawn_detached(&mut command) {
-            Ok(child) => return watch_launch(child, &program, grace),
+            Ok(child) => return Ok((child, program)),
             Err(e) => last_error = Some(format!("{program}: {e}")),
         }
     }
@@ -247,27 +254,56 @@ impl BrowserEnv {
     }
 }
 
-/// Open the pull request at `raw_url` and return the status-line message for
-/// how that went. The caller waits at most [`LAUNCH_GRACE`], and only that
-/// long when the browser keeps running. Whenever no browser opens, the message
-/// leads with the URL, so a user on a host with no browser can copy it.
+/// Start opening the pull request at `raw_url` and return the status-line
+/// message to show now. The caller is never held up by the browser.
 ///
-/// A program that exited successfully reports "Opened"; one still running
-/// when the watch ended reports "Opening … in the browser", since a browser
-/// that stays in the foreground never says whether the page loaded.
-pub fn open_pull_request(raw_url: &str, env: &BrowserEnv) -> String {
+/// When a program was launched, that message is `Opening <url> in the
+/// browser`, and `on_settled` is called once, from another thread, with the
+/// message for how the launch went: watched for up to [`LAUNCH_GRACE`], a
+/// program that exited successfully reports "Opened", one that exited
+/// non-zero reports the could-not-open message with the URL, and one still
+/// running keeps "Opening … in the browser", since a browser that stays in
+/// the foreground never says whether the page loaded. When nothing was
+/// launched — the URL was refused, there is no display, or no program could
+/// be started — the returned message is already the outcome, and
+/// `on_settled` is dropped uncalled.
+///
+/// Whenever no browser opens, the message leads with the URL, so a user on a
+/// host with no browser can copy it.
+pub fn open_pull_request(
+    raw_url: &str,
+    env: &BrowserEnv,
+    on_settled: impl FnOnce(String) + Send + 'static,
+) -> String {
     let Some(url) = canonical_pull_request_url(raw_url) else {
         return "Could not open the pull request: not a GitHub pull request URL".to_string();
     };
-    let launched = match env.browser.as_deref().map(|b| browser_command(b, &url)) {
-        Some(Ok(Some((program, args)))) => spawn_browser(&program, &args)
-            .and_then(|child| watch_launch(child, &program, LAUNCH_GRACE)),
+    let spawned = match env.browser.as_deref().map(|b| browser_command(b, &url)) {
+        Some(Ok(Some((program, args)))) => {
+            spawn_browser(&program, &args).map(|child| (child, program))
+        }
         Some(Err(e)) => Err(e),
         None | Some(Ok(None)) if !env.display => {
             return format!("Pull request: {url} (no display here to open a browser on)");
         }
-        None | Some(Ok(None)) => open_with_platform_opener(&url, LAUNCH_GRACE),
+        None | Some(Ok(None)) => spawn_platform_opener(&url),
     };
+    let (child, program) = match spawned {
+        Ok(spawned) => spawned,
+        Err(e) => return launch_message(&url, Err(e)),
+    };
+    let opening = launch_message(&url, Ok(Launched::Running));
+    std::thread::spawn(move || {
+        on_settled(launch_message(
+            &url,
+            watch_launch(child, &program, LAUNCH_GRACE),
+        ));
+    });
+    opening
+}
+
+/// The status-line message for how opening `url` went.
+fn launch_message(url: &str, launched: Result<Launched, String>) -> String {
     match launched {
         Ok(Launched::Exited) => format!("Opened {url}"),
         Ok(Launched::Running) => format!("Opening {url} in the browser"),
@@ -361,6 +397,24 @@ mod tests {
         );
     }
 
+    /// What [`open_pull_request`] shows at once for `raw`, and what the status
+    /// line ends up showing: the message it delivers when a launch settles,
+    /// or, when it launched nothing and so delivers nothing, the first one.
+    fn open_and_settle(raw: &str, env: &BrowserEnv) -> (String, String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shown = open_pull_request(raw, env, move |message| {
+            let _ = tx.send(message);
+        });
+        let settled = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => shown.clone(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("a launch of {raw} never settled")
+            }
+        };
+        (shown, settled)
+    }
+
     #[cfg(unix)]
     fn wait_for_file(path: &std::path::Path) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -395,9 +449,9 @@ mod tests {
             "https://github.com/o/r/pull/1;touch${{IFS}}{}",
             pwned.display()
         );
-        let msg = open_pull_request(&hostile, &env);
+        let (_, msg) = open_and_settle(&hostile, &env);
         assert!(msg.starts_with("Could not open"), "{msg}");
-        let msg = open_pull_request("https://github.com/o/r/pull/1", &env);
+        let (_, msg) = open_and_settle("https://github.com/o/r/pull/1", &env);
         assert!(
             msg.starts_with("Pull request: https://github.com/o/r/pull/1 (could not open"),
             "{msg}"
@@ -427,7 +481,11 @@ mod tests {
             browser: Some(script.display().to_string()),
             display: false,
         };
-        let msg = open_pull_request("https://github.com/o/r/pull/12?tab=files", &env);
+        let (shown, msg) = open_and_settle("https://github.com/o/r/pull/12?tab=files", &env);
+        assert_eq!(
+            shown,
+            "Opening https://github.com/o/r/pull/12 in the browser"
+        );
         assert_eq!(msg, "Opened https://github.com/o/r/pull/12");
         assert_eq!(
             wait_for_file(&record),
@@ -449,7 +507,11 @@ mod tests {
             browser: Some(script.display().to_string()),
             display: false,
         };
-        let msg = open_pull_request("https://github.com/o/r/pull/3", &env);
+        let (shown, msg) = open_and_settle("https://github.com/o/r/pull/3", &env);
+        assert!(
+            !shown.starts_with("Opened"),
+            "nothing may claim Opened before the browser's exit is known; got {shown}"
+        );
         assert!(
             msg.starts_with(
                 "Pull request: https://github.com/o/r/pull/3 (could not open a browser:"
@@ -466,7 +528,11 @@ mod tests {
             browser: Some("/nonexistent/dot-agent-deck-test-browser".into()),
             display: true,
         };
-        let msg = open_pull_request("https://github.com/o/r/pull/3", &env);
+        let (shown, msg) = open_and_settle("https://github.com/o/r/pull/3", &env);
+        assert_eq!(
+            shown, msg,
+            "a program that never started has nothing to watch"
+        );
         assert!(
             msg.starts_with(
                 "Pull request: https://github.com/o/r/pull/3 (could not open a browser:"
@@ -484,7 +550,7 @@ mod tests {
             display: false,
         };
         assert_eq!(
-            open_pull_request("https://github.com/o/r/pull/4", &env),
+            open_and_settle("https://github.com/o/r/pull/4", &env).1,
             "Pull request: https://github.com/o/r/pull/4 (no display here to open a browser on)"
         );
     }

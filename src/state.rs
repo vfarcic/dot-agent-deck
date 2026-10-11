@@ -1845,6 +1845,14 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #1401: how a pull request launch from the `o` key settled — the
+    /// launch's number and the status-line message for it — waiting for the
+    /// render loop. Filled by the thread that watches the browser
+    /// ([`crate::system_browser::open_pull_request`]), which has no `UiState`,
+    /// and drained by the render loop, which shows it only while that launch
+    /// is still the latest. Only the last one is kept, as for
+    /// `pending_worktree_kept`.
+    pub pending_pull_request_launch: Option<(u64, String)>,
     /// PRD #1223: panes the daemon announced as stopped, waiting for the render
     /// loop to drop them from the `TabManager`, the pane controller and the
     /// `UiState` maps — none of which the event subscriber can reach. The
@@ -11543,6 +11551,17 @@ impl AppState {
     /// field's docs.
     pub fn queue_worktree_kept(&mut self, kept: crate::issue_dispatch_run::KeptWorktree) {
         self.pending_worktree_kept = Some(kept);
+    }
+
+    /// PRD #1401: record how pull request launch `launch` settled, for the
+    /// render loop to put on the status line.
+    pub fn queue_pull_request_launch(&mut self, launch: u64, message: String) {
+        self.pending_pull_request_launch = Some((launch, message));
+    }
+
+    /// PRD #1401: take the pending pull request launch outcome, if any.
+    pub fn take_pull_request_launch(&mut self) -> Option<(u64, String)> {
+        self.pending_pull_request_launch.take()
     }
 
     /// PRD #1223: apply the daemon's pane-closed announcement

@@ -6138,7 +6138,7 @@ async fn desktop_pr_browser_scroll(
 #[tauri::command]
 async fn desktop_pr_browser_open_external(webview: Webview) -> Result<(), String> {
     ensure_main_webview(&webview)?;
-    pr_browser::open_external(webview.app_handle())
+    pr_browser::open_external(webview.app_handle()).await
 }
 
 /// PRD #1401 — close the browser: the toolbar's Close, `Escape` in the app

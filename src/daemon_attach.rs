@@ -62,6 +62,45 @@ use crate::daemon_client::LocalEndpoint;
 pub const DAEMON_START_POLL_TIMEOUT: Duration =
     crate::login_shell::CAPTURE_TIMEOUT.saturating_add(Duration::from_secs(5));
 
+/// The environment variable through which an `e2e` build's test harness
+/// lengthens [`ensure_external_daemon_or_die`]'s poll budget, in milliseconds
+/// ([`daemon_start_poll_timeout`]). Read only by a build with the `e2e`
+/// feature; the name exists in every build so the harness and this module
+/// share one spelling.
+pub const TEST_DAEMON_START_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_TEST_DAEMON_START_TIMEOUT_MS";
+
+/// The poll budget [`ensure_external_daemon_or_die`] uses:
+/// [`DAEMON_START_POLL_TIMEOUT`], or — only under the `e2e` feature — the
+/// longer of that and [`TEST_DAEMON_START_TIMEOUT_ENV`]. The e2e harness
+/// scales the budget by the machine's load, because under an I/O stall the
+/// spawned daemon can take longer than the fixed budget to bind while being
+/// perfectly healthy (PRD #1401's `session/pr/005`). Gated on the feature
+/// rather than read from the environment in every build, the way
+/// [`crate::platform::paths`]'s `effective_current_exe` is, so a release build
+/// has no code that reads the override, and the override can only lengthen
+/// the budget, never shorten it below the daemon's pre-bind work.
+#[cfg(feature = "e2e")]
+fn daemon_start_poll_timeout() -> Duration {
+    lengthened_start_timeout(std::env::var(TEST_DAEMON_START_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// [`DAEMON_START_POLL_TIMEOUT`], or `raw_ms` milliseconds when that is a
+/// number and longer.
+#[cfg(any(test, feature = "e2e"))]
+fn lengthened_start_timeout(raw_ms: Option<&str>) -> Duration {
+    raw_ms
+        .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map_or(DAEMON_START_POLL_TIMEOUT, |test| {
+            test.max(DAEMON_START_POLL_TIMEOUT)
+        })
+}
+
+#[cfg(not(feature = "e2e"))]
+fn daemon_start_poll_timeout() -> Duration {
+    DAEMON_START_POLL_TIMEOUT
+}
+
 /// How often [`ensure_external_daemon_or_die`] re-checks for the endpoint.
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -410,7 +449,8 @@ pub fn via_daemon_enabled() -> bool {
 /// stderr and exits nonzero — there is no in-process fallback). Polling uses
 /// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
 /// former's docs for why the budget is derived from the daemon's own pre-bind
-/// work rather than hardcoded.
+/// work rather than hardcoded. An `e2e` build may lengthen it
+/// ([`daemon_start_poll_timeout`]).
 pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
@@ -419,7 +459,7 @@ pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
         DAEMON_START_POLL_INTERVAL,
-        DAEMON_START_POLL_TIMEOUT,
+        daemon_start_poll_timeout(),
     )
     .await
 }
@@ -427,6 +467,24 @@ pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1401: the e2e harness's override lengthens the lazy start's budget
+    /// and never shortens it below the production one; anything that is not a
+    /// number leaves the production budget alone.
+    #[test]
+    fn the_test_start_timeout_only_lengthens_the_budget() {
+        assert_eq!(
+            lengthened_start_timeout(Some("45000")),
+            Duration::from_secs(45)
+        );
+        for raw in [None, Some("1000"), Some("0"), Some(""), Some("soon")] {
+            assert_eq!(
+                lengthened_start_timeout(raw),
+                DAEMON_START_POLL_TIMEOUT,
+                "{raw:?}"
+            );
+        }
+    }
 
     /// The launcher's poll budget must strictly exceed the daemon's own
     /// worst-case *pre-bind* budget, because the daemon runs the login-shell
