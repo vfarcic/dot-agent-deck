@@ -1115,7 +1115,10 @@ enum EndCheck {
 /// during this check, and one admitted before it was waited for. The ledger's
 /// binding is compared with `held` again under the same ledger lock that
 /// ends the unit, so a unit whose binding moved anyway is reported
-/// [`EndCheck::Moved`] rather than ended behind a live successor.
+/// [`EndCheck::Moved`] rather than ended behind a live successor. An
+/// orchestration's unit ends only once its instance is finished
+/// ([`AgentPtyRegistry::seal_instance_if_empty`]), which is what keeps a fresh
+/// role from joining it when this close held one generation, not the instance.
 async fn end_unit_if_nothing_remains(
     unit_id: &str,
     held: &Scope,
@@ -1130,13 +1133,12 @@ async fn end_unit_if_nothing_remains(
     if !enumerate(held, registry).is_empty() || !respawning(held, registry).is_empty() {
         return EndCheck::Remains;
     }
-    #[cfg(test)]
-    registry.pause_point("close-end-check").await;
     if let Scope::Instance(instance) = held {
-        // The instance's admission state is finished, so nothing can join it
-        // any more: a role still registered for a pane no generation holds is
-        // a dead registration (a respawn whose replacement failed before this
-        // close, say), not a member. Take it down, so it neither routes a
+        // No record of the instance is left and none is mid-respawn, so a
+        // role still registered for a pane no generation holds is a dead
+        // registration (a respawn whose replacement failed before this close,
+        // say), not a member: a role that joins registers only after its
+        // generation holds the pane. Take it down, so it neither routes a
         // delegate to nothing nor keeps the unit from ending.
         let mut state = state.write().await;
         let dead: Vec<String> = state
@@ -1155,6 +1157,19 @@ async fn end_unit_if_nothing_remains(
         if in_state {
             return EndCheck::Remains;
         }
+    }
+    #[cfg(test)]
+    registry.pause_point("close-end-check").await;
+    // A `--pane` close of an orchestration's last role holds only that
+    // generation's admission state, so a fresh role may still join the
+    // instance. The unit ends only together with finishing the instance, in
+    // one registry lock hold that sees a role published before it and refuses
+    // one publishing after: an ended unit never sits beside a live role of its
+    // instance, and a role that joined in time keeps the unit live.
+    if let Scope::Instance(instance) = held
+        && !registry.seal_instance_if_empty(instance)
+    {
+        return EndCheck::Remains;
     }
     let mut records = registry.dispatched_units();
     match records.get(unit_id).map(scope_of_unit) {
@@ -1542,6 +1557,10 @@ async fn close_one(
         // The report may list fewer panes than were stopped.
         if let Some(pane) = out.panes.get_mut(index) {
             pane.stopped = Some(result.is_ok());
+        }
+        #[cfg(test)]
+        if index == 0 {
+            registry.pause_point("close-after-first-stop").await;
         }
         if let Err(error) = result {
             survivors.push(
@@ -3282,6 +3301,154 @@ mod tests {
         assert!(!wt.exists());
         assert!(!deck.live(&w));
         assert!(deck.registry.dispatched_units().get(&id).is_none());
+        deck.shutdown().await;
+    }
+
+    /// Start a role of the instance `orch` in `pane`, the way `pane spawn`
+    /// joins one: through the attach socket, with the instance's membership.
+    async fn join_instance(
+        deck: &Deck,
+        orch: &str,
+        pane: &str,
+    ) -> Result<String, crate::daemon_client::ClientError> {
+        let cwd = deck.dir.path().to_string_lossy().into_owned();
+        deck.client
+            .start_agent(StartAgentOptions {
+                command: Some("sleep 30".to_string()),
+                cwd: Some(cwd.clone()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "team".to_string(),
+                    role_index: 1,
+                    role_name: format!("coder-{pane}"),
+                    is_start_role: false,
+                    orchestration_cwd: Some(cwd),
+                    display_title: None,
+                    orchestration_id: Some(orch.to_string()),
+                }),
+                ..StartAgentOptions::default()
+            })
+            .await
+    }
+
+    /// Whether any live agent is a role of the instance `orch`.
+    fn instance_has_live_role(deck: &Deck, orch: &str) -> bool {
+        deck.registry.agent_records().iter().any(|r| {
+            crate::agent_pty::orchestration_instance_of(r.tab_membership.as_ref()) == Some(orch)
+                && deck.live(&r.id)
+        })
+    }
+
+    /// Scenario: a dispatched orchestration's last live role is closed by
+    /// `--pane`, beside a dead role registration, so its stop leaves the unit
+    /// live and the close's final end check decides. Paused inside that
+    /// check, a new role joins the instance, as `pane spawn` does. The close
+    /// resumes and does not end the unit behind the new role: the pane it was
+    /// asked for is reported closed, the unit stays live, and the new role
+    /// runs. Closing that role then ends the unit, and no role joins after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_role_joining_during_a_last_role_pane_close_keeps_the_unit_live() {
+        let deck = Deck::new().await;
+        let o = deck
+            .start("pe-o", "sleep 30", Some(("orch-pe", "orchestrator", true)))
+            .await;
+        let id = deck.orch_unit("team-pe", ("disp", "nobody"), "orch-pe", "pe-o", &o);
+        deck.report_done("pe-o", &o);
+        deck.state.write().await.register_orchestration_role(
+            "pe-dead",
+            "ghost",
+            false,
+            crate::state::OrchestrationIdentity {
+                id: "orch-pe".to_string(),
+                name: "team".to_string(),
+            },
+            None,
+        );
+        let (reached, release) = deck.registry.pause_at_for_test("close-end-check");
+        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+        let close = close_in_background(&deck, pane("pe-o"), None, true);
+        reached
+            .await
+            .expect("the close reaches its final end check");
+        assert!(!deck.live(&o));
+        assert!(
+            deck.registry.dispatched_units().get(&id).is_some(),
+            "precondition: the stop left the unit for the end check"
+        );
+        let joined = join_instance(&deck, "orch-pe", "pe-new")
+            .await
+            .expect("the instance is open while its last role's pane closes");
+        let _ = release.send(());
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(target.error, None, "{target:?}");
+        assert_eq!(target.worktree_verdict, None, "the unit still runs there");
+        assert!(deck.live(&joined));
+        assert!(
+            deck.registry.dispatched_units().get(&id).is_some(),
+            "the unit is not ended behind its live role"
+        );
+        assert!(!deck.registry.is_instance_closing("orch-pe"));
+
+        let report = deck.close(pane("pe-new"), None, true, false).await;
+        assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        let refused = join_instance(&deck, "orch-pe", "pe-late")
+            .await
+            .expect_err("no role joins an instance whose unit ended");
+        assert!(
+            refused
+                .to_string()
+                .contains(crate::agent_pty::INSTANCE_CLOSING_REASON),
+            "{refused}"
+        );
+        assert!(!instance_has_live_role(&deck, "orch-pe"));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: closing one role of a dispatched orchestration by `--pane`
+    /// leaves the instance open, so a new role still joins it. Closing the
+    /// last role by `--pane` ends the unit through that role's stop, and from
+    /// then on a role that tries to join the instance is refused: an ended
+    /// unit never has a live role.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_last_role_closed_by_pane_ends_the_unit_and_its_instance() {
+        let deck = Deck::new().await;
+        let o = deck
+            .start("pf-o", "sleep 30", Some(("orch-pf", "orchestrator", true)))
+            .await;
+        let w = deck
+            .start("pf-w", "sleep 30", Some(("orch-pf", "coder", false)))
+            .await;
+        let id = deck.orch_unit("team-pf", ("disp", "nobody"), "orch-pf", "pf-o", &o);
+        deck.report_done("pf-o", &o);
+        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+
+        let report = deck.close(pane("pf-o"), None, true, false).await;
+        assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
+        assert!(deck.registry.dispatched_units().get(&id).is_some());
+        let joined = join_instance(&deck, "orch-pf", "pf-new")
+            .await
+            .expect("closing a role that is not the last leaves the instance open");
+
+        for (p, agent) in [("pf-w", &w), ("pf-new", &joined)] {
+            let report = deck.close(pane(p), None, true, false).await;
+            let target = &report.targets[0];
+            assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+            assert!(!deck.live(agent));
+        }
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        let refused = join_instance(&deck, "orch-pf", "pf-late")
+            .await
+            .expect_err("no role joins an instance whose unit ended");
+        assert!(
+            refused
+                .to_string()
+                .contains(crate::agent_pty::INSTANCE_CLOSING_REASON),
+            "{refused}"
+        );
+        assert!(!instance_has_live_role(&deck, "orch-pf"));
         deck.shutdown().await;
     }
 

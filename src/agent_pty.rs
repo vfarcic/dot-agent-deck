@@ -7300,10 +7300,7 @@ impl Drop for InstanceCloseGuard {
         };
         inner.closing_instances.remove(&self.instance);
         if self.finished {
-            inner.ended_instances.push_back(self.instance.clone());
-            while inner.ended_instances.len() > MAX_ENDED_INSTANCES {
-                inner.ended_instances.pop_front();
-            }
+            AgentPtyRegistry::mark_instance_ended_locked(&mut inner, &self.instance);
         }
     }
 }
@@ -16577,6 +16574,50 @@ impl AgentPtyRegistry {
             .any(|ended| ended == instance)
     }
 
+    /// PRD #1589: record `instance` as finished, so it refuses every spawn
+    /// and respawn into it for the daemon's lifetime. Bounded by
+    /// [`MAX_ENDED_INSTANCES`]; an instance already recorded is not recorded
+    /// twice.
+    fn mark_instance_ended_locked(inner: &mut RegistryInner, instance: &str) {
+        if inner.ended_instances.iter().any(|ended| ended == instance) {
+            return;
+        }
+        inner.ended_instances.push_back(instance.to_string());
+        while inner.ended_instances.len() > MAX_ENDED_INSTANCES {
+            inner.ended_instances.pop_front();
+        }
+    }
+
+    /// PRD #1589: finish `instance` if nothing of it is left in this registry
+    /// — no record, live or exited, and no respawn in its remove→replace
+    /// window — and answer whether it did. The check and the finishing are one
+    /// lock hold, the one a spawn publishes under and re-checks
+    /// [`Self::instance_refuses_join_locked`] in: so a role that published
+    /// first is seen here and keeps the instance open, and one publishing after
+    /// is refused, its child killed. This is what lets a `close` end an
+    /// orchestration's unit without taking its admission state for the whole
+    /// close — a `--pane` close of one role — and still never leave an ended
+    /// unit beside a live role of its instance.
+    pub fn seal_instance_if_empty(&self, instance: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let member = |membership: Option<&TabMembership>| {
+            orchestration_instance_of(membership) == Some(instance)
+        };
+        if inner
+            .agents
+            .values()
+            .any(|agent| member(agent.tab_membership.as_ref()))
+            || inner
+                .respawning_members
+                .values()
+                .any(|record| member(record.tab_membership.as_ref()))
+        {
+            return false;
+        }
+        Self::mark_instance_ended_locked(&mut inner, instance);
+        true
+    }
+
     /// PRD #1589 test seam: the next time [`Self::pause_point`] is reached
     /// with `name`, it reports on the returned receiver and waits for the
     /// returned sender.
@@ -16695,24 +16736,40 @@ impl AgentPtyRegistry {
                 )
             })
         });
-        let mut units = self.dispatched_units();
-        let unit = units.unit_of_generation(
-            record.pane_id_env.as_deref(),
-            &record.id,
-            instance.as_deref(),
-        )?;
-        let ends = match &unit.kind {
-            crate::dispatched_units::UnitKind::Single { .. } => true,
-            crate::dispatched_units::UnitKind::Orchestration { .. } => {
-                !instance_has_records && !instance_registered_in_state
+        // Read and released before the registry lock is taken again below:
+        // the ledger is never held while taking it.
+        let (id, orchestration) = {
+            let units = self.dispatched_units();
+            let unit = units.unit_of_generation(
+                record.pane_id_env.as_deref(),
+                &record.id,
+                instance.as_deref(),
+            )?;
+            (
+                unit.id.clone(),
+                matches!(
+                    unit.kind,
+                    crate::dispatched_units::UnitKind::Orchestration { .. }
+                ),
+            )
+        };
+        let ends = match instance.as_deref() {
+            _ if !orchestration => true,
+            _ if instance_registered_in_state => false,
+            // A close ends the unit only together with finishing its instance,
+            // under the lock a spawn publishes under, so no role can join an
+            // instance whose unit this close ended (PRD #1589).
+            Some(instance) if reason == crate::dispatched_units::EndReason::ClosedByVerb => {
+                self.seal_instance_if_empty(instance)
             }
+            _ => !instance_has_records,
         };
         if !ends {
             return None;
         }
-        let id = unit.id.clone();
-        units.end(&id, reason, chrono::Utc::now().timestamp_millis());
-        Some(id)
+        self.dispatched_units()
+            .end(&id, reason, chrono::Utc::now().timestamp_millis())
+            .map(|_| id)
     }
 
     /// Issue #1077: whether this daemon has EVER issued a hook capability token
