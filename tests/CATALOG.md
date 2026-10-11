@@ -7937,6 +7937,34 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/013 — The doorbell policy rings only when every guard passes.
+- **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
+- **Agent:** none.
+- **Asserts:** an empty queue never rings; a queued message is held while the agent is not Idle, while a draft is pending, while a waiter is armed, and while a Native announcement is inside its arm grace; it rings, naming the oldest queued id, once all pass.
+- **Does not assert:** the daemon wiring or the bytes written (`inbox/doorbell/001–012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/doorbell/014 — One ring covers the queue, re-rings on the schedule, and a fetch owes one cleanup CR.
+- **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
+- **Agent:** none.
+- **Asserts:** two queued messages share one ring; re-rings come exactly at each schedule delay with the last delay repeating and a pre-ring CR while the ring is outstanding; fetching a covered message owes one cleanup CR while the rest keep their schedule; an emptied queue restarts the schedule for the next message.
+- **Does not assert:** the daemon wiring or the bytes written (`inbox/doorbell/005`, `007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/doorbell/015 — The cleanup CR waits for a draft and for Idle but not for an armed waiter.
+- **Layer:** L1 unit (`src/doorbell.rs`).
+- **Agent:** none.
+- **Asserts:** an owed cleanup CR is held while a draft is pending or the agent is busy, and sent while a waiter is armed (the component that armed after the ring is the case it exists for).
+- **Does not assert:** the daemon wiring (`inbox/doorbell/011`).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/doorbell/016 — The doorbell's environment overrides parse, and bad values keep the defaults.
+- **Layer:** L1 unit (`src/doorbell.rs`, injected lookup).
+- **Agent:** none.
+- **Asserts:** `DOT_AGENT_DECK_DOORBELL_TICK_MS`, `DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS` (ordered, last delay repeats) and `DOT_AGENT_DECK_INBOX_ARM_GRACE_MS` replace the defaults; zero or unparsable values leave them; the fixed line is exactly the documented text.
+- **Does not assert:** reading the real process environment.
+- **Platform coverage:** mac+linux+windows.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:

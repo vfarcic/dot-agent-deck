@@ -143,6 +143,21 @@ struct Waiter {
 #[derive(Debug, Clone, Copy)]
 struct Announcement {
     wake: InboxWake,
+    /// When it was announced: a `Native` component's arm grace runs from here.
+    at: Instant,
+}
+
+/// PRD #1666 S4: what the doorbell needs to know about one agent generation's
+/// inbox. See [`InboxHub::doorbell_facts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DoorbellFacts {
+    /// The ids of the agent's `queued` messages, oldest first.
+    pub queued: Vec<String>,
+    /// Live waiters armed for the agent.
+    pub armed: usize,
+    /// When the agent's component last announced `Native` wake-up, if that is
+    /// what it announced.
+    pub native_announced_at: Option<Instant>,
 }
 
 type AgentKey = (String, String);
@@ -332,7 +347,10 @@ impl InboxHub {
     pub fn announce(&self, pane_id: &str, agent_id: &str, wake: InboxWake) {
         self.lock().announced.insert(
             (pane_id.to_string(), agent_id.to_string()),
-            Announcement { wake },
+            Announcement {
+                wake,
+                at: Instant::now(),
+            },
         );
     }
 
@@ -342,6 +360,50 @@ impl InboxHub {
             .announced
             .get(&(pane_id.to_string(), agent_id.to_string()))
             .map(|a| a.wake)
+    }
+
+    /// PRD #1666 S4: the panes holding at least one `queued` message, for the
+    /// doorbell's tick.
+    pub fn panes_with_queued(&self) -> Vec<String> {
+        let st = self.lock();
+        let mut panes: Vec<String> = st
+            .inbox
+            .all()
+            .iter()
+            .filter(|m| m.state == MessageState::Queued)
+            .filter_map(|m| m.recipient.as_ref().map(|r| r.pane_id.clone()))
+            .collect();
+        panes.sort();
+        panes.dedup();
+        panes
+    }
+
+    /// PRD #1666 S4: the doorbell's view of `agent_id` in `pane_id` — its queued
+    /// messages (only those this agent generation may take), its armed waiters
+    /// and its announcement.
+    pub fn doorbell_facts(&self, pane_id: &str, agent_id: &str) -> DoorbellFacts {
+        let st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        DoorbellFacts {
+            queued: st
+                .inbox
+                .list(pane_id)
+                .into_iter()
+                .filter(|m| {
+                    m.state == MessageState::Queued
+                        && m.recipient
+                            .as_ref()
+                            .is_some_and(|r| r.admits(pane_id, agent_id))
+                })
+                .map(|m| m.id.as_str().to_string())
+                .collect(),
+            armed: st.waiters.get(&key).map_or(0, Vec::len),
+            native_announced_at: st
+                .announced
+                .get(&key)
+                .filter(|a| a.wake == InboxWake::Native)
+                .map(|a| a.at),
+        }
     }
 
     /// Hand `agent_id` its queued messages, rendered, up to `max_chars`; with

@@ -11143,6 +11143,24 @@ impl AppState {
         }
     }
 
+    /// PRD #1666: the status of the session [`Self::live_session_for`] picks
+    /// for `agent_id` in `pane_id`, without building its snapshot. `None` while
+    /// no hook has reported for that agent generation — the doorbell reads that
+    /// as Unknown and stays silent.
+    pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == Some(pane_id)
+            })
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.status.clone())
+    }
+
     /// Register a pane ID as managed by our app.
     ///
     /// Issue #601: registering a pane is the process asserting that the pane

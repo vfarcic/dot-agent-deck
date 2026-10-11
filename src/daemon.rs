@@ -871,6 +871,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
     let state = daemon.state;
+    // PRD #1666 S4: the doorbell, for agents no inbox component is armed for.
+    let doorbell = crate::doorbell::spawn(
+        Arc::clone(&pty_registry),
+        state.clone(),
+        crate::doorbell::DoorbellConfig::from_env(),
+    );
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
     // this event names?" against the registry rather than against a set it
@@ -1219,6 +1225,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     codex_rollout_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
+    doorbell.abort();
     if let Some(h) = orphan_handle {
         h.abort();
     }

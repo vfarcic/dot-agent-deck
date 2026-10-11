@@ -2539,6 +2539,21 @@ impl GuardedSendDetail {
     }
 }
 
+/// PRD #1666 S4: what [`AgentPtyRegistry::write_doorbell`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorbellWrite {
+    /// Every byte went in.
+    Written,
+    /// The user has an unsent draft in the pane; nothing was written.
+    DraftPending,
+    /// The pane is gone or now belongs to another agent; nothing was written.
+    NotOwner,
+    /// The pane's PTY is not taking input; nothing was written.
+    NotReading,
+    /// A write failed part-way or could not be encoded.
+    Failed,
+}
+
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
 /// atomically for the identity-guarded send path. Bundles the shared writer with
 /// the identity/liveness needed to re-validate after the writer lock is acquired.
@@ -11756,6 +11771,96 @@ impl AgentPtyRegistry {
         )
         .await
         .map(|sent| sent.detail.outcome())
+    }
+
+    /// PRD #1666 S4: the doorbell's write — the one automatic writer the inbox
+    /// keeps. Writes, in order and under one hold of the pane's writer: a bare
+    /// `\r` when `pre_cr` (submitting a ring a previous write may have left in
+    /// the box), then `line` encoded as a single line followed by
+    /// [`SUBMIT_DELAY`] and `\r`. A `pre_cr` followed by a line waits
+    /// [`SUBMIT_DELAY`] between them.
+    ///
+    /// Guards, all re-checked under the writer, so nothing typed or respawned
+    /// between the caller's decision and the write slips through:
+    ///
+    /// * **identity** — `expected_agent_id` must still own `pane_id` and run;
+    /// * **draft** — no ring while the user has an unsent draft in the pane
+    ///   ([`Self::draft_pending`]). There is deliberately NO cap: the doorbell
+    ///   waits for the user however long they take, and the caller re-asks on
+    ///   its next tick.
+    ///
+    /// No echo wait, no screen read and no retry: whether the message arrived is
+    /// the inbox's to say, not the screen's.
+    pub async fn write_doorbell(
+        &self,
+        pane_id: &str,
+        expected_agent_id: &str,
+        pre_cr: bool,
+        line: Option<&str>,
+    ) -> DoorbellWrite {
+        let owner = |target: &PaneWriterTarget| {
+            target.agent_id == expected_agent_id && !target.exited.load(Ordering::SeqCst)
+        };
+        let Some(target) = self.writer_target_for_pane(pane_id) else {
+            return DoorbellWrite::NotOwner;
+        };
+        if !owner(&target) {
+            return DoorbellWrite::NotOwner;
+        }
+        if self.draft_pending(pane_id) {
+            return DoorbellWrite::DraftPending;
+        }
+        let payload = match line.map(encode_pane_payload).transpose() {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%error, pane_id = %pane_id, "doorbell line could not be encoded");
+                return DoorbellWrite::Failed;
+            }
+        };
+        let stall = self.pty_write_stall_bound();
+        let Some(w) = within_real_time(stall, target.writer.lock()).await else {
+            return DoorbellWrite::NotReading;
+        };
+        if within_real_time(stall, w.until_idle()).await.is_none() {
+            return DoorbellWrite::NotReading;
+        }
+        // Under the writer: user bytes are recorded while it is held, so these
+        // reads cannot miss a keystroke already in the PTY.
+        match self.writer_target_for_pane(pane_id) {
+            Some(current) if owner(&current) && current.agent_id == target.agent_id => {}
+            _ => return DoorbellWrite::NotOwner,
+        }
+        if self.draft_pending(pane_id) {
+            return DoorbellWrite::DraftPending;
+        }
+        let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
+        if pre_cr {
+            steps.push(b"\r");
+        }
+        if let Some(payload) = payload.as_deref() {
+            steps.push(payload);
+            steps.push(b"\r");
+        }
+        let mut sink = w.daemon(stall, Arc::new(AtomicBool::new(false)));
+        for (n, bytes) in steps.into_iter().enumerate() {
+            if n > 0 {
+                tokio::time::sleep(SUBMIT_DELAY).await;
+            }
+            match sink.write_tracked(bytes).await {
+                WriteProgress::Complete => {}
+                _ => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        agent_id = %expected_agent_id,
+                        step = n,
+                        "doorbell write did not complete"
+                    );
+                    return DoorbellWrite::Failed;
+                }
+            }
+            let _ = sink.flush_tracked().await;
+        }
+        DoorbellWrite::Written
     }
 
     /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
