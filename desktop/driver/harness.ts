@@ -234,6 +234,8 @@ export type DeckOptions = {
   daemonFirst: boolean;
   /** `default_command` in the deck's `config.toml`, which seeds New agent's Command field. */
   defaultCommand?: string;
+  /** Explicit process overrides for a native-driver scenario (e.g. a system-browser recorder). */
+  env?: NodeJS.ProcessEnv;
 };
 
 export class Deck {
@@ -293,6 +295,7 @@ export class Deck {
       // A backstop, not a timing assumption: a daemon this harness failed to
       // stop still exits on its own.
       DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS: "900",
+      ...options.env,
     };
   }
 

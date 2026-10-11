@@ -2206,7 +2206,7 @@ Record which decks you ran it against, and their versions, in the PR.
 
 ## The in-app pull request browser ([PRD #1401](https://github.com/vfarcic/dot-agent-deck/issues/1401))
 
-An agent whose record carries a pull request (`SessionSnapshot.pull_request`, resolved by the daemon) shows a badge on its tile and on its agent screen. Clicking it, or saying "open the PR" on the agent's screen, opens GitHub's own page for it inside the app. The code is `desktop/src-tauri/src/pr_browser.rs` (Rust) and `desktop/src/components/PullRequestBrowser.tsx` with `desktop/src/lib/prBrowser.ts` (the app's side).
+An agent whose record carries a pull request (`SessionSnapshot.pull_request`, resolved by the daemon) shows a badge on its tile and on its agent screen. Clicking it, or saying "open the PR" on the agent's screen or "open the PR for <agent>" on the overview (`open_pr`'s optional `agent_ref`, refused rather than dropped when it does not resolve — `OPEN_PR_ROW` in `voice/outcome.rs`), opens GitHub's own page for it inside the app. The code is `desktop/src-tauri/src/pr_browser.rs` (Rust) and `desktop/src/components/PullRequestBrowser.tsx` with `desktop/src/lib/prBrowser.ts` (the app's side).
 
 ### How the page is drawn
 
@@ -2257,9 +2257,13 @@ GitHub's pull request pages frame only the hosts above, so none of these gaps is
 
 The order, the lock and the failures are tested with a fake platform whose confirmation arrives seconds late, on both paths (`sign_out_with_a_browser_open_reopens_only_after_the_clear_completes`, `sign_out_with_no_browser_closes_the_hidden_webview_only_after_the_clear_completes`, `a_failed_clear_is_reported_and_nothing_reopens`, `a_clear_that_is_never_confirmed_is_a_failure_not_a_success`, `a_page_that_does_not_leave_is_never_cleared_under`, `open_is_refused_after_an_unconfirmed_clear_until_the_late_completion`). The three native calls are not reached by any automated test: the Linux one is exercised by hand (step 6 below); the macOS and Windows ones are type-checked for their targets from Linux and need the hand check on those platforms.
 
+### Real-app PR browser test
+
+`desktop/driver/pull-request.live.test.ts` (`pull_request_001`, catalog `desktop/pull-request/001`) is local opt-in coverage: from the repository root in the driver tier's environment, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh`. It needs authenticated `gh`, GitHub network access and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH); Nix WebKitGTK also needs `glib-networking` modules in `GIO_EXTRA_MODULES` for HTTPS. The real Tauri app opens the real PR from a shell agent's screen and its overview row, checks native child dimensions and visibly painted GitHub content through screenshots/OCR, exercises the toolbar, and confirms Close and toolbar- and page-focused Escape remove the view. Open in browser is checked with a URL recorder rather than a real external browser. Evidence goes under the gitignored `desktop/driver-results/pull-request-live-<pid>/`. It has passed on Linux WebKitGTK only: it does not cover macOS WKWebView, the `tauri dev` launch, sign-in persistence or real-agent work, and did not reproduce the reported macOS blank/unclosable page. That macOS investigation remains open.
+
 ### Checking it by hand
 
-No automated test reaches the native webview's placement, the real sign-in or the system browser hand-off. On each platform, with an agent whose branch has a pull request:
+The opt-in test covers initial native placement and browser controls on Linux at 96 DPI. Resizing/zoom, real sign-in, launching the system browser itself, and macOS WKWebView and Windows WebView2 still need the hand check. On each platform, with an agent whose branch has a pull request:
 
 1. Click the badge on the agent's screen. The page fills the frame under the toolbar and nothing else; resize the window and zoom (`Cmd/Ctrl` `+`/`-`) and it follows the frame.
 2. Sign in to GitHub, quit and relaunch, and open the pull request again: still signed in.
