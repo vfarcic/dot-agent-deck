@@ -203,6 +203,64 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Close dispatched units, one agent, or one orchestration.
+    ///
+    /// Name units by the name they were dispatched under, or by the unit id a
+    /// listing printed with --unit-id, or close one pane with --pane, or every
+    /// role of an orchestration with --orchestration-of. --all lists every
+    /// unit you may close and closes nothing; --all --yes lists them, then
+    /// closes exactly those.
+    ///
+    /// Refused unless --force: a dispatched unit that has not reported
+    /// `work-done --done`, an agent that is mid-turn, and one role of a live
+    /// orchestration closed on its own. Run from an agent's pane, `close` acts
+    /// only on units that agent dispatched, never on its own pane or
+    /// orchestration, and --force does not change that.
+    ///
+    /// Exit status: 0 everything named was closed (or listed); 1 something was
+    /// refused or failed; 2 the running daemon is too old for `close`; 3 no
+    /// daemon is running.
+    Close {
+        /// Dispatched units to close, by the name given to `dispatch`.
+        #[arg(conflicts_with_all = ["unit_ids", "pane", "orchestration_of", "all"])]
+        units: Vec<String>,
+        /// Dispatched units to close, by the unit id `close --all` (or an
+        /// `ambiguous` refusal) printed. Repeat it, or give several ids.
+        #[arg(
+            long = "unit-id",
+            value_name = "ID",
+            num_args = 1..,
+            conflicts_with_all = ["pane", "orchestration_of", "all"]
+        )]
+        unit_ids: Vec<String>,
+        /// Close the one agent in this pane.
+        #[arg(long, value_name = "PANE_ID", conflicts_with_all = ["orchestration_of", "all"])]
+        pane: Option<String>,
+        /// Close every role of the orchestration this pane belongs to.
+        #[arg(
+            long = "orchestration-of",
+            value_name = "PANE_ID",
+            conflicts_with = "all"
+        )]
+        orchestration_of: Option<String>,
+        /// List every unit you may close. Closes nothing unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all: close the units it listed.
+        #[arg(long, requires = "all")]
+        yes: bool,
+        /// Show what would be closed, and what would be refused, without
+        /// closing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Close even a unit that has not reported, an agent that is mid-turn,
+        /// or one role of a live orchestration.
+        #[arg(long)]
+        force: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Acknowledge that a delegated task reached you, so the deck stops
     /// re-sending its pointer. Run it with the delivery id your task file names
     /// (`d-` plus 8 hex characters). Always exits 0: a failed acknowledgement
@@ -1626,6 +1684,30 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Some(Commands::Close {
+            units,
+            unit_ids,
+            pane,
+            orchestration_of,
+            all,
+            yes,
+            dry_run,
+            force,
+            json,
+        }) => {
+            let args = dot_agent_deck::close_cli::CloseArgs {
+                units,
+                unit_ids,
+                pane,
+                orchestration_of,
+                all,
+                yes,
+                dry_run,
+                force,
+                json,
+            };
+            run_close_cli(args)
         }
         Some(Commands::Docs { topic, all }) => {
             use dot_agent_deck::embedded_docs::{self, DocsOutput};
@@ -3337,6 +3419,27 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
         print!("{}", format_human(&agents));
         ExitCode::SUCCESS
     }
+}
+
+/// `dot-agent-deck close` — PRD #1589. Connect-only: it never starts a daemon,
+/// because closing agents on a daemon it just started would close nothing. The
+/// request building and rendering live in [`dot_agent_deck::close_cli`].
+#[tokio::main]
+async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let output = dot_agent_deck::close_cli::identity_error_output(args.json, message);
+            print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
+            return ExitCode::from(output.code);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    let output = dot_agent_deck::close_cli::run_close(&client, &args, &identity).await;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
 }
 
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).

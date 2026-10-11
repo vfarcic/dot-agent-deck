@@ -470,16 +470,38 @@ fn orchestration_role_line(role: &OrchestrationRoleRecord) -> String {
 /// `cwd` are what say *whose work* was running; `cwd` in particular is the only
 /// field here that distinguishes two panes of different dispatched units when
 /// neither holds an orchestration role.
-fn teardown_agent_line(agent: &AgentRecord) -> String {
-    let dash = |v: Option<&str>| v.filter(|s| !s.is_empty()).unwrap_or("-").to_string();
+///
+/// PRD #1589 (auditor S5): every value but the registry-minted `id` is escaped
+/// and bounded on its own — a directory name may legally carry a newline, an
+/// ESC or a bidi control, and this line lands in the daemon's log and in
+/// `close`'s disclosure. Per value rather than over the whole line, so a long
+/// path cannot push another pane out of the inventory. A pane id the registry
+/// retains is at most [`crate::agent_pty::PANE_ID_ENV_MAX_LEN`] plain
+/// characters, so escaping leaves it exactly as it was.
+pub(crate) fn teardown_agent_line(agent: &AgentRecord) -> String {
+    let shown = |v: Option<&str>, max: usize| match v.filter(|s| !s.is_empty()) {
+        Some(v) => crate::config_validation::escape_field_for_log(v, max),
+        None => "-".to_string(),
+    };
     format!(
         "{} pane={} label={} cwd={}",
         agent.id,
-        dash(agent.pane_id_env.as_deref()),
-        dash(agent.display_name.as_deref()),
-        dash(agent.cwd.as_deref()),
+        shown(
+            agent.pane_id_env.as_deref(),
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS
+        ),
+        shown(
+            agent.display_name.as_deref(),
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS
+        ),
+        shown(agent.cwd.as_deref(), MAX_LOGGED_PATH_CHARS),
     )
 }
+
+/// The most characters of a path [`teardown_agent_line`] and the worktree
+/// cleanup log keep. Longer than an identifier's bound because a real worktree
+/// path is.
+pub(crate) const MAX_LOGGED_PATH_CHARS: usize = 512;
 
 /// Issue #1109: render what an UNGUARDED teardown is destroying, for the
 /// daemon's own log. `None` when there is nothing to name.
@@ -1177,6 +1199,27 @@ mod tests {
     /// The other side of the same rule: a role map that WAS read and was empty
     /// must not carry the permanence sentence, or every clean single-agent stop
     /// claims a loss it did not cause.
+    /// Scenario: an agent whose working directory carries a newline, a CR, an
+    /// ESC and a bidi override, and runs far past any real path, is named in
+    /// the teardown line on one line with each of those escaped and the path
+    /// bounded — and its agent and pane ids exactly as they were.
+    #[test]
+    fn teardown_line_escapes_and_bounds_each_producer_value() {
+        let hostile =
+            String::from("/home/u/repo\nINFO forged line\r\u{1b}[2J\u{202e}") + &"x".repeat(2000);
+        let line = teardown_agent_line(&agent("42", Some("pane-7"), None, Some(&hostile)));
+        assert!(line.starts_with("42 pane=pane-7 label=- cwd="), "{line}");
+        for raw in ['\n', '\r', '\u{1b}', '\u{202e}'] {
+            assert!(!line.contains(raw), "{raw:?} must be escaped: {line:?}");
+        }
+        assert!(line.contains("repo\\nINFO"), "{line}");
+        assert!(
+            line.chars().count() < MAX_LOGGED_PATH_CHARS + 200,
+            "the path is bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
     #[test]
     fn teardown_inventory_distinguishes_an_unknown_role_map_from_an_empty_one() {
         let agents = vec![agent("12", Some("pane-12"), None, None)];

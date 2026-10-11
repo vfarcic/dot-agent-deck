@@ -91,7 +91,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 | What you see | What it means | What it does not mean |
 |---|---|---|
 | `dot-agent-deck dispatch` exits 0 | The daemon accepted the request, or gave no answer the command could check (an older daemon, or none within 5 seconds). | That a worktree was created, that a unit started, or that it got its task. The daemon answers before doing any of that. |
-| A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started and where, and usually the commit the worktree was cut from. | That the agent received its task. |
+| A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. | That the agent received its task. |
 | A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. This is the first sign its task arrived. | That the work is correct; read the report. |
 
 Any other turn beginning `dispatch:` is a failure that says why (a name already used, an orchestration the project does not define, a worktree that could not be created), and the unit did not start. If some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place and the turn says so.
@@ -134,9 +134,11 @@ Detaching the TUI or closing the desktop app does not close the dispatcher pane,
 
 ## Finish up
 
-Closing a unit's tab or card removes that unit's worktree directory. Closing the dispatcher pane removes nothing; it never owned a worktree. Your own repository is not touched either way.
+Close a unit when you are done with it: its tab or card in a client, or `dot-agent-deck close <name>` from a shell. You can also ask the dispatcher to close the units it started, for example *"close the units that have reported back"*; it runs the same command, and closes only units it dispatched. `close --all` lists what can be closed without closing anything. A unit that has not reported back, or whose agent is busy, is refused unless you add `--force`. See [Closing Agents](closing-agents.md) for the details.
 
-If the unit's worktree has **uncommitted changes** when you close it, the directory is kept on disk so the work can be recovered. The close confirmation warns when that is about to happen and names the directory; after the close, the status line reports what actually happened. A unit whose worktree turned out to be clean is removed without a message.
+Closing a unit removes that unit's worktree directory. Closing the dispatcher pane removes nothing; it never owned a worktree, and the units it started keep running. Your own repository is not touched either way.
+
+If the unit's worktree has **uncommitted changes** when you close it, the directory is kept on disk so the work can be recovered. In the TUI, the close confirmation warns when that is about to happen and names the directory, and after the close the status line reports what actually happened; a unit whose worktree turned out to be clean is removed without a message. The desktop app does not currently say when a worktree is kept; check with `dot-agent-deck worktree list`. `close` reports what happened to each worktree in its output.
 
 The branch `agent/dispatch-<name>` is not deleted when a unit is closed, because it may hold committed work. Dispatching the same name again is therefore refused while that branch exists. Delete it when you are done (`git branch -D agent/dispatch-<name>`), or use a different name.
 
