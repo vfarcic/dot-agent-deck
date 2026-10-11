@@ -30,6 +30,10 @@ export default defineConfig({
     // them.
     exclude: [...configDefaults.exclude, "e2e/**", "driver/**"],
     setupFiles: ["./src/test/setup.ts"],
+    // Bound concurrent jsdom bootstraps on shared development hosts. Letting
+    // the pool use every available core timed out 15 worker startups while
+    // Rust builds were active, before those files could run any assertions.
+    maxWorkers: 4,
     // A ceiling, not a pace: a passing test waits no longer for it. vitest's
     // default of 5s is an idle machine's budget, and under the parallel load
     // this repo's agents put on one box (load averages of 90 to 130 on 16

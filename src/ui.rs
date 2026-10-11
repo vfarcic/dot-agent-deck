@@ -373,6 +373,10 @@ pub enum UiMode {
     /// selection emits [`Action::ConfirmCloseSelected`] and performs the
     /// teardown. The selection index lives in `UiState::close_confirm`.
     CloseConfirm,
+    /// PRD #1258 M3: the "Host of this deck" overlay — the attached daemon's
+    /// host sample (disk per watched role, load per core, memory, sample age).
+    /// Read-only; Escape closes it.
+    HostMetrics,
     /// Issue #1635: the upgrade dialog, opened by the `open_upgrade` key
     /// (default `u`) or a click on the footer's update badge. Its state lives
     /// in `UiState::upgrade_dialog`.
@@ -2616,6 +2620,28 @@ struct UiState {
     /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
     /// (tests), and the form then seeds from [`Self::last_command`] as before.
     last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
+    /// PRD #1258 M3 — what the host overlay shows: the attached daemon's last
+    /// answer, or that one is on its way.
+    host_metrics: HostMetricsView,
+    /// PRD #1258 M3 — when [`Self::host_metrics`] last received an answer, so the
+    /// open overlay knows when to ask again (see [`poll_host_metrics`]). `None`
+    /// before the first answer of an opening.
+    host_metrics_received_at: Option<std::time::Instant>,
+    /// PRD #1258 M3 — fetches the host sample off the TUI thread. `None`
+    /// without a daemon-backed controller (render seams), where the overlay
+    /// shows whatever [`Self::host_metrics`] already holds.
+    host_metrics_reader: Option<crate::embedded_pane::HostMetricsReader>,
+}
+
+/// PRD #1258 M3 — the host overlay's content.
+#[derive(Debug, Clone, PartialEq)]
+enum HostMetricsView {
+    /// A request is on its way and nothing has come back for this opening yet.
+    Loading,
+    /// The daemon answered: its sample, or that it does not report one.
+    Report(crate::daemon_client::HostMetricsReport),
+    /// The request failed; the message says why.
+    Failed(String),
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2771,6 +2797,9 @@ impl UiState {
             last_command: None,
             pending_last_command: None,
             last_command_reader: None,
+            host_metrics: HostMetricsView::Loading,
+            host_metrics_received_at: None,
+            host_metrics_reader: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -7076,6 +7105,13 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// PRD #1258 M3: open the "Host of this deck" overlay and ask the attached
+    /// daemon for its host sample. Reached from the dashboard `host_metrics`
+    /// binding (default `m`).
+    OpenHostMetrics,
+    /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
+    /// button share this arm.
+    CloseHostMetrics,
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -9606,6 +9642,11 @@ fn handle_normal_key(
     if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
     }
+    // PRD #1258 M3: the host-of-this-deck overlay (default `m`). Needs no card,
+    // so it opens on an empty dashboard too.
+    if kb.matches(KbAction::HostMetrics, &key) {
+        return Action::OpenHostMetrics;
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if kb.matches(KbAction::OpenUpgrade, &key) {
@@ -9750,6 +9791,62 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// PRD #1258 M3: keys while the host overlay is up. Escape, `q` and the
+/// overlay's own binding close it; Ctrl+C keeps its PRD #40 safety net and
+/// opens the quit flow, as from every other modal.
+fn handle_host_metrics_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return Action::Continue;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+        || kb.matches(KbAction::HostMetrics, &key)
+    {
+        return Action::CloseHostMetrics;
+    }
+    Action::Continue
+}
+
+/// PRD #1258 M3: collect the host overlay's answer and keep it fresh while the
+/// overlay is open. Called once per pass of the event loop — the loop that
+/// already wakes every frame to drain input — so the refresh rides an existing
+/// path rather than a timer of its own, and does nothing while the overlay is
+/// closed. A new request goes out once the shown answer is older than the
+/// daemon's own cache window ([`crate::host_metrics::HOST_METRICS_MAX_AGE`]):
+/// asking sooner would only return the same cached sample. A deck that does not
+/// report host metrics is not asked again until the overlay is reopened.
+fn poll_host_metrics(ui: &mut UiState, now: std::time::Instant) {
+    let Some(reader) = ui.host_metrics_reader.clone() else {
+        return;
+    };
+    // An answer that lands after the overlay closed is taken and dropped.
+    if let Some(answer) = reader.take()
+        && ui.mode == UiMode::HostMetrics
+    {
+        ui.host_metrics = match answer {
+            Ok(report) => HostMetricsView::Report(report),
+            Err(error) => HostMetricsView::Failed(error),
+        };
+        ui.host_metrics_received_at = Some(now);
+    }
+    if ui.mode != UiMode::HostMetrics
+        || reader.in_flight()
+        || matches!(
+            ui.host_metrics,
+            HostMetricsView::Report(crate::daemon_client::HostMetricsReport::NotAvailable)
+        )
+    {
+        return;
+    }
+    let due = ui.host_metrics_received_at.is_none_or(|at| {
+        now.saturating_duration_since(at) >= crate::host_metrics::HOST_METRICS_MAX_AGE
+    });
+    if due {
+        reader.request(DAEMON_REQUEST_TIMEOUT);
+    }
 }
 
 /// Issue #142: one step of the Schedules manager selection, WRAPPING at
@@ -10968,6 +11065,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::Help
         | UiMode::DirPicker
         | UiMode::NewPaneForm
+        // PRD #1258 M3: the host overlay sits over the dashboard like help.
+        | UiMode::HostMetrics
         // Issue #142: the Schedules manager is a topmost modal as well.
         // The wheel over it belongs to ITS list (handled before this guard),
         // never to whatever pane the centered dialog happens to cover.
@@ -12587,6 +12686,25 @@ fn dispatch_action(
         // `s`/`S` key and the `[Schedules s]` button-bar button. Loads the
         // schedules from the global config and snapshots which currently have a
         // live tab/agent (for the status indicator), then switches mode.
+        // PRD #1258 M3: open the host overlay. With a daemon-backed controller
+        // the view starts at "Reading…" and the request goes out off the TUI
+        // thread; `poll_host_metrics` puts the answer on screen when it lands.
+        // Without one (the render seams) the overlay shows what it was given.
+        Action::OpenHostMetrics => {
+            ui.mode = UiMode::HostMetrics;
+            if let Some(reader) = ui.host_metrics_reader.clone() {
+                // An answer left over from an earlier opening is stale now.
+                let _ = reader.take();
+                ui.host_metrics = HostMetricsView::Loading;
+                ui.host_metrics_received_at = None;
+                reader.request(DAEMON_REQUEST_TIMEOUT);
+            }
+        }
+        Action::CloseHostMetrics => {
+            if ui.mode == UiMode::HostMetrics {
+                ui.mode = UiMode::Normal;
+            }
+        }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
@@ -13486,6 +13604,7 @@ fn handle_key_event(
             }
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
+            UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -13690,6 +13809,11 @@ pub fn run_tui(
         .as_any()
         .downcast_ref::<EmbeddedPaneController>()
         .map(EmbeddedPaneController::last_command_reader);
+    // PRD #1258 M3: the host overlay asks the same daemon, on the same client.
+    ui.host_metrics_reader = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::host_metrics_reader);
     if let (Some(reader), Some(command)) = (
         ui.last_command_reader.as_ref(),
         ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
@@ -15265,6 +15389,9 @@ pub fn run_tui(
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
+        // PRD #1258 M3: land the host overlay's answer and refresh it while open.
+        poll_host_metrics(&mut ui, std::time::Instant::now());
+
         // PRD #20 R20-007 (finding #10): consume any typed stream rejections the
         // daemon pushed asynchronously (a key/paste refused because the focused
         // target went non-live / exited / rebound). Surface honest feedback and
@@ -15642,6 +15769,9 @@ pub fn run_tui(
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
+                        // PRD #1258 M3: the host overlay's [Close] button lives
+                        // in `modal_button_rects`, like help's.
+                        | UiMode::HostMetrics
                         // PRD #127 finding #4: the Schedules dialog is a
                         // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
                         // buttons live in `modal_button_rects` and any miss is
@@ -17502,6 +17632,16 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     ui.form_button_rects.clear();
     if ui.mode == UiMode::Help {
         ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
+    }
+    if ui.mode == UiMode::HostMetrics {
+        // The loop redraws every frame, so the shown age counts up while the
+        // answer is held and drops back when the next one lands.
+        let held = ui
+            .host_metrics_received_at
+            .map_or(std::time::Duration::ZERO, |at| {
+                std::time::Instant::now().saturating_duration_since(at)
+            });
+        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics, held);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -19898,6 +20038,7 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             "Approve / deny permission",
         ),
         help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
+        help_key_line(&n(KbAction::HostMetrics), "Host of this deck"),
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&n(KbAction::OpenUpgrade), "Upgrade (update badge)"),
@@ -20001,6 +20142,191 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     // PRD #80 M5: explicit clickable [Close] button alongside the existing
     // "Press ? or Esc to close" hint. Drawn on the footer's blank first row.
     let close_button = [Button::new("Close", "", Action::ToggleHelp, true)];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &close_button, btn_row, 2)
+}
+
+/// PRD #1258 M3: a byte count in GiB, as both clients show it — at most one
+/// decimal, and none when it would be `.0`, so a whole number reads `128 GiB`.
+fn format_gib(bytes: u64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let text = format!("{gib:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{text} GiB")
+}
+
+/// PRD #1258 M3: the width of the host overlay's label column.
+const HOST_METRICS_LABEL_WIDTH: usize = 18;
+
+/// PRD #1258 M3: the label both clients give a watched role. A role a newer
+/// daemon added shows under its own name rather than being dropped — scrubbed
+/// of control and bidi characters and clamped to the label column, because the
+/// daemon chose it and its figures have to stay on the row (audit A2).
+fn host_metrics_role_label(role: &str) -> String {
+    match role {
+        crate::daemon_protocol::ROLE_WORKING_ROOT => "Working root".to_string(),
+        crate::daemon_protocol::ROLE_WORKTREE_PARENT => "Worktree parent".to_string(),
+        crate::daemon_protocol::ROLE_TEMP_ROOT => "Temp root".to_string(),
+        other => crate::untrusted_text::display_line(other, HOST_METRICS_LABEL_WIDTH),
+    }
+}
+
+/// PRD #1258: the largest sample age either client shows, in ms — the largest
+/// integer a JS number holds exactly. Above it the desktop could not print the
+/// figure this overlay prints, so both stop here (CLAUDE.md rule 22); the
+/// desktop's `HOST_MAX_SHOWN_AGE_MS` is the same number.
+const HOST_METRICS_MAX_SHOWN_AGE_MS: u64 = (1 << 53) - 1;
+
+/// PRD #1258: the sample age the overlay shows — the age the daemon reported
+/// plus how long the TUI has held the answer since, so a held answer does not
+/// claim to be as fresh as when it arrived. The desktop bridge adds its held
+/// time the same way (`HostMetricsReportDto::from_report`).
+fn host_metrics_shown_age_ms(reported_ms: u64, held: std::time::Duration) -> u64 {
+    reported_ms
+        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX))
+        .min(HOST_METRICS_MAX_SHOWN_AGE_MS)
+}
+
+/// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
+/// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
+/// TUI has held the answer, added to its sample age.
+fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<Line<'static>> {
+    use crate::daemon_client::HostMetricsReport;
+    const UNKNOWN: &str = "unknown";
+    let row = |label: &str, value: String| {
+        Line::from(format!(
+            "  {label:<width$} {value}",
+            width = HOST_METRICS_LABEL_WIDTH
+        ))
+    };
+    let mut lines = vec![Line::styled(
+        "  Host of this deck",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.push(Line::styled(
+        "  The machine this deck's daemon runs on",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(""));
+    match view {
+        HostMetricsView::Loading => lines.push(Line::from("  Reading…")),
+        HostMetricsView::Failed(error) => {
+            lines.push(Line::from("  Could not read this deck's host:"));
+            lines.push(Line::from(format!(
+                "  {}",
+                crate::untrusted_text::display_line(
+                    error,
+                    crate::untrusted_text::REMOTE_MESSAGE_MAX_BYTES
+                )
+            )));
+        }
+        HostMetricsView::Report(HostMetricsReport::NotAvailable) => {
+            lines.push(Line::from(
+                "  Host metrics are not available from this deck.",
+            ));
+            lines.push(Line::from(
+                "  Its daemon is an older version, or runs on Windows.",
+            ));
+        }
+        HostMetricsView::Report(HostMetricsReport::Available(metrics)) => {
+            let gib = |bytes: Option<u64>| bytes.map_or_else(|| UNKNOWN.to_string(), format_gib);
+            // The client refuses a reply over the bound; this keeps the render
+            // bounded even for a report that did not come through it.
+            for disk in metrics
+                .disks
+                .iter()
+                .take(crate::daemon_protocol::MAX_DISK_ROLES)
+            {
+                lines.push(row(
+                    &host_metrics_role_label(&disk.role),
+                    format!(
+                        "{} free of {} total",
+                        gib(disk.free_bytes),
+                        gib(disk.total_bytes)
+                    ),
+                ));
+            }
+            // A non-finite load is not a reading; the desktop bridge drops it
+            // the same way. Rust's `{:.2}` rounds an exact tie to even, which
+            // the desktop's formatter matches (`fixedLikeRust`).
+            let load = metrics
+                .load_per_cpu
+                .filter(|load| load.is_finite())
+                .map_or_else(|| UNKNOWN.to_string(), |load| format!("{load:.2}"));
+            let cores = metrics
+                .cpu_count
+                .map_or_else(|| format!("{UNKNOWN} cores"), |n| format!("{n} cores"));
+            lines.push(row("Load per core", format!("{load} across {cores}")));
+            lines.push(row("Memory used", gib(metrics.memory_used_bytes)));
+            lines.push(row("Memory available", gib(metrics.memory_available_bytes)));
+            lines.push(row(
+                "Sample age",
+                format!(
+                    "{} ms",
+                    host_metrics_shown_age_ms(metrics.sample_age_ms, held)
+                ),
+            ));
+        }
+    }
+    lines
+}
+
+/// PRD #1258 M3: the "Host of this deck" overlay. Returns its `[Close]` button
+/// rect for the mouse hit-test, as [`render_help_overlay`] does.
+fn render_host_metrics_overlay(
+    frame: &mut Frame,
+    view: &HostMetricsView,
+    held: std::time::Duration,
+) -> Vec<(Action, Rect)> {
+    let lines = host_metrics_lines(view, held);
+    let area = frame.area();
+    let popup_width = 64u16.min(area.width.saturating_sub(2));
+    // Body, then a blank row, the button row and the hint: plus the border.
+    // Counted in `usize` and clamped before narrowing, so no line count can
+    // overflow the `u16` (audit A2).
+    let popup_height = lines
+        .len()
+        .saturating_add(3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Host ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let footer_height: u16 = 2;
+    let body_height = inner.height.saturating_sub(footer_height);
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, body_height),
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + body_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled("  Press Esc to close", text_primary()),
+        ]),
+        footer_area,
+    );
+    let close_button = [Button::new("Close", "", Action::CloseHostMetrics, true)];
     let btn_row = Rect {
         x: footer_area.x,
         y: footer_area.y,
@@ -24056,6 +24382,127 @@ pub fn observe_command_banner_key_burst(
         visibility_before,
         visibility_after: ui.command_banner.visibility(closing),
     }
+}
+
+/// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`
+/// into a `width × height` buffer, as just received.
+pub fn render_host_metrics_overlay_to_buffer(
+    report: &crate::daemon_client::HostMetricsReport,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_host_metrics_overlay_held_to_buffer(report, std::time::Duration::ZERO, width, height)
+}
+
+/// PRD #1258 L1 seam: draw the live host overlay renderer for `report` after
+/// the TUI has held it for `held`.
+pub fn render_host_metrics_overlay_held_to_buffer(
+    report: &crate::daemon_client::HostMetricsReport,
+    held: std::time::Duration,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let view = HostMetricsView::Report(report.clone());
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_host_metrics_overlay(frame, &view, held);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #1258 M3 L1 seam: start on an empty dashboard holding `report` as the
+/// attached daemon's answer, press `keys` one at a time through the production
+/// [`handle_key_event`] (key resolution from `keybindings`, the mode handlers,
+/// [`dispatch_action`]) and draw each frame with the production
+/// [`render_frame`]. Returns the frame before the first key and one after each.
+///
+/// The controller has no daemon behind it, so no request is sent: the overlay
+/// shows the injected answer, which keeps host load out of the frames.
+pub fn render_host_metrics_key_sequence_to_buffers(
+    keybindings: &KeybindingConfig,
+    report: &crate::daemon_client::HostMetricsReport,
+    keys: &[KeyEvent],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    ui.host_metrics = HostMetricsView::Report(report.clone());
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState| {
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Stacked,
+            None,
+            bar_rows,
+        );
+        let filtered = filter_sessions(&state, ui);
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(keys.len() + 1);
+    frames.push(draw(&mut ui));
+    for key in keys {
+        let filtered = filter_sessions(&state, &ui);
+        let _ = handle_key_event(
+            *key,
+            &mut ui,
+            &*ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            &filtered,
+            frame_area,
+        );
+        frames.push(draw(&mut ui));
+    }
+    frames
 }
 
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
@@ -35373,6 +35820,7 @@ mod tests {
             UiMode::DirPicker,
             UiMode::NewPaneForm,
             UiMode::ScheduledTasks,
+            UiMode::HostMetrics,
         ] {
             assert!(
                 overlay_blocks_mouse(&mode),
@@ -42969,6 +43417,7 @@ mod tests {
             | UiMode::StopConfirm
             | UiMode::ScheduledTasks
             | UiMode::CloseConfirm
+            | UiMode::HostMetrics
             | UiMode::Upgrade => mode,
         }
     }
@@ -42990,6 +43439,7 @@ mod tests {
             UiMode::StopConfirm,
             UiMode::ScheduledTasks,
             UiMode::CloseConfirm,
+            UiMode::HostMetrics,
             UiMode::Upgrade,
         ]
         .into_iter()

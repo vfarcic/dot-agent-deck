@@ -690,6 +690,78 @@ impl LastCommandReader {
     }
 }
 
+/// PRD #1258 M3 — what one host-metrics request ended with, as the host
+/// overlay reads it from [`HostMetricsReader::take`].
+pub type HostMetricsAnswer = Result<crate::daemon_client::HostMetricsReport, String>;
+
+/// PRD #1258 M3 — fetches the attached daemon's host sample for the TUI's host
+/// overlay **without blocking the TUI thread**: [`Self::request`] spawns the
+/// query on the runtime and returns at once, and the render loop collects the
+/// answer with [`Self::take`] on a later frame. At most one request is in
+/// flight; a request made while one is outstanding is dropped, so a held key or
+/// a fast refresh can never queue connections against a slow daemon.
+///
+/// The capability check is [`DaemonClient::host_metrics`]'s, so a daemon that
+/// predates the verb is never sent it and answers
+/// [`crate::daemon_client::HostMetricsReport::NotAvailable`].
+#[derive(Clone)]
+pub struct HostMetricsReader {
+    client: DaemonClient,
+    runtime: tokio::runtime::Handle,
+    slot: Arc<Mutex<HostMetricsSlot>>,
+}
+
+#[derive(Default)]
+struct HostMetricsSlot {
+    in_flight: bool,
+    answer: Option<HostMetricsAnswer>,
+}
+
+impl HostMetricsReader {
+    /// Start a request bounded by `timeout`, unless one is already in flight.
+    /// Returns whether a request was started.
+    pub fn request(&self, timeout: Duration) -> bool {
+        {
+            let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.in_flight {
+                return false;
+            }
+            slot.in_flight = true;
+        }
+        let client = self.client.clone();
+        let slot = Arc::clone(&self.slot);
+        self.runtime.spawn(async move {
+            let answer = match tokio::time::timeout(timeout, client.host_metrics()).await {
+                Ok(Ok(report)) => Ok(report),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("the deck did not answer in time".to_string()),
+            };
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            slot.in_flight = false;
+            slot.answer = Some(answer);
+        });
+        true
+    }
+
+    /// The answer to the last request, once it has arrived; `None` while it is
+    /// still in flight or after it was already taken.
+    pub fn take(&self) -> Option<HostMetricsAnswer> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .answer
+            .take()
+    }
+
+    /// Whether a request is outstanding.
+    pub fn in_flight(&self) -> bool {
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .in_flight
+    }
+}
+
 impl EmbeddedPaneController {
     /// Build a controller whose panes are stream-backed against the daemon
     /// at `socket_path`. Caller is responsible for ensuring the daemon is
@@ -716,6 +788,17 @@ impl EmbeddedPaneController {
         LastCommandReader {
             client: self.client.clone(),
             runtime: self.runtime.clone(),
+        }
+    }
+
+    /// PRD #1258 M3: a handle the host overlay fetches through — on this
+    /// controller's own client, so it describes the host of the very daemon the
+    /// TUI is attached to, local or remote.
+    pub fn host_metrics_reader(&self) -> HostMetricsReader {
+        HostMetricsReader {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
+            slot: Arc::new(Mutex::new(HostMetricsSlot::default())),
         }
     }
 

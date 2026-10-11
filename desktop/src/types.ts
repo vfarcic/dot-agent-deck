@@ -890,6 +890,34 @@ export interface AgentProfile {
   savedToProject: boolean;
 }
 
+/**
+ * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
+ * reports it. A figure the daemon could not read is absent, never zero.
+ */
+export interface HostDiskUsage {
+  role: string;
+  freeBytes?: number;
+  totalBytes?: number;
+}
+
+/** PRD #1258 M4 — a deck's host sample; every reading but the age may be absent. */
+export interface HostMetrics {
+  disks: HostDiskUsage[];
+  loadPerCpu?: number;
+  cpuCount?: number;
+  memoryUsedBytes?: number;
+  memoryAvailableBytes?: number;
+  sampledAtMs: number;
+  sampleAgeMs: number;
+}
+
+/**
+ * PRD #1258 M4 — what a deck says about its host: its sample, or that its
+ * daemon does not report one (an older build), which the card states as "not
+ * available from this deck" rather than as zeros.
+ */
+export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -927,6 +955,12 @@ export interface DeckSnapshot {
    * to show "Select a deck" instead. Absent in fixture mode.
    */
   allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host, from its own daemon. Absent until the
+   * deck has answered, and for a deck that is not connected. Absent in fixture
+   * mode.
+   */
+  hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];

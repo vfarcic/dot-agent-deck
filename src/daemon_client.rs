@@ -1318,6 +1318,20 @@ pub enum FocusReport {
     Superseded,
 }
 
+/// PRD #1258 — what [`DaemonClient::host_metrics`] got.
+///
+/// `NotAvailable` is an **outcome, not an error**, for the reason
+/// [`FocusReport::Withheld`] is one: a daemon that predates the verb, or runs
+/// where it cannot sample (Windows), is an ordinary deck, and both clients show
+/// "not available from this deck" for it rather than a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostMetricsReport {
+    /// The daemon advertises `host-metrics` and answered with its host's sample.
+    Available(crate::daemon_protocol::HostMetrics),
+    /// The daemon does not advertise `host-metrics`, so nothing was sent.
+    NotAvailable,
+}
+
 /// PRD #1223 — the answer to a request this client sends only to a daemon that
 /// advertises it: the queries [`DaemonClient::list_directories`] and
 /// [`DaemonClient::new_agent_options`], and the start
@@ -2617,6 +2631,52 @@ impl DaemonClient {
             ));
         }
         Ok(FocusReport::Recorded)
+    }
+
+    /// PRD #1258 — ask the daemon for its host's disk, load and memory.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_HOST_METRICS`]**, answering
+    /// [`HostMetricsReport::NotAvailable`] without sending anything. The
+    /// capability comes from [`Self::capabilities`], one `Hello` per endpoint
+    /// until that cache is invalidated; the residual — a cache outliving a
+    /// daemon replaced by an older build — fails closed, as that daemon refuses
+    /// the unknown variant and this returns [`ClientError::Server`].
+    ///
+    /// The numbers describe the **daemon's** host: for a remote deck, the
+    /// remote machine.
+    ///
+    /// A reply with more than [`crate::daemon_protocol::MAX_DISK_ROLES`] roles, or
+    /// a role longer than [`crate::daemon_protocol::MAX_ROLE_BYTES`], is
+    /// [`ClientError::Malformed`]. Role text is passed through otherwise: the
+    /// renderers scrub it for display.
+    pub async fn host_metrics(&self) -> Result<HostMetricsReport, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_HOST_METRICS)
+        {
+            return Ok(HostMetricsReport::NotAvailable);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::HostMetrics).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "host-metrics failed".into()),
+            ));
+        }
+        let metrics = resp.host_metrics.ok_or_else(|| {
+            ClientError::Malformed("host-metrics reply carried no host_metrics".into())
+        })?;
+        // Audit A2: the frame ceiling is 16 MiB, far more than three roles, so
+        // the reply's own size is bounded here, before either client renders
+        // it. The error names no count or role: the peer chose both.
+        if !metrics.within_reply_bounds() {
+            return Err(ClientError::Malformed(
+                "host-metrics reply exceeded its size bounds".into(),
+            ));
+        }
+        Ok(HostMetricsReport::Available(metrics))
     }
 
     /// Issue #1445 — tell the daemon the orchestrator in `pane_id` was re-armed
@@ -4430,6 +4490,209 @@ mod tests {
             "a refused attach must register no viewer"
         );
         registry.shutdown_all();
+    }
+
+    /// Scenario: An older daemon answers Hello with either no capabilities or
+    /// unrelated capabilities; the host-metrics query returns NotAvailable.
+    /// A subsequent Hello acts as a socket barrier and proves no metrics frame arrived.
+    #[cfg(unix)]
+    #[spec("protocol/host-metrics/003")]
+    #[tokio::test]
+    async fn protocol_host_metrics_003_missing_capability_sends_no_frame() {
+        for advertised in [
+            None,
+            Some(vec![crate::daemon_protocol::CAP_FOCUS_GAINED.to_string()]),
+        ] {
+            let (_dir, path, listener) = {
+                let _guard = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("older-daemon.sock");
+                let listener = bind_attach_listener(&path).expect("bind older daemon");
+                (dir, path, listener)
+            };
+            let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                loop {
+                    let mut stream = listener.accept().await.expect("accept query");
+                    let (kind, payload) = read_frame(&mut stream)
+                        .await
+                        .unwrap()
+                        .expect("request frame");
+                    assert_eq!(kind, KIND_REQ);
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let op = request["op"].as_str().unwrap().to_string();
+                    seen_tx.send(op.clone()).unwrap();
+                    let response = if op == "hello" {
+                        AttachResponse {
+                            capabilities: advertised.clone(),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        AttachResponse::err("unexpected request to an older daemon")
+                    };
+                    crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = DaemonClient::new(path);
+            assert!(matches!(
+                client
+                    .host_metrics()
+                    .await
+                    .expect("withholding is not an error"),
+                HostMetricsReport::NotAvailable
+            ));
+            assert_eq!(
+                seen_rx.recv().await.as_deref(),
+                Some("hello"),
+                "capability handshake"
+            );
+            // A completed barrier query replaces a timing-based negative assertion.
+            let (mut rd, mut wr) = client.connect().await.unwrap();
+            issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: PROTOCOL_VERSION,
+                    client_build_version: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                seen_rx.recv().await.as_deref(),
+                Some("hello"),
+                "no metrics frame before barrier"
+            );
+            assert!(
+                matches!(
+                    seen_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "no extra frames"
+            );
+            server.abort();
+        }
+    }
+
+    /// Audit A2: a daemon that advertises `host-metrics` and answers it with
+    /// `disks` (raw JSON, as a hostile peer would write it). Returns the
+    /// client's result.
+    #[cfg(unix)]
+    async fn host_metrics_reply_with(
+        disks: serde_json::Value,
+    ) -> Result<HostMetricsReport, ClientError> {
+        let (_dir, path, listener) = {
+            let _guard = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hostile-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind hostile daemon");
+            (dir, path, listener)
+        };
+        let server = tokio::spawn(async move {
+            loop {
+                let mut stream = listener.accept().await.expect("accept query");
+                let (_, payload) = read_frame(&mut stream).await.unwrap().expect("request");
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                let response = if request["op"] == "hello" {
+                    serde_json::to_value(AttachResponse {
+                        capabilities: Some(vec![
+                            crate::daemon_protocol::CAP_HOST_METRICS.to_string(),
+                        ]),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    })
+                    .unwrap()
+                } else {
+                    serde_json::json!({
+                        "ok": true,
+                        "host_metrics": {
+                            "disks": disks,
+                            "sampled_at_ms": 1,
+                            "sample_age_ms": 0,
+                        },
+                    })
+                };
+                crate::daemon_protocol::write_frame(
+                    &mut stream,
+                    crate::daemon_protocol::KIND_RESP,
+                    &serde_json::to_vec(&response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let result = DaemonClient::new(path).host_metrics().await;
+        server.abort();
+        result
+    }
+
+    #[cfg(unix)]
+    fn roles(count: usize, role: &str) -> serde_json::Value {
+        serde_json::Value::Array(
+            (0..count)
+                .map(|_| serde_json::json!({ "role": role }))
+                .collect(),
+        )
+    }
+
+    /// Scenario: A daemon answers the host-metrics query with one more disk
+    /// role than the client's bound; the client refuses the reply as malformed
+    /// with a message naming no count, and a reply exactly at the bound decodes.
+    #[cfg(unix)]
+    #[spec("protocol/host-metrics/007")]
+    #[tokio::test]
+    async fn protocol_host_metrics_007_too_many_roles_is_malformed() {
+        let max = crate::daemon_protocol::MAX_DISK_ROLES;
+        match host_metrics_reply_with(roles(max + 1, "x")).await {
+            Err(ClientError::Malformed(message)) => {
+                assert!(!message.contains(&(max + 1).to_string()), "{message}")
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        match host_metrics_reply_with(roles(max, "x")).await {
+            Ok(HostMetricsReport::Available(metrics)) => assert_eq!(metrics.disks.len(), max),
+            other => panic!("a reply at the bound decodes, got {other:?}"),
+        }
+    }
+
+    /// Scenario: A daemon answers the host-metrics query with a role name one
+    /// byte over the client's bound; the client refuses the reply as malformed
+    /// without echoing the name, and a role exactly at the bound decodes.
+    #[cfg(unix)]
+    #[spec("protocol/host-metrics/008")]
+    #[tokio::test]
+    async fn protocol_host_metrics_008_oversized_role_is_malformed() {
+        let max = crate::daemon_protocol::MAX_ROLE_BYTES;
+        // Multi-byte characters, so the bound is checked in bytes, not chars.
+        let over = "é".repeat(max / 2 + 1);
+        assert!(over.len() > max && over.chars().count() <= max);
+        match host_metrics_reply_with(roles(1, &over)).await {
+            Err(ClientError::Malformed(message)) => assert!(!message.contains(&over), "{message}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        let at = "r".repeat(max);
+        match host_metrics_reply_with(roles(1, &at)).await {
+            Ok(HostMetricsReport::Available(metrics)) => assert_eq!(metrics.disks[0].role, at),
+            other => panic!("a role at the bound decodes, got {other:?}"),
+        }
+    }
+
+    /// Scenario: A daemon answers with a role carrying ESC, a CSI sequence, a
+    /// newline and a right-to-left override, within the size bounds; the client
+    /// decodes it unchanged, because scrubbing is each renderer's job
+    /// (`dashboard/host-metrics/005` covers the TUI's).
+    #[cfg(unix)]
+    #[spec("protocol/host-metrics/009")]
+    #[tokio::test]
+    async fn protocol_host_metrics_009_control_characters_reach_the_renderer_unchanged() {
+        let hostile = "\u{1b}[2Jro\nle\u{202e}x";
+        match host_metrics_reply_with(roles(1, hostile)).await {
+            Ok(HostMetricsReport::Available(metrics)) => {
+                assert_eq!(metrics.disks[0].role, hostile)
+            }
+            other => panic!("expected the role passed through, got {other:?}"),
+        }
     }
 
     /// PRD #1105 — a handle with no identity has nothing to claim focus as. That

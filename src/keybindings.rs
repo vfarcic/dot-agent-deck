@@ -96,6 +96,9 @@ pub enum Action {
     OpenUpgrade,
     ScrollPaneUp,
     ScrollPaneDown,
+    /// PRD #1258 M3: open the overlay showing the attached deck's host — disk
+    /// per watched role, load per core, memory and the sample's age.
+    HostMetrics,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -363,6 +366,16 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "scroll_pane_down",
         default: "PageDown",
         description: "Scroll focused pane forward",
+    },
+    // PRD #1258 M3: the host-of-this-deck overlay. Last in canonical order, so
+    // an existing binding a user already put on `m` keeps it and this action is
+    // the one reported unbound.
+    ActionSpec {
+        action: Action::HostMetrics,
+        section: Section::Dashboard,
+        name: "host_metrics",
+        default: "m",
+        description: "Host of this deck",
     },
 ];
 

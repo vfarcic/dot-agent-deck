@@ -186,6 +186,12 @@ pub(crate) struct AgentView {
     fetches: usize,
     /// Events folded. Test/measurement only.
     folded: usize,
+    /// PRD #1258 M4: the daemon's last host-metrics answer and when it landed.
+    /// Fetched beside each full `ListAgents` (so at most every
+    /// [`RECONCILE_INTERVAL`] while the deck is quiet) and replayed on the
+    /// cached path, so a burst of folded events costs no host-metrics
+    /// connection. Cleared with the list on a new subscription.
+    host_metrics: Option<(dot_agent_deck::daemon_client::HostMetricsReport, Instant)>,
 }
 
 impl Default for AgentView {
@@ -198,6 +204,7 @@ impl Default for AgentView {
             fetched_at: None,
             fetches: 0,
             folded: 0,
+            host_metrics: None,
         }
     }
 }
@@ -222,7 +229,29 @@ impl AgentView {
         // across a subscription gap would let the picker conclude "unchanged"
         // from a number this view is no longer entitled to report.
         self.schedule_revision = None;
+        // PRD #1258 M4: a new subscription may be a different daemon process.
+        self.host_metrics = None;
         self.due = Some(FetchReason::Resubscribed);
+    }
+
+    /// PRD #1258 M4: keep the host-metrics answer that came with the last fetch.
+    /// `None` (the request failed) keeps the previous answer rather than
+    /// discarding a reading because one refresh could not renew it.
+    pub(crate) fn install_host_metrics(
+        &mut self,
+        report: Option<dot_agent_deck::daemon_client::HostMetricsReport>,
+        now: Instant,
+    ) {
+        if let Some(report) = report {
+            self.host_metrics = Some((report, now));
+        }
+    }
+
+    /// PRD #1258 M4: the held host-metrics answer and when it landed.
+    pub(crate) fn host_metrics(
+        &self,
+    ) -> Option<&(dot_agent_deck::daemon_client::HostMetricsReport, Instant)> {
+        self.host_metrics.as_ref()
     }
 
     /// Fold one broadcast message, and note whether it opened a metadata gap a

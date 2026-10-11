@@ -1326,6 +1326,17 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
+/* PRD #1258 M4: the deck's host, between its header and its agents. A compact
+   label/value grid that wraps into columns on a wide card. */
+.host-metrics { padding: 8px 13px 9px; border-bottom: 1px solid var(--line); }
+.host-metrics-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.host-metrics-header strong { font-size: 11px; font-weight: 720; }
+.host-metrics-subtitle { color: var(--faint); font-size: 9.5px; }
+.host-metrics-rows { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 2px 18px; }
+.host-metrics-row { display: flex; gap: 8px; min-width: 0; font-size: 10.5px; }
+.host-metrics-row dt { flex: 0 0 112px; color: var(--muted); }
+.host-metrics-row dd { margin: 0; min-width: 0; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.host-metrics-unavailable { margin: 0; color: var(--muted); font-size: 10.5px; }
 
 .overview-legend { padding: 0 12px 6px; }
 .overview-legend span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .12em; }

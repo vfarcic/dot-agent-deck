@@ -13,7 +13,6 @@ expression: buf
                                                                                                               
                                                                                                               
                                                                                                               
-                                                                                                              
    ┌ help ───────────────────────────────────────────────────────────────────────────────────────────────┐    
    │  global (works from any pane)                       mouse                                           │    
    │                                                                                                     │    
@@ -44,6 +43,7 @@ expression: buf
    │  g                  generate .dot-agent-deck.toml   restored automatically on launch.               │    
    │  y / n              approve / deny permission                                                       │    
    │  s                  schedules manager                                                               │    
+   │  m                  host of this deck                                                               │    
    │  u                  upgrade (update badge)                                                          │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    

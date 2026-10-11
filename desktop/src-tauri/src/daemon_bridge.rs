@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
-    deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet, observed_fleet_decks,
-    safe_message, selection_fields, unconfigured_fleet,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, HostMetricsReportDto,
+    deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet,
+    observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -1610,18 +1610,34 @@ pub(crate) async fn snapshot_with(
             unconfigured: unconfigured_fleet(),
             observed: observed_fleet_decks(),
             all_decks: crate::dto::all_decks_applied(),
+            host_metrics: None,
         };
     }
 
     if let Some(view) = view {
         if view.needs_fetch(tokio::time::Instant::now()).is_none() {
             let records = view.records();
-            return connected_snapshot(connection, records, view.schedule_revision());
+            let host = held_host_metrics(view);
+            return connected_snapshot(connection, records, view.schedule_revision(), host);
         }
-        return match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
+        // PRD #1258 M4: the host sample rides the same refreshes the list does —
+        // the first one, every reconcile tick and every refetch — and is asked
+        // concurrently, so the two waits overlap rather than add up: the refresh
+        // waits for the slower of the two replies. The host request is bounded
+        // at `HOST_METRICS_REPLY_TIMEOUT` (2 s), so it can lengthen a refresh by
+        // at most that much, and only when the deck's sample is slower than its
+        // agent list.
+        let (listing, host) = tokio::join!(
+            bounded_reply("ListAgents", daemon.client.list_agents_detailed()),
+            fetch_host_metrics(&daemon.client),
+        );
+        return match listing {
             Ok(listing) => {
-                view.install(listing, tokio::time::Instant::now());
-                connected_snapshot(connection, view.records(), view.schedule_revision())
+                let now = tokio::time::Instant::now();
+                view.install(listing, now);
+                view.install_host_metrics(host, now);
+                let host = held_host_metrics(view);
+                connected_snapshot(connection, view.records(), view.schedule_revision(), host)
             }
             Err(error) => {
                 // The fetch failed, so the view's demand stands: it was never
@@ -1636,8 +1652,17 @@ pub(crate) async fn snapshot_with(
     // PRD #742 M14: bounded, like the handshake above it. This is the call that
     // produces a deck's FIRST snapshot, so a peer that stalls here is a deck the
     // webview never hears from rather than a request that is merely slow.
-    match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
-        Ok(listing) => connected_snapshot(connection, listing.records, listing.schedule_revision),
+    let (listing, host) = tokio::join!(
+        bounded_reply("ListAgents", daemon.client.list_agents_detailed()),
+        fetch_host_metrics(&daemon.client),
+    );
+    match listing {
+        Ok(listing) => connected_snapshot(
+            connection,
+            listing.records,
+            listing.schedule_revision,
+            host.map(|report| HostMetricsReportDto::from_report(&report, Duration::ZERO)),
+        ),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
             // other end is not the daemon this handshake classified, so the
@@ -1681,10 +1706,41 @@ pub(crate) async fn disconnected_with_reason(
 /// advisory in any case: the refusal that actually protects a live orchestration
 /// is made daemon-side by `run_daemon_stop` (issue #770), not by this figure,
 /// and every `DesktopAction` — Stop included — tails a full `refresh_and_emit`.
+/// PRD #1258 M4: how long the bridge waits for a host-metrics answer. Short,
+/// because the sample is a few `statvfs` calls and two small reads on the
+/// daemon's side, and a deck whose filesystem stalls should cost a refresh this
+/// much at most rather than [`DECK_REPLY_TIMEOUT`].
+const HOST_METRICS_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PRD #1258 M4: ask the deck for its host sample. The capability check is
+/// [`DaemonClient::host_metrics`]'s, read from the cache the handshake seeded,
+/// so an older daemon costs no connection and answers `NotAvailable`. `None`
+/// when the request failed or did not answer in time: a host reading is
+/// informational, so a failure here never marks the link stale.
+async fn fetch_host_metrics(
+    client: &DaemonClient,
+) -> Option<dot_agent_deck::daemon_client::HostMetricsReport> {
+    match tokio::time::timeout(HOST_METRICS_REPLY_TIMEOUT, client.host_metrics()).await {
+        Ok(Ok(report)) => Some(report),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// PRD #1258 M4: the view's held host answer, aged by how long it has been held.
+fn held_host_metrics(view: &AgentView) -> Option<HostMetricsReportDto> {
+    view.host_metrics().map(|(report, at)| {
+        HostMetricsReportDto::from_report(
+            report,
+            tokio::time::Instant::now().saturating_duration_since(*at),
+        )
+    })
+}
+
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
     schedule_revision: Option<u64>,
+    host_metrics: Option<HostMetricsReportDto>,
 ) -> DesktopSnapshot {
     DesktopSnapshot {
         connection: DesktopConnection {
@@ -1706,6 +1762,7 @@ fn connected_snapshot(
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
         all_decks: crate::dto::all_decks_applied(),
+        host_metrics,
     }
 }
 

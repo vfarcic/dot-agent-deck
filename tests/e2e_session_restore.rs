@@ -277,7 +277,10 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
     // match cannot succeed. Short names keep the assertion about what this test
     // is actually for (both panes come back, under their saved names) instead of
     // depending on a pane-column frame that no longer exists.
-    let restored = common::wait_until(Duration::from_secs(10), || {
+    // PRD #1258: load-scaled, because the deck lazy-spawns its daemon before it
+    // can restore anything, and on a STARVED run that alone outlasted a fixed
+    // 10 s (the daemon's pre-bind work measured 5.7 s in the same run).
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         let grid = deck.snapshot_grid();
         grid.contains("r-alpha") && grid.contains("r-beta")
     });
@@ -481,7 +484,10 @@ fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
 
     // Fallback: the saved orchestrator pane returns as a PLAIN dashboard card
     // (its saved name), never an orchestration tab.
-    let fell_back = common::wait_until(Duration::from_secs(10), || {
+    // PRD #1258: load-scaled, because the deck lazy-spawns its daemon before it
+    // can restore anything, and on a STARVED run that alone outlasted a fixed
+    // 10 s (the daemon's pre-bind work measured 5.7 s in the same run).
+    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         deck.snapshot_grid().contains("orchestrator")
     });
     assert!(
@@ -568,7 +574,10 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
     // (its saved name `orchestrator`). RED today: the startup panic prevents any
     // pane from ever rendering, so this times out — the final grid captures the
     // `index out of bounds` panic text rather than a dashboard.
-    let fell_back = common::wait_until(Duration::from_secs(10), || {
+    // PRD #1258: load-scaled, because the deck lazy-spawns its daemon before it
+    // can restore anything, and on a STARVED run that alone outlasted a fixed
+    // 10 s (the daemon's pre-bind work measured 5.7 s in the same run).
+    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         deck.snapshot_grid().contains("orchestrator")
     });
     assert!(

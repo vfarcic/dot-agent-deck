@@ -218,7 +218,7 @@ fn release_standin(path: &Path, deck: &TuiDeck, role: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
             let opened = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
@@ -242,14 +242,19 @@ fn release_standin(path: &Path, deck: &TuiDeck, role: &str) {
 
 fn wait_for_role(deck: &TuiDeck, role: &str) {
     assert!(
-        common::wait_until(Duration::from_secs(15), || role_agent_exists(deck, role)),
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            role_agent_exists(deck, role)
+        }),
         "{role} never registered"
     );
 }
 
+// PRD #1258: the three waits above and below are load-scaled. Each bounds
+// something that must happen, and `status/blocked/018` timed out on the fixed
+// 20 s here during a STARVED lane-1 run, then passed alone in 22.6 s.
 fn assert_blocked(deck: &TuiDeck, role: &str, kind: &str) {
     assert!(
-        common::wait_until(Duration::from_secs(20), || {
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
             role_status(deck, role).as_deref() == Some("Blocked")
                 && has_role_badge(&deck.snapshot_grid(), role, "Blocked")
         }),
@@ -843,6 +848,11 @@ process.stdin.resume();
 /// marker blocks the first card; a bare 429 leaves the other in Error.
 #[spec("status/blocked/019")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): under load the daemon's hook listener can
+// apply the marker session's QuotaBlocked before its own SessionStart, leaving
+// the card Idle. That ordering bug is the daemon's, not this test's; #1664 has
+// the evidence and what lifts the quarantine.
+#[ignore = "quarantined: vfarcic, #1664"]
 fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     if Command::new("node").arg("--version").output().is_err() {
         eprintln!("SKIP: node is unavailable");

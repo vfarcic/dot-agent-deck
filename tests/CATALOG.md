@@ -545,8 +545,76 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay.
 - **Does not assert:** dynamic content (none today).
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/host-metrics
+
+The attached deck's host measurements, supplied by the daemon. Desktop browser coverage of several decks is in `desktop/e2e/host-metrics.spec.ts`; the catalog IDs below name the Rust harness tests.
+
+##### dashboard/host-metrics/001 — The default `m` key opens the host overlay and Escape restores the dashboard.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** TestBackend frames through the production key handlers show the host title and disk roles only while the overlay is open; Escape returns the initial dashboard frame.
+- **Does not assert:** daemon transport or real host values (covered by `dashboard/host-metrics/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/002 — A fixed host sample renders all roles and unknown fields explicitly.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** an `insta` overlay snapshot names the deck's host and shows per-role free/total disk, load per core and core count, memory used/available, and sample age; independently absent fields show unknown, including both the load and core count.
+- **Does not assert:** the sampler's operating-system reads or cache expiry (covered by `protocol/host-metrics/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/003 — An older deck explicitly reports unavailable metrics.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** the overlay says `not available from this deck` beneath `Host of this deck`, without fabricated zero readings.
+- **Does not assert:** capability withholding on the wire (covered by `protocol/host-metrics/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/004 — The real TUI displays its daemon's host measurements and closes on Escape.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric sample-age row after `m`; Escape removes the overlay and restores the empty dashboard.
+- **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
+- **Timing:** the first wait (the empty dashboard painting after the lazy daemon spawn) has a load-scaled ceiling: 30 s on an idle box, up to 120 s. The deck's daemon-start bound is set 5 s under that ceiling, so a daemon that never binds still prints its error before the wait ends. A starved run once spent 13.6 s on the daemon's pre-bind alone and overran the fixed 30 s (issue #1665).
+- **Platform coverage:** mac+linux.
+
+##### dashboard/host-metrics/005 — A role carrying control characters and a bidi override renders scrubbed.
+- **Layer:** L1 (ratatui `TestBackend` via `render_host_metrics_overlay_to_buffer`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a clear-screen CSI sequence, a newline and a `U+202E` override renders on one row as its scrubbed text beside its disk figures, and no buffer cell holds a control character or bidi override (PRD #1258 audit A2).
+- **Does not assert:** the client's size bounds (covered by `protocol/host-metrics/007`–`009`); the desktop panel's scrubbing.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/006 — An oversized role count renders a bounded overlay without panicking.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a report of 65,525 roles, the count that overflowed the overlay's `u16` height arithmetic, renders without panicking and draws exactly `MAX_DISK_ROLES` role rows, with the rows after the roles still drawn (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/007 — An oversized role name is clamped to the label column.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a 100 KiB role renders clamped below `MAX_ROLE_BYTES` with a trailing `…`, and its disk figures stay on the same row (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/008 — The overlay's words match the copy the desktop panel is tested against.
+- **Layer:** L1 (ratatui `TestBackend` reading `tests/fixtures/host-metrics-copy.json`).
+- **Agent:** none.
+- **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
+- **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/009 — A held answer's sample age grows by the time the TUI has held it.
+- **Layer:** L1 (ratatui `TestBackend`, the overlay renderer given an explicit held duration).
+- **Agent:** none.
+- **Asserts:** an answer the daemon reported as 1500 ms old reads `1500 ms` as received, `4000 ms` after 2.5 s held and `3601500 ms` after an hour, the same reply age plus held time the desktop bridge shows (CLAUDE.md rule 22, PR #1672 review); a `u64::MAX` age plus held time saturates and reads the shared `9007199254740991 ms` ceiling.
+- **Does not assert:** the event loop's clock (the draw passes `Instant::now()` less the time the answer landed); the desktop's age, which its bridge computes (`HostMetricsReportDto::from_report`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/config-gen
@@ -722,6 +790,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 
 ##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1664"]` (CLAUDE.md rule 6). Under load the daemon's hook listener can apply the marker session's QuotaBlocked before its own SessionStart, so the card stays Idle; #1664 has the evidence, the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
 - **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
 - **Does not assert:** a real OpenCode API request.
@@ -1112,6 +1181,85 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none (four hand-built `SessionStart` events, one per origin value plus one with no origin key at all).
 - **Asserts:** the full truth table of `is_wrapper_fork_session_start` / `is_wrapper_interface_ready_session_start` / `is_wrapper_interface_settled_session_start` over `wrapper_fork`, `wrapper_interface_ready`, `wrapper_interface_settled` and an ABSENT key — with the load-bearing row being that the settled marker must NOT satisfy the ready predicate, since that single bit is what decides which of the wrapper's two facts may release a Wrapper-strategy agent's gate before the upgrade window expires, and which post-readiness buffer is then owed (`src/state.rs` guard 1). It used to decide which fact SKIPPED the buffer; measurement retracted that in round 3, and the predicates are unchanged by the retraction. The two composite predicates are asserted as the unions of the narrow ones rather than tabulated, so the RELATIONSHIP survives a fourth value being added: `is_wrapper_interface_session_start` is exactly the either-fact question the readiness GATE asks, and `is_wrapper_session_start` is that plus the fork marker. Finally that an unrecognised value (`wrapper_interface_ready_v2`) satisfies none of them, so a future or hostile origin cannot inherit the strong one's privilege by prefix.
 - **Does not assert:** what the daemon does with each value (`orchestration/delegate/026` for the settled fact being held for an upgrade, `/027` for the ready fact's interface buffer, `/028` for an unattributed one); which fact a given child produces, which is the wrapper's `InterfaceWatch` and is behavioural (`codex/wrap/006`); that the marker is authenticated — it is not, deliberately, which is why guard 2 exists.
+- **Platform coverage:** mac+linux+windows.
+
+#### protocol/host-metrics
+
+##### protocol/host-metrics/001 — The daemon serves host numbers by role without exposing paths.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, no PTY).
+- **Agent:** none.
+- **Asserts:** Hello advertises `host-metrics`; the reply contains exactly `working_root`, `worktree_parent`, and `temp_root`, bounded nonzero disk totals, CPU count, optional finite load, Linux memory readings, and numeric sample timestamp/age; serialized strings contain no absolute path.
+- **Does not assert:** TUI or desktop rendering; remote transport; unsupported-platform capability withholding; exact host utilisation.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/002 — Socket queries reuse a fresh cached sample and refresh an expired one.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** after the first reply completes, advancing time 250 ms and requesting on another connection preserves the sample timestamp and every payload field except age; age increases by exactly 250 ms; after the max age, the next query resets age through an on-demand refresh.
+- **Does not assert:** background sampling; wall-clock timing; clients' rendering; sampler cost.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/003 — The client withholds metrics queries from older daemons.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** absent capabilities and unrelated capabilities both produce `NotAvailable`; a completed Hello barrier proves the peer received no metrics request frame.
+- **Does not assert:** the supported query's response decoding; client rendering; cached capabilities outliving a daemon replacement.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/004 — An unreadable memory field is absent rather than zero.
+- **Layer:** unit (daemon memory-reader fixture).
+- **Agent:** none.
+- **Asserts:** an unreadable source produces absent readings; valid fixture values convert kB to bytes; malformed total memory leaves used memory absent while preserving available memory.
+- **Does not assert:** macOS memory sampling; disk/load failures; UI placeholders.
+- **Platform coverage:** linux.
+
+##### protocol/host-metrics/005 — A stuck sample starts one blocking job and every request still answers.
+- **Layer:** unit (the daemon's `HostMetricsCache` with an injected sampler that never finishes, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** eight concurrent requests on a cold cache whose sample never finishes start exactly one sample and all answer without one exactly `HOST_METRICS_SAMPLE_WAIT` later; a request waiting when the sample lands gets it at age 0 and starts none; a cache hit inside the max age starts none; after expiry, eight more requests during a second stuck sample start one more, the seven that did not start it answer at once with the last sample at its true age, and the one that did answers after the wait with the age that includes it (PRD #1258 audit A1).
+- **Does not assert:** a real hung filesystem; the production sampler's detached thread (counted by construction: one per sampler start; its effect on shutdown is `protocol/host-metrics/011`); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/006 — A zero fragment size leaves free disk absent rather than zero.
+- **Layer:** unit (`statvfs` figure arithmetic).
+- **Agent:** none.
+- **Asserts:** a zero fragment size yields neither a free nor a total figure; a zero available-block count beside a real total is a real `0`; ordinary figures multiply out; an overflowing product is absent.
+- **Does not assert:** a real `statvfs` call (covered by `protocol/host-metrics/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/007 — The client refuses a reply with more disk roles than its bound.
+- **Layer:** unit (client library against a synthetic socket peer advertising `host-metrics`).
+- **Agent:** none.
+- **Asserts:** a reply of `MAX_DISK_ROLES + 1` roles is `ClientError::Malformed` with a message naming no count; a reply of exactly `MAX_DISK_ROLES` decodes (PRD #1258 audit A2).
+- **Does not assert:** the renderers' own bounds (covered by `dashboard/host-metrics/006`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/008 — The client refuses a reply whose role name is longer than its bound.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role one byte over `MAX_ROLE_BYTES`, made of two-byte characters so the bound is measured in bytes, is `ClientError::Malformed` with a message that does not echo it; a role exactly at the bound decodes unchanged (PRD #1258 audit A2).
+- **Does not assert:** the renderers' clamp (covered by `dashboard/host-metrics/007`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/009 — Role text within the bounds reaches the renderer unchanged.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a CSI sequence, a newline and a `U+202E` override decodes unchanged: the client bounds size and leaves scrubbing to each renderer.
+- **Does not assert:** the TUI's scrub (covered by `dashboard/host-metrics/005`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/010 — A refresh that panics or is dropped releases its waiters and the next refresh starts.
+- **Layer:** unit (the daemon's `HostMetricsCache` with a scripted sampler on current-thread Tokio runtimes, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a sample that panics on the refresh task, a refresh task dropped when its runtime shuts down, and a sampler that panics inside the request that started it each clear the in-flight marker; every request waiting on the refresh returns without a sample, released by the refresh ending rather than by the bounded wait (set to an hour here); a request that joined the refresh started none; the next request starts exactly one refresh and answers with its sample (PRD #1258 audit A1 follow-up).
+- **Does not assert:** the production sampler's detached thread (whose panic surfaces as a failed sample, not a panic); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/011 — Dropping the daemon's runtime does not wait on a stuck sample.
+- **Layer:** unit (the daemon's `HostMetricsCache` with the production `detached_sampler` around a sample that blocks until released, on a multi-thread Tokio runtime like `#[tokio::main]`'s, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a request gives up on the stuck sample after its bounded wait; with the sample confirmed stuck in its call and not yet released, dropping the runtime returns, so a sample that never finishes cannot hold up the daemon's exit (PR #1672 review; a sample on Tokio's blocking pool fails this, since a runtime drop joins its blocking jobs).
+- **Does not assert:** a real hung filesystem; the daemon's full stop path; how long the drop takes (the 30 s receive only bounds a broken build).
 - **Platform coverage:** mac+linux+windows.
 
 #### protocol/live-target
@@ -3222,6 +3370,13 @@ without depending on the config struct API.
 - **Does not assert:** filesystem loading of `keybindings.toml` (covered by `keybindings/remap/001`); arbitrary per-mode config syntax (out of scope).
 - **Platform coverage:** mac+linux+windows.
 
+##### keybindings/remap/004 — A dashboard `host_metrics` remap opens the overlay on the configured key.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** a TOML `host_metrics = "F2"` remap produces no warnings; TestBackend frames stay on the dashboard after the old `m`, show the overlay after F2, and return to the dashboard after Escape; help names F2 on its host row.
+- **Does not assert:** loading the keybindings file from disk (covered by `keybindings/remap/001` and `/002`).
+- **Platform coverage:** mac+linux+windows.
+
 #### keybindings/safety
 
 ##### keybindings/safety/001 — `Ctrl+C` always opens the quit modal, even when another action is bound to `Ctrl+C`.
@@ -3543,7 +3698,7 @@ without depending on the config struct API.
 
 ##### orchestration/delegate/012 — A slow-readiness toggle proves the delegate buffer prevents lost payload and submit bytes (PRD #249 M4).
 - **Layer:** fast synthetic real-binary-subprocess integration (real `handle_delegate`, respawn, hook socket, managed PTY, and Python raw-mode readiness stub; no LLM and no `e2e` feature gate).
-- **Agent:** deterministic slow-readiness stand-in that discards PTY input for 650 ms after `SessionStart`, then echoes accepted bytes in raw mode.
+- **Agent:** deterministic slow-readiness stand-in that discards PTY input for 650 ms from the moment it enters raw mode (the test writes `SessionStart` as soon as it sees that, so the window measured from `SessionStart` lands near 650 ms: 635–665 ms across 30 module-stress runs on 2026-10-10), then echoes accepted bytes in raw mode. The zero-buffer control retries up to three times when a starved delivery leg lands the pointer after the window, and its failure message reports each try's window and when the pointer was seen.
 - **Asserts:** changing only `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` loses the pointer at `0`, while `1000` delivers the pointer and its trailing submit CR after the measured input-readiness window.
 - **Scope note (issue #243):** the buffer this test is entirely about now applies on a NARROWER set of paths than when it was written, and this test sits on one that kept it. The buffer is scoped by what the readiness gate ESTABLISHED, not by which agent it is: a native `SessionStart`, a hookless wrapper's fork-time event, the wrapper's weaker `wrapper_interface_settled` fact, and the timeout fallback all still hold the prompt (this test injects an UNMARKED `SessionStart`, which the gate treats exactly as a native one); only the wrapper's STRONG `wrapper_interface_ready` fact — the child clearing `ICANON`/`ECHO` — is priced differently, and even then only for an agent the deck itself spawned as a wrapper host and never over an explicitly-set env value. Round 3 retracted the claim that it SKIPS the buffer: raw mode is taken at TUI init, before a composer will accept a submit, so that fact pays the longer `WRAPPER_INTERFACE_READINESS_BUFFER` instead. So the race pinned here is live for every agent — a wrapped one merely pays a different interval against it.
 - **Does not assert:** a real Claude or OpenCode timing distribution; the deterministic stub pins the race that real-agent timing cannot reproduce reliably. Nor the wrapper's interface buffer, the one path this 1000 ms value no longer covers (`orchestration/delegate/027`, `codex/wrap/006`).
@@ -3663,18 +3818,18 @@ without depending on the config struct API.
 ##### orchestration/delegate/027 — The wrapper's STRONG interface fact (the child took raw input mode) is priced at the 5000 ms interface buffer rather than the ordinary 1000 ms, and an operator-pinned buffer replaces it in both directions (issue #243, guards 1–3).
 - **Layer:** fast synthetic PTY integration (same shape as `/026`; two arms in one test process so both see the same fixture).
 - **Agent:** a `codex`-named stand-in that runs `stty raw -echo` BEFORE writing a byte and then paints its banner. Ordering is deliberate: the watch checks line discipline first and the settle window only as a fallback, so clearing `ICANON`/`ECHO` with no output yet makes fact 1 the only fact that CAN fire, instead of leaving it to a race between the wrapper's 50 ms supervisory poll and its 750 ms settle window.
-- **Asserts:** in both arms, the control that the announced origin really is `wrapper_interface_ready` AND that `agent_spawned_as_wrapper_host` admits this replacement — the second is the fail-closed alarm, and round 3 did not weaken it: guard 2 refuses toward the SHORTER buffer, so a version that turned down every honest agent would leave the deck writing into a still-initialising codex-cli with every other assertion in the suite green. **Arm 1** (variable REMOVED, so the deck's own defaults decide): the pointer is held at least 5000 ms past the interface event, under a 10 s ceiling that separates "released by this fact" from "released by the timeout" — measured **5.008 s**. **Arm 2** (`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1500`, deliberately neither default): the same fact on the same fixture is held at least 1500 ms and at most 3 s — measured **1.509 s**.
+- **Asserts:** in both arms, the control that the announced origin really is `wrapper_interface_ready` AND that `agent_spawned_as_wrapper_host` admits this replacement — the second is the fail-closed alarm, and round 3 did not weaken it: guard 2 refuses toward the SHORTER buffer, so a version that turned down every honest agent would leave the deck writing into a still-initialising codex-cli with every other assertion in the suite green. **Arm 1** (variable REMOVED, so the deck's own defaults decide): the pointer is held at least 5000 ms past the interface event, under a 10 s ceiling that separates "released by this fact" from "released by the timeout" — measured **5.008 s**. **Arm 2** (`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1500`, deliberately neither default): the same fact on the same fixture is held at least 1500 ms and at most 3 s (load-scaled on a contended box, never past 4.5 s, the same ceiling as `/028`) — measured **1.509 s**.
 - **Round 3 inverted arm 1 and made arm 2 two-sided.** Arm 1 asserted `held <= 700 ms` for two rounds — that the strong fact SKIPPED the buffer — and the premise was measured false: a full-screen TUI takes raw mode at INIT (real codex-cli 85 ms after exec, `orchestration/delegate/009` at fork + 100 ms), so writing then is the earliest and worst instant available and `/009` lost the pointer into an unsubmitted composer exactly as production did. There is no skip left to pin. Arm 2's lower bound was likewise vacuous once the skip became a second buffer — with guard 3 deleted the strong path pays 5000 ms, which clears a 1500 ms floor — so it now bounds above as well, which is also the honest statement of what guard 3 promises: the operator's value OVERRIDES both defaults rather than being max()-ed against them, and a value above the pin violates that as much as one below it.
-- **Verified load-bearing, per arm and per guard.** Pricing the strong fact with `delegate_readiness_buffer()` (guard 1 dropped, and the same shape a fail-closed guard 2 produces) turns arm 1 red at **1.023 s** against its 5000 ms bound. Ignoring the operator's setting on the interface path (guard 3 dropped) turns arm 2 red at **5.012 s** against its 3 s ceiling, while arm 1 stays green — which is what isolates the two. Neutering `agent_spawned_as_wrapper_host` outright is caught earlier still, by arm 1's control.
+- **Verified load-bearing, per arm and per guard.** Pricing the strong fact with `delegate_readiness_buffer()` (guard 1 dropped, and the same shape a fail-closed guard 2 produces) turns arm 1 red at **1.023 s** against its 5000 ms bound. Ignoring the operator's setting on the interface path (guard 3 dropped) turns arm 2 red at **5.012 s** against its ceiling (3 s, at most 4.5 s under load), while arm 1 stays green — which is what isolates the two. Neutering `agent_spawned_as_wrapper_host` outright is caught earlier still, by arm 1's control.
 - **Does not assert:** a real Codex releasing on this fact (`orchestration/delegate/009`); the fact-2-then-fact-1 upgrade, which this fixture cannot produce (`orchestration/delegate/026`); that 5000 ms is ENOUGH for any particular machine — it is a mitigation sized from measurement, not a bound, which is why the operator override exists; the scheduler's copy of the gate, which has no interface path.
 - **Platform coverage:** mac+linux (unix-only — POSIX shell, `stty`, and pty line discipline).
 
 ##### orchestration/delegate/028 — A forged `wrapper_interface_ready` marker for a pane the daemon never spawned as a wrapper host releases the gate but is priced as an ORDINARY readiness fact, never as a real wrapper's observation (issue #243 audit F1, guard 2).
 - **Layer:** fast integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket; no wrapper, no pty fixture, one crafted `AgentEvent`).
 - **Agent:** a plain `cat` worker — a command `AgentType::from_command` cannot resolve, so the frozen `spawn_agent_type` is `None` and the daemon has no standing to believe anything about that pane's interface.
-- **Asserts:** the control that the pane really is not a wrapper host (else the marker would be honest); then that the pointer still ARRIVES — releasing the gate was forgeable before #243 by a bare unmarked `SessionStart` and still is, so withholding delivery is not the property under test — and then a TWO-SIDED bound on how long it was held, measured from before the line even hits the socket: at least the deck's own 1000 ms, and at most 3 s. Measured **1.006 s**. This is the audit's own reproduction (a bare `python3` with no deck environment writing one JSON line to the daemon socket) turned into a regression test.
+- **Asserts:** the control that the pane really is not a wrapper host (else the marker would be honest); then that the pointer still ARRIVES — releasing the gate was forgeable before #243 by a bare unmarked `SessionStart` and still is, so withholding delivery is not the property under test — and then a TWO-SIDED bound on how long it was held, measured from before the line even hits the socket: at least the deck's own 1000 ms, and at most 3 s. Measured **1.006 s**. The 3 s is load-scaled and capped at 4.5 s, because a STARVED box once held it 3.71 s (io full 84.1%, PRD #1258). Scaling costs no detection: a mis-priced 5000 ms buffer cannot deliver in under 5000 ms from that instant however the run is scheduled, so any ceiling below 5000 ms still excludes it. This is the audit's own reproduction (a bare `python3` with no deck environment writing one JSON line to the daemon socket) turned into a regression test.
 - **The upper bound is the guard-2 assertion; the floor is not.** This entry claimed "dropping guard 2 delivers in 21.1 ms" and that proof expired with `56c10dd`: once the SKIP became a second buffer, dropping guard 2 stopped delivering instantly and started delivering after `WRAPPER_INTERFACE_READINESS_BUFFER`, which sails over a 1000 ms floor. Measured — the test stayed green with `agent_spawned_as_wrapper_host` deleted from the seam. What guard 2 is worth is now ATTRIBUTION rather than privilege (a forgery can no longer suppress a buffer, only mis-price one toward the value every other agent already gets), so telling 1000 ms from 5000 ms is the only way to observe it at all.
-- **Verified load-bearing (re-measured round 3):** dropping the `agent_spawned_as_wrapper_host` term from the seam holds the pointer **5.017 s**, red against the 3 s ceiling. Like `/026`, the buffer variable must stay UNSET for that to be true — with it pinned, guard 3 collapses both defaults to one number and the test would pass with guard 2 deleted.
+- **Verified load-bearing (re-measured round 3):** dropping the `agent_spawned_as_wrapper_host` term from the seam holds the pointer **5.017 s**, red against the ceiling at any load (3 s, at most 4.5 s). Like `/026`, the buffer variable must stay UNSET for that to be true — with it pinned, guard 3 collapses both defaults to one number and the test would pass with guard 2 deleted.
 - **Does not assert:** that the marker is unforgeable — it is not, and the fix is provenance rather than authentication; the honest case guard 2 also refuses (a role command that already names the wrapper, whose frozen identity `from_command` cannot recover — which since round 3 costs it the LONGER buffer rather than the fast path, i.e. it waits the same interval every non-wrapper agent has always waited, documented at the oracle and logged with a `warn!`); the gate-release path itself (`orchestration/delegate/010`).
 - **Platform coverage:** mac+linux (unix-only — daemon-owned PTYs).
 
@@ -5941,7 +6096,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### pane/restart/012 — A delegate to a worker that still owes a work-done is refused as busy, and `pane restart --force` cancels that task so the role takes a plain delegate again (issues #580 and #590).
 - **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker; no daemon socket, no LLM).
 - **Agent:** none (a `cat` stand-in, which echoes the task pointer so its delivery is observable).
-- **Asserts:** the first delegate is dispatched and its pointer reaches the worker; a second plain delegate before any work-done comes back with `delivered` empty, the role in `busy` and an `error` naming `--supersede`, and no second pointer reaches the pane; after `pane restart --force` a plain delegate is dispatched with nothing in `busy` or `superseded`, and its pointer reaches the replacement agent.
+- **Asserts:** the first delegate is dispatched and its pointer reaches the worker and comes back from `cat` (both copies are waited for, since the submit CR can trail the text by up to `SUBMIT_ECHO_BOUND` on a loaded box); a second plain delegate before any work-done comes back with `delivered` empty, the role in `busy` and an `error` naming `--supersede`, and no second pointer reaches the pane; after `pane restart --force` a plain delegate is dispatched with nothing in `busy` or `superseded`, and its pointer reaches the replacement agent.
 - **Does not assert:** the CLI's rendering of the refusal (`delegate_verdict`'s unit tests in `src/main.rs` own that); the commission's age-based expiry (`agent_pty`'s `commission_ledger_*` unit tests own that); a real agent.
 - **Platform coverage:** mac+linux (unix-only).
 

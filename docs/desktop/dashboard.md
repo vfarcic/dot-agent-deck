@@ -18,6 +18,8 @@ Each daemon being shown gets its own section, headed with its name (**Local daem
 - One group per orchestration (kicker **ORCHESTRATION**), named after the run. Its rows are numbered in role order, and the start role, the one you message, carries an **ORCHESTRATOR** badge.
 - One group per workspace mode (kicker **MODE TAB**), named after the mode. You see one only while an agent started in a workspace mode by a release before 0.44.0 is still running; workspace modes were removed in 0.44.0, so neither client starts one.
 
+Under the header, a **Host of this deck** panel shows free disk space, load per core, memory and the age of those figures for the machine that daemon runs on. A daemon from an older release says **Host metrics are not available from this deck** there instead. The TUI shows the same figures when you press `m`. [Session Management → Check the machine a deck runs on](../session-management.md#check-the-machine-a-deck-runs-on) explains each row.
+
 Each group header shows how many agents it holds, how many are in each status, and the working directory most of its agents share. A row shows its own directory only when it differs from that.
 
 ![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the DAEMONS counter reads 2/2 and the other counters add up the agents of both](/img/dashboard-fleet-desktop.png)

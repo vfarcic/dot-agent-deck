@@ -525,6 +525,12 @@ async fn wait_for_silence_notice(
 struct SlowReadinessResult {
     snapshot: Vec<u8>,
     measured_readiness_window: Duration,
+    /// How long after the test wrote `SessionStart` the pointer was seen in the
+    /// pane, or `None` if it never was. An upper bound (the wait polls every
+    /// 20 ms, and stops early only on pointer AND submit CR), which is enough to
+    /// tell a delivery leg that a starved box stretched past the stub's discard
+    /// window from a stub whose window does not exist (PRD #1258).
+    pointer_observed_by: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -646,9 +652,12 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         snapshot_contains_pointer_then_submit,
     )
     .await;
+    let pointer_observed_by =
+        snapshot_contains(&snapshot, POINTER).then(|| session_start_at.elapsed());
     SlowReadinessResult {
         snapshot,
         measured_readiness_window,
+        pointer_observed_by,
     }
 }
 
@@ -1551,15 +1560,21 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
             // land in the window; a stub whose window does not exist fails
             // every one.
             let mut zero = run_slow_readiness_delegate(0).await;
+            let mut tries = vec![(zero.measured_readiness_window, zero.pointer_observed_by)];
             for _ in 1..3 {
                 if !snapshot_contains(&zero.snapshot, POINTER) {
                     break;
                 }
                 zero = run_slow_readiness_delegate(0).await;
+                tries.push((zero.measured_readiness_window, zero.pointer_observed_by));
             }
+            // Each try's (readiness window, pointer seen by), both from the
+            // `SessionStart` write. A pointer seen well past its window is a
+            // starved delivery leg; one seen inside it is a stub that never
+            // discarded, which is the defect this control exists to catch.
             assert!(
                 !snapshot_contains(&zero.snapshot, POINTER),
-                "the zero-buffer control unexpectedly delivered the pointer outside the stub's discard window; snapshot = {:?}",
+                "the zero-buffer control unexpectedly delivered the pointer outside the stub's discard window on every try; (readiness window, pointer seen by) per try = {tries:?}; snapshot = {:?}",
                 String::from_utf8_lossy(&zero.snapshot)
             );
 
@@ -1782,7 +1797,10 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         &daemon.registry,
         &new_agent_id,
         WRAPPED_READY_BANNER.as_bytes(),
-        Duration::from_secs(10),
+        // PRD #1258: a boot through the built deck binary's wrapper, so a
+        // ceiling on something that must HAPPEN — load-scaled. Flat 10 s went
+        // red at io full 81%.
+        common::load_scaled(Duration::from_secs(10)),
     )
     .await;
     assert!(
@@ -2100,7 +2118,10 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         &daemon.registry,
         &new_agent_id,
         banner.as_bytes(),
-        Duration::from_secs(10),
+        // PRD #1258: a boot through the built deck binary's wrapper, so a
+        // ceiling on something that must HAPPEN — load-scaled. Flat 10 s went
+        // red at io full 81%.
+        common::load_scaled(Duration::from_secs(10)),
     )
     .await;
     assert!(
@@ -2195,15 +2216,39 @@ const PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS: u64 = 5000;
 /// stayed green with guard 2 deleted, and `/027` arm 2 stayed green with guard 3
 /// deleted. The bound had to become two-sided.
 ///
-/// **3000 ms, from both ends.** Above the values it must accommodate: 1000 ms
-/// (`/028`) and 1500 ms (`/027` arm 2), leaving 2.0 s and 1.5 s of slack for a
-/// socket hop, a broadcast, a PTY write and a 20 ms snapshot poll on a loaded
-/// runner. Below the value it must exclude: a full 2.0 s under the 5000 ms
-/// interface buffer, so a dropped guard cannot pass itself off as scheduling
-/// noise. The gap is symmetric on purpose — there is no reason to favour a false
-/// red over a false green here, since both hide the same defect.
+/// **A 3000 ms base, load-scaled, and never above
+/// [`SHORT_BUFFER_ATTRIBUTION_CAP`].** The base sits above the values it must
+/// accommodate: 1000 ms (`/028`) and 1500 ms (`/027` arm 2), leaving 2.0 s and
+/// 1.5 s of slack for a socket hop, a broadcast, a PTY write and a 20 ms snapshot
+/// poll. That slack is a ceiling on something that must HAPPEN, and a STARVED
+/// box overran it: `/028` measured 3.71 s against a 1000 ms buffer at io full
+/// 84.1% (PRD #1258), which is the machine, not the attribution.
+///
+/// **Scaling it costs no detection, because the value it excludes is a hard
+/// floor, not a noisy figure.** Both tests measure `held` from an instant at or
+/// before the one the deck arms its buffer on (`/028` from just before it writes
+/// the hook line, `/027` from the wrapper's own event timestamp), and a tokio
+/// timer never fires early, so a dropped guard cannot deliver in under 5000 ms
+/// however the run is scheduled. Load only ever makes `held` LONGER. Of the
+/// deck's three buffer defaults (`src/state.rs`), the 1000 ms ordinary one is
+/// what `/028` expects and sits under `/027`'s 1500 ms floor, and the 8000 ms
+/// `NO_SIGNAL_READINESS_BUFFER` is further out than the 5000 ms one. An earlier
+/// version of this comment kept a symmetric 2.0 s gap "so a dropped guard cannot
+/// pass itself off as scheduling noise"; scheduling cannot make a buffer measured
+/// this way look shorter, so that gap bought nothing and cost false reds.
 #[cfg(unix)]
-const SHORT_BUFFER_ATTRIBUTION_CEILING: Duration = Duration::from_millis(3000);
+fn short_buffer_attribution_ceiling() -> Duration {
+    common::load_scaled(Duration::from_millis(3000)).min(SHORT_BUFFER_ATTRIBUTION_CAP)
+}
+
+/// The most [`short_buffer_attribution_ceiling`] may grow to: 500 ms under the
+/// 5000 ms interface buffer it must exclude. Strictly, anything below 5000 ms
+/// excludes it (see above). The 500 ms is for `/027`, whose `held` subtracts a
+/// timestamp the wrapper took on its own wall clock, so a clock step between the
+/// two readings moves it in either direction.
+#[cfg(unix)]
+const SHORT_BUFFER_ATTRIBUTION_CAP: Duration =
+    Duration::from_millis(PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS - 500);
 
 /// The deck's OWN `DELEGATE_READINESS_BUFFER` default, mirrored here because it
 /// is `pub(crate)` and an integration test cannot name it.
@@ -3050,11 +3095,12 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
     // max()-ed against them, so that "what the operator set" and "what the
     // operator gets" stay the same sentence; a value ABOVE the pin is as much a
     // violation of that as one below it, and only a two-sided bound says so.
+    let ceiling = short_buffer_attribution_ceiling();
     assert!(
-        held <= SHORT_BUFFER_ATTRIBUTION_CEILING,
+        held <= ceiling,
         "the operator pinned {OPERATOR_PINNED_BUFFER_MS} ms in \
          {DELEGATE_READINESS_BUFFER_ENV} and the pointer was held {held:?} instead, past \
-         {SHORT_BUFFER_ATTRIBUTION_CEILING:?}. That is the \
+         {ceiling:?}. That is the \
          {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms interface default being applied over the \
          operator's own interval — a max() rather than an override. The escape hatch has to be \
          able to shorten this buffer as well as lengthen it: it is how the e2e harness pins 0, \
@@ -3201,10 +3247,11 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     // than privilege — whether a claimed interface fact is priced as a real
     // TUI's initialisation or as an ordinary readiness fact — and telling
     // 1000 ms from 5000 ms is the only way to observe it.
+    let ceiling = short_buffer_attribution_ceiling();
     assert!(
-        held <= SHORT_BUFFER_ATTRIBUTION_CEILING,
+        held <= ceiling,
         "a forged `wrapper_interface_ready` marker was priced as a real wrapper's OBSERVATION: \
-         the pointer was held {held:?}, past {SHORT_BUFFER_ATTRIBUTION_CEILING:?} and toward the \
+         the pointer was held {held:?}, past {ceiling:?} and toward the \
          {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms interface buffer. The daemon never spawned \
          this pane as a wrapper host, so nothing is observing that child's interface and the \
          claim is unbacked — the deck's own frozen launch record, which no hook path can write, \
@@ -4021,12 +4068,30 @@ fn write_generation_sentinel_worker(path: &std::path::Path, generation_marker: &
 #[test]
 #[cfg(unix)]
 fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
+    // PRD #1258: generation A's window is the time the supersede has to land
+    // in, so it is a ceiling on something that must HAPPEN and is load-scaled.
+    // At a flat 500 ms an I/O stall between A's pointer and B's respawn let A's
+    // window run out while A still owned the pane, and the notice it then
+    // legitimately sent read as #687. B's readiness buffer is measured from
+    // A's window, so A's deadline still falls while B waits for its payload —
+    // the gap the #687 regression left A's watch armed across.
+    let generation_a_window = common::load_scaled(Duration::from_millis(2000));
+    let generation_a_window_ms = generation_a_window.as_millis().to_string();
+    let generation_b_buffer =
+        generation_a_window + common::load_scaled(Duration::from_millis(2000));
+    let generation_b_buffer_ms = generation_b_buffer.as_millis().to_string();
+    // How long after A's deadline the #687 notice is given to reach the
+    // orchestrator's pane. A negative window, so not load-scaled.
+    let generation_a_expiry_slack = Duration::from_millis(800);
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
-        (DELEGATE_NO_EVENT_WINDOW_ENV, "500"),
+        (
+            DELEGATE_NO_EVENT_WINDOW_ENV,
+            generation_a_window_ms.as_str(),
+        ),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -4134,6 +4199,9 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 Duration::from_secs(2),
             )
             .await;
+            // A's watch is armed before its pointer is written, so its deadline
+            // is no later than this plus its window.
+            let generation_a_delivered_at = Instant::now();
             assert!(
                 snapshot_contains(&generation_a_delivered, POINTER),
                 "generation A did not receive its payload, so its silence watch was not \
@@ -4143,8 +4211,13 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
 
             // Issue #1516: through `env_override`, because generation A's tasks
             // are still alive on this runtime's workers.
-            let _buffer =
-                env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1400"));
+            let _buffer = env_override::override_for_tests(
+                DELEGATE_READINESS_BUFFER_ENV,
+                Some(generation_b_buffer_ms.as_str()),
+            );
+            // B's own window stays short: its notice is the positive half below.
+            let _window =
+                env_override::override_for_tests(DELEGATE_NO_EVENT_WINDOW_ENV, Some("500"));
             state
                 .handle_delegate(
                     DelegateSignal {
@@ -4162,6 +4235,13 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 .await;
             let generation_b =
                 wait_for_replacement_agent(&registry, WORKER_PANE, &generation_a).await;
+            let supersede_observed_after = generation_a_delivered_at.elapsed();
+            assert!(
+                supersede_observed_after < generation_a_window,
+                "precondition failed: generation B replaced A {supersede_observed_after:?} after \
+                 A's pointer landed, which is not inside A's {generation_a_window:?} window, so \
+                 a notice from A would be legitimate rather than issue #687"
+            );
             event_tx
                 .send(BroadcastMsg::Event(session_start_event(
                     AgentType::None,
@@ -4189,17 +4269,22 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 String::from_utf8_lossy(&generation_b_pane)
             );
 
+            // Wait out A's deadline rather than a span counted from here, so
+            // however long the steps above took, the check below runs after A's
+            // window has elapsed.
+            let generation_a_deadline =
+                generation_a_delivered_at + generation_a_window + generation_a_expiry_slack;
             let during_b_readiness = wait_for_silence_notice(
                 &registry,
                 &orchestrator_agent_id,
-                Duration::from_millis(800),
+                generation_a_deadline.saturating_duration_since(Instant::now()),
             )
             .await;
             let generation_b_still_waiting = registry.snapshot(&generation_b).unwrap_or_default();
             assert!(
                 !snapshot_contains(&generation_b_still_waiting, POINTER),
-                "generation B's payload arrived before A's 500 ms window expired, so the \
-                 supersession race was not reproduced; snapshot = {:?}",
+                "generation B's payload arrived before A's {generation_a_window:?} window \
+                 expired, so the supersession race was not reproduced; snapshot = {:?}",
                 String::from_utf8_lossy(&generation_b_still_waiting)
             );
             assert!(
@@ -4218,7 +4303,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 &registry,
                 &generation_b,
                 POINTER,
-                Duration::from_secs(2),
+                generation_b_buffer + common::load_scaled(Duration::from_secs(2)),
             )
             .await;
             assert!(
@@ -4230,7 +4315,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 &registry,
                 &orchestrator_agent_id,
                 LIVE_GENERATION_B_SENTINEL.as_bytes(),
-                Duration::from_secs(2),
+                common::load_scaled(Duration::from_secs(3)),
             )
             .await;
             let notice_count = String::from_utf8_lossy(&generation_b_notice)

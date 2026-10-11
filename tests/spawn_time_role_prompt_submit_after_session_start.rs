@@ -99,7 +99,11 @@ async fn spawn_daemon() -> DaemonHandle {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Issue #709's ceilings, not idle-machine ones: each wait below returns
+    // the moment its condition holds, and a flat 2 s / 5 s failed here under
+    // I/O starvation with the code under test never reached.
+    let ceiling = common::daemon_task_start_budget();
+    let deadline = tokio::time::Instant::now() + ceiling;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < deadline {
         if attach_path.exists() && UnixStream::connect(&attach_path).await.is_ok() {
@@ -110,7 +114,7 @@ async fn spawn_daemon() -> DaemonHandle {
     }
     assert!(
         attach_ready,
-        "attach socket was not accepting connections within 5s"
+        "attach socket was not accepting connections within {ceiling:?}"
     );
 
     DaemonHandle {
@@ -262,7 +266,7 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
     .expect("join spawn task");
 
     let agent_id = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + common::daemon_task_start_budget();
         loop {
             let records = daemon.pty_registry.agent_records();
             if let Some(rec) = records
@@ -287,7 +291,7 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
         &daemon.pty_registry,
         &agent_id,
         b"STUB-RAW-READY",
-        Duration::from_secs(2),
+        common::child_boot_budget(),
     )
     .await;
     assert!(
@@ -351,7 +355,7 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
         &daemon.pty_registry,
         &agent_id,
         needle,
-        Duration::from_secs(5),
+        common::load_scaled(Duration::from_secs(5)),
     )
     .await;
     assert!(
