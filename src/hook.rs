@@ -1848,17 +1848,19 @@ pub fn send_and_await_spawn_role_reply(json: &str) -> SocketReply {
 /// Issue #1129: the budget for a fire-and-forget signal's acknowledgement —
 /// `work-done` and `dispatch`.
 ///
-/// The same 5s [`DELEGATE_REPLY_TIMEOUT`] gives `delegate`, and deliberately
-/// not a smaller number even though this reply is cheaper to produce. Cheaper
-/// because the daemon writes it at the provenance gate, **before** the handler
-/// runs (`DaemonMessage::provenance_ack_reply`), so it costs one registry lookup
-/// and a socket write — where `delegate`'s reply is written after
-/// `handle_delegate` has run under the `state` read lock that the 5s exists to
-/// cover. So a budget sized for the more expensive of the two is generous here
-/// by construction, and the margin is spent only when the daemon cannot answer
-/// promptly — wedged, overloaded, or with a full accept queue — which is exactly
-/// when a *smaller* budget would convert a slow-but-delivered signal into a
-/// reported failure.
+/// The same 5s [`DELEGATE_REPLY_TIMEOUT`] gives `delegate`. For `dispatch` the
+/// reply is cheaper to produce: the daemon writes it at the provenance gate,
+/// **before** the handler runs (`DaemonMessage::provenance_ack_reply`), so it
+/// costs one registry lookup and a socket write. Since PRD #1631 `work-done`'s
+/// is written once its report is queued, after `prepare_work_done` has run
+/// under the `state` read lock — the same lock `delegate`'s reply waits behind,
+/// and the one the 5s exists to cover — or behind a full delivery queue
+/// (`crate::pane_delivery_queue::MAX_PENDING_PANE_DELIVERIES`). The margin is
+/// spent only when the daemon cannot answer promptly — wedged, overloaded, or
+/// with a full accept queue — which is exactly when a *smaller* budget would
+/// convert a slow-but-delivered signal into a reported failure. A reply that
+/// misses it is [`SocketReply::NoReply`], which the CLI reports as handed to
+/// the daemon rather than as a failure.
 ///
 /// It is also the first deadline these two verbs have ever had. They went
 /// through [`send_to_socket`], whose connect and write are unbounded, so a

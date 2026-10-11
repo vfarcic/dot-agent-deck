@@ -4756,11 +4756,12 @@ async fn run_hook_loop_with_limits(
                                     continue;
                                 }
                                 Ok(()) => {
-                                    // Issue #1129: the two fire-and-forget verbs
-                                    // get their acknowledgement HERE, ahead of
-                                    // the handler, so the caller learns whether
-                                    // the gate admitted it without waiting for
-                                    // work it is not waiting on. `dispatch`'s
+                                    // Issue #1129: `dispatch` gets its
+                                    // acknowledgement HERE, ahead of the
+                                    // handler, so the caller learns whether the
+                                    // gate admitted it without waiting for work
+                                    // it is not waiting on (`work_done` answers
+                                    // in its own arm since PRD #1631). `dispatch`'s
                                     // handler is awaited inline below and spends
                                     // a whole worktree-create-and-spawn; an ack
                                     // written after it would park the calling
@@ -5101,13 +5102,23 @@ async fn run_hook_loop_with_limits(
                                     // the `Dispatch` arm's `deliver_dispatch_result`:
                                     // awaited inline, a deferred write holds one of
                                     // the `MAX_CONCURRENT_HOOK_CONNECTIONS` permits
-                                    // for up to the draft cap. The `work-done` CLI
-                                    // was acked at the provenance gate, and
-                                    // `deliver` logs its own outcome. The state
-                                    // changes `prepare_work_done` makes stay inline;
-                                    // only the PTY write moves, into the recipient
+                                    // for up to the draft cap. `deliver` logs its
+                                    // own outcome. The state changes
+                                    // `prepare_work_done` makes stay inline; only
+                                    // the PTY write moves, into the recipient
                                     // pane's queue, behind every report already
                                     // queued for that pane.
+                                    //
+                                    // PRD #1631: the `work-done` CLI is acked
+                                    // HERE, once its report is queued, not at the
+                                    // provenance gate. Acked at the gate, a
+                                    // worker's second report could be queued
+                                    // ahead of its first, which was still on its
+                                    // way to the queue, and the two reached the
+                                    // orchestrator reversed. Acked after the
+                                    // queue push, a sender that waits for its ack
+                                    // is ordered, and the wait is the state
+                                    // change and the push, never the delivery.
                                     let delivery = state
                                         .read()
                                         .await
@@ -5125,6 +5136,13 @@ async fn run_hook_loop_with_limits(
                                                 }),
                                             )
                                             .await;
+                                    }
+                                    if let Ok(json) = serde_json::to_string(
+                                        &crate::event::SignalAck::accepted(),
+                                    ) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
                                     }
                                 }
                                 DaemonMessage::Ack(signal) => {
@@ -10274,6 +10292,60 @@ mod hook_ingestion_tests {
             fx.orchestrator_saw("WORKDONE-AFTER-DEAF-3c9f", Duration::from_secs(20))
                 .await,
             "the hook loop answered but stopped handling after the unread acks"
+        );
+        fx.stop().await;
+    }
+
+    /// Send one `work_done` line from the worker's pane without half-closing,
+    /// and return the connection for reading its reply line by line.
+    async fn open_work_done(fx: &ProvenanceFixture, report: &str) -> UnixStream {
+        use tokio::io::AsyncWriteExt;
+        let msg = crate::event::DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+            pane_id: PROV_WORKER_PANE.to_string(),
+            task: report.to_string(),
+            done: false,
+            timestamp: chrono::Utc::now(),
+            token: Some(fx.worker_token.clone()),
+        });
+        let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        stream
+    }
+
+    /// Scenario: PRD #1631 — the daemon's state lock is held, so a worker's
+    /// `work-done` cannot get as far as queueing its report for the
+    /// orchestrator. No acknowledgement may reach the worker meanwhile: an ack
+    /// written before the report is queued lets the worker's next `work-done`
+    /// be queued ahead of it (`orchestration/work-done/010`). Once the lock is
+    /// released the report is acknowledged and delivered.
+    #[tokio::test]
+    async fn work_done_is_acknowledged_only_once_its_report_is_queued() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let fx = ProvenanceFixture::start().await;
+        let held = fx.state.write().await;
+        let stream = open_work_done(&fx, "WORKDONE-QUEUED-FIRST-7d2e").await;
+        let mut reply = BufReader::new(stream);
+        let mut line = String::new();
+        let early =
+            tokio::time::timeout(Duration::from_millis(1500), reply.read_line(&mut line)).await;
+        assert!(
+            early.is_err(),
+            "the work-done was acknowledged before its report could be queued: {line:?}"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(20), reply.read_line(&mut line))
+            .await
+            .expect("the work-done was never acknowledged after the lock was released")
+            .expect("read the acknowledgement");
+        let ack: crate::event::SignalAck = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("work_done reply was not a SignalAck ({e}): {line:?}"));
+        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-QUEUED-FIRST-7d2e", Duration::from_secs(20))
+                .await,
+            "the acknowledged report never reached the orchestrator's PTY"
         );
         fx.stop().await;
     }

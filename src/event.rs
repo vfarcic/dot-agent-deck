@@ -1749,11 +1749,11 @@ impl DaemonMessage {
     /// provenance gate, or `None` for a verb whose own handler answers on the
     /// connection.
     ///
-    /// Only the two fire-and-forget verbs (`work_done` and `dispatch`) are
-    /// `Some`, and the exhaustive `match` is what enforces the invariant the hook
-    /// loop depends on: **exactly one line per message**. `delegate`,
-    /// `restart_role`, `spawn_role`, `list_targets`, `get_seed` and `ack` all
-    /// write their own response after their handler runs, so an admission line
+    /// Only `dispatch` is `Some`, and the exhaustive `match` is what enforces
+    /// the invariant the hook loop depends on: **exactly one line per
+    /// message**. `work_done`, `delegate`, `restart_role`, `spawn_role`,
+    /// `list_targets`, `get_seed` and `ack` all write their own response after
+    /// their handler runs, so an admission line
     /// here would be a second one and the caller — which reads exactly one line
     /// — would take the ack for the answer. `ack` answers after its handler
     /// (PR #1414 review) because admission is not what its caller needs to know:
@@ -1767,12 +1767,19 @@ impl DaemonMessage {
     /// as the dispatch takes. The price is stated in [`SignalAck::accepted`]: an
     /// admitted message is one the gate let through, not one whose work
     /// succeeded.
+    ///
+    /// `work_done` was acknowledged here too until PRD #1631, and that ordered
+    /// nothing: a worker whose first report was acked here could send its
+    /// second before the first was queued for delivery, and the two could reach
+    /// the recipient reversed (`orchestration/work-done/010`). Its handler
+    /// acknowledges once the report is queued — a state change under the
+    /// `state` read lock and a queue push, not the delivery, which may wait for
+    /// the recipient's draft — so a sender that waits for its ack is ordered.
     pub fn provenance_ack_reply(&self) -> Option<String> {
         match self {
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
-                serde_json::to_string(&SignalAck::accepted()).ok()
-            }
-            DaemonMessage::Delegate(_)
+            DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
@@ -1802,8 +1809,10 @@ impl DaemonMessage {
 /// # What it claims, and what it does not
 ///
 /// It claims exactly one thing: **this daemon admitted the message past the
-/// provenance gate**. It is written before the handler runs, so it is not a
-/// receipt for the work. In particular these remain invisible to the sender, as
+/// provenance gate**. It is not a receipt for the work: `dispatch`'s is written
+/// before its handler runs, and `work_done`'s once the handler has made its
+/// state changes and queued the report for delivery (PRD #1631), before the
+/// report is written into any pane. In particular these remain invisible to the sender, as
 /// they were before:
 ///
 /// - a `dispatch` from a pane the registry holds no record for, which the hook
@@ -3709,12 +3718,13 @@ mod tests {
     /// The invariant the hook loop rests on: **exactly one line per message**.
     /// A verb that answers in its own arm must return `None` from
     /// `provenance_ack_reply`, or the caller — which reads exactly one line —
-    /// would take the admission for the answer.
+    /// would take the admission for the answer. `work_done` answers in its own
+    /// arm since PRD #1631, once its report is queued.
     #[test]
-    fn only_the_fire_and_forget_verbs_are_acknowledged_at_the_gate() {
+    fn only_dispatch_is_acknowledged_at_the_gate() {
         for msg in one_of_every_variant() {
             let acked = msg.provenance_ack_reply().is_some();
-            let expected = matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_));
+            let expected = matches!(msg, DaemonMessage::Dispatch(_));
             assert_eq!(
                 acked,
                 expected,
@@ -3765,17 +3775,14 @@ mod tests {
 
     /// The admission is affirmative: it identifies itself and carries no error.
     #[test]
-    fn an_admitted_fire_and_forget_verb_answers_an_affirmative_ack() {
-        let msg = DaemonMessage::WorkDone(WorkDoneSignal {
-            pane_id: "p".into(),
-            task: "t".into(),
-            done: false,
-            timestamp: chrono::Utc::now(),
-            token: None,
-        });
+    fn an_admitted_dispatch_answers_an_affirmative_ack() {
+        let msg = one_of_every_variant()
+            .into_iter()
+            .find(|msg| matches!(msg, DaemonMessage::Dispatch(_)))
+            .expect("a dispatch");
         let line = msg
             .provenance_ack_reply()
-            .expect("work_done is acknowledged");
+            .expect("dispatch is acknowledged at the gate");
         let ack: SignalAck = serde_json::from_str(&line).expect("the ack parses");
         assert!(ack.is_signal_ack());
         assert!(ack.accepted);

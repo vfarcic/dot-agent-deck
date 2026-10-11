@@ -916,8 +916,10 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
 ///   the signal and said why.
 ///
 /// An `accepted: true` ack says the gate admitted the message, **not** that the
-/// handler behind it succeeded — the daemon writes it before the handler runs.
-/// See `dot_agent_deck::event::SignalAck` for what stays invisible.
+/// handler behind it succeeded — for `dispatch` the daemon writes it before the
+/// handler runs, and for `work-done` once the report is queued, before it is
+/// written into any pane. See `dot_agent_deck::event::SignalAck` for what
+/// stays invisible.
 fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
     use dot_agent_deck::hook::SocketReply;
     match dot_agent_deck::hook::send_and_await_signal_ack(json) {
