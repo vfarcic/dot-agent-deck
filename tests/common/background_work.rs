@@ -30,8 +30,15 @@ impl Fixture {
         // session. The Bash argv carries the measured Claude fingerprint;
         // Python is only the parent stand-in, never a real agent.
         std::fs::write(deck.workdir().join("background-parent.py"), r#"
-import pathlib, subprocess, time
+import os, pathlib, signal, subprocess, time
 children = {}
+def reap(name, child):
+    # Forget the pid before reaping it: until `wait` the child is a zombie,
+    # so the number cannot be reused while the pid file still names it, and
+    # `Fixture::drop` never signals a group this parent has already reaped.
+    os.killpg(child.pid, signal.SIGKILL)
+    pathlib.Path(name + '.pid').unlink(missing_ok=True)
+    child.wait()
 try:
     while not pathlib.Path('parent-exit.run').exists():
         for name in ('one', 'two'):
@@ -42,15 +49,12 @@ try:
                 children[name] = child
                 pathlib.Path(name + '.pid').write_text(str(child.pid))
             elif not enabled and child is not None:
-                import os, signal
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
+                reap(name, child)
                 del children[name]
         time.sleep(.05)
 finally:
-    for child in children.values():
-        child.kill()
-        child.wait()
+    for name, child in children.items():
+        reap(name, child)
 "#).unwrap();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -275,7 +279,9 @@ impl Drop for Fixture {
                 && let Ok(pid) = pid.parse::<i32>()
             {
                 // SAFETY: this is a session leader created by this fixture,
-                // reported through its private pid file. No global matching.
+                // reported through its private pid file, which the parent
+                // removes before it reaps the child, so a pid still on disk
+                // names a child the parent has not reaped. No global matching.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }

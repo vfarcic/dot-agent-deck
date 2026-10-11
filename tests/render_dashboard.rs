@@ -169,6 +169,70 @@ fn background_004_card_counts_elapsed_skew_and_narrow_layout() {
     ");
 }
 
+/// Scenario: Hydrate a Blocked card that also has background work and render it at Minimal density, whose one content row the Blocked reason takes. The reason keeps the row and the background line follows it on that row after ` · `, cut with `…` on a narrow card; an orphaned card does the same, and at Normal density the two stay on rows of their own.
+#[spec("status/background/016")]
+#[test]
+fn background_016_minimal_card_keeps_background_beside_its_reason() {
+    let now = render_now();
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Blocked", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "blocked": {"kind": "usage_limit", "detected_at_ms": now.timestamp_millis()},
+        "background": {"commands": 1, "subagents": 1, "since_ms": now.timestamp_millis() - 240_000},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("background-card".into());
+    state.seed_hydrated_session("background-card".into(), None, None, None, Some(&snapshot));
+    let blocked = state.sessions.values().next().unwrap().clone();
+    let render = |session: &SessionState, density: CardDensityKind, width: u16| {
+        buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    let minimal = render(&blocked, CardDensityKind::Minimal, 80);
+    insta::assert_snapshot!("background_016_minimal_blocked_card", minimal);
+
+    // Narrow: the reason is kept whole and the background part is cut.
+    let narrow = render(&blocked, CardDensityKind::Minimal, 40);
+    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(row, "⚠ Usage limit reached · Background: 1…");
+
+    // Orphaned (and not Blocked): the orphaned line shares its row the same way.
+    let mut orphaned = blocked.clone();
+    orphaned.status = SessionStatus::Idle;
+    orphaned.blocked = None;
+    orphaned.orchestration_orphaned = true;
+    let row = render(&orphaned, CardDensityKind::Minimal, 120);
+    let row = row.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(
+        row,
+        "Orphaned — delegation unavailable · Background: 1 command, 1 subagent · 4m"
+    );
+
+    // Normal has room for both rows, so each keeps its own.
+    let normal = render(&blocked, CardDensityKind::Normal, 80);
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(rows.contains(&"⚠ Usage limit reached"), "{normal}");
+    assert!(
+        rows.contains(&"Background: 1 command, 1 subagent · 4m"),
+        "{normal}"
+    );
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title must carry the card number, display name, and status

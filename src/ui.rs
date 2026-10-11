@@ -21478,11 +21478,14 @@ fn render_session_card(
     // survives every density (at Minimal it takes `Dir:`'s place), and ahead
     // of the prompt/tool rows because it is the fact that explains why those
     // rows keep advancing while the run has in fact stalled.
+    // The attention rows' text is kept whole until the background line below
+    // has decided whether it shares their row (Minimal density).
+    let mut attention: Vec<(String, Style)> = Vec::new();
     if is_orphaned {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+        attention.push((
+            "Orphaned — delegation unavailable".to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
-        )));
+        ));
     }
 
     // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
@@ -21518,24 +21521,42 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(&text, w),
+        attention.push((
+            text,
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
-        )));
+        ));
     }
 
     // Issue #1678: background work the agent left running after its turn
-    // ended, under the status rows and above the prompt — a status row that
-    // `fit_card_rows` never sheds, so a narrow or short card keeps it.
-    if !is_placeholder
-        && let Some(text) = session
+    // ended, under the status rows and above the prompt. `fit_card_rows`
+    // sheds the separator, prompts and `Dir:` before a status row, but it
+    // cannot shrink a card below its status rows: Minimal has one content row,
+    // which a Blocked or orphaned reason already takes. There the reason keeps
+    // the row, since it needs the user's attention, and the background line is
+    // appended to it after ` · `, cut with `…` when the row runs out.
+    let background = if is_placeholder {
+        None
+    } else {
+        session
             .background_work()
             .and_then(|work| background_work_label(&work, now))
-    {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(&text, w),
-            text_primary(),
-        )));
+    };
+    let plain = |(text, style): (String, Style)| {
+        Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
+    };
+    let shares_row = density == CardDensity::Minimal && !attention.is_empty();
+    let mut attention = attention.into_iter();
+    match background {
+        Some(text) if shares_row => {
+            let (reason, style) = attention.next().expect("checked non-empty");
+            status_lines.push(reason_with_background(&reason, style, &text, w));
+            status_lines.extend(attention.map(plain));
+        }
+        Some(text) => {
+            status_lines.extend(attention.map(plain));
+            status_lines.push(plain((text, text_primary())));
+        }
+        None => status_lines.extend(attention.map(plain)),
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -21582,6 +21603,29 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Issue #1678: a Minimal card's one content row when it has both a status
+/// reason (Blocked or orphaned) and background work — `reason · background`,
+/// cut with `…` at `width`, so the reason is kept whole first. The reason keeps
+/// its own style and the background part reads as it does on its own line.
+fn reason_with_background(
+    reason: &str,
+    style: Style,
+    background: &str,
+    width: usize,
+) -> Line<'static> {
+    let row = truncate_with_ellipsis(&format!("{reason} · {background}"), width);
+    let split = row
+        .char_indices()
+        .nth(reason.chars().count())
+        .map_or(row.len(), |(at, _)| at);
+    let (head, tail) = row.split_at(split);
+    let mut spans = vec![Span::styled(head.to_string(), style)];
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail.to_string(), text_primary()));
+    }
+    Line::from(spans)
 }
 
 /// How far ahead of `now` a background start may sit and still read as "just

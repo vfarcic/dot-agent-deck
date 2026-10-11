@@ -4630,6 +4630,76 @@ mod opencode_child_permission_tests {
         assert_eq!(card(&state), (SessionStatus::Thinking, 0));
     }
 
+    fn tool_end(subagent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event": "tool.execute.after",
+            "tool_name": "bash",
+            "subagent_id": subagent,
+        })
+    }
+
+    /// Scenario (Qodo / Greptile on PR #1688): after the root's turn ended,
+    /// child A asks for permission and child B, which never asked, then
+    /// finishes a tool call. A's prompt is still unanswered, so the card stays
+    /// on Needs Input; A's own tool end (the control) then releases it to Idle.
+    #[test]
+    fn opencode_child_permission_another_childs_tool_end_keeps_the_prompt() {
+        let (mut state, _ownership) = daemon();
+        root_ended_with_child_running(&mut state);
+        send(
+            &mut state,
+            serde_json::json!({"event": "subagent.start", "subagent_id": "other"}),
+        );
+        send(&mut state, ask(Some("child")));
+        send(&mut state, tool_end("other"));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::WaitingForInput, 2),
+            "another child's tool end must not hide this child's prompt"
+        );
+        // A repeat, and one from a subagent the card never saw, change nothing.
+        send(&mut state, tool_end("other"));
+        send(&mut state, tool_end("stranger"));
+        assert_eq!(card(&state).0, SessionStatus::WaitingForInput);
+        send(&mut state, tool_end("child"));
+        assert_eq!(
+            card(&state),
+            (SessionStatus::Idle, 2),
+            "the asking child's own tool end releases its share"
+        );
+    }
+
+    /// Scenario (Qodo / Greptile on PR #1688): during the root's turn the root
+    /// asks for permission, and a running child then finishes a tool call. The
+    /// root's prompt is the main thread's, which no subagent's report can
+    /// answer, so the card stays on Needs Input — also when the child had
+    /// joined the wait with a prompt of its own and its tool end releases it.
+    #[test]
+    fn opencode_child_permission_a_childs_tool_end_keeps_the_main_threads_prompt() {
+        for child_asked in [false, true] {
+            let (mut state, _ownership) = daemon();
+            send(&mut state, serde_json::json!({"event": "session.created"}));
+            send(
+                &mut state,
+                serde_json::json!({"event": "session.status", "status": "busy"}),
+            );
+            send(
+                &mut state,
+                serde_json::json!({"event": "subagent.start", "subagent_id": "child"}),
+            );
+            send(&mut state, ask(None));
+            if child_asked {
+                send(&mut state, ask(Some("child")));
+            }
+            send(&mut state, tool_end("child"));
+            assert_eq!(
+                card(&state).0,
+                SessionStatus::WaitingForInput,
+                "child_asked={child_asked}: the root's prompt is still open"
+            );
+        }
+    }
+
     /// Scenario (audit AU-5): after the root's turn ended, two child sessions
     /// whose ids are over the bound — each attributed to its own stand-in, and
     /// never reported active — both ask for permission, and only the first is

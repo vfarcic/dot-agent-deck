@@ -1344,9 +1344,10 @@ pub struct SessionState {
 /// ended has taken its prompt with it, and nothing else would ever lift the
 /// card off Needs Input. So a `SubagentStop` naming the LAST subagent recorded
 /// here ends the wait. It resumes to Idle when the card was Idle before (a
-/// background agent after the turn ended) and to Thinking otherwise, as the
-/// subagent's answered `ToolEnd` does — never to Working, Error or Blocked,
-/// which a subagent event must not assert on the parent.
+/// background agent after the turn ended) and to Thinking otherwise — never to
+/// Working, Error or Blocked, which a subagent event must not assert on the
+/// parent. Issue #1678: the subagent's answered `ToolEnd` resumes the same way,
+/// and only for an id the wait holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SubagentWait {
     pub subagent_ids: Vec<String>,
@@ -17714,16 +17715,34 @@ impl AppState {
                 });
                 asserted
             }
+            // Issue #1354: a subagent's call ending must not clear the main
+            // thread's active tool (the call that launched the subagent is
+            // still running). It still counts, and it answers that subagent's
+            // own permission prompt — the prompt is resolved by exactly this
+            // event, and ignoring it would strand the card on Needs Input.
+            // Issue #1678 (Qodo / Greptile on PR #1688): only its OWN share,
+            // through `release_subagent_wait` and only while the wait holds its
+            // id. Another subagent's call ending (an OpenCode child's, now
+            // routed to the root card) answers nothing, so it leaves a main
+            // thread's wait, another subagent's, and one counted in the
+            // overflow alone.
+            EventType::ToolEnd if event.is_from_subagent() => {
+                session.tool_count += 1;
+                let pending = event
+                    .metadata
+                    .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    .and_then(|id| wait_held_id(id))
+                    .filter(|id| {
+                        session
+                            .subagent_wait
+                            .as_ref()
+                            .is_some_and(|wait| wait.subagent_ids.iter().any(|held| held == id))
+                    })
+                    .map(str::to_string);
+                pending.is_some_and(|id| release_subagent_wait(session, &id))
+            }
             EventType::ToolEnd => {
-                // Issue #1354: a subagent's call ending must not clear the main
-                // thread's active tool (the call that launched the subagent is
-                // still running). It still counts, and it still answers a
-                // `WaitingForInput` — a subagent's permission prompt is resolved
-                // by exactly this event, and ignoring it would strand the card
-                // on Needs Input.
-                if !event.is_from_subagent() {
-                    session.active_tool = None;
-                }
+                session.active_tool = None;
                 session.tool_count += 1;
                 let asserted = session.status == SessionStatus::WaitingForInput;
                 if asserted {

@@ -1064,7 +1064,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L1.
 - **Agent:** none.
 - **Asserts:** step by step through the main thread's `Agent` call, the subagent's `Bash` call, the subagent's `PermissionRequest` and its answered `PostToolUse`, `SubagentStop`, the `Agent` call's end and `Stop`: the card reads Working with `Agent` as active tool through the subagent's own calls, Needs Input on the subagent's prompt and Thinking once that call ends, and Idle at the end.
-- **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
+- **Does not assert:** a subagent prompt answered after the main turn already stopped — since issue #1678 its answered `PostToolUse` resumes the card as `SubagentStop` does, to Idle there; a different subagent's call ending, which answers no prompt but its own (`hook.rs`'s `opencode_child_permission_another_childs_tool_end_keeps_the_prompt` and `…_a_childs_tool_end_keeps_the_main_threads_prompt`).
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/005 — Reporting panes stay Idle on new-daemon shell activity, while old-daemon synthetic Working retains its takeover protection.
@@ -1168,6 +1168,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none; real shell stand-in with synthetic Claude subagent/Stop reports.
 - **Asserts:** an exited spawn with no successor reservation produces an explicit-zero ShellIdle carrying the legacy non-claiming Displaced verdict; after newer successor hydration, replaying that serialized carrier without its retirement marker preserves the successor and mints no departed card, for distinct and shared session keys and with additive background fields retained or ignored. An explicitly Displaced control preserves the successor.
 - **Does not assert:** execution of the released v0.46 binary, cross-version delegate/hook flows, real agents, or PTY rendering. The marker-less generation gates were checked against v0.46.0's source.
+- **Platform coverage:** mac+linux.
+
+##### status/background/016 — At Minimal density a Blocked or orphaned card keeps the reason on its one row and the background line after it (#1678).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Blocked card with background work rendered through the production card seam.
+- **Asserts:** at Minimal the one content row reads `⚠ Usage limit reached · Background: 1 command, 1 subagent · 4m` (snapshot); on a 40-column card the reason is kept whole and the background part is cut with `…`; an orphaned card's line shares its row the same way; at Normal the reason and the background line each keep a row of their own.
+- **Does not assert:** a card both Blocked and orphaned at Minimal (its second reason row is still clipped, as before), Compact density, the desktop (which has no density setting).
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
