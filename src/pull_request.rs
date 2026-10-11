@@ -91,7 +91,10 @@ use crate::untrusted_text::escape_control_and_bidi;
 pub use crate::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
 
 /// The `--json` fields the badge needs from `gh pr list`.
-pub(crate) const GH_PR_FIELDS: &str = "number,state,isDraft,reviewDecision,url,headRefName";
+/// `isCrossRepository` because `--head` matches a branch NAME, so a fork's
+/// pull request from a branch named like ours is listed too.
+pub(crate) const GH_PR_FIELDS: &str =
+    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository";
 
 /// The arguments of `gh pr list` for `branch` of `repo_slug`, asking for
 /// `fields`. Shared with [`crate::worktree_reclaim`]'s PR lookup: `--state all`
@@ -113,10 +116,6 @@ pub const DOT_AGENT_DECK_PR_REFRESH_SECS_ENV: &str = "DOT_AGENT_DECK_PR_REFRESH_
 
 /// How often an open or draft PR is re-read when the seam is unset.
 pub const DEFAULT_REFRESH: Duration = Duration::from_secs(60);
-
-/// A branch with no PR is re-read this many intervals apart (a PR an agent
-/// opens is normally picked up sooner, by the turn-end re-read).
-const NO_PR_POLL_FACTOR: u32 = 5;
 
 /// A failed lookup is retried this many intervals later, whatever happens in
 /// between.
@@ -229,6 +228,9 @@ struct GhPr {
     review_decision: Option<String>,
     url: String,
     head_ref_name: String,
+    /// The PR's branch lives in a fork. Absent (an older `gh`) reads as not.
+    #[serde(default)]
+    is_cross_repository: bool,
 }
 
 impl GhPr {
@@ -260,7 +262,9 @@ impl GhPr {
 }
 
 /// The PR `gh pr list --json` output reports for exactly `branch`, or `None`
-/// when it reports none. Only an exact `headRefName` match counts. Of several,
+/// when it reports none. Only an exact `headRefName` match counts, from a
+/// branch of the repository itself: a fork's pull request from a branch with
+/// the same name is someone else's. Of several,
 /// an open (or draft) one wins, then the highest number. An entry with a state
 /// this build does not know, or a URL off `https://github.com/`, is skipped.
 pub fn parse_pr_list(json: &str, branch: &str) -> Result<Option<PullRequestInfo>, String> {
@@ -268,7 +272,7 @@ pub fn parse_pr_list(json: &str, branch: &str) -> Result<Option<PullRequestInfo>
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
     Ok(entries
         .into_iter()
-        .filter(|pr| pr.head_ref_name == branch)
+        .filter(|pr| pr.head_ref_name == branch && !pr.is_cross_repository)
         .filter_map(GhPr::into_info)
         .max_by_key(|pr| {
             let open = matches!(pr.state, PullRequestState::Open | PullRequestState::Draft);
@@ -327,8 +331,9 @@ pub(crate) struct KeyEntry {
 /// * a merged or closed PR, never (a new branch is a new key);
 /// * an open or draft PR, every `interval`, or after a turn end once the
 ///   debounce passed;
-/// * no PR, every [`NO_PR_POLL_FACTOR`] intervals, or after a turn end once
-///   the debounce passed.
+/// * no PR, every `interval` too — a PR the user opens while the agent is
+///   idle ends no turn, and must still show within about a minute — or after
+///   a turn end once the debounce passed.
 pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> bool {
     if entry.in_flight {
         return false;
@@ -351,8 +356,7 @@ pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> b
         {
             false
         }
-        Some(Some(_)) => age >= interval || kicked,
-        Some(None) => age >= interval * NO_PR_POLL_FACTOR || kicked,
+        Some(Some(_)) | Some(None) => age >= interval || kicked,
     }
 }
 
@@ -879,6 +883,32 @@ mod tests {
         );
     }
 
+    /// Scenario: a contributor's fork opens a pull request into the
+    /// repository from a branch named like the agent's. The badge shows the
+    /// agent's own pull request even though the fork's has the higher number,
+    /// and with only the fork's it shows none (PR #1680 review).
+    #[test]
+    fn a_pull_request_from_a_fork_is_not_the_branchs() {
+        use serde_json::json;
+        assert!(
+            GH_PR_FIELDS
+                .split(',')
+                .any(|field| field == "isCrossRepository"),
+            "gh must be asked where each PR's branch lives"
+        );
+        let mut fork = gh_pr(9000, "feat/x", "OPEN", false, json!(""));
+        fork["isCrossRepository"] = json!(true);
+        let mut own = gh_pr(1234, "feat/x", "OPEN", false, json!(""));
+        own["isCrossRepository"] = json!(false);
+        assert_eq!(
+            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x")
+                .unwrap()
+                .map(|pr| pr.number),
+            Some(1234)
+        );
+        assert_eq!(parse_pr_list(&gh(json!([fork])), "feat/x").unwrap(), None);
+    }
+
     #[test]
     fn unparsable_gh_output_is_an_error_not_no_pr() {
         assert!(parse_pr_list("not json", "feat/x").is_err());
@@ -976,17 +1006,17 @@ mod tests {
         ));
     }
 
+    /// Scenario: the agent is idle on a branch with no pull request, and the
+    /// user opens one from another terminal. No turn ends to prompt a
+    /// re-read, yet the badge must appear within about a minute (PRD #1401),
+    /// so a branch with no PR is re-read every interval (PR #1680 review).
     #[test]
-    fn no_pr_is_polled_slowly() {
+    fn no_pr_is_polled_every_interval() {
         let at = Instant::now();
         let interval = Duration::from_secs(60);
         let entry = fetched(Some(None), false, at);
-        assert!(!fetch_due(&entry, at + interval, interval));
-        assert!(fetch_due(
-            &entry,
-            at + interval * NO_PR_POLL_FACTOR,
-            interval
-        ));
+        assert!(!fetch_due(&entry, at + Duration::from_secs(59), interval));
+        assert!(fetch_due(&entry, at + interval, interval));
     }
 
     #[test]
@@ -1023,7 +1053,7 @@ mod tests {
                 "--repo",
                 "o/r",
                 "--json",
-                "number,state,isDraft,reviewDecision,url,headRefName",
+                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository",
             ]
         );
     }

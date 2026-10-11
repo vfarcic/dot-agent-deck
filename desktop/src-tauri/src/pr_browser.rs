@@ -508,11 +508,13 @@ impl<R: Runtime> Effects for AppEffects<R> {
         // its own callback. Tagged with the session it was asked in, so it
         // never closes one opened after it (`in_session`).
         let app = self.0.clone();
-        let generation = GENERATIONS.current();
+        let Some(page) = GENERATIONS.page_token() else {
+            return;
+        };
         tauri::async_runtime::spawn(async move {
-            in_session(&SESSION, &GENERATIONS, generation, || {
+            in_page(&SESSION, &GENERATIONS, page, || {
                 close_browser(&app);
-                let _ = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, generation);
+                let _ = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, page.open);
             })
             .await;
         });
@@ -521,9 +523,11 @@ impl<R: Runtime> Effects for AppEffects<R> {
     fn navigate(&self, url: &Url) {
         let app = self.0.clone();
         let url = url.clone();
-        let generation = GENERATIONS.current();
+        let Some(page) = GENERATIONS.page_token() else {
+            return;
+        };
         tauri::async_runtime::spawn(async move {
-            in_session(&SESSION, &GENERATIONS, generation, || {
+            in_page(&SESSION, &GENERATIONS, page, || {
                 if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
                     let _ = webview.navigate(url);
                 }
@@ -533,24 +537,76 @@ impl<R: Runtime> Effects for AppEffects<R> {
     }
 }
 
-/// Which open of the browser is current. Every [`open`] starts a new one —
-/// including one that reuses the open webview for another pull request — so
-/// a page effect asked for under one open can tell that it is now another's.
+/// Which open of the browser is current, and which page within it. Every
+/// [`open`] starts a new one — including one that reuses the open webview for
+/// another pull request — so a page effect asked for under one open can tell
+/// that it is now another's. The open's number is what the app sees
+/// ([`CLOSED_EVENT`]); the page's number is the browser's own, and also moves
+/// when sign-out puts the page back in place, which the app never hears of.
 #[derive(Debug)]
-pub struct Generations(AtomicU64);
+pub struct Generations {
+    open: AtomicU64,
+    page: AtomicU64,
+    /// An open's page has been asked for and has not started loading, so the
+    /// page on screen is still the one it replaces.
+    loading: AtomicBool,
+}
+
+/// The open and the page a page effect was asked under ([`Generations::page_token`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageToken {
+    /// The open's generation, as [`Generations::current`] answers it.
+    pub open: u64,
+    page: u64,
+}
 
 impl Generations {
     pub const fn new() -> Self {
-        Self(AtomicU64::new(0))
+        Self {
+            open: AtomicU64::new(0),
+            page: AtomicU64::new(0),
+            loading: AtomicBool::new(false),
+        }
     }
 
-    /// A new open has begun; its generation.
+    /// A new open has begun; its generation. Until its page starts loading
+    /// ([`Self::page_started`]) no page effect is taken.
     pub fn begin(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::SeqCst) + 1
+        // `loading` first, the numbers after: a hook that reads the new
+        // open's number has then also seen `loading` raised (see
+        // `page_token`, which reads them in the other order).
+        self.loading.store(true, Ordering::SeqCst);
+        self.page.fetch_add(1, Ordering::SeqCst);
+        self.open.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn current(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// The page an open asked for has started loading. The webview reports
+    /// every start, so an in-place load the replaced page began in that
+    /// moment ends the wait early too; no hook says which page a start is.
+    pub fn page_started(&self) {
+        self.loading.store(false, Ordering::SeqCst);
+    }
+
+    /// The page was put back in place (sign-out): effects asked for before
+    /// are not about it.
+    pub fn retire_page(&self) {
+        self.page.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// What a page effect asked for now is tagged with, or `None` while an
+    /// open's page has not started loading: the hook that asks is then the
+    /// replaced page's, whatever generation is current.
+    pub fn page_token(&self) -> Option<PageToken> {
+        let open = self.open.load(Ordering::SeqCst);
+        let page = self.page.load(Ordering::SeqCst);
+        if self.loading.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(PageToken { open, page })
     }
 }
 
@@ -565,10 +621,10 @@ static GENERATIONS: Generations = Generations::new();
 /// another generation and does nothing, rather than closing or navigating the
 /// page that replaced its own. Answers whether the effect ran.
 ///
-/// What it decides from is the generation current when the page's hook
-/// fired, so it cannot tell an effect asked for by the old page in the
-/// moment between [`open`] advancing the generation and the new page loading
-/// in a reused webview.
+/// Page effects are tagged by [`Generations::page_token`], which refuses one
+/// the old page asks for in the moment between [`open`] advancing the
+/// generation and the new page starting to load in a reused webview, and run
+/// through [`in_page`], which also drops one asked before a sign-out.
 pub async fn in_session(
     session: &tokio::sync::Mutex<()>,
     generations: &Generations,
@@ -577,6 +633,24 @@ pub async fn in_session(
 ) -> bool {
     let _session = session.lock().await;
     if generations.current() != generation {
+        return false;
+    }
+    effect();
+    true
+}
+
+/// [`in_session`] for a page effect: runs `effect` only if the open AND the
+/// page it was asked under ([`Generations::page_token`]) are still current —
+/// not after another pull request opened, nor after sign-out put the page
+/// back. Answers whether it ran.
+pub async fn in_page(
+    session: &tokio::sync::Mutex<()>,
+    generations: &Generations,
+    page: PageToken,
+    effect: impl FnOnce(),
+) -> bool {
+    let _session = session.lock().await;
+    if generations.current() != page.open || generations.page.load(Ordering::SeqCst) != page.page {
         return false;
     }
     effect();
@@ -695,6 +769,10 @@ fn builder<R: Runtime>(
             NewWindowResponse::Deny
         })
         .on_page_load(|webview, payload| {
+            // An open's page has started: page effects from here on are its.
+            if webview.label() == PR_WEBVIEW_LABEL && payload.event() == PageLoadEvent::Started {
+                GENERATIONS.page_started();
+            }
             if webview.label() == PR_WEBVIEW_LABEL
                 && payload.event() == PageLoadEvent::Finished
                 && payload.url().as_str() == BLANK
@@ -903,7 +981,7 @@ pub async fn sign_out<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // Before macOS 14 the page cannot have a store of its own and shares the
     // app's, so clearing it would also erase the app's own saved state.
     #[cfg(target_os = "macos")]
-    if !macos_has_own_data_store() {
+    if !off_the_runtime(macos_has_own_data_store).await {
         return Err(MACOS_SHARED_STORE.into());
     }
     let host = AppSignOut {
@@ -913,6 +991,7 @@ pub async fn sign_out<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     sign_out_with(
         &host,
         &SESSION,
+        &GENERATIONS,
         &CLEARING,
         SignOutTimeouts {
             leave: LEAVE_TIMEOUT,
@@ -1061,11 +1140,15 @@ async fn awaited(answer: Answer, limit: Duration, late: &str) -> Result<(), Stri
 pub async fn sign_out_with(
     host: &impl SignOutHost,
     session: &tokio::sync::Mutex<()>,
+    generations: &Generations,
     clearing: &'static AtomicBool,
     timeouts: SignOutTimeouts,
 ) -> Result<(), String> {
     let _session = session.lock().await;
     admit_open(clearing)?;
+    // The page this puts back is not the one an effect queued behind this
+    // lock was asked about.
+    generations.retire_page();
     let raised = Raised::raise(clearing);
     match host.browser() {
         Browser::Open { resume } => {
@@ -1353,6 +1436,15 @@ fn macos_has_own_data_store() -> bool {
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .is_some_and(|version| macos_major_at_least(&version, 14))
+}
+
+/// `probe`, which waits on a process, run where it holds up no async task.
+/// A probe that cannot be run answers `false`, the side that refuses.
+#[cfg(any(target_os = "macos", test))]
+async fn off_the_runtime(probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+    tauri::async_runtime::spawn_blocking(probe)
+        .await
+        .unwrap_or(false)
 }
 
 /// `"14.2.1"` → at least 14. Anything unreadable is not.
@@ -2359,9 +2451,16 @@ mod tests {
             Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
         let running = {
             let host = host.clone();
-            tokio::spawn(
-                async move { sign_out_with(&*host, session, host.clearing, TIMEOUTS).await },
-            )
+            tokio::spawn(async move {
+                sign_out_with(
+                    &*host,
+                    session,
+                    &Generations::new(),
+                    host.clearing,
+                    TIMEOUTS,
+                )
+                .await
+            })
         };
         tokio::time::sleep(Duration::from_secs(1)).await;
         let midway = host.log();
@@ -2519,12 +2618,26 @@ mod tests {
         ));
         let session: &'static tokio::sync::Mutex<()> =
             Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
-        let result = sign_out_with(&*host, session, host.clearing, TIMEOUTS).await;
+        let result = sign_out_with(
+            &*host,
+            session,
+            &Generations::new(),
+            host.clearing,
+            TIMEOUTS,
+        )
+        .await;
         assert_eq!(result, Err(CLEAR_UNCONFIRMED.into()));
         assert!(session.try_lock().is_ok(), "the session stayed held");
         assert_eq!(admit_open(host.clearing), Err(STILL_CLEARING.into()));
         assert_eq!(
-            sign_out_with(&*host, session, host.clearing, TIMEOUTS).await,
+            sign_out_with(
+                &*host,
+                session,
+                &Generations::new(),
+                host.clearing,
+                TIMEOUTS
+            )
+            .await,
             Err(STILL_CLEARING.into()),
             "a second clear started over one still running"
         );
@@ -2686,6 +2799,96 @@ mod tests {
         assert!(
             !effect.await.unwrap(),
             "the effect ran against the newer open"
+        );
+    }
+
+    /// Scenario: PR #1680 review — the page on screen asks to close (its
+    /// Escape) in the moment after the app opened another pull request in the
+    /// same webview, before the new page has started loading. The close is
+    /// the old page's, so it is dropped; once the new page starts, its own
+    /// effects run.
+    #[tokio::test]
+    async fn a_page_effect_asked_before_the_new_page_starts_is_dropped() {
+        let session = tokio::sync::Mutex::const_new(());
+        let generations = Generations::new();
+        generations.begin();
+        generations.page_started();
+        assert!(
+            generations.page_token().is_some(),
+            "the first page's own effect"
+        );
+
+        generations.begin();
+        assert_eq!(
+            generations.page_token(),
+            None,
+            "an effect asked before the new page started is the old page's"
+        );
+
+        generations.page_started();
+        let page = generations.page_token().expect("the new page's own effect");
+        assert!(in_page(&session, &generations, page, || {}).await);
+    }
+
+    /// Scenario: PR #1680 review — the page asks to close (its Escape) while
+    /// sign-out holds the session. Sign-out succeeds and puts the pull
+    /// request back; the close that was waiting is about the page sign-out
+    /// replaced, so it does not close the one it put back.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_effect_queued_behind_sign_out_does_not_close_the_resumed_page() {
+        let session: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::const_new(())));
+        let generations: &'static Generations = Box::leak(Box::new(Generations::new()));
+        generations.begin();
+        generations.page_started();
+        let page = generations.page_token().expect("the page's own effect");
+        let host = Arc::new(FakeSignOut::new(
+            open_browser(),
+            FakeAnswer::After(Duration::from_millis(100), Ok(())),
+            FakeAnswer::After(Duration::from_secs(1), Ok(())),
+        ));
+        let signing_out = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                sign_out_with(&*host, session, generations, host.clearing, TIMEOUTS).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(session.try_lock().is_err(), "sign-out holds the session");
+        let closed = Arc::new(Mutex::new(false));
+        let effect = {
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                in_page(session, generations, page, || {
+                    *closed.lock().unwrap() = true
+                })
+                .await
+            })
+        };
+        assert_eq!(signing_out.await.unwrap(), Ok(()));
+        assert!(host.log().contains(&format!("resume:{PR}")));
+        assert!(
+            !effect.await.unwrap(),
+            "the close ran against the resumed page"
+        );
+        assert!(!*closed.lock().unwrap());
+    }
+
+    /// Scenario: PR #1680 review — sign-out on macOS asks `sw_vers` for the
+    /// version first. That wait must not hold up the async runtime: a task
+    /// beside it still runs while the probe waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_macos_version_probe_runs_off_the_async_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let beside = tokio::spawn(async move {
+            let _ = tx.send(());
+        });
+        let answered =
+            off_the_runtime(move || rx.recv_timeout(Duration::from_secs(5)).is_ok()).await;
+        beside.await.unwrap();
+        assert!(
+            answered,
+            "the probe blocked the runtime: the task beside it never ran"
         );
     }
 }

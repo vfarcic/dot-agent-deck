@@ -100,7 +100,17 @@ export function unavailablePrBrowser(): PrBrowserHost {
     setVisible: nothing,
     back: nothing,
     scroll: nothing,
-    openExternal: async () => { if (shown) window.open(shown, "_blank", "noopener,noreferrer"); },
+    /* A blank tab first, then the address: with `noopener` the answer is
+       always `null`, so a blocked tab could not be told from an opened one,
+       and the frame would close with nothing showing the pull request. The
+       tab is cut off from this page before it is sent anywhere. */
+    openExternal: async () => {
+      if (!shown) return;
+      const tab = window.open("", "_blank");
+      if (!tab) throw new Error("The browser blocked the new tab. Allow pop-ups for this page, then try again.");
+      tab.opener = null;
+      tab.location.href = shown;
+    },
     close: async () => { shown = undefined; },
     signOut: nothing,
     onClosed: () => () => undefined,

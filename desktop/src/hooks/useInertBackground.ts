@@ -16,16 +16,18 @@
  *
  * **The other dialogs here are NOT fenced, and saying so is the honest version
  * of "a repo-wide convention".** `ConfirmDialog`, `SettingsSheet`,
- * `OutputReader`, `ConfigurationPanels`'s four sheets and `App`'s command
- * palette and shortcut guide each declare `aria-modal="true"` over the same
- * mounted background and each call nothing here, so the claim is as untrue for
- * them as it was for the pane. PRD #1401's pull request browser is the third
- * caller, and the first that opens over another: it comes up over a
- * still-mounted pane, so only the topmost open caller fences (see `stack`
- * below) and the pane beneath it is background like the rest. They are left
- * alone deliberately — the two
- * surfaces wired up are the ones whose PRDs came with the audit that found
- * this — rather than because they are exempt. `VoiceControlPanel` is the one
+ * `OutputReader` and `ConfigurationPanels`'s four sheets each declare
+ * `aria-modal="true"` over the same mounted background and each call nothing
+ * here, so the claim is as untrue for them as it was for the pane. PRD #1401's
+ * pull request browser is the third caller, and the first that opens over
+ * another: it comes up over a still-mounted pane, so only the topmost open
+ * caller fences (see `stack` below) and the pane beneath it is background like
+ * the rest. `App`'s command palette and shortcut guide joined for that reason
+ * (PR #1680 review): the deck's window keys open them over the pull request
+ * browser, inside the deck it had fenced, so without a fence of their own they
+ * came up inert. The rest are left alone deliberately — the surfaces wired up
+ * are the ones whose PRDs came with the audit that found this, or that open
+ * over one of them — rather than because they are exempt. `VoiceControlPanel` is the one
  * that is exempt: it omits `aria-modal` on purpose (see its own note), so it
  * claims nothing it does not do.
  *

@@ -130,7 +130,10 @@ fn reap(rx: Receiver<Child>) {
             Err(RecvTimeoutError::Disconnected) => std::thread::sleep(REAP_POLL),
         }
         children.extend(rx.try_iter());
-        // An unreadable status will not become readable: stop holding it.
+        // An error is not a child left to reap: `waitpid(WNOHANG)` fails
+        // only with ECHILD, a child already reaped (SIGCHLD ignored, or
+        // waited on elsewhere), and Windows has no zombies — dropping the
+        // `Child` closes its handle. Retrying would poll ECHILD forever.
         children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 }
@@ -222,10 +225,13 @@ fn is_interpreter(word: &str) -> bool {
 }
 
 /// The program and arguments that open `url` per `browser`, a `$BROWSER`
-/// value: its first `:`-separated entry, split on whitespace into a program
-/// and arguments, with `%s` replaced by the URL or, without one, the URL
-/// appended as the last argument. `Ok(None)` means `browser` names no program,
-/// so the platform opener applies.
+/// value: its first entry ([`BROWSER_SEPARATOR`]-separated), split on
+/// whitespace into a program and arguments ([`split_words`], where quotes keep
+/// a path with spaces in one word), with `%s` replaced by the URL or, without
+/// one, the URL appended as the last argument. An entry without `%s` that
+/// names an existing file is that program whole, spaces and all, as Python's
+/// `webbrowser` reads it. `Ok(None)` means `browser` names no program, so the
+/// platform opener applies.
 ///
 /// Refused: a `%s` in a template that runs an interpreter (see
 /// [`is_interpreter`]), because there the substituted argument is program
@@ -236,14 +242,34 @@ fn is_interpreter(word: &str) -> bool {
 /// [`canonical_pull_request_url`] rebuilt, which carries no character a shell
 /// treats specially.
 pub fn browser_command(browser: &str, url: &str) -> Result<Option<(String, Vec<String>)>, String> {
-    let command = browser.split(':').next().unwrap_or("").trim();
-    let mut words = command.split_whitespace();
-    let Some(program) = words.next() else {
+    browser_command_with(browser, url, BROWSER_SEPARATOR)
+}
+
+/// What separates `$BROWSER`'s entries: the platform's `PATH` separator, as
+/// Python's `webbrowser` reads it — `;` on Windows, where a `:` follows the
+/// drive letter of an absolute path, and `:` elsewhere.
+const BROWSER_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
+/// [`browser_command`] with entries separated by `separator`.
+fn browser_command_with(
+    browser: &str,
+    url: &str,
+    separator: char,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let entry = browser.split(separator).next().unwrap_or("").trim();
+    let mut words =
+        if !entry.is_empty() && !entry.contains("%s") && std::path::Path::new(entry).is_file() {
+            vec![entry.to_string()]
+        } else {
+            split_words(entry)?
+        };
+    if words.is_empty() {
         return Ok(None);
-    };
-    let mut args: Vec<String> = words.map(str::to_string).collect();
+    }
+    let program = words.remove(0);
+    let mut args = words;
     if args.iter().any(|arg| arg.contains("%s")) {
-        if is_interpreter(program) || args.iter().any(|arg| is_interpreter(arg)) {
+        if is_interpreter(&program) || args.iter().any(|arg| is_interpreter(arg)) {
             return Err(format!(
                 "BROWSER ({program}) would run the URL as a script; set it to a browser program"
             ));
@@ -254,7 +280,45 @@ pub fn browser_command(browser: &str, url: &str) -> Result<Option<(String, Vec<S
     } else {
         args.push(url.to_string());
     }
-    Ok(Some((program.to_string(), args)))
+    Ok(Some((program, args)))
+}
+
+/// `entry` split into words at whitespace, where a run inside `"…"` or `'…'`
+/// belongs to the word around it, quotes removed. Nothing else is special: a
+/// `\` is kept as written, so a Windows path survives, and nothing is
+/// expanded. A quote left open is an error.
+fn split_words(entry: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in entry.chars() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => word.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("BROWSER has a quote that is never closed".to_string());
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 /// Spawn `program` with `args`, detached from the terminal's stdio.
@@ -518,6 +582,67 @@ mod tests {
             Some(("chromium".into(), vec!["--new-window".into(), url.into()]))
         );
         assert_eq!(browser_command("  ", url).unwrap(), None);
+    }
+
+    /// Scenario: `$BROWSER` names a browser by an absolute path that has a
+    /// space in it, or a Windows drive letter. The program is that whole path,
+    /// not a piece of it (review findings on PR #1680).
+    #[test]
+    fn a_browser_path_with_spaces_or_a_drive_letter_is_kept_whole() {
+        let url = "https://github.com/o/r/pull/1";
+        let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        for (browser, separator, program, args) in [
+            // Quoted, with and without `%s`, in either quote style.
+            (
+                format!("\"{chrome}\" --new-window %s"),
+                ':',
+                chrome.to_string(),
+                vec!["--new-window".to_string(), url.to_string()],
+            ),
+            (
+                format!("'{chrome}'"),
+                ':',
+                chrome.to_string(),
+                vec![url.to_string()],
+            ),
+            // Windows: entries are `;`-separated, so a drive letter's `:` is
+            // part of the path, and a `\` is a path separator, not an escape.
+            (
+                r"C:\Browsers\firefox.exe".to_string(),
+                ';',
+                r"C:\Browsers\firefox.exe".to_string(),
+                vec![url.to_string()],
+            ),
+            (
+                r#""C:\Program Files\Mozilla Firefox\firefox.exe" -new-tab %s;edge"#.to_string(),
+                ';',
+                r"C:\Program Files\Mozilla Firefox\firefox.exe".to_string(),
+                vec!["-new-tab".to_string(), url.to_string()],
+            ),
+        ] {
+            assert_eq!(
+                browser_command_with(&browser, url, separator).unwrap(),
+                Some((program, args)),
+                "{browser}"
+            );
+        }
+        assert!(browser_command_with("\"/opt/unterminated", url, ':').is_err());
+    }
+
+    /// Scenario: `$BROWSER` is an existing browser's path with a space in it,
+    /// unquoted. Like Python's `webbrowser`, an entry without `%s` that names
+    /// a file is that program.
+    #[test]
+    fn an_unquoted_browser_path_with_a_space_that_exists_is_the_program() {
+        let url = "https://github.com/o/r/pull/1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("My Browser");
+        std::fs::write(&path, b"").unwrap();
+        let entry = path.to_str().unwrap().to_string();
+        assert_eq!(
+            browser_command_with(&entry, url, BROWSER_SEPARATOR).unwrap(),
+            Some((entry.clone(), vec![url.to_string()]))
+        );
     }
 
     #[test]

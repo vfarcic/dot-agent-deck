@@ -11,7 +11,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
-import { PR_BROWSER_CLOSED_EVENT, tauriPrBrowser } from "./prBrowser";
+import { PR_BROWSER_CLOSED_EVENT, tauriPrBrowser, unavailablePrBrowser } from "./prBrowser";
 
 const BOUNDS = { x: 0, y: 40, width: 800, height: 600, viewportWidth: 800, viewportHeight: 640 };
 
@@ -33,5 +33,36 @@ describe("PRD #1401 — the in-app browser's close event", () => {
 
     listeners[0]({ payload: 2 });
     expect(closed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("PRD #1401 — Open in browser outside the app", () => {
+  const PR = "https://github.com/o/r/pull/7";
+
+  /** Scenario: in the browser preview, a popup blocker stops the new tab. Open in browser fails, so the frame that shows the pull request stays open. */
+  it("fails when the browser blocks the new tab", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    try {
+      const host = unavailablePrBrowser();
+      await host.open(PR, BOUNDS);
+      await expect(host.openExternal()).rejects.toThrow(/blocked/);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  /** Scenario: in the browser preview, the new tab opens. It is cut off from this page before it is sent to the pull request. */
+  it("sends an opened tab to the pull request with no way back to this page", async () => {
+    const tab = { opener: window as unknown, location: { href: "about:blank" } };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    try {
+      const host = unavailablePrBrowser();
+      await host.open(PR, BOUNDS);
+      await expect(host.openExternal()).resolves.toBeUndefined();
+      expect(tab.opener).toBeNull();
+      expect(tab.location.href).toBe(PR);
+    } finally {
+      open.mockRestore();
+    }
   });
 });

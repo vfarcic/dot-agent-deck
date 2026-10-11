@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_DESKTOP_SETTINGS, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto, type PullRequestInfoDto, type VoiceResultDto, type VoiceStatusDto } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto, type PullRequestInfoDto, type VoiceResultDto, type VoiceStatusDto } from "./lib/bridge";
 import { PrBrowserHostContext, type PrBrowserHost } from "./lib/prBrowser";
 import { PullRequestBadge } from "./components/PullRequestBadge";
 import { pullRequestFromDto, pullRequestLabel } from "./lib/pullRequest";
@@ -390,6 +390,46 @@ describe("PRD #1401 — the in-app pull request browser", () => {
 
     await act(async () => { dialog.remove(); });
     expect(host.setVisible).toHaveBeenLastCalledWith(true);
+  });
+});
+
+describe("PRD #1401 — the deck's own dialogs over the pull request browser", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  /**
+   * Scenario: Greptile on PR #1680 — on the deck (experimental), open Coder 7's pull request
+   * from its tile, and press Ctrl+K. The command menu comes up over the
+   * page and takes typing and clicks; closing it leaves the pull request open
+   * and usable. The same holds for the shortcut sheet on `?`.
+   */
+  it.each([
+    ["the command menu", { key: "k", ctrlKey: true }, "Command menu"],
+    ["the shortcut sheet", { key: "?" }, "Control keys"],
+  ])("lets %s take input over the page", async (_what, key, name) => {
+    const { host } = fakeHost();
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.keyDown(document.body, key);
+    const dialog = await screen.findByRole("dialog", { name, hidden: true });
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(dialog.closest("[inert]"), `${name} must take input over the page`).toBeNull();
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("dialog", { name, hidden: true })).not.toBeInTheDocument();
+    const browser = screen.getByTestId("pr-browser");
+    expect(browser).not.toHaveAttribute("data-covered");
+    expect(browser.closest("[inert]")).toBeNull();
   });
 });
 
