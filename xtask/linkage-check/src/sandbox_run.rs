@@ -25,7 +25,8 @@
 //! property under test is which branch a real repository is on — with the
 //! ambient git environment switched off the way `repo_state`'s `Sandbox::git()`
 //! does, so no fixture can read or write the checkout the tests run in. No
-//! network; the terminal test waits on its stand-ins, bounded.
+//! external network (the `run_all_` tests pick a free loopback port); they
+//! wait on their stand-ins by polling, bounded.
 //!
 //! Fixtures sit under `/tmp` rather than the system temp dir: macOS's
 //! `/var/folders/…/T/` is long enough by itself to leave no room for a
@@ -195,6 +196,19 @@ impl Fixture {
     /// `sandbox-run.sh MODE CHECKOUT DIR SANDBOX PROFILE ARGS…`, the way the
     /// Taskfile calls it.
     fn run(&self, mode: &str, dir: &Path, sandbox: &str, profile: &str, args: &[&str]) -> Output {
+        self.run_with_env(mode, dir, sandbox, profile, args, &[])
+    }
+
+    /// [`Fixture::run`] with extra environment variables.
+    fn run_with_env(
+        &self,
+        mode: &str,
+        dir: &Path,
+        sandbox: &str,
+        profile: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = Command::new("bash");
         cmd.arg(self.checkout().join("scripts/sandbox-run.sh"))
             .arg(mode)
@@ -202,7 +216,8 @@ impl Fixture {
             .arg(dir)
             .arg(sandbox)
             .arg(profile)
-            .args(args);
+            .args(args)
+            .envs(env.iter().copied());
         self.isolate(&mut cmd);
         cmd.output().expect("run scripts/sandbox-run.sh")
     }
@@ -337,8 +352,9 @@ fn a_detached_head_gets_a_sandbox_named_for_its_commit() {
 }
 
 /// Scenario: run on two branches whose 150-byte names differ only at the end;
-/// each socket path stays within the platform's `sun_path` bound, and the two
-/// cut names still get two sandboxes.
+/// each is cut so its socket path is exactly the platform's `sun_path` bound,
+/// a real Unix socket binds at that path, and the two cut names still get two
+/// sandboxes.
 #[test]
 fn a_long_branch_name_is_cut_to_fit_the_socket_path_bound() {
     if skip_without(
@@ -354,13 +370,23 @@ fn a_long_branch_name_is_cut_to_fit_the_socket_path_bound() {
     f.git(&["checkout", "-q", "-b", &format!("{stem}two")]);
     let two = f.tui_socket();
     for socket in [&one, &two] {
-        assert!(
-            socket.len() <= socket_path_max(),
-            "{socket} is {} bytes, past {}",
+        // A cut slug fills its budget exactly, so this is the longest path the
+        // script hands out. Binding it is what proves `socket_path_max` (and
+        // the script's copy of it) is a length the kernel takes, rather than
+        // one this file and the script merely agree on.
+        assert_eq!(
             socket.len(),
-            socket_path_max()
+            socket_path_max(),
+            "{socket} is not cut to the bound"
         );
         assert!(sandbox_of(socket).starts_with(f.sandbox_root()));
+        let listener = std::os::unix::net::UnixListener::bind(socket);
+        assert!(
+            listener.is_ok(),
+            "a socket at the {}-byte path {socket} does not bind: {:?}",
+            socket.len(),
+            listener.err()
+        );
     }
     assert_ne!(one, two);
 }
@@ -398,6 +424,121 @@ fn a_socket_path_past_the_bound_is_refused_with_the_reason() {
         "a too-long SANDBOX was accepted: {text}"
     );
     assert!(text.contains("attach.sock is"), "{text}");
+    assert!(!explicit.exists(), "it created a SANDBOX it refused");
+}
+
+/// A UTF-8 locale bash honours here, or `None` when there is none. Under one,
+/// `${#var}` counts characters rather than bytes, which is the condition the
+/// multibyte test needs; without one that test would pass vacuously.
+fn utf8_locale() -> Option<&'static str> {
+    ["C.UTF-8", "en_US.UTF-8"].into_iter().find(|locale| {
+        Command::new("bash")
+            .args(["-c", "x=\u{e9}; printf %s \"${#x}\""])
+            .env("LC_ALL", locale)
+            .output()
+            .map(|o| o.stdout == b"1")
+            .unwrap_or(false)
+    })
+}
+
+/// Scenario: under a UTF-8 locale, point DIR at a directory named with
+/// two-byte characters, short enough in characters for a per-branch sandbox
+/// but too long in bytes, and run; it refuses with the bound, because a socket
+/// path is bounded in bytes. An explicit SANDBOX that fits in characters but
+/// not in bytes is refused the same way, and not created.
+#[test]
+fn a_multibyte_path_is_bounded_in_bytes_not_characters() {
+    let test = "a_multibyte_path_is_bounded_in_bytes_not_characters";
+    if skip_without(&[("bash", "--version"), ("git", "--version")], test) {
+        return;
+    }
+    let Some(locale) = utf8_locale() else {
+        eprintln!("SKIP: {test}: no UTF-8 locale for bash here");
+        return;
+    };
+    let f = Fixture::new();
+    let max = socket_path_max();
+    let root_len = f.root.as_os_str().len();
+
+    // DIR = ROOT/<n x e-acute>. Its sandbox root, DIR/.dad-sandbox, is
+    // root_len + 1 + n + 13 characters, which leaves the shortest slug (19)
+    // room exactly when n <= max - 46 - root_len. Every e-acute is two bytes,
+    // so in bytes it does not.
+    let n = max - 46 - root_len;
+    let deep = f.root.join("\u{e9}".repeat(n));
+    fs::create_dir_all(&deep).unwrap();
+    let out = f.run_with_env("tui", &deep, "", "release", &[], &[("LC_ALL", locale)]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a DIR too long in bytes was accepted: {text}"
+    );
+    assert!(text.contains(&max.to_string()), "{text}");
+    assert!(!deep.join(".dad-sandbox").exists(), "{text}");
+
+    // SANDBOX = ROOT/<m x e-acute>/sb, whose attach.sock is exactly `max`
+    // characters long and `max + m` bytes.
+    let m = max - root_len - 16;
+    let explicit = f.root.join("\u{e9}".repeat(m)).join("sb");
+    let out = f.run_with_env(
+        "tui",
+        &f.cfg(),
+        explicit.to_str().unwrap(),
+        "release",
+        &[],
+        &[("LC_ALL", locale)],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a SANDBOX too long in bytes was accepted: {text}"
+    );
+    assert!(text.contains("attach.sock is"), "{text}");
+    assert!(!explicit.exists(), "it created a SANDBOX it refused");
+}
+
+/// Scenario: create a tag with the same name as the branch the checkout is on,
+/// and run; the sandbox is still the branch's own, `branch-main`.
+#[test]
+fn a_tag_named_like_the_branch_does_not_move_its_sandbox() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "a_tag_named_like_the_branch_does_not_move_its_sandbox",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    f.git(&["tag", "main"]);
+    assert_eq!(
+        Path::new(&f.tui_socket()),
+        f.sandbox_root().join("branch-main/attach.sock")
+    );
+}
+
+/// Scenario: run on a branch whose name holds an uppercase letter; its sandbox
+/// carries the hash, so on a case-insensitive filesystem (macOS's default
+/// APFS) it cannot land on the sandbox of the same name in lowercase.
+#[test]
+fn a_branch_name_with_uppercase_carries_the_hash() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "a_branch_name_with_uppercase_carries_the_hash",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    f.git(&["checkout", "-q", "-b", "Topic"]);
+    let dir = sandbox_of(&f.tui_socket());
+    let name = dir.file_name().unwrap().to_str().unwrap().to_string();
+    assert!(
+        name.starts_with("branch-Topic-") && name.len() == "branch-Topic-".len() + 8,
+        "an uppercase name carries an eight-digit hash: {name}"
+    );
+    assert_ne!(
+        name.to_lowercase(),
+        "branch-topic",
+        "`Topic` would share `topic`'s sandbox on a case-insensitive filesystem"
+    );
 }
 
 /// Scenario: run with SANDBOX set; the TUI is handed exactly that sandbox's
@@ -506,19 +647,33 @@ echo "GOT:$line"
 
 /// The desktop stand-in (`pnpm`, as `pnpm tauri dev`): ignore SIGTTOU, the way
 /// a job-control shell does, and make its own group the terminal's foreground
-/// if it can reach the terminal at all. Records which happened.
+/// if it can reach the terminal at all. Records which happened, and whether it
+/// started with SIGINT ignored (perl reports an inherited SIG_IGN as `IGNORE`).
 const TERMINAL_TAKING_DESKTOP: &str = r#"#!/usr/bin/env perl
 use POSIX;
+my $int = ($SIG{INT} // '') eq 'IGNORE' ? 'int-ignored' : 'int-default';
 $SIG{TTOU} = 'IGNORE';
 my $result = 'no-tty';
 if (open(my $tty, '<', '/dev/tty')) {
     $result = POSIX::tcsetpgrp(fileno($tty), getpgrp()) ? 'took-foreground' : 'tcsetpgrp-refused';
 }
 open(my $mark, '>', $ENV{DAD_TEST_MARK}) or die "mark: $!";
-print $mark $result;
+print $mark "$result $int";
 close $mark;
 sleep 600;
 "#;
+
+/// A loopback port nothing listens on, to stand in for vite's 1420 through
+/// `DAD_SANDBOX_RUN_VITE_PORT`: 1420 is in use whenever a `tauri dev` runs on
+/// the machine, which is the ordinary state of a desktop developer's box, and
+/// the script's preflight would refuse.
+fn free_port() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind a loopback port")
+        .port()
+        .to_string()
+}
 
 /// Kills a leftover desktop group if the test fails before the script's own
 /// teardown runs.
@@ -536,8 +691,9 @@ impl Drop for GroupGuard {
 
 /// Scenario: start `task run-all`'s script on a terminal with a desktop
 /// stand-in that tries to take the terminal's foreground; the TUI stand-in is
-/// still in the foreground group, reads the line typed at it, and the desktop's
-/// group — the one `desktop.pgid` names — is gone once the TUI exits.
+/// still in the foreground group, reads the line typed at it, the desktop
+/// started with SIGINT at its default, and the desktop's group — the one
+/// `desktop.pgid` names — is gone once the TUI exits.
 #[test]
 fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     let test = "run_all_keeps_the_tui_in_the_terminals_foreground_group";
@@ -583,6 +739,7 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     );
     cmd.env("PATH", path);
     cmd.env("DAD_TEST_MARK", &mark);
+    cmd.env("DAD_SANDBOX_RUN_VITE_PORT", free_port());
     cmd.cwd(&f.root);
     let mut child = pty
         .slave
@@ -617,10 +774,6 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
 
     if !wait_for("TUI pgid=", &mut seen) {
         let _ = child.kill();
-        if seen.contains("port 1420 is in use") {
-            eprintln!("SKIP: {test}: port 1420 is in use on this machine");
-            return;
-        }
         panic!("the TUI stand-in never reported; terminal output:\n{seen}");
     }
     let mut guard = GroupGuard(
@@ -654,6 +807,13 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     assert_eq!(
         pgid, tpgid,
         "the TUI is not in the terminal's foreground group (desktop stand-in: {attempt}); output:\n{seen}"
+    );
+    // The keeper is a shell without job control, which starts a background
+    // command with SIGINT and SIGQUIT ignored; the desktop's tree must not
+    // inherit that.
+    assert!(
+        attempt.contains("int-default"),
+        "the desktop started with SIGINT ignored: {attempt}"
     );
 
     writer.write_all(b"hello\r").expect("type at the TUI");
@@ -694,4 +854,121 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     assert!(!alive, "the desktop's group {pgid} outlived the TUI");
     assert!(!sandbox.join("desktop.pgid").exists());
     guard.0 = None;
+}
+
+/// The TUI stand-in for the teardown-race test: exits the moment it starts.
+const INSTANT_TUI: &str = "#!/usr/bin/env bash\nexit 0\n";
+
+/// The desktop stand-in for the teardown-race test: records its pid and
+/// whether the script had already exited when it started, then holds on.
+const RECORDING_DESKTOP: &str = r#"#!/usr/bin/env bash
+if [ -e "$DAD_TEST_EXITED" ]; then when=after-exit; else when=before-exit; fi
+echo "$$ $when" >"$DAD_TEST_MARK"
+exec sleep 600
+"#;
+
+/// Scenario: run `task run-all`'s script with a TUI that exits at once and a
+/// `perl` that takes half a second to start the keeper's session, so the
+/// teardown runs while the keeper is not yet a process-group leader; no
+/// desktop starts after the script has exited, and nothing of the desktop's
+/// is left running.
+#[test]
+fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
+    let test = "run_all_stops_a_desktop_whose_session_is_not_made_yet";
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version"), ("perl", "-v")],
+        test,
+    ) {
+        return;
+    }
+    let real_perl = Command::new("sh")
+        .args(["-c", "command -v perl"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        real_perl.starts_with('/'),
+        "no absolute perl: {real_perl:?}"
+    );
+
+    let f = Fixture::new();
+    let co = f.checkout();
+    f.write_exec(&co.join("target/debug/dot-agent-deck"), INSTANT_TUI);
+    fs::create_dir_all(co.join("desktop/node_modules")).unwrap();
+    let stub_bin = f.root.join("stub-bin");
+    f.write_exec(&stub_bin.join("pnpm"), RECORDING_DESKTOP);
+    f.write_exec(
+        &stub_bin.join("perl"),
+        &format!("#!/usr/bin/env bash\nsleep 0.5\nexec {real_perl} \"$@\"\n"),
+    );
+    let sandbox = f.root.join("sb");
+    let mark = f.root.join("desktop-started");
+    let exited = f.root.join("script-exited");
+    let path = format!(
+        "{}:{}",
+        stub_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let port = free_port();
+    let out = f.run_with_env(
+        "all",
+        &f.cfg(),
+        sandbox.to_str().unwrap(),
+        "debug",
+        &[],
+        &[
+            ("PATH", &path),
+            ("DAD_TEST_MARK", mark.to_str().unwrap()),
+            ("DAD_TEST_EXITED", exited.to_str().unwrap()),
+            ("DAD_SANDBOX_RUN_VITE_PORT", &port),
+        ],
+    );
+    fs::write(&exited, "").unwrap();
+    assert!(out.status.success(), "{}", combined(&out));
+
+    // Wait, bounded, until nothing of the desktop's is alive: a keeper that
+    // outlived the script carries the sandbox path in its argv from perl
+    // onwards, and the desktop stand-in is named by the pid it recorded. With
+    // the defect that keeper starts the desktop after the script has gone and
+    // stops it a second later, so the record outlasts it either way.
+    let sandbox_arg = sandbox.to_str().unwrap().to_string();
+    let still_running = || -> Vec<String> {
+        let desktop_pid = fs::read_to_string(&mark)
+            .ok()
+            .and_then(|m| m.split_whitespace().next().map(str::to_string));
+        let ps = Command::new("ps")
+            .args(["-A", "-ww", "-o", "pid=", "-o", "stat=", "-o", "args="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter(|l| {
+                let mut fields = l.split_whitespace();
+                let pid = fields.next();
+                let zombie = fields.next().is_some_and(|stat| stat.starts_with('Z'));
+                !zombie
+                    && (l.contains(&sandbox_arg)
+                        || (desktop_pid.is_some() && pid == desktop_pid.as_deref()))
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut left = still_running();
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left = still_running();
+    }
+    for line in &left {
+        if let Some(pid) = line.split_whitespace().next() {
+            let _ = Command::new("kill").args(["-KILL", pid]).status();
+        }
+    }
+    let started = fs::read_to_string(&mark).unwrap_or_default();
+    assert!(
+        !started.contains("after-exit"),
+        "a desktop started after run-all had exited: {started}; output:\n{}",
+        combined(&out)
+    );
+    assert!(left.is_empty(), "the desktop outlived run-all: {left:?}");
 }

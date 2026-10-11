@@ -22,7 +22,10 @@ tasks:
       trying a branch build never bounces your everyday deck. Run it from the
       directory holding your .dot-agent-deck.toml. Vars: DIR (config dir, default
       the dir you invoke from), SANDBOX (isolation state dir, default one per branch,
-      DIR/.dad-sandbox/branch-<name>), PROFILE (release|debug, default release).
+      DIR/.dad-sandbox/branch-<slug>: the branch name with anything outside
+      A-Za-z0-9._- made `-`, plus a hash when it was changed, holds an uppercase
+      letter or was cut to fit; DIR/.dad-sandbox/commit-<sha> on a detached HEAD),
+      PROFILE (release|debug, default release).
       See docs/develop/local-run.md.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'

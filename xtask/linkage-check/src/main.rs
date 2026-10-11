@@ -227,8 +227,8 @@ mod sample_attribution;
 /// PR #1672: `scripts/sandbox-run.sh`, behind `task run`/`run-all`/`run-stop` —
 /// the per-branch sandbox it picks, the socket-path bound on it, and the
 /// desktop's session of its own that keeps `run-all`'s TUI in the terminal's
-/// foreground. Tests only, and Unix only — the rules live in the script, and no
-/// CI job runs it.
+/// foreground. Tests only, and Unix only — the rules live in the script, which
+/// CI runs only through these tests.
 #[cfg(all(test, unix))]
 mod sandbox_run;
 /// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
