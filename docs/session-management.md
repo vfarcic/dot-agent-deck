@@ -12,20 +12,20 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 
 **Desktop:**
 
-![The desktop app's dashboard with four agents, each row starting with its status: waiting or running](/img/dashboard-desktop.png)
+![The desktop app's dashboard with four agents, each row starting with its status: idle, running, running and needs input](/img/dashboard-desktop.png)
 
 | TUI card | `daemon status` | Desktop app | Meaning | What to do |
 |---|---|---|---|---|
 | **Thinking** | `Thinking` | running | The agent is reasoning before it acts. | Nothing. |
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
-| **Needs Input** | `WaitingForInput` | waiting | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
-| **Idle** | `Idle` | waiting | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
+| **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
+| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
 | **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
 
-A newer daemon can report a status this build does not know; the TUI shows it as **Idle** and the desktop app as **waiting**.
+A newer daemon can report a status this build does not know; both the TUI and the desktop app show it as **Idle**.
 
 ### Which agents report which status
 
@@ -37,7 +37,7 @@ The first five statuses come from each agent's hooks, plugin or extension, and h
 | **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
 | A subagent's permission prompt told apart from the main agent's | Yes | Yes | No | No | No |
 
-- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **waiting**, **running** while the turn runs, and **waiting** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
+- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **idle**, **running** while the turn runs, **needs input** at a permission prompt, and **idle** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
 - Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
