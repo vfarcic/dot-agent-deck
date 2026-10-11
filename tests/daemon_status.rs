@@ -325,7 +325,7 @@ async fn start_tui_managed_agent(
     pane_id: &str,
     cwd: &str,
 ) -> String {
-    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    wait_for_attach_socket(&daemon.attach_path, common::INPROC_DAEMON_READY_TIMEOUT).await;
     DaemonClient::new(daemon.attach_path.clone())
         .start_agent(StartAgentOptions {
             command: Some(common::capability_export_command("cat")),
@@ -543,7 +543,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    wait_for_attach_socket(&daemon.attach_path, common::INPROC_DAEMON_READY_TIMEOUT).await;
     let agent_id = DaemonClient::new(daemon.attach_path.clone())
         .start_agent(StartAgentOptions {
             command: Some(common::capability_export_command("cat")),

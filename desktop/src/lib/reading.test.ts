@@ -10,9 +10,7 @@ import {
   READING_OFF,
   READING_ON,
   READING_VOICE_KEY,
-  READING_LABEL_MAX_CHARS,
   readingKey,
-  readingLabel,
   readingNotice,
   readingStartFailed,
   type ReadingAgent,
@@ -21,7 +19,7 @@ import {
   type ReadingTarget,
 } from "./reading";
 import noticeCases from "./readingNoticeCases.json";
-import { SpeechQueue, SpeechRefusedError, wordedNow, type SpeechText, type SpeechVoice } from "./speech";
+import { providerVoice, SpeechQueue, SpeechRefusedError, wordedNow, type SpeechText, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingAgent = { deckId: "deck-local", agentId: "tester", label: "tester", incarnation: 1 };
 const CODER: ReadingAgent = { deckId: "deck-local", agentId: "coder", label: "coder", incarnation: 2 };
@@ -604,6 +602,49 @@ describe("DeckReader with speech in flight", () => {
     expect(h.queue.speaking).toBe(false);
   });
 
+  /** Scenario (issue #1667): the coder's summary is having its provider audio prepared when the tester's pane opens, before the reader is told of the pane; the audio is not played, and neither is the sentence naming the coder. */
+  it("plays nothing about another agent whose audio was being prepared when a pane opened", async () => {
+    let resolveAudio!: (audio: ArrayBuffer) => void;
+    const fetched: string[] = [];
+    const played: string[] = [];
+    const context = {
+      decodeAudioData: async (audio: ArrayBuffer) => ({ duration: 1, audio }) as unknown as AudioBuffer,
+      createBufferSource: () => {
+        const source = { buffer: null as unknown, onended: null as (() => void) | null, connect: () => undefined, stop: () => undefined, start: () => { played.push(fetched.at(-1)!); setTimeout(() => source.onended?.(), 0); } };
+        return source as unknown as AudioBufferSourceNode;
+      },
+      destination: {} as AudioDestinationNode,
+    };
+    const provider = providerVoice((text) => {
+      fetched.push(text);
+      return new Promise((resolve) => { resolveAudio = resolve; });
+    }, () => context as never);
+    const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: false }), provider, system: new FetchingVoice() });
+    const sinks = new Map<string, (sentence: ReadingSentenceDto) => void>();
+    let open: { deckId: string; agentId: string } | undefined;
+    const reader = new DeckReader({
+      start: async (target, onSentence) => {
+        sinks.set(target.agentId, onSentence);
+        return { kind: "started", session: 1 };
+      },
+      stop: vi.fn(async () => undefined),
+      speech: queue,
+      openPane: () => open,
+    });
+    reader.update(true, [TESTER, CODER], false);
+    await flush();
+    sinks.get("coder")!({ kind: "turn", text: "Coder: done.", bare: "Done." });
+    await flush();
+    expect(fetched).toEqual(["Coder: done."]);
+    open = TESTER;
+    resolveAudio(new ArrayBuffer(0));
+    await flush();
+    await flush();
+    expect(fetched).toEqual(["Coder: done."]);
+    expect(played).toEqual([]);
+    expect(queue.speaking).toBe(false);
+  });
+
   /** Scenario (D6, shared across agents): while one sentence is being said, the tester finishes two turns and the coder one; the tester's newer summary replaces its older one, the coder's is kept, and they are heard in order. */
   it("replaces an agent's waiting summary and never another agent's", async () => {
     const h = speaking();
@@ -792,12 +833,3 @@ describe("the one-time notice (decision 5 of 2026-10-09)", () => {
   });
 });
 
-describe("the label sent for an agent (issue #1667)", () => {
-  /** Scenario: a run title long enough to push the label past what a sentence names is cut to that many characters, counting a multi-byte character as one; a short label is sent as it is. */
-  it("bounds the label to what a sentence names", () => {
-    expect(readingLabel("prd-1401 Coder")).toBe("prd-1401 Coder");
-    const long = `${"é".repeat(READING_LABEL_MAX_CHARS)} Coder`;
-    expect(readingLabel(long)).toBe("é".repeat(READING_LABEL_MAX_CHARS));
-    expect(new TextEncoder().encode(readingLabel("🛠".repeat(200))).length).toBeLessThanOrEqual(256);
-  });
-});

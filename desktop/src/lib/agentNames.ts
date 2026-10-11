@@ -21,7 +21,16 @@ export function orchestrationTitle(tab: Pick<Extract<AgentTab, { kind: "orchestr
   return tab.displayTitle || tab.name;
 }
 
-/** What an agent is called where it is not on screen: the run's title and its name for an orchestration agent, its name otherwise. */
-export function agentSpokenName(agent: Pick<AgentSession, "displayName" | "tab">): string {
-  return agent.tab.kind === "orchestration" ? `${orchestrationTitle(agent.tab)} ${agent.displayName}` : agent.displayName;
+/**
+ * What an agent is called where it is not on screen: the run's title and its
+ * name for an orchestration agent, its name otherwise. With `maxChars`, at
+ * most that many characters, cut from the run's title first so a long title
+ * never cuts off the agent's own name, which is what tells a run's agents
+ * apart.
+ */
+export function agentSpokenName(agent: Pick<AgentSession, "displayName" | "tab">, maxChars = Infinity): string {
+  const name = Array.from(agent.displayName);
+  if (name.length >= maxChars || agent.tab.kind !== "orchestration") return name.slice(0, maxChars).join("");
+  const title = Array.from(orchestrationTitle(agent.tab)).slice(0, maxChars - name.length - 1).join("").trimEnd();
+  return title === "" ? agent.displayName : `${title} ${agent.displayName}`;
 }

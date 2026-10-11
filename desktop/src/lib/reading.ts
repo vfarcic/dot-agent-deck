@@ -89,7 +89,7 @@ export interface ReadingTarget {
   agentId: string;
   /**
    * The agent's name in a sentence about it (decision 4): `agentSpokenName`,
-   * bounded by {@link readingLabel}.
+   * bounded to {@link READING_LABEL_MAX_CHARS}.
    */
   label: string;
 }
@@ -97,15 +97,9 @@ export interface ReadingTarget {
 /**
  * The most characters of a label that are sent: as many as a sentence names
  * of it (`MAX_AGENT_NAME_CHARS` on the Rust side), which also keeps it inside
- * the bytes the Rust side accepts for one.
+ * the bytes the Rust side accepts for one. `agentSpokenName` bounds it.
  */
 export const READING_LABEL_MAX_CHARS = 64;
-
-/** `name` as sent for a {@link ReadingTarget.label}: at most {@link READING_LABEL_MAX_CHARS} characters. */
-export function readingLabel(name: string): string {
-  const chars = Array.from(name);
-  return chars.length <= READING_LABEL_MAX_CHARS ? name : chars.slice(0, READING_LABEL_MAX_CHARS).join("");
-}
 
 /** An agent the reader is told about. */
 export interface ReadingAgent extends ReadingTarget {

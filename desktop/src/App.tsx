@@ -85,7 +85,7 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
-import { readingLabel, type ReadingAgent } from "./lib/reading";
+import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
@@ -707,7 +707,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: readingLabel(agentSpokenName(agent)), incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the
