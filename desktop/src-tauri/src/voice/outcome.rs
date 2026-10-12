@@ -1198,8 +1198,10 @@ pub async fn handle_utterance_with_modes(
         // resolved, and the dashboard decides as if none was named
         // ([`SHOW_HOST_METRICS_ROW`]): with several daemons showing a Host
         // button, a name only the model supplied would otherwise open one the
-        // user never asked about instead of asking which.
-        if row.id == SHOW_HOST_METRICS_ROW && !said(spoken, transcript.text()) {
+        // user never asked about instead of asking which. The daemon's words
+        // must be heard beside the ones that asked for the row: a daemon
+        // called "host" is not named by "show host" (Qodo on PR #1672).
+        if row.id == SHOW_HOST_METRICS_ROW && !said_beyond_the_ask(spoken, transcript.text(), row) {
             continue;
         }
         // An observed-name param the model supplied while labels are withheld:
@@ -1669,6 +1671,33 @@ fn mentioned(label: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
 fn said(spoken: &str, transcript: &str) -> bool {
     let words = content_words(spoken);
     let heard = Heard::new(transcript);
+    !words.is_empty() && words.iter().all(|word| heard.word(word))
+}
+
+/// Whether the user SAID `spoken` ([`said`]) in the words left once one
+/// occurrence of each of `row`'s `heard_as` entries is taken out — the words
+/// that asked for the row. "host for host" names a daemon called "host";
+/// "show host" does not, though its one "host" is that daemon's whole name.
+fn said_beyond_the_ask(spoken: &str, transcript: &str, row: &CommandRow) -> bool {
+    let mut rest = spoken_words(transcript);
+    if let ActionGrounding::HeardAs(entries) = &row.grounding {
+        for entry in entries.iter().chain(&row.grounding_also) {
+            let wanted = spoken_words(entry);
+            if wanted.is_empty() {
+                continue;
+            }
+            if let Some(at) = rest.windows(wanted.len()).position(|window| {
+                window
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(heard, wanted)| same_word(heard, wanted))
+            }) {
+                rest.drain(at..at + wanted.len());
+            }
+        }
+    }
+    let words = content_words(spoken);
+    let heard = Heard::from_words(rest);
     !words.is_empty() && words.iter().all(|word| heard.word(word))
 }
 
@@ -8259,6 +8288,43 @@ mod tests {
                     then_submit: false,
                 },
                 "{supplied:?}"
+            );
+        }
+    }
+
+    /// Scenario (PR #1672, Qodo): a daemon is named "host", the row's own word.
+    /// "show host" with the model supplying `deck = "host"` dispatches with no
+    /// daemon, since the one "host" asked for the figures; "host for host" and
+    /// "show host on host" say it a second time, and open that daemon.
+    #[tokio::test]
+    async fn voice_outcome_show_host_needs_a_daemon_said_beside_the_row_words() {
+        let decks = [
+            deck("deck-host", "host", true),
+            deck("deck-local", "Local deck", true),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &decks,
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "host"),
+            "show host",
+        )
+        .await;
+        assert_eq!(outcome.sentence(), "Showing the Host figures.");
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+
+        for said in ["host for host", "show host on host"] {
+            let (outcome, _) = open_new_agent_over(
+                &decks,
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "host"),
+                said,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params.len() == 1 && params[0].value == "deck-host"),
+                "{said:?}: {outcome:?}"
             );
         }
     }
