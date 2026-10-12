@@ -624,141 +624,63 @@ impl Surface {
     }
 }
 
-/// The shortest time between two placement lines, so a resize drag, which
-/// reports the frame on every step, prints about one line a second.
-const PLACEMENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
-
-/// What [`PlacementLog::placed`] says to print now, and when to call
-/// [`PlacementLog::flush`] for a line it held back.
-#[derive(Debug, Default, PartialEq)]
-pub struct PlacementReport {
-    pub lines: Vec<String>,
-    pub flush: Option<ScheduledFlush>,
-}
-
-/// A flush [`PlacementLog::placed`] asks for: call [`PlacementLog::flush`]
-/// with `epoch` once `after` has passed.
-#[derive(Debug, PartialEq)]
-pub struct ScheduledFlush {
-    pub after: Duration,
-    /// Which open the held line belongs to, so a flush that comes due after
-    /// the next open leaves that open's line alone.
-    pub epoch: u64,
-}
-
 #[derive(Debug)]
 struct PlacementLogState {
-    epoch: u64,
-    last_line: Option<Instant>,
-    logged: Option<Placed>,
-    held: Option<(Placed, String)>,
-    flush_scheduled: bool,
+    /// The last line printed for the page on screen.
+    last_line: Option<String>,
     fallback_warned: bool,
 }
 
 impl PlacementLogState {
-    const fn new(epoch: u64) -> Self {
+    const fn new() -> Self {
         Self {
-            epoch,
             last_line: None,
-            logged: None,
-            held: None,
-            flush_scheduled: false,
             fallback_warned: false,
         }
     }
 }
 
-/// Which placements of the PR page are printed: the first after each open,
-/// then each change of the applied rectangle, at most one line per
-/// `interval`. A change inside the interval is held and printed by
-/// [`PlacementLog::flush`] once the interval is over, so the rectangle a
-/// resize drag ends on is printed even when nothing is placed after it. The
-/// fallback warning is printed once per open. A line still held when the next
-/// page opens is printed by that open, and a flush scheduled before an open
-/// prints nothing after it. The clock is a parameter, as in [`HandOffGate`].
+/// Which placements of the PR page are printed: each one whose line differs
+/// from the last line printed for the page on screen — so the first placement
+/// of a page, and every distinct placement after it — and never a repeat. The
+/// fallback warning is printed once per page. Every line is printed by the
+/// placement it describes: nothing is held back or printed later.
 #[derive(Debug)]
 pub struct PlacementLog {
-    interval: Duration,
     state: Mutex<PlacementLogState>,
 }
 
 impl PlacementLog {
-    pub const fn new(interval: Duration) -> Self {
+    pub const fn new() -> Self {
         Self {
-            interval,
-            state: Mutex::new(PlacementLogState::new(0)),
+            state: Mutex::new(PlacementLogState::new()),
         }
     }
 
-    /// A pull request is opening: its first placement is printed whatever
-    /// came before, and so is the fallback warning. Returns the line the page
-    /// before it still held, which is printed now rather than dropped.
-    pub fn opened(&self) -> Option<String> {
-        let mut state = self.lock();
-        let held = state.held.take().map(|(_, line)| line);
-        *state = PlacementLogState::new(state.epoch.wrapping_add(1));
-        held
+    /// The page on screen is gone — it closed, or an open replaced it — so
+    /// the next placement is printed whatever came before, and so is the
+    /// fallback warning.
+    pub fn forget(&self) {
+        *self.lock() = PlacementLogState::new();
     }
 
-    /// The page was placed at `placed` at `now`. `fallback` is why the main
-    /// webview's bounds could not be read, when they could not; `line`
-    /// describes the placement and is only built when it is printed or held.
-    pub fn placed(
-        &self,
-        now: Instant,
-        placed: Placed,
-        fallback: Option<&str>,
-        line: impl FnOnce() -> String,
-    ) -> PlacementReport {
+    /// The page was placed as `line` describes. `fallback` is why the main
+    /// webview's bounds could not be read, when they could not. Answers the
+    /// lines to print now.
+    pub fn placed(&self, fallback: Option<&str>, line: String) -> Vec<String> {
         let mut state = self.lock();
-        let mut report = PlacementReport::default();
+        let mut lines = Vec::new();
         if let Some(error) = fallback
             && !state.fallback_warned
         {
             state.fallback_warned = true;
-            report.lines.push(fallback_warning(error));
+            lines.push(fallback_warning(error));
         }
-        if state.logged == Some(placed) {
-            state.held = None;
-            return report;
+        if state.last_line.as_ref() != Some(&line) {
+            state.last_line = Some(line.clone());
+            lines.push(line);
         }
-        let since = state
-            .last_line
-            .map(|last| now.saturating_duration_since(last));
-        match since {
-            Some(since) if since < self.interval => {
-                state.held = Some((placed, line()));
-                if !state.flush_scheduled {
-                    state.flush_scheduled = true;
-                    report.flush = Some(ScheduledFlush {
-                        after: self.interval - since,
-                        epoch: state.epoch,
-                    });
-                }
-            }
-            _ => {
-                state.last_line = Some(now);
-                state.logged = Some(placed);
-                state.held = None;
-                report.lines.push(line());
-            }
-        }
-        report
-    }
-
-    /// The line [`PlacementLog::placed`] held back, if one is still waiting
-    /// and no page has opened since the flush was scheduled for `epoch`.
-    pub fn flush(&self, epoch: u64, now: Instant) -> Option<String> {
-        let mut state = self.lock();
-        if state.epoch != epoch {
-            return None;
-        }
-        state.flush_scheduled = false;
-        let (placed, line) = state.held.take()?;
-        state.last_line = Some(now);
-        state.logged = Some(placed);
-        Some(line)
+        lines
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PlacementLogState> {
@@ -769,7 +691,19 @@ impl PlacementLog {
 }
 
 /// The app's one placement log.
-static PLACEMENT_LOG: PlacementLog = PlacementLog::new(PLACEMENT_LOG_INTERVAL);
+static PLACEMENT_LOG: PlacementLog = PlacementLog::new();
+
+/// Points the page on screen at another pull request with `navigate`, and
+/// only once that has succeeded tells `log` another page is on screen. A
+/// failed switch leaves the page, and what was printed about it, as they were.
+fn switch_page(
+    log: &PlacementLog,
+    navigate: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    navigate()?;
+    log.forget();
+    Ok(())
+}
 
 /// Every placement line starts with this, so it can be found in the
 /// desktop's output.
@@ -1082,6 +1016,7 @@ pub fn handoff_page(
 fn close_browser<R: Runtime>(app: &AppHandle<R>) {
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
         let _ = webview.close();
+        PLACEMENT_LOG.forget();
         release_window(app);
     }
 }
@@ -1155,14 +1090,12 @@ pub async fn open<R: Runtime>(
     let _session = SESSION.lock().await;
     admit_open(&CLEARING)?;
     let generation = GENERATIONS.begin();
-    if let Some(line) = PLACEMENT_LOG.opened() {
-        eprintln!("{line}");
-    }
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-        if let Err(error) = webview.navigate(url) {
+        let navigate = || webview.navigate(url).map_err(|error| error.to_string());
+        if let Err(error) = switch_page(&PLACEMENT_LOG, navigate) {
             // The replaced page stays; its effects are its own again.
             GENERATIONS.open_failed();
-            return Err(error.to_string());
+            return Err(error);
         }
         place(&webview, bounds)?;
         let _ = webview.show();
@@ -1173,7 +1106,8 @@ pub async fn open<R: Runtime>(
         .get_window(MAIN_WEBVIEW_LABEL)
         .ok_or_else(|| "The app's window is not open.".to_string())?;
     let profile = app_profile(app)?;
-    let at = bounds.onto_window(&window)?;
+    let surface = Surface::of(&window)?;
+    let at = bounds.on(&surface);
     let webview = window
         .add_child(
             builder(app, PR_WEBVIEW_LABEL, WebviewUrl::External(url), &profile),
@@ -1181,6 +1115,10 @@ pub async fn open<R: Runtime>(
             LogicalSize::new(at.width, at.height),
         )
         .map_err(|error| format!("The pull request browser could not open: {error}"))?;
+    // Printed once the page exists, so an open whose page could not be
+    // created prints nothing.
+    PLACEMENT_LOG.forget();
+    log_placement(&surface, bounds, at);
     #[cfg(target_os = "linux")]
     overlay::attach(&webview, bounds)?;
     let _ = webview.set_focus();
@@ -1209,55 +1147,24 @@ fn place<R: Runtime>(webview: &tauri::Webview<R>, bounds: Bounds) -> Result<(), 
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let at = bounds.onto_window(&webview.window())?;
+        let surface = Surface::of(&webview.window())?;
+        let at = bounds.on(&surface);
         webview
             .set_bounds(tauri::Rect {
                 position: LogicalPosition::new(at.x, at.y).into(),
                 size: LogicalSize::new(at.width, at.height).into(),
             })
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl Bounds {
-    /// The frame on `window`'s content area, in logical pixels — what
-    /// `add_child` and `set_bounds` place a webview in.
-    fn onto_window<R: Runtime>(self, window: &tauri::Window<R>) -> Result<Placed, String> {
-        let surface = Surface::of(window)?;
-        let placed = self.on(&surface);
-        log_placement(&surface, self, placed);
-        Ok(placed)
+            .map_err(|error| error.to_string())?;
+        log_placement(&surface, bounds, at);
+        Ok(())
     }
 }
 
 /// Prints the placement through [`PLACEMENT_LOG`], to stderr as the app's
-/// other diagnostics are, and prints a held line once its interval is over.
+/// other diagnostics are.
 fn log_placement(surface: &Surface, bounds: Bounds, placed: Placed) {
-    let now = Instant::now();
-    let report = PLACEMENT_LOG.placed(
-        now,
-        placed,
-        surface.main_webview.as_ref().err().map(String::as_str),
-        || placement_line(surface, bounds, placed),
-    );
-    for line in report.lines {
-        eprintln!("{line}");
-    }
-    let Some(ScheduledFlush { after, epoch }) = report.flush else {
-        return;
-    };
-    let spawned = std::thread::Builder::new()
-        .name("pr-browser-placement-log".into())
-        .spawn(move || {
-            std::thread::sleep(after);
-            if let Some(line) = PLACEMENT_LOG.flush(epoch, Instant::now()) {
-                eprintln!("{line}");
-            }
-        });
-    // Without the thread, print the held line now rather than never.
-    if spawned.is_err()
-        && let Some(line) = PLACEMENT_LOG.flush(epoch, now)
-    {
+    let fallback = surface.main_webview.as_ref().err().map(String::as_str);
+    for line in PLACEMENT_LOG.placed(fallback, placement_line(surface, bounds, placed)) {
         eprintln!("{line}");
     }
 }
@@ -2704,132 +2611,114 @@ mod tests {
         );
     }
 
-    /// The first placement after an open is printed, a repeat is not, a
-    /// change inside the interval is held and printed by the flush, and the
-    /// fallback warning comes once per open.
+    fn line(text: &str) -> String {
+        text.to_string()
+    }
+
+    /// A page that opens prints its first placement; the same line again
+    /// prints nothing, a changed one prints at once, and so does a return to
+    /// an earlier rectangle. The fallback warning comes once per page, and a
+    /// page closed and opened again prints afresh.
     #[test]
-    fn placements_are_logged_on_open_and_on_change_at_most_once_an_interval() {
-        let log = PlacementLog::new(Duration::from_secs(1));
-        let at = |y: f64| Placed {
-            x: 15.0,
-            y,
-            width: 100.0,
-            height: 100.0,
-        };
-        let start = Instant::now();
-        let after = |ms: u64| start + Duration::from_millis(ms);
-        let line = |text: &'static str| move || text.to_string();
+    fn placements_are_printed_on_open_and_on_each_change() {
+        let log = PlacementLog::new();
 
-        log.opened();
-        assert_eq!(
-            log.placed(start, at(55.0), None, line("first")).lines,
-            ["first"]
-        );
-        assert_eq!(
-            log.placed(after(10), at(55.0), None, line("same")),
-            PlacementReport::default()
-        );
+        log.forget();
+        assert_eq!(log.placed(None, line("open")), ["open"]);
+        assert!(log.placed(None, line("open")).is_empty());
+        assert_eq!(log.placed(None, line("moved")), ["moved"]);
+        assert_eq!(log.placed(None, line("open")), ["open"]);
 
-        // A resize drag: the first change is held with a flush scheduled for
-        // the end of the interval, the next replaces it without scheduling
-        // another, and the flush prints the last one.
-        let report = log.placed(after(200), at(60.0), None, line("drag 1"));
-        assert_eq!(
-            report,
-            PlacementReport {
-                lines: vec![],
-                flush: Some(ScheduledFlush {
-                    after: Duration::from_millis(800),
-                    epoch: 1
-                })
-            }
-        );
-        assert_eq!(
-            log.placed(after(400), at(65.0), None, line("drag 2")),
-            PlacementReport::default()
-        );
-        assert_eq!(log.flush(1, after(1000)).as_deref(), Some("drag 2"));
-        assert_eq!(log.flush(1, after(1001)), None);
-        assert_eq!(
-            log.placed(after(1100), at(65.0), None, line("settled")),
-            PlacementReport::default()
-        );
+        let first = log.placed(Some("gone"), line("fallback"));
+        assert_eq!(first, [fallback_warning("gone"), line("fallback")]);
+        assert!(log.placed(Some("gone"), line("fallback")).is_empty());
 
-        // After the interval a change prints at once.
+        // Closed, then the same pull request opened again where it was.
+        log.forget();
         assert_eq!(
-            log.placed(after(2100), at(70.0), None, line("moved")).lines,
-            ["moved"]
-        );
-
-        // A change that goes back to the printed placement drops what was held.
-        log.placed(after(2200), at(75.0), None, line("held"));
-        log.placed(after(2300), at(70.0), None, line("back"));
-        assert_eq!(log.flush(1, after(3100)), None);
-
-        // The fallback warning: once per open, and again after the next open.
-        let first = log.placed(after(5000), at(80.0), Some("gone"), line("fallback"));
-        assert_eq!(
-            first.lines,
-            [fallback_warning("gone"), "fallback".to_string()]
-        );
-        let again = log.placed(after(5010), at(80.0), Some("gone"), line("fallback"));
-        assert!(again.lines.is_empty(), "{again:?}");
-        log.opened();
-        let reopened = log.placed(after(5020), at(80.0), Some("gone"), line("reopened"));
-        assert_eq!(
-            reopened.lines,
-            [fallback_warning("gone"), "reopened".to_string()]
+            log.placed(Some("gone"), line("fallback")),
+            [fallback_warning("gone"), line("fallback")]
         );
     }
 
-    /// Page A closes with a line held and page B opens before A's flush is
-    /// due: B's open prints A's held line, A's flush then prints nothing and
-    /// leaves B's held line for B's own flush, and B's first placement is
-    /// printed as the first after an open.
+    /// Review finding 10: a page that closes with no other opening prints
+    /// nothing after its close — the log prints only from a placement, and
+    /// the next page's first placement carries nothing over from the closed
+    /// one.
     #[test]
-    fn a_flush_from_before_an_open_leaves_the_next_page_alone() {
-        let log = PlacementLog::new(Duration::from_secs(1));
-        let at = |y: f64| Placed {
+    fn a_closed_page_prints_nothing_after_it() {
+        let log = PlacementLog::new();
+        log.forget();
+        assert_eq!(log.placed(None, line("a 1")), ["a 1"]);
+        assert_eq!(log.placed(None, line("a 2")), ["a 2"]);
+
+        log.forget();
+        assert_eq!(log.placed(None, line("a 2")), ["a 2"], "the next page");
+    }
+
+    /// Review finding 11: a switch to another pull request that fails to
+    /// navigate leaves the page on screen and its log alone — its next
+    /// placement is not printed as a new page's, and the fallback warning is
+    /// not repeated — while a switch that succeeds prints the new page afresh.
+    #[test]
+    fn a_failed_switch_leaves_the_page_and_its_log_alone() {
+        let log = PlacementLog::new();
+        log.forget();
+        assert_eq!(
+            log.placed(Some("gone"), line("a")),
+            [fallback_warning("gone"), line("a")]
+        );
+
+        let failed = switch_page(&log, || Err("refused".to_string()));
+        assert_eq!(failed, Err("refused".to_string()));
+        assert!(log.placed(Some("gone"), line("a")).is_empty(), "A as new");
+        assert_eq!(log.placed(Some("gone"), line("a moved")), ["a moved"]);
+
+        assert_eq!(switch_page(&log, || Ok(())), Ok(()));
+        assert_eq!(
+            log.placed(Some("gone"), line("a moved")),
+            [fallback_warning("gone"), line("a moved")],
+            "B, in A's place"
+        );
+    }
+
+    /// Review finding 19: a change printed at once and a later change are
+    /// each printed by their own placement, once, and nothing comes after.
+    #[test]
+    fn each_change_is_printed_by_its_own_placement() {
+        let log = PlacementLog::new();
+        log.forget();
+        assert_eq!(log.placed(None, line("r1")), ["r1"]);
+        assert_eq!(log.placed(None, line("r2")), ["r2"]);
+        assert_eq!(log.placed(None, line("r3")), ["r3"]);
+        assert!(log.placed(None, line("r3")).is_empty());
+    }
+
+    /// The line the log compares is the full placement line, so a changed
+    /// rectangle prints and a repeated one does not.
+    #[test]
+    fn a_changed_rectangle_changes_the_line() {
+        let surface = Surface {
+            scale: 1.0,
+            main_webview: Err("gone".to_string()),
+            window_content: tauri::PhysicalSize::new(1000, 800),
+            mapping: Mapping::Proportional,
+        };
+        let frame = |y: f64| Bounds {
             x: 15.0,
             y,
             width: 100.0,
             height: 100.0,
+            viewport_width: 1000.0,
+            viewport_height: 800.0,
         };
-        let start = Instant::now();
-        let after = |ms: u64| start + Duration::from_millis(ms);
-        let line = |text: &'static str| move || text.to_string();
-
-        log.opened();
-        assert_eq!(
-            log.placed(start, at(55.0), None, line("a first")).lines,
-            ["a first"]
-        );
-        let a = log
-            .placed(after(200), at(60.0), None, line("a held"))
-            .flush
-            .expect("A's held line schedules a flush");
-        assert_eq!(a.after, Duration::from_millis(800));
-
-        assert_eq!(log.opened().as_deref(), Some("a held"));
-        assert_eq!(
-            log.placed(after(300), at(70.0), None, line("b first"))
-                .lines,
-            ["b first"]
-        );
-        let b = log
-            .placed(after(400), at(75.0), None, line("b held"))
-            .flush
-            .expect("B's held line schedules its own flush");
-        assert_eq!(b.after, Duration::from_millis(900));
-        assert_ne!(a.epoch, b.epoch);
-
-        assert_eq!(log.flush(a.epoch, after(1000)), None, "A's flush fired");
-        assert_eq!(
-            log.flush(b.epoch, after(1300)).as_deref(),
-            Some("b held"),
-            "B's flush"
-        );
-        assert_eq!(log.flush(b.epoch, after(1301)), None);
+        let log = PlacementLog::new();
+        let print = |bounds: Bounds| {
+            log.placed(None, placement_line(&surface, bounds, bounds.on(&surface)))
+        };
+        assert_eq!(print(frame(55.0)).len(), 1);
+        assert!(print(frame(55.0)).is_empty());
+        assert_eq!(print(frame(60.0)).len(), 1);
     }
 
     /// Decision 4: the files that grant permissions name only the app's own
