@@ -578,18 +578,26 @@ pub enum LaunchCommand {
 }
 
 /// Whether the shell that runs `<deck> wrap … -- <command>` hands the wrapper
-/// the argv the user meant (issue #1685): no control operator, grouping,
-/// redirection or newline that would end the wrapper's arguments early or
-/// apply to the wrapper rather than the agent, and a first word the wrapper
-/// can exec — not a `NAME=value` assignment and not a word only the shell
-/// runs ([`SHELL_ONLY_WORDS`]).
+/// the argv the user meant (issue #1685): no control operator, grouping or
+/// newline that would end the wrapper's arguments early, and a first word the
+/// wrapper can exec — not a `NAME=value` assignment and not a word only the
+/// shell runs ([`SHELL_ONLY_WORDS`]).
+///
+/// A redirection (`>log`, `2>&1`, `&>log`) does not count. That shell applies
+/// it to the wrapper, whose per-descriptor routing hands it on to the agent
+/// while still reading the agent's output (PRD #20 finding #11); inside the
+/// wrapper it would send that output past it.
 ///
 /// Errs towards `false`: a command that fails it is run by the user's shell
 /// inside the wrapper, which is correct for a plain invocation too, only a
 /// different launch shape. A quoted `;` therefore counts, and so does any
 /// `$( … )`.
 fn runs_as_plain_argv(command: &str) -> bool {
-    if command.contains(['\n', ';', '&', '|', '(', ')', '<', '>']) {
+    let without_redirections = command
+        .replace("&>", ">")
+        .replace(">&", ">")
+        .replace("<&", "<");
+    if without_redirections.contains(['\n', ';', '&', '|', '(', ')']) {
         return false;
     }
     command.split_whitespace().next().is_none_or(|first| {
@@ -3586,6 +3594,9 @@ mod tests {
             "env FOO=1 codex",
             "devbox run codex-big",
             "sh -c 'codex'",
+            "codex 2>/dev/null",
+            "codex >log 2>&1",
+            "codex &>log </dev/null",
             "",
         ] {
             assert!(runs_as_plain_argv(plain), "{plain:?}");
@@ -3597,7 +3608,8 @@ mod tests {
             "cd /tmp && codex",
             "codex; echo done",
             "codex | tee log",
-            "codex > log",
+            "codex |& tee log",
+            "codex & wait",
             "codex\necho done",
             "exec codex",
             "{ codex; }",
