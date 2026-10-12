@@ -705,6 +705,83 @@ fn switch_page(
     Ok(())
 }
 
+/// An open that reuses the page on screen for another pull request, in
+/// order: `prepare` puts the page over the frame and shows it, and only once
+/// that has succeeded does [`switch_page`] point it at the new pull request —
+/// the last step, so nothing after it can fail an open whose page has
+/// already switched. Any failure undoes the open in `generations`: the page
+/// that remains is the one it replaced, and its effects are its own again.
+/// Answers what `prepare` answered.
+fn reuse_page<T>(
+    generations: &Generations,
+    log: &PlacementLog,
+    prepare: impl FnOnce() -> Result<T, String>,
+    navigate: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    let switched = prepare().and_then(|prepared| switch_page(log, navigate).map(|()| prepared));
+    if switched.is_err() {
+        generations.open_failed();
+    }
+    switched
+}
+
+/// An open that makes a new page, in order: `create` makes it and `attach`
+/// puts it in place, and only once both have succeeded is it the page on
+/// screen, so `log` forgets the page before it. A page `attach` could not put
+/// in place is closed again with `discard`, so it is not left registered for
+/// the next open to find and reuse; a `discard` that fails too is part of
+/// the answer. Any failure undoes the open in `generations`.
+async fn create_page<P: Clone, F: Future<Output = Result<(), String>>>(
+    generations: &Generations,
+    log: &PlacementLog,
+    create: impl FnOnce() -> Result<P, String>,
+    attach: impl FnOnce(P) -> F,
+    discard: impl FnOnce(P) -> Result<(), String>,
+) -> Result<P, String> {
+    let made = async {
+        let page = create()?;
+        if let Err(error) = attach(page.clone()).await {
+            return Err(match discard(page) {
+                Ok(()) => error,
+                Err(close) => format!("{error} The page it made did not close either: {close}"),
+            });
+        }
+        Ok(page)
+    }
+    .await;
+    match made {
+        Ok(_) => log.forget(),
+        Err(_) => generations.open_failed(),
+    }
+    made
+}
+
+/// Closes the page on screen with `close`, and only once that has succeeded
+/// treats it as gone: `log` forgets it and `release` gives the window back
+/// (Linux). A close that failed leaves the page, and what was printed about
+/// it, as they were, and answers why.
+fn close_page(
+    log: &PlacementLog,
+    close: impl FnOnce() -> Result<(), String>,
+    release: impl FnOnce(),
+) -> Result<(), String> {
+    close()?;
+    log.forget();
+    release();
+    Ok(())
+}
+
+/// `close`, then `tell` the app the page closed — only once it has, so the
+/// app never forgets a page that is still on screen.
+fn close_and_tell(
+    close: impl FnOnce() -> Result<(), String>,
+    tell: impl FnOnce(),
+) -> Result<(), String> {
+    close()?;
+    tell();
+    Ok(())
+}
+
 /// Every placement line starts with this, so it can be found in the
 /// desktop's output.
 pub const PLACEMENT_LOG_PREFIX: &str = "dot-agent-deck-desktop: PR page placement:";
@@ -788,8 +865,7 @@ impl<R: Runtime> Effects for AppEffects<R> {
         };
         tauri::async_runtime::spawn(async move {
             in_page(&SESSION, &GENERATIONS, page, || {
-                close_browser(&app);
-                let _ = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, page.open);
+                close_and_announce(&app, page.open);
             })
             .await;
         });
@@ -803,8 +879,13 @@ impl<R: Runtime> Effects for AppEffects<R> {
         };
         tauri::async_runtime::spawn(async move {
             in_page(&SESSION, &GENERATIONS, page, || {
-                if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-                    let _ = webview.navigate(url);
+                // A link that does not load leaves the page where it was.
+                if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL)
+                    && let Err(error) = webview.navigate(url)
+                {
+                    eprintln!(
+                        "dot-agent-deck-desktop: the pull request page could not follow a link: {error}"
+                    );
                 }
             })
             .await;
@@ -866,8 +947,8 @@ impl Generations {
         self.loading.store(false, Ordering::SeqCst);
     }
 
-    /// The open's navigation failed, so no new page is coming: the open is
-    /// undone and the page that remains owns page effects again, under the
+    /// The open failed, so no new page is coming: the open is undone and the
+    /// page that remains, if any, owns page effects again, under the
     /// generation its own open was answered with. Called under [`SESSION`],
     /// where nothing else advances the numbers.
     pub fn open_failed(&self) {
@@ -1013,11 +1094,43 @@ pub fn handoff_page(
     Ok(())
 }
 
-fn close_browser<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-        let _ = webview.close();
-        PLACEMENT_LOG.forget();
-        release_window(app);
+/// Closes the open browser ([`close_page`]); with none open there is nothing
+/// to do. A close the platform refused leaves the page open and registered,
+/// so the next close tries again.
+fn close_browser<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) else {
+        return Ok(());
+    };
+    close_page(
+        &PLACEMENT_LOG,
+        || {
+            webview
+                .close()
+                .map_err(|error| format!("The pull request page did not close: {error}"))
+        },
+        || release_window(app),
+    )
+}
+
+/// A close nobody awaits — the page's own Escape, or a failed sign-out:
+/// closes the browser and tells the app, with `generation`, only once it has
+/// closed ([`close_and_tell`]). A close that failed is printed, and the app,
+/// told nothing, keeps the frame and its Close.
+fn close_and_announce<R: Runtime>(app: &AppHandle<R>, generation: u64) {
+    let closed = close_and_tell(
+        || close_browser(app),
+        || {
+            // The page is gone either way; an app that was not told keeps an
+            // empty frame, which its Close still closes.
+            if let Err(error) = app.emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, generation) {
+                eprintln!(
+                    "dot-agent-deck-desktop: the pull request page closed, but the app could not be told: {error}"
+                );
+            }
+        },
+    );
+    if let Err(error) = closed {
+        eprintln!("dot-agent-deck-desktop: {error}");
     }
 }
 
@@ -1076,7 +1189,9 @@ fn builder<R: Runtime>(
 /// can tell a close of this page from a late one of a page before it.
 /// Waits while a sign-out is clearing the profile, so a page never loads into
 /// a profile that is half deleted, and is refused while a clear the platform
-/// never confirmed may still be running ([`admit_open`]).
+/// never confirmed may still be running ([`admit_open`]). An open that fails
+/// leaves no page of its own: a reused page keeps its pull request
+/// ([`reuse_page`]), and a page made for it is closed again ([`create_page`]).
 pub async fn open<R: Runtime>(
     app: &AppHandle<R>,
     url: &str,
@@ -1091,38 +1206,96 @@ pub async fn open<R: Runtime>(
     admit_open(&CLEARING)?;
     let generation = GENERATIONS.begin();
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
-        let navigate = || webview.navigate(url).map_err(|error| error.to_string());
-        if let Err(error) = switch_page(&PLACEMENT_LOG, navigate) {
-            // The replaced page stays; its effects are its own again.
-            GENERATIONS.open_failed();
-            return Err(error);
+        let placed = reuse_page(
+            &GENERATIONS,
+            &PLACEMENT_LOG,
+            || {
+                let placed = position(&webview, bounds)?;
+                webview.show().map_err(|error| error.to_string())?;
+                Ok(placed)
+            },
+            || webview.navigate(url).map_err(|error| error.to_string()),
+        )?;
+        if let Some((surface, at)) = placed {
+            log_placement(&surface, bounds, at);
         }
-        place(&webview, bounds)?;
-        let _ = webview.show();
-        let _ = webview.set_focus();
+        focus(&webview);
         return Ok(generation);
     }
-    let window = app
-        .get_window(MAIN_WEBVIEW_LABEL)
-        .ok_or_else(|| "The app's window is not open.".to_string())?;
-    let profile = app_profile(app)?;
-    let surface = Surface::of(&window)?;
-    let at = bounds.on(&surface);
-    let webview = window
-        .add_child(
-            builder(app, PR_WEBVIEW_LABEL, WebviewUrl::External(url), &profile),
-            LogicalPosition::new(at.x, at.y),
-            LogicalSize::new(at.width, at.height),
-        )
-        .map_err(|error| format!("The pull request browser could not open: {error}"))?;
-    // Printed once the page exists, so an open whose page could not be
-    // created prints nothing.
-    PLACEMENT_LOG.forget();
-    log_placement(&surface, bounds, at);
-    #[cfg(target_os = "linux")]
-    overlay::attach(&webview, bounds)?;
-    let _ = webview.set_focus();
+    let mut placed = None;
+    let webview = create_page(
+        &GENERATIONS,
+        &PLACEMENT_LOG,
+        || {
+            let window = app
+                .get_window(MAIN_WEBVIEW_LABEL)
+                .ok_or_else(|| "The app's window is not open.".to_string())?;
+            let profile = app_profile(app)?;
+            let surface = Surface::of(&window)?;
+            let at = bounds.on(&surface);
+            let webview = window
+                .add_child(
+                    builder(app, PR_WEBVIEW_LABEL, WebviewUrl::External(url), &profile),
+                    LogicalPosition::new(at.x, at.y),
+                    LogicalSize::new(at.width, at.height),
+                )
+                .map_err(|error| format!("The pull request browser could not open: {error}"))?;
+            placed = Some((surface, at));
+            Ok(webview)
+        },
+        |webview| attach(webview, bounds),
+        |webview| discard(app, webview),
+    )
+    .await?;
+    // Printed once the page is in place, so an open whose page could not be
+    // created or placed prints nothing.
+    if let Some((surface, at)) = placed {
+        log_placement(&surface, bounds, at);
+    }
+    focus(&webview);
     Ok(generation)
+}
+
+/// Puts a newly made page in place. On Linux that is moving it into the
+/// overlay over the main webview ([`overlay::attach`]); elsewhere `add_child`
+/// already placed it.
+async fn attach<R: Runtime>(webview: tauri::Webview<R>, bounds: Bounds) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        awaited(
+            overlay::attach(&webview, bounds),
+            ATTACH_TIMEOUT,
+            "the page was not put in place in time.",
+        )
+        .await
+        .map_err(|error| format!("The pull request browser could not open: {error}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (webview, bounds);
+        Ok(())
+    }
+}
+
+/// How long an open waits for the page to be moved into the overlay
+/// ([`overlay::attach`]); the move is one step on the main thread.
+#[cfg(target_os = "linux")]
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Closes a page an open made and could not put in place, so the next open
+/// makes a fresh one rather than finding it.
+fn discard<R: Runtime>(app: &AppHandle<R>, webview: tauri::Webview<R>) -> Result<(), String> {
+    webview.close().map_err(|error| error.to_string())?;
+    release_window(app);
+    Ok(())
+}
+
+/// Gives the page the keyboard. Only focus: a page that did not get it is
+/// still open and placed, and a click gives it focus, so a failure is printed.
+fn focus<R: Runtime>(webview: &tauri::Webview<R>) {
+    if let Err(error) = webview.set_focus() {
+        eprintln!("dot-agent-deck-desktop: the pull request page did not take focus: {error}");
+    }
 }
 
 /// Whether a pull request may open now. Not while `clearing` is raised: that
@@ -1141,9 +1314,21 @@ pub fn admit_open(clearing: &AtomicBool) -> Result<(), String> {
 const STILL_CLEARING: &str = "The app is still clearing your GitHub sign-in, and the system has not said it has finished. Try again in a moment; if this keeps happening, restart the app.";
 
 fn place<R: Runtime>(webview: &tauri::Webview<R>, bounds: Bounds) -> Result<(), String> {
+    if let Some((surface, at)) = position(webview, bounds)? {
+        log_placement(&surface, bounds, at);
+    }
+    Ok(())
+}
+
+/// Moves `webview` over `bounds`, and answers the placement to print. On
+/// Linux there is none: the overlay places the page at its next layout.
+fn position<R: Runtime>(
+    webview: &tauri::Webview<R>,
+    bounds: Bounds,
+) -> Result<Option<(Surface, Placed)>, String> {
     #[cfg(target_os = "linux")]
     {
-        overlay::place(webview, bounds)
+        overlay::place(webview, bounds).map(|()| None)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1155,8 +1340,7 @@ fn place<R: Runtime>(webview: &tauri::Webview<R>, bounds: Bounds) -> Result<(), 
                 size: LogicalSize::new(at.width, at.height).into(),
             })
             .map_err(|error| error.to_string())?;
-        log_placement(&surface, bounds, at);
-        Ok(())
+        Ok(Some((surface, at)))
     }
 }
 
@@ -1252,25 +1436,29 @@ pub async fn open_external<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
 /// current one ([`in_session`]). A page the user closed, or replaced with
 /// another pull request, while the launch was being watched is left alone:
 /// the launch still answers its own outcome, but the page it would close is
-/// no longer the one it was asked about.
+/// no longer the one it was asked about. A close that fails answers why, so
+/// the app keeps the frame, with the reason, and its Close.
 pub async fn handoff_in_session(
     url: Url,
     session: &tokio::sync::Mutex<()>,
     generations: &Generations,
     generation: u64,
     open: impl FnOnce(&Url) -> Result<(), String> + Send + 'static,
-    close: impl FnOnce(),
+    close: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || handoff_page(&url, open, || ()))
         .await
         .map_err(|error| error.to_string())??;
-    in_session(session, generations, generation, close).await;
-    Ok(())
+    let mut closed = Ok(());
+    in_session(session, generations, generation, || closed = close()).await;
+    closed.map_err(|error| format!("The pull request opened in your browser. {error}"))
 }
 
-/// The toolbar's Close, `Escape` in the app, and voice's "close".
-pub fn close<R: Runtime>(app: &AppHandle<R>) {
-    close_browser(app);
+/// The toolbar's Close, `Escape` in the app, and voice's "close". A close
+/// the platform refused answers why, and leaves the page open for the next
+/// close to try again.
+pub fn close<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    close_browser(app)
 }
 
 /// Held by [`open`] and [`sign_out`] for their whole run, so a pull request
@@ -1586,7 +1774,12 @@ impl<R: Runtime> SignOutHost for AppSignOut<R> {
         ) {
             Ok(webview) => webview,
             Err(error) => {
-                let _ = window.close();
+                // Sign-out is already failing; this only tidies up after it.
+                if let Err(close) = window.close() {
+                    eprintln!(
+                        "dot-agent-deck-desktop: the hidden sign-out window did not close: {close}"
+                    );
+                }
                 return Err(format!("Could not open the sign-in profile: {error}"));
             }
         };
@@ -1627,22 +1820,30 @@ impl<R: Runtime> SignOutHost for AppSignOut<R> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some((window, _)) = scratch {
-            let _ = window.close();
+        // The clear has already answered. A window left open is hidden and
+        // holds only the empty page; a later sign-out that finds its label
+        // taken says it could not open the profile.
+        if let Some((window, _)) = scratch
+            && let Err(error) = window.close()
+        {
+            eprintln!("dot-agent-deck-desktop: the hidden sign-out window did not close: {error}");
         }
     }
 
     fn resume(&self, url: Url) {
-        if let Ok(webview) = open_webview(&self.app) {
-            let _ = webview.navigate(url);
+        // The profile is cleared either way; a page that does not come back
+        // stays empty in its frame, which still closes.
+        if let Ok(webview) = open_webview(&self.app)
+            && let Err(error) = webview.navigate(url)
+        {
+            eprintln!(
+                "dot-agent-deck-desktop: the pull request page was not put back after sign-out: {error}"
+            );
         }
     }
 
     fn close_browser(&self) {
-        close_browser(&self.app);
-        let _ = self
-            .app
-            .emit_to(MAIN_WEBVIEW_LABEL, CLOSED_EVENT, GENERATIONS.current());
+        close_and_announce(&self.app, GENERATIONS.current());
     }
 }
 
@@ -1778,7 +1979,13 @@ fn release_window<R: Runtime>(app: &AppHandle<R>) {
     #[cfg(target_os = "linux")]
     if let Some(window) = app.get_window(MAIN_WEBVIEW_LABEL) {
         let main_thread = window.clone();
-        let _ = window.run_on_main_thread(move || overlay::release(&main_thread));
+        // The page is already closed; an overlay left behind is reused by
+        // the next open and taken apart by the next close.
+        if let Err(error) = window.run_on_main_thread(move || overlay::release(&main_thread)) {
+            eprintln!(
+                "dot-agent-deck-desktop: the main webview was not moved back out of the pull request overlay: {error}"
+            );
+        }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = app;
@@ -1830,23 +2037,34 @@ mod overlay {
         ))
     }
 
-    pub fn attach<R: Runtime>(webview: &Webview<R>, bounds: Bounds) -> Result<(), String> {
+    /// Moves a new PR webview out of the window's box into the overlay over
+    /// the main webview. The move runs on the main thread; the answer comes
+    /// once it has, with why the page could not be moved when it could not.
+    pub fn attach<R: Runtime>(webview: &Webview<R>, bounds: Bounds) -> super::Answer {
         remember(bounds);
-        webview
-            .with_webview(|platform| {
-                let child: gtk::Widget = platform.inner().upcast();
-                let Some(parent) = child.parent() else { return };
-                let Ok(vbox) = parent.downcast::<gtk::Box>() else {
-                    return;
-                };
-                let Some(overlay) = overlay_in(&vbox, &child) else {
-                    return;
-                };
-                vbox.remove(&child);
-                overlay.add_overlay(&child);
-                child.show();
-            })
-            .map_err(|error| error.to_string())
+        let (reply, answer) = super::Reply::new();
+        let moved = reply.clone();
+        let sent = webview
+            .with_webview(move |platform| moved.send(move_into_overlay(platform.inner().upcast())));
+        if let Err(error) = sent {
+            reply.send(Err(error.to_string()));
+        }
+        answer
+    }
+
+    fn move_into_overlay(child: gtk::Widget) -> Result<(), String> {
+        let parent = child
+            .parent()
+            .ok_or_else(|| "the page has no place in the window.".to_string())?;
+        let vbox = parent
+            .downcast::<gtk::Box>()
+            .map_err(|_| "the page is not in the window's box.".to_string())?;
+        let overlay = overlay_in(&vbox, &child)
+            .ok_or_else(|| "the window has no main webview to put the page over.".to_string())?;
+        vbox.remove(&child);
+        overlay.add_overlay(&child);
+        child.show();
+        Ok(())
     }
 
     /// Takes the overlay apart once the PR webview has gone: the main webview
@@ -2682,6 +2900,239 @@ mod tests {
         );
     }
 
+    /// Scenario: PR #1680 review — the page's Escape, or a failed sign-out,
+    /// asks for a close and the platform refuses it. The page stays open and
+    /// registered: the window is not released, its placement log is not
+    /// reset, and the app is not told it closed, so the frame and its Close
+    /// stay for another try. A close that then succeeds releases the window
+    /// and tells the app, after the close.
+    #[test]
+    fn a_close_the_platform_refuses_leaves_the_page_open_and_untold() {
+        let log = PlacementLog::new();
+        log.forget();
+        assert_eq!(log.placed(None, line("a")), ["a"]);
+        let steps = RefCell::new(Vec::new());
+        let close = |result: Result<(), String>| {
+            close_and_tell(
+                || {
+                    close_page(
+                        &log,
+                        || {
+                            steps.borrow_mut().push("close");
+                            result
+                        },
+                        || steps.borrow_mut().push("release"),
+                    )
+                },
+                || steps.borrow_mut().push("told"),
+            )
+        };
+
+        assert_eq!(
+            close(Err("no event loop".into())),
+            Err("no event loop".into())
+        );
+        assert_eq!(*steps.borrow(), ["close"], "a refused close was acted on");
+        assert!(
+            log.placed(None, line("a")).is_empty(),
+            "the page still on screen was printed as a new one"
+        );
+
+        steps.borrow_mut().clear();
+        assert_eq!(close(Ok(())), Ok(()));
+        assert_eq!(*steps.borrow(), ["close", "release", "told"]);
+        assert_eq!(log.placed(None, line("a")), ["a"], "the next page");
+    }
+
+    /// Scenario: PR #1680 review — the user presses Open in browser, the
+    /// system browser opens, and the in-app page then fails to close. The
+    /// hand-off answers why instead of success, so the app keeps the frame,
+    /// with the reason, and its Close.
+    #[tokio::test]
+    async fn a_hand_off_whose_page_does_not_close_answers_why() {
+        let session = tokio::sync::Mutex::const_new(());
+        let generations = Generations::new();
+        let open = generations.begin();
+        let result = handoff_in_session(
+            url("https://github.com/o/r/pull/7"),
+            &session,
+            &generations,
+            open,
+            |_| Ok(()),
+            || Err("no event loop".to_string()),
+        )
+        .await;
+        let error = result.expect_err("a page left open was reported closed");
+        assert!(error.contains("no event loop"), "{error}");
+    }
+
+    /// Scenario: PR #1680 review — another pull request opens in the page
+    /// already on screen, and the page cannot be placed over the frame or
+    /// shown. The page is not pointed at the new pull request, the open is
+    /// undone so the page keeps its own effects, and its log is left alone.
+    /// An open whose page is placed switches it, after placing it.
+    #[test]
+    fn an_open_that_cannot_place_the_page_does_not_switch_it() {
+        let generations = Generations::new();
+        let log = PlacementLog::new();
+        let first = generations.begin();
+        generations.page_started();
+        log.forget();
+        assert_eq!(log.placed(None, line("a")), ["a"]);
+        let steps = RefCell::new(Vec::new());
+
+        generations.begin();
+        let result: Result<(), String> = reuse_page(
+            &generations,
+            &log,
+            || {
+                steps.borrow_mut().push("place");
+                Err("not placed".into())
+            },
+            || {
+                steps.borrow_mut().push("navigate");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("not placed".into()));
+        assert_eq!(
+            *steps.borrow(),
+            ["place"],
+            "the page moved to a pull request its open failed to show"
+        );
+        assert_eq!(generations.current(), first, "the failed open is current");
+        assert_eq!(generations.page_token().map(|page| page.open), Some(first));
+        assert!(log.placed(None, line("a")).is_empty(), "A printed as new");
+
+        steps.borrow_mut().clear();
+        let second = generations.begin();
+        let result = reuse_page(
+            &generations,
+            &log,
+            || {
+                steps.borrow_mut().push("place");
+                Ok(7)
+            },
+            || {
+                steps.borrow_mut().push("navigate");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(7));
+        assert_eq!(*steps.borrow(), ["place", "navigate"]);
+        assert_eq!(generations.current(), second);
+        assert_eq!(log.placed(None, line("a")), ["a"], "B, in A's place");
+    }
+
+    /// Scenario: PR #1680 review — on Linux a pull request opens with no page
+    /// open, the page is made, and moving it into the overlay fails. The open
+    /// fails; the page it made is closed again, so it is not left registered
+    /// for the next open to find; the open is undone; and the placement log
+    /// is not reset by a page that never opened. The next open makes a fresh
+    /// page. A page the platform could not make is never put in place, and
+    /// a close that also fails is part of the answer.
+    #[tokio::test]
+    async fn a_page_that_cannot_be_put_in_place_is_closed_and_not_kept() {
+        let generations = Generations::new();
+        let log = PlacementLog::new();
+        log.forget();
+        assert_eq!(log.placed(None, line("a")), ["a"]);
+        let registered = RefCell::new(Vec::<&str>::new());
+        let steps = RefCell::new(Vec::new());
+        let before = generations.current();
+        let make = |page: &'static str| {
+            steps.borrow_mut().push("create");
+            registered.borrow_mut().push(page);
+            Ok(page)
+        };
+        let attach = |result: Result<(), String>| {
+            let steps = &steps;
+            move |_page: &'static str| {
+                steps.borrow_mut().push("attach");
+                async move { result }
+            }
+        };
+        let discard = |result: Result<(), String>| {
+            let steps = &steps;
+            let registered = &registered;
+            move |page: &'static str| {
+                steps.borrow_mut().push("discard");
+                if result.is_ok() {
+                    registered.borrow_mut().retain(|open| *open != page);
+                }
+                result
+            }
+        };
+
+        generations.begin();
+        let result = create_page(
+            &generations,
+            &log,
+            || make("b"),
+            attach(Err("no overlay".into())),
+            discard(Ok(())),
+        )
+        .await;
+        assert_eq!(result, Err("no overlay".into()));
+        assert_eq!(*steps.borrow(), ["create", "attach", "discard"]);
+        assert!(
+            registered.borrow().is_empty(),
+            "the failed page is still registered"
+        );
+        assert_eq!(generations.current(), before, "the failed open is current");
+        assert!(
+            log.placed(None, line("a")).is_empty(),
+            "a page that never opened reset the log"
+        );
+
+        steps.borrow_mut().clear();
+        let next = generations.begin();
+        let result = create_page(
+            &generations,
+            &log,
+            || make("c"),
+            attach(Ok(())),
+            discard(Ok(())),
+        )
+        .await;
+        assert_eq!(result, Ok("c"));
+        assert_eq!(*steps.borrow(), ["create", "attach"]);
+        assert_eq!(*registered.borrow(), ["c"], "a fresh page");
+        assert_eq!(generations.current(), next);
+        assert_eq!(log.placed(None, line("a")), ["a"], "C's first placement");
+
+        steps.borrow_mut().clear();
+        registered.borrow_mut().clear();
+        generations.begin();
+        let result = create_page(
+            &generations,
+            &log,
+            || Err::<&'static str, String>("no window".into()),
+            attach(Ok(())),
+            discard(Ok(())),
+        )
+        .await;
+        assert_eq!(result, Err("no window".into()));
+        assert!(steps.borrow().is_empty(), "a page never made was handled");
+        assert_eq!(generations.current(), next, "the failed open is current");
+
+        generations.begin();
+        let error = create_page(
+            &generations,
+            &log,
+            || make("d"),
+            attach(Err("no overlay".into())),
+            discard(Err("no event loop".into())),
+        )
+        .await
+        .expect_err("a page that was not put in place opened");
+        assert!(
+            error.contains("no overlay") && error.contains("no event loop"),
+            "{error}"
+        );
+        assert_eq!(generations.current(), next, "the failed open is current");
+    }
+
     /// Review finding 19: a change printed at once and a later change are
     /// each printed by their own placement, once, and nothing comes after.
     #[test]
@@ -3509,7 +3960,10 @@ mod tests {
         let a = generations.begin();
         let close = {
             let closed = closed.clone();
-            move || *closed.lock().unwrap() += 1
+            move || {
+                *closed.lock().unwrap() += 1;
+                Ok(())
+            }
         };
         let result = handoff_in_session(
             page.clone(),
@@ -3530,7 +3984,10 @@ mod tests {
         let b = generations.current();
         let close = {
             let closed = closed.clone();
-            move || *closed.lock().unwrap() += 1
+            move || {
+                *closed.lock().unwrap() += 1;
+                Ok(())
+            }
         };
         let result = handoff_in_session(page, session, generations, b, |_| Ok(()), close).await;
         assert_eq!(result, Ok(()));

@@ -6262,8 +6262,7 @@ async fn desktop_pr_browser_open_external(webview: Webview) -> Result<(), String
 #[tauri::command]
 async fn desktop_pr_browser_close(webview: Webview) -> Result<(), String> {
     ensure_main_webview(&webview)?;
-    pr_browser::close(webview.app_handle());
-    Ok(())
+    pr_browser::close(webview.app_handle())
 }
 
 /// PRD #1401 — Settings → Sign out of GitHub: clear the browser's profile.
@@ -6464,8 +6463,9 @@ pub fn run() {
             // drawn over a page that no longer knows it is there.
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Err(error) = pr_browser::close(webview.app_handle())
             {
-                pr_browser::close(webview.app_handle());
+                eprintln!("dot-agent-deck-desktop: {error}");
             }
         });
     // PRD #802's audit blocker, teardown trigger 3: the web content PROCESS
