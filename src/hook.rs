@@ -1451,7 +1451,7 @@ pub(crate) fn build_opencode_event_with_question(
     // `timestamp` all read this one clock reading.
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
-    let question = opencode_question(&input.event, input.properties.as_ref(), now_ms);
+    let mut question = opencode_question(&input.event, input.properties.as_ref(), now_ms);
     let mut event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
@@ -1575,7 +1575,13 @@ pub(crate) fn build_opencode_event_with_question(
         background: None,
         background_revision: None,
     };
-    if let Some(question) = &question {
+    if let Some(question) = &mut question {
+        // PRD #1631: a subagent's prompt (issue #1678) is that subagent's
+        // question, as a Claude Code subagent's is.
+        question.subagent_id = event
+            .metadata
+            .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+            .cloned();
         if event.tool_name.is_none()
             && let Some(tool) = &question.tool
         {

@@ -351,10 +351,12 @@ const replyThroughOpenCode = async (client, answer) => {{
 // line, which the child passes to the deck — so the deck reports the answer
 // sent only once OpenCode took it. When OpenCode did not, the question is
 // raised again, so it is pending in the deck once more and can be answered.
+// Answers whether a child was started: one that names no request, or whose
+// child cannot be spawned, is not held, and the caller reports it plainly.
 const awaitAnswer = (client, payload) => {{
   const requestId = payload?.properties?.id;
   if (typeof requestId !== "string" || !requestId) {{
-    return;
+    return false;
   }}
   stopHeldAnswer(requestId);
   resolvedRequests.delete(requestId);
@@ -364,7 +366,7 @@ const awaitAnswer = (client, payload) => {{
       stdio: ["pipe", "pipe", "ignore"],
     }});
   }} catch (_) {{
-    return;
+    return false;
   }}
   heldAnswers.set(requestId, child);
   const forget = () => {{
@@ -413,6 +415,7 @@ const awaitAnswer = (client, payload) => {{
   try {{
     child.stdin?.write(JSON.stringify(payload) + "\n");
   }} catch (_) {{}}
+  return true;
 }};
 
 const questionPayload = (event, directory) => {{
@@ -1200,25 +1203,38 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       }}
       if (eventType === "permission.asked" || eventType === "permission.replied") {{
         // Issue #1678: a child session's prompt is its subagent's, filed under
-        // the root with the child's id, like its tool calls.
+        // the root with the child's id, like its tool calls. PRD #1631: and,
+        // like the root's, the ask goes through `await-answer` so the deck can
+        // answer it, and the reply names the request it answers.
         const props = event?.properties ?? {{}};
         const askingId = props.sessionID ?? props.sessionId;
         if (isChildSession(askingId)) {{
-          sendEvent(
-            subagentPayload(undefined, askingId, directory, {{
-              event: eventType,
-              prompt: permissionPrompt(props),
-            }})
-          );
+          const payload = subagentPayload(undefined, askingId, directory, {{
+            event: eventType,
+            prompt: permissionPrompt(props),
+          }});
+          if (eventType === "permission.asked") {{
+            if (!awaitAnswer(ctx?.client, {{ ...payload, properties: props }})) {{
+              sendEvent(payload);
+            }}
+            return;
+          }}
+          payload.request_id = props.requestID ?? props.id;
+          noteResolved(payload.request_id);
+          stopHeldAnswer(payload.request_id);
+          sendEvent(payload);
           return;
         }}
       }}
       if (eventType === "permission.asked" || eventType === "question.asked") {{
         // PRD #1631: reported through `await-answer`, which also waits for
-        // the deck's answer.
+        // the deck's answer. A permission that cannot be held is reported
+        // plainly, with no `properties`, so the card still shows it.
         const payload = questionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);
-        awaitAnswer(ctx?.client, payload);
+        if (!awaitAnswer(ctx?.client, payload) && eventType === "permission.asked") {{
+          sendEvent(permissionPayload(event, directory));
+        }}
         return;
       }}
       if (
@@ -3268,6 +3284,19 @@ await send("session.idle", {{ sessionID: "s1" }});
     /// `SKIP:`) when Node is not available. `node_args` go before the driver.
     #[cfg(unix)]
     fn run_plugin_driver(body: &str, node_args: &[&str]) -> Option<Vec<serde_json::Value>> {
+        run_plugin_driver_with_awaits(body, node_args).map(|(payloads, _)| payloads)
+    }
+
+    /// [`run_plugin_driver`], also answering what the plugin handed
+    /// `await-answer` (PRD #1631): its recorder reads that first stdin line,
+    /// keeps it apart from the plain reports and exits without an answer.
+    /// The driver gets `awaited(n)`, which waits until `n` have been handed
+    /// over, so a later event cannot stop a child before it has read.
+    #[cfg(unix)]
+    fn run_plugin_driver_with_awaits(
+        body: &str,
+        node_args: &[&str],
+    ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         if std::process::Command::new("node")
             .arg("--version")
             .output()
@@ -3278,13 +3307,14 @@ await send("session.idle", {{ sessionID: "s1" }});
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("payloads.jsonl");
+        let awaits = dir.path().join("awaits.jsonl");
         let recorder = dir.path().join("recorder.sh");
         crate::test_isolation::write_script(
             &recorder,
             format!(
-                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
-                out.display(),
-                out.display()
+                "#!/bin/sh\nif [ \"$1\" = \"await-answer\" ]; then\n  IFS= read -r input\n  printf '%s\\n' \"$input\" >> '{awaits}'\n  exit 0\nfi\ncat >> '{out}'\necho >> '{out}'\n",
+                awaits = awaits.display(),
+                out = out.display(),
             ),
         )
         .unwrap();
@@ -3298,8 +3328,9 @@ await send("session.idle", {{ sessionID: "s1" }});
         std::fs::write(
             &driver,
             format!(
-                "import plugin from {};\n{body}",
-                serde_json::to_string(&plugin.display().to_string()).unwrap()
+                "import plugin from {plugin};\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+                awaits = serde_json::to_string(&awaits.display().to_string()).unwrap(),
             ),
         )
         .unwrap();
@@ -3313,14 +3344,15 @@ await send("session.idle", {{ sessionID: "s1" }});
             "the plugin driver failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        Some(
-            std::fs::read_to_string(&out)
+        let read = |path: &Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| serde_json::from_str(l).expect("every payload is JSON the deck decodes"))
-                .collect(),
-        )
+                .collect()
+        };
+        Some((read(&out), read(&awaits)))
     }
 
     /// The final replies the plugin attached to its idle reports, in order,
@@ -3579,21 +3611,28 @@ await status("grandchild", "idle");
 
     /// Issue #1678 audit AU-2: a known child's permission prompt and its answer
     /// are filed under the root with the child's id — decoded as that
-    /// subagent's `PermissionRequest` and its answered prompt. The root's own
-    /// prompt goes to `await-answer` instead (PRD #1631), with no subagent
-    /// attribution; `question/detect/007` covers that path.
+    /// subagent's `PermissionRequest` and its answered prompt — while the
+    /// root's own prompt carries no subagent attribution. PRD #1631: both asks
+    /// go to `await-answer`, so the deck can answer either; the child's names
+    /// its subagent and becomes that subagent's question, and the child's
+    /// reply names the request it answers. A child's ask with no request id,
+    /// which the deck could not answer, is still reported, plainly.
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent() {
-        let Some(payloads) = run_plugin_driver(
+        let Some((payloads, awaits)) = run_plugin_driver_with_awaits(
             r#"
 const hooks = await plugin({ directory: "/work" });
 const send = (type, properties) => hooks.event({ event: { type, properties } });
 await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
 await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
 await send("session.status", { sessionID: "child", status: { type: "busy" } });
-await send("permission.asked", { sessionID: "child", title: "CHILD_ASK" });
-await send("permission.replied", { sessionID: "child" });
+await send("permission.asked", { sessionID: "child", id: "per_child", permission: "bash", patterns: ["touch c"], title: "CHILD_ASK" });
+await awaited(1);
+await send("permission.replied", { sessionID: "child", requestID: "per_child", reply: "once" });
+await send("permission.asked", { sessionID: "root", id: "per_root", permission: "bash", patterns: ["touch r"], title: "ROOT_ASK" });
+await awaited(2);
+await send("permission.asked", { sessionID: "child", title: "UNHELD_ASK" });
 "#,
             &[],
         ) else {
@@ -3604,8 +3643,8 @@ await send("permission.replied", { sessionID: "child" });
             vec![
                 row("root", "session.created", ""),
                 row("root", "subagent.start", "child"),
-                row("root", "permission.asked", "child"),
                 row("root", "permission.replied", "child"),
+                row("root", "permission.asked", "child"),
                 row("root", "subagent.stop", "child"),
                 row("root", "session.deleted", ""),
             ],
@@ -3618,13 +3657,56 @@ await send("permission.replied", { sessionID: "child" });
                     .expect("every payload maps to an event")
             })
             .collect();
-        assert_eq!(payloads[2]["prompt"], "CHILD_ASK");
+        assert!(decoded[2].is_subagent_permission_reply());
+        assert_eq!(decoded[2].resolved_question_id(), Some("per_child"));
+        assert_eq!(payloads[3]["prompt"], "UNHELD_ASK");
+        assert!(payloads[3].get("properties").is_none(), "{:?}", payloads[3]);
         assert_eq!(
-            decoded[2].event_type,
+            decoded[3].event_type,
             crate::event::EventType::PermissionRequest
         );
-        assert!(decoded[2].is_from_subagent());
-        assert!(decoded[3].is_subagent_permission_reply());
+        assert!(decoded[3].is_from_subagent());
+        assert_eq!(decoded[3].question(), None);
+
+        // What each `await-answer` was handed, in whichever order the two
+        // children read it.
+        let asked = |id: &str| {
+            let payload = awaits
+                .iter()
+                .find(|p| p["properties"]["id"] == id)
+                .unwrap_or_else(|| panic!("{id} was not held: {awaits:#?}"));
+            let (event, question) = crate::hook::build_opencode_event_with_question(
+                serde_json::from_value(payload.clone()).unwrap(),
+            )
+            .expect("an event");
+            (payload.clone(), event, question.expect("a question"))
+        };
+        assert_eq!(awaits.len(), 2, "{awaits:#?}");
+        let (child, child_event, child_question) = asked("per_child");
+        assert_eq!(
+            (
+                &child["session_id"],
+                &child["subagent_id"],
+                &child["prompt"]
+            ),
+            (
+                &serde_json::Value::from("root"),
+                &serde_json::Value::from("child"),
+                &serde_json::Value::from("CHILD_ASK")
+            )
+        );
+        assert_eq!(
+            child_event.event_type,
+            crate::event::EventType::PermissionRequest
+        );
+        assert!(child_event.is_from_subagent());
+        assert_eq!(child_question.id, "per_child");
+        assert_eq!(child_question.subagent_id.as_deref(), Some("child"));
+        let (root, root_event, root_question) = asked("per_root");
+        assert_eq!(root["session_id"], "root");
+        assert!(root.get("subagent_id").is_none(), "{root}");
+        assert!(!root_event.is_from_subagent());
+        assert_eq!(root_question.subagent_id, None);
     }
 
     /// Issue #1678 audit AU-3: a child's user message recorded before its

@@ -262,6 +262,15 @@ export function voiceNothingRan(why: string): string {
   return `Nothing ran — ${why}. Say it again.`;
 }
 /**
+ * PRD #1631 — a spoken submit ("go ahead", "send it", "enter") said while the
+ * open agent waits on a question that the utterance did not answer. Enter in
+ * the agent's dialog would pick whichever option it has highlighted, so
+ * nothing is pressed.
+ */
+export function voiceQuestionWaitingNoEnter(label: string): string {
+  return `Nothing was pressed — ${label} is waiting on a question. Answer it by voice, or use the keyboard.`;
+}
+/**
  * PRD #1260 review — a pending one-shot send called off because the agent it
  * would have pressed Enter for was replaced under the same id.
  */
@@ -2455,6 +2464,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        this names this Enter alone. */
     const epoch = sendEpoch.current;
     const generation = modeGeneration.current;
+    /* PRD #1631 — a spoken send, a trailing one and the countdown each press
+       their Enter here, and none is pressed while `aim`'s pane is on screen
+       with its agent waiting on a question: see `submitAgentPrompt`. */
+    const shown = paneRef.current;
+    if (shows(shown, aim) && shown.question) {
+      setProblem(voiceQuestionWaitingNoEnter(shown.label));
+      return;
+    }
     try {
       const target = { deckId: aim.deckId, agentId: aim.agentId };
       const sent = sendTerminalInput(target, VOICE_DICTATION_SUBMIT);
@@ -3716,6 +3733,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const lost = paneLost(target);
     if (lost) {
       reportRefused(answerRefusal(lost));
+      return;
+    }
+    /* PRD #1631 — the agent waits on a question the utterance did not answer
+       (it reached here as a command, not through `answerQuestion`). Enter in
+       its dialog would pick the highlighted option, past the grounding, the
+       countdown and the "always allow" confirmation answering by voice goes
+       through, so nothing is pressed — whichever path resolved the submit. */
+    const shown = paneRef.current;
+    if (shows(shown, target) && shown.question) {
+      reportRefused(voiceQuestionWaitingNoEnter(shown.label));
       return;
     }
     /* PRD #1541 — what voice typed is on its way out, so there is nothing

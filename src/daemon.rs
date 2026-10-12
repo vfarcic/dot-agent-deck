@@ -15938,6 +15938,124 @@ mod question_hold_tests {
             "the old question is not answered"
         );
     }
+
+    /// Scenario: An OpenCode subagent's child session asks a permission, and
+    /// the plugin's `await-answer` child holds it on the deck as the plugin
+    /// sends it: filed under the main session with the child's id. The deck
+    /// shows it pending, attributed to that subagent, with the card on Needs
+    /// Input; the deck answers it and the child reports OpenCode took the
+    /// reply. OpenCode's own `permission.replied` from the child, carrying the
+    /// request id, then takes the card off Needs Input.
+    #[spec("question/hold/019")]
+    #[tokio::test]
+    async fn question_hold_019_an_opencode_subagents_permission_prompt_is_held_and_answered() {
+        let deck = Deck::start(HookLoopLimits {
+            ack_wait: Duration::from_millis(2000),
+            ..limits()
+        })
+        .await;
+        let a = deck.agent("pane-oc-subagent").await;
+        let session = format!("{}-session", a.pane);
+        let decode = |payload: serde_json::Value| {
+            let input: crate::hook::OpenCodeHookInput = serde_json::from_value(payload).unwrap();
+            let (mut event, question) =
+                crate::hook::build_opencode_event_with_question(input).expect("an event");
+            event.pane_id = Some(a.pane.clone());
+            event.agent_id = Some(a.id.clone());
+            (event, question)
+        };
+        let mut properties: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions/opencode-permission-asked.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        properties["sessionID"] = "child".into();
+        let request_id = properties["id"].as_str().unwrap().to_string();
+
+        // What the plugin hands `await-answer` for the child's prompt.
+        let (asked, question) = decode(serde_json::json!({
+            "session_id": session,
+            "subagent_id": "child",
+            "event": "permission.asked",
+            "properties": properties,
+            "prompt": "touch oc_a.txt",
+            "cwd": "/work",
+        }));
+        let question = question.expect("the child's prompt is a question");
+        assert!(asked.is_from_subagent(), "the ask is the subagent's");
+        assert_eq!(question.subagent_id.as_deref(), Some("child"));
+        let msg = crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
+            pane_id: a.pane.clone(),
+            token: Some(a.token.clone()),
+            event: asked,
+            hold: true,
+            ack: true,
+        }));
+        let mut producer = UnixStream::connect(&deck.sock).await.expect("connect");
+        producer
+            .write_all(format!("{}\n", serde_json::to_string(&msg).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        producer.flush().await.unwrap();
+        deck.until_held(&a, &request_id).await;
+
+        let pending = deck.pending(&a).await.expect("the prompt is pending");
+        assert_eq!(pending.id, request_id);
+        assert_eq!(
+            pending.subagent_id.as_deref(),
+            Some("child"),
+            "attributed to the subagent"
+        );
+        {
+            let state = deck.state.read().await;
+            let card = &state.sessions[&session];
+            assert_eq!(card.status, crate::state::SessionStatus::WaitingForInput);
+            assert_eq!(
+                card.subagent_wait.as_ref().map(|w| w.subagent_ids.clone()),
+                Some(vec!["child".to_string()]),
+                "the wait is the subagent's"
+            );
+        }
+
+        let acknowledge = async move {
+            let mut reader = tokio::io::BufReader::new(producer);
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("the answer arrives")
+                .unwrap();
+            let reply: QuestionReply = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(reply.outcome, ReplyOutcome::Answered);
+            assert!(reply.answers_for(&request_id).is_some());
+            let mut producer = reader.into_inner();
+            producer.write_all(b"{\"delivered\":true}\n").await.unwrap();
+            producer.flush().await.unwrap();
+            producer
+        };
+        let (answered, _producer) = tokio::join!(deck.answer(&a, &pending.id), acknowledge);
+        assert_eq!(answered, Ok(()), "the subagent's prompt is answered");
+
+        // OpenCode reports the child's prompt answered, as the plugin sends it.
+        let (replied, _) = decode(serde_json::json!({
+            "session_id": session,
+            "subagent_id": "child",
+            "event": "permission.replied",
+            "request_id": pending.id,
+            "prompt": "touch oc_a.txt",
+            "cwd": "/work",
+        }));
+        assert!(replied.is_subagent_permission_reply());
+        assert_eq!(replied.resolved_question_id(), Some(pending.id.as_str()));
+        ingest_event(&deck.state, &deck.event_tx, &deck.registry, replied).await;
+        wait_for(&deck.state, "the card to leave Needs Input", |s| {
+            s.sessions[&session].status != crate::state::SessionStatus::WaitingForInput
+        })
+        .await;
+        assert_eq!(deck.pending(&a).await, None);
+    }
 }
 
 #[cfg(test)]

@@ -8386,6 +8386,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** how the successor card came to sit beside the old one without retiring it.
 - **Platform coverage:** mac+linux.
 
+##### question/hold/019 — An OpenCode subagent's permission prompt is held, attributed to the subagent, and answered.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop; the frames are built by the OpenCode parser from the plugin's child-session payloads).
+- **Agent:** none (`/bin/sh` stand-in; a raw socket producer acknowledging as the OpenCode plugin's child does; captured OpenCode 1.18.34 `permission.asked` re-pointed at a child session).
+- **Asserts:** a child session's `permission.asked` carrying `subagent_id` is held as the pane's pending question with that `subagent_id`, the card is on Needs Input with the wait held by that subagent, `AnswerQuestion` answers it and the producer's acknowledgement makes it succeed; the child's `permission.replied` carrying `request_id` is a subagent permission reply that names the question, and it takes the card off Needs Input with nothing pending.
+- **Does not assert:** that the plugin routes the child's ask through `await-answer` (`question/detect/007` and `opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent`), or the reply posted to OpenCode.
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
