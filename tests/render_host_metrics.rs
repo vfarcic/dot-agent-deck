@@ -6,7 +6,7 @@ use dot_agent_deck::daemon_client::HostMetricsReport;
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
     render_help_overlay_with_bindings_to_buffer, render_host_metrics_key_sequence_to_buffers,
-    render_host_metrics_overlay_held_to_buffer, render_host_metrics_overlay_to_buffer,
+    render_host_metrics_overlay_to_buffer,
 };
 use ratatui::buffer::Buffer;
 use serde_json::json;
@@ -88,11 +88,11 @@ fn dashboard_host_metrics_001_default_key_opens_and_escape_closes() {
     );
     let closed = text(&frames[2]);
     assert!(!closed.contains("Host of this deck"), "{closed}");
-    assert!(!closed.contains("Sample age"), "{closed}");
+    assert!(!closed.contains("Working root"), "{closed}");
     assert_eq!(text(&frames[0]), closed, "Escape restores the dashboard");
 }
 
-/// Scenario: Render a fixed daemon sample into a TestBackend and snapshot the host title, three disk roles, load per core, core count, memory and sample age. An unreadable disk field and a second sample with unreadable load, cores, memory and disks must show explicit unknown markers rather than invented zero readings.
+/// Scenario: Render a fixed daemon sample into a TestBackend and snapshot the host title, three disk roles, load per core, core count and memory. An unreadable disk field and a second sample with unreadable load, cores, memory and disks must show explicit unknown markers rather than invented zero readings.
 #[spec("dashboard/host-metrics/002")]
 #[test]
 fn dashboard_host_metrics_002_overlay_content_and_unknown_fields() {
@@ -116,7 +116,6 @@ fn dashboard_host_metrics_002_overlay_content_and_unknown_fields() {
     assert_line_has(&rendered, "Load per core", &["0.75", "8", "cores"]);
     assert_line_has(&rendered, "Memory used", &["12", "GiB"]);
     assert_line_has(&rendered, "Memory available", &["20", "GiB"]);
-    assert_line_has(&rendered, "Sample age", &["1500", "ms"]);
     assert!(
         !regex::Regex::new(r"\b0(?:\.0+)? GiB\b")
             .unwrap()
@@ -173,7 +172,7 @@ fn dashboard_host_metrics_003_old_deck_is_explicitly_unavailable() {
         rendered.contains("not available from this deck"),
         "{rendered}"
     );
-    for invented in ["0 GiB", "0 cores", "0.00", "Sample age: 0"] {
+    for invented in ["0 GiB", "0 cores", "0.00"] {
         assert!(
             !rendered.contains(invented),
             "unavailable deck invents {invented:?}\n{rendered}"
@@ -218,43 +217,6 @@ fn remap_004_host_metrics_uses_configured_key() {
     assert!(
         row.contains("F2"),
         "help must show the remapped host-metrics key\n{help}"
-    );
-}
-
-/// Scenario: Render the same daemon answer, reported as 1500 ms old, as just
-/// received, after the TUI has held it for 2.5 s, and after an hour. The sample
-/// age row reads 1500, 4000 and 3601500 ms, so a held answer shows how old its
-/// figures really are, as the desktop does; an age past what the desktop can
-/// print reads the shared ceiling instead.
-#[spec("dashboard/host-metrics/009")]
-#[test]
-fn dashboard_host_metrics_009_a_held_answer_shows_its_growing_age() {
-    let age_row = |held_ms: u64, report: &HostMetricsReport| {
-        let rendered = text(&render_host_metrics_overlay_held_to_buffer(
-            report,
-            std::time::Duration::from_millis(held_ms),
-            100,
-            32,
-        ));
-        let line = rendered
-            .lines()
-            .find_map(|line| line.split_once("Sample age").map(|(_, value)| value))
-            .unwrap_or_else(|| panic!("missing the sample age row\n{rendered}"));
-        line.trim().trim_end_matches('│').trim().to_owned()
-    };
-    let report = sample();
-    assert_eq!(age_row(0, &report), "1500 ms");
-    assert_eq!(age_row(2_500, &report), "4000 ms");
-    assert_eq!(age_row(3_600_000, &report), "3601500 ms");
-
-    let mut ancient = report.clone();
-    if let HostMetricsReport::Available(metrics) = &mut ancient {
-        metrics.sample_age_ms = u64::MAX;
-    }
-    assert_eq!(
-        age_row(2_500, &ancient),
-        "9007199254740991 ms",
-        "the held time saturates, and the age stops at the ceiling both clients share"
     );
 }
 
@@ -384,7 +346,10 @@ fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
             2,
             "{width} wide\n{rendered}"
         );
-        assert!(rendered.contains("Sample age"), "{width} wide\n{rendered}");
+        assert!(
+            rendered.contains("Memory available"),
+            "{width} wide\n{rendered}"
+        );
         let area = buffer.area();
         let colour_of = |word: &str| {
             for y in area.y..area.bottom() {

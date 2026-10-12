@@ -1,5 +1,5 @@
 {
-  "description": "PRD #1258: the words and formats both clients use for a deck's host (CLAUDE.md rule 22). Read by the TUI's `dashboard_host_metrics_008_*` (tests/render_host_metrics_copy.rs), which renders the host overlay, and by the desktop's HostMetricsPanel.copy.test.tsx, which renders the deck card's host panel, so a word or format changed on one side fails the other. Each sample is the daemon's wire shape (snake_case); `rows` is every label/value row the client draws for it, in order. `notAvailable` is the text for a deck that does not report host metrics. Samples three to six hold the cases the two clients' number formatters once disagreed on (PR #1672 review): exact rounding ties (0.125 per core; 1.25, 2.75, 0.25, 1.75 and 3.25 GiB), which both round to the even neighbour as Rust's `format!` does; negative zero; a load of 1e21, which JS `toFixed` writes in exponent form; a u64::MAX disk; and a u64::MAX age, which both clients cap at 2^53 - 1, the largest integer the webview holds exactly. The last sample carries the daemon's health levels: a non-ok value is followed by its level's word, `(warning)` or `(critical)`, an `ok` value by none, and a level a client does not recognise (`dire`) reads as no level at all. Its `levels` names the level each row is coloured by, `null` for a row with none.",
+  "description": "PRD #1258: the words and formats both clients use for a deck's host (CLAUDE.md rule 22). Read by the TUI's `dashboard_host_metrics_008_*` (tests/render_host_metrics_copy.rs), which renders the host overlay, and by the desktop's HostMetricsPanel.copy.test.tsx, which renders the deck card's host panel, so a word or format changed on one side fails the other. Each sample is the daemon's wire shape (snake_case); `rows` is every label/value row the client draws for it, in order. `notAvailable` is the text for a deck that does not report host metrics. Samples three to six hold the cases the two clients' number formatters once disagreed on (PR #1672 review): exact rounding ties (0.125 per core; 1.25, 2.75, 0.25, 1.75 and 3.25 GiB), which both round to the even neighbour as Rust's `format!` does; negative zero; a load of 1e21, which JS `toFixed` writes in exponent form; and a u64::MAX disk. The samples carry the daemon's `sample_age_ms`, which neither client draws. The last sample carries the daemon's health levels: a non-ok value is followed by its level's word, `(warning)` or `(critical)`, an `ok` value by none, and a level a client does not recognise (`dire`) reads as no level at all. Its `levels` names the level each row is coloured by, `null` for a row with none.",
   "title": "Host of this deck",
   "subtitle": "The machine this deck's daemon runs on",
   "notAvailable": [
@@ -28,8 +28,7 @@
         ["scratch", "unknown free of unknown total"],
         ["Load per core", "0.75 across 8 cores"],
         ["Memory used", "unknown"],
-        ["Memory available", "20 GiB"],
-        ["Sample age", "1500 ms"]
+        ["Memory available", "20 GiB"]
       ]
     },
     {
@@ -42,8 +41,7 @@
       "rows": [
         ["Load per core", "unknown across unknown cores"],
         ["Memory used", "1.5 GiB"],
-        ["Memory available", "unknown"],
-        ["Sample age", "0 ms"]
+        ["Memory available", "unknown"]
       ]
     },
     {
@@ -64,8 +62,7 @@
         ["Temp root", "0.2 GiB free of 17179869184 GiB total"],
         ["Load per core", "0.12 across 8 cores"],
         ["Memory used", "1.8 GiB"],
-        ["Memory available", "3.2 GiB"],
-        ["Sample age", "9007199254740991 ms"]
+        ["Memory available", "3.2 GiB"]
       ]
     },
     {
@@ -80,8 +77,7 @@
       "rows": [
         ["Load per core", "0.62 across 4 cores"],
         ["Memory used", "0 GiB"],
-        ["Memory available", "unknown"],
-        ["Sample age", "7 ms"]
+        ["Memory available", "unknown"]
       ]
     },
     {
@@ -95,8 +91,7 @@
       "rows": [
         ["Load per core", "-0.00 across unknown cores"],
         ["Memory used", "unknown"],
-        ["Memory available", "1 GiB"],
-        ["Sample age", "0 ms"]
+        ["Memory available", "1 GiB"]
       ]
     },
     {
@@ -110,8 +105,7 @@
       "rows": [
         ["Load per core", "1000000000000000000000.00 across 1 cores"],
         ["Memory used", "unknown"],
-        ["Memory available", "unknown"],
-        ["Sample age", "0 ms"]
+        ["Memory available", "unknown"]
       ]
     },
     {
@@ -138,10 +132,9 @@
         ["scratch", "1 GiB free of 2 GiB total"],
         ["Load per core", "1.00 across 4 cores (warning)"],
         ["Memory used", "8 GiB"],
-        ["Memory available", "8 GiB"],
-        ["Sample age", "10 ms"]
+        ["Memory available", "8 GiB"]
       ],
-      "levels": ["critical", "warn", "ok", null, "warn", null, "ok", null]
+      "levels": ["critical", "warn", "ok", null, "warn", null, "ok"]
     }
   ]
 }

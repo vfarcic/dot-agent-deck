@@ -374,7 +374,7 @@ pub enum UiMode {
     /// teardown. The selection index lives in `UiState::close_confirm`.
     CloseConfirm,
     /// PRD #1258 M3: the "Host of this deck" overlay — the attached daemon's
-    /// host sample (disk per watched role, load per core, memory, sample age).
+    /// host sample (disk per watched role, load per core, memory).
     /// Read-only; Escape closes it.
     HostMetrics,
     /// Issue #1635: the upgrade dialog, opened by the `open_upgrade` key
@@ -17689,14 +17689,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
     }
     if ui.mode == UiMode::HostMetrics {
-        // The loop redraws every frame, so the shown age counts up while the
-        // answer is held and drops back when the next one lands.
-        let held = ui
-            .host_metrics_received_at
-            .map_or(std::time::Duration::ZERO, |at| {
-                std::time::Instant::now().saturating_duration_since(at)
-            });
-        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics, held);
+        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -20274,22 +20267,6 @@ fn host_metrics_role_label(role: &str) -> String {
     }
 }
 
-/// PRD #1258: the largest sample age either client shows, in ms — the largest
-/// integer a JS number holds exactly. Above it the desktop could not print the
-/// figure this overlay prints, so both stop here (CLAUDE.md rule 22); the
-/// desktop's `HOST_MAX_SHOWN_AGE_MS` is the same number.
-const HOST_METRICS_MAX_SHOWN_AGE_MS: u64 = (1 << 53) - 1;
-
-/// PRD #1258: the sample age the overlay shows — the age the daemon reported
-/// plus how long the TUI has held the answer since, so a held answer does not
-/// claim to be as fresh as when it arrived. The desktop bridge adds its held
-/// time the same way (`HostMetricsReportDto::from_report`).
-fn host_metrics_shown_age_ms(reported_ms: u64, held: std::time::Duration) -> u64 {
-    reported_ms
-        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX))
-        .min(HOST_METRICS_MAX_SHOWN_AGE_MS)
-}
-
 /// PRD #1258: the word both clients write beside a host reading at `level`,
 /// so colour is never the only signal. `ok` needs none. The desktop's
 /// `hostLevelWord` returns the same words (CLAUDE.md rule 22).
@@ -20309,19 +20286,14 @@ fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option
 const HOST_METRICS_MIN_BODY_WIDTH: usize = "critical".len();
 
 /// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
-/// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
-/// TUI has held the answer, added to its sample age.
+/// says `unknown`; nothing absent is ever drawn as zero.
 ///
 /// `width` is the body's width in columns. A judged row that does not fit it
 /// gives its level word a line of its own below the value, so a narrow
 /// terminal cuts the figures' tail rather than the word — the signal that does
 /// not depend on colour (PR #1672 review). Below
 /// [`HOST_METRICS_MIN_BODY_WIDTH`] it draws no reading at all.
-fn host_metrics_lines(
-    view: &HostMetricsView,
-    held: std::time::Duration,
-    width: u16,
-) -> Vec<Line<'static>> {
+fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> {
     use crate::daemon_client::HostMetricsReport;
     use unicode_width::UnicodeWidthStr;
     const UNKNOWN: &str = "unknown";
@@ -20456,13 +20428,6 @@ fn host_metrics_lines(
                 gib(metrics.memory_available_bytes),
                 metrics.memory_level,
             ));
-            lines.push(row(
-                "Sample age",
-                format!(
-                    "{} ms",
-                    host_metrics_shown_age_ms(metrics.sample_age_ms, held)
-                ),
-            ));
         }
     }
     lines
@@ -20470,15 +20435,11 @@ fn host_metrics_lines(
 
 /// PRD #1258 M3: the "Host of this deck" overlay. Returns its `[Close]` button
 /// rect for the mouse hit-test, as [`render_help_overlay`] does.
-fn render_host_metrics_overlay(
-    frame: &mut Frame,
-    view: &HostMetricsView,
-    held: std::time::Duration,
-) -> Vec<(Action, Rect)> {
+fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec<(Action, Rect)> {
     let area = frame.area();
     // Wide enough for a disk row with its level word (PRD #1258).
     let popup_width = 72u16.min(area.width.saturating_sub(2));
-    let lines = host_metrics_lines(view, held, popup_width.saturating_sub(2));
+    let lines = host_metrics_lines(view, popup_width.saturating_sub(2));
     // Body, then a blank row, the button row and the hint: plus the border.
     // Counted in `usize` and clamped before narrowing, so no line count can
     // overflow the `u16` (audit A2).
@@ -24935,20 +24896,9 @@ pub fn observe_command_banner_key_burst(
 }
 
 /// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`
-/// into a `width × height` buffer, as just received.
+/// into a `width × height` buffer.
 pub fn render_host_metrics_overlay_to_buffer(
     report: &crate::daemon_client::HostMetricsReport,
-    width: u16,
-    height: u16,
-) -> ratatui::buffer::Buffer {
-    render_host_metrics_overlay_held_to_buffer(report, std::time::Duration::ZERO, width, height)
-}
-
-/// PRD #1258 L1 seam: draw the live host overlay renderer for `report` after
-/// the TUI has held it for `held`.
-pub fn render_host_metrics_overlay_held_to_buffer(
-    report: &crate::daemon_client::HostMetricsReport,
-    held: std::time::Duration,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -24959,7 +24909,7 @@ pub fn render_host_metrics_overlay_held_to_buffer(
         Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
-            render_host_metrics_overlay(frame, &view, held);
+            render_host_metrics_overlay(frame, &view);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()

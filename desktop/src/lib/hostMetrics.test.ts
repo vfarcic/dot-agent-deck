@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fixedLikeRust, formatDisk, formatGib, formatLoad, formatSampleAge, HOST_MAX_SHOWN_AGE_MS, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "./hostMetrics";
+import { fixedLikeRust, formatDisk, formatGib, formatLoad, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "./hostMetrics";
 import type { HostMetricsReport } from "../types";
 
 const GiB = 1024 ** 3;
@@ -13,11 +13,10 @@ describe("host metrics wording (PRD #1258 M4)", () => {
     expect(formatDisk(undefined, 16 * GiB)).toBe("unknown free of 16 GiB total");
   });
 
-  /** Scenario: load and core count are each independently `unknown`, and the age is the daemon's own milliseconds. */
-  it("formats load, cores and age the way the TUI overlay does", () => {
+  /** Scenario: load and core count are each independently `unknown`. */
+  it("formats load and cores the way the TUI overlay does", () => {
     expect(formatLoad(0.75, 8)).toBe("0.75 across 8 cores");
     expect(formatLoad(undefined, undefined)).toBe("unknown across unknown cores");
-    expect(formatSampleAge(1500)).toBe("1500 ms");
   });
 
   /** Scenario: numbers are written as the TUI's Rust `format!` writes them — exact ties to the even neighbour, negative zero signed, every digit from 1e21 up — while values that are not exact ties round as `toFixed` does. */
@@ -41,7 +40,6 @@ describe("host metrics wording (PRD #1258 M4)", () => {
     expect(fixedLikeRust(2 ** 64 / GiB, 1)).toBe("17179869184.0");
     expect(formatGib(1.25 * GiB)).toBe("1.2 GiB");
     expect(formatLoad(1 / 8, 8)).toBe("0.12 across 8 cores");
-    expect(formatSampleAge(2 ** 64)).toBe(`${HOST_MAX_SHOWN_AGE_MS} ms`);
   });
 
   /** Scenario: the three fixed roles read as their labels, and a role a newer daemon adds keeps its own name. */

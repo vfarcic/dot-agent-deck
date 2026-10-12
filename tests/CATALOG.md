@@ -563,7 +563,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### dashboard/host-metrics/002 — A fixed host sample renders all roles and unknown fields explicitly.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** an `insta` overlay snapshot names the deck's host and shows per-role free/total disk, load per core and core count, memory used/available, and sample age; independently absent fields show unknown, including both the load and core count.
+- **Asserts:** an `insta` overlay snapshot names the deck's host and shows per-role free/total disk, load per core and core count, and memory used/available; independently absent fields show unknown, including both the load and core count.
 - **Does not assert:** the sampler's operating-system reads or cache expiry (covered by `protocol/host-metrics/*`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -577,7 +577,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### dashboard/host-metrics/004 — The real TUI displays its daemon's host measurements and closes on Escape.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric sample-age row after `m`; Escape removes the overlay and restores the empty dashboard.
+- **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric load-per-core row after `m`; Escape removes the overlay and restores the empty dashboard.
 - **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
 - **Timing:** the first wait (the empty dashboard painting after the lazy daemon spawn) has a load-scaled ceiling: 30 s on an idle box, up to 120 s. The deck's daemon-start bound is set 5 s under that ceiling, so a daemon that never binds still prints its error before the wait ends. A starved run once spent 13.6 s on the daemon's pre-bind alone and overran the fixed 30 s (issue #1665).
 - **Platform coverage:** mac+linux.
@@ -608,13 +608,6 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none.
 - **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order, including the `(warning)` and `(critical)` words of the sample the daemon judged and none for a level it does not know; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
 - **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
-- **Platform coverage:** mac+linux+windows.
-
-##### dashboard/host-metrics/009 — A held answer's sample age grows by the time the TUI has held it.
-- **Layer:** L1 (ratatui `TestBackend`, the overlay renderer given an explicit held duration).
-- **Agent:** none.
-- **Asserts:** an answer the daemon reported as 1500 ms old reads `1500 ms` as received, `4000 ms` after 2.5 s held and `3601500 ms` after an hour, the same reply age plus held time the desktop bridge shows (CLAUDE.md rule 22, PR #1672 review); a `u64::MAX` age plus held time saturates and reads the shared `9007199254740991 ms` ceiling.
-- **Does not assert:** the event loop's clock (the draw passes `Instant::now()` less the time the answer landed); the desktop's age, which its bridge computes (`HostMetricsReportDto::from_report`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/host-metrics/010 — Each judged value is coloured by its level, with a word beside every non-ok one.

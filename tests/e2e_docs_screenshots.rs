@@ -887,7 +887,7 @@ const HOST_SAMPLE: &str = r#"{
 
 /// Scenario: Press `m` on the empty dashboard, with the daemon reporting a
 /// fixed host sample, so the Host of this deck overlay shows per-role disk,
-/// load per core, memory and a sample age of 0 ms, with the temp root's 9%
+/// load per core and memory, with the temp root's 9%
 /// free marked as a warning by the daemon's default thresholds.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
@@ -897,16 +897,14 @@ fn docs_screenshot_host_metrics() {
         launch_with(|builder| builder.with_env("DOT_AGENT_DECK_E2E_HOST_SAMPLE", HOST_SAMPLE));
     deck.wait_for_string("No active agents");
     deck.send_keys(b"m");
-    // The age is the cache's, measured when the reply is written: wait for a
-    // frame that says 0 ms, which a fresh sample does, so the image is stable.
+    // The overlay's first and last rows, so a frame caught while it is still
+    // being drawn is not the one written.
     capture(&deck, "host-metrics", |grid| {
         grid.contains("Host of this deck")
             && grid.contains("0.42 across 16 cores")
             && grid.contains("(warning)")
-            && grid.lines().any(|line| {
-                // The grid retains the overlay's right border after the value.
-                line.contains("Sample age") && line.trim_end_matches([' ', '│']).ends_with(" 0 ms")
-            })
+            && grid.contains("Memory available")
+            && grid.contains("Press Esc to close")
     });
 }
 

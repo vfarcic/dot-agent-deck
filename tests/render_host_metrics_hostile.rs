@@ -102,7 +102,7 @@ fn dashboard_host_metrics_006_an_oversized_role_count_renders_bounded() {
         .count();
     assert_eq!(rows, MAX_DISK_ROLES, "{rendered}");
     assert!(
-        rendered.contains("Sample age"),
+        rendered.contains("Memory available"),
         "the rows after the roles are still drawn\n{rendered}"
     );
 }

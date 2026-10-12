@@ -28,14 +28,6 @@ export function hostRoleLabel(role: string): string {
 }
 
 /**
- * The largest age either client shows, in ms: the largest integer a JS number
- * holds exactly. The daemon's age is a u64; above this the webview could not
- * print the figure the TUI prints, so both clients stop here. The TUI's
- * `HOST_METRICS_MAX_SHOWN_AGE_MS` is the same number.
- */
-export const HOST_MAX_SHOWN_AGE_MS = Number.MAX_SAFE_INTEGER;
-
-/**
  * `value` with `decimals` places, written exactly as the TUI's Rust
  * `format!("{:.N}")` writes it — which `toFixed` does not in three cases:
  *
@@ -86,11 +78,6 @@ export function formatLoad(loadPerCpu: number | undefined, cpuCount: number | un
   const load = loadPerCpu === undefined || !Number.isFinite(loadPerCpu) ? HOST_UNKNOWN : fixedLikeRust(loadPerCpu, 2);
   const cores = cpuCount === undefined ? HOST_UNKNOWN : String(cpuCount);
   return `${load} across ${cores} cores`;
-}
-
-/** `1500 ms` — the daemon's own figure, never rounded into something it did not say, up to {@link HOST_MAX_SHOWN_AGE_MS}. */
-export function formatSampleAge(ms: number): string {
-  return `${Math.min(HOST_MAX_SHOWN_AGE_MS, Math.max(0, Math.round(ms)))} ms`;
 }
 
 const LEVELS: readonly HostLevel[] = ["ok", "warn", "critical"];

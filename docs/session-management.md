@@ -127,7 +127,7 @@ Before you start more agents on a deck, you can check how much room its machine 
 
 **TUI:**
 
-![The Host of this deck overlay over an empty TUI dashboard: Working root and Worktree parent each 128 GiB free of 512 GiB total in green, Temp root 6 GiB free of 64 GiB total in yellow followed by (warning), load per core 0.42 across 16 cores and 43.5 GiB memory available in green, 18.5 GiB memory used, sample age 0 ms](/img/host-metrics-tui.png)
+![The Host of this deck overlay over an empty TUI dashboard: Working root and Worktree parent each 128 GiB free of 512 GiB total in green, Temp root 6 GiB free of 64 GiB total in yellow followed by (warning), load per core 0.42 across 16 cores and 43.5 GiB memory available in green, 18.5 GiB memory used](/img/host-metrics-tui.png)
 
 **Desktop:**
 
@@ -142,7 +142,6 @@ What it shows:
 | **Temp root** | Free and total space on the disk holding the deck's test scratch directory |
 | **Load per core** | The machine's one-minute load average divided by its CPU cores, and the core count. Around `1.00` or more means the machine is fully busy. |
 | **Memory used** / **Memory available** | The machine's memory in use and still available |
-| **Sample age** | How old the figures are, in milliseconds |
 
 A figure the machine cannot report reads `unknown`, never `0`.
 

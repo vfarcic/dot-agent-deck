@@ -10,6 +10,7 @@ expression: rendered
 
 
 
+
               ┌ Host ────────────────────────────────────────────────────────────────┐
               │  Host of this deck                                                   │
               │  The machine this deck's daemon runs on                              │
@@ -20,7 +21,6 @@ expression: rendered
               │  Load per core      0.75 across 8 cores                              │
               │  Memory used        12 GiB                                           │
               │  Memory available   20 GiB                                           │
-              │  Sample age         1500 ms                                          │
               │                                                                      │
               │  [Close]                                                             │
               │  Press Esc to close                                                  │

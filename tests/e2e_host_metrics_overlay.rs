@@ -36,7 +36,7 @@ fn launch_ready_ceiling() -> Duration {
     load_scaled(LAUNCH_READY_BASE).min(LAUNCH_READY_MAX)
 }
 
-/// Scenario: Launch the real TUI with its lazily spawned daemon and no agents, then press `m` on the dashboard. The overlay must show real disk numbers, a host title and sample age; Escape must restore the empty dashboard.
+/// Scenario: Launch the real TUI with its lazily spawned daemon and no agents, then press `m` on the dashboard. The overlay must show real disk numbers, the load per core and a host title; Escape must restore the empty dashboard.
 #[spec("dashboard/host-metrics/004")]
 #[test]
 fn dashboard_host_metrics_004_real_daemon_overlay_opens_and_closes() {
@@ -69,12 +69,12 @@ fn dashboard_host_metrics_004_real_daemon_overlay_opens_and_closes() {
             && numeric_row("Working root", "GiB")
             && numeric_row("Worktree parent", "GiB")
             && numeric_row("Temp root", "GiB")
-            && numeric_row("Sample age", "ms")
+            && numeric_row("Load per core", "cores")
     });
     deck.send_keys(b"\x1b");
     deck.wait_until_grid("Escape restores dashboard", |grid| {
         grid.contains("No active agents")
             && !grid.contains("Host of this deck")
-            && !grid.contains("Sample age")
+            && !grid.contains("Working root")
     });
 }

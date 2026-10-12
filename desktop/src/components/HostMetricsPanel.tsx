@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Gauge } from "lucide-react";
 import type { HostMetricsReport } from "../types";
-import { formatDisk, formatGib, formatLoad, formatSampleAge, HOST_BUTTON_TEXT, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
+import { formatDisk, formatGib, formatLoad, HOST_BUTTON_TEXT, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
 import { displayText, DISPLAY_LIMITS, domIdentity } from "../lib/displayText";
 
 /**
@@ -21,8 +21,8 @@ function JudgedValue({ value, level }: { value: string; level: unknown }) {
 }
 
 /**
- * PRD #1258 — one deck's host: disk per watched role, load per core, memory and
- * the sample's age, as that deck's daemon reports them, each coloured by the
+ * PRD #1258 — one deck's host: disk per watched role, load per core and memory,
+ * as that deck's daemon reports them, each coloured by the
  * level the daemon gave it. The same rows and words as the TUI's host overlay.
  * Shown in the popover that the deck header's host button opens.
  */
@@ -56,10 +56,6 @@ export function HostMetricsPanel({ report }: { report: HostMetricsReport }) {
           <div className="host-metrics-row">
             <dt>Memory available</dt>
             <JudgedValue value={formatGib(report.metrics.memoryAvailableBytes)} level={report.metrics.memoryLevel} />
-          </div>
-          <div className="host-metrics-row">
-            <dt>Sample age</dt>
-            <dd>{formatSampleAge(report.metrics.sampleAgeMs)}</dd>
           </div>
         </dl>
       )}

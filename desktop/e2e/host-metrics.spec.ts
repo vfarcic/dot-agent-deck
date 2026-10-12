@@ -122,12 +122,12 @@ async function openHost(card: Locator): Promise<Locator> {
   return metrics;
 }
 
-/** Scenario: Two connected decks report distinct utilisation through bootstrap and snapshot events. Each deck has its own host button beside its name; opening one shows that host's disk roles, load, cores, memory and sample age, and a new remote sample changes only its own deck. */
-test("each connected deck shows its own host utilisation and sample age", async ({ page }) => {
+/** Scenario: Two connected decks report distinct utilisation through bootstrap and snapshot events. Each deck has its own host button beside its name; opening one shows that host's disk roles, load, cores and memory but no sample age, and a new remote sample changes only its own deck. */
+test("each connected deck shows its own host utilisation", async ({ page }) => {
   const { localCard, remoteCard } = await overview(page, available(), available(true));
-  for (const [card, free, worktreeFree, tempFree, load, cores, used, memory, age] of [
-    [localCard, 128, 64, 8, "0.75", 8, 12, 20, 1500],
-    [remoteCard, 96, 48, 6, "1.25", 16, 24, 40, 2500],
+  for (const [card, free, worktreeFree, tempFree, load, cores, used, memory] of [
+    [localCard, 128, 64, 8, "0.75", 8, 12, 20],
+    [remoteCard, 96, 48, 6, "1.25", 16, 24, 40],
   ] as const) {
     const metrics = await openHost(card);
     await expect(metrics).toContainText("Host of this deck");
@@ -139,7 +139,8 @@ test("each connected deck shows its own host utilisation and sample age", async 
     await expect(metrics).toContainText(new RegExp(`Load per core[^\\n]*${load.replace(".", "\\.")}[^\\n]*${cores} cores`));
     await expect(metrics).toContainText(new RegExp(`Memory used[^\\n]*${used}(?:\\.0+)? GiB`));
     await expect(metrics).toContainText(new RegExp(`Memory available[^\\n]*${memory}(?:\\.0+)? GiB`));
-    await expect(metrics).toContainText(new RegExp(`Sample age[^\\n]*${age} ms`));
+    // The daemon's sample age is on the wire but not shown (PR #1672).
+    await expect(metrics).not.toContainText("Sample age");
   }
   await expect(localCard.getByTestId("daemon-identity")).toContainText("Local daemon");
   await expect(remoteCard.getByTestId("daemon-identity")).toContainText("build@remote-host");
@@ -150,11 +151,9 @@ test("each connected deck shows its own host utilisation and sample age", async 
   await page.evaluate((payload) => (window as unknown as MockWindow).__dadHostMetricsSnapshot(payload), snapshot(REMOTE, updated));
   // The remote popover is still the open one, and it shows the new sample.
   await expect(remoteCard.getByTestId("host-metrics")).toContainText(/Working root[^\n]*80(?:\.0+)? GiB/);
-  await expect(remoteCard.getByTestId("host-metrics")).toContainText(/Sample age[^\n]*3500 ms/);
   const local = await openHost(localCard);
   await expect(remoteCard.getByTestId("host-metrics")).toHaveCount(0);
   await expect(local).toContainText(/Working root[^\n]*128(?:\.0+)? GiB/);
-  await expect(local).toContainText(/Sample age[^\n]*1500 ms/);
 });
 
 /** Scenario: A connected old daemon lacks host-metrics while another deck reports valid numbers. Its host button names that state, and opening it says “not available from this deck” without displaying zero readings, while the capable deck keeps its own numbers. */
@@ -173,7 +172,7 @@ test("an old daemon says metrics are not available from this deck without zeros"
   await expect(local).not.toContainText("not available from this deck");
 });
 
-/** Scenario: A capable daemon returns unreadable individual fields with a known sample age. Every missing disk, load, core-count and memory value is visibly unknown instead of zero while the other deck remains measurable. */
+/** Scenario: A capable daemon returns unreadable individual fields. Every missing disk, load, core-count and memory value is visibly unknown instead of zero while the other deck remains measurable. */
 test("absent host fields render unknown independently", async ({ page }) => {
   const unknown: HostMetricsReport = { status: "available", metrics: {
     disks: [{ role: "working_root" }, { role: "worktree_parent" }, { role: "temp_root" }],
@@ -185,7 +184,6 @@ test("absent host fields render unknown independently", async ({ page }) => {
     await expect(metrics).toContainText(new RegExp(`${label}[^\\n]*unknown`));
   }
   await expect(metrics).toContainText(/Load per core[^\n]*unknown[^\n]*unknown/);
-  await expect(metrics).toContainText(/Sample age[^\n]*1500 ms/);
   await expect(metrics).not.toContainText(/\b0(?:\.0+)?\s*(?:GiB|cores)\b/);
 });
 
