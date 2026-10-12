@@ -25,7 +25,7 @@ import {
   type QuestionSelectionDto,
   type VoiceQuestionTarget,
 } from "../lib/voiceQuestion";
-import { VOICE_DICTATION_SEND_MS, VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS, VoiceControlPanel, type VoicePane } from "./VoiceControlPanel";
+import { VOICE_DICTATION_SEND_MS, VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS, VoiceControlPanel, newAnswerLease, type VoicePane } from "./VoiceControlPanel";
 
 function microphone() {
   const queue: string[] = [];
@@ -552,7 +552,8 @@ describe("answering an agent's question by voice", () => {
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
     const lease = sendVoiceAnswer.mock.calls[0][3];
-    expect(lease).toMatch(/^[A-Za-z0-9-]{1,64}$/);
+    // The form `voice/lease.rs` accepts: a decimal number that fits a u64.
+    expect(lease).toMatch(/^\d{1,20}$/);
     expect(screen.getByTestId("voice-question")).toHaveTextContent("sending…");
     expect(screen.getByTestId("voice-question-cancel")).toBeInTheDocument();
 
@@ -565,6 +566,28 @@ describe("answering an agent's question by voice", () => {
     expect(screen.queryByTestId("voice-question")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Too late to cancel — Allowed: touch x");
     view.unmount();
+  });
+
+  /**
+   * Scenario: the panel names one lease after another, including while the
+   * clock stands still or steps back. Each is a number above the last, as
+   * Rust requires of a lease it may have to refuse by number once it has
+   * forgotten a cancel, and stays a safe integer.
+   */
+  it("question/desktop/019: every lease is numbered above the one before", () => {
+    const now = vi.spyOn(Date, "now");
+    try {
+      now.mockReturnValue(1_760_000_000_000);
+      const first = Number(newAnswerLease());
+      const still = Number(newAnswerLease());
+      now.mockReturnValue(1_700_000_000_000);
+      const back = Number(newAnswerLease());
+      expect(still).toBeGreaterThan(first);
+      expect(back).toBeGreaterThan(still);
+      expect(Number.isSafeInteger(back)).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   /**

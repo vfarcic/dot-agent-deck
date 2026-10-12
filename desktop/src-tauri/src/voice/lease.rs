@@ -14,29 +14,46 @@
 //! A cancel can reach Rust before the send it cancels does (two IPC calls,
 //! each spawned on its own), so a cancel for a lease no send has begun is kept
 //! as a tombstone, and the send that names it later begins already dead.
+//!
+//! Those tombstones are bounded, and forgetting one must not let its send
+//! through (PR #1698 review). So a lease is named by a number the panel only
+//! ever raises — the clock's microseconds when it sends, or one more than its
+//! last lease when that is higher — and when a tombstone has to go, the number
+//! it forgot becomes a floor that no lease at or below it begins under alive.
+//! The panel's next send is numbered above every lease it already named, so
+//! the floor refuses a send whose cancel may have been forgotten, and none it
+//! has yet to make. Nothing is cleared when the page reloads, so a late send
+//! from the page before still finds its cancel.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::daemon_client::AnswerReport;
 
-/// Longest lease name accepted.
-pub const MAX_LEASE_CHARS: usize = 64;
+/// Longest lease name accepted: the digits of a `u64`.
+pub const MAX_LEASE_CHARS: usize = 20;
 
 /// Cancels kept for sends that have not begun. One panel has at most one
 /// answer in flight, so this only bounds a webview that cancels names it
-/// never sends.
+/// never sends; one past it raises the floor instead.
 const MAX_TOMBSTONES: usize = 32;
 
-/// Whether `lease` may name a lease: 1 to [`MAX_LEASE_CHARS`] of
-/// `[A-Za-z0-9-]`.
+/// Whether `lease` may name a lease: a decimal number of 1 to
+/// [`MAX_LEASE_CHARS`] digits that fits a `u64`.
 pub fn is_valid_lease(lease: &str) -> bool {
-    !lease.is_empty()
-        && lease.len() <= MAX_LEASE_CHARS
-        && lease
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    parse(lease).is_some()
+}
+
+/// The number `lease` names.
+fn parse(lease: &str) -> Option<u64> {
+    if lease.is_empty()
+        || lease.len() > MAX_LEASE_CHARS
+        || !lease.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    lease.parse().ok()
 }
 
 /// Every live lease, and the cancels that arrived before their send.
@@ -47,33 +64,37 @@ pub struct AnswerLeases {
 
 #[derive(Default)]
 struct Book {
-    live: HashMap<String, Arc<AtomicBool>>,
-    tombstones: VecDeque<String>,
+    live: std::collections::HashMap<u64, Arc<AtomicBool>>,
+    /// Leases cancelled before their send began, each above `floor`.
+    tombstones: BTreeSet<u64>,
+    /// No lease at or below this begins alive: a cancel for one of them may
+    /// have been forgotten.
+    floor: u64,
 }
 
 /// One send's lease. Dropping it forgets the lease.
 pub struct AnswerLease {
-    name: String,
+    /// `None` for a name [`is_valid_lease`] refuses, which begins dead.
+    number: Option<u64>,
     alive: Arc<AtomicBool>,
     book: Arc<Mutex<Book>>,
 }
 
 impl AnswerLeases {
     /// Begin the send named `lease`. Dead from the start when the panel
-    /// already cancelled it.
+    /// already cancelled it, when its cancel may have been forgotten (it is at
+    /// or below the floor), or when it is not a name [`is_valid_lease`]
+    /// accepts.
     pub fn begin(&self, lease: &str) -> AnswerLease {
         let mut book = self.book.lock().unwrap();
-        let cancelled = match book.tombstones.iter().position(|name| name == lease) {
-            Some(at) => {
-                book.tombstones.remove(at);
-                true
-            }
-            None => false,
-        };
-        let alive = Arc::new(AtomicBool::new(!cancelled));
-        book.live.insert(lease.to_string(), Arc::clone(&alive));
+        let number = parse(lease);
+        let alive = number.is_some_and(|n| !book.tombstones.remove(&n) && n > book.floor);
+        let alive = Arc::new(AtomicBool::new(alive));
+        if let Some(n) = number {
+            book.live.insert(n, Arc::clone(&alive));
+        }
         AnswerLease {
-            name: lease.to_string(),
+            number,
             alive,
             book: Arc::clone(&self.book),
         }
@@ -81,15 +102,23 @@ impl AnswerLeases {
 
     /// The panel no longer wants the answer sent under `lease`.
     pub fn cancel(&self, lease: &str) {
+        let Some(number) = parse(lease) else {
+            return;
+        };
         let mut book = self.book.lock().unwrap();
-        match book.live.get(lease) {
-            Some(alive) => alive.store(false, Ordering::SeqCst),
-            None => {
-                if book.tombstones.len() >= MAX_TOMBSTONES {
-                    book.tombstones.pop_front();
-                }
-                book.tombstones.push_back(lease.to_string());
-            }
+        if let Some(alive) = book.live.get(&number) {
+            alive.store(false, Ordering::SeqCst);
+            return;
+        }
+        if number <= book.floor {
+            return;
+        }
+        book.tombstones.insert(number);
+        if book.tombstones.len() > MAX_TOMBSTONES
+            && let Some(oldest) = book.tombstones.pop_first()
+        {
+            // Every tombstone is above the floor, so this only raises it.
+            book.floor = oldest;
         }
     }
 }
@@ -109,13 +138,16 @@ impl AnswerLease {
 
 impl Drop for AnswerLease {
     fn drop(&mut self) {
+        let Some(number) = self.number else {
+            return;
+        };
         let mut book = self.book.lock().unwrap();
         if book
             .live
-            .get(&self.name)
+            .get(&number)
             .is_some_and(|alive| Arc::ptr_eq(alive, &self.alive))
         {
-            book.live.remove(&self.name);
+            book.live.remove(&number);
         }
     }
 }
@@ -194,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn question_desktop_011_a_cancelled_lease_writes_no_frame() {
         let leases = AnswerLeases::default();
-        let lease = leases.begin("lease-1");
+        let lease = leases.begin("1");
         let (stall_tx, stall_rx) = tokio::sync::oneshot::channel::<()>();
         let written = Arc::new(AtomicBool::new(false));
         let sending = {
@@ -212,7 +244,7 @@ mod tests {
         };
         let canceller = async {
             tokio::task::yield_now().await;
-            leases.cancel("lease-1");
+            leases.cancel("1");
             let _ = stall_tx.send(());
         };
         let (outcome, ()) = tokio::join!(sending, canceller);
@@ -220,8 +252,8 @@ mod tests {
         assert!(!written.load(Ordering::SeqCst), "no frame was written");
 
         // A cancel that arrives before its send.
-        leases.cancel("lease-2");
-        let early = leases.begin("lease-2");
+        leases.cancel("2");
+        let early = leases.begin("2");
         assert!(!early.is_live());
         let outcome = send_leased(&early, |_| async {
             panic!("a dead lease never sends");
@@ -232,12 +264,12 @@ mod tests {
         assert_eq!(outcome, Ok(Leased::Cancelled));
 
         // A cancel after the frame went: too late, and said so.
-        let late = leases.begin("lease-3");
+        let late = leases.begin("3");
         let outcome = send_leased(&late, |still_wanted| {
             let leases = &leases;
             async move {
                 assert!(still_wanted());
-                leases.cancel("lease-3");
+                leases.cancel("3");
                 Ok(AnswerReport::Answered)
             }
         })
@@ -245,14 +277,14 @@ mod tests {
         assert_eq!(outcome, Ok(Leased::TooLate(AnswerReport::Answered)));
 
         // A lease that held throughout.
-        let held = leases.begin("lease-4");
+        let held = leases.begin("4");
         let outcome = send_leased(&held, |_| async { Ok(AnswerReport::Answered) }).await;
         assert_eq!(outcome, Ok(Leased::Sent(AnswerReport::Answered)));
 
         // A send that fails after the gate let the request through may have
         // been acted on: unconfirmed, not an error saying nothing went. One
         // that fails before the gate is the plain error.
-        let timed_out = leases.begin("lease-5");
+        let timed_out = leases.begin("5");
         let outcome = send_leased(&timed_out, |still_wanted| async move {
             assert!(still_wanted());
             Err("the deck did not answer in time".to_string())
@@ -264,16 +296,55 @@ mod tests {
                 "the deck did not answer in time".to_string()
             ))
         );
-        let unreached = leases.begin("lease-6");
+        let unreached = leases.begin("6");
         let outcome = send_leased(&unreached, |_| async {
             Err("the deck did not answer in time".to_string())
         })
         .await;
         assert_eq!(outcome, Err("the deck did not answer in time".to_string()));
 
-        assert!(is_valid_lease("a1-b2"));
+        assert!(is_valid_lease("1760000000000000"));
+        assert!(is_valid_lease(&u64::MAX.to_string()));
         assert!(!is_valid_lease(""));
-        assert!(!is_valid_lease("a b"));
-        assert!(!is_valid_lease(&"a".repeat(MAX_LEASE_CHARS + 1)));
+        assert!(!is_valid_lease("lease-1"));
+        assert!(!is_valid_lease("-1"));
+        assert!(!is_valid_lease("1 2"));
+        assert!(!is_valid_lease("18446744073709551616"), "past a u64");
+        assert!(!is_valid_lease(&"1".repeat(MAX_LEASE_CHARS + 1)));
+    }
+
+    /// Scenario (question/desktop/019, PR #1698 review): the panel cancels an
+    /// answer before its send reaches Rust, and then — before that send
+    /// begins — more cancels arrive than Rust keeps. The forgotten cancel
+    /// still holds: its send begins dead and nothing is written. A cancel
+    /// still kept holds too, the panel's next answer is sent as usual, and a
+    /// name that is not a lease begins dead.
+    #[tokio::test]
+    async fn question_desktop_019_a_forgotten_cancel_still_stops_its_send() {
+        let leases = AnswerLeases::default();
+        let last = MAX_TOMBSTONES as u64 + 2;
+        for lease in 1..=last {
+            leases.cancel(&lease.to_string());
+        }
+        let forgotten = leases.begin("1");
+        assert!(!forgotten.is_live(), "its cancel was forgotten, not undone");
+        let outcome = send_leased(&forgotten, |_| async {
+            panic!("a cancelled answer is never sent");
+            #[allow(unreachable_code)]
+            Ok(AnswerReport::Answered)
+        })
+        .await;
+        assert_eq!(outcome, Ok(Leased::Cancelled));
+        assert!(
+            !leases.begin(&last.to_string()).is_live(),
+            "a cancel still kept still holds"
+        );
+
+        let next = leases.begin(&(last + 1).to_string());
+        assert!(next.is_live(), "the panel's next answer is sent");
+        let outcome = send_leased(&next, |_| async { Ok(AnswerReport::Answered) }).await;
+        assert_eq!(outcome, Ok(Leased::Sent(AnswerReport::Answered)));
+
+        assert!(!leases.begin("not-a-lease").is_live());
     }
 }

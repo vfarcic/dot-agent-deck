@@ -951,12 +951,18 @@ type QuestionForm = {
   cancelling?: boolean;
 };
 
-/** A fresh name for one send's lease — see `voice/lease.rs`. */
-function newAnswerLease(): string {
-  const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-    ? crypto.randomUUID()
-    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return random.replace(/[^A-Za-z0-9-]/g, "").slice(0, 64) || "lease";
+/** The number the last send's lease was named by. */
+let lastAnswerLease = 0;
+
+/**
+ * A fresh name for one send's lease — see `voice/lease.rs`: a number above
+ * every lease this page named before, and, from the clock's microseconds, above
+ * those a page before a reload named too. Rust refuses a lease at or below one
+ * whose cancel it had to forget, so the numbers only ever go up.
+ */
+export function newAnswerLease(): string {
+  lastAnswerLease = Math.max(Date.now() * 1000, lastAnswerLease + 1);
+  return String(lastAnswerLease);
 }
 
 /** The command table's row for the deck, whose screen issue #1198 hides by default. */
