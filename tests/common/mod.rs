@@ -121,6 +121,33 @@ pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
 /// after one Enter before pressing it again.
 pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
+/// What Claude Code draws in its input box in place of text it took as a paste
+/// too long to show (`[Pasted text #1]`, or `[Pasted text #1 +3 lines]`). See
+/// [`TuiDeck::submit_claude_prompt`] for when a prompt ends up there.
+pub const CLAUDE_PASTE_PLACEHOLDER: &str = "[Pasted text #";
+
+/// The longest prompt [`TuiDeck::submit_claude_prompt`] types; a longer one it
+/// pastes. Claude Code 2.1.296 takes any single read of more than 800
+/// characters as a paste (its input handler's `key.length > 800`), so a prompt
+/// no longer than this cannot be read as one, however its keystrokes are
+/// batched on the way.
+pub const CLAUDE_TYPED_PROMPT_MAX_CHARS: usize = 800;
+
+/// What [`TuiDeck::submit_claude_prompt`] types after a
+/// [`CLAUDE_PASTE_PLACEHOLDER`], so the model is asked, outside the paste, to
+/// act on it. Starts with a space so it does not run into the placeholder.
+pub const CLAUDE_PASTE_DIRECTIVE: &str = " Follow the pasted instructions.";
+
+/// How Claude Code's input showed a prompt before
+/// [`TuiDeck::submit_claude_prompt_shown`] pressed Enter on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePromptShown {
+    /// Its own text, probe through last word.
+    Text,
+    /// A new [`CLAUDE_PASTE_PLACEHOLDER`] in its place.
+    PastePlaceholder,
+}
+
 /// Issue #709: the 1-minute load average per CPU, or `None` where this platform
 /// does not publish one cheaply.
 ///
@@ -2089,6 +2116,34 @@ impl TuiDeck {
     /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
     /// reasoning.
     ///
+    /// **A prompt over [`CLAUDE_TYPED_PROMPT_MAX_CHARS`] is pasted, not typed,
+    /// and submitted with an instruction to follow it.** Claude Code takes a
+    /// single read of more than 800 characters as a paste, and whether a long
+    /// typed prompt's keystrokes arrive in one read is up to the machine's
+    /// load. Measured on `background_008` (a ~900-character prompt, typed)
+    /// on Claude Code 2.1.296, three outcomes: the text rendered; the input
+    /// read `[Pasted text #1]` and nothing else for 46 s (io-full 56%), which
+    /// the probe wait could never see; and, on a quiet machine, the input held
+    /// only the prompt's last 53 characters, starting mid-word, under a
+    /// "paste again to expand" hint — the head taken as a paste and then lost
+    /// when the tail was typed straight after it. The last is a lost prompt no
+    /// reading of the screen can recover. A bracketed paste marks its own end
+    /// rather than leaving Claude Code to infer it from how the bytes were
+    /// read, so a long prompt is sent as one, and every run since has ended in
+    /// the second outcome (four, on `harness/claude-prompt/001` and
+    /// `background_008`). A paste that long is drawn as
+    /// [`CLAUDE_PASTE_PLACEHOLDER`] instead of its text, so a placeholder that
+    /// was not on screen before the prompt was sent is read as the prompt
+    /// sitting in the input. Submitting it sends the whole text, but as pasted
+    /// content, and Haiku declines instructions that arrive only inside a
+    /// paste: measured with `harness/claude-prompt/001`, it echoed all of the
+    /// text and then asked what to do with it. So the helper types
+    /// [`CLAUDE_PASTE_DIRECTIVE`] after the placeholder, waits for it to render,
+    /// and then presses Enter, which is what a user who pasted a task would
+    /// type. That the submission carried the prompt's text and not the
+    /// placeholder's is what the hook-text match below checks, as it does for
+    /// a rendered prompt.
+    ///
     /// Only a `Thinking` event that carries prompt text and arrives AFTER the
     /// prompt is typed counts, so an earlier turn on the same agent — or a
     /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
@@ -2105,6 +2160,20 @@ impl TuiDeck {
         prompt: &str,
         probe: &str,
     ) -> dot_agent_deck::event::AgentEvent {
+        self.submit_claude_prompt_shown(events, agent_id, prompt, probe)
+            .0
+    }
+
+    /// [`TuiDeck::submit_claude_prompt`], also returning how the input showed
+    /// the prompt before it was submitted.
+    #[cfg(unix)]
+    pub fn submit_claude_prompt_shown(
+        &self,
+        events: &EventSub,
+        agent_id: &str,
+        prompt: &str,
+        probe: &str,
+    ) -> (dot_agent_deck::event::AgentEvent, ClaudePromptShown) {
         assert!(
             prompt.contains(probe) && !probe.contains(char::is_whitespace) && !probe.is_empty(),
             "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
@@ -2124,7 +2193,16 @@ impl TuiDeck {
                 && e.user_prompt.is_some()
         };
         let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
-        self.send_keys(prompt.as_bytes());
+        let placeholders = |grid: &str| grid.matches(CLAUDE_PASTE_PLACEHOLDER).count();
+        let placeholders_before = placeholders(&self.snapshot_grid());
+        if prompt.chars().count() > CLAUDE_TYPED_PROMPT_MAX_CHARS {
+            let mut pasted = b"\x1b[200~".to_vec();
+            pasted.extend_from_slice(prompt.as_bytes());
+            pasted.extend_from_slice(b"\x1b[201~");
+            self.send_keys(&pasted);
+        } else {
+            self.send_keys(prompt.as_bytes());
+        }
         // ONE deadline for both halves, so the helper reports its own failure
         // well inside a test's nextest kill window instead of being killed
         // between two back-to-back ceilings.
@@ -2134,24 +2212,59 @@ impl TuiDeck {
         // appearing after it proves the rest did. Word-wrap moves a whole word
         // to the next row rather than splitting it, so a space-free token is
         // matchable on one row.
-        let typed = || {
-            let grid = self.snapshot_grid();
+        let rendered = |grid: &str| {
             let Some(at) = grid.find(probe) else {
                 return false;
             };
             let after = &grid[at + probe.len()..];
             probe.ends_with(tail) || after.contains(tail)
         };
-        while !typed() {
+        let shown = loop {
+            let grid = self.snapshot_grid();
+            if rendered(&grid) {
+                break ClaudePromptShown::Text;
+            }
+            if placeholders(&grid) > placeholders_before {
+                eprintln!(
+                    "[harness] submit_claude_prompt: Claude Code shows the prompt as \
+                     {CLAUDE_PASTE_PLACEHOLDER}N]; typing \
+                     {CLAUDE_PASTE_DIRECTIVE:?} after it and submitting that"
+                );
+                break ClaudePromptShown::PastePlaceholder;
+            }
             if Instant::now() >= deadline {
                 panic!(
-                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
-                     Code's input — no {probe:?} followed by its last word {tail:?} within \
-                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    "PROMPT NOT DELIVERED: the prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?}, and no new \
+                     {CLAUDE_PASTE_PLACEHOLDER}N] placeholder, within {budget:?} — so nothing \
+                     after this point was exercised.\nFinal grid:\n{}",
                     self.snapshot_grid()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
+        };
+        if shown == ClaudePromptShown::PastePlaceholder {
+            self.send_keys(CLAUDE_PASTE_DIRECTIVE.as_bytes());
+            let directive_tail = CLAUDE_PASTE_DIRECTIVE
+                .split_whitespace()
+                .last()
+                .expect("a non-empty directive");
+            let directive_typed = |grid: &str| {
+                grid.rfind(CLAUDE_PASTE_PLACEHOLDER)
+                    .is_some_and(|at| grid[at..].contains(directive_tail))
+            };
+            while !directive_typed(&self.snapshot_grid()) {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "PROMPT NOT DELIVERED: Claude Code shows the prompt as a paste, but the \
+                         {CLAUDE_PASTE_DIRECTIVE:?} typed after its placeholder never rendered \
+                         within {budget:?} — so nothing after this point was exercised.\n\
+                         Final grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         // The hook reports the submitted text truncated to 200 bytes, so the
         // match catches a prefix submitted short of that and a garbled one; a
@@ -2190,7 +2303,7 @@ impl TuiDeck {
                              only after Enter #{enters}"
                         );
                     }
-                    return ev;
+                    return (ev, shown);
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }

@@ -7927,6 +7927,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
 - **Platform coverage:** mac+linux.
 
+### Test harness: Claude Code prompt submission
+
+#### harness/claude-prompt
+
+##### harness/claude-prompt/001 — A prompt too long for the harness to type is pasted, shown by Claude Code as a `[Pasted text #N]` placeholder, and still submitted whole.
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** a one-line prompt of over 1,000 characters, which `submit_claude_prompt_shown` sends as one bracketed paste because it is longer than `CLAUDE_TYPED_PROMPT_MAX_CHARS`, is shown by Claude Code as a paste placeholder rather than its text; the helper reports that it submitted the placeholder (with `CLAUDE_PASTE_DIRECTIVE` typed after it, since Haiku declines instructions that arrive only inside a paste), and its hook-text match passes; the instruction at the prompt's very end (touch a uniquely named sentinel) is carried out, so the submission held the whole text and not only the 200 bytes the hook reports. `status/background/008` failed on 2026-10-12 because the helper typed its ~900-character prompt, which Claude Code then took as a paste: collapsed, which the helper waited on for text that never renders, or with its head lost.
+- **Does not assert:** what Claude Code does with a typed prompt over 800 characters (the helper no longer types one), the placeholder's exact wording, desktop.
+- **Platform coverage:** mac+linux; requires local Claude credentials and runs nowhere in CI.
+
 ### Agent questions (PRD #1631)
 
 The question an agent is waiting on — a permission prompt, a menu, a form — as the daemon knows it (`pending_question` on the session's snapshot), and the `answer-question` verb that answers it through the agent's own channel. `question/live/001`–`005` run real agents in lane 2; `006` exercises an offline Pi extension dialog in lane 1.
