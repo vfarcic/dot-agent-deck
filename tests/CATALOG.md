@@ -8003,6 +8003,78 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** persistence across daemon restart; the deck-id persistence round trip is `inbox/core/002`.
 - **Platform coverage:** mac+linux.
 
+#### inbox/claude
+
+##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
+- **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.
+- **Agent:** none.
+- **Asserts:** A measured supported version (2.1.296) installs exactly one status handler and one `asyncRewake: true`, `timeout: 86400` waiter on SessionStart and Stop only; the installed command executes safely from a path with spaces and exits silently outside a deck.
+- **Does not assert:** The exact minimum supported version or a real Claude wake.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/002 — Old or unknown Claude removes stale native waiters while preserving user settings.
+- **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub.
+- **Agent:** none.
+- **Asserts:** 2.0.0 and an unparseable version keep status handlers, remove stale waiter entries and preserve co-located user hooks, model and permissions.
+- **Does not assert:** The exact asyncRewake version floor or runtime hook behavior on an older real Claude.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/003 — Repeated installs consolidate both deck handler kinds without deleting a user's mixed-rule command.
+- **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated settings and supported-version stub.
+- **Agent:** none.
+- **Asserts:** Three installs over duplicate mixed rules keep one status handler, one waiter and one user command on each managed event.
+- **Does not assert:** Concurrent installer locking, covered by hooks/install tests.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/004 — Uninstall removes both deck handler kinds and preserves co-located user hooks.
+- **Layer:** Unit (`tests/inbox_claude.rs`), public settings-path seam and temporary files.
+- **Agent:** none.
+- **Asserts:** Status and waiter commands are removed from duplicate mixed rules while user commands, model and permissions survive.
+- **Does not assert:** Running the uninstall CLI or modifying the developer's global settings.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/005 — SessionStart frames the session and establishes native grace before a spawn seed can ring.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real daemon/hook/wait binaries and raw scripted parent PTY.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** A spawn-time queued seed gets no doorbell during native grace after SessionStart, the synchronous hook emits SessionStart additionalContext framing, and a real Once waiter then receives the body on stderr with exit 2, Fetched state and no automatic PTY input.
+- **Does not assert:** Real Claude model consumption or acknowledgement; /009 covers the prompt-observed acknowledgement.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/006 — Startup and clear waiters hand one task to the newest waiter once.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real Once CLI children of a scripted parent.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** Three armed startup/clear waiters yield one framed stderr wake with exit 2 on the newest, two older waiters remain armed, the task is Fetched and no bytes are typed into the pane.
+- **Does not assert:** Real Claude's clear behavior or model compliance with do-not-act-twice framing.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/007 — A Once waiter exits when its scripted Claude parent dies.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real waiter CLI and fixture-owned parent PID.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** Closing hook stdin does not disarm the live waiter; killing its scripted parent while the managed supervisor remains alive makes the waiter exit and clears the daemon's armed count, independently of whole-pane teardown.
+- **Does not assert:** Killing any production process or Claude's actual asyncRewake child topology.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/008 — Doorbell prompts fetch and inject queued content with or without the leading space.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real UserPromptSubmit hook and daemon.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** Both exact and leading-space-trimmed fixed doorbells produce UserPromptSubmit additionalContext containing the framed full body and acknowledge the right message; ordinary human prompts emit no injection.
+- **Does not assert:** Codex wiring or a real model turn; the trimmed spelling pins the shared scanner requirement for S7.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/009 — Native task notifications acknowledge the message and show its subject without polluting human prompt history.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), attached real TUI, daemon and hook/wait CLI children.
+- **Agent:** none (synthetic Claude parent; no credential; no reel marker).
+- **Asserts:** Fetched waiter output wrapped as a task notification becomes Acknowledged after UserPromptSubmit; the card displays `✉ native fixture`, first_prompts and last_user_prompt retain the prior human prompt, and raw task-notification markup is absent from the grid.
+- **Does not assert:** Actual asyncRewake delivery by Claude, a real-model action or lane-2 coverage.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/010 — SessionStart sends Native announce before status on one hook connection.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI and recording Unix socket.
+- **Agent:** none.
+- **Asserts:** The recording endpoint receives exactly one connection containing InboxAnnounce with Native wake first, then SessionStart status.
+- **Does not assert:** Daemon grace policy, covered by /005 and inbox/doorbell/004.
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
