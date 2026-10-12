@@ -422,11 +422,12 @@ pub fn scroll_script(scroll: Scroll) -> &'static str {
 /// sits in, all in the main webview's CSS pixels.
 ///
 /// CSS pixels rather than the window's, because the two differ by more than
-/// the app's zoom: WebKitGTK also scales CSS pixels by the screen's DPI over 96
-/// (measured: a page sized from CSS pixels times the zoom came out 4% short
-/// under Xvfb's default 100 DPI). So the rectangle is placed in PROPORTION to
-/// the page — [`Bounds::onto`] maps it onto whatever size the main webview
-/// really has — and no scale factor has to be known on either side.
+/// the app's zoom, differently per platform ([`Mapping`]): WebKitGTK also
+/// scales CSS pixels by the screen's DPI over 96 (measured: a page sized from
+/// CSS pixels times the zoom came out 4% short under Xvfb's default 100 DPI),
+/// and on macOS the page starts a title bar below the main webview's top. So
+/// the rectangle is placed against the size of the page it was measured in,
+/// and no scale factor has to be known on either side.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bounds {
@@ -437,6 +438,39 @@ pub struct Bounds {
     /// The main webview's own width and height (`innerWidth`/`innerHeight`).
     pub viewport_width: f64,
     pub viewport_height: f64,
+}
+
+/// How a frame in the main webview's CSS pixels maps onto the main webview's
+/// own rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mapping {
+    /// In proportion to the page on each axis ([`Bounds::onto`]). Linux, where
+    /// WebKitGTK's DPI scaling makes a CSS pixel a fraction of a logical one
+    /// on both axes, and Windows, where no placement has been reported and,
+    /// with the page filling the webview's height, this is the same rectangle
+    /// as [`Mapping::BelowTopInset`].
+    Proportional,
+    /// One zoom on both axes, the main webview's width over the page's (CSS
+    /// pixels to points), below a top inset: the main webview's height less
+    /// the page's height times that zoom, when that is positive
+    /// ([`Bounds::below_top_inset`]). macOS. Measured on the reporter's Mac
+    /// (Retina, scale 2): a main webview at the content view's origin, 1440 by
+    /// 920 points, around a page 1440 by 892 CSS pixels at zoom 1, so the page
+    /// is 28 points (a title bar) shorter than the webview. Assumed, from the
+    /// symptom: the 28 points are above the page's y=0, since the proportional
+    /// mapping (920/892 on y) put the page too high, over its toolbar. The
+    /// inset is computed rather than a constant, so it is 0 in full screen,
+    /// where the title bar goes away.
+    BelowTopInset,
+}
+
+impl Mapping {
+    /// This platform's mapping.
+    pub const NATIVE: Mapping = if cfg!(target_os = "macos") {
+        Mapping::BelowTopInset
+    } else {
+        Mapping::Proportional
+    };
 }
 
 /// A rectangle in the target's own units, from [`Bounds::onto`].
@@ -494,10 +528,27 @@ impl Bounds {
         }
     }
 
+    /// The frame on a target `width` × `height` by [`Mapping::BelowTopInset`],
+    /// kept inside it, with the top inset it was placed below.
+    pub fn below_top_inset(self, width: f64, height: f64) -> (Placed, f64) {
+        let zoom = width / self.viewport_width;
+        let inset = (height - self.viewport_height * zoom).max(0.0);
+        let x = (self.x * zoom).clamp(0.0, width);
+        let y = (inset + self.y * zoom).clamp(0.0, height);
+        let placed = Placed {
+            x,
+            y,
+            width: (self.width * zoom).min(width - x).max(1.0),
+            height: (self.height * zoom).min(height - y).max(1.0),
+        };
+        (placed, inset)
+    }
+
     /// The frame on `surface`, in the logical pixels `add_child` and
-    /// `set_bounds` place a webview in. This is the placement on macOS and
-    /// Windows, and the PR webview's initial rectangle on every platform; on
-    /// Linux the overlay places the page from then on (`overlay::place`).
+    /// `set_bounds` place a webview in, by the surface's [`Mapping`]. This is
+    /// the placement on macOS and Windows, and the PR webview's initial
+    /// rectangle on every platform; on Linux the overlay places the page from
+    /// then on (`overlay::place`).
     ///
     /// Mapped onto the main webview's own rectangle (`Webview::bounds`),
     /// origin and size, because that is the page the frame was measured in —
@@ -516,18 +567,26 @@ impl Bounds {
     /// than the window gets a page displaced by the difference
     /// (`the_fallback_places_from_the_window_corner`).
     pub fn on(self, surface: &Surface) -> Placed {
-        let Ok(main) = surface.main_webview else {
-            let content = surface.window_content.to_logical::<f64>(surface.scale);
-            return self.onto(content.width, content.height);
+        self.mapped(surface).0
+    }
+
+    /// [`Bounds::on`], with the top inset the page was placed below: `None`
+    /// for [`Mapping::Proportional`], which has none.
+    pub fn mapped(self, surface: &Surface) -> (Placed, Option<f64>) {
+        let (x, y, width, height) = surface.target();
+        let (placed, inset) = match surface.mapping {
+            Mapping::Proportional => (self.onto(width, height), None),
+            Mapping::BelowTopInset => {
+                let (placed, inset) = self.below_top_inset(width, height);
+                (placed, Some(inset))
+            }
         };
-        let origin = main.position.to_logical::<f64>(surface.scale);
-        let size = main.size.to_logical::<f64>(surface.scale);
-        let placed = self.onto(size.width, size.height);
-        Placed {
-            x: origin.x + placed.x,
-            y: origin.y + placed.y,
+        let placed = Placed {
+            x: x + placed.x,
+            y: y + placed.y,
             ..placed
-        }
+        };
+        (placed, inset)
     }
 }
 
@@ -542,6 +601,27 @@ pub struct Surface {
     pub main_webview: Result<tauri::Rect, String>,
     /// The window's content size (`Window::inner_size`).
     pub window_content: tauri::PhysicalSize<u32>,
+    /// How the frame maps onto the main webview: [`Mapping::NATIVE`].
+    pub mapping: Mapping,
+}
+
+impl Surface {
+    /// The rectangle the frame is mapped onto, in logical pixels: left, top,
+    /// width and height of the main webview, or of the window's content area
+    /// from its top-left corner when the main webview's bounds are unknown.
+    fn target(&self) -> (f64, f64, f64, f64) {
+        match &self.main_webview {
+            Ok(main) => {
+                let origin = main.position.to_logical::<f64>(self.scale);
+                let size = main.size.to_logical::<f64>(self.scale);
+                (origin.x, origin.y, size.width, size.height)
+            }
+            Err(_) => {
+                let content = self.window_content.to_logical::<f64>(self.scale);
+                (0.0, 0.0, content.width, content.height)
+            }
+        }
+    }
 }
 
 /// The shortest time between two placement lines, so a resize drag, which
@@ -672,8 +752,9 @@ static PLACEMENT_LOG: PlacementLog = PlacementLog::new(PLACEMENT_LOG_INTERVAL);
 pub const PLACEMENT_LOG_PREFIX: &str = "dot-agent-deck-desktop: PR page placement:";
 
 /// One placement, with everything it was computed from: the main webview's
-/// `bounds()`, `inner_size()`, the scale factor, the frame the page reported
-/// and the rectangle applied to the PR webview.
+/// `bounds()`, `inner_size()`, the scale factor, the frame the page reported,
+/// how it was mapped (with the top inset, when the mapping has one) and the
+/// rectangle applied to the PR webview.
 pub fn placement_line(surface: &Surface, bounds: Bounds, placed: Placed) -> String {
     let main = match &surface.main_webview {
         Ok(rect) => format!(
@@ -683,10 +764,17 @@ pub fn placement_line(surface: &Surface, bounds: Bounds, placed: Placed) -> Stri
         ),
         Err(error) => format!("main webview bounds() unavailable ({error}), fallback in use"),
     };
+    let mapping = match bounds.mapped(surface).1 {
+        Some(inset) => format!(
+            "mapped at zoom {:.4} below a top inset of logical {inset:.2}",
+            surface.target().2 / bounds.viewport_width
+        ),
+        None => "mapped in proportion to the page, no top inset".to_string(),
+    };
     format!(
         "{PLACEMENT_LOG_PREFIX} {main}; inner_size() physical {}x{}; scale factor {}; \
          frame from the page x={:.2} y={:.2} {:.2}x{:.2} in a {:.2}x{:.2} page (CSS px); \
-         applied to the PR webview logical x={:.2} y={:.2} {:.2}x{:.2}",
+         {mapping}; applied to the PR webview logical x={:.2} y={:.2} {:.2}x{:.2}",
         surface.window_content.width,
         surface.window_content.height,
         surface.scale,
@@ -706,7 +794,7 @@ pub fn placement_line(surface: &Surface, bounds: Bounds, placed: Placed) -> Stri
 /// The warning for a main webview whose bounds could not be read.
 pub fn fallback_warning(error: &str) -> String {
     format!(
-        "{PLACEMENT_LOG_PREFIX} warning: the main webview's bounds() failed ({error}), so the page is placed by the fallback: the frame mapped onto inner_size() from the window's top-left corner, which is right only while the main webview fills the window from that corner"
+        "{PLACEMENT_LOG_PREFIX} warning: the main webview's bounds() failed ({error}), so the page is placed by the fallback: the frame mapped onto inner_size() from the window's top-left corner, which is right while the main webview fills the window from that corner"
     )
 }
 
@@ -1162,6 +1250,7 @@ impl Surface {
             scale,
             main_webview,
             window_content,
+            mapping: Mapping::NATIVE,
         })
     }
 }
@@ -2229,29 +2318,38 @@ mod tests {
     /// The reported defect: on macOS the GitHub page was drawn over the
     /// toolbar, leaving only the tops of Close, Back and Open in browser.
     ///
-    /// The frame is measured in the main webview's CSS pixels, so it is only
-    /// right when it is mapped onto the main webview's own rectangle. On macOS
-    /// and Windows it used to be mapped onto `Window::inner_size` from the
-    /// window's origin, which is that rectangle only while the main webview
-    /// sits at the content view's top-left corner and fills it. On macOS
-    /// nothing in AppKit keeps it there: with Tauri's `unstable` feature the
-    /// main webview is itself a child webview, which wry gives only a
-    /// `ViewMinYMargin` autoresizing mask: AppKit keeps its distance from the
-    /// top and never resizes it, and only Tauri's own bounds calls size it.
-    /// Each case supplies the rectangle the platform would report for the
-    /// main webview — the displacement is given here, not measured on a Mac —
-    /// and the page must start at or below the toolbar's bottom edge and stay
-    /// inside the main webview. The first macOS case models the reported
-    /// symptom (the cause on the user's Mac is inferred, not observed): a main
-    /// webview one title bar (28 points) below the content view's top put the
-    /// page 28 points too high, over all but the top of the toolbar. The
-    /// Windows case with an offset origin gives it in physical pixels at
-    /// scale 2, the unit WebView2's bounds come in. The Linux cases are an
-    /// arithmetic control only: on Linux the page is placed by
-    /// `overlay::place` after it opens, not by `Bounds::on`.
+    /// Each case gives what the platform reports — the main webview's
+    /// rectangle, the window's content size and the scale factor — the frame
+    /// the page reported, and the truth the page has to meet: where CSS y=0
+    /// of the main webview's page sits in it (`inset_top`, logical pixels
+    /// below the main webview's top) and how many logical pixels a CSS pixel
+    /// is (its width over the page's). The PR page must start at or below the
+    /// toolbar's bottom edge, reach its frame's bottom, and stay inside the
+    /// main webview.
+    ///
+    /// The first case is the user's Mac, from the placement line its desktop
+    /// log printed (Retina, scale 2): the main webview at the content view's
+    /// origin, 920 points tall, around a page 892 CSS pixels tall at zoom 1 —
+    /// a title bar (28 points) shorter. The page landed too high, so those 28
+    /// points are above CSS y=0, and the toolbar's bottom edge is at 83. The
+    /// cases with a main webview one title bar down model the theory
+    /// 3868a2a7 was built on, which that line refuted for this Mac; they stay
+    /// as a guard for a displaced origin. The Linux cases are an arithmetic
+    /// control only: on Linux the page is placed by `overlay::place` after it
+    /// opens, not by `Bounds::on`.
     #[test]
     fn the_page_never_covers_the_toolbar() {
         use tauri::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
+
+        struct Case {
+            name: &'static str,
+            surface: Surface,
+            /// The main webview's left, top, width and height, logical.
+            main: (f64, f64, f64, f64),
+            frame: Bounds,
+            /// Where CSS y=0 sits below the main webview's top, logical.
+            inset_top: f64,
+        }
 
         // `styles.css`: the overlay's 14px padding, the panel's 1px border,
         // then the 40px toolbar, its bottom border included (`border-box`).
@@ -2277,148 +2375,249 @@ mod tests {
                 size: PhysicalSize::new(width, height).into(),
             })
         };
-        // (case, surface, the main webview's left, top and size in logical
-        // pixels, its size in CSS pixels)
         let cases = [
-            (
-                "macOS, main webview a title bar below the content view's top, scale 1",
-                Surface {
-                    scale: 1.0,
-                    main_webview: logical(28.0, 1440.0, 892.0),
-                    window_content: PhysicalSize::new(1440, 920),
-                },
-                (0.0, 28.0, 1440.0, 892.0),
-                (1440.0, 892.0),
-            ),
-            (
-                "macOS, main webview a title bar below the content view's top, scale 2, app zoom 125%",
-                Surface {
-                    scale: 2.0,
-                    main_webview: logical(28.0, 1728.0, 1089.0),
-                    window_content: PhysicalSize::new(3456, 2234),
-                },
-                (0.0, 28.0, 1728.0, 1089.0),
-                (1728.0 / 1.25, 1089.0 / 1.25),
-            ),
-            (
-                "macOS, main webview larger than the content size the window reports, scale 2",
-                Surface {
-                    scale: 2.0,
-                    main_webview: logical(0.0, 1728.0, 1117.0),
-                    window_content: PhysicalSize::new(2880, 1840),
-                },
-                (0.0, 0.0, 1728.0, 1117.0),
-                (1728.0, 1117.0),
-            ),
-            (
-                "Linux, scale 1, WebKitGTK at 100 DPI",
-                Surface {
-                    scale: 1.0,
-                    main_webview: logical(0.0, 1440.0, 920.0),
-                    window_content: PhysicalSize::new(1440, 920),
-                },
-                (0.0, 0.0, 1440.0, 920.0),
-                (1440.0 / 1.04, 920.0 / 1.04),
-            ),
-            (
-                "Linux, scale 2",
-                Surface {
+            Case {
+                name: "the user's Mac: main webview at the origin, 28 points taller than its page, scale 2",
+                surface: Surface {
                     scale: 2.0,
                     main_webview: logical(0.0, 1440.0, 920.0),
                     window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::BelowTopInset,
                 },
-                (0.0, 0.0, 1440.0, 920.0),
-                (1440.0, 920.0),
-            ),
-            (
-                "Windows, scale 2",
-                Surface {
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: Bounds {
+                    x: 15.0,
+                    y: 55.0,
+                    width: 1410.0,
+                    height: 782.0,
+                    viewport_width: 1440.0,
+                    viewport_height: 892.0,
+                },
+                inset_top: 28.0,
+            },
+            Case {
+                name: "macOS full screen: no title bar, so no inset, scale 2",
+                surface: Surface {
                     scale: 2.0,
-                    main_webview: physical(0, 0, 2880, 1840),
-                    window_content: PhysicalSize::new(2880, 1840),
+                    main_webview: logical(0.0, 1440.0, 900.0),
+                    window_content: PhysicalSize::new(2880, 1800),
+                    mapping: Mapping::BelowTopInset,
                 },
-                (0.0, 0.0, 1440.0, 920.0),
-                (1440.0, 920.0),
-            ),
-            (
-                "Windows, main webview at physical (100, 56) in the content area, scale 2",
-                Surface {
+                main: (0.0, 0.0, 1440.0, 900.0),
+                frame: frame_in(1440.0, 900.0),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "the user's Mac at app zoom 125%: the inset stays 28 points, scale 2",
+                surface: Surface {
                     scale: 2.0,
-                    main_webview: physical(100, 56, 2780, 1784),
+                    main_webview: logical(0.0, 1440.0, 920.0),
                     window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::BelowTopInset,
                 },
-                (50.0, 28.0, 1390.0, 892.0),
-                (1390.0, 892.0),
-            ),
-            (
-                "a main webview that cannot report its bounds and fills the window, scale 2",
-                Surface {
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: frame_in(1440.0 / 1.25, 892.0 / 1.25),
+                inset_top: 28.0,
+            },
+            Case {
+                name: "the user's Mac with bounds() failing: inner_size() in its place, scale 2",
+                surface: Surface {
                     scale: 2.0,
                     main_webview: Err("no bounds".into()),
                     window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::BelowTopInset,
                 },
-                (0.0, 0.0, 1440.0, 920.0),
-                (1440.0, 920.0),
-            ),
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: Bounds {
+                    x: 15.0,
+                    y: 55.0,
+                    width: 1410.0,
+                    height: 782.0,
+                    viewport_width: 1440.0,
+                    viewport_height: 892.0,
+                },
+                inset_top: 28.0,
+            },
+            Case {
+                name: "macOS, main webview a title bar below the content view's top, scale 1",
+                surface: Surface {
+                    scale: 1.0,
+                    main_webview: logical(28.0, 1440.0, 892.0),
+                    window_content: PhysicalSize::new(1440, 920),
+                    mapping: Mapping::BelowTopInset,
+                },
+                main: (0.0, 28.0, 1440.0, 892.0),
+                frame: frame_in(1440.0, 892.0),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "macOS, main webview a title bar below the content view's top, scale 2, app zoom 125%",
+                surface: Surface {
+                    scale: 2.0,
+                    main_webview: logical(28.0, 1728.0, 1089.0),
+                    window_content: PhysicalSize::new(3456, 2234),
+                    mapping: Mapping::BelowTopInset,
+                },
+                main: (0.0, 28.0, 1728.0, 1089.0),
+                frame: frame_in(1728.0 / 1.25, 1089.0 / 1.25),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "macOS, main webview larger than the content size the window reports, scale 2",
+                surface: Surface {
+                    scale: 2.0,
+                    main_webview: logical(0.0, 1728.0, 1117.0),
+                    window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::BelowTopInset,
+                },
+                main: (0.0, 0.0, 1728.0, 1117.0),
+                frame: frame_in(1728.0, 1117.0),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "Linux, scale 1, WebKitGTK at 100 DPI",
+                surface: Surface {
+                    scale: 1.0,
+                    main_webview: logical(0.0, 1440.0, 920.0),
+                    window_content: PhysicalSize::new(1440, 920),
+                    mapping: Mapping::Proportional,
+                },
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: frame_in(1440.0 / 1.04, 920.0 / 1.04),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "Linux, scale 2",
+                surface: Surface {
+                    scale: 2.0,
+                    main_webview: logical(0.0, 1440.0, 920.0),
+                    window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::Proportional,
+                },
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: frame_in(1440.0, 920.0),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "Windows, scale 2",
+                surface: Surface {
+                    scale: 2.0,
+                    main_webview: physical(0, 0, 2880, 1840),
+                    window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::Proportional,
+                },
+                main: (0.0, 0.0, 1440.0, 920.0),
+                frame: frame_in(1440.0, 920.0),
+                inset_top: 0.0,
+            },
+            Case {
+                name: "Windows, main webview at physical (100, 56) in the content area, scale 2",
+                surface: Surface {
+                    scale: 2.0,
+                    main_webview: physical(100, 56, 2780, 1784),
+                    window_content: PhysicalSize::new(2880, 1840),
+                    mapping: Mapping::Proportional,
+                },
+                main: (50.0, 28.0, 1390.0, 892.0),
+                frame: frame_in(1390.0, 892.0),
+                inset_top: 0.0,
+            },
         ];
-        for (case, surface, (left, top, width, height), (css_width, css_height)) in cases {
-            let placed = frame_in(css_width, css_height).on(&surface);
-            let toolbar_bottom = top + TOOLBAR_BOTTOM * height / css_height;
+        for Case {
+            name,
+            surface,
+            main: (left, top, width, height),
+            frame,
+            inset_top,
+        } in cases
+        {
+            let placed = frame.on(&surface);
+            let zoom = width / frame.viewport_width;
+            let native_y = |css_y: f64| top + inset_top + css_y * zoom;
+            let toolbar_bottom = native_y(frame.y);
             assert!(
                 placed.y >= toolbar_bottom - 0.5,
-                "{case}: the page starts at y={:.1}, above the toolbar's bottom edge at y={toolbar_bottom:.1}, so it covers the toolbar ({placed:?})",
+                "{name}: the page starts at y={:.2}, above the toolbar's bottom edge at y={toolbar_bottom:.2}, so it covers the toolbar ({placed:?})",
                 placed.y
             );
             assert!(
                 placed.y + placed.height <= top + height + 0.5
                     && placed.x + placed.width <= left + width + 0.5,
-                "{case}: the page runs past the main webview's {width}x{height} at ({left}, {top}) ({placed:?})"
+                "{name}: the page runs past the main webview's {width}x{height} at ({left}, {top}) ({placed:?})"
             );
             assert!(
-                placed.x >= left + 15.0 * width / css_width - 0.5
-                    && placed.y + placed.height >= top + height - 15.0 * height / css_height - 1.0,
-                "{case}: the page does not fill its frame ({placed:?})"
+                placed.x >= left + frame.x * zoom - 0.5
+                    && placed.y + placed.height >= native_y(frame.y + frame.height) - 1.0,
+                "{name}: the page does not fill its frame ({placed:?})"
             );
         }
     }
 
     /// What the fallback does: a main webview whose bounds cannot be read is
     /// assumed to fill the window from its top-left corner, so the frame is
-    /// mapped onto `inner_size` from there — the placement from before
-    /// `Bounds::on`. With a main webview that is in fact one title bar (28
-    /// points) lower and that much shorter, the page lands where the old
-    /// placement put it: about 26 points above the toolbar's bottom edge,
-    /// covering most of the toolbar. The warning names the fallback and the
-    /// error, so a placement made this way can be told apart in the log.
+    /// mapped onto `inner_size` from there, by the same [`Mapping`]. On the
+    /// reporter's Mac, where the main webview did fill the window, that is
+    /// the placement `bounds()` gives: the page at the toolbar's bottom edge,
+    /// 28 + 55 = 83. A main webview one title bar lower and that much shorter
+    /// gets the same rectangle, since the fallback reads the difference as a
+    /// top inset; one offset sideways, or lower without being shorter, gets a
+    /// page displaced by the offset. The warning names the fallback and
+    /// the error, so a placement made this way can be told apart in the log.
     #[test]
     fn the_fallback_places_from_the_window_corner() {
-        use tauri::PhysicalSize;
+        use tauri::{LogicalPosition, LogicalSize, PhysicalSize};
 
         let frame = Bounds {
             x: 15.0,
             y: 55.0,
             width: 1410.0,
-            height: 822.0,
+            height: 782.0,
             viewport_width: 1440.0,
             viewport_height: 892.0,
         };
-        let surface = Surface {
+        let surface = |main_webview| Surface {
             scale: 2.0,
-            main_webview: Err("the webview is gone".into()),
+            main_webview,
             window_content: PhysicalSize::new(2880, 1840),
+            mapping: Mapping::BelowTopInset,
         };
-        let placed = frame.on(&surface);
+        let fallback = surface(Err("the webview is gone".into()));
+        let placed = frame.on(&fallback);
+        let measured = frame.on(&surface(Ok(tauri::Rect {
+            position: LogicalPosition::new(0.0, 0.0).into(),
+            size: LogicalSize::new(1440.0, 920.0).into(),
+        })));
         assert_eq!(
-            placed,
-            frame.onto(1440.0, 920.0),
-            "the fallback maps onto inner_size from the window's corner"
+            placed, measured,
+            "with a main webview filling the window, the fallback is the measured placement"
         );
-        // Where the toolbar's bottom edge really is, in the main webview one
-        // title bar down.
-        let toolbar_bottom = 28.0 + 55.0;
+        assert!((placed.y - 83.0).abs() < 1e-9, "{placed:?}");
+
+        let lower_and_shorter = frame.on(&surface(Ok(tauri::Rect {
+            position: LogicalPosition::new(0.0, 28.0).into(),
+            size: LogicalSize::new(1440.0, 892.0).into(),
+        })));
+        assert_eq!(
+            lower_and_shorter, placed,
+            "the fallback reads a main webview a title bar lower and shorter as a top inset"
+        );
+        let sideways = frame.on(&surface(Ok(tauri::Rect {
+            position: LogicalPosition::new(40.0, 0.0).into(),
+            size: LogicalSize::new(1400.0, 920.0).into(),
+        })));
         assert!(
-            (toolbar_bottom - placed.y - 26.3).abs() < 0.5,
-            "with an offset main webview the fallback puts the page about 26 points over the toolbar ({placed:?})"
+            sideways.x > placed.x + 30.0,
+            "a main webview offset sideways is where the fallback cannot follow ({sideways:?}, {placed:?})"
+        );
+
+        let proportional = Surface {
+            mapping: Mapping::Proportional,
+            ..fallback.clone()
+        };
+        assert_eq!(
+            frame.on(&proportional),
+            frame.onto(1440.0, 920.0),
+            "the proportional fallback maps onto inner_size from the window's corner"
         );
 
         let warning = fallback_warning("the webview is gone");
@@ -2429,15 +2628,18 @@ mod tests {
                 && warning.contains("inner_size()"),
             "{warning}"
         );
-        let line = placement_line(&surface, frame, placed);
+        let line = placement_line(&fallback, frame, placed);
         assert!(
-            line.contains("bounds() unavailable (the webview is gone), fallback in use"),
+            line.contains("bounds() unavailable (the webview is gone), fallback in use")
+                && line.contains("below a top inset of logical 28.00"),
             "{line}"
         );
     }
 
     /// A placement line carries everything the placement was computed from,
-    /// with the kind of each rectangle the platform reported.
+    /// with the kind of each rectangle the platform reported and the top
+    /// inset the page was placed below. The macOS line is the reporter's own
+    /// inputs, so it is the line their Mac should now print.
     #[test]
     fn a_placement_line_names_its_inputs_and_result() {
         use tauri::{LogicalPosition, LogicalSize, PhysicalSize};
@@ -2445,23 +2647,34 @@ mod tests {
         let surface = Surface {
             scale: 2.0,
             main_webview: Ok(tauri::Rect {
-                position: LogicalPosition::new(0.0, 28.0).into(),
-                size: LogicalSize::new(1440.0, 892.0).into(),
+                position: LogicalPosition::new(0.0, 0.0).into(),
+                size: LogicalSize::new(1440.0, 920.0).into(),
             }),
             window_content: PhysicalSize::new(2880, 1840),
+            mapping: Mapping::BelowTopInset,
         };
         let frame = Bounds {
             x: 15.0,
             y: 55.0,
             width: 1410.0,
-            height: 822.0,
+            height: 782.0,
             viewport_width: 1440.0,
             viewport_height: 892.0,
         };
         let line = placement_line(&surface, frame, frame.on(&surface));
         assert_eq!(
             line,
-            "dot-agent-deck-desktop: PR page placement: main webview bounds() origin logical (0.00, 28.00) size logical 1440.00x892.00; inner_size() physical 2880x1840; scale factor 2; frame from the page x=15.00 y=55.00 1410.00x822.00 in a 1440.00x892.00 page (CSS px); applied to the PR webview logical x=15.00 y=83.00 1410.00x822.00"
+            "dot-agent-deck-desktop: PR page placement: main webview bounds() origin logical (0.00, 0.00) size logical 1440.00x920.00; inner_size() physical 2880x1840; scale factor 2; frame from the page x=15.00 y=55.00 1410.00x782.00 in a 1440.00x892.00 page (CSS px); mapped at zoom 1.0000 below a top inset of logical 28.00; applied to the PR webview logical x=15.00 y=83.00 1410.00x782.00"
+        );
+
+        let linux = Surface {
+            mapping: Mapping::Proportional,
+            ..surface
+        };
+        let line = placement_line(&linux, frame, frame.on(&linux));
+        assert!(
+            line.contains("(CSS px); mapped in proportion to the page, no top inset; applied to"),
+            "{line}"
         );
     }
 
