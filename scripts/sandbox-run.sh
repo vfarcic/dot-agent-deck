@@ -393,6 +393,30 @@ stop_recorded_desktop() {
 
 # --- desktop preflight -------------------------------------------------------
 
+# Does something listen on loopback address $1, port $2? On loopback a listener
+# answers a connect at once, and a port with nothing on it is refused at once.
+# A port a socket holds BOUND but not listening is refused at once on Linux, but
+# macOS drops the SYN, and the connect waits out the TCP connect timeout, about
+# 75 seconds: two probes of such a port took a test's run-all 151 seconds on
+# build-macos (PR #1672). Nothing listens there, which is all this asks, so a
+# probe still waiting after a second is a no; vite reports any other reason it
+# cannot bind in its own log.
+port_answers() {
+  local probe i=0
+  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null &
+  probe=$!
+  while kill -0 "$probe" 2>/dev/null; do
+    if [ "$i" -ge 10 ]; then
+      # wait's status: a killed probe is a no, one that connected just now a yes.
+      { kill "$probe"; wait "$probe"; } 2>/dev/null
+      return
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$probe"
+}
+
 desktop_preflight() {
   command -v pnpm >/dev/null 2>&1 ||
     die "pnpm is not on PATH — run this from a \`devbox shell\` (docs/develop/desktop-gui.md#prerequisites)"
@@ -409,7 +433,7 @@ desktop_preflight() {
   # xtask/linkage-check/src/sandbox_run.rs, whose stand-in desktop binds
   # nothing: 1420 is in use whenever a `tauri dev` runs on the machine.
   local port=${DAD_SANDBOX_RUN_VITE_PORT:-1420}
-  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || (exec 3<>"/dev/tcp/::1/$port") 2>/dev/null; then
+  if port_answers 127.0.0.1 "$port" || port_answers ::1 "$port"; then
     die "port $port is in use, probably by another \`pnpm dev\` or \`tauri dev\` — the desktop's vite server needs it"
   fi
   if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then

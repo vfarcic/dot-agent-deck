@@ -775,8 +775,10 @@ sleep 600;
 /// preflight would then refuse it and fail the test. So the port stays bound,
 /// by a socket that never listens, for as long as the [`HeldPort`] lives: no
 /// other process can bind the same address, and the script's probe — a
-/// connect — is refused, which is the answer "free" it needs. The probe tries
-/// `::1` as well, so that address is held too wherever this host has IPv6.
+/// connect — finds no listener, which is the answer "free" it needs. On Linux
+/// that connect is refused at once; macOS drops the SYN, and the probe gives up
+/// after a second (`port_answers` in the script). The probe tries `::1` as
+/// well, so that address is held too wherever this host has IPv6.
 struct HeldPort {
     port: u16,
     _sockets: Vec<std::os::fd::OwnedFd>,
@@ -901,6 +903,167 @@ fn free_port() -> HeldPort {
     panic!("no loopback port free on both 127.0.0.1 and ::1 in 20 attempts");
 }
 
+/// What a `run_all_` test prints when it fails, so a red run on a platform
+/// nobody here can reproduce on says why (PR #1672: build-macos failed with an
+/// empty terminal and nothing else to go on).
+struct Diagnostics {
+    /// The fixture root; every process of the run carries a path under it.
+    root: PathBuf,
+    sandbox: PathBuf,
+    /// The script's pid, whose descendants are listed whatever their argv.
+    script_pid: Option<u32>,
+    port: u16,
+    started: Instant,
+    phases: Vec<(String, Duration)>,
+}
+
+impl Diagnostics {
+    fn new(root: &Path, sandbox: &Path, port: u16) -> Diagnostics {
+        Diagnostics {
+            root: root.to_path_buf(),
+            sandbox: sandbox.to_path_buf(),
+            script_pid: None,
+            port,
+            started: Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    /// Mark the end of a phase, timed from the end of the one before.
+    fn phase(&mut self, name: &str) {
+        let since = self.phases.iter().map(|(_, d)| *d).sum::<Duration>();
+        self.phases.push((
+            name.to_string(),
+            self.started.elapsed().saturating_sub(since),
+        ));
+    }
+
+    fn timings(&self) -> String {
+        let mut out = String::new();
+        for (name, d) in &self.phases {
+            out.push_str(&format!("  {name}: {:.2}s\n", d.as_secs_f64()));
+        }
+        out.push_str(&format!(
+            "  total so far: {:.2}s\n",
+            self.started.elapsed().as_secs_f64()
+        ));
+        out
+    }
+
+    /// Everything known about the run, for a failure message.
+    fn report(&self) -> String {
+        format!(
+            "\n--- phases ---\n{}--- tools ---\n{}--- vite-port probe ---\n{}--- processes ---\n{}--- sandbox {} ---\n{}",
+            self.timings(),
+            tools_report(),
+            probe_report(self.port),
+            self.processes(),
+            self.sandbox.display(),
+            files_report(&self.sandbox),
+        )
+    }
+
+    /// `ps` for the script's descendants and anything naming the fixture,
+    /// with the fields that say who holds the terminal. The flags are ones
+    /// procps and BSD `ps` both take.
+    fn processes(&self) -> String {
+        let out = match Command::new("ps")
+            .args(["-A", "-ww", "-o", "pid,ppid,pgid,sess,tpgid,stat,tty,args"])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => return format!("ps: {e}\n"),
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        let header = lines.next().unwrap_or_default();
+        let rows: Vec<(u32, u32, &str)> = lines
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let pid = f.next()?.parse().ok()?;
+                let ppid = f.next()?.parse().ok()?;
+                Some((pid, ppid, l))
+            })
+            .collect();
+        let mut ours: Vec<u32> = self.script_pid.into_iter().collect();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (pid, ppid, _) in &rows {
+                if ours.contains(ppid) && !ours.contains(pid) {
+                    ours.push(*pid);
+                    grew = true;
+                }
+            }
+        }
+        let root = self.root.to_string_lossy();
+        let mut report = format!("{header}\n");
+        for (pid, _, line) in &rows {
+            if ours.contains(pid) || line.contains(root.as_ref()) {
+                report.push_str(line);
+                report.push('\n');
+            }
+        }
+        report.push_str(&String::from_utf8_lossy(&out.stderr));
+        report
+    }
+}
+
+/// Which bash and perl a run gets, and on what.
+fn tools_report() -> String {
+    let probe = r#"
+        echo "uname: $(uname -sr)"
+        echo "bash: $(command -v bash) $(bash -c 'echo $BASH_VERSION')"
+        echo "perl: $(command -v perl) $(perl -e 'print $]')"
+        echo "sleep 0.1: $(sleep 0.1 && echo ok)"
+    "#;
+    match Command::new("sh").args(["-c", probe]).output() {
+        Ok(out) => combined(&out),
+        Err(e) => format!("sh: {e}\n"),
+    }
+}
+
+/// How a connect to the held port goes, from Rust and bounded: the script's
+/// preflight makes the same connect from bash.
+fn probe_report(port: u16) -> String {
+    let mut out = String::new();
+    for addr in ["127.0.0.1", "[::1]"] {
+        let Ok(sa) = format!("{addr}:{port}").parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        let t = Instant::now();
+        let result = std::net::TcpStream::connect_timeout(&sa, Duration::from_secs(2));
+        let what = match result {
+            Ok(_) => "connected".to_string(),
+            Err(e) => format!("{:?}: {e}", e.kind()),
+        };
+        out.push_str(&format!(
+            "  {sa}: {what} after {}ms\n",
+            t.elapsed().as_millis()
+        ));
+    }
+    out
+}
+
+/// Every file in the sandbox, with the contents of the small ones.
+fn files_report(dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return "(no sandbox dir)\n".to_string();
+    };
+    let mut out = String::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push_str(&format!("{} ({len} bytes)\n", path.display()));
+        if path.is_file() && len <= 16 * 1024 {
+            for line in fs::read_to_string(&path).unwrap_or_default().lines() {
+                out.push_str(&format!("  | {line}\n"));
+            }
+        }
+    }
+    out
+}
+
 /// Kills a leftover desktop group if the test fails before the script's own
 /// teardown runs.
 struct GroupGuard(Option<String>);
@@ -968,11 +1131,14 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     let port = free_port();
     cmd.env("DAD_SANDBOX_RUN_VITE_PORT", port.port.to_string());
     cmd.cwd(&f.root);
+    let mut diag = Diagnostics::new(&f.root, &sandbox, port.port);
     let mut child = pty
         .slave
         .spawn_command(cmd)
         .expect("spawn the script on the pty");
     drop(pty.slave);
+    diag.script_pid = child.process_id();
+    diag.phase("spawn the script on a pty");
 
     let mut reader = pty.master.try_clone_reader().expect("pty reader");
     let mut writer = pty.master.take_writer().expect("pty writer");
@@ -1000,9 +1166,13 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     };
 
     if !wait_for("TUI pgid=", &mut seen) {
+        diag.phase("wait for the TUI stand-in's report (timed out)");
+        // Gathered before the kill, so the stuck processes are in it.
+        let report = diag.report();
         let _ = child.kill();
-        panic!("the TUI stand-in never reported; terminal output:\n{seen}");
+        panic!("the TUI stand-in never reported; terminal output:\n{seen}{report}");
     }
+    diag.phase("wait for the TUI stand-in's report");
     let mut guard = GroupGuard(
         fs::read_to_string(sandbox.join("desktop.pgid"))
             .ok()
@@ -1019,8 +1189,8 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     // never tried to take the terminal.
     assert!(
         !attempt.is_empty(),
-        "the desktop stand-in never ran, so nothing tried to take the terminal; desktop.log:\n{}\noutput:\n{seen}",
-        fs::read_to_string(sandbox.join("desktop.log")).unwrap_or_default()
+        "the desktop stand-in never ran, so nothing tried to take the terminal; output:\n{seen}{}",
+        diag.report()
     );
     let mut fields = report.split_whitespace().filter_map(|w| w.split_once('='));
     let pgid = fields
@@ -1032,23 +1202,28 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
         .map(|(_, v)| v.to_string())
         .unwrap_or_default();
     assert_eq!(
-        pgid, tpgid,
-        "the TUI is not in the terminal's foreground group (desktop stand-in: {attempt}); output:\n{seen}"
+        pgid,
+        tpgid,
+        "the TUI is not in the terminal's foreground group (desktop stand-in: {attempt}); output:\n{seen}{}",
+        diag.report()
     );
     // The keeper is a shell without job control, which starts a background
     // command with SIGINT and SIGQUIT ignored; the desktop's tree must not
     // inherit that.
     assert!(
         attempt.contains("int-default"),
-        "the desktop started with SIGINT ignored: {attempt}"
+        "the desktop started with SIGINT ignored: {attempt}{}",
+        diag.report()
     );
 
     writer.write_all(b"hello\r").expect("type at the TUI");
     writer.flush().unwrap();
     assert!(
         wait_for("GOT:hello", &mut seen),
-        "the TUI did not read the line typed at it (desktop stand-in: {attempt}); output:\n{seen}"
+        "the TUI did not read the line typed at it (desktop stand-in: {attempt}); output:\n{seen}{}",
+        diag.report()
     );
+    diag.phase("type a line and read it back");
 
     // The TUI exits after one line, and the script's teardown stops the
     // desktop's group.
@@ -1057,16 +1232,19 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
         if let Some(status) = child.try_wait().expect("wait for the script") {
             assert!(
                 status.success(),
-                "the script failed: {status:?}; output:\n{seen}"
+                "the script failed: {status:?}; output:\n{seen}{}",
+                diag.report()
             );
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the script did not exit; output:\n{seen}"
+            "the script did not exit; output:\n{seen}{}",
+            diag.report()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    diag.phase("wait for the script's teardown");
     let pgid = guard
         .0
         .clone()
@@ -1078,9 +1256,18 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     let alive = String::from_utf8_lossy(&members.stdout)
         .lines()
         .any(|l| l.trim() == pgid);
-    assert!(!alive, "the desktop's group {pgid} outlived the TUI");
-    assert!(!sandbox.join("desktop.pgid").exists());
+    assert!(
+        !alive,
+        "the desktop's group {pgid} outlived the TUI{}",
+        diag.report()
+    );
+    assert!(
+        !sandbox.join("desktop.pgid").exists(),
+        "desktop.pgid outlived the teardown{}",
+        diag.report()
+    );
     guard.0 = None;
+    eprintln!("{test} phases:\n{}", diag.timings());
 }
 
 /// The TUI stand-in for the teardown-race test: exits the moment it starts.
@@ -1138,6 +1325,7 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
     );
     let port = free_port();
     let port_arg = port.port.to_string();
+    let mut diag = Diagnostics::new(&f.root, &sandbox, port.port);
     let out = f.run_with_env(
         "all",
         &f.cfg(),
@@ -1152,7 +1340,20 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
         ],
     );
     fs::write(&exited, "").unwrap();
-    assert!(out.status.success(), "{}", combined(&out));
+    diag.phase("run the script to its exit");
+    assert!(out.status.success(), "{}{}", combined(&out), diag.report());
+    // The script's own waits add up to about eight seconds at most (the
+    // vite-port probes, the keeper's two seconds, the group's five), so a run
+    // past a minute is a wait that never saw what it waited for — on macOS,
+    // before the probe was bounded, it took 151 seconds.
+    let ran = diag.phases.last().map(|(_, d)| *d).unwrap_or_default();
+    assert!(
+        ran < Duration::from_secs(60),
+        "the script took {:.1}s to exit; output:\n{}{}",
+        ran.as_secs_f64(),
+        combined(&out),
+        diag.report()
+    );
 
     // Wait, bounded, until nothing of the desktop's is alive: a keeper that
     // outlived the script carries the sandbox path in its argv from perl
@@ -1187,6 +1388,13 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
         std::thread::sleep(Duration::from_millis(100));
         left = still_running();
     }
+    diag.phase("wait for the desktop's processes to go");
+    // Gathered before the kill, so what outlived the script is in it.
+    let report = if left.is_empty() {
+        String::new()
+    } else {
+        diag.report()
+    };
     for line in &left {
         if let Some(pid) = line.split_whitespace().next() {
             let _ = Command::new("kill").args(["-KILL", pid]).status();
@@ -1195,8 +1403,13 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
     let started = fs::read_to_string(&mark).unwrap_or_default();
     assert!(
         !started.contains("after-exit"),
-        "a desktop started after run-all had exited: {started}; output:\n{}",
-        combined(&out)
+        "a desktop started after run-all had exited: {started}; output:\n{}{}",
+        combined(&out),
+        diag.report()
     );
-    assert!(left.is_empty(), "the desktop outlived run-all: {left:?}");
+    assert!(
+        left.is_empty(),
+        "the desktop outlived run-all: {left:?}{report}"
+    );
+    eprintln!("{test} phases:\n{}", diag.timings());
 }
