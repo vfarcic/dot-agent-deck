@@ -382,22 +382,7 @@ fn teardown_inventory(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         .preconnect_logged("old TUI: Stop stimulus", &plan.env, ctx.ev)?;
     // Command mode first, read off the footer: Ctrl+D toggles, and Ctrl+C in
     // PaneInput would go to the focused pane (issue #1392).
-    if !inner::ensure_command_mode(ctx.tui) {
-        return Err(Abort::Scenario(format!(
-            "the old TUI never showed a COMMAND footer, so Ctrl+C was not sent.\n=== grid ===\n{}",
-            ctx.tui.grid()
-        )));
-    }
-    ctx.tui.send(b"\x03");
-    if !ctx
-        .tui
-        .wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT)
-    {
-        return Err(Abort::Scenario(format!(
-            "Ctrl+D then Ctrl+C never opened the quit dialog in the old TUI.\n=== grid ===\n{}",
-            ctx.tui.grid()
-        )));
-    }
+    inner::open_quit_dialog(ctx.tui, "the old TUI").map_err(Abort::Scenario)?;
     ctx.tui.send(b"\x1b[B"); // Down -> Stop (index 1)
     // Enter takes whichever option is selected, so it goes only once the
     // dialog marks Stop selected (`> Stop`, `render_quit_confirm`) rather than

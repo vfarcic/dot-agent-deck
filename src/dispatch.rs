@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
+    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree_from, record_worktree,
     remove_worktree, run_git_capture, run_git_status,
 };
 use crate::scheduler::StderrNotifier;
@@ -362,7 +362,7 @@ fn names_a_relative_path(command: &str) -> bool {
     })
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
         .replace("..", "_")
         .replace('\0', "")
@@ -415,41 +415,89 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
     }
 }
 
-/// Human-readable description of the commit a dispatch is about to cut its
-/// worktree from — `"main at c701932"`, or `"detached HEAD at c701932"`.
+/// The commit a dispatch cuts its worktree from, read once from the caller's
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchBase {
+    /// The full sha `HEAD` resolved to. [`create_dispatch_worktree`] passes it
+    /// to `git worktree add` as the start-point, so this IS the unit's base.
+    sha: String,
+    /// What the success line reports — `"main at c701932"`, or
+    /// `"detached HEAD at c701932"` — naming the same commit as [`Self::sha`].
+    description: String,
+}
+
+/// Read the commit a dispatch is about to cut its worktree from.
 ///
-/// Issue #674: `dispatch` takes no base or branch option. [`create_worktree`]
-/// runs `git worktree add <dir> -b <branch>` with no start-point, which git
-/// resolves to the CALLER's `HEAD`, so the freshness of the caller's checkout is
-/// the only thing deciding where a unit starts — and nothing in the dispatch
-/// output named it. A stale or simply unexpected base (a feature branch the user
+/// Issue #674: `dispatch` takes no base or branch option and cuts every unit
+/// from the CALLER's `HEAD`, so the freshness of the caller's checkout is the
+/// only thing deciding where a unit starts — and nothing in the dispatch output
+/// named it. A stale or simply unexpected base (a feature branch the user
 /// happened to be standing on) was therefore invisible at the one moment the
 /// user is looking: three units cut from a `main` six commits behind
 /// `origin/main` reported exactly the same success line as three cut from a
 /// current one.
 ///
-/// Deliberately best-effort and `Option`: this is a reporting nicety on a path
-/// that has already done the real work, so a probe that fails must drop the
-/// clause rather than fail the dispatch. Read BEFORE the worktree is created,
-/// which is the state `git worktree add` will actually resolve.
-async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
+/// Issue #1643: `HEAD` is resolved to a full sha HERE, once, and that sha is
+/// both what the clause reports and what the worktree is cut from (see
+/// [`create_dispatch_worktree`]). Before, git resolved `HEAD` a second time
+/// inside `git worktree add`, so a `HEAD` that moved in between left the reply
+/// naming one commit and the unit starting from another. The branch NAME in the
+/// description is read separately and is a label; the sha is the base.
+///
+/// Deliberately best-effort and `Option`: this is a reporting nicety, so a
+/// probe that fails drops the clause rather than failing the dispatch, and the
+/// worktree is then cut without a start-point, as it always was.
+async fn resolve_dispatch_base(clone_dir: &Path) -> Option<DispatchBase> {
     let clone = clone_dir.to_string_lossy();
+    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--verify", "HEAD^{commit}"])
+        .await
+        .ok()?;
+    let sha = sha.trim();
+    // Abbreviated from the sha just read, never from a fresh `HEAD`, so the
+    // short form cannot name a different commit than the full one.
+    let short = run_git_capture(&["-C", &clone, "rev-parse", "--short", sha])
+        .await
+        .ok()?;
     let head = run_git_capture(&["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .ok()?;
-    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--short", "HEAD"])
-        .await
-        .ok()?;
-    let (head, sha) = (head.trim(), sha.trim());
-    if head.is_empty() || sha.is_empty() {
+    let (head, short) = (head.trim(), short.trim());
+    if sha.is_empty() || short.is_empty() || head.is_empty() {
         return None;
     }
     // `rev-parse --abbrev-ref HEAD` answers the literal string `HEAD` when the
     // checkout is detached, which as a branch name would read as a lie.
-    if head == "HEAD" {
-        return Some(format!("detached HEAD at {sha}"));
-    }
-    Some(format!("{head} at {sha}"))
+    let description = if head == "HEAD" {
+        format!("detached HEAD at {short}")
+    } else {
+        format!("{head} at {short}")
+    };
+    Some(DispatchBase {
+        sha: sha.to_string(),
+        description,
+    })
+}
+
+/// Create a dispatch's worktree from `base` — the commit the success line will
+/// report — rather than from whatever `HEAD` is by the time `git worktree add`
+/// runs (issue #1643). With no base (the probe failed) git resolves `HEAD`
+/// itself, which is what every dispatch did before.
+async fn create_dispatch_worktree(
+    clone_dir: &Path,
+    paths: &DispatchPaths,
+    name: &str,
+    base: Option<&DispatchBase>,
+) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        false,
+        Creator::dispatch(name),
+        base.map(|b| b.sha.as_str()),
+    )
+    .await
 }
 
 /// Whether `dir` is the top of its git working tree — where a unit cut from it
@@ -768,20 +816,11 @@ pub async fn handle_dispatch(
         }
     };
 
-    // Captured before the worktree exists, so it names the state `git worktree
-    // add` resolves its (absent) start-point against. See
-    // [`describe_dispatch_base`] for why this is reported at all.
-    let base = describe_dispatch_base(&clone_dir).await;
+    // Read once, and the worktree is cut from exactly this sha, so the base the
+    // reply names is the unit's base. See [`resolve_dispatch_base`].
+    let base = resolve_dispatch_base(&clone_dir).await;
 
-    match create_worktree(
-        &clone_dir,
-        &paths.worktree_dir,
-        &paths.branch,
-        false,
-        Creator::dispatch(name),
-    )
-    .await
-    {
+    match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref()).await {
         Ok(WorktreeCreation::Created) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
@@ -862,49 +901,50 @@ pub async fn handle_dispatch(
 
     let notifier = StderrNotifier;
 
-    match spawn(
-        req,
-        &ctx.registry,
-        &notifier,
-        Some(&ctx.event_tx),
-        false,
-        ctx.state.as_ref(),
-    )
-    .await
-    {
+    // PRD #1589 D5: a dispatch with a caller is a unit the `close` verb can
+    // later be authorized against, so it is recorded — inside the spawn, before
+    // its task is delivered (see `spawn_dispatched_unit`). A dispatch with no
+    // caller (an internal caller with nobody to report to) records nothing.
+    let spawned = match ctx.caller.as_ref() {
+        Some(caller) => {
+            crate::spawn::spawn_dispatched_unit(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+                crate::dispatched_units::UnitOrigin {
+                    name: name.to_string(),
+                    worktree: paths.worktree_dir.clone(),
+                    branch: paths.branch.clone(),
+                    clone_dir: clone_dir.clone(),
+                    dispatcher: crate::dispatched_units::Dispatcher {
+                        pane_id: caller.pane_id.clone(),
+                        agent_id: caller.agent_id.clone(),
+                    },
+                },
+                caller.clone(),
+            )
+            .await
+        }
+        None => {
+            spawn(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+            )
+            .await
+        }
+    };
+    match spawned {
         Ok(handle) => {
-            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
-            // the single agent's pane, or the orchestration's start role — which is
-            // the pane a `work-done --done` will arrive under. Registered here, at
-            // the first moment that pane id exists, rather than by the daemon after
-            // this call returns: every instant between the spawn and the
-            // registration is an instant in which a completion resolves to nothing.
-            if let Some(caller) = ctx.caller.clone() {
-                tracing::debug!(
-                    unit_pane_id = %handle.delivery_pane_id,
-                    unit_agent_id = %handle.delivery_agent_id,
-                    caller_pane_id = %caller.pane_id,
-                    // PRD #220 Phase 2 review (finding A4), missed here and caught
-                    // by PR #1081's review (Greptile finding 3): the unit name is
-                    // producer-supplied and rode into this field raw, where a bare
-                    // LF forges a log line, a CR overwrites the one being written
-                    // and a bidi override reorders whatever renders it.
-                    unit = %crate::config_validation::escape_field_for_log(
-                        &caller.unit_name,
-                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-                    ),
-                    "dispatch: retained the caller for this unit's completion report"
-                );
-                // Bound to the unit's AGENT as well as its pane: a pane id is a
-                // recycled handle, and a predecessor's late EOF would otherwise
-                // evict this route out from under the agent that now holds the
-                // pane (PR #1081 review, Greptile finding 1).
-                ctx.registry.register_dispatch_return(
-                    &handle.delivery_pane_id,
-                    &handle.delivery_agent_id,
-                    caller,
-                );
-            }
+            // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
+            // unit's completion report inside the spawn, before the task was
+            // delivered — see `crate::spawn::spawn_dispatched_unit`.
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: true,
@@ -919,19 +959,26 @@ pub async fn handle_dispatch(
                 // The base clause is appended rather than interpolated into both
                 // arms so a failed probe degrades to the pre-#674 sentence exactly,
                 // instead of leaving a dangling "cut from ".
+                //
+                // PRD #1589: the branch is named too, so a runner can record the
+                // branch each unit works on as dispatch created it — what
+                // `/issue-queue` intersects with the merged branches before a
+                // `close --all` — instead of reconstructing it from the name.
                 message: {
                     let opened = match &handle.kind {
                         SpawnKind::Orchestration { name: orch } => format!(
-                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                         SpawnKind::SingleAgent => format!(
-                            "{SPAWNED_OPENING} agent for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} agent for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                     };
                     let mut msg = match &base {
-                        Some(base) => format!("{opened}, cut from {base}"),
+                        Some(base) => format!("{opened}, cut from {}", base.description),
                         None => opened,
                     };
                     // Only for an orchestration: a `--single` dispatch consulted no
@@ -1089,7 +1136,7 @@ async fn rollback_dispatched_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::issue_dispatch_run::{new_worktree_registry, take_worktree};
+    use crate::issue_dispatch_run::{create_worktree, new_worktree_registry, take_worktree};
 
     /// Build a real git repo with one commit, so the `git worktree` primitives
     /// under test operate on a genuine repo rather than a stubbed one.
@@ -1174,19 +1221,83 @@ mod tests {
         init_repo_in(tmp.path(), &repo);
         git_in(tmp.path(), &repo, &["checkout", "-q", "-b", "feature-x"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
             .expect("a healthy repo must yield a base");
 
-        let sha = String::from_utf8(
-            crate::git_env::fixture_git(&repo, tmp.path())
-                .args(["rev-parse", "--short", "HEAD"])
-                .output()
-                .expect("git available")
-                .stdout,
-        )
-        .unwrap();
-        assert_eq!(base, format!("feature-x at {}", sha.trim()));
+        assert_eq!(
+            base.description,
+            format!(
+                "feature-x at {}",
+                git_out(tmp.path(), &repo, &["rev-parse", "--short", "HEAD"])
+            )
+        );
+        assert_eq!(base.sha, git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]));
+    }
+
+    /// `git` in `repo`, trimmed stdout.
+    fn git_out(sandbox_root: &Path, repo: &Path, args: &[&str]) -> String {
+        let out = crate::git_env::fixture_git(repo, sandbox_root)
+            .args(args)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Issue #1643: the base the reply names must be the base the unit is cut
+    /// from, even when the caller's `HEAD` moves after it was read. Before the
+    /// fix, `git worktree add -b` got no start-point and read `HEAD` a second
+    /// time, so a commit landing in between put the unit on the NEW commit
+    /// while the reply named the old one.
+    #[tokio::test]
+    async fn dispatch_worktree_is_cut_from_the_reported_base_when_head_moves() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "race");
+
+        let base = resolve_dispatch_base(&repo)
+            .await
+            .expect("a healthy repo must yield a base");
+        // `HEAD` moves between the probe and the worktree creation.
+        git_in(
+            tmp.path(),
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "moved"],
+        );
+        let moved = git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]);
+        assert_ne!(moved, base.sha, "the premise: HEAD really moved");
+
+        assert_eq!(
+            create_dispatch_worktree(&repo, &paths, "race", Some(&base)).await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            base.sha,
+            "the unit must start at the reported base ({}), not at the moved HEAD",
+            base.description
+        );
+    }
+
+    /// With no base (the probe failed), the worktree is still cut, from the
+    /// caller's `HEAD`, exactly as before issue #1643.
+    #[tokio::test]
+    async fn dispatch_worktree_without_a_base_is_cut_from_head() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "no-base");
+
+        assert_eq!(
+            create_dispatch_worktree(&repo, &paths, "no-base", None).await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            git_out(tmp.path(), &repo, &["rev-parse", "HEAD"])
+        );
     }
 
     /// Issue #1602 (PR #1603 review): the root of a repository is where a
@@ -1217,9 +1328,10 @@ mod tests {
         init_repo_in(tmp.path(), &repo);
         git_in(tmp.path(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
-            .expect("a detached checkout is still a healthy repo");
+            .expect("a detached checkout is still a healthy repo")
+            .description;
 
         assert!(
             base.starts_with("detached HEAD at "),
@@ -1237,7 +1349,7 @@ mod tests {
         let not_a_repo = tmp.path().join("plain-dir");
         std::fs::create_dir_all(&not_a_repo).unwrap();
 
-        assert_eq!(describe_dispatch_base(&not_a_repo).await, None);
+        assert_eq!(resolve_dispatch_base(&not_a_repo).await, None);
     }
 
     // --- slug + path derivation ---
@@ -2170,6 +2282,16 @@ mod tests {
             "the reported shape must say orchestration, got: {}",
             result.message
         );
+        // PRD #1589: the reply names the branch the unit works on, which is what
+        // `/issue-queue` records per unit for its `close --all` ledger.
+        assert!(
+            result.message.contains(&format!(
+                "in {} on branch agent/dispatch-team-unit",
+                worktree.display()
+            )),
+            "the success reply must name the worktree and its branch, got: {}",
+            result.message
+        );
 
         // Issue #1233: the orchestration's own per-publish file, not the
         // compatibility mirror beside it.
@@ -2666,6 +2788,200 @@ mod tests {
         );
         assert!(!worktree_dir.exists());
         assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"));
+    }
+
+    /// Scenario: reviewer nit-R1 (PRD #1589) — a dispatched orchestration is
+    /// closed while it is starting, and its dispatch resumes while the close
+    /// still holds the instance: one role stopped, the other still running in
+    /// the worktree. The dispatch answers that it was closed, and its rollback
+    /// finds a live role and retains the worktree; the close then stops that
+    /// role and removes the worktree itself, reporting it. The worktree is
+    /// never left behind with nothing to reclaim it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_closed_mid_construction_leaves_no_orphaned_worktree() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::spawn::{RoleSpawn, SpawnTarget};
+        struct SilentNotifier;
+        impl crate::scheduler::Notifier for SilentNotifier {
+            fn notify(&self, _event: crate::scheduler::NotifyEvent) {}
+        }
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let worktree_dir = repo.parent().unwrap().join("repo-dispatch-nit-r1");
+        let branch = "agent/dispatch-nit-r1";
+        create_worktree(
+            &repo,
+            &worktree_dir,
+            branch,
+            false,
+            Creator::dispatch("nit-r1"),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _keep) = tokio::sync::broadcast::channel(1024);
+        let worktrees = new_worktree_registry();
+        record_worktree(&worktrees, &worktree_dir, &repo, RemovalPolicy::KeepIfDirty);
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+
+        let (dispatch_reached, dispatch_release) =
+            registry.pause_at_for_test("dispatch-publication");
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let role = |idx: usize, name: &str| RoleSpawn {
+                agent_type: None,
+                role_index: idx,
+                role_name: name.to_string(),
+                command: "sleep 30".to_string(),
+                is_start_role: idx == 0,
+            };
+            let req = SpawnRequest {
+                task_name: "dispatch-nit-r1".to_string(),
+                working_dir: worktree_dir.to_string_lossy().into_owned(),
+                command: None,
+                prompt: "unused".to_string(),
+                resolved_target: Some(SpawnTarget::Orchestration {
+                    name: "nit-r1".to_string(),
+                    roles: vec![role(0, "orchestrator"), role(1, "worker")],
+                    config: Box::new(OrchestrationConfig {
+                        default: false,
+                        name: "nit-r1".to_string(),
+                        roles: vec![OrchestrationRoleConfig {
+                            agent: None,
+                            name: "orchestrator".to_string(),
+                            command: "sleep 30".to_string(),
+                            start: true,
+                            description: None,
+                            prompt_template: None,
+                            clear: false,
+                        }],
+                    }),
+                }),
+                compose_orchestrator_context: None,
+            };
+            let origin = crate::dispatched_units::UnitOrigin {
+                name: "nit-r1".to_string(),
+                worktree: worktree_dir.clone(),
+                branch: branch.to_string(),
+                clone_dir: repo.clone(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "nobody".to_string(),
+                },
+            };
+            let caller = crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".to_string(),
+                agent_id: "nobody".to_string(),
+                unit_name: "nit-r1".to_string(),
+            };
+            tokio::spawn(async move {
+                crate::spawn::spawn_dispatched_unit(
+                    req,
+                    &registry,
+                    &SilentNotifier,
+                    Some(&event_tx),
+                    true,
+                    Some(&state),
+                    origin,
+                    caller,
+                )
+                .await
+                .map(|handle| handle.unit_id)
+            })
+        };
+        dispatch_reached
+            .await
+            .expect("the dispatch reaches its publication");
+        let orchestrator = registry
+            .agent_records()
+            .into_iter()
+            .find(|r| {
+                matches!(
+                    &r.tab_membership,
+                    Some(crate::agent_pty::TabMembership::Orchestration {
+                        is_start_role: true,
+                        ..
+                    })
+                )
+            })
+            .and_then(|r| r.pane_id_env)
+            .expect("the orchestrator was published");
+
+        let (close_reached, close_release) = registry.pause_at_for_test("close-after-first-stop");
+        let close = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let worktrees = worktrees.clone();
+            tokio::spawn(async move {
+                crate::close_agents::handle_close_agents(
+                    crate::daemon_protocol::CloseSelector::OrchestrationOf {
+                        pane_id: orchestrator,
+                    },
+                    None,
+                    false,
+                    false,
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &worktrees,
+                )
+                .await
+            })
+        };
+        close_reached
+            .await
+            .expect("the close stops the orchestrator and pauses");
+
+        let _ = dispatch_release.send(());
+        let result = spawned.await.unwrap();
+        assert!(
+            matches!(&result, Err(crate::spawn::SpawnError::Agent(m))
+                if m == crate::spawn::CLOSED_WHILE_STARTING),
+            "{result:?}"
+        );
+        let rollback =
+            rollback_dispatched_worktree(&registry, &worktrees, &worktree_dir, &repo, branch).await;
+        assert_eq!(
+            rollback,
+            RollbackOutcome::Retained { live: 1 },
+            "the close is still stopping the worker, so the rollback leaves the tree"
+        );
+        assert!(
+            worktrees.lock().unwrap().contains_key(&worktree_dir),
+            "a retained tree keeps the entry a later cleanup finds it by"
+        );
+
+        let _ = close_release.send(());
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(
+            target.outcome,
+            crate::daemon_protocol::CloseOutcome::Closed,
+            "{target:?}"
+        );
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(crate::daemon_protocol::WorktreeVerdictKind::Removed),
+            "the close that owns the teardown reclaims the tree: {target:?}"
+        );
+        assert!(!worktree_dir.exists(), "the worktree is not orphaned");
+        assert!(!worktrees.lock().unwrap().contains_key(&worktree_dir));
+        assert!(registry.agent_records().is_empty());
+        assert_eq!(registry.dispatched_units().live().count(), 0);
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a

@@ -742,8 +742,11 @@ fn scheduler_idle_worker_024_blocked_worker_notices_orchestrator_once() {
         "delegate failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
+    // Issue #1650: this `clear = false` Codex stand-in was spawned moments ago
+    // and stays silent until the trigger below, so the deck holds the pointer
+    // for the whole 30 s readiness window before typing it.
     assert!(
-        common::wait_until(Duration::from_secs(15), || {
+        common::wait_until(Duration::from_secs(45), || {
             role_pane_text(&deck, "worker").contains("worker-task-worker")
         }),
         "task pointer did not reach worker PTY"

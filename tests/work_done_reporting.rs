@@ -535,6 +535,16 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
             "the respawn-failure report must be SUBMITTED (CR after its final clause), not left \
              as an LF line in scrollback; snapshot = {after_delegate:?}"
         );
+        // The ledger is settled before the report goes out, so anything that
+        // answers the report finds no commission left to spend. Released after
+        // it instead, a `work-done` sent on seeing the report could land first
+        // and be laundered into a solicited one, as it did on a quiet macOS
+        // runner on 2026-10-10.
+        assert!(
+            !harness.registry.owes_delegation_commission(WORKER_PANE),
+            "the respawn-failure report must not be visible while the dead delegate's \
+             commission still stands"
+        );
 
         // The delegate never reached the worker, so a completion arriving now was
         // asked for by a person, not by the orchestrator.

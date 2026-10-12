@@ -1562,13 +1562,32 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
 #[spec("dispatch/return/006")]
 #[test]
 fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
+    real_single_dispatch_round_trip(false);
+}
+
+/// Scenario: An interactive Haiku dispatcher starts a single unit that discovers
+/// a committed sentinel and reports completion. Asked to close that unit, the
+/// dispatcher runs the close CLI itself; the unit disappears while it stays alive.
+#[spec("dispatch/close-verb/008")]
+#[test]
+fn close_verb_008_real_dispatcher_closes_its_reported_single_unit() {
+    real_single_dispatch_round_trip(true);
+}
+
+fn real_single_dispatch_round_trip(close_after_report: bool) {
     // Decision 26 runtime-skip: missing CLI / credentials is environmental.
     skip_unless!(common::check_claude_available());
 
-    const UNIT: &str = "live-return-probe";
+    let unit = if close_after_report {
+        "live-close-probe"
+    } else {
+        "live-return-probe"
+    };
     const SENTINEL_PREFIX: &str = "dispatch-return-live-sentinel-";
     const SENTINEL: &str = "dispatch-return-live-sentinel-6f2c.txt";
     const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+    const CLOSE_MAX_LIFETIME_SECS: &str = "900";
+    const RETURN_MAX_LIFETIME_SECS: &str = "300";
 
     // Both the dispatcher and the unit it spawns inherit this command. Keep them
     // fully interactive (no `-p`), pin the cheap model, and pre-allow every tool
@@ -1580,6 +1599,14 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(220, 60)
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            if close_after_report {
+                CLOSE_MAX_LIFETIME_SECS
+            } else {
+                RETURN_MAX_LIFETIME_SECS
+            },
+        )
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .with_env(
@@ -1602,7 +1629,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     .expect("write the uniquely named fixture sentinel");
     common::commit_fixture_repo(deck.workdir());
 
-    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let expected_worktree = dispatch_worktree_of(&deck, unit);
     let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     // Trust the not-yet-created sibling worktree before dispatch, so the unit's
@@ -1679,7 +1706,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     // responsible for teaching the fresh agent how to signal completion.
     let directive = format!(
         "Use Bash to run exactly this command now, then wait for its result: \
-         dot-agent-deck dispatch {UNIT} --single --task \"Use Bash to list the repo root. \
+         dot-agent-deck dispatch {unit} --single --task \"Use Bash to list the repo root. \
          Find the only filename beginning {SENTINEL_PREFIX}. Report the full matching \
          filename and say whether it exists. Do not ask questions.\" \
          Do not inspect the files or do the unit's work yourself, and do not ask me anything first."
@@ -1698,7 +1725,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     const RETURN_WAIT: Duration = Duration::from_secs(240);
     let completion_stem = common::search_key("dispatch: a unit you dispatched has completed");
     let unit_frame = common::search_key(&format!(
-        "[UNTRUSTED-ROLE-LABEL: {UNIT} :END-UNTRUSTED-ROLE-LABEL]"
+        "[UNTRUSTED-ROLE-LABEL: {unit} :END-UNTRUSTED-ROLE-LABEL]"
     ));
     let report_open = common::search_key("[UNTRUSTED-WORKER-REPORT:");
     let report_close = common::search_key(":END-UNTRUSTED-WORKER-REPORT]");
@@ -1722,7 +1749,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
                     .is_some_and(|report| report.contains(SENTINEL))
         }),
         "the real unit never returned a visible completion to the dispatcher within {}s. \
-         Expected the dispatcher's grid to carry `dispatch:`, unit {UNIT:?} in an \
+         Expected the dispatcher's grid to carry `dispatch:`, unit {unit:?} in an \
          `UNTRUSTED-ROLE-LABEL` frame, the word `completed`, and the unit-discovered \
          sentinel {SENTINEL:?} inside an `UNTRUSTED-WORKER-REPORT` frame. \
          worktree_exists={}. No test code invoked `work-done`, so a missing completion \
@@ -1741,6 +1768,88 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
             .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
+
+    if close_after_report {
+        let dashboard_shows_unit = || {
+            deck.snapshot_grid().lines().any(|line| {
+                // The dashboard uses heavy borders; the first light border
+                // starts the pane with historical paths/reports.
+                line.split('│')
+                    .next()
+                    .is_some_and(|cell| cell.contains(&format!("dispatch-{unit}")))
+            })
+        };
+        assert!(
+            common::wait_until(Duration::from_secs(30), dashboard_shows_unit),
+            "the completed unit's card must be visible before close\n{}",
+            deck.snapshot_grid()
+        );
+        let records = common::agent_records_on(deck.attach_socket_path());
+        let unit_ids: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| Path::new(cwd) == expected_worktree)
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        assert!(
+            !unit_ids.is_empty(),
+            "the completed unit must still be registered before close"
+        );
+        assert_eq!(
+            dispatcher_ids.len(),
+            1,
+            "one real seeded dispatcher must own the unit"
+        );
+        assert!(
+            expected_worktree.is_dir(),
+            "unit worktree must exist before close"
+        );
+        // Wait for the completion turn to finish before entering the next user
+        // instruction into the same interactive dispatcher's prompt editor.
+        assert!(
+            common::wait_until_panes_settled(
+                deck.attach_socket_path(),
+                &dispatcher_ids,
+                Duration::from_millis(1500),
+                Duration::from_secs(8),
+                Duration::from_secs(90),
+            ),
+            "dispatcher did not settle after receiving completion\n{}",
+            deck.snapshot_grid()
+        );
+        let directive = format!(
+            "Use Bash to run exactly: dot-agent-deck close {unit}. \
+             This is the completed unit you dispatched. Run the command now, \
+             report its output, and leave your own pane open. Do not use git or \
+             any other cleanup command, do not dispatch again, and do not ask questions."
+        );
+        deck.send_keys(directive.as_bytes());
+        deck.send_keys(b"\r");
+        assert!(
+            common::wait_until(Duration::from_secs(180), || {
+                let records = common::agent_records_on(deck.attach_socket_path());
+                !expected_worktree.exists()
+                    && records.iter().all(|record| !unit_ids.contains(&record.id))
+                    && records.iter().any(|record| record.id == dispatcher_ids[0])
+                    && !dashboard_shows_unit()
+            }),
+            "the real dispatcher did not close its completed unit while staying alive. \
+             worktree_exists={}\nFinal grid:\n{}",
+            expected_worktree.exists(),
+            deck.snapshot_grid()
+        );
+        let dispatcher_text =
+            common::pane_search_key_on(deck.attach_socket_path(), &dispatcher_ids[0]);
+        assert!(
+            dispatcher_text.contains(&common::search_key(&format!("dot-agent-deck close {unit}"))),
+            "dispatcher's pane never showed the requested close command\n{}",
+            deck.snapshot_grid()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

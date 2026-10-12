@@ -980,6 +980,7 @@ async fn hello_response_carries_running_agents_and_daemon_version() {
         &AttachRequest::Hello {
             client_version: 3,
             client_build_version: None,
+            follow_on: false,
         },
     )
     .await;
@@ -1000,6 +1001,61 @@ async fn hello_response_carries_running_agents_and_daemon_version() {
         vec![id],
         "the summary names the running agent (id fallback — no display_name set)"
     );
+}
+
+// PRD #1589 (review on PR #1681): a `Hello` with `follow_on` keeps the
+// connection open for exactly one more request, which the daemon whose reply
+// advertised `hello-follow-on` serves; a `Hello` without it closes after the
+// reply, as it always did.
+#[tokio::test]
+async fn hello_follow_on_serves_one_more_request_on_the_same_connection() {
+    let server = start_server().await;
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    let hello = AttachRequest::Hello {
+        client_version: PROTOCOL_VERSION,
+        client_build_version: None,
+        follow_on: true,
+    };
+    write_request(&mut s, &hello).await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok);
+    assert!(
+        resp.capabilities
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c == dot_agent_deck::daemon_protocol::CAP_HELLO_FOLLOW_ON),
+        "the reply advertises the follow-on: {:?}",
+        resp.capabilities
+    );
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    let listed = read_response(&mut s).await;
+    assert!(listed.ok, "{:?}", listed.error);
+    // One only: the follow-on's own connection closes after its reply, even
+    // when that request is another `Hello` asking for a follow-on.
+    let mut buf = [0u8; 1];
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "closed after one");
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &hello).await;
+    read_response(&mut s).await;
+    write_request(&mut s, &hello).await;
+    assert!(read_response(&mut s).await.ok);
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "no second follow-on");
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: false,
+        },
+    )
+    .await;
+    read_response(&mut s).await;
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "no follow-on asked");
 }
 
 #[tokio::test]
@@ -2651,6 +2707,7 @@ async fn hello_advertises_the_project_capabilities() {
         &AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         },
     )
     .await;
@@ -2692,6 +2749,7 @@ async fn hello_names_the_daemon_process() {
             &AttachRequest::Hello {
                 client_version: PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .await;
@@ -2820,6 +2878,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -2939,6 +2999,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                     kind: TargetKind::Pty,
                     writable: Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             });
         }
         let mut attached = connect_attach(&server, &agent_id).await;
@@ -3017,6 +3079,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                     kind: TargetKind::Pty,
                     writable: Writable::Live,
                 }),
+                background: None,
+                background_revision: None,
             });
         }
         assert_eq!(
@@ -3257,6 +3321,8 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
                 kind: TargetKind::Process,
                 writable: Writable::HistoryOnly,
             }),
+            background: None,
+            background_revision: None,
         });
         let mut attached = connect_attach(&server, &agent_id).await;
         let marker = b"PANELESS-HISTORY-INPUT-LEAKED";
@@ -3313,6 +3379,8 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -3395,6 +3463,8 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -3455,6 +3525,8 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event(EventType::SessionStart, now));
         state.apply_event(event(
@@ -3530,6 +3602,8 @@ fn pane_input_043_second_producer_ordinary_frames_do_not_move_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -3695,6 +3769,8 @@ fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
                 kind: TargetKind::Process,
                 writable,
             }),
+            background: None,
+            background_revision: None,
         };
 
         let server = start_server().await;
@@ -4081,6 +4157,8 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
                 kind: TargetKind::Pty,
                 writable,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -4178,6 +4256,8 @@ fn stream_write_revalidates_liveness_after_writer_lock() {
                 kind: TargetKind::Pty,
                 writable,
             }),
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -4243,6 +4323,8 @@ async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner
         agent_version: None,
         schema_version: None,
         live_target: Some(live_target),
+        background: None,
+        background_revision: None,
     };
     {
         let mut state = server.state.write().await;
@@ -4349,6 +4431,8 @@ fn pane_input_014_stream_liveness_race_returns_typed_rejection() {
                     kind: TargetKind::Pty,
                     writable,
                 }),
+                background: None,
+                background_revision: None,
             };
             {
                 let mut state = server.state.write().await;

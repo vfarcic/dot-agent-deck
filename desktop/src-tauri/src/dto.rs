@@ -342,6 +342,72 @@ pub struct DesktopConnection {
     /// live bridge builds, and absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnected_reason: Option<DisconnectedReasonDto>,
+    /// Issue #1637: agents whose hooks on this deck run an older
+    /// `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+    /// from the daemon's `Hello` reply. Each carries the daemon's own remedy, so
+    /// this app and the TUI show the same words. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+}
+
+/// One hook-binary notice as the webview reads it (issue #1637). Every string
+/// is sanitized: a remote deck's daemon composed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookBinaryNoticeDto {
+    pub binary: String,
+    pub agents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub daemon_version: String,
+    pub reason: dot_agent_deck::daemon_protocol::HookBinaryReason,
+    pub remedy: String,
+    /// The command the Copy button copies, exactly as shown. Dropped, not
+    /// cleaned, when it carries anything a display would hide or alter (a
+    /// control, bidi or line-separator character), so what is copied is
+    /// always what is displayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Whether `command` can be shown and copied verbatim.
+fn is_copyable_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES
+        && !command.chars().any(|c| {
+            c.is_control()
+                || dot_agent_deck::untrusted_text::is_bidi_format_char(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
+}
+
+impl HookBinaryNoticeDto {
+    pub(crate) fn new(notice: &dot_agent_deck::daemon_protocol::HookBinaryNotice) -> Self {
+        let command = notice
+            .command
+            .as_deref()
+            .filter(|command| is_copyable_command(command))
+            .map(str::to_string);
+        let mut remedy = safe_display_text(&notice.remedy);
+        // A `Run:` whose command is dropped would end the strip with nothing
+        // to run, so it reads as the daemon's no-command advice instead.
+        if command.is_none() && remedy == dot_agent_deck::daemon_protocol::REMEDY_RUN {
+            remedy = dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL.to_string();
+        }
+        Self {
+            binary: safe_message(notice.binary.clone()),
+            agents: notice
+                .agents
+                .iter()
+                .map(|agent| safe_message(agent.clone()))
+                .collect(),
+            version: notice.version.clone().map(safe_message),
+            daemon_version: safe_message(notice.daemon_version.clone()),
+            reason: notice.reason,
+            remedy,
+            command,
+        }
+    }
 }
 
 /// [`DesktopConnection::disconnected_reason`] on the wire.
@@ -550,6 +616,17 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// Issue #1678: the background work the agent left running after its turn
+    /// ended — commands and subagents still going, and since when — copied
+    /// from `SessionSnapshot.background`. The daemon computes it; nothing here
+    /// derives it from events or recounts it.
+    ///
+    /// Absent when there is nothing to show (no count above zero), when the
+    /// record carries no live snapshot, and from a daemon predating the field.
+    /// `since_ms` is NOT clamped here, for the reason `last_activity_ms` gives:
+    /// the webview owns the clock the comparison is made against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<DesktopBackground>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
     /// copied through, bounded by [`map_prompt_keys`], and never resolved from
@@ -792,6 +869,21 @@ pub(crate) fn map_pending_question(
         answerable,
         revision: question.revision,
     }
+}
+
+/// Issue #1678: the webview's view of a `BackgroundWork`. The background
+/// aggregate carries counts and an instant, not subagent ids or command lines.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBackground {
+    /// Commands still running in their own session below the agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest counted item started, epoch milliseconds on the
+    /// daemon's clock; absent when the daemon has no start for any of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -1914,6 +2006,15 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
                 .filter(|detail| !detail.is_empty()),
             resets_at_ms: reason.resets_at_ms,
         });
+    // Issue #1678: the daemon's aggregate, only when it has something to show.
+    let background = live
+        .and_then(|snapshot| snapshot.background)
+        .filter(|work| !work.is_empty())
+        .map(|work| DesktopBackground {
+            commands: work.commands,
+            subagents: work.subagents,
+            since_ms: work.since_ms,
+        });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
     // event.
@@ -1947,6 +2048,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        background,
         prompt_keys,
         authoring_kind: record.authoring_kind,
         pending_question,
@@ -2755,6 +2857,7 @@ pub(crate) fn disconnected_snapshot(
             listing_options: false,
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
+            hook_binary_notices: Vec::new(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -3573,6 +3676,8 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 pending_question: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -4048,6 +4153,61 @@ mod tests {
                 .get("blocked")
                 .is_none()
         );
+    }
+
+    /// Issue #1678: the daemon's background aggregate reaches the webview as
+    /// counts and an instant under `background`, unclamped; an empty aggregate
+    /// (the daemon's explicit clear) and a record with no live snapshot both
+    /// leave the key off the wire.
+    #[test]
+    fn background_work_maps_from_the_live_snapshot() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = SessionStatus::Idle;
+        live.background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 2,
+            subagents: 1,
+            since_ms: Some(1_756_684_800_123),
+        });
+        live.background_revision = Some(7);
+        let mapped = map_agent(record.clone());
+        assert_eq!(
+            mapped.background,
+            Some(DesktopBackground {
+                commands: 2,
+                subagents: 1,
+                since_ms: Some(1_756_684_800_123),
+            })
+        );
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 2, "subagents": 1, "sinceMs": 1_756_684_800_123i64 })
+        );
+
+        // No start instant: the key is omitted, the counts stay.
+        record.live.as_mut().unwrap().background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 0,
+            subagents: 3,
+            since_ms: None,
+        });
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 0, "subagents": 3 })
+        );
+
+        // The daemon's explicit clear shows nothing.
+        record.live.as_mut().unwrap().background =
+            Some(dot_agent_deck::event::BackgroundWork::default());
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert!(value.get("background").is_none());
+
+        // Nor does a record with no live snapshot, or an older daemon's.
+        record.live.as_mut().unwrap().background = None;
+        assert!(map_agent(record.clone()).background.is_none());
+        record.live = None;
+        assert!(map_agent(record).background.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -4983,5 +5143,53 @@ mod tests {
             serde_json::to_value(&plain).unwrap(),
             serde_json::json!("not observed")
         );
+    }
+
+    /// Issue #1637 audit A3: a notice whose command carries a newline (a
+    /// hidden second command) or a bidi override reaches the webview with no
+    /// command at all, so there is nothing to copy; a newline in the remedy's
+    /// words is removed from what is shown. A clean command passes verbatim.
+    #[test]
+    fn a_hook_notice_command_that_display_would_alter_is_dropped() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = |remedy: &str, command: Option<&str>| HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: remedy.into(),
+            command: command.map(str::to_string),
+        };
+        for hostile in [
+            "brew upgrade dot-agent-deck\ntouch /tmp/hook-notice-marker",
+            "brew upgrade dot-agent-deck\r",
+            "brew upgrade \u{202E}kced-tnega-tod",
+            "brew upgrade dot-agent-deck\u{2028}touch x",
+        ] {
+            let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(hostile)));
+            assert_eq!(dto.command, None, "{hostile:?}");
+            // Never a bare `Run:`: the dropped command's lead-in becomes the
+            // daemon's no-command advice.
+            assert_eq!(
+                dto.remedy,
+                dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL,
+                "{hostile:?}"
+            );
+        }
+        let over_cap = format!(
+            "/{} hooks install",
+            "a".repeat(dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES)
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(&over_cap)));
+        assert_eq!(dto.command, None);
+        assert_eq!(
+            dto.remedy,
+            dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:\ntouch /tmp/x", None));
+        assert!(!dto.remedy.contains('\n'), "{:?}", dto.remedy);
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some("brew upgrade dot-agent-deck")));
+        assert_eq!(dto.command.as_deref(), Some("brew upgrade dot-agent-deck"));
     }
 }

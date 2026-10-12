@@ -154,10 +154,59 @@ globalThis[DAD_GUARD] = true;
 
 const BINARY_PATH = {binary_path_json};
 const knownSessions = new Map();
+// Pending user messages, by message id, until their text part arrives: at most
+// MAX_PENDING_USER_MESSAGES, the oldest forgotten first (its prompt is then not
+// reported).
 const messageRoles = new Map();
 const directorySessions = new Map();
+// Session id -> the directory's first session it is reported as. At most
+// MAX_SESSION_ALIASES, the oldest forgotten first: a forgotten alias is worked
+// out again from directorySessions the next time its session reports.
 const sessionAliases = new Map();
+const MAX_PENDING_USER_MESSAGES = 64;
+const MAX_SESSION_ALIASES = 256;
 let shuttingDown = false;
+
+// Issue #1678: the longest session or message id, in UTF-8 bytes, the plugin
+// keeps in its child-session, alias and reply records — the daemon's own bound
+// on a tracked subagent id. A longer session id is recognised by a fixed-size
+// stand-in (sessionKey), never by a cut-down copy: the stand-in is derived
+// from the whole id, so ids that differ only past a cut are not merged by
+// truncation. It is a 64-bit digest, not a collision-free one: two ids of the
+// same length can still share a stand-in, with negligible probability.
+// Stand-ins begin with OVERSIZED_ID_PREFIX, and an id that itself begins with
+// it is held by a stand-in too, so no stand-in equals an id held as itself. A
+// child held by a stand-in is never reported active (no `subagent.start` or
+// `subagent.stop`); its tool calls and permission prompts still carry subagent
+// attribution, as its stand-in, so such children's prompts are told apart
+// unless their stand-ins coincide.
+const MAX_ID_BYTES = 256;
+const OVERSIZED_ID_PREFIX = "oversized-id:";
+const utf8Length = (text) =>
+  typeof Buffer !== "undefined" ? Buffer.byteLength(text, "utf8") : new TextEncoder().encode(text).length;
+const idFits = (id) =>
+  typeof id === "string" && id.length > 0 && id.length <= MAX_ID_BYTES && utf8Length(id) <= MAX_ID_BYTES;
+const digest = (text) => {{
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  for (let i = 0; i < text.length; i += 1) {{
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x5bd1e995);
+  }}
+  return (a >>> 0).toString(16).padStart(8, "0") + (b >>> 0).toString(16).padStart(8, "0");
+}};
+// Does session id `id` keep its own id: it fits in MAX_ID_BYTES and is not in
+// the stand-ins' namespace?
+const keepsOwnId = (id) => idFits(id) && !id.startsWith(OVERSIZED_ID_PREFIX);
+// How the plugin holds session id `id`: the id itself when it keeps it,
+// otherwise a fixed-size stand-in derived from all of it.
+const sessionKey = (id) => {{
+  if (typeof id !== "string" || !id) {{
+    return undefined;
+  }}
+  return keepsOwnId(id) ? id : OVERSIZED_ID_PREFIX + id.length + ":" + digest(id);
+}};
 
 // PRD #1497: the assistant's reply, for the deck's voice "reading on". The text
 // parts of each assistant message are kept as they stream in (the full text
@@ -390,7 +439,9 @@ const normalizeSessionId = (sessionId, directory) => {{
   if (sessionId && sessionId !== "unknown") {{
     const existing = directorySessions.get(dirKey);
     if (existing && existing !== sessionId) {{
-      sessionAliases.set(sessionId, existing);
+      if (idFits(sessionId)) {{
+        rememberBounded(sessionAliases, sessionId, existing, MAX_SESSION_ALIASES);
+      }}
       return existing;
     }}
     directorySessions.set(dirKey, sessionId);
@@ -533,15 +584,16 @@ const sessionPayload = (event, directory) => {{
   }};
 }};
 
+const permissionPrompt = (props) =>
+  props.prompt ??
+  props.title ??
+  props.message ??
+  props.text ??
+  props.question ??
+  "";
+
 const permissionPayload = (event, directory) => {{
   const props = event?.properties ?? {{}};
-  const prompt =
-    props.prompt ??
-    props.title ??
-    props.message ??
-    props.text ??
-    props.question ??
-    "";
   const cwd = directory ?? process.cwd();
   return {{
     session_id: normalizeSessionId(
@@ -549,7 +601,7 @@ const permissionPayload = (event, directory) => {{
       cwd
     ),
     event: event?.type ?? "permission.unknown",
-    prompt,
+    prompt: permissionPrompt(props),
     cwd,
     // PRD #1631: the request a `*.replied` / `question.rejected` answers.
     request_id: props.requestID ?? props.id,
@@ -601,6 +653,18 @@ const closeSession = (sessionId, directory, emitEvent = true, removeAlias = true
 }};
 
 const flushSessions = () => {{
+  // A child still active when OpenCode goes away ends with it: its stop is
+  // sent under the session its start was, before that session closes.
+  for (const [childId, route] of activeSubagents.entries()) {{
+    sendEvent({{
+      session_id: route.sessionId,
+      subagent_id: childId,
+      event: "subagent.stop",
+      cwd: route.cwd,
+    }});
+  }}
+  activeSubagents.clear();
+  childRoutes.clear();
   for (const [sessionId, info] of knownSessions.entries()) {{
     closeSession(sessionId, info?.cwd, true, true);
   }}
@@ -644,15 +708,15 @@ const clipBytes = (text, budget) => {{
 }};
 
 // Insert or refresh `key` in a Map (with `value`) or a Set, as its newest
-// entry, forgetting the oldest past MAX_REPLY_SESSIONS.
-const rememberBounded = (collection, key, value) => {{
+// entry, forgetting the oldest past `cap` (MAX_REPLY_SESSIONS unless given).
+const rememberBounded = (collection, key, value, cap = MAX_REPLY_SESSIONS) => {{
   collection.delete(key);
   if (collection instanceof Map) {{
     collection.set(key, value);
   }} else {{
     collection.add(key);
   }}
-  while (collection.size > MAX_REPLY_SESSIONS) {{
+  while (collection.size > cap) {{
     collection.delete(collection.keys().next().value);
   }}
 }};
@@ -680,20 +744,156 @@ const forgetAllReplyState = () => {{
   sessionParents.clear();
 }};
 
+// Issue #1678: a subagent's child session (one whose `parentID` is known) is
+// reported as that subagent's work, never as the main session's. Its going
+// active (`session.status` busy or retry) is a `subagent.start` naming the
+// child's raw id, and its going idle, failing or being deleted is the paired
+// `subagent.stop`, both filed under the session the child descends from. Only
+// a transition is sent: a child already active sends no second start, and one
+// that is not sends no stop, so a child that goes busy again later starts
+// again. Its other session events and its user message (the prompt it was
+// given) are not sent, and its tool calls and permission prompts carry
+// `subagent_id`, so none of them counts as the main session's work or turn
+// activity; a permission prompt still puts the card on Needs Input, and its
+// answer (or the child's stop) takes the card back off it. A session whose
+// ancestry is not known when it reports is still treated as the main
+// session's.
+//
+// Where a child's reports go is kept apart from sessionParents, which forgets
+// its oldest entries as other sessions are created: an active child is held in
+// activeSubagents with the session its start was filed under until it stops,
+// and the MAX_REPLY_SESSIONS children seen most recently in childRoutes, so
+// neither is taken for the main session because its ancestry was forgotten.
+// Both are keyed by sessionKey.
+//
+// Bounded: at most MAX_ACTIVE_SUBAGENTS children are reported active at once;
+// a child past that sends neither its start nor its stop.
+const MAX_ACTIVE_SUBAGENTS = 128;
+const MAX_ANCESTRY_DEPTH = 32;
+// Child key -> {{ root, sessionId, cwd }}: the root it descends from, and the
+// session id and directory its `subagent.start` was sent with.
+const activeSubagents = new Map();
+// Child key -> the root it descends from.
+const childRoutes = new Map();
+
+const routeOf = (key) => activeSubagents.get(key)?.root ?? childRoutes.get(key);
+
 const isChildSession = (sessionId) => {{
-  const parent = sessionParents.get(sessionId);
-  return parent !== undefined && parent !== "";
+  const key = sessionKey(sessionId);
+  if (key === undefined) {{
+    return false;
+  }}
+  const parent = sessionParents.get(key);
+  if (parent !== undefined) {{
+    return parent !== "";
+  }}
+  return activeSubagents.has(key) || childRoutes.has(key);
 }};
 
-// Record a session's ancestry from its info; a child's reply state is dropped.
+// The root `key` descends from (itself for a root), so a grandchild's work is
+// filed under the main session too. Walks the known ancestry; where that is
+// broken (an ancestor not known, or forgotten) the route recorded for `key`,
+// or for the ancestor the walk stopped at, is used.
+const rootKeyOf = (key) => {{
+  let current = key;
+  for (let depth = 0; depth < MAX_ANCESTRY_DEPTH; depth += 1) {{
+    const parent = sessionParents.get(current);
+    if (parent === "") {{
+      return current;
+    }}
+    if (parent === undefined) {{
+      break;
+    }}
+    current = parent;
+  }}
+  return routeOf(key) ?? routeOf(current) ?? current;
+}};
+
+// What a child's report is attributed to: its own id, or its stand-in for one
+// that does not keep it (sessionKey), so two such children stay apart.
+const subagentAttribution = (childId) => sessionKey(childId);
+
+const subagentPayload = (event, childId, directory, rest) => {{
+  const props = event?.properties ?? {{}};
+  const cwd = props.info?.directory ?? props.directory ?? directory ?? process.cwd();
+  return {{
+    session_id: normalizeSessionId(rootKeyOf(sessionKey(childId)), cwd),
+    subagent_id: subagentAttribution(childId),
+    cwd,
+    ...rest,
+  }};
+}};
+
+// A child session's own session event: a start or stop on a transition,
+// nothing otherwise.
+const handleChildSessionEvent = (event, childId, directory) => {{
+  const key = sessionKey(childId);
+  const type = event?.type ?? "";
+  const status = event?.properties?.status?.type;
+  const active =
+    (type === "session.status" || type === "session.status.updated") &&
+    (status === "busy" || status === "retry");
+  const ended =
+    type === "session.idle" ||
+    type === "session.error" ||
+    type === "session.deleted" ||
+    ((type === "session.status" || type === "session.status.updated") && status === "idle");
+  const root = rootKeyOf(key);
+  const running = activeSubagents.get(key);
+  if (
+    active &&
+    !running &&
+    keepsOwnId(childId) &&
+    activeSubagents.size < MAX_ACTIVE_SUBAGENTS
+  ) {{
+    const payload = subagentPayload(event, childId, directory, {{ event: "subagent.start" }});
+    activeSubagents.set(key, {{ root, sessionId: payload.session_id, cwd: payload.cwd }});
+    childRoutes.delete(key);
+    sendEvent(payload);
+  }} else if (ended && running) {{
+    activeSubagents.delete(key);
+    sendEvent({{
+      session_id: running.sessionId,
+      subagent_id: childId,
+      event: "subagent.stop",
+      cwd: running.cwd,
+    }});
+  }}
+  if (type === "session.deleted") {{
+    forgetReplyState(childId);
+    sessionParents.delete(key);
+    childRoutes.delete(key);
+    cancelAncestryLookup(childId);
+  }} else if (!activeSubagents.has(key)) {{
+    rememberBounded(childRoutes, key, root);
+  }}
+}};
+
+// Drop the user messages still waiting for their text that child `key` sent:
+// they are the prompt its subagent was given, not the user's.
+const forgetChildPrompts = (key) => {{
+  for (const [messageId, info] of messageRoles.entries()) {{
+    if (info?.rawSessionKey === key) {{
+      messageRoles.delete(messageId);
+    }}
+  }}
+}};
+
+// Record a session's ancestry from its info; a child's reply state and pending
+// prompts are dropped, and where its reports go is recorded.
 const noteSessionAncestry = (info) => {{
-  if (!info || typeof info.id !== "string" || !info.id) {{
+  const key = sessionKey(info?.id);
+  if (key === undefined) {{
     return;
   }}
-  const parent = typeof info.parentID === "string" ? info.parentID : "";
-  rememberBounded(sessionParents, info.id, parent);
+  const parent = typeof info.parentID === "string" && info.parentID ? sessionKey(info.parentID) : "";
+  rememberBounded(sessionParents, key, parent);
   if (parent) {{
     forgetReplyState(info.id);
+    forgetChildPrompts(key);
+    if (!activeSubagents.has(key)) {{
+      rememberBounded(childRoutes, key, rootKeyOf(key));
+    }}
   }}
 }};
 
@@ -719,7 +919,7 @@ const cancelAncestryLookup = (sessionId) => {{
 const lookUpAncestry = (sessionId) => {{
   const sessions = sessionClient?.session;
   if (
-    !sessionId ||
+    !idFits(sessionId) ||
     sessionParents.has(sessionId) ||
     ancestryLookups.has(sessionId) ||
     unsettledAncestryLookups >= MAX_ANCESTRY_LOOKUPS ||
@@ -791,7 +991,7 @@ const replyMessage = (messageId, sessionId) => {{
 
 const recordAssistantMessage = (info) => {{
   const sessionId = info?.sessionID;
-  if (!sessionId || !info.id || isChildSession(sessionId)) {{
+  if (!idFits(sessionId) || !idFits(info.id) || isChildSession(sessionId)) {{
     return;
   }}
   // Asked now, so the answer is usually in by the time the turn goes idle.
@@ -805,10 +1005,10 @@ const recordAssistantMessage = (info) => {{
 }};
 
 const recordReplyPart = (part) => {{
-  if (part?.type !== "text" || part.synthetic || part.ignored || !part.id || !part.messageID) {{
+  if (part?.type !== "text" || part.synthetic || part.ignored || !idFits(part.id) || !idFits(part.messageID)) {{
     return;
   }}
-  if (isChildSession(part.sessionID)) {{
+  if ((part.sessionID !== undefined && !idFits(part.sessionID)) || isChildSession(part.sessionID)) {{
     return;
   }}
   const message = replyMessage(part.messageID, part.sessionID);
@@ -843,7 +1043,7 @@ const recordReplyDelta = (props) => {{
 }};
 
 const recordTurnError = (sessionId, error) => {{
-  if (!sessionId || isChildSession(sessionId)) {{
+  if (!idFits(sessionId) || isChildSession(sessionId)) {{
     return;
   }}
   rememberBounded(error?.name === "MessageAbortedError" ? abortedTurns : failedTurns, sessionId);
@@ -878,7 +1078,7 @@ const takeReply = (sessionId) => {{
   if (!message || aborted) {{
     return {{}};
   }}
-  if (sessionParents.get(sessionId) !== "") {{
+  if (sessionParents.get(sessionKey(sessionId)) !== "") {{
     lookUpAncestry(sessionId);
     return {{}};
   }}
@@ -893,11 +1093,19 @@ const isIdleReport = (payload) =>
 const recordUserMessage = (event, directory) => {{
   const info = event?.properties?.info;
   const messageId = info?.id;
-  if (!messageId) {{
+  if (!idFits(messageId)) {{
+    return;
+  }}
+  // A message from a session id over the bound is not kept, so its prompt is
+  // not reported.
+  if (info?.sessionID !== undefined && info?.sessionID !== null && !idFits(info.sessionID)) {{
+    messageRoles.delete(messageId);
     return;
   }}
   const role = (info?.role ?? "").toLowerCase();
-  if (role !== "user") {{
+  // Issue #1678: a child session's user message is the prompt its subagent
+  // was given, not the user's.
+  if (role !== "user" || isChildSession(info?.sessionID)) {{
     messageRoles.delete(messageId);
     if (role === "assistant") {{
       recordAssistantMessage(info);
@@ -905,10 +1113,18 @@ const recordUserMessage = (event, directory) => {{
     return;
   }}
   const dir = info?.directory ?? directory ?? process.cwd();
-  messageRoles.set(messageId, {{
-    role,
-    sessionId: normalizeSessionId(info.sessionID ?? null, dir),
-  }});
+  // The session that sent it is kept as well, so a message whose session is
+  // only later known to be a child is still recognised as the child's.
+  rememberBounded(
+    messageRoles,
+    messageId,
+    {{
+      role,
+      sessionId: normalizeSessionId(info.sessionID ?? null, dir),
+      rawSessionKey: sessionKey(info.sessionID),
+    }},
+    MAX_PENDING_USER_MESSAGES
+  );
 }};
 
 const emitUserPrompt = (sessionId, prompt, directory) => {{
@@ -937,6 +1153,12 @@ const handleMessagePartUpdated = (event, directory) => {{
     return;
   }}
   if (!part.text) {{
+    return;
+  }}
+  // Issue #1678: its session may have become known as a child since the
+  // message was recorded.
+  if (isChildSession(info.rawSessionKey) || isChildSession(part.sessionID)) {{
+    messageRoles.delete(part.messageID);
     return;
   }}
   const sessionId = normalizeSessionId(
@@ -976,6 +1198,21 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         recordReplyDelta(event?.properties);
         return;
       }}
+      if (eventType === "permission.asked" || eventType === "permission.replied") {{
+        // Issue #1678: a child session's prompt is its subagent's, filed under
+        // the root with the child's id, like its tool calls.
+        const props = event?.properties ?? {{}};
+        const askingId = props.sessionID ?? props.sessionId;
+        if (isChildSession(askingId)) {{
+          sendEvent(
+            subagentPayload(undefined, askingId, directory, {{
+              event: eventType,
+              prompt: permissionPrompt(props),
+            }})
+          );
+          return;
+        }}
+      }}
       if (eventType === "permission.asked" || eventType === "question.asked") {{
         // PRD #1631: reported through `await-answer`, which also waits for
         // the deck's answer.
@@ -1006,12 +1243,17 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (eventType === "session.created" || eventType === "session.updated") {{
         noteSessionAncestry(event?.properties?.info);
       }}
+      const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
+      if (isChildSession(ownId)) {{
+        handleChildSessionEvent(event, ownId, directory);
+        return;
+      }}
       const payload = sessionPayload(event, directory);
       if (event?.type === "session.deleted") {{
         const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
         if (deletedId) {{
           forgetReplyState(deletedId);
-          sessionParents.delete(deletedId);
+          sessionParents.delete(sessionKey(deletedId));
           cancelAncestryLookup(deletedId);
         }}
         closeSession(payload.session_id, payload.cwd, false, false);
@@ -1030,6 +1272,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
     }},
     "tool.execute.before": async (input, output) => {{
+      if (isChildSession(input?.sessionID)) {{
+        sendEvent(
+          subagentPayload(undefined, input.sessionID, directory, {{
+            event: "tool.execute.before",
+            tool_name: input?.tool,
+            tool_input: output?.args,
+          }})
+        );
+        return;
+      }}
       const sessionId = normalizeSessionId(
         defaultSessionId(input?.sessionID),
         directory
@@ -1044,6 +1296,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       }});
     }},
     "tool.execute.after": async (input) => {{
+      if (isChildSession(input?.sessionID)) {{
+        sendEvent(
+          subagentPayload(undefined, input.sessionID, directory, {{
+            event: "tool.execute.after",
+            tool_name: input?.tool,
+            tool_input: input?.args,
+          }})
+        );
+        return;
+      }}
       const sessionId = normalizeSessionId(
         defaultSessionId(input?.sessionID),
         directory
@@ -1145,10 +1407,59 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
 /// of it. The first matching line wins, as before.
 fn existing_binary_path(root: &Path) -> Option<String> {
     let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    binary_path_literal(&js)
+}
+
+/// The `BINARY_PATH` literal in plugin source `js` — [`existing_binary_path`]'s
+/// parse.
+fn binary_path_literal(js: &str) -> Option<String> {
     js.lines()
         .filter_map(|line| line.strip_prefix("const BINARY_PATH = "))
         .filter_map(|rest| rest.strip_suffix(';'))
         .find_map(|literal| serde_json::from_str::<String>(literal).ok())
+}
+
+/// What the OpenCode plugin is pinned to now, read back from every root's
+/// plugin file without installing anything (issue #1637's pin refresh,
+/// `OPENCODE.configured_pins`), one pin per binary as [`auto_install`] reports
+/// them. A root whose directory exists but holds no plugin file names
+/// nothing, so with no plugin left anywhere, as after `hooks uninstall
+/// --agent opencode`, the list is empty (Qodo on #1656). `None` when no root
+/// exists (as at startup, which installs nothing then), or a plugin cannot be
+/// read (including one that is not a regular file or is past
+/// `MAX_HOOK_CONFIG_BYTES`, audit A9) or carries no readable `BINARY_PATH`,
+/// which leaves the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    configured_pins_in(&candidate_roots())
+}
+
+/// [`configured_pins`] over explicit roots.
+fn configured_pins_in(roots: &[PathBuf]) -> Option<Vec<crate::hook_binary::HookPin>> {
+    // The same gate as `auto_install_resolved`.
+    if !roots.iter().any(|root| root.exists()) {
+        return None;
+    }
+    let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
+    for root in roots {
+        // Bounded and non-blocking, as the JSON configs are read (audit A9).
+        let js = match crate::bounded_read::read_config_file(
+            &plugin_file(root),
+            crate::agent_hook_config::MAX_HOOK_CONFIG_BYTES,
+        ) {
+            Ok(Some(js)) => js,
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
+        let binary = binary_path_literal(&js)?;
+        if out.iter().all(|pin| pin.binary != binary) {
+            out.push(crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::OpenCode,
+                config: root.clone(),
+                binary,
+            });
+        }
+    }
+    Some(out)
 }
 
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
@@ -1176,10 +1487,15 @@ fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
 /// Roots that don't exist are skipped — no speculative directory creation. Per-target
 /// failures are logged via `tracing::warn!` and never abort the remaining targets.
 /// Silent on stdout (dashboard startup path).
-fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
+///
+/// Returns the binary each existing root's plugin pins afterwards (issue
+/// #1637), so the daemon can name the binary OpenCode's events come from.
+fn auto_install_to(roots: &[PathBuf], binary_path: &str) -> Vec<(PathBuf, String)> {
     // Held across the read-preserve-write span, not just the write. See
     // [`PLUGIN_LOCK`].
     let _guard = lock_plugin();
+    let takeover = crate::hook_binary::Takeover::current();
+    let mut pins = Vec::new();
     for root in roots {
         if !root.exists() {
             continue;
@@ -1212,21 +1528,51 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         // build output) is replaced by the installing binary. This path used to
         // fall back to `pin_is_repairable` here, which leaves an unstatable pin
         // alone, so an inaccessible install stayed pinned for OpenCode alone.
+        //
+        // Issue #1637: except one an eligible newer copy supersedes — a pin
+        // whose `--version` reports an older release than this install's. It
+        // is replaced like an unusable pin, and logged as a takeover.
+        let mut taking_over = None;
         let (pinned, repairing) = match existing_binary_path(root) {
             Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
-                if !crate::agent_hook_config::executables_match(&existing, binary_path) {
+                if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                    // This very install: refresh the template, keep the pin's
+                    // spelling.
+                    (existing, false)
+                } else if takeover.supersedes(&existing) {
+                    taking_over = Some(existing);
+                    (binary_path.to_string(), true)
+                } else {
+                    pins.push((root.clone(), existing));
                     continue;
                 }
-                // This very install: refresh the template, keep the pin's
-                // spelling.
-                (existing, false)
             }
             Some(_) => (binary_path.to_string(), true),
             None => (binary_path.to_string(), false),
         };
-        match write_plugin_reporting(root, &pinned) {
+        let written = write_plugin_reporting(root, &pinned);
+        // Reported only once it is what the plugin holds, as the Claude and
+        // Devin installers do: a failed write leaves the old pin in place.
+        if written.is_ok() {
+            pins.push((root.clone(), pinned.clone()));
+        }
+        match written {
             // Already current: nothing was written, so nothing is announced.
             Ok((_, false)) => {}
+            Ok((path, true)) if taking_over.is_some() => {
+                tracing::info!(
+                    "the OpenCode plugin at {} pinned an older dot-agent-deck ({}); now pinned \
+                     to this newer copy, {pinned}",
+                    path.display(),
+                    taking_over.as_deref().unwrap_or_default()
+                );
+                crate::agent_hook_config::log_auto_install_change(
+                    "opencode",
+                    &path,
+                    &pinned,
+                    "takeover: newer copy",
+                );
+            }
             // Repair logs what it changed: silently mutating global config is
             // the same class of thing that caused this bug.
             Ok((path, true)) if repairing => {
@@ -1254,6 +1600,7 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
             ),
         }
     }
+    pins
 }
 
 /// Fan-out core for explicit install: write the plugin into every candidate root that
@@ -1309,11 +1656,21 @@ fn install_to_roots(
 
 /// Silently install OpenCode plugin into every existing layout.
 /// Intended for dashboard startup — never prints to stdout, refusal included.
-pub fn auto_install() {
-    auto_install_resolved(
-        &candidate_roots(),
-        crate::platform::paths::durable_binary_path,
-    );
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    let roots = candidate_roots();
+    let pins = auto_install_resolved(&roots, crate::platform::paths::durable_binary_path);
+    // One pin per binary: the roots of one machine name the same install.
+    let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
+    for (root, binary) in pins {
+        if out.iter().all(|pin| pin.binary != binary) {
+            out.push(crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::OpenCode,
+                config: root,
+                binary,
+            });
+        }
+    }
+    out
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -1330,13 +1687,19 @@ pub fn auto_install() {
 /// often absent; resolving first logged `durable_binary_path`'s "pinning … as a
 /// last resort" warning for a plugin that was then never written (Qodo on PR
 /// #1344).
-fn auto_install_resolved(roots: &[PathBuf], resolve: impl FnOnce() -> Result<String, String>) {
+fn auto_install_resolved(
+    roots: &[PathBuf],
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Vec<(PathBuf, String)> {
     if !roots.iter().any(|root| root.exists()) {
-        return;
+        return Vec::new();
     }
     match resolve() {
         Ok(binary_path) => auto_install_to(roots, &binary_path),
-        Err(e) => tracing::warn!("auto-install: {e}"),
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -1376,6 +1739,113 @@ pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back the
+    /// `BINARY_PATH` each root's plugin pins, one pin per binary. No root at
+    /// all, or a plugin with no readable `BINARY_PATH`, is no evidence; a root
+    /// with no plugin names nothing, so roots without any name no pin.
+    #[test]
+    fn configured_pins_reads_each_plugin_back() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        assert_eq!(configured_pins_in(&roots), None, "no root, as at startup");
+        std::fs::create_dir_all(&roots[0]).unwrap();
+        assert_eq!(configured_pins_in(&roots), Some(Vec::new()));
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        for root in &roots {
+            std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
+        }
+        assert_eq!(configured_pins_in(&roots), Some(Vec::new()));
+        std::fs::write(plugin_file(&roots[0]), plugin_template(old)).unwrap();
+        let pins = configured_pins_in(&roots).expect("one plugin read");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].binary, old);
+        std::fs::write(plugin_file(&roots[1]), plugin_template(old)).unwrap();
+        assert_eq!(
+            configured_pins_in(&roots).expect("two plugins read").len(),
+            1
+        );
+        std::fs::write(plugin_file(&roots[1]), b"// hand-edited\n").unwrap();
+        assert_eq!(configured_pins_in(&roots), None);
+    }
+
+    /// Scenario (Qodo on #1656): the OpenCode plugin pins an older copy,
+    /// which raised its notice, and then `hooks uninstall --agent opencode`
+    /// removes the plugin. The next refresh reads the roots as naming
+    /// nothing, so the notice clears within one refresh.
+    #[test]
+    fn uninstalling_the_plugin_clears_the_notice_within_one_refresh() {
+        use crate::hook_binary::{DeckIdentity, HookBinaryState, PinRefresh};
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        std::fs::create_dir_all(plugin_file(&roots[0]).parent().unwrap()).unwrap();
+        let old = fixture.path().join("missing-old").join("dot-agent-deck");
+        std::fs::write(
+            plugin_file(&roots[0]),
+            plugin_template(&old.to_string_lossy()),
+        )
+        .unwrap();
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let pins = configured_pins_in(&roots).expect("one plugin read");
+        // `old` does not exist, so its probe fails: an `Unprobeable` notice.
+        let mut state = HookBinaryState::from_startup(deck.clone(), &pins, None);
+        assert_eq!(state.notices().len(), 1);
+
+        uninstall_from(&plugin_file(&roots[0])).unwrap();
+        let read = configured_pins_in(&roots).expect("the roots were read");
+        assert!(read.is_empty());
+        let refresh = PinRefresh::classify(&deck, vec![(crate::event::AgentType::OpenCode, read)]);
+        assert!(state.apply_refresh(refresh));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
+    }
+
+    /// Scenario (issue #1637 audit A9): one root's plugin file is replaced by
+    /// a FIFO with no writer. The read-back returns at once with no evidence
+    /// rather than waiting for a writer, as it does for a plugin past the size
+    /// cap.
+    #[cfg(unix)]
+    #[test]
+    fn configured_pins_neither_blocks_on_a_fifo_nor_reads_an_oversized_plugin() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let roots = vec![fixture.path().join("xdg"), fixture.path().join("legacy")];
+        for root in &roots {
+            std::fs::create_dir_all(plugin_file(root).parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            plugin_file(&roots[0]),
+            plugin_template("/opt/old/dot-agent-deck"),
+        )
+        .unwrap();
+        let fifo =
+            std::ffi::CString::new(plugin_file(&roots[1]).into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a NUL-terminated path; `mkfifo` only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let read = {
+            let roots = roots.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(configured_pins_in(&roots));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the read blocked on the FIFO")
+        };
+        assert_eq!(read, None);
+
+        std::fs::remove_file(plugin_file(&roots[1])).unwrap();
+        let mut huge = plugin_template("/opt/old/dot-agent-deck").into_bytes();
+        huge.resize(
+            crate::agent_hook_config::MAX_HOOK_CONFIG_BYTES as usize + 1,
+            b'\n',
+        );
+        std::fs::write(plugin_file(&roots[1]), huge).unwrap();
+        assert_eq!(configured_pins_in(&roots), None);
+    }
     #[cfg(unix)]
     use spec::spec;
 
@@ -1449,6 +1919,66 @@ pub(crate) mod tests {
 
         assert_eq!(plugin_fingerprint(&path), before);
         assert_eq!(existing_binary_path(&root).as_deref(), Some(a.as_str()));
+    }
+
+    /// Scenario: an automatic install whose plugin write fails reports no pin, so the daemon never announces a binary the plugin does not hold (issue #1637).
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_reports_no_pin_when_the_write_fails() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        // A file where the plugin directory goes: the write cannot succeed.
+        std::fs::write(root.join("plugin"), b"not a directory").unwrap();
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+
+        let pins = auto_install_to(std::slice::from_ref(&root), &b);
+
+        assert!(pins.is_empty(), "{pins:?}");
+        assert_eq!(existing_binary_path(&root), None);
+    }
+
+    /// Scenario: the OpenCode plugin pins live install A. A newer, eligible copy B's automatic install repins it to B (issue #1637) and reports B as the pin; a tie, a newer A, an A whose version cannot be read, and an ineligible B all keep A and report A.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_takeover_matrix() {
+        use crate::hook_binary::{Takeover, with_takeover};
+        for (pinned, takeover, replaced) in [
+            (Some("0.0.1"), Takeover::eligible("1.0.0"), true),
+            (Some("1.0.0"), Takeover::eligible("1.0.0"), false),
+            (Some("2.0.0"), Takeover::eligible("1.0.0"), false),
+            (None, Takeover::eligible("1.0.0"), false),
+            (Some("0.0.1"), Takeover::ineligible(), false),
+        ] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let root = fixture.path().join("fake-operator-home").join("opencode");
+            let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+            if let Some(version) = pinned {
+                crate::test_isolation::write_script(
+                    std::path::Path::new(&a),
+                    format!("#!/bin/sh\necho 'dot-agent-deck {version}'\n").as_bytes(),
+                )
+                .unwrap();
+            }
+            let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+            write_plugin(&root, &a).unwrap();
+
+            let pins = with_takeover(takeover, || {
+                auto_install_to(std::slice::from_ref(&root), &b)
+            });
+
+            let expected = if replaced { &b } else { &a };
+            assert_eq!(
+                existing_binary_path(&root).as_deref(),
+                Some(expected.as_str()),
+                "pinned {pinned:?}"
+            );
+            assert_eq!(
+                pins,
+                vec![(root.clone(), expected.clone())],
+                "pinned {pinned:?}"
+            );
+        }
     }
 
     /// Scenario: An OpenCode plugin pins install A, which is then deleted or is cargo build output. An automatic install from B repins it to B.
@@ -2817,8 +3347,8 @@ await send("session.idle", {{ sessionID: "s1" }});
     /// PRD #1497 audit AU-B1: a subagent's child session (`parentID` naming
     /// the root, same directory) streams its own assistant text interleaved
     /// with the root's turn and goes idle first. Its text never reaches any
-    /// report — not even the idle report the directory alias files under the
-    /// root's id — and the root's own final reply still arrives. A session
+    /// report — its going idle is a `subagent.stop`, not an idle report of the
+    /// root's (issue #1678) — and the root's own final reply still arrives. A session
     /// whose ancestry no session event named is asked of OpenCode's client:
     /// a root's reply is sent, a child's or an unanswerable one's is not.
     #[cfg(unix)]
@@ -2879,19 +3409,487 @@ for (const id of ["resumed", "lookup-child", "lookup-fails"]) {
         assert_eq!(
             replies,
             vec![
-                ("root".to_owned(), None),
-                ("root".to_owned(), None),
                 (
                     "root".to_owned(),
                     Some("ROOT_FINAL_SENTINEL: done.".to_owned())
                 ),
                 ("root".to_owned(), Some("LOOKUP_REPLY resumed".to_owned())),
                 ("root".to_owned(), None),
-                ("root".to_owned(), None),
             ],
-            "the child's two idle reports (filed under the root by the directory alias) carry \
-             nothing, the root's carries its own reply, and only the client-confirmed root is \
-             read: {payloads:#?}"
+            "a child's going idle — the known child's, and the one the client confirmed a child \
+             before it went idle — is no idle report of the root's (issue #1678), the root's \
+             carries its own reply, and only the client-confirmed root is read: {payloads:#?}"
+        );
+    }
+
+    /// Scenario: Drive the generated OpenCode plugin under node with a root session that starts a child session (and a grandchild), as OpenCode's `task` tool does. The child's lifecycle reaches the deck as one `subagent.start` when it goes busy and one `subagent.stop` when it goes idle, fails or is deleted, filed under the root with the child's id; its creation, its prompt and its other session events are not sent as the root's, and its tool calls carry the child's id.
+    #[cfg(unix)]
+    #[spec("status/background/011")]
+    #[test]
+    fn background_011_opencode_plugin_pairs_a_child_sessions_lifecycle() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await status("root", "busy");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.updated", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("message.updated", { sessionID: "child", info: { id: "cu", sessionID: "child", role: "user" } });
+await send("message.part.updated", { sessionID: "child", part: { id: "cp", sessionID: "child", messageID: "cu", type: "text", text: "CHILD_PROMPT_SENTINEL" } });
+await status("child", "busy");
+await status("child", "retry");
+await status("child", "busy");
+await hooks["tool.execute.before"]({ sessionID: "child", tool: "bash" }, { args: { command: "sleep 60" } });
+await hooks["tool.execute.after"]({ sessionID: "child", tool: "bash", args: { command: "sleep 60" } });
+await send("session.created", { sessionID: "grandchild", info: { id: "grandchild", parentID: "child", directory: "/work" } });
+await status("grandchild", "busy");
+await status("root", "idle");
+await status("child", "idle");
+await send("session.idle", { sessionID: "child" });
+await status("child", "busy");
+await send("session.error", { sessionID: "child", error: { name: "APIError", data: { message: "boom" } } });
+await status("child", "idle");
+await send("session.deleted", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.deleted", { sessionID: "grandchild", info: { id: "grandchild", parentID: "child", directory: "/work" } });
+await status("root", "busy");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("CHILD_PROMPT_SENTINEL"),
+            "a child session's prompt reached the deck as the user's: {payloads:#?}"
+        );
+        let seen: Vec<(String, String, String)> = payloads
+            .iter()
+            .map(|p| {
+                let field = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
+                (field("session_id"), field("event"), field("subagent_id"))
+            })
+            .collect();
+        let row = |session: &str, event: &str, subagent: &str| {
+            (session.to_owned(), event.to_owned(), subagent.to_owned())
+        };
+        assert_eq!(
+            seen,
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "tool.execute.before", "child"),
+                row("root", "tool.execute.after", "child"),
+                row("root", "subagent.start", "grandchild"),
+                row("root", "session.status", ""),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.start", "child"),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.stop", "grandchild"),
+                row("root", "session.status", ""),
+                // The plugin's own flush as node exits.
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            assert_eq!(
+                event.is_from_subagent(),
+                payload.get("subagent_id").is_some(),
+                "{payload}"
+            );
+        }
+    }
+
+    /// `(session_id, event, subagent_id)` of each payload, for comparing a
+    /// driver's whole output at once.
+    #[cfg(unix)]
+    fn payload_rows(payloads: &[serde_json::Value]) -> Vec<(String, String, String)> {
+        payloads
+            .iter()
+            .map(|p| {
+                let field = |k: &str| p[k].as_str().unwrap_or_default().to_owned();
+                (field("session_id"), field("event"), field("subagent_id"))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn row(session: &str, event: &str, subagent: &str) -> (String, String, String) {
+        (session.to_owned(), event.to_owned(), subagent.to_owned())
+    }
+
+    /// Issue #1678 audit AU-1: a child that is running while 256 other child
+    /// sessions are created (pushing its ancestry out of the plugin's bounded
+    /// record) still reports as the subagent it is. Its tool calls keep its
+    /// id, its going idle is the stop paired with its start (once, though it
+    /// goes idle twice), and nothing is left active for the exit flush to stop.
+    /// A grandchild it starts afterwards is filed under the root too.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_keeps_an_active_childs_route_when_its_ancestry_is_forgotten() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+await created("root");
+await status("root", "busy");
+await created("child", "root");
+await status("child", "busy");
+for (let i = 0; i < 256; i += 1) {
+  await created("churn-" + i, "root");
+}
+await hooks["tool.execute.before"]({ sessionID: "child", tool: "bash" }, { args: { command: "ls" } });
+await hooks["tool.execute.after"]({ sessionID: "child", tool: "bash", args: { command: "ls" } });
+await created("grandchild", "child");
+await status("grandchild", "busy");
+await status("child", "idle");
+await send("session.idle", { sessionID: "child" });
+await status("grandchild", "idle");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "tool.execute.before", "child"),
+                row("root", "tool.execute.after", "child"),
+                row("root", "subagent.start", "grandchild"),
+                row("root", "subagent.stop", "child"),
+                row("root", "subagent.stop", "grandchild"),
+                // The plugin's own flush as node exits: no child is left to stop.
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+    }
+
+    /// Issue #1678 audit AU-2: a known child's permission prompt and its answer
+    /// are filed under the root with the child's id — decoded as that
+    /// subagent's `PermissionRequest` and its answered prompt. The root's own
+    /// prompt goes to `await-answer` instead (PRD #1631), with no subagent
+    /// attribution; `question/detect/007` covers that path.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await send("permission.asked", { sessionID: "child", title: "CHILD_ASK" });
+await send("permission.replied", { sessionID: "child" });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "permission.asked", "child"),
+                row("root", "permission.replied", "child"),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        let decoded: Vec<crate::event::AgentEvent> = payloads
+            .iter()
+            .map(|p| {
+                crate::hook::build_opencode_event(serde_json::from_value(p.clone()).unwrap())
+                    .expect("every payload maps to an event")
+            })
+            .collect();
+        assert_eq!(payloads[2]["prompt"], "CHILD_ASK");
+        assert_eq!(
+            decoded[2].event_type,
+            crate::event::EventType::PermissionRequest
+        );
+        assert!(decoded[2].is_from_subagent());
+        assert!(decoded[3].is_subagent_permission_reply());
+    }
+
+    /// Issue #1678 audit AU-3: a child's user message recorded before its
+    /// `session.created` named its parent, whose text arrives afterwards, is
+    /// the prompt its subagent was given and is not reported as the user's.
+    /// The root's own prompt still is.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_drops_a_childs_prompt_recorded_before_its_ancestry() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const user = (sessionID, id) => send("message.updated", { sessionID, info: { id, sessionID, role: "user", directory: "/work" } });
+const text = (sessionID, messageID, t) => send("message.part.updated", { sessionID, part: { id: messageID + "-p", sessionID, messageID, type: "text", text: t } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await user("child", "cu");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await text("child", "cu", "CHILD_INTERNAL_PROMPT_SENTINEL");
+await user("late-child", "lu");
+await send("session.updated", { sessionID: "late-child", info: { id: "late-child", parentID: "root", directory: "/work" } });
+await text("late-child", "lu", "LATE_CHILD_PROMPT_SENTINEL");
+await user("root", "ru");
+await text("root", "ru", "ROOT_PROMPT");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("PROMPT_SENTINEL"),
+            "a child's prompt was reported as the user's: {payloads:#?}"
+        );
+        let prompts: Vec<&str> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .map(|p| p["prompt"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(prompts, vec!["ROOT_PROMPT"], "{payloads:#?}");
+    }
+
+    /// Issue #1678 audit AU-4: a child session id over 256 UTF-8 bytes (by
+    /// length, and by multi-byte characters under 256 characters) is never
+    /// reported active and never sent, yet its tool call and permission prompt
+    /// still carry subagent attribution — each such child its own stand-in.
+    /// Another long id sharing all but its last character is not taken for
+    /// that child. A 256-byte id is a child like any other. At most 64 user
+    /// messages wait for their text: the oldest one's prompt is then not
+    /// reported, the newest one's is, and one sent from a session id over the
+    /// bound is not reported (audit AU-8).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_bounds_the_ids_and_messages_it_holds() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const status = (sessionID, type) => send("session.status", { sessionID, status: { type } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+const tool = (sessionID) => hooks["tool.execute.before"]({ sessionID, tool: "bash" }, { args: { command: "ls" } });
+await created("root");
+const long = "x".repeat(299) + "a";
+const wide = "é".repeat(129);
+const fits = "y".repeat(256);
+for (const id of [long, wide, fits]) {
+  await created(id, "root");
+  await status(id, "busy");
+  await tool(id);
+  await send("permission.asked", { sessionID: id, title: "ask" });
+  await status(id, "idle");
+}
+await tool("x".repeat(299) + "b");
+for (let i = 0; i < 65; i += 1) {
+  await send("message.updated", { sessionID: "root", info: { id: "m" + i, sessionID: "root", role: "user" } });
+}
+await send("message.updated", { sessionID: "root", info: { id: "mz", sessionID: "z".repeat(300), role: "user" } });
+for (const i of [0, 64]) {
+  await send("message.part.updated", { sessionID: "root", part: { id: "p" + i, sessionID: "root", messageID: "m" + i, type: "text", text: "PROMPT_" + i } });
+}
+await send("message.part.updated", { sessionID: "root", part: { id: "pz", sessionID: "root", messageID: "mz", type: "text", text: "OVERSIZED_SESSION_PROMPT" } });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let fits = "y".repeat(256);
+        // Each oversized child is attributed to its own stand-in.
+        let stand_ins: Vec<String> = payloads
+            .iter()
+            .filter_map(|p| p["subagent_id"].as_str())
+            .filter(|id| id.starts_with("oversized-id:"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(stand_ins.len(), 4, "{payloads:#?}");
+        assert_eq!(stand_ins[0], stand_ins[1], "one child, one stand-in");
+        assert_eq!(stand_ins[2], stand_ins[3], "one child, one stand-in");
+        assert_ne!(stand_ins[0], stand_ins[2], "two children stay apart");
+        let expected = {
+            let mut rows = vec![row("root", "session.created", "")];
+            for oversized in [&stand_ins[0], &stand_ins[2]] {
+                rows.push(row("root", "tool.execute.before", oversized));
+                rows.push(row("root", "permission.asked", oversized));
+            }
+            rows.extend([
+                row("root", "subagent.start", &fits),
+                row("root", "tool.execute.before", &fits),
+                row("root", "permission.asked", &fits),
+                row("root", "subagent.stop", &fits),
+                row("root", "tool.execute.before", ""),
+                row("root", "session.prompt", ""),
+                row("root", "session.deleted", ""),
+            ]);
+            rows
+        };
+        assert_eq!(payload_rows(&payloads), expected, "{payloads:#?}");
+        let longest = payloads
+            .iter()
+            .flat_map(|p| p.as_object().unwrap().values())
+            .filter_map(|v| v.as_str())
+            .map(str::len)
+            .max();
+        assert_eq!(longest, Some(256), "no field carries an id over the bound");
+        let prompts: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .map(|p| &p["prompt"])
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![&serde_json::Value::from("PROMPT_64")],
+            "neither the oldest pending prompt nor one from an oversized session is reported"
+        );
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            assert_eq!(
+                event.is_from_subagent(),
+                payload.get("subagent_id").is_some(),
+                "{payload}"
+            );
+        }
+    }
+
+    /// Issue #1678 audit AU-5: two child sessions whose ids are over the bound
+    /// both ask for permission after the root's turn ended, and only the first
+    /// is answered. Each prompt is attributed to its own child, so the card,
+    /// fed those reports through the deck's hook decoder, stays on Needs Input
+    /// until the second is answered too, then returns to Idle.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_keeps_two_oversized_childrens_prompts_apart() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const created = (id, parentID) => send("session.created", { sessionID: id, info: { id, parentID, directory: "/work" } });
+await created("root");
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+const first = "x".repeat(299) + "a";
+const second = "x".repeat(299) + "b";
+for (const id of [first, second]) {
+  await created(id, "root");
+  await send("session.status", { sessionID: id, status: { type: "busy" } });
+  await send("permission.asked", { sessionID: id, title: "ask" });
+}
+await send("permission.replied", { sessionID: first });
+await send("permission.replied", { sessionID: second });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let rows = payload_rows(&payloads);
+        let asks: Vec<&(String, String, String)> = rows
+            .iter()
+            .filter(|(_, event, _)| event.starts_with("permission."))
+            .collect();
+        assert_eq!(asks.len(), 4, "{payloads:#?}");
+        let (first, second) = (&asks[0].2, &asks[1].2);
+        assert!(first.starts_with("oversized-id:"), "{first}");
+        assert!(second.starts_with("oversized-id:"), "{second}");
+        assert_ne!(first, second, "two oversized children stay apart");
+        assert_eq!(
+            asks.iter()
+                .map(|(session, event, id)| (session.as_str(), event.as_str(), id))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root", "permission.asked", first),
+                ("root", "permission.asked", second),
+                ("root", "permission.replied", first),
+                ("root", "permission.replied", second),
+            ]
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, event, _)| event.starts_with("subagent.")),
+            "an oversized child is never reported active: {payloads:#?}"
+        );
+
+        let mut state = crate::state::AppState::default();
+        let mut statuses = Vec::new();
+        for payload in &payloads {
+            let event = crate::hook::build_opencode_event(
+                serde_json::from_value(payload.clone()).expect("the deck decodes every payload"),
+            )
+            .expect("every payload maps to an event");
+            let is_permission = payload["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("permission."));
+            state.apply_event(event);
+            if is_permission {
+                statuses.push(state.sessions["root"].status.clone());
+            }
+        }
+        use crate::state::SessionStatus;
+        assert_eq!(
+            statuses,
+            vec![
+                SessionStatus::WaitingForInput,
+                SessionStatus::WaitingForInput,
+                SessionStatus::WaitingForInput,
+                SessionStatus::Idle,
+            ],
+            "answering one oversized child's prompt leaves the other's open"
+        );
+    }
+
+    /// Issue #1678 review #2: OpenCode disposing its instance while a child is
+    /// still running stops that child, under the session its start was filed
+    /// under, before the root's session closes; the exit flush that follows
+    /// stops nothing twice.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_stops_its_active_children_when_disposed() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+await send("server.instance.disposed", {});
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "session.status", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "session.status", ""),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
         );
     }
 

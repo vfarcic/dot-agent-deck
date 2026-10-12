@@ -73,6 +73,8 @@ fn event(event_type: EventType) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 

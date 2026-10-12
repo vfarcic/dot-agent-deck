@@ -117,6 +117,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "self-upgrade",
+        description: "The upgrade dialog open at its first question, each copy one release behind v0.47.0: in the TUI, the footer's update badge and this CLI's plan as a downloaded binary; on the desktop, the Dashboard with the newer-release banner and the rail's upgrade button, and the plans for the app from a .dmg and a Homebrew CLI.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "settings-voice",
         description: "Desktop Voice settings.",
         clients: &[Client::Desktop],

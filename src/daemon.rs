@@ -859,6 +859,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // spawns is handed that path explicitly instead of re-resolving it from
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
+    // PRD #1589 D8: and which attach endpoint, so an agent's `close` (and every
+    // other attach-socket call it makes) reaches THIS daemon. The configured
+    // primary path as given, or `None` for a hook-only daemon — whose children
+    // are then pointed nowhere rather than at the default endpoint.
+    pty_registry.set_attach_socket(daemon.attach_socket_path.clone());
     let state = daemon.state;
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
@@ -1759,6 +1764,143 @@ pub async fn ingest_event(
     ingest_event_unless(state, event_tx, registry, event, false, None, |_| false).await;
 }
 
+/// Issue #1637: record which `dot-agent-deck` sent an admitted hook line
+/// (its `deck_build` / `deck_exe` stamp, or the absence of one), and broadcast
+/// the notices when that changes them. Under the state's write guard, so a
+/// `SubscribeEventsWithSnapshot` reply holds a change or its stream does.
+async fn observe_hook_sender(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_type: &crate::event::AgentType,
+    line: &str,
+) {
+    let sender = crate::hook_binary::HookLineSender::from_line(line);
+    // The steady state — an agent's hooks sending the stamp they sent last time
+    // — changes nothing, so it is settled under a read guard and never queues
+    // behind or blocks the event's own write.
+    if !state
+        .read()
+        .await
+        .hook_binaries
+        .would_change(agent_type, &sender)
+    {
+        return;
+    }
+    let mut state = state.write().await;
+    if state.hook_binaries.observe(agent_type, &sender) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
+/// Issue #1637: every [`crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL`], read
+/// the agents' hook configs again for the binaries they pin, and apply what
+/// changed to the notices. `daemon serve` runs it for the daemon's lifetime.
+///
+/// The configs are read, and any new pin probed, on a detached thread before
+/// the state lock is taken ([`crate::hook_binary::PinRefresh::collect`],
+/// [`spawn_detached_collection`]); the result is then applied under the write
+/// lock in one step, which touches no file ([`apply_hook_pin_refresh`]). The
+/// first read is one interval after start, since startup has just read the
+/// same configs.
+///
+/// The thread is detached rather than a `spawn_blocking` task because the
+/// runtime's teardown waits for every blocking task it started, so a read
+/// stuck in the filesystem would hold the daemon's exit (audit A9). Aborting
+/// this task drops only the wait; the thread finishes, or is ended with the
+/// process. Only one read runs at a time: this loop waits for it, and a read
+/// left running by an aborted loop holds [`HOOK_PIN_COLLECTING`] until it ends.
+pub async fn run_hook_pin_refresh(state: SharedState, event_tx: broadcast::Sender<BroadcastMsg>) {
+    let period = crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let deck = state.read().await.hook_binaries.deck().clone();
+        let Some(collected) = spawn_detached_collection(&HOOK_PIN_COLLECTING, move || {
+            crate::hook_binary::PinRefresh::collect(&deck)
+        }) else {
+            tracing::warn!(
+                "hook pin refresh: the previous read of the agents' hook configs has not finished; skipped"
+            );
+            continue;
+        };
+        let refresh = match collected.await {
+            Ok(refresh) => refresh,
+            Err(_) => {
+                tracing::warn!("hook pin refresh: reading the agents' hook configs failed");
+                continue;
+            }
+        };
+        apply_hook_pin_refresh(&state, &event_tx, refresh).await;
+    }
+}
+
+/// Set while a hook-pin read started by [`run_hook_pin_refresh`] is running.
+static HOOK_PIN_COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Run `collect` on a detached thread and return a receiver for its result,
+/// unless `in_flight` says a previous one is still running, or no thread
+/// could be made: `None` then, and nothing runs. `in_flight` is set until
+/// `collect` returns or panics; a panic drops the sender, which the receiver
+/// reports as an error.
+fn spawn_detached_collection<T: Send + 'static>(
+    in_flight: &'static AtomicBool,
+    collect: impl FnOnce() -> T + Send + 'static,
+) -> Option<tokio::sync::oneshot::Receiver<T>> {
+    struct Release(&'static AtomicBool);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let release = Release(in_flight);
+    let spawned = std::thread::Builder::new()
+        .name("hook-pin-refresh".into())
+        .spawn(move || {
+            // Released before the result is sent, so a caller that has the
+            // result may start the next one; a panic releases it unwinding.
+            let value = collect();
+            drop(release);
+            let _ = tx.send(value);
+        });
+    match spawned {
+        Ok(_) => Some(rx),
+        Err(e) => {
+            // The closure, and with it `release`, was dropped with the error.
+            tracing::warn!("hook pin refresh: could not start a thread to read the configs: {e}");
+            None
+        }
+    }
+}
+
+/// Apply one [`crate::hook_binary::PinRefresh`] under the state's write guard,
+/// and broadcast the notices when that changes them.
+async fn apply_hook_pin_refresh(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    refresh: crate::hook_binary::PinRefresh,
+) {
+    let mut state = state.write().await;
+    if state.hook_binaries.apply_refresh(refresh) {
+        let _ = event_tx.send(BroadcastMsg::HookBinaryNotice(
+            crate::hook_binary::HookBinaryNotices {
+                notices: state.hook_binaries.notices(),
+            },
+        ));
+    }
+}
+
 /// [`ingest_event`] for a raw event the hook socket's provenance gate admitted
 /// (issue #318). `unproven` is the gate's verdict that the event comes from an
 /// outside agent — a pane, or a paneless agent, this daemon never issued a hook
@@ -1827,8 +1969,9 @@ async fn ingest_hook_event(
 /// [`ingest_event`], except that `stale` is asked once the `AppState` write
 /// lock is held, with the state it guards, and a `true` drops the event before
 /// it is broadcast or applied. Asked under that lock so nothing the lock orders
-/// can slip between the verdict and the apply. Returns whether the event was
-/// ingested.
+/// can slip between the verdict and the apply — which is also why it gets the
+/// state: the shell-activity monitor records its sample there in the same hold
+/// (issue #1678). Returns whether the event was ingested.
 ///
 /// An event is ingested holding the question lifecycle of the pane it lands
 /// on (PRD #1631, audit R1–R3 —
@@ -1856,7 +1999,7 @@ pub(crate) async fn ingest_event_unless<F>(
     mut stale: F,
 ) -> bool
 where
-    F: FnOnce(&crate::state::AppState) -> bool,
+    F: FnOnce(&mut crate::state::AppState) -> bool,
 {
     loop {
         let pane = match event.pane_id.clone() {
@@ -1904,7 +2047,7 @@ pub(crate) async fn ingest_event_in_lifecycle(
     lifecycle: &crate::agent_pty::QuestionLifecycle,
     event: AgentEvent,
     registration: Option<u64>,
-    stale: impl FnOnce(&crate::state::AppState) -> bool,
+    stale: impl FnOnce(&mut crate::state::AppState) -> bool,
 ) -> bool {
     debug_assert!(
         event
@@ -1947,7 +2090,7 @@ async fn ingest_event_core<F>(
     stale: F,
 ) -> Result<bool, (AgentEvent, F)>
 where
-    F: FnOnce(&crate::state::AppState) -> bool,
+    F: FnOnce(&mut crate::state::AppState) -> bool,
 {
     let mut state = state.write().await;
     // Audit T2: the pane whose question this event can change, which is the
@@ -1959,7 +2102,7 @@ where
     if question_pane.as_deref() != held {
         return Err((event, stale));
     }
-    if stale(&state) {
+    if stale(&mut state) {
         return Ok(false);
     }
     // PRD #1631 (audit R1): an event publishing a hold is ingested only while
@@ -2035,6 +2178,19 @@ where
         } else if crate::quota_block::is_work_evidence(&event) {
             registry.quota_note_work_event(pane_id, generation);
         }
+        // Issue #1650: remember when a booting agent first announced it is
+        // ready, so a `clear = false` delegate that arrives later can tell a
+        // worker still starting from one that is up. Only for the generation
+        // the event names, like the quota latch above.
+        if let Some(agent_id) = event.agent_id.as_deref()
+            && crate::state::session_start_opens_boot_gate(&event)
+        {
+            registry.note_boot_readiness(
+                pane_id,
+                agent_id,
+                event.is_wrapper_interface_ready_session_start(),
+            );
+        }
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -2063,6 +2219,12 @@ where
     event
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
+    // Issue #1678: so is the background-retirement marker, which makes an
+    // attached client clear a card's background copy. The daemon's own report
+    // is broadcast directly by the shell-activity monitor and never ingested.
+    event
+        .metadata
+        .remove(crate::event::BACKGROUND_RETIRED_METADATA_KEY);
     // Issues #601 / #697: both unproven markers are the daemon's alone too. The
     // first comes only from the hook gate's own verdict; the second is only
     // ever on an eviction the daemon broadcasts below and never ingests.
@@ -2125,12 +2287,40 @@ where
         &mut event,
         registration,
     );
-    let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    // Issue #1678: the aggregate is the daemon's alone, whatever arrived.
+    event.background = None;
+    event.background_revision = None;
+    // Issue #1678: apply FIRST, then broadcast — still under this one write-lock
+    // hold, so `SubscribeEventsWithSnapshot` ordering is unchanged — because the
+    // event that changes a card's background work has to carry the aggregate
+    // the apply computed. The broadcast copy is taken before the apply, so it
+    // is the same frame clients have always received, and it is sent whether
+    // or not the local apply accepts the event.
+    let mut broadcast = event.clone();
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
     // it like `daemon_owns_pane` above.
     state.apply_hook_event_watching_waiting(event, registry, attested_agent);
+    // Stamped on the frame that changed the aggregate, and on every shell frame
+    // of a pane that reports its own turns — the client's cue that the frame
+    // is background work and not a status (an older daemon never stamps one).
+    // And on every later event of a card whose aggregate has changed at least
+    // once, so a turn end that leaves the count as it was (a same-agent
+    // `/clear` keeps a running command) still tells clients what is running.
+    if let Some(applied) = state.take_applied_background()
+        && (applied.changed
+            || applied.revision > 0
+            || (applied.reporting
+                && matches!(
+                    broadcast.event_type,
+                    crate::event::EventType::ShellBusy | crate::event::EventType::ShellIdle
+                )))
+    {
+        broadcast.background = Some(applied.work);
+        broadcast.background_revision = Some(applied.revision);
+    }
+    let _ = event_tx.send(BroadcastMsg::Event(broadcast));
     // Issue #697: an outside agent's card evicted to make room for this one
     // reaches attached clients too, in order and under the same lock, so a
     // client that attached later than the daemon started — and so holds a
@@ -2583,7 +2773,7 @@ async fn drop_held_question(
             crate::event::EventType::Unknown,
             crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY,
         );
-        let replaced = |s: &crate::state::AppState| {
+        let replaced = |s: &mut crate::state::AppState| {
             s.pending_question_on_pane(pane_id)
                 .is_none_or(|q| q.id != id || q.revision != revision)
         };
@@ -2660,6 +2850,8 @@ pub(crate) fn deck_question_event(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -2731,7 +2923,9 @@ fn notify_orchestrator_of_quota_block(
 ///   and arming on it would move the parent's watch onto the subagent's log. The hook CLI applies the same
 ///   bounds, but a raw frame on the socket need not have come through it, and
 ///   these values are copied into the arm queue before anything else looks at
-///   them.
+///   them;
+/// * the daemon-authored background-work aggregate (`background`,
+///   `background_revision`, issue #1678) is stripped from every producer frame.
 fn admit_producer_event(event: &mut AgentEvent) {
     use crate::quota_block::{
         QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
@@ -2759,6 +2953,10 @@ fn admit_producer_event(event: &mut AgentEvent) {
             }
         }
     }
+    // Issue #1678: the background aggregate is the daemon's alone; a producer's
+    // copy would otherwise reach every attached client's card.
+    event.background = None;
+    event.background_revision = None;
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,
@@ -3055,7 +3253,7 @@ async fn report_codex_rollout_failure(
     let turn_id = failure.turn_id.clone();
     let outcome = failure.outcome.clone();
     let event = codex_rollout_failure_event(failure);
-    let superseded = |_: &crate::state::AppState| {
+    let superseded = |_: &mut crate::state::AppState| {
         registry
             .codex_rollout_arms()
             .supersedes(&agent_id, &turn_id)
@@ -3159,6 +3357,8 @@ fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFail
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -3320,6 +3520,8 @@ fn install_delivery_notice_sink(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             };
             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
             guard.apply_daemon_report_event(event);
@@ -3360,6 +3562,51 @@ async fn run_shell_activity_monitor(
         async move { crate::platform::proc::process_table_async(&roots).await }
     })
     .await
+}
+
+/// Issue #1678 D7: the spawn a shell-activity reading belongs to — pane, registry
+/// agent and PTY child together — so a reading never outlives the spawn it was
+/// taken for, and a successor in the same pane starts from nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShellActivityKey {
+    pane_id: String,
+    agent_id: String,
+    shell_pid: i32,
+}
+
+impl ShellActivityKey {
+    fn of(candidate: &crate::agent_pty::ShellActivityCandidate) -> Self {
+        Self {
+            pane_id: candidate.pane_id.clone(),
+            agent_id: candidate.agent_id.clone(),
+            shell_pid: candidate.shell_pid,
+        }
+    }
+}
+
+/// What the shell-activity monitor last read for one spawn.
+#[derive(Debug, Clone)]
+struct ShellActivityReading {
+    busy: bool,
+    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4).
+    sessions: std::collections::HashSet<i32>,
+    /// Whether the spawn's turn had ended when it was last read, so the
+    /// monitor emits once when a turn ends with a command still running.
+    turn_ended: bool,
+}
+
+/// [`AgentPtyRegistry::classify_command_sessions`], owned, for the monitor loop.
+fn classify_owned(
+    candidates: &[crate::agent_pty::ShellActivityCandidate],
+    table: &[crate::platform::proc::ProcessInfo],
+) -> Vec<(
+    crate::agent_pty::ShellActivityCandidate,
+    std::collections::HashSet<i32>,
+)> {
+    AgentPtyRegistry::classify_command_sessions(candidates, table)
+        .into_iter()
+        .map(|(candidate, sessions)| (candidate.clone(), sessions))
+        .collect()
 }
 
 // ── The shell-activity poll's three time constants ──
@@ -3616,7 +3863,8 @@ async fn run_shell_activity_monitor_with<S, F>(
     S: Fn(&[i32]) -> F,
     F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
 {
-    let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut last_known: std::collections::HashMap<ShellActivityKey, ShellActivityReading> =
+        std::collections::HashMap::new();
     // The sample still in flight from an earlier tick, if any (#500 review, P1).
     //
     // This exists so a wedged `ps` cannot ACCUMULATE. The obvious shape —
@@ -3694,11 +3942,39 @@ async fn run_shell_activity_monitor_with<S, F>(
         let candidates = pty_registry
             .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
 
+        // Issue #1678 D3/D5 (A3, A4): retire the background work of every spawn
+        // the registry no longer holds live on its pane, before and regardless
+        // of whether this tick's sample answers. Retirement is a lifecycle
+        // fact, not a process-table reading: a spawn can exit before its first
+        // valid sample, on a platform whose sampler always answers `None`, or
+        // while another pane keeps sampling in a failure episode, and its
+        // subagents would otherwise stay counted. A spawn the registry still
+        // holds live on its pane — published and not exited, or reserved for
+        // that pane and not yet published (R1) — is not touched here, so an
+        // unknown sample keeps its commands (D4). The
+        // retirement reaches attached clients as the daemon's report, sent
+        // under the same write lock that applied it.
+        let departed_work = {
+            let state = state.read().await;
+            state
+                .background_spawns_with_work()
+                .into_iter()
+                .any(|(pane, agent)| !pty_registry.agent_is_live_on_pane(&agent, &pane))
+        };
+        if departed_work {
+            let mut state = state.write().await;
+            for event in state.retire_departed_background_spawns(|pane, agent| {
+                pty_registry.agent_is_live_on_pane(agent, pane)
+            }) {
+                let _ = event_tx.send(BroadcastMsg::Event(event));
+            }
+        }
+
         let snapshot = if candidates.is_empty() {
             // No pane, so no sample — and an empty reading rather than a
             // skipped tick, because "there are no panes" is a fact we just
             // established under the lock, not a failure to observe. Falling
-            // through with an empty snapshot lets the `retain` below clear
+            // through with an empty snapshot lets the departed-spawn sweep below clear
             // `last_known`, which is what makes a later reuse of the same pane
             // id start edge-detection from a clean slate.
             //
@@ -3784,15 +4060,14 @@ async fn run_shell_activity_monitor_with<S, F>(
                             .iter()
                             .filter(|current| {
                                 at_start.iter().any(|then| {
-                                    then.pane_id == current.pane_id
-                                        && then.shell_pid == current.shell_pid
+                                    ShellActivityKey::of(then) == ShellActivityKey::of(current)
                                 })
                             })
                             .cloned()
                             .collect();
-                        AgentPtyRegistry::classify_shell_activity(&unchanged, &table)
+                        classify_owned(&unchanged, &table)
                     } else {
-                        AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                        classify_owned(&candidates, &table)
                     }
                 }
                 // ── The load-bearing decision of issue #429 ──
@@ -3842,108 +4117,79 @@ async fn run_shell_activity_monitor_with<S, F>(
                 }
             }
         };
-        let seen: std::collections::HashSet<&str> = snapshot
-            .iter()
-            .map(|(pane_id, _)| pane_id.as_str())
-            .collect();
-        // Drop panes that disappeared from the registry since the last poll
-        // (closed / respawned) so a later reuse of the same pane id starts
-        // edge-detection from a clean slate instead of inheriting a stale
-        // busy/idle reading.
-        last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
+        // Issue #1678 D7: drop the readings of spawns that left the candidate
+        // set since the last poll (closed, respawned, exited) so a later reuse
+        // of the same pane starts edge-detection from a clean slate instead of
+        // inheriting a stale reading — keyed by spawn identity, so a successor
+        // in the same pane is never measured against its predecessor. A spawn
+        // that is still a candidate keeps its last known reading even when this
+        // sample could not answer for it (D4: unknown is not zero). Its
+        // background work was retired by the lifecycle sweep above.
+        let current: std::collections::HashSet<ShellActivityKey> =
+            candidates.iter().map(ShellActivityKey::of).collect();
+        last_known.retain(|key, _| current.contains(key));
 
-        for (pane_id, busy) in snapshot {
-            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+        for (candidate, sessions) in snapshot {
+            let key = ShellActivityKey::of(&candidate);
+            let busy = !sessions.is_empty();
+            let previous = last_known.get(&key);
+            let busy_changed = previous.map(|seen| seen.busy) != Some(busy);
+            let sessions_changed = previous.is_none_or(|seen| seen.sessions != sessions);
+            let previously_ended = previous.is_some_and(|seen| seen.turn_ended);
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan
             // reads idle and whose reading did not just change has nothing to
             // report, so it never takes the state lock at all.
-            if !changed && !busy {
+            if !busy_changed && !sessions_changed && !busy {
                 continue;
             }
 
-            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware. A
-            // purely edge-triggered monitor emits exactly one `ShellBusy` per
-            // busy window — at the rising edge — which is the whole reported
-            // bug: Claude Code's Bash tool backgrounds a command at its 120s
-            // cap, the agent ends its turn, the real `Stop` hook maps to
-            // `EventType::Idle` (`src/hook.rs`) and knocks the pane back to
-            // `Idle` while the command runs on. The scan still reads busy, but
-            // it read busy *before* `Stop` too, so there is no new edge and
-            // nothing ever re-promotes: measured at ~9.7 minutes of wrong
-            // badge for a ~700s command.
+            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware for a
+            // pane whose agent does NOT report its own turns. A purely
+            // edge-triggered monitor emits exactly one `ShellBusy` per busy
+            // window — at the rising edge — so when Claude Code's Bash tool
+            // backgrounds a command at its 120s cap and the `Stop` hook lands as
+            // `Idle`, nothing ever re-promoted. So such a pane also re-emits when
+            // the scan reads busy AND the session's status has regressed to
+            // `Idle`/`Unknown`; `apply_event`'s `ShellBusy` arm still decides what
+            // (if anything) to promote. It cannot spam: one `ShellBusy` lands, the
+            // card reads `Working`, and the next poll sends nothing.
             //
-            // So also re-emit when the scan reads busy AND the session's
-            // status has actually regressed to `Idle`/`Unknown`. That is a
-            // monitor-side correction only — it adds no precedence rule and
-            // changes no wire format; `apply_event`'s `ShellBusy` arm still
-            // decides what (if anything) to promote, and still promotes
-            // exactly `Idle`/`Unknown`, so a real `WaitingForInput`/`Error`/
-            // `Thinking`/`Working` is never overridden by this signal.
-            //
-            // It cannot spam the pipeline either: the re-emit is conditioned
-            // on the very status the emitted event corrects. One `ShellBusy`
-            // lands, `apply_event` moves the session to `Working`, and the
-            // next poll reads `Working` and sends nothing — a steady-state
-            // busy pane is silent until something knocks it back to `Idle`
-            // again.
-            let (session_id, agent_id, status_regressed) = {
+            // Issue #1678: a pane whose agent DOES report its turns (D1) is the
+            // opposite case. Its card legitimately stays `Idle` after `Stop`, so
+            // that predicate would fire every 500 ms for as long as the command
+            // runs. It emits only when the sampled session set changes (the
+            // aggregate's command count or ages move), on a busy edge, and once
+            // when its turn ends while busy — the `ShellBusy` an older
+            // event-folding client has always received at that moment.
+            let (session_id, view, status_regressed) = {
                 let state = state.read().await;
-                let Some(session_id) = state.pane_hook_session_id(&pane_id) else {
+                let Some(session_id) = state.pane_hook_session_id(&candidate.pane_id) else {
+                    // A bare shell pane that never emitted an agent event has no
+                    // session to update. Its reading is still recorded, as before.
+                    last_known.insert(
+                        key,
+                        ShellActivityReading {
+                            busy,
+                            sessions,
+                            turn_ended: previously_ended,
+                        },
+                    );
                     continue;
                 };
-                // PRD #386 M6b: the pane's CURRENT CARD —
-                // NOT `sessions[session_id]`. Both values read below describe
-                // the session this event will actually land on, and that is
-                // the card, not the hook generation.
-                //
-                // `pane_hook_session_id` is the pane's latest hook GENERATION
-                // and is the authoritative value for `AgentEvent.session_id`
-                // (it is what the daemon's send guard compares against); it is
-                // NOT a key into `sessions`. A same-agent `/clear` / thread
-                // restart rolls that generation forward while `apply_event`'s
-                // same-agent reuse guard deliberately keeps the CARD under its
-                // stable id (see `AppState::apply_event`'s "ORIGINAL hook
-                // session_id" comment and `Self::pane_hook_session_id`'s doc),
-                // so after a rollover the two diverge and a
-                // `sessions[generation]` lookup MISSES. The card is therefore
-                // resolved with the same newest-by-`last_activity` rule the
-                // rest of the daemon uses for "which session owns this pane"
-                // (`pane_session_id`, the resolution behind `pane_writable`),
-                // which returns a real card id — so the `sessions` lookup here
-                // is keyed correctly by construction.
+                // PRD #386 M6b: the pane's CURRENT CARD — NOT
+                // `sessions[session_id]`. `pane_hook_session_id` is the pane's
+                // latest hook GENERATION and is the authoritative value for
+                // `AgentEvent.session_id` (it is what the daemon's send guard
+                // compares against); it is NOT a key into `sessions`, because a
+                // same-agent `/clear` rolls the generation forward while
+                // `apply_event`'s reuse guard keeps the card under its stable id.
+                // The card is resolved with the newest-by-`last_activity` rule
+                // the rest of the daemon uses (`pane_session_id`).
                 let card = state
-                    .pane_session_id(&pane_id)
+                    .pane_session_id(&candidate.pane_id)
                     .and_then(|card_id| state.sessions.get(&card_id));
-                // PRD #386 M6b: carry the pane's agent id. `apply_event`'s
-                // same-agent reuse guard matches an incoming event onto an
-                // existing card for the pane ONLY when the two `agent_id`s
-                // agree, and it is the client (not the daemon) where that
-                // matters: the DAEMON's card is keyed by the hook session id
-                // this event already carries, so it resolves either way, but
-                // an attached TUI mints its card at spawn time under a
-                // `pane-<id>` key with the spawn `agent_id` on it, and the
-                // real hook events are remapped onto THAT card. A synthesized
-                // event with `agent_id: None` failed the guard, missed the
-                // card, and created a SECOND, phantom session under the raw
-                // hook id — so the daemon read `Working` while the dashboard
-                // the user is looking at kept rendering the real card as
-                // `Idle` (plus a stray extra card). Measured directly: in a
-                // `006` run the TUI resolved every real event onto its card
-                // and ONLY `ShellBusy` onto a session of its own. A TUI that
-                // RECONNECTS reaches the same failure from the other
-                // direction: it keys the pane's card by the hydration-minted
-                // `pane-{pane_id}`, so the reuse guard is again the only
-                // thing that can remap the event onto it.
-                //
-                // Taken from the pane's own card rather than invented, so it
-                // is exactly the id that card was minted with; `None` when no
-                // card resolves yet, which is the pre-existing behaviour and
-                // no worse than it. Fails SAFE either way: emitting no agent
-                // id is only a missed remap, whereas emitting a WRONG one
-                // would route a live pane's shell status onto someone else's
-                // card.
-                let agent_id = card.and_then(|card| card.agent_id.clone());
+                let view = state.background_view(&candidate.pane_id, &candidate.agent_id);
                 // A pane with no card yet is left to the rising edge alone —
                 // there is no status to have regressed, and guessing one would
                 // emit on every tick until the session materializes.
@@ -3955,21 +4201,48 @@ async fn run_shell_activity_monitor_with<S, F>(
                                 | crate::state::SessionStatus::Unknown
                         )
                     });
-                (session_id, agent_id, regressed)
+                (session_id, view, regressed)
             };
 
-            if !changed && !status_regressed {
+            let emit = if view.reports_turn_boundaries {
+                busy_changed || sessions_changed || (busy && view.turn_ended && !previously_ended)
+            } else {
+                busy_changed || status_regressed
+            };
+            last_known.insert(
+                key.clone(),
+                ShellActivityReading {
+                    busy,
+                    sessions: sessions.clone(),
+                    turn_ended: view.turn_ended,
+                },
+            );
+
+            if !emit {
+                // Nothing to tell a client, but a changed set still moves the
+                // first-seen ages the aggregate will report once the pane's
+                // turn ends (D5) — recorded only for the spawn that was sampled.
+                if sessions_changed {
+                    let mut guard = state.write().await;
+                    if pty_registry.shell_activity_candidate_current(&candidate) {
+                        guard.observe_command_sessions(
+                            &candidate.pane_id,
+                            &candidate.agent_id,
+                            &sessions,
+                        );
+                    }
+                }
                 continue;
             }
 
-            if !changed {
+            if !busy_changed && !view.reports_turn_boundaries {
                 // Only ever the corrective re-emit — a transition logs
                 // nothing, and a steady-state busy pane reaches here at most
                 // once per regression, so this cannot become a per-tick line
                 // even at `RUST_LOG=debug`. It is the one place a "why is the
                 // badge still Idle?" investigation needs to look.
                 debug!(
-                    pane_id = %pane_id,
+                    pane_id = %candidate.pane_id,
                     "shell-activity: re-emitting ShellBusy — scan still reads busy while the \
                      session fell back to Idle/Unknown"
                 );
@@ -3993,22 +4266,134 @@ async fn run_shell_activity_monitor_with<S, F>(
                 timestamp: chrono::Utc::now(),
                 user_prompt: None,
                 metadata: std::collections::HashMap::new(),
-                pane_id: Some(pane_id),
-                // The pane's own agent id — see where it is read above. This
-                // is what lets an attached TUI resolve the event onto the
-                // card it already renders for this pane instead of minting a
-                // phantom session beside it.
-                agent_id,
+                pane_id: Some(candidate.pane_id.clone()),
+                // PRD #386 M6b: the pane's agent id, which is what lets an
+                // attached TUI resolve the event onto the card it already renders
+                // for this pane instead of minting a phantom session beside it.
+                // Issue #1678 D7: the id of the spawn that was SAMPLED, never
+                // that of whatever card holds the pane by now — the sample is
+                // revalidated against it below.
+                agent_id: Some(candidate.agent_id.clone()),
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             };
 
-            // One ordered ingestion step (broadcast + apply under a single
+            // One ordered ingestion step (apply + broadcast under a single
             // write-lock hold), exactly as the hook loop below does it — see
-            // `ingest_event` for the interleaving this closes.
-            ingest_event(&state, &event_tx, &pty_registry, event).await;
+            // `ingest_event` for the interleaving this closes. Issue #1678 D7:
+            // under that same hold, a sample whose spawn has been replaced or
+            // has exited is dropped before it touches anything, and the sampled
+            // set is recorded before the event that publishes it is applied.
+            let ingested = ingest_event_unless(
+                &state,
+                &event_tx,
+                &pty_registry,
+                event,
+                false,
+                None,
+                |state| {
+                    if !pty_registry.shell_activity_candidate_current(&candidate) {
+                        return true;
+                    }
+                    state.observe_command_sessions(
+                        &candidate.pane_id,
+                        &candidate.agent_id,
+                        &sessions,
+                    );
+                    false
+                },
+            )
+            .await;
+            if !ingested {
+                last_known.remove(&key);
+            }
         }
+    }
+}
+
+/// PRD #1589 D5: mark a dispatched unit complete from a `work-done --done`,
+/// gated on the generation the hook gate ATTESTED for this report.
+///
+/// Threaded from the `WorkDone` arm rather than resolved inside
+/// `prepare_dispatch_completion`, because that seam sees only the signal and
+/// the registry: looking the pane's occupant up there would launder a
+/// predecessor's late report into its successor, and reading the retained
+/// return's own agent id would compare the record to itself (auditor B2). Only
+/// an attested sender that is the unit's authorized terminal generation, and
+/// still speaks for its pane, marks it; a missing token admitted under
+/// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, an unattested pane, a superseded
+/// generation and a worker role of an orchestration never do. The return
+/// route's delivery is unchanged and runs whatever this decides. Returns the
+/// unit id it marked, if any.
+pub(crate) fn mark_dispatched_unit_completion(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    signal: &crate::event::WorkDoneSignal,
+    provenance: &crate::hook_provenance::Provenance,
+) -> Option<String> {
+    if !signal.done {
+        return None;
+    }
+    let crate::hook_provenance::Provenance::Attested { agent_id } = provenance else {
+        return None;
+    };
+    if registry.generation_ownership(Some(&signal.pane_id), Some(agent_id))
+        != crate::state::Ownership::Owned
+    {
+        return None;
+    }
+    let marked = registry.dispatched_units().mark_completed(
+        &signal.pane_id,
+        agent_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    if let Some(unit_id) = marked.as_deref() {
+        info!(
+            unit_id = %unit_id,
+            pane_id = %signal.pane_id,
+            agent_id = %agent_id,
+            "dispatch: unit reported done; it may now be closed without --force"
+        );
+    }
+    marked
+}
+
+/// PRD #1589 D2: the `(agent id, cwd)` a `dispatch` is recorded and run under,
+/// resolved as ONE pair from one record.
+///
+/// For an attested sender the pair comes from the attested generation's OWN
+/// record, and only while that generation still holds the pane it claims. The
+/// earlier lookup found "whatever live record names this pane" after the gate,
+/// so a retained predecessor token could attest A while the lookup found its
+/// successor B, pairing the dispatch with B's identity and cwd (auditor B1).
+/// Now A is refused outright, and B is never paired with A's claim.
+///
+/// The token-less compatibility path is unchanged: a pane never issued a token,
+/// or a message admitted under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, still
+/// resolves by pane, because there is no attested generation to bind to.
+pub(crate) fn resolve_dispatch_caller(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    pane_id: &str,
+    provenance: &crate::hook_provenance::Provenance,
+) -> Option<(String, String)> {
+    match provenance {
+        crate::hook_provenance::Provenance::Attested { agent_id } => {
+            if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
+                return None;
+            }
+            let record = registry.agent_record_any(agent_id)?;
+            if record.pane_id_env.as_deref() != Some(pane_id) {
+                return None;
+            }
+            record.cwd.map(|cwd| (record.id, cwd))
+        }
+        _ => registry
+            .agent_records()
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|r| r.cwd.map(|cwd| (r.id, cwd))),
     }
 }
 
@@ -4979,13 +5364,16 @@ async fn run_hook_loop_with_limits(
                                     // consistent pair; two lookups could straddle a
                                     // hand-over and pair one agent's cwd with another's
                                     // identity.
-                                    let caller = {
-                                        let records = pty_registry.agent_records();
-                                        records
-                                            .iter()
-                                            .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
-                                            .and_then(|r| r.cwd.clone().map(|cwd| (r.id.clone(), cwd)))
-                                    };
+                                    //
+                                    // PRD #1589 D2: and for an attested sender the
+                                    // pair is the attested generation's own, while
+                                    // it still holds the pane — see
+                                    // `resolve_dispatch_caller`.
+                                    let caller = resolve_dispatch_caller(
+                                        &pty_registry,
+                                        &signal.pane_id,
+                                        &provenance,
+                                    );
                                     let (caller_agent_id, cwd) = match caller {
                                         Some(c) => c,
                                         None => {
@@ -5119,6 +5507,15 @@ async fn run_hook_loop_with_limits(
                                     // queue push, a sender that waits for its ack
                                     // is ordered, and the wait is the state
                                     // change and the push, never the delivery.
+                                    // PRD #1589 D5: the completion mark `close`
+                                    // reads, bound to the attested sender. Before
+                                    // the return route's own handling, which is
+                                    // unchanged.
+                                    mark_dispatched_unit_completion(
+                                        &pty_registry,
+                                        &signal,
+                                        &provenance,
+                                    );
                                     let delivery = state
                                         .read()
                                         .await
@@ -5228,7 +5625,7 @@ async fn run_hook_loop_with_limits(
                                     // more lines outside both bounds.
                                     let ack = signal.ack;
                                     let Some(held) = handle_question_signal(
-                                        signal,
+                                        *signal,
                                         attested_agent.clone(),
                                         unproven,
                                         &state,
@@ -5532,6 +5929,11 @@ async fn run_hook_loop_with_limits(
                                     &line,
                                 );
                             }
+                            // Issue #1637: which deck binary sent this line,
+                            // read off the line like the token, and never part
+                            // of the event.
+                            observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
+                                .await;
                             ingest_hook_event(
                                 &state,
                                 &event_tx,
@@ -5619,6 +6021,176 @@ mod orphan_watchdog_tests {
     }
 }
 
+/// PRD #1589: the two hook-socket seams the `close` verb depends on — the
+/// completion mark bound to the attested sender, and the `dispatch` caller
+/// resolved as one attested pair.
+#[cfg(all(test, unix))]
+mod close_verb_seam_tests {
+    use super::*;
+    use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::hook_provenance::{Provenance, Refusal};
+
+    fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: &str, command: &str) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
+                cwd: Some(cwd),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn")
+    }
+
+    fn wait_exited(registry: &AgentPtyRegistry, agent: &str) {
+        for _ in 0..400 {
+            if !registry.agent_is_live(agent) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the child never exited");
+    }
+
+    fn done(pane: &str, done: bool) -> crate::event::WorkDoneSignal {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane,
+            "task": "finished",
+            "done": done,
+            "timestamp": chrono::Utc::now(),
+        }))
+        .expect("a work-done signal")
+    }
+
+    fn unit(registry: &AgentPtyRegistry, pane: &str, agent: &str) -> String {
+        registry
+            .dispatched_units()
+            .register(crate::dispatched_units::NewUnit {
+                name: format!("unit-{pane}"),
+                worktree: std::path::PathBuf::from("/wt"),
+                branch: "b".to_string(),
+                clone_dir: std::path::PathBuf::from("/repo"),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "disp-agent".to_string(),
+                },
+                kind: crate::dispatched_units::UnitKind::Single {
+                    pane_id: pane.to_string(),
+                    agent_id: agent.to_string(),
+                },
+                dispatched_at_ms: 1,
+            })
+    }
+
+    fn completed(registry: &AgentPtyRegistry, id: &str) -> bool {
+        registry
+            .dispatched_units()
+            .get(id)
+            .is_some_and(|u| u.completed_at_ms.is_some())
+    }
+
+    /// Scenario: a dispatched unit's `work-done --done` marks it complete only
+    /// when the hook gate attested the report to the unit's own terminal
+    /// generation. A token-less report admitted under the `warn` escape hatch,
+    /// an unattested pane, another generation's token, a non-terminal report,
+    /// and a superseded generation's late `--done` mark nothing.
+    #[test]
+    fn completion_is_marked_only_by_the_attested_current_terminal_generation() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, "unit-pane", "/tmp", "sleep 30");
+        let id = unit(&registry, "unit-pane", &agent);
+        let signal = done("unit-pane", true);
+        for provenance in [
+            Provenance::Unattested,
+            Provenance::Refused(Refusal::Missing),
+            Provenance::Attested {
+                agent_id: "someone-else".to_string(),
+            },
+        ] {
+            assert_eq!(
+                mark_dispatched_unit_completion(&registry, &signal, &provenance),
+                None,
+                "{provenance:?}"
+            );
+        }
+        let attested = Provenance::Attested {
+            agent_id: agent.clone(),
+        };
+        assert_eq!(
+            mark_dispatched_unit_completion(&registry, &done("unit-pane", false), &attested),
+            None,
+            "progress without --done is not completion"
+        );
+        assert!(!completed(&registry, &id));
+        assert_eq!(
+            mark_dispatched_unit_completion(&registry, &signal, &attested),
+            Some(id.clone())
+        );
+        assert!(completed(&registry, &id));
+
+        // A generation whose pane was handed over cannot mark its unit late.
+        let old = spawn(&registry, "recycled", "/tmp", "/usr/bin/true");
+        let old_unit = unit(&registry, "recycled", &old);
+        wait_exited(&registry, &old);
+        let _new = spawn(&registry, "recycled", "/tmp", "sleep 30");
+        assert_eq!(
+            mark_dispatched_unit_completion(
+                &registry,
+                &done("recycled", true),
+                &Provenance::Attested { agent_id: old },
+            ),
+            None
+        );
+        assert!(!completed(&registry, &old_unit));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: a dispatcher A exits and B takes its pane in another
+    /// directory. A `dispatch` attested to A is refused rather than paired
+    /// with B's identity and cwd; one attested to B runs as B, in B's cwd; and
+    /// the token-less compatibility path still resolves by pane.
+    #[test]
+    fn a_dispatch_runs_as_the_attested_generation_with_its_own_cwd() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = spawn(
+            &registry,
+            "disp",
+            &a_dir.path().to_string_lossy(),
+            "/usr/bin/true",
+        );
+        wait_exited(&registry, &a);
+        let b = spawn(
+            &registry,
+            "disp",
+            &b_dir.path().to_string_lossy(),
+            "sleep 30",
+        );
+        let b_cwd = b_dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_dispatch_caller(&registry, "disp", &Provenance::Attested { agent_id: a }),
+            None,
+            "a superseded generation must not dispatch as its successor"
+        );
+        assert_eq!(
+            resolve_dispatch_caller(
+                &registry,
+                "disp",
+                &Provenance::Attested {
+                    agent_id: b.clone()
+                }
+            ),
+            Some((b.clone(), b_cwd.clone()))
+        );
+        assert_eq!(
+            resolve_dispatch_caller(&registry, "disp", &Provenance::Unattested),
+            Some((b, b_cwd)),
+            "the token-less compatibility path is unchanged"
+        );
+        registry.shutdown_all();
+    }
+}
+
 /// Issue #714: producer admission of the quota-block contract. Platform
 /// independent — it touches no socket and spawns nothing.
 #[cfg(test)]
@@ -5643,6 +6215,8 @@ mod quota_admission_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -6420,6 +6994,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         assert!(forged.is_daemon_pane_closed(), "precondition");
         ingest_event(&state, &event_tx, &registry, forged).await;
@@ -6525,6 +7101,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -6931,6 +7509,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }))
             .expect("surface broadcast-only card");
         let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
@@ -8171,6 +8751,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         assert_eq!(
             state.read().await.sessions["sess-370"].status,
@@ -8224,7 +8806,7 @@ mod hook_ingestion_tests {
     /// Scenario: PRD #386 M6b's agent-id stamping across a session rollover —
     /// the EMITTED SHAPE rather than the local effect
     /// (`shell_activity_monitor_reflects_a_real_detached_shell_command` above
-    /// covers that). Spawn a real `/bin/sh` pane owned by `agent-21`, seed it a hook
+    /// covers that). Spawn a real `/bin/sh` pane, seed it a hook
     /// `SessionStart`, then seed a SECOND `SessionStart` under the SAME agent
     /// with a NEW hook session id — a same-agent `/clear` / thread restart, so
     /// the pane's hook generation rolls forward to `sess-21-gen2` while
@@ -8233,9 +8815,11 @@ mod hook_ingestion_tests {
     /// its broadcast, and type a `setsid`-detached `sleep` into the PTY (the
     /// topology PRD #386's descendant scan fires on). Every event
     /// it broadcasts must report the CURRENT hook generation as its
-    /// `session_id` AND carry `agent_id: Some("agent-21")` resolved from the
-    /// pane's card — an unstamped event cannot be remapped onto a reconnected
-    /// TUI's hydrated card and mints a phantom session instead.
+    /// `session_id` AND carry the owning agent's id — an unstamped event cannot
+    /// be remapped onto a reconnected TUI's hydrated card and mints a phantom
+    /// session instead. Since issue #1678 (D7) that id is the SAMPLED spawn's
+    /// registry id rather than whatever the pane's card carries, so the card is
+    /// seeded with the real spawn id, as every daemon-spawned agent's hooks are.
     ///
     /// **What #1159 changed here.** The detached child outlives the wait for the
     /// broadcast instead of being a `sleep 2` the `ShellBusy` had to be caught
@@ -8244,7 +8828,6 @@ mod hook_ingestion_tests {
     #[tokio::test]
     async fn shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover() {
         const PANE: &str = "pane-21";
-        const AGENT: &str = "agent-21";
         const GEN1: &str = "sess-21-gen1";
         const GEN2: &str = "sess-21-gen2";
 
@@ -8273,10 +8856,12 @@ mod hook_ingestion_tests {
             user_prompt: None,
             metadata: std::collections::HashMap::new(),
             pane_id: Some(PANE.to_string()),
-            agent_id: Some(AGENT.to_string()),
+            agent_id: Some(spawned.clone()),
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
 
         // Generation 1, then the same-agent restart that rolls the generation
@@ -8337,11 +8922,10 @@ mod hook_ingestion_tests {
             );
             assert_eq!(
                 event.agent_id.as_deref(),
-                Some(AGENT),
-                "the synthesized {:?} must carry the owning agent id resolved \
-                 from the pane's CARD; a `sessions[hook_generation]` lookup \
-                 misses after a same-agent restart and re-emits `None`, which \
-                 no hydrated TUI card can be remapped onto",
+                Some(spawned.as_str()),
+                "the synthesized {:?} must carry the sampled spawn's agent id \
+                 across a same-agent restart; an event with `None` cannot be \
+                 remapped onto any hydrated TUI card",
                 event.event_type
             );
             saw_busy = event.event_type == crate::event::EventType::ShellBusy;
@@ -8404,6 +8988,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         // One wedged sample, then honest ones. The sampler is the REAL
@@ -8556,6 +9142,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state
             .write()
@@ -8669,6 +9257,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         // `SessionStart` creates the card (and the `pane_hook_session_id`
         // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
@@ -8787,6 +9377,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         assert_eq!(
             state.read().await.sessions[SESSION].status,
@@ -8961,6 +9553,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state
             .write()
@@ -9120,6 +9714,705 @@ mod hook_ingestion_tests {
             "pane B did not exist when the sample started, so the pid naming it in that \
              table cannot be known to be B's — which under pid reuse is exactly how a \
              replacement pane inherits a departed one's descendants"
+        );
+    }
+
+    /// Scenario: Run the shell-activity monitor with a stub sampler against a real reporting Claude pane whose turn has ended, and have the first sample replace that pane's agent with a successor before it answers busy for the old one. The late sample is dropped under the state lock: nothing is broadcast as busy, and the successor's card keeps its Idle status and no background work.
+    #[spec("status/background/009")]
+    #[tokio::test(start_paused = true)]
+    async fn background_009_a_late_sample_from_a_replaced_spawn_touches_nothing() {
+        const PANE: &str = "pane-1678";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |registry: &Arc<AgentPtyRegistry>| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/sh"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    agent_type: Some(AgentType::ClaudeCode),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn pane agent")
+        };
+        let old = spawn(&registry);
+        let old_pid = registry.child_pid(&old).expect("old spawn pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        state
+            .write()
+            .await
+            .set_agent_ownership(Arc::downgrade(&ownership));
+        let hook = |session: &str, agent: &str, event_type| AgentEvent {
+            session_id: session.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(agent.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        {
+            let mut guard = state.write().await;
+            guard.apply_event(hook(
+                "sess-old",
+                &old,
+                crate::event::EventType::SessionStart,
+            ));
+            guard.apply_event(hook("sess-old", &old, crate::event::EventType::Idle));
+        }
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let successor: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let monitor = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let successor = successor.clone();
+            async move {
+                let sampler_registry = registry.clone();
+                let sampler_state = state.clone();
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                    let _ = started_tx.send(());
+                    let first = samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let registry = sampler_registry.clone();
+                    let state = sampler_state.clone();
+                    let successor = successor.clone();
+                    let old = old.clone();
+                    async move {
+                        let leader = |pid: i32| crate::platform::proc::ProcessInfo {
+                            pid,
+                            ppid: 1,
+                            session_id: pid,
+                            has_controlling_tty: true,
+                            session_leader: true,
+                            command_line: crate::platform::proc::CommandLine::NotSampled,
+                        };
+                        if !first {
+                            // The successor, sampled for itself: idle.
+                            let pid = successor
+                                .lock()
+                                .unwrap()
+                                .as_deref()
+                                .and_then(|id| registry.child_pid(id))
+                                .map_or(0, |pid| pid as i32);
+                            return Some(vec![leader(pid)]);
+                        }
+                        // While this sample is in flight the pane's agent is
+                        // replaced and the successor reports its own ended turn.
+                        registry.close_agent(&old).expect("close the old spawn");
+                        let new = spawn(&registry);
+                        {
+                            let mut guard = state.write().await;
+                            guard.apply_event(hook(
+                                "sess-new",
+                                &new,
+                                crate::event::EventType::SessionStart,
+                            ));
+                            guard.apply_event(hook(
+                                "sess-new",
+                                &new,
+                                crate::event::EventType::Idle,
+                            ));
+                        }
+                        *successor.lock().unwrap() = Some(new);
+                        // ...and the sample answers busy for the OLD spawn, with
+                        // the measured Claude fingerprint on its detached shell.
+                        Some(vec![
+                            leader(old_pid),
+                            crate::platform::proc::ProcessInfo {
+                                pid: old_pid + 100_000,
+                                ppid: old_pid,
+                                session_id: old_pid + 100_000,
+                                has_controlling_tty: false,
+                                session_leader: true,
+                                command_line: crate::platform::proc::CommandLine::Read(
+                                    "bash -c sleep 9 shell-snapshots/snapshot-x && eval "
+                                        .to_string(),
+                                ),
+                            },
+                        ])
+                    }
+                })
+                .await
+            }
+        });
+
+        // The third sample can only start after the tick that classified the
+        // late answer, and the one after it, have finished.
+        for what in [
+            "the first sample",
+            "the successor's sample",
+            "a third sample",
+        ] {
+            next_sample_start(&mut started_rx, what).await;
+        }
+        monitor.abort();
+        let _ = monitor.await;
+
+        let new = successor
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("successor spawned");
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                assert_ne!(
+                    event.event_type,
+                    crate::event::EventType::ShellBusy,
+                    "the old spawn's late busy sample must not be broadcast: {event:?}"
+                );
+                assert!(
+                    event.background.is_none_or(|work| work.is_empty()),
+                    "no frame may carry the old spawn's command: {event:?}"
+                );
+            }
+        }
+        let guard = state.read().await;
+        let live = guard
+            .live_session_for(&new, Some(PANE))
+            .expect("the successor's card");
+        assert_eq!(live.status, crate::state::SessionStatus::Idle);
+        assert_eq!(
+            live.background, None,
+            "the successor must not inherit the old spawn's sample"
+        );
+        drop(guard);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Let a reporting pane exit with a background subagent before its first successful command sample, while sampling is unsupported, or during another pane's failure/backoff episode. Also poll while an attested child's publication is paused, with and without Stop: its subagent must survive publication without a retirement broadcast, while a reservation that is actually abandoned and exited spawns lose their work.
+    #[spec("status/background/013")]
+    #[tokio::test(start_paused = true)]
+    async fn background_013_exit_retirement_does_not_depend_on_command_samples() {
+        let mut failures = Vec::new();
+        for mode in [
+            "before-first-sample",
+            "unsupported-sampler",
+            "failure-backoff",
+        ] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let spawn = |pane: &str| {
+                registry
+                    .spawn_agent(SpawnOptions {
+                        command: Some("/bin/sh"),
+                        env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+                        agent_type: Some(AgentType::ClaudeCode),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            };
+            let old = spawn("retirement-old");
+            let other = (mode != "before-first-sample").then(|| spawn("retirement-live"));
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            {
+                let mut guard = state.write().await;
+                guard.set_agent_ownership(Arc::downgrade(&ownership));
+                for (pane, agent) in std::iter::once(("retirement-old", &old))
+                    .chain(other.as_ref().map(|id| ("retirement-live", id)))
+                {
+                    for kind in ["session_start", "subagent_start", "idle"] {
+                        let event = serde_json::from_value(serde_json::json!({
+                            "session_id": pane, "pane_id": pane, "agent_id": agent,
+                            "agent_type": "claude_code", "event_type": kind, "timestamp": chrono::Utc::now(),
+                            "metadata": {crate::event::SUBAGENT_ID_METADATA_KEY: "background-child"}
+                        })).unwrap();
+                        // Only the subagent start is attributed to a child.
+                        let mut event: AgentEvent = event;
+                        if kind != "subagent_start" {
+                            event.metadata.clear();
+                        }
+                        guard.apply_event(event);
+                    }
+                    assert_eq!(
+                        guard
+                            .live_session_for(agent, Some(pane))
+                            .unwrap()
+                            .background
+                            .unwrap()
+                            .subagents,
+                        1
+                    );
+                }
+            }
+            let pids: Vec<i32> = [&old]
+                .into_iter()
+                .chain(other.iter())
+                .map(|id| registry.child_pid(id).unwrap() as i32)
+                .collect();
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let monitor = tokio::spawn({
+                let registry = registry.clone();
+                let state = state.clone();
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                async move {
+                    run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                        let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        let _ = started_tx.send(());
+                        let table = (mode == "failure-backoff" && first).then(|| {
+                            pids.iter()
+                                .map(|&pid| crate::platform::proc::ProcessInfo {
+                                    pid,
+                                    ppid: 1,
+                                    session_id: pid,
+                                    has_controlling_tty: true,
+                                    session_leader: true,
+                                    command_line: crate::platform::proc::CommandLine::NotSampled,
+                                })
+                                .collect()
+                        });
+                        async move { table }
+                    })
+                    .await;
+                }
+            });
+            if mode != "before-first-sample" {
+                next_sample_start(&mut started_rx, "the initial sample").await;
+                if mode == "failure-backoff" {
+                    next_sample_start(&mut started_rx, "the failing sample before exit").await;
+                }
+            }
+            // Kill only the test's exact child pid; no SessionEnd hook or pane
+            // close is sent, and the old card stays in the state for inspection.
+            // The exit watcher uses a real OS thread, so its deadline must use
+            // wall time rather than this test's auto-advancing paused clock.
+            unsafe {
+                libc::kill(registry.child_pid(&old).unwrap() as i32, libc::SIGKILL);
+            }
+            tokio::task::spawn_blocking({
+                let registry = registry.clone();
+                let old = old.clone();
+                move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while registry.agent_is_live(&old) {
+                        assert!(std::time::Instant::now() < deadline, "agent exit deadline");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!registry.agent_is_live(&old));
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            monitor.abort();
+            let _ = monitor.await;
+            let guard = state.read().await;
+            let live = guard
+                .live_session_for(&old, Some("retirement-old"))
+                .unwrap();
+            if live.background.is_some() {
+                failures.push(format!(
+                    "{mode}: exited card still shows {:?}",
+                    live.background
+                ));
+            }
+            if let Some(other) = other.as_ref() {
+                assert_eq!(
+                    guard
+                        .live_session_for(other, Some("retirement-live"))
+                        .unwrap()
+                        .background
+                        .unwrap()
+                        .subagents,
+                    1,
+                    "unknown samples must preserve the live pane's background"
+                );
+            }
+            drop(guard);
+            registry.shutdown_all();
+        }
+        for ended_before_publication in [false, true] {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = crate::test_temp::tempdir().unwrap();
+            let identity = temp.path().join("identity");
+            let script = temp.path().join("pending-worker.sh");
+            crate::test_isolation::write_script(&script, "#!/bin/sh\nprintf '%s\\n%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" \"$DOT_AGENT_DECK_PANE_CAPABILITY\" > \"$BACKGROUND_TEST_IDENTITY\"\nexec /bin/cat\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (reached, release) = registry.pause_next_publish_for_test();
+            let spawning = tokio::task::spawn_blocking({
+                let registry = registry.clone();
+                move || {
+                    registry.spawn_agent(SpawnOptions {
+                        command: Some(script.to_str().unwrap()),
+                        env: vec![
+                            (DOT_AGENT_DECK_PANE_ID.into(), "pending-background".into()),
+                            (
+                                "BACKGROUND_TEST_IDENTITY".into(),
+                                identity.to_string_lossy().into_owned(),
+                            ),
+                        ],
+                        agent_type: Some(AgentType::ClaudeCode),
+                        ..Default::default()
+                    })
+                }
+            });
+            tokio::task::spawn_blocking(move || {
+                reached
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("child forked before publication")
+            })
+            .await
+            .unwrap();
+            let identity = temp.path().join("identity");
+            let (agent, token) = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&identity) {
+                        let lines: Vec<_> = text.lines().collect();
+                        if lines.len() == 2 && !lines[0].is_empty() && !lines[1].is_empty() {
+                            break (lines[0].to_string(), lines[1].to_string());
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child identity deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                registry.hook_token_of(&agent).is_none(),
+                "no RunningAgent is published yet"
+            );
+            let (abandoned, abandoned_token) =
+                registry.reserve_spawn_for_test(Some("abandoned-background"));
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            state
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+            let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            for (pane, id, capability, ended) in [
+                (
+                    "pending-background",
+                    &agent,
+                    &token,
+                    ended_before_publication,
+                ),
+                ("abandoned-background", &abandoned, &abandoned_token, true),
+            ] {
+                use crate::hook_provenance::{Provenance, classify_event};
+                assert!(
+                    matches!(
+                        classify_event(Some(pane), Some(id), Some(capability), &*registry),
+                        Provenance::Attested { .. }
+                    ),
+                    "reserved child's reports are attested"
+                );
+                for kind in ["session_start", "subagent_start", "idle"] {
+                    if kind == "idle" && !ended {
+                        continue;
+                    }
+                    let mut event: AgentEvent = serde_json::from_value(serde_json::json!({
+                        "session_id": pane, "pane_id": pane, "agent_id": id,
+                        "agent_type": "claude_code", "event_type": kind, "timestamp": chrono::Utc::now()
+                    })).unwrap();
+                    if kind == "subagent_start" {
+                        event.metadata.insert(
+                            crate::event::SUBAGENT_ID_METADATA_KEY.into(),
+                            "pending-child".into(),
+                        );
+                    }
+                    ingest_hook_event(&state, &event_tx, &registry, event, false, Some(id.clone()))
+                        .await;
+                }
+            }
+            while events.try_recv().is_ok() {}
+            let monitor = tokio::spawn(run_shell_activity_monitor_with(
+                registry.clone(),
+                state.clone(),
+                event_tx.clone(),
+                |_roots| async { None },
+            ));
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            while let Ok(BroadcastMsg::Event(event)) = events.try_recv() {
+                if event.is_background_retirement() {
+                    failures.push(format!("pending Stop={ended_before_publication}: admitted reservation received a premature retirement: agent={:?}, background={:?}, revision={:?}", event.agent_id, event.background, event.background_revision));
+                }
+            }
+            if ended_before_publication {
+                let before = state
+                    .read()
+                    .await
+                    .live_session_for(&agent, Some("pending-background"))
+                    .unwrap();
+                if before.background.as_ref().map(|b| b.subagents) != Some(1) {
+                    failures.push(format!(
+                        "pending Stop=true: unpublished card lost its subagent: {:?}",
+                        before.background
+                    ));
+                }
+            }
+            let reserved = state
+                .read()
+                .await
+                .live_session_for(&abandoned, Some("abandoned-background"))
+                .unwrap();
+            if reserved.background.as_ref().map(|b| b.subagents) != Some(1) {
+                failures.push(format!("pending Stop={ended_before_publication}: reservation lost its subagent before abandonment: {:?}", reserved.background));
+            }
+            release.send(()).unwrap();
+            let published = tokio::time::timeout(Duration::from_secs(30), spawning)
+                .await
+                .expect("publication deadline")
+                .unwrap()
+                .unwrap();
+            assert_eq!(published, agent);
+            let idle: AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "pending-background", "pane_id": "pending-background", "agent_id": agent,
+                "agent_type": "claude_code", "event_type": "idle", "timestamp": chrono::Utc::now()
+            })).unwrap();
+            ingest_hook_event(
+                &state,
+                &event_tx,
+                &registry,
+                idle,
+                false,
+                Some(agent.clone()),
+            )
+            .await;
+            registry.release_spawn_for_test(&abandoned);
+            for _ in 0..8 {
+                tokio::time::advance(POLL_INTERVAL).await;
+                tokio::task::yield_now().await;
+            }
+            monitor.abort();
+            let _ = monitor.await;
+            let mut abandoned_clear = false;
+            while let Ok(message) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = message
+                    && event.is_background_retirement()
+                {
+                    if event.agent_id.as_deref() == Some(abandoned.as_str()) {
+                        abandoned_clear = event
+                            .background
+                            .as_ref()
+                            .is_some_and(|b| b.commands == 0 && b.subagents == 0);
+                    } else if event.agent_id.as_deref() == Some(agent.as_str()) {
+                        failures.push(format!("pending Stop={ended_before_publication}: published spawn received a retirement"));
+                    }
+                }
+            }
+            if !abandoned_clear {
+                failures.push(format!("pending Stop={ended_before_publication}: removing the abandoned reservation must emit its explicit-zero clear"));
+            }
+            let guard = state.read().await;
+            let after = guard
+                .live_session_for(&agent, Some("pending-background"))
+                .unwrap();
+            if after.background.as_ref().map(|b| b.subagents) != Some(1) {
+                failures.push(format!("pending Stop={ended_before_publication}: published card lost its admitted subagent: {:?}", after.background));
+            }
+            assert!(
+                guard
+                    .live_session_for(&abandoned, Some("abandoned-background"))
+                    .unwrap()
+                    .background
+                    .is_none(),
+                "an abandoned reservation must retire once removed"
+            );
+            drop(guard);
+            registry.shutdown_all();
+        }
+        assert!(
+            failures.is_empty(),
+            "spawn retirement must distinguish pending admission from departure:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Scenario: A background-bearing spawn exits before any successor reserves its pane, and the daemon serializes its retirement. A client hydrates a newer successor before draining that frame without the retirement marker: the frame must make no legacy generation claim, preserve the successor's card, and mint no departed card.
+    #[spec("status/background/015")]
+    #[tokio::test]
+    async fn background_015_retirement_is_safe_for_a_marker_unaware_client() {
+        use crate::event::{EventType, GenerationVerdict};
+        use crate::state::AppState;
+
+        let pane = "legacy-retirement-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+                agent_type: Some(AgentType::ClaudeCode),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut daemon = AppState::default();
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        daemon.set_agent_ownership(Arc::downgrade(&ownership));
+        for kind in ["session_start", "subagent_start", "idle"] {
+            let mut event: AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "departed-conversation", "pane_id": pane, "agent_id": agent,
+                "agent_type": "claude_code", "event_type": kind,
+                "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5)
+            }))
+            .unwrap();
+            if kind == "subagent_start" {
+                event.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.into(),
+                    "legacy-child".into(),
+                );
+            }
+            daemon.apply_event(event);
+        }
+        assert_eq!(
+            daemon
+                .live_session_for(&agent, Some(pane))
+                .unwrap()
+                .background
+                .unwrap()
+                .subagents,
+            1
+        );
+        // Retain the exited registry record and reserve no successor until
+        // after the retirement is authored, matching the queue/hydration race.
+        unsafe {
+            libc::kill(registry.child_pid(&agent).unwrap() as i32, libc::SIGKILL);
+        }
+        tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let agent = agent.clone();
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while registry.agent_is_live(&agent) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "legacy fixture exit deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let retired = daemon.retire_departed_background_spawns(|pane, agent| {
+            registry.agent_is_live_on_pane(agent, pane)
+        });
+        assert_eq!(retired.len(), 1, "daemon authors exactly one clear");
+        let wire = serde_json::to_value(&retired[0]).unwrap();
+        let carrier: AgentEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert!(carrier.is_background_retirement());
+        assert_eq!(carrier.event_type, EventType::ShellIdle);
+        assert_eq!(carrier.background.as_ref().unwrap().subagents, 0);
+        let mut failures = Vec::new();
+        if carrier.pane_generation_verdict() != Some(GenerationVerdict::Displaced) {
+            failures.push(format!("serialized retirement must carry the legacy non-claiming Displaced verdict; got {:?}", carrier.pane_generation_verdict()));
+        }
+
+        let mut successor = daemon.live_session_for(&agent, Some(pane)).unwrap();
+        successor.background = None;
+        successor.background_revision = None;
+        successor.last_activity_ms = Some(chrono::Utc::now().timestamp_millis());
+        // Verified against v0.46.0 src/state.rs:14949-14953 (Displaced
+        // admission), 14703-14710 (Current supersedes), 15542-15569
+        // (pane retirement), and 16093-16125 (card creation). For this
+        // marker-less ShellIdle, the current fold reaches the same generation
+        // gates before status/card mutation. Removing the background fields
+        // additionally models v0.46's serde ignoring unknown additive fields.
+        for ignore_background in [false, true] {
+            for shared_key in [false, true] {
+                let mut client = AppState::default();
+                client.register_pane(pane.into());
+                client.seed_hydrated_session(
+                    pane.into(),
+                    None,
+                    None,
+                    Some("legacy-successor".into()),
+                    Some(&successor),
+                );
+                let installed_key = client.sessions.keys().next().unwrap().clone();
+                let successor_key = if shared_key {
+                    "departed-conversation".into()
+                } else {
+                    installed_key.clone()
+                };
+                if shared_key {
+                    let mut card = client.sessions.remove(&installed_key).unwrap();
+                    card.session_id = successor_key.clone();
+                    client.sessions.insert(successor_key.clone(), card);
+                }
+                let before =
+                    serde_json::to_value(client.sessions[&successor_key].live_snapshot()).unwrap();
+                let mut legacy_wire = wire.clone();
+                legacy_wire["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(crate::event::BACKGROUND_RETIRED_METADATA_KEY);
+                if ignore_background {
+                    legacy_wire.as_object_mut().unwrap().remove("background");
+                    legacy_wire
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("background_revision");
+                }
+                let legacy_carrier: AgentEvent = serde_json::from_value(legacy_wire).unwrap();
+                assert!(!legacy_carrier.is_background_retirement());
+                // Positive control: v0.46's early Displaced rejection and
+                // this tree's must both leave the hydrated successor intact.
+                let mut control = client.clone();
+                let mut displaced = legacy_carrier.clone();
+                displaced.metadata.insert(
+                    crate::event::PANE_GENERATION_METADATA_KEY.into(),
+                    crate::event::PANE_GENERATION_DISPLACED.into(),
+                );
+                control.apply_event(displaced);
+                assert_eq!(control.sessions.len(), 1);
+                assert_eq!(
+                    control.sessions[&successor_key].agent_id.as_deref(),
+                    Some("legacy-successor")
+                );
+                client.apply_event(legacy_carrier);
+                let kept = client
+                    .sessions
+                    .get(&successor_key)
+                    .filter(|card| card.agent_id.as_deref() == Some("legacy-successor"));
+                let minted_departed = client
+                    .sessions
+                    .values()
+                    .any(|card| card.agent_id.as_deref() == Some(agent.as_str()));
+                if let Some(kept) = kept.filter(|_| !minted_departed) {
+                    assert_eq!(client.sessions.len(), 1);
+                    assert_eq!(
+                        serde_json::to_value(kept.live_snapshot()).unwrap(),
+                        before,
+                        "retirement must preserve the successor's live fields"
+                    );
+                } else {
+                    failures.push(format!("marker-unaware replay ignore_background={ignore_background}, shared_key={shared_key}: successor was evicted or departed card minted; cards={:?}", client.sessions.values().map(|card| (&card.session_id, &card.agent_id)).collect::<Vec<_>>()));
+                }
+            }
+        }
+        registry.shutdown_all();
+        assert!(
+            failures.is_empty(),
+            "retirement must be safe when the client ignores its marker:\n{}",
+            failures.join("\n")
         );
     }
 
@@ -10740,6 +12033,8 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
             assert!(
                 guard
@@ -10805,6 +12100,8 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -11597,7 +12894,7 @@ mod hook_provenance_audit_tests {
         /// Send an unheld question through the real socket and wait for its
         /// one reply, which barriers both registry mutation and broadcast.
         async fn question(&self, pane: &str, event: serde_json::Value, token: Option<&str>) {
-            let payload = serde_json::to_value(crate::event::DaemonMessage::Question(
+            let payload = serde_json::to_value(crate::event::DaemonMessage::Question(Box::new(
                 crate::event::QuestionSignal {
                     pane_id: pane.to_string(),
                     token: token.map(str::to_string),
@@ -11605,7 +12902,7 @@ mod hook_provenance_audit_tests {
                     hold: false,
                     ack: false,
                 },
-            ))
+            )))
             .unwrap();
             let mut stream = self.open(payload).await;
             let mut reply = String::new();
@@ -13129,6 +14426,8 @@ mod question_hold_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let question = crate::question::claude_permission_request(
             id.to_string(),
@@ -13203,13 +14502,14 @@ mod question_hold_tests {
             }
         });
         let hold = |id: &str| {
-            let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
-                pane_id: PANE.to_string(),
-                token: Some(token.clone()),
-                event: question_event(&agent, id),
-                hold: true,
-                ack: false,
-            });
+            let msg =
+                crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
+                    pane_id: PANE.to_string(),
+                    token: Some(token.clone()),
+                    event: question_event(&agent, id),
+                    hold: true,
+                    ack: false,
+                }));
             let sock = sock.clone();
             async move {
                 let mut stream = UnixStream::connect(&sock).await.expect("connect");
@@ -13341,13 +14641,13 @@ mod question_hold_tests {
         event.pane_id = Some(PANE.to_string());
         event.agent_id = Some(agent.clone());
         let raised = event.question().expect("the same parse raised a question");
-        let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+        let msg = crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
             pane_id: PANE.to_string(),
             token: Some(token),
             event,
             hold: true,
             ack: false,
-        });
+        }));
         let mut producer = UnixStream::connect(&sock).await.expect("connect");
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         producer.write_all(line.as_bytes()).await.unwrap();
@@ -13500,13 +14800,13 @@ mod question_hold_tests {
             }
         });
 
-        let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+        let msg = crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
             pane_id: PANE.to_string(),
             token: Some(token.clone()),
             event: question_event(&agent, "q-gone"),
             hold: true,
             ack: false,
-        });
+        }));
         let mut producer = UnixStream::connect(&sock).await.expect("connect");
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         producer.write_all(line.as_bytes()).await.unwrap();
@@ -13672,13 +14972,14 @@ mod question_hold_tests {
             let mut event = self.question_on(agent, question_id, detail);
             let question = event.question().unwrap();
             event.set_question(&question);
-            let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
-                pane_id: agent.pane.clone(),
-                token: Some(agent.token.clone()),
-                event,
-                hold: true,
-                ack,
-            });
+            let msg =
+                crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
+                    pane_id: agent.pane.clone(),
+                    token: Some(agent.token.clone()),
+                    event,
+                    hold: true,
+                    ack,
+                }));
             let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
             let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
             stream.write_all(line.as_bytes()).await.unwrap();
@@ -14371,7 +15672,7 @@ mod question_hold_tests {
             }
         };
         let unheld = |event: AgentEvent, token: Option<String>, pane: &str| {
-            serde_json::to_string(&crate::event::DaemonMessage::Question(
+            serde_json::to_string(&crate::event::DaemonMessage::Question(Box::new(
                 crate::event::QuestionSignal {
                     pane_id: pane.to_string(),
                     token,
@@ -14379,7 +15680,7 @@ mod question_hold_tests {
                     hold: false,
                     ack: false,
                 },
-            ))
+            )))
             .unwrap()
         };
 
@@ -14636,5 +15937,108 @@ mod question_hold_tests {
             Err(crate::question::AnswerRefusal::ChannelGone),
             "the old question is not answered"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_pin_refresh_tests {
+    use super::*;
+    use crate::event::AgentType;
+    use crate::hook_binary::{DeckIdentity, HookBinaryState, HookPin, PinRefresh};
+
+    /// Scenario (issue #1637 audit A9): a hook-config read is stuck, as one on
+    /// a FIFO with no writer would be. While it runs a second read is refused
+    /// rather than started; aborting the task waiting on it and shutting its
+    /// runtime down both finish at once instead of waiting for the read; once
+    /// the read ends, a new one may start.
+    #[test]
+    fn a_stuck_collection_blocks_neither_shutdown_nor_runs_twice() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let waiter = runtime.spawn(async move {
+            let collected = spawn_detached_collection(&IN_FLIGHT, move || {
+                started_tx.send(()).unwrap();
+                let _ = unblock_rx.recv();
+                1
+            })
+            .expect("the first collection starts");
+            collected.await
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the collection started");
+        assert!(
+            spawn_detached_collection(&IN_FLIGHT, || 2).is_none(),
+            "a second collection is not started while the first runs"
+        );
+
+        waiter.abort();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the runtime shut down while the collection was still stuck");
+        assert!(IN_FLIGHT.load(Ordering::Acquire), "still running");
+
+        unblock_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while IN_FLIGHT.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collection never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let next = spawn_detached_collection(&IN_FLIGHT, || 3).expect("a new collection starts");
+        assert_eq!(next.blocking_recv(), Ok(3));
+    }
+
+    /// Scenario (issue #1637): the daemon knows Codex's hooks are pinned to a
+    /// copy it cannot run, and shows a notice. A refresh then reads Codex's
+    /// config and finds it names no deck binary any more: applying it under
+    /// the state lock clears the notice and broadcasts the new, empty list
+    /// once; the same refresh again broadcasts nothing.
+    #[tokio::test]
+    async fn a_refresh_that_changes_the_notices_broadcasts_them_once() {
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let mut initial = crate::state::AppState::default();
+        initial.hook_binaries = HookBinaryState::from_startup(
+            deck.clone(),
+            &[HookPin {
+                agent: AgentType::Codex,
+                config: std::path::PathBuf::from("/cfg/hooks.json"),
+                binary: crate::test_paths::abs("/nonexistent/dad-1637/dot-agent-deck"),
+            }],
+            None,
+        );
+        assert_eq!(initial.hook_binaries.notices().len(), 1);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(initial));
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let none_pinned = || PinRefresh::classify(&deck, vec![(AgentType::Codex, Vec::new())]);
+
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        match rx.try_recv() {
+            Ok(BroadcastMsg::HookBinaryNotice(sent)) => assert!(sent.notices.is_empty()),
+            other => panic!("expected one notice broadcast, got {other:?}"),
+        }
+        apply_hook_pin_refresh(&state, &event_tx, none_pinned()).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged refresh broadcasts nothing"
+        );
+        assert!(state.read().await.hook_binaries.notices().is_empty());
     }
 }

@@ -248,7 +248,7 @@ heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running",
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
-status (working, thinking, waiting for input, idle, blocked, error), of an agent type (Claude Code,
+status (working, thinking, needs input, idle, blocked, error), of an agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
 contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
 all working agents, show Codex agents, show the agents on build box, show only agents waiting for
@@ -793,7 +793,11 @@ heard_as_whole = [
 # submit "the meeting is at the" when the user said "type the meeting is at the
 # end". Submitting is the last thing that happens to a prompt, so that failure
 # is unrecoverable — see the constant's own doc for the phrases that were
-# rejected and why.
+# rejected and why. The row's other `heard_as_whole` entries ("go ahead",
+# "finished", …) are answered by the same fast path, by the same comparison,
+# but only where this row is callable: elsewhere they reach the model, which
+# answers a bare "go ahead" over the New agent dialog with `start_new_agent`
+# (issue #1246).
 #
 # The MODEL's path is held to the same rule by `heard_as_whole` (PRD #1223,
 # closing audit G1). With `heard_as` a steered pick grounded on any occurrence

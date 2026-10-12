@@ -1470,7 +1470,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /* PRD #1497 — reading and the speech queue it speaks through. A sentence
      that could not be spoken is reported in the row, and so is one about
      reading itself (a deck that cannot be read). Which pane is open is asked
-     when a sentence is said, for its name (decision 4). */
+     when a sentence arrives — only that agent is read while it is open
+     (issue #1667) — and when it is said, for its name (decision 4). */
   const openPaneRef = useRef(pane);
   openPaneRef.current = pane;
   const reader = useReadingMode(

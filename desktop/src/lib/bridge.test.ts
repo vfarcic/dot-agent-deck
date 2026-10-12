@@ -1017,11 +1017,11 @@ describe("TauriDeckBridge", () => {
       thinking: "running",
       working: "running",
       compacting: "running",
-      waiting_for_input: "waiting",
-      idle: "waiting",
+      waiting_for_input: "needs_input",
+      idle: "idle",
       error: "failed",
       blocked: "blocked",
-      unknown: "waiting",
+      unknown: "idle",
     };
 
     for (const [daemonStatus, deckStatus] of Object.entries(expected)) {
@@ -1030,11 +1030,46 @@ describe("TauriDeckBridge", () => {
       expect(mapDesktopSnapshot(dto).agents[0]?.status, `daemon status "${daemonStatus}"`).toBe(deckStatus);
     }
 
-    // The fallthrough itself stays "waiting" for a status this build has never
+    // The fallthrough itself is "idle" for a status this build has never
     // heard of — a newer daemon may add one without a protocol bump.
     const future = structuredClone(snapshot);
     future.agents[0].status = "hyperthinking" as DesktopAgentDto["status"];
-    expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("waiting");
+    expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("idle");
+  });
+
+  /**
+   * Issue #1678. The daemon's background aggregate reaches the tile as counts
+   * and an instant, and the bridge checks every number first: the DTO is an
+   * assertion about a shape, so a count that is not a non-negative integer in
+   * the daemon's `u32` range drops the whole reading, and a `sinceMs` that is
+   * not a finite number drops only the duration.
+   */
+  it("background work crosses the bridge only as validated counts and an instant", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const withBackground = (background: unknown) => {
+      const dto = structuredClone(snapshot);
+      dto.agents[0].status = "idle";
+      dto.agents[0].background = background as DesktopAgentDto["background"];
+      return mapDesktopSnapshot(dto).agents[0]?.background;
+    };
+
+    expect(withBackground({ commands: 2, subagents: 1, sinceMs: 1_700_000_000_000 })).toEqual({ commands: 2, subagents: 1, sinceMs: 1_700_000_000_000 });
+    expect(withBackground({ commands: 0, subagents: 1 })).toEqual({ commands: 0, subagents: 1 });
+    expect(withBackground({ commands: 0xffff_ffff, subagents: 0 })).toEqual({ commands: 0xffff_ffff, subagents: 0 });
+    // Absent, and the daemon's explicit zero, both show nothing.
+    expect(withBackground(undefined)).toBeUndefined();
+    expect(withBackground({ commands: 0, subagents: 0, sinceMs: 1 })).toBeUndefined();
+    // A count the daemon could not have sent drops the reading.
+    for (const bad of [-1, 1.5, 0x1_0000_0000, Number.NaN, Number.POSITIVE_INFINITY, "2", null]) {
+      expect(withBackground({ commands: bad, subagents: 1 })).toBeUndefined();
+      expect(withBackground({ commands: 1, subagents: bad })).toBeUndefined();
+    }
+    expect(withBackground("2 commands")).toBeUndefined();
+    expect(withBackground(null)).toBeUndefined();
+    // An unusable instant drops the duration and keeps the counts.
+    for (const bad of [Number.NaN, Number.NEGATIVE_INFINITY, "1700000000000", null]) {
+      expect(withBackground({ commands: 1, subagents: 0, sinceMs: bad })).toEqual({ commands: 1, subagents: 0 });
+    }
   });
 
   /**
@@ -1444,6 +1479,28 @@ describe("TauriDeckBridge", () => {
 
     expect(mapped.agents[0]?.cwd).toBe("Unavailable");
     expect(mapped.worktree).toBe("Unavailable");
+  });
+
+  /**
+   * Scenario (issue #1637): the daemon reports a hook-binary notice in a live
+   * snapshot. `mapDesktopSnapshot` carries it onto the connection the deck
+   * view and the overview render, and a snapshot without notices carries none.
+   */
+  it("carries the daemon's hook-binary notices onto the mapped connection", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const notice = {
+      binary: "/opt/homebrew/bin/dot-agent-deck",
+      agents: ["Claude Code", "Codex"],
+      version: "0.45.1",
+      daemonVersion: "0.46.0",
+      reason: "older" as const,
+      remedy: "Run:",
+      command: "brew upgrade dot-agent-deck",
+    };
+    const withNotice = structuredClone(snapshot);
+    withNotice.connection.hookBinaryNotices = [notice];
+    expect(mapDesktopSnapshot(withNotice).connection.hookBinaryNotices).toEqual([notice]);
+    expect(mapDesktopSnapshot(snapshot).connection.hookBinaryNotices).toBeUndefined();
   });
 
   /**

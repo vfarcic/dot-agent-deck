@@ -62,6 +62,8 @@ pub(crate) struct HandshakeInfo {
     /// Whether the deck honours the directory browser's listing options
     /// (issue #1240) — see [`listing_options`].
     pub(crate) listing_options: bool,
+    /// Issue #1637: the daemon's hook-binary notices, from the same reply.
+    pub(crate) hook_binary_notices: Vec<crate::dto::HookBinaryNoticeDto>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -406,14 +408,8 @@ impl DaemonLinks {
     pub(crate) async fn refresh_disconnected_reason(&self, endpoint: &Endpoint) -> bool {
         self.refresh_disconnected_reason_with(endpoint, |remote| {
             let endpoint = Endpoint::Remote(remote.clone());
-            match remote_binary_for(&endpoint) {
-                Ok(binary) => {
-                    let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
-                        &remote,
-                        binary.as_ref(),
-                    );
-                    dot_agent_deck::daemon_start::probe_remote(&deck)
-                }
+            match remote_deck_for(&endpoint, &remote) {
+                Ok(deck) => dot_agent_deck::daemon_start::probe_remote(&deck),
                 Err(error) => DisconnectedReason::Unknown(deck_list_problem(
                     &endpoint,
                     dot_agent_deck::daemon_start::StartFailure::CheckFailed,
@@ -1224,7 +1220,22 @@ fn classify_handshake(
             .flatten(),
         new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
         listing_options: response.ok && listing_options(response),
+        hook_binary_notices: hook_binary_notices(response),
     }
+}
+
+/// Issue #1637: the notices a `Hello` reply carries, for the webview. None from
+/// a refused handshake or a daemon that predates them.
+fn hook_binary_notices(response: &AttachResponse) -> Vec<crate::dto::HookBinaryNoticeDto> {
+    if !response.ok {
+        return Vec::new();
+    }
+    response
+        .hook_binary_notices
+        .iter()
+        .flatten()
+        .map(crate::dto::HookBinaryNoticeDto::new)
+        .collect()
 }
 
 /// [`classify_handshake`] with the process-wide allowance read, for
@@ -1286,6 +1297,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         daemon_version: handshake.daemon_version,
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
+        hook_binary_notices: handshake.hook_binary_notices,
     }
 }
 
@@ -1380,6 +1392,7 @@ async fn hello_exchange(socket_path: &Path) -> Result<(HandshakeInfo, AttachResp
         &AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(client_build.clone()),
+            follow_on: false,
         },
     )
     .await
@@ -1591,8 +1604,17 @@ pub(crate) async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> Des
 pub(crate) async fn snapshot_with(
     endpoint: &Endpoint,
     links: &DaemonLinks,
-    view: Option<&mut AgentView>,
+    mut view: Option<&mut AgentView>,
 ) -> DesktopSnapshot {
+    // Issue #1637: the daemon's hook-binary notices changed, and they live on
+    // the `Hello` reply the held link captured. Drop it so this refresh
+    // handshakes again.
+    if view
+        .as_deref_mut()
+        .is_some_and(AgentView::take_handshake_due)
+    {
+        links.invalidate(endpoint).await;
+    }
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
         Err(error) => return disconnected_with_reason(endpoint, links, error).await,
@@ -1800,25 +1822,39 @@ pub(crate) fn spawn_local_daemon() -> Result<(), String> {
         .map_err(|error| safe_message(error.to_string()))
 }
 
-/// The deck-list row's recorded deck binary for a remote `endpoint` — a
-/// Homebrew install records its own — `Ok(None)` when the row records none,
-/// which runs the default install path, and `Err` when the deck list could
-/// not be read or holds no row for this deck. The two are kept apart (PR #1623
-/// review): running the default path on a failed lookup would report a
-/// recorded non-default install as "not installed". Validated when the row
-/// was read, so it is safe to put in a remote command.
-pub(crate) fn remote_binary_for(
+/// The remote deck a check or a start reaches for `endpoint` (`remote`): it
+/// runs the deck-list row's recorded deck binary — a Homebrew install records
+/// its own — or the default install path when the row records none, and a
+/// Homebrew install found in place of a missing default one is recorded on
+/// that row (issue #1675), as `connect` records it. `Err` when the deck list
+/// could not be read or holds no row for this deck, kept apart from a row with
+/// no binary (PR #1623 review): running the default path on a failed lookup
+/// would report a recorded non-default install as "not installed". The binary
+/// is validated when the row is read, so it is safe to put in a remote command.
+pub(crate) fn remote_deck_for(
     endpoint: &Endpoint,
-) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
-    remote_binary_in(endpoint, &crate::decks::remotes_path())
+    remote: &dot_agent_deck::daemon_client::RemoteEndpoint,
+) -> Result<
+    dot_agent_deck::daemon_start::RemoteDeck<dot_agent_deck::remote::SystemSshExecutor>,
+    String,
+> {
+    remote_deck_in(endpoint, remote, crate::decks::remotes_path())
 }
 
-/// [`remote_binary_for`] against the deck list at `path`.
-fn remote_binary_in(
+/// [`remote_deck_for`] against the deck list at `path`.
+fn remote_deck_in(
     endpoint: &Endpoint,
-    path: &Path,
-) -> Result<Option<dot_agent_deck::remote::RemoteBinaryPath>, String> {
-    crate::upgrade::remote_entry_for(endpoint, path).map(|entry| entry.binary)
+    remote: &dot_agent_deck::daemon_client::RemoteEndpoint,
+    path: PathBuf,
+) -> Result<
+    dot_agent_deck::daemon_start::RemoteDeck<dot_agent_deck::remote::SystemSshExecutor>,
+    String,
+> {
+    let entry = crate::upgrade::remote_entry_for(endpoint, &path)?;
+    Ok(
+        dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(remote, entry.binary.as_ref())
+            .recording_to(path, entry),
+    )
 }
 
 /// What a failed deck-list lookup means for a check or a start on
@@ -1862,8 +1898,8 @@ pub(crate) async fn start_deck_daemon(endpoint: &Endpoint) -> StartOutcome {
             let remote = remote.clone();
             let lookup = endpoint.clone();
             tokio::task::spawn_blocking(move || {
-                let binary = match remote_binary_for(&lookup) {
-                    Ok(binary) => binary,
+                let deck = match remote_deck_for(&lookup, &remote) {
+                    Ok(deck) => deck,
                     Err(error) => {
                         return StartOutcome::Failed(deck_list_problem(
                             &lookup,
@@ -1872,10 +1908,6 @@ pub(crate) async fn start_deck_daemon(endpoint: &Endpoint) -> StartOutcome {
                         ));
                     }
                 };
-                let deck = dot_agent_deck::daemon_start::RemoteDeck::for_endpoint(
-                    &remote,
-                    binary.as_ref(),
-                );
                 dot_agent_deck::daemon_start::start_remote(&deck, Default::default())
             })
             .await
@@ -3628,6 +3660,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             );
             assert_eq!(connection.daemon_version.as_deref(), daemon_version);
@@ -3645,6 +3678,63 @@ mod tests {
         assert_eq!(offer(Some(CLIENT_VERSION))["kind"], "current");
         assert_eq!(offer(Some("999.0.0"))["kind"], "daemon-newer");
         assert_eq!(offer(None)["kind"], "unknown");
+    }
+
+    /// Issue #1637: a deck's connection carries the hook-binary notices its
+    /// daemon put on the `Hello` reply, camelCased for the webview, with the
+    /// daemon's remedy verbatim. A refused handshake carries none.
+    #[test]
+    fn the_connection_carries_the_hook_binary_notices_from_the_handshake() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = HookBinaryNotice {
+            binary: "/opt/homebrew/bin/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into()],
+            version: Some("0.45.1".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        response.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        response.hook_binary_notices = Some(vec![notice]);
+        let handshake =
+            classify_handshake_for_test(&response, &dot_agent_deck::build_id::local_build_id());
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            handshake,
+        );
+        let wire = serde_json::to_value(&connection).unwrap();
+        let notices = wire["hookBinaryNotices"].as_array().expect("on the wire");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["binary"], "/opt/homebrew/bin/dot-agent-deck");
+        assert_eq!(notices[0]["agents"][0], "Claude Code");
+        assert_eq!(notices[0]["version"], "0.45.1");
+        assert_eq!(notices[0]["daemonVersion"], "0.46.0");
+        assert_eq!(notices[0]["reason"], "older");
+        assert_eq!(notices[0]["remedy"], "Run:");
+        assert_eq!(notices[0]["command"], "brew upgrade dot-agent-deck");
+
+        let mut refused = response.clone();
+        refused.ok = false;
+        refused.error = Some("no".into());
+        let handshake =
+            classify_handshake_for_test(&refused, &dot_agent_deck::build_id::local_build_id());
+        assert!(handshake.hook_binary_notices.is_empty());
+
+        let mut silent = response;
+        silent.hook_binary_notices = None;
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            classify_handshake_for_test(&silent, &dot_agent_deck::build_id::local_build_id()),
+        );
+        assert!(
+            serde_json::to_value(&connection)
+                .unwrap()
+                .get("hookBinaryNotices")
+                .is_none(),
+            "omitted when the daemon reports none"
+        );
     }
 
     /// The revalidation backstop, at the predicate rather than through a
@@ -3669,6 +3759,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             ),
             _transport: tokio::runtime::Runtime::new()
@@ -3903,6 +3994,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 
@@ -4013,6 +4106,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }));
         let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
 
@@ -4229,6 +4324,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 
@@ -8003,20 +8100,27 @@ start = true
             )
         };
         let (brew, plain) = (endpoint_of(0), endpoint_of(1));
+        let binary_run = |endpoint: &Endpoint| {
+            let Endpoint::Remote(remote) = endpoint else {
+                panic!("a remote deck")
+            };
+            remote_deck_in(endpoint, remote, path.clone()).map(|deck| deck.port.binary())
+        };
 
         assert_eq!(
-            remote_binary_in(&brew, &path)
-                .unwrap()
-                .map(|binary| binary.as_str().to_string()),
-            Some("/opt/homebrew/bin/dot-agent-deck".to_string())
+            binary_run(&brew).unwrap(),
+            "/opt/homebrew/bin/dot-agent-deck"
         );
-        assert_eq!(remote_binary_in(&plain, &path).unwrap(), None);
+        assert_eq!(
+            binary_run(&plain).unwrap(),
+            dot_agent_deck::remote::REMOTE_INSTALL_PATH
+        );
 
         // The row is gone, and then the file is unreadable: both fail.
         std::fs::write(&path, "").unwrap();
-        assert!(remote_binary_in(&brew, &path).is_err());
+        assert!(binary_run(&brew).is_err());
         std::fs::write(&path, "[[remotes]\nnot toml").unwrap();
-        let error = remote_binary_in(&brew, &path).unwrap_err();
+        let error = binary_run(&brew).unwrap_err();
 
         let problem = deck_list_problem(
             &brew,

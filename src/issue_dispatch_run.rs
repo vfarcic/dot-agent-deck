@@ -363,30 +363,83 @@ pub async fn remove_worktree(
     clone_dir: &Path,
     policy: RemovalPolicy,
 ) -> Option<KeptWorktree> {
+    remove_worktree_outcome(worktree_dir, clone_dir, policy)
+        .await
+        .kept(worktree_dir)
+}
+
+/// PRD #1589 D6: what [`remove_worktree_outcome`] did, with the three ways a
+/// tree ends up kept told apart — [`KeptWorktree`] folds a failed status probe
+/// and a failed removal into one `confirmed_dirty: false`, which is enough for
+/// a warning and not for the `close` verb's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeRemoval {
+    /// Removed; the clone and the branch are kept.
+    Removed,
+    /// Kept: `git status --porcelain` reported uncommitted work.
+    KeptDirty,
+    /// Kept: the status probe failed, so dirtiness is unknown.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+}
+
+impl WorktreeRemoval {
+    /// The issue #717 report of this outcome: `None` when the tree was
+    /// removed.
+    pub fn kept(self, worktree_dir: &Path) -> Option<KeptWorktree> {
+        let path = worktree_dir.to_string_lossy().into_owned();
+        match self {
+            WorktreeRemoval::Removed => None,
+            WorktreeRemoval::KeptDirty => Some(KeptWorktree {
+                path,
+                confirmed_dirty: true,
+            }),
+            WorktreeRemoval::KeptCouldNotCheck | WorktreeRemoval::RemoveFailed => {
+                Some(KeptWorktree {
+                    path,
+                    confirmed_dirty: false,
+                })
+            }
+        }
+    }
+}
+
+/// [`remove_worktree`], answering with the typed [`WorktreeRemoval`]. The one
+/// implementation: [`remove_worktree`] is this outcome mapped to its report.
+pub async fn remove_worktree_outcome(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> WorktreeRemoval {
     let worktree = worktree_dir.to_string_lossy();
+    // PRD #1589 (auditor S5): the path and git's error text are producer
+    // values — a directory name may carry a newline or a terminal control — so
+    // each is escaped and bounded before it reaches the log.
+    let logged = |value: &str| {
+        crate::config_validation::escape_field_for_log(
+            value,
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        )
+    };
+    let shown_worktree = logged(&worktree);
     if policy == RemovalPolicy::KeepIfDirty {
         match worktree_is_dirty(worktree_dir).await {
             Ok(true) => {
                 tracing::warn!(
-                    worktree = %worktree_dir.display(),
+                    worktree = %shown_worktree,
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: true,
-                });
+                return WorktreeRemoval::KeptDirty;
             }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
-                    worktree = %worktree_dir.display(),
-                    error = %e,
+                    worktree = %shown_worktree,
+                    error = %logged(&e.to_string()),
                     "dispatch: could not check worktree status; leaving in place"
                 );
-                return Some(KeptWorktree {
-                    path: worktree_dir.to_string_lossy().into_owned(),
-                    confirmed_dirty: false,
-                });
+                return WorktreeRemoval::KeptCouldNotCheck;
             }
         }
     }
@@ -400,10 +453,10 @@ pub async fn remove_worktree(
     match res {
         Ok(()) => {
             tracing::info!(
-                worktree = %worktree_dir.display(),
+                worktree = %shown_worktree,
                 "issue-dispatch: removed worktree on tab close (clone preserved)"
             );
-            None
+            WorktreeRemoval::Removed
         }
         // A FAILED removal leaves the directory on disk too, so the user is
         // told about it for the same reason a deliberate keep is: something
@@ -412,14 +465,11 @@ pub async fn remove_worktree(
         // reason is a stuck `git worktree remove` rather than their edits.
         Err(e) => {
             tracing::warn!(
-                worktree = %worktree_dir.display(),
-                error = %e,
+                worktree = %shown_worktree,
+                error = %logged(&e.to_string()),
                 "issue-dispatch: worktree cleanup on close failed"
             );
-            Some(KeptWorktree {
-                path: worktree_dir.to_string_lossy().into_owned(),
-                confirmed_dirty: false,
-            })
+            WorktreeRemoval::RemoveFailed
         }
     }
 }
@@ -662,7 +712,9 @@ enum Reclaim {
 /// Removes nothing it cannot attribute to that failed spawn: the worktree must
 /// carry the deck's ownership marker and an abandoned-spawn marker naming this
 /// task and issue, must not be recorded by a live dispatch in `worktrees`, and
-/// must have no agent rooted in it (`records` is asked afresh each time).
+/// must have nothing in `agents` rooted in it — no live agent and no spawn
+/// still starting there ([`AgentPtyRegistry::dir_in_use`], asked afresh each
+/// time).
 ///
 /// Those checks pass once without any lock, which is all most fires need: an
 /// unmarked worktree costs no lock wait. The removal itself then runs under
@@ -674,19 +726,29 @@ enum Reclaim {
 /// without the mark, or abandoned again under a new generation, and leaves it
 /// (PRD #1487, the F2 reclaim race). A lock that cannot be taken removes
 /// nothing.
+///
+/// Issue #1612: the last agent check is not a read followed by a removal. It
+/// takes a hold on the worktree in `agents` ([`AgentPtyRegistry::hold_dir_for_removal`])
+/// in the same acquisition that finds nothing rooted there, and keeps it
+/// through the removal; while it is held, every start this daemon is asked for
+/// inside the worktree is refused. So an agent started in the abandoned
+/// worktree is either seen by that check — its spawn is reserved before its
+/// child exists, long before its record is published — and keeps the worktree,
+/// or refused, and never has its directory removed under it.
 async fn reclaim_abandoned_spawn(
     worktree_dir: &Path,
     clone_dir: &Path,
     creator: Creator,
     worktrees: &WorktreeRegistry,
-    records: impl Fn() -> Vec<AgentRecord>,
+    agents: &AgentPtyRegistry,
 ) -> Reclaim {
     reclaim_abandoned_spawn_paced(
         worktree_dir,
         clone_dir,
         creator,
         worktrees,
-        records,
+        agents,
+        std::future::ready(()),
         std::future::ready(()),
     )
     .await
@@ -694,17 +756,20 @@ async fn reclaim_abandoned_spawn(
 
 /// [`reclaim_abandoned_spawn`], awaiting `before_lock` between the unlocked
 /// first pass and taking the lock — the window the regression tests hold open
-/// to let a second reclaimer remove and re-create the worktree.
+/// to let a second reclaimer remove and re-create the worktree — and
+/// `before_remove` between the last check and the removal, the window issue
+/// #1612's regression test holds open to start an agent in the worktree.
 async fn reclaim_abandoned_spawn_paced(
     worktree_dir: &Path,
     clone_dir: &Path,
     creator: Creator,
     worktrees: &WorktreeRegistry,
-    records: impl Fn() -> Vec<AgentRecord>,
+    agents: &AgentPtyRegistry,
     before_lock: impl std::future::Future<Output = ()>,
+    before_remove: impl std::future::Future<Output = ()>,
 ) -> Reclaim {
     let Some(generation) =
-        abandoned_generation_if_unused(worktree_dir, &creator, worktrees, &records).await
+        abandoned_generation_if_unused(worktree_dir, &creator, worktrees, agents).await
     else {
         return Reclaim::NotAbandoned;
     };
@@ -723,11 +788,17 @@ async fn reclaim_abandoned_spawn_paced(
     if tokio::fs::metadata(worktree_dir).await.is_err() {
         return Reclaim::Removed;
     }
-    if abandoned_generation_if_unused(worktree_dir, &creator, worktrees, &records).await
+    // Issue #1612: the final agent check, made as a hold that lasts until the
+    // removal below has finished — see `reclaim_abandoned_spawn`.
+    let Some(_removal_hold) = agents.hold_dir_for_removal(worktree_dir) else {
+        return Reclaim::NotAbandoned;
+    };
+    if abandoned_generation_if_unused(worktree_dir, &creator, worktrees, agents).await
         != Some(generation)
     {
         return Reclaim::NotAbandoned;
     }
+    before_remove.await;
     match remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await {
         None => {
             tracing::info!(
@@ -745,18 +816,19 @@ async fn reclaim_abandoned_spawn_paced(
 }
 
 /// The generation of `creator`'s abandoned-spawn mark on `worktree_dir`, unless
-/// a live dispatch records the worktree or an agent is rooted in it.
+/// a live dispatch records the worktree or something in `agents` is rooted in
+/// it.
 async fn abandoned_generation_if_unused(
     worktree_dir: &Path,
     creator: &Creator,
     worktrees: &WorktreeRegistry,
-    records: &impl Fn() -> Vec<AgentRecord>,
+    agents: &AgentPtyRegistry,
 ) -> Option<String> {
     let recorded = worktrees
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains_key(worktree_dir);
-    if recorded || worktree_still_in_use(&records(), worktree_dir) {
+    if recorded || agents.dir_in_use(worktree_dir) {
         return None;
     }
     let dir = worktree_dir.to_path_buf();
@@ -839,7 +911,7 @@ async fn dispatch_one_issue(
             clone_dir,
             Creator::issue_dispatch(task_name, issue),
             worktrees,
-            || registry.agent_records(),
+            registry,
         )
         .await
         {
@@ -1489,6 +1561,40 @@ pub async fn create_worktree(
     reuse_existing_branch: bool,
     creator: Creator,
 ) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        worktree_dir,
+        branch,
+        reuse_existing_branch,
+        creator,
+        None,
+    )
+    .await
+}
+
+/// [`create_worktree`] with an explicit start-point for a branch it creates.
+///
+/// Issue #1643: with no start-point, `git worktree add -b` resolves the
+/// checkout's `HEAD` itself, at the moment it runs. A caller that has already
+/// read `HEAD` and reported it — `dispatch`'s `cut from <branch> at <sha>` —
+/// then names one commit while git may cut the branch from another, if `HEAD`
+/// moved in between. Passing the sha it read makes the reported base the
+/// branch's base by construction.
+///
+/// `start_point` applies only when this call CREATES the branch (`-b`). A
+/// branch that already exists is attached as it stands, and its own history is
+/// its base; that covers `reuse_existing_branch` and a retry after a scan
+/// short-read, whose branch our own earlier attempt created from the same
+/// start-point. `None` is exactly [`create_worktree`]. This stays the only
+/// `git worktree add` in `src/`.
+pub async fn create_worktree_from(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
+    start_point: Option<&str>,
+) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
@@ -1546,7 +1652,9 @@ pub async fn create_worktree(
         let result = if branch_exists {
             run_git_status(&["-C", &clone, "worktree", "add", &wt, branch]).await
         } else {
-            run_git_status(&["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+            let mut args: Vec<&str> = vec!["-C", &clone, "worktree", "add", &wt, "-b", branch];
+            args.extend(start_point);
+            run_git_status(&args).await
         };
         match result {
             Err(e) if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) => {
@@ -2196,6 +2304,64 @@ async fn capture_within(
 mod tests {
     use super::*;
 
+    /// Scenario: PRD #1589 (auditor S5) — the worktree cleanup a close awaits
+    /// is pointed at a directory whose name carries a newline, a CR, an ESC and
+    /// a bidi override and runs far past any real path. The status check fails
+    /// (nothing is there), and its warning names the path escaped, on one line,
+    /// bounded — never with the raw controls that would forge a log line.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_worktree_cleanup_log_escapes_and_bounds_the_path() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = dir
+            .path()
+            .join(String::from("wt\nWARN forged line\r\u{1b}[2J\u{202e}") + &"x".repeat(2000));
+        let captured = CapturedLog::default();
+        let guard = crate::test_isolation::capture_tracing_on_this_thread(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with_ansi(false)
+                .finish(),
+        );
+        let outcome =
+            remove_worktree_outcome(&hostile, dir.path(), RemovalPolicy::KeepIfDirty).await;
+        drop(guard);
+        assert_eq!(outcome, WorktreeRemoval::KeptCouldNotCheck);
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("could not check worktree status"),
+            "the warning must be logged: {logged:?}"
+        );
+        assert_eq!(logged.trim_end().lines().count(), 1, "{logged:?}");
+        for raw in ['\r', '\u{1b}', '\u{202e}'] {
+            assert!(!logged.contains(raw), "{raw:?} reached the log: {logged:?}");
+        }
+        assert!(logged.contains("wt\\nWARN"), "{logged:?}");
+        assert!(
+            logged.chars().count() < 1800,
+            "each value is bounded: {} chars",
+            logged.chars().count()
+        );
+    }
+
     /// Issue #692: a subprocess that outlives its bound is reported as a
     /// failure naming the command and the bound, and the call returns promptly
     /// instead of waiting for the child.
@@ -2724,7 +2890,7 @@ mod tests {
         assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
 
         assert_eq!(
-            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, Vec::new).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
             Reclaim::Removed,
             "the next attempt reclaims it under the lock"
         );
@@ -2779,21 +2945,23 @@ mod tests {
 
         // Still locked: the retry runs, fails again, and says so.
         assert!(matches!(
-            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, Vec::new).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
             Reclaim::Failed(_)
         ));
         git(&["worktree", "unlock", &wt.to_string_lossy()]);
 
-        // Never someone else's: an agent rooted in it, a live dispatch's
+        // Never someone else's: an agent starting in it, a live dispatch's
         // record, or a mark naming another issue each keep the claim.
-        let rooted = [pane_in("pane-1", &wt)];
+        let agents = AgentPtyRegistry::new();
+        let starting = agents.reserve_spawn_in_for_test(&wt).unwrap();
         assert_eq!(
-            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, || rooted.to_vec()).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &agents).await,
             Reclaim::NotAbandoned
         );
+        agents.release_spawn_for_test(&starting);
         record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
         assert_eq!(
-            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, Vec::new).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
             Reclaim::NotAbandoned
         );
         take_worktree(&reg, &wt);
@@ -2803,7 +2971,7 @@ mod tests {
                 &repo,
                 Creator::issue_dispatch("nightly", 8),
                 &reg,
-                Vec::new
+                &AgentPtyRegistry::new()
             )
             .await,
             Reclaim::NotAbandoned
@@ -2811,7 +2979,7 @@ mod tests {
         assert!(wt.exists(), "none of those removed anything");
 
         assert_eq!(
-            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, Vec::new).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
             Reclaim::Removed
         );
         assert!(!wt.exists(), "the retry removed the leftover");
@@ -2836,7 +3004,7 @@ mod tests {
         crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
         let reg = new_worktree_registry();
         assert_eq!(
-            reclaim_abandoned_spawn(&wt, &repo, creator, &reg, Vec::new).await,
+            reclaim_abandoned_spawn(&wt, &repo, creator, &reg, &AgentPtyRegistry::new()).await,
             Reclaim::NotAbandoned
         );
         assert!(wt.exists());
@@ -2864,16 +3032,24 @@ mod tests {
             let stale = crate::worktree_owner::mark_abandoned_spawn(&wt, &creator()).unwrap();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
             let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
-            let delayed =
-                reclaim_abandoned_spawn_paced(&wt, &repo, creator(), &reg, Vec::new, async move {
+            let agents = AgentPtyRegistry::new();
+            let delayed = reclaim_abandoned_spawn_paced(
+                &wt,
+                &repo,
+                creator(),
+                &reg,
+                &agents,
+                async move {
                     reached_tx.send(()).unwrap();
                     resume_rx.await.unwrap();
-                });
-            let (wt_ref, repo_ref, reg_ref) = (&wt, &repo, &reg);
+                },
+                std::future::ready(()),
+            );
+            let (wt_ref, repo_ref, reg_ref, agents) = (&wt, &repo, &reg, &agents);
             let other = async move {
                 reached_rx.await.unwrap();
                 assert_eq!(
-                    reclaim_abandoned_spawn(wt_ref, repo_ref, creator(), reg_ref, Vec::new).await,
+                    reclaim_abandoned_spawn(wt_ref, repo_ref, creator(), reg_ref, agents).await,
                     Reclaim::Removed,
                     "the first reclaimer removes the leftover"
                 );
@@ -2905,6 +3081,92 @@ mod tests {
         }
     }
 
+    /// Scenario: an agent is started in an abandoned worktree while it is being
+    /// reclaimed. Started after the reclaim's first pass and still unpublished
+    /// when its last check runs, it keeps the worktree. Started after that check
+    /// and before the removal, it is refused, so the removal deletes no
+    /// directory an agent runs in. Once the reclaim has finished, starts are
+    /// accepted again (issue #1612).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agent_started_in_an_abandoned_worktree_never_has_it_removed_under_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt, &creator()).unwrap();
+        let reg = new_worktree_registry();
+        let agents = Arc::new(AgentPtyRegistry::new());
+
+        // A start reserved after the first pass and unpublished at the last
+        // check: a removal that asked only the published records deleted it.
+        let starting = std::sync::Mutex::new(None);
+        let outcome = reclaim_abandoned_spawn_paced(
+            &wt,
+            &repo,
+            creator(),
+            &reg,
+            &agents,
+            async {
+                *starting.lock().unwrap() = Some(agents.reserve_spawn_in_for_test(&wt).unwrap());
+            },
+            std::future::ready(()),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Reclaim::NotAbandoned,
+            "the starting agent keeps it"
+        );
+        assert!(wt.exists(), "and nothing was removed under it");
+        agents.release_spawn_for_test(&starting.into_inner().unwrap().unwrap());
+
+        // A start that arrives after the last check, before the removal.
+        let late_start = std::sync::Mutex::new(None);
+        let outcome = reclaim_abandoned_spawn_paced(
+            &wt,
+            &repo,
+            creator(),
+            &reg,
+            &agents,
+            std::future::ready(()),
+            async {
+                assert!(wt.exists(), "the worktree is still there to start in");
+                let wt = wt.to_string_lossy();
+                *late_start.lock().unwrap() =
+                    Some(agents.spawn_agent(crate::agent_pty::SpawnOptions {
+                        command: Some("sleep 30"),
+                        cwd: Some(&wt),
+                        ..crate::agent_pty::SpawnOptions::default()
+                    }));
+            },
+        )
+        .await;
+        let late_start = late_start.into_inner().unwrap().unwrap();
+        if let Ok(id) = &late_start {
+            agents.close_agent(id).unwrap();
+        }
+        assert!(
+            matches!(
+                late_start,
+                Err(crate::agent_pty::AgentPtyError::DirBeingRemoved(_))
+            ),
+            "a start in a worktree being removed is refused: {late_start:?}"
+        );
+        assert_eq!(outcome, Reclaim::Removed);
+        assert!(!wt.exists());
+        assert!(agents.agent_records().is_empty(), "no agent was started");
+
+        // The removal is over: starts in that path are refused no longer.
+        let after = agents
+            .reserve_spawn_in_for_test(&wt)
+            .expect("the reclaim's hold ends with it");
+        agents.release_spawn_for_test(&after);
+        agents.shutdown_all();
+    }
+
     /// Scenario: another deck process holds the repository's worktree lock —
     /// the one worktree creation takes — while an abandoned leftover is
     /// reclaimed. The reclaim waits and removes nothing until the lock is
@@ -2930,7 +3192,7 @@ mod tests {
                 &repo_task,
                 creator,
                 &new_worktree_registry(),
-                Vec::new,
+                &AgentPtyRegistry::new(),
             )
             .await
         });
@@ -2967,7 +3229,7 @@ mod tests {
             &tmp.path().join("no-such-clone"),
             creator,
             &new_worktree_registry(),
-            Vec::new,
+            &AgentPtyRegistry::new(),
         )
         .await;
         assert!(
