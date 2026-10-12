@@ -12,6 +12,8 @@
 //! file it lives in.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::time::Duration;
 
@@ -53,7 +55,7 @@ fn claude_input_contains(grid: &str, text: &str) -> bool {
 /// Scenario: Type a draft into a genuine interactive Claude Haiku worker,
 /// then delegate a file-creation task through the real CLI. The sentinel must
 /// stay absent until Ctrl+U clears the draft, after which the agent acts on the
-/// separately submitted task pointer.
+/// separately consumed inbox task, acknowledging it once without adding it to user history.
 #[spec("prompt/pane-input/042")]
 #[test]
 fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
@@ -119,7 +121,8 @@ fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
             "worker",
             "--task",
             &format!(
-                "Read the task file and create {SENTINEL} in this working directory with the exact text done-544. Then report completion."
+                "Use the Bash tool to run exactly: printf %s done-544 > '{}'. Then report completion.",
+                sentinel_path.display()
             ),
         ])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
@@ -159,6 +162,39 @@ fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
     assert_eq!(
         std::fs::read_to_string(sentinel_path).expect("read Claude-created sentinel"),
         "done-544"
+    );
+    let records = common::agent_records_on(deck.attach_socket_path());
+    let worker = records
+        .iter()
+        .find(|record| {
+            matches!(&record.tab_membership,
+        Some(TabMembership::Orchestration { role_name, .. }) if role_name == "worker")
+        })
+        .expect("real Claude worker");
+    let messages = inbox_view::messages(
+        deck.attach_socket_path(),
+        worker.pane_id_env.as_deref().unwrap(),
+    );
+    let task = messages
+        .iter()
+        .find(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(SENTINEL))
+        })
+        .expect("delegate inbox task");
+    assert_eq!(task.state, dot_agent_deck::inbox::StateName::Acknowledged);
+    assert_eq!(task.deliveries, 1);
+    assert!(
+        !worker
+            .live
+            .as_ref()
+            .unwrap()
+            .last_user_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SENTINEL)
     );
 }
 

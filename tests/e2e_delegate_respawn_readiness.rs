@@ -13,6 +13,8 @@
 //! have no reel marker because PRD #249 is a bug fix rather than a showcase.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::path::Path;
 use std::time::Duration;
@@ -332,18 +334,24 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
             event.event_type == EventType::Thinking
                 && event.agent_type == case.agent_type
                 && event.timestamp >= delegate_released_at
-                && event
-                    .user_prompt
-                    .as_deref()
-                    .is_some_and(|prompt| prompt.contains(&format!("worker-task-{WORKER_ROLE}.md")))
+                && event.user_prompt.as_deref().is_some_and(|prompt| {
+                    if case.agent_type == AgentType::ClaudeCode {
+                        prompt.starts_with("✉ ")
+                    } else {
+                        prompt.contains(&format!("worker-task-{WORKER_ROLE}.md"))
+                    }
+                })
         },
         Duration::from_secs(90),
     );
     assert!(
-        submitted
-            .user_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains(&format!("worker-task-{WORKER_ROLE}.md"))),
+        submitted.user_prompt.as_deref().is_some_and(|prompt| {
+            if case.agent_type == AgentType::ClaudeCode {
+                prompt.starts_with("✉ ")
+            } else {
+                prompt.contains(&format!("worker-task-{WORKER_ROLE}.md"))
+            }
+        }),
         "the REAL {} worker emitted a prompt event, but it was not the delegated task pointer: {:?}",
         case.agent_name,
         submitted.user_prompt
@@ -397,9 +405,41 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
             deck.snapshot_grid()
         );
     }
+    if case.agent_type == AgentType::ClaudeCode {
+        let agent = common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find(|r| {
+                matches!(&r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == WORKER_ROLE)
+            })
+            .expect("replacement Claude worker");
+        let messages = inbox_view::messages(
+            deck.attach_socket_path(),
+            agent.pane_id_env.as_deref().unwrap(),
+        );
+        let task = messages
+            .iter()
+            .find(|m| {
+                m.text
+                    .as_deref()
+                    .is_some_and(|s| s.contains(case.sentinel_name))
+            })
+            .expect("delegated task in replacement inbox");
+        assert_eq!(task.bind_agent.as_deref(), Some(agent.id.as_str()));
+        assert_eq!(task.deliveries, 1);
+        assert_eq!(task.state, dot_agent_deck::inbox::StateName::Acknowledged);
+        assert!(
+            !agent
+                .live
+                .unwrap()
+                .last_user_prompt
+                .unwrap_or_default()
+                .contains(case.sentinel_name)
+        );
+    }
 }
 
-/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive Claude Code on Haiku, visibly wait for its prompt editor, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with Bash, and create the uniquely named sentinel requested by the delegated task.
+/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive Haiku, wait for its prompt editor and release the real delegate CLI. The replacement worker must consume one inbox task, visibly traverse Thinking and Working with Bash, create the unique sentinel and acknowledge the generation-bound message while its card carries an envelope label.
 #[spec("orchestration/delegate/014")]
 #[test]
 #[cfg(unix)]
