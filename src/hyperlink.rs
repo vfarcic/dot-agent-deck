@@ -55,6 +55,10 @@ pub struct Osc8Filter {
     /// clipboard request (`ESC ] 52 ;`), lifted out on completion rather than
     /// passed to vt100.
     osc_other_is_clipboard: bool,
+    /// Issue #1705: the OSC 52 request being buffered has outgrown anything
+    /// [`crate::osc52::osc52_copy_text`] would accept, so the rest of it is
+    /// discarded as it arrives rather than buffered, and the request dropped.
+    osc_other_oversized: bool,
     /// Issue #1705: completed OSC 52 requests, everything after `52;`, in
     /// arrival order, for [`Osc8Filter::take_clipboard_requests`].
     clipboard_requests: Vec<Vec<u8>>,
@@ -77,6 +81,7 @@ impl Osc8Filter {
             osc_uri: Vec::new(),
             osc_other_buf: Vec::new(),
             osc_other_is_clipboard: false,
+            osc_other_oversized: false,
             clipboard_requests: Vec::new(),
         }
     }
@@ -171,15 +176,15 @@ impl Osc8Filter {
                     } else if byte == 0x1b {
                         self.state = FilterState::OscOtherEsc;
                     } else {
-                        self.osc_other_buf.push(byte);
+                        self.push_osc_other(byte);
                     }
                 }
                 FilterState::OscOtherEsc => {
                     if byte == b'\\' {
                         self.complete_osc_other(&[0x1b, b'\\']);
                     } else {
-                        self.osc_other_buf.push(0x1b);
-                        self.osc_other_buf.push(byte);
+                        self.push_osc_other(0x1b);
+                        self.push_osc_other(byte);
                         self.state = FilterState::OscOther;
                     }
                 }
@@ -208,14 +213,36 @@ impl Osc8Filter {
     /// lifted out (issue #1705); anything else goes on to vt100 unchanged.
     fn complete_osc_other(&mut self, terminator: &[u8]) {
         let mut sequence = std::mem::take(&mut self.osc_other_buf);
+        let oversized = std::mem::take(&mut self.osc_other_oversized);
         if std::mem::take(&mut self.osc_other_is_clipboard) {
             // `ESC ] 5 2 ;` is the first five bytes; the rest is the request.
-            self.clipboard_requests.push(sequence.split_off(5));
+            if !oversized {
+                self.clipboard_requests.push(sequence.split_off(5));
+            }
         } else {
             sequence.extend_from_slice(terminator);
             self.text_buf.extend_from_slice(&sequence);
         }
         self.state = FilterState::Normal;
+    }
+
+    /// One more byte of a non-OSC-8 sequence. An OSC 52 request is buffered
+    /// only up to what [`crate::osc52::osc52_copy_text`] could accept, with as
+    /// much again for whitespace inside the payload; past that it is marked
+    /// oversized and its remaining bytes are dropped, so an agent cannot grow
+    /// this buffer without bound (issue #1705).
+    fn push_osc_other(&mut self, byte: u8) {
+        if self.osc_other_is_clipboard {
+            if self.osc_other_oversized {
+                return;
+            }
+            if self.osc_other_buf.len() >= 2 * crate::osc52::OSC52_MAX_PAYLOAD_BYTES + 16 {
+                self.osc_other_oversized = true;
+                self.osc_other_buf.truncate(5);
+                return;
+            }
+        }
+        self.osc_other_buf.push(byte);
     }
 
     fn complete_osc8(&mut self) {
@@ -313,6 +340,31 @@ mod tests {
         assert!(f.take_clipboard_requests().is_empty(), "not complete yet");
         assert_eq!(f.process(b"k=\x1b"), vec![]);
         assert_eq!(f.process(b"\\x"), vec![Osc8Segment::Text(b"x".to_vec())]);
+        assert_eq!(f.take_clipboard_requests(), vec![b"c;aGk=".to_vec()]);
+    }
+
+    /// Issue #1705: an OSC 52 request too large to ever be accepted is dropped
+    /// whole and stops being buffered, and the stream after it is unharmed.
+    #[test]
+    fn oversized_clipboard_request_is_dropped_and_not_buffered() {
+        let mut f = Osc8Filter::new();
+        f.process(b"\x1b]52;c;");
+        let chunk = vec![b'A'; 1024 * 1024];
+        for _ in 0..4 {
+            f.process(&chunk);
+        }
+        assert!(
+            f.osc_other_buf.len() <= 2 * crate::osc52::OSC52_MAX_PAYLOAD_BYTES + 16,
+            "buffered {} bytes of one request",
+            f.osc_other_buf.len()
+        );
+        assert_eq!(
+            f.process(b"\x07after"),
+            vec![Osc8Segment::Text(b"after".to_vec())]
+        );
+        assert!(f.take_clipboard_requests().is_empty());
+        // The next request is buffered normally again.
+        f.process(b"\x1b]52;c;aGk=\x07");
         assert_eq!(f.take_clipboard_requests(), vec![b"c;aGk=".to_vec()]);
     }
 

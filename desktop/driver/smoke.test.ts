@@ -254,7 +254,7 @@ test("terminal_004 an agent that owns the mouse copies to the clipboard with OSC
       input,
       "printf '\\e[?1000h\\e[?1002h\\e[?1006h'; echo armed-$((1+1)); "
         + "while IFS= read -rsn1 c; do [ \"$c\" = m ] && break; done; "
-        + "printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 -w0)\"; "
+        + "printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 | tr -d '\\r\\n')\"; "
         + "printf '\\e[?1006l\\e[?1002l\\e[?1000l'; echo released-$((1+1))"
         + ENTER,
     );

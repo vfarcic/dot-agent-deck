@@ -607,13 +607,15 @@ pub struct EmbeddedPaneController {
     /// honest feedback + leaves PaneInput — closing the server/UI race where the
     /// UI's pre-forward liveness snapshot was stale.
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
-    /// Issue #1705: the text of every clipboard copy an agent asked its
-    /// terminal for (OSC 52), from any pane, in arrival order. The pane I/O
-    /// tasks push here; the render loop drains it each frame via
-    /// [`Self::take_clipboard_copies`] and passes the copy on to the user's own
+    /// Issue #1705: the newest clipboard copy an agent asked its terminal for
+    /// (OSC 52), from any pane, not yet passed on. One slot rather than a
+    /// queue: each copy replaces the last on the clipboard, so a copy that is
+    /// overtaken before the render loop drains it would only be overwritten.
+    /// The pane I/O tasks set it; the render loop takes it each frame via
+    /// [`Self::take_clipboard_copy`] and passes it on to the user's own
     /// terminal, from the UI thread so it cannot land inside a frame being
     /// drawn.
-    clipboard_copies: Arc<Mutex<Vec<String>>>,
+    clipboard_copy: Arc<Mutex<Option<String>>>,
     /// PRD #241 F3b (review finding G2): warnings from closes that COMPLETED
     /// without being able to confirm the daemon side (see
     /// [`StopOutcome::DoneUnverified`]). `close_pane` returns `Ok(())` on that
@@ -711,7 +713,7 @@ impl EmbeddedPaneController {
             client,
             runtime,
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
-            clipboard_copies: Arc::new(Mutex::new(Vec::new())),
+            clipboard_copy: Arc::new(Mutex::new(None)),
             close_warnings: Arc::new(Mutex::new(Vec::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
         }
@@ -753,12 +755,12 @@ impl EmbeddedPaneController {
         std::mem::take(&mut *self.stream_rejections.lock().unwrap())
     }
 
-    /// Issue #1705: drain and return the clipboard copies agents have asked
-    /// for since the last call, already validated by
-    /// [`crate::osc52::osc52_copy_text`]. The render loop passes the newest on
-    /// to the user's terminal.
-    pub fn take_clipboard_copies(&self) -> Vec<String> {
-        std::mem::take(&mut *self.clipboard_copies.lock().unwrap())
+    /// Issue #1705: take the newest clipboard copy an agent has asked for
+    /// since the last call, already validated by
+    /// [`crate::osc52::osc52_copy_text`]. The render loop passes it on to the
+    /// user's terminal.
+    pub fn take_clipboard_copy(&self) -> Option<String> {
+        self.clipboard_copy.lock().unwrap().take()
     }
 
     /// PRD #241 F3b (review finding G2): drain and return the warnings queued by
@@ -1581,7 +1583,7 @@ impl EmbeddedPaneController {
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
         let rejections_for_task = Arc::clone(&self.stream_rejections);
-        let clipboard_for_task = Arc::clone(&self.clipboard_copies);
+        let clipboard_for_task = Arc::clone(&self.clipboard_copy);
 
         // PRD #241 F3b: published state for the I/O task. Seeded here rather
         // than inside `run_pane_io_task` so it already reads `IO_ATTACHED`
@@ -2880,7 +2882,7 @@ async fn run_pane_io_task(
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
     bytes_since_spawn: Arc<AtomicU64>,
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
-    clipboard_copies: Arc<Mutex<Vec<String>>>,
+    clipboard_copy: Arc<Mutex<Option<String>>>,
     io_state: Arc<AtomicU8>,
     lost: Arc<Mutex<Option<PaneLostReason>>>,
 ) {
@@ -2935,15 +2937,16 @@ async fn run_pane_io_task(
                                 );
                                 // Taken on every frame, replayed or not, so a
                                 // replayed request never waits for a live one.
+                                // Newest first: only the last valid copy in
+                                // the frame would survive on the clipboard.
                                 let requests = osc8.take_clipboard_requests();
-                                if !replayed {
-                                    let copies: Vec<String> = requests
+                                if !replayed
+                                    && let Some(text) = requests
                                         .iter()
-                                        .filter_map(|r| crate::osc52::osc52_copy_text(r))
-                                        .collect();
-                                    if !copies.is_empty() {
-                                        clipboard_copies.lock().unwrap().extend(copies);
-                                    }
+                                        .rev()
+                                        .find_map(|r| crate::osc52::osc52_copy_text(r))
+                                {
+                                    *clipboard_copy.lock().unwrap() = Some(text);
                                 }
                             }
                             crate::daemon_protocol::KIND_STREAM_END => break,

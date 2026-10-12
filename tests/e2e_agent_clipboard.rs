@@ -62,7 +62,7 @@ fn clipboard_001_an_agent_copy_in_a_pane_reaches_the_users_terminal() {
     let copied = "dad-osc52-42-ok";
     let request = format!("\x1b]52;c;{}\x1b\\", base64(copied.as_bytes()));
     deck.send_bytes(
-        b"printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 -w0)\"; \
+        b"printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 | tr -d '\\r\\n')\"; \
           printf '\\e]52;c;?\\a'; echo copied-$((1+1))\r",
     );
     deck.wait_for_string("copied-2");

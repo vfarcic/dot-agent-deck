@@ -10,6 +10,20 @@ import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/term
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 import { keepSelectionAcrossResize } from "../lib/terminalSelection";
 
+/**
+ * Issue #1705 — every clipboard write from an agent's terminal, in the order
+ * it was asked for. `writeClipboardText` is asynchronous (an import, then an
+ * IPC round trip), so two copies started back to back, from one pane or from
+ * two, could finish out of order and leave the older text on the clipboard.
+ * Each write starts only once the one before it has settled. A write the
+ * platform refuses has no better outcome than the unchanged clipboard it
+ * leaves, so a failure ends that write and not the queue.
+ */
+let clipboardWrites: Promise<void> = Promise.resolve();
+function copyInOrder(text: string): void {
+  clipboardWrites = clipboardWrites.then(() => writeClipboardText(text)).catch(() => undefined);
+}
+
 interface TerminalViewportProps {
   agentId: string;
   /**
@@ -249,9 +263,7 @@ export function TerminalViewport({
     replayRef.current = replay;
     const clipboardRequests = terminal.parser.registerOscHandler(52, (data) => {
       const text = replaying ? undefined : osc52CopyText(data);
-      // A write the platform refuses has no better outcome than the unchanged
-      // clipboard it leaves.
-      if (text !== undefined) void writeClipboardText(text).catch(() => undefined);
+      if (text !== undefined) copyInOrder(text);
       return true;
     });
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
@@ -293,9 +305,8 @@ export function TerminalViewport({
       event.stopPropagation();
       const selection = terminal.getSelection();
       if (isSelectionCtrlC(event, platform, hasSelection)) terminal.clearSelection();
-      // Nothing selected leaves the clipboard as it was. A write the platform
-      // refuses has no better outcome than the unchanged clipboard it leaves.
-      if (selection) void writeClipboardText(selection).catch(() => undefined);
+      // Nothing selected leaves the clipboard as it was.
+      if (selection) copyInOrder(selection);
     };
     // A read-only pane's textarea is `disabled` and cannot take focus, and
     // xterm's selection handler cancels the press that would otherwise have

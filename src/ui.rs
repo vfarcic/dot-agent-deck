@@ -15291,7 +15291,7 @@ pub fn run_tui(
             // the user's own terminal — write-only, validated by
             // `osc52::osc52_copy_text`, and only the newest when several
             // arrived in one frame, since each would replace the last.
-            if let Some(text) = embedded.take_clipboard_copies().pop() {
+            if let Some(text) = embedded.take_clipboard_copy() {
                 copy_to_clipboard_osc52(&text);
             }
             let rejections = embedded.take_stream_rejections();

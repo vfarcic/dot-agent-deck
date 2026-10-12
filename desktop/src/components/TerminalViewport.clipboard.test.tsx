@@ -234,6 +234,30 @@ describe("TerminalViewport honours an agent's OSC 52 copy (issue 1705)", () => {
   });
 
   /**
+   * Scenario: an agent copies twice in quick succession, and the first copy is
+   * slow to reach the clipboard. The second copy starts only once the first has
+   * finished, so the clipboard is left holding the newer text.
+   */
+  it("writes copies to the clipboard in the order the agent made them", async () => {
+    const finishes: (() => void)[] = [];
+    writeClipboardText.mockImplementation(() => new Promise<undefined>((resolve) => finishes.push(() => resolve(undefined))));
+    try {
+      const { emit, parsed } = mountTerminal({ backlog: READY });
+      emit(`${osc52("older")}${osc52("newer")}`);
+      await parsed();
+      await waitFor(() => expect(writeClipboardText).toHaveBeenCalledTimes(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // The newer copy waits for the older one rather than racing it.
+      expect(writeClipboardText.mock.calls).toEqual([["older"]]);
+      finishes[0]();
+      await waitFor(() => expect(writeClipboardText.mock.calls).toEqual([["older"], ["newer"]]));
+      finishes[1]();
+    } finally {
+      writeClipboardText.mockImplementation(async () => undefined);
+    }
+  });
+
+  /**
    * Scenario: the pane is read-only (another client holds its input, or the
    * agent has finished). An agent's copy still lands on the clipboard, because
    * copying out of a pane is reading, not typing into it.

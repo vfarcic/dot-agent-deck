@@ -403,6 +403,8 @@ describe("TerminalViewport copy and editing keys share one terminal (issues 1403
 
 describe("TerminalViewport plain Ctrl+C over a selection (issue 1705)", () => {
   const ctrlC: Key = { key: "c", code: "KeyC", keyCode: 67, ctrlKey: true };
+  /** Clipboard writes are queued in order (issue #1705); let the queue run before asserting. */
+  const settled = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
   async function mountWithSelection() {
     const mounted = mountTerminal();
@@ -423,10 +425,12 @@ describe("TerminalViewport plain Ctrl+C over a selection (issue 1705)", () => {
     onPlatform("windows");
     const { sent, press, terminal } = await mountWithSelection();
     press(ctrlC);
+    await settled();
     expect(writeClipboardText).toHaveBeenCalledWith("exit status 0");
     expect(terminal.hasSelection()).toBe(false);
     expect(sent).toEqual([]);
     press(ctrlC);
+    await settled();
     expect(sent).toEqual(["\x03"]);
     expect(writeClipboardText).toHaveBeenCalledTimes(1);
   });
@@ -440,6 +444,7 @@ describe("TerminalViewport plain Ctrl+C over a selection (issue 1705)", () => {
     onPlatform(platform);
     const { sent, press } = await mountWithSelection();
     press(ctrlC);
+    await settled();
     expect(sent).toEqual(["\x03"]);
     expect(writeClipboardText).not.toHaveBeenCalled();
   });

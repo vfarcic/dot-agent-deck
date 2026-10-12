@@ -26,6 +26,20 @@ describe("osc52CopyText", () => {
     expect(osc52CopyText("c;aGk")).toBe("hi");
   });
 
+  it("ignores whitespace inside the base64, as a payload wrapped at 76 columns has", () => {
+    const text = "a line long enough that GNU base64 wraps its encoding onto a second line";
+    const wrapped = base64(text).replace(/(.{76})/g, "$1\n");
+    expect(wrapped).toContain("\n");
+    expect(osc52CopyText(`c;${wrapped}`)).toBe(text);
+    expect(osc52CopyText("c; aG k=\r\n")).toBe("hi");
+    expect(osc52CopyText("c; \n")).toBeUndefined();
+  });
+
+  it("keeps a leading byte-order mark as text, so a BOM-only copy is not empty", () => {
+    expect(osc52CopyText("c;77u/")).toBe("\ufeff");
+    expect(osc52CopyText(`c;${base64("\ufeffhi")}`)).toBe("\ufeffhi");
+  });
+
   it("never treats a read request as a copy", () => {
     expect(osc52CopyText("c;?")).toBeUndefined();
     expect(osc52CopyText(";?")).toBeUndefined();

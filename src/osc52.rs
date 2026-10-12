@@ -11,31 +11,45 @@
 //! output can make it print could otherwise read whatever the user last copied.
 //!
 //! The desktop app applies the same rules to the same request in its own
-//! terminal (`desktop/src/lib/osc52.ts`), so both clients copy the same things.
+//! terminal (`desktop/src/lib/osc52.ts`). Its parser, xterm.js, also accepts
+//! the 8-bit C1 introducer that the TUI's filter does not (see
+//! `docs/develop/desktop-gui.md`, "Copying out of an agent's terminal").
 
 /// The largest copy passed on, in bytes of text. Dropped rather than
 /// truncated above it: a copy that silently lost its tail pastes as if whole.
 pub const OSC52_MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// The longest base64 that can carry [`OSC52_MAX_TEXT_BYTES`] (every 4
+/// characters carry 3 bytes): a payload longer than this, whitespace aside, is
+/// refused before it is decoded.
+pub const OSC52_MAX_PAYLOAD_BYTES: usize = OSC52_MAX_TEXT_BYTES.div_ceil(3) * 4;
+
 /// The text of a set-clipboard request, given everything after `52;`, or
 /// `None` — meaning "leave the clipboard as it is" — for anything that is not
 /// a well-formed copy: a target letter OSC 52 does not define (`c p q s 0-7`,
 /// or none, which is the default), a read request, an empty payload (which
-/// would clear the user's clipboard), a payload that is not base64 or whose
-/// bytes are not UTF-8, or text over [`OSC52_MAX_TEXT_BYTES`].
+/// would clear the user's clipboard), a payload that is not base64 (ASCII
+/// whitespace inside it is ignored, as `atob` ignores it, so a payload GNU
+/// `base64` wrapped at 76 columns is the same copy) or whose bytes are not
+/// UTF-8, or text over [`OSC52_MAX_TEXT_BYTES`].
 pub fn osc52_copy_text(request: &[u8]) -> Option<String> {
     let separator = request.iter().position(|&b| b == b';')?;
-    let (targets, payload) = (&request[..separator], &request[separator + 1..]);
+    let targets = &request[..separator];
     if !targets.iter().all(|b| b"cpqs01234567".contains(b)) {
         return None;
     }
+    let payload: Vec<u8> = request[separator + 1..]
+        .iter()
+        .copied()
+        .filter(|b| !matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '))
+        .collect();
     if payload.is_empty() || payload == b"?" {
         return None;
     }
-    if payload.len() > OSC52_MAX_TEXT_BYTES.div_ceil(3) * 4 {
+    if payload.len() > OSC52_MAX_PAYLOAD_BYTES {
         return None;
     }
-    let bytes = base64_decode(payload)?;
+    let bytes = base64_decode(&payload)?;
     if bytes.is_empty() || bytes.len() > OSC52_MAX_TEXT_BYTES {
         return None;
     }
@@ -113,6 +127,28 @@ mod tests {
         assert_eq!(osc52_copy_text(b"c;aGk").as_deref(), Some("hi"));
         assert_eq!(osc52_copy_text(b"c;aGk=").as_deref(), Some("hi"));
         assert_eq!(osc52_copy_text(b"c;aA==").as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn ignores_whitespace_inside_the_base64() {
+        let text = "a line long enough that GNU base64 wraps its encoding onto a second line";
+        let encoded = crate::ui::base64_encode(text.as_bytes());
+        let mut wrapped = b"c;".to_vec();
+        for (i, chunk) in encoded.as_bytes().chunks(76).enumerate() {
+            if i > 0 {
+                wrapped.push(b'\n');
+            }
+            wrapped.extend_from_slice(chunk);
+        }
+        assert!(wrapped.contains(&b'\n'), "the payload must actually wrap");
+        assert_eq!(osc52_copy_text(&wrapped).as_deref(), Some(text));
+        assert_eq!(osc52_copy_text(b"c; aG k=\r\n").as_deref(), Some("hi"));
+        assert_eq!(osc52_copy_text(b"c; \n"), None);
+    }
+
+    #[test]
+    fn keeps_a_leading_byte_order_mark_as_text() {
+        assert_eq!(osc52_copy_text(b"c;77u/").as_deref(), Some("\u{feff}"));
     }
 
     #[test]
