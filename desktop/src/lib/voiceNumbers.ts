@@ -73,8 +73,8 @@ export interface VoiceNumberRefDto {
   number: number;
 }
 
-/** What one utterance says about the numbered list (`voice::numbers::NumberAnswer`). Numbers are 1-based. */
-export type VoiceNumberAnswerDto =
+/** What one utterance says about one item of the numbered list: every `voice::numbers::NumberAnswer` but `PullRequest`. Numbers are 1-based. */
+export type VoiceItemAnswerDto =
   | { kind: "not_number" }
   /* `section` is always sent by Rust; an answer without one (the shape before
      round 4) means the first section showing that number. */
@@ -83,6 +83,16 @@ export type VoiceNumberAnswerDto =
   | { kind: "not_numbered"; section: VoiceNumberedSectionKind; shown: VoiceNumberedSectionKind[] }
   | { kind: "stale" }
   | { kind: "ambiguous"; choices: VoiceNumberRefDto[] };
+
+/** What one utterance says about the numbered list (`voice::numbers::NumberAnswer`). */
+export type VoiceNumberAnswerDto =
+  | VoiceItemAnswerDto
+  /* PRD #1401 — the answer about an agent said by its number, asked for its
+     pull request ("open the PR for agent 3"): `of` is never `not_number`. */
+  | { kind: "pull_request"; of: VoiceItemAnswerDto };
+
+/** What choosing a numbered item opens: the item, or (an agent's) pull request. */
+export type VoiceNumberedOpens = "item" | "pull_request";
 
 /** No numbered list: what a screen with nothing numbered declares. */
 export const NO_NUMBERED_LIST: VoiceNumberedListDto = { generation: 0, sections: [] };
@@ -105,6 +115,42 @@ const SECTION_WORDS: Record<VoiceNumberedSectionKind, readonly string[]> = {
 
 /** `voice::numbers::LEADING_VERBS`: verbs that may lead a section word. */
 const LEADING_VERBS: readonly (readonly string[])[] = [["select"], ["choose"], ["pick"], ["open"], ["enter"], ["go", "to"], ["switch", "to"]];
+
+/** `voice::numbers::PULL_REQUEST_WORDS`: the words that name a pull request. */
+const PULL_REQUEST_WORDS: readonly (readonly string[])[] = [["pr"], ["p", "r"], ["pull", "request"]];
+
+/** `voice::numbers::PULL_REQUEST_VERBS`: verbs that may lead a pull request asked for by number. */
+const PULL_REQUEST_VERBS: readonly (readonly string[])[] = [["open"], ["show", "me"], ["show"]];
+
+/** `voice::numbers::after`: `words` less the first of `leads` they start with, if any. */
+function after(words: string[], leads: readonly (readonly string[])[]): string[] | undefined {
+  const lead = leads.find((candidate) => words.length >= candidate.length && candidate.every((word, at) => words[at] === word));
+  return lead === undefined ? undefined : words.slice(lead.length);
+}
+
+/** `voice::numbers::before`: `words` less the first of `tails` they end with, if any. */
+function before(words: string[], tails: readonly (readonly string[])[]): string[] | undefined {
+  const tail = tails.find((candidate) => words.length >= candidate.length && candidate.every((word, at) => words[words.length - candidate.length + at] === word));
+  return tail === undefined ? undefined : words.slice(0, words.length - tail.length);
+}
+
+/** `voice::numbers::pull_request_of`: the words naming the agent in "open the PR for agent 3" or "open agent 3's pull request", if the utterance is one. */
+function pullRequestOf(words: string[]): string[] | undefined {
+  let rest = after(words, PULL_REQUEST_VERBS) ?? words;
+  if (rest[0] === "the") rest = rest.slice(1);
+  let agent: string[];
+  const afterPullRequest = after(rest, PULL_REQUEST_WORDS);
+  if (afterPullRequest !== undefined) {
+    if (afterPullRequest[0] !== "for" && afterPullRequest[0] !== "of") return undefined;
+    agent = afterPullRequest.slice(1);
+  } else {
+    const owner = before(rest, PULL_REQUEST_WORDS);
+    if (owner === undefined || owner[owner.length - 1] !== "s") return undefined;
+    agent = owner.slice(0, -1);
+  }
+  const named = agent[0] === "the" ? agent.slice(1) : agent;
+  return named[0] !== undefined && SECTION_WORDS.agent.includes(named[0]) ? agent : undefined;
+}
 
 /** The item showing `number` in the declared section `section` — with no section, the first section showing it — if any. */
 export function numberedEntry(list: VoiceNumberedListDto, section: VoiceNumberedSectionKind | undefined, number: number): VoiceNumberedEntryDto | undefined {
@@ -187,7 +233,18 @@ function named(section: VoiceNumberedSectionDto, at: number, collides: Collides)
  * rule for rule; see its documentation for the order.
  */
 export function answerNumberLocally(utterance: string, heard: VoiceNumberedListDto, now: number): VoiceNumberAnswerDto {
-  const read = readSection(wholeUtterance(utterance));
+  const words = wholeUtterance(utterance);
+  const agent = pullRequestOf(words);
+  if (agent !== undefined) {
+    const of = answerWords(agent, heard, now);
+    return of.kind === "not_number" ? of : { kind: "pull_request", of };
+  }
+  return answerWords(words, heard, now);
+}
+
+/** `voice::numbers::answer_words`: the answer for the utterance's words. */
+function answerWords(words: string[], heard: VoiceNumberedListDto, now: number): VoiceItemAnswerDto {
+  const read = readSection(words);
   const said = read === undefined ? undefined : ordinal(read.said);
   const shown = shownSections(heard);
   if (read === undefined || said === undefined || shown.length === 0) return { kind: "not_number" };
@@ -228,6 +285,9 @@ const ROWS: Record<VoiceNumberedKind, { action: string; invoke: string; param?: 
   mode: { action: "choose_mode", invoke: "chooseNewAgentMode", param: { name: "mode", kind: "mode_ref" }, report: (label) => `Mode: ${label}.` },
 };
 
+/** PRD #1401 — the row an agent's pull request opens with: `open_pr`, as a spoken name for the agent would have run it. */
+const PULL_REQUEST_ROW = { action: "open_pr", invoke: "openPullRequest", param: { name: "agent", kind: "agent_ref" }, report: () => "Opening the pull request." };
+
 /**
  * The item as a resolved param of its row's kind — what the dispatch reads,
  * and what a numbered choice lists. `value` is the item's identity; an agent
@@ -248,10 +308,11 @@ export function numberedParam(entry: VoiceNumberedEntryDto, spoken: string): Voi
 
 /**
  * Choosing `entry` as a dispatch: the row a spoken name for it would have run,
- * with the item as its param, reported as that row reports.
+ * with the item as its param, reported as that row reports. An agent's pull
+ * request (`opens`) is `open_pr`'s row instead.
  */
-export function numberedOutcome(entry: VoiceNumberedEntryDto, transcript: string): Extract<VoiceOutcomeDto, { kind: "dispatch" }> {
-  const row = ROWS[entry.kind];
+export function numberedOutcome(entry: VoiceNumberedEntryDto, transcript: string, opens: VoiceNumberedOpens = "item"): Extract<VoiceOutcomeDto, { kind: "dispatch" }> {
+  const row = opens === "pull_request" && entry.kind === "agent" ? PULL_REQUEST_ROW : ROWS[entry.kind];
   return {
     kind: "dispatch",
     transcript,

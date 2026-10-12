@@ -137,7 +137,7 @@ Scrolling by voice works on the dashboard itself, not while the New agent dialog
 
 When an agent has a [pull request badge](dashboard.md#pull-requests), you can open its pull request [inside the app](dashboard.md#read-a-pull-request-in-the-app) by voice, from the dashboard or from an agent's pane:
 
-- **On the dashboard**, name the agent: **"open the PR for the coder"**, **"open the coder's PR"** or **"show the pull request for the reviewer"**. Name it the way you would to open its pane, by its name, its role or what it is doing. If you say **"open the PR"** without naming one and there is more than one agent, the app asks which agent you mean; answer with its name or its number (see [Choosing by number](#choosing-by-number)). With a single agent on the dashboard, it opens that agent's.
+- **On the dashboard**, name the agent: **"open the PR for the coder"**, **"open the coder's PR"** or **"show the pull request for the reviewer"**. Name it the way you would to open its pane, by its name, its role or what it is doing, or by the number beside it on the dashboard: **"open the PR for agent 3"** or **"open agent 3's pull request"**. If you say **"open the PR"** without naming one and there is more than one agent, the app asks which agent you mean; answer with its name or its number (see [Choosing by number](#choosing-by-number)). With a single agent on the dashboard, it opens that agent's.
 - **On an agent's pane**, **"open the PR"** or **"show the pull request"** opens that agent's pull request. Name another agent, such as **"open the reviewer's pull request"**, to open that agent's instead.
 
 When the agent has no pull request, nothing opens and the app says so. When no agent matches the name you said, nothing opens and the app says that too.

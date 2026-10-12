@@ -2614,6 +2614,17 @@ screen = "deck"
 action = "open_pr"
 outcome = "unavailable"
 
+# An agent's PR by its number ("open the PR for agent 3") is answered on the
+# dashboard from the numbered list (`voice::numbers`, PullRequest) and never
+# reaches the model there. On the Daemons screen, whose tiles are numbered too,
+# the webview leaves it to the model, which refuses it like any other `open_pr`.
+[[fixtures]]
+name = "open-pr-by-agent-number-unavailable-on-the-daemons-screen"
+utterance = "open the PR for agent 1"
+screen = "deck"
+action = "open_pr"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "open-pr-in-browser"
 utterance = "open it in the browser"
