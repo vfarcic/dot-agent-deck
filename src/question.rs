@@ -40,11 +40,25 @@ pub const MAX_DESCRIPTION_BYTES: usize = 300;
 /// Most questions one form may carry; a longer form shows its first ones and
 /// is keyboard-only ([`PendingQuestion::sanitized`]).
 pub const MAX_QUESTIONS: usize = 8;
-/// Most options one question may carry; a longer list is cut.
+/// Most options one question may carry of its own — the ones its agent's
+/// payload lists, not the ones the deck appends from its tables. A question
+/// with more makes its whole form keyboard-only ([`own_options_fit`]).
 pub const MAX_OPTIONS: usize = 16;
+/// Most options the deck appends to a question's own: Claude Code's
+/// "Type something." and "Chat about this".
+pub const MAX_APPENDED_OPTIONS: usize = 2;
 /// The options a Codex form question can be answered with by one digit,
 /// `1`-`9` [read from Codex 0.160.0's `request_user_input` source].
 pub const CODEX_DIGIT_OPTIONS: u32 = 9;
+/// Whether a question of `own` options of its own fits [`MAX_OPTIONS`]. A
+/// producer whose payload has a question that does not makes the whole form
+/// keyboard-only (PR #1698 review): offering the first sixteen alone would let
+/// a user who heard a partial list ask for an option that was never offered,
+/// and answer by label the options they did hear while the rest stay hidden.
+fn own_options_fit(own: usize) -> bool {
+    own <= MAX_OPTIONS
+}
+
 /// Longest question id accepted. An id is a routing key, so an id that is too
 /// long or carries anything outside `[A-Za-z0-9_-]` drops the whole question
 /// rather than being repaired.
@@ -467,14 +481,21 @@ impl PendingQuestion {
         }
         // A form longer than the deck shows stays on the card, its first
         // questions shown, but keyboard-only: an answer to the questions shown
-        // would be sent as the whole form's (PR #1698 review).
-        let oversized = self.questions.len() > MAX_QUESTIONS;
+        // would be sent as the whole form's (PR #1698 review). So does a
+        // question with more options than the deck shows: its producer has
+        // already made the form keyboard-only past MAX_OPTIONS of its own
+        // ([`own_options_fit`]), and this cap leaves room for the options the
+        // deck appends, so a cut here only ever comes from a producer that
+        // did not.
+        let shown_options = MAX_OPTIONS + MAX_APPENDED_OPTIONS;
+        let mut oversized = self.questions.len() > MAX_QUESTIONS;
         let mut questions = Vec::new();
         for question in self.questions.into_iter().take(MAX_QUESTIONS) {
+            oversized |= question.options.len() > shown_options;
             let options: Vec<QuestionOption> = question
                 .options
                 .into_iter()
-                .take(MAX_OPTIONS)
+                .take(shown_options)
                 .map(|option| QuestionOption {
                     index: option.index,
                     label: clean(&option.label, MAX_LABEL_BYTES, false),
@@ -955,7 +976,8 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
 ///
 /// - `AskUserQuestion` → a [`QuestionKind::Choice`] form, one question per
 ///   `tool_input.questions[]`, the payload's options followed by the options
-///   Claude Code appends on screen; held.
+///   Claude Code appends on screen; held, and keyboard-only when a question
+///   has more than [`MAX_OPTIONS`] of its own ([`own_options_fit`]).
 /// - `ExitPlanMode` → [`QuestionKind::Plan`], options from the table; answered
 ///   by keys, NOT held — a hook decision does not dismiss the plan dialog
 ///   [observed on 2.1.289].
@@ -979,6 +1001,7 @@ pub fn claude_permission_request(
     let no_fill = |s: &str| s.to_string();
     match tool_name {
         "AskUserQuestion" => {
+            let mut too_many = false;
             let questions = tool_input
                 .and_then(|input| input.get("questions"))
                 .and_then(Value::as_array)
@@ -987,6 +1010,7 @@ pub fn claude_permission_request(
                         .iter()
                         .map(|question| {
                             let mut options = payload_options(question);
+                            too_many |= !own_options_fit(options.len());
                             let next = options.len() as u32 + 1;
                             options.extend(table_options(
                                 tables,
@@ -1022,7 +1046,11 @@ pub fn claude_permission_request(
                         detail: None,
                         use_id: None,
                     }),
-                    channel: AnswerChannel::Held,
+                    channel: if too_many {
+                        AnswerChannel::Unsupported
+                    } else {
+                        AnswerChannel::Held
+                    },
                     subagent_id: None,
                     revision: None,
                 },
@@ -1285,6 +1313,8 @@ pub fn codex_request_user_input(
         .iter()
         .map(|question| {
             let mut options = payload_options(question);
+            // Past nine options of its own the form is keyboard-only, which
+            // also covers past MAX_OPTIONS ([`own_options_fit`]).
             beyond_digits |= options.len() > CODEX_DIGIT_OPTIONS as usize;
             let next = options.len() as u32 + 1;
             options.extend(table_options(
@@ -1459,16 +1489,20 @@ pub fn opencode_always_scope(props: &Value) -> Option<String> {
 
 /// PRD #1631: OpenCode's `question.asked` properties → a held
 /// [`QuestionKind::Choice`] form. Each question gets OpenCode's own
-/// "Type your own answer" option unless it says `custom: false`.
+/// "Type your own answer" option unless it says `custom: false`. A question
+/// with more than [`MAX_OPTIONS`] of its own makes the form keyboard-only
+/// ([`own_options_fit`]).
 pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
     let id = str_field(props, "id")?.to_string();
     let tables = agent_tables(&AgentType::OpenCode);
+    let mut too_many = false;
     let questions = props
         .get("questions")?
         .as_array()?
         .iter()
         .map(|question| {
             let mut options = payload_options(question);
+            too_many |= !own_options_fit(options.len());
             if question.get("custom").and_then(Value::as_bool) != Some(false) {
                 let next = options.len() as u32 + 1;
                 options.extend(table_options(
@@ -1497,7 +1531,11 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
         questions,
         raised_at_ms,
         tool: None,
-        channel: AnswerChannel::Held,
+        channel: if too_many {
+            AnswerChannel::Unsupported
+        } else {
+            AnswerChannel::Held
+        },
         subagent_id: None,
         revision: None,
     })
@@ -1600,7 +1638,8 @@ pub struct PiDialog {
 
 /// PRD #1631: a Pi dialog → a held question. `select` → a choice of its
 /// options; `confirm` → [`QuestionKind::Confirm`] with Yes (allow) and No
-/// (deny); `input` → one free-text option.
+/// (deny); `input` → one free-text option. A `select` of more than
+/// [`MAX_OPTIONS`] options is keyboard-only ([`own_options_fit`]).
 pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion> {
     let option = |index: u32, label: &str, role: OptionRole| QuestionOption {
         index,
@@ -1647,6 +1686,11 @@ pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion
         ),
         _ => return None,
     };
+    let channel = if own_options_fit(options.len()) {
+        AnswerChannel::Held
+    } else {
+        AnswerChannel::Unsupported
+    };
     Some(PendingQuestion {
         id: dialog.id.clone(),
         kind,
@@ -1658,7 +1702,7 @@ pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion
         }],
         raised_at_ms,
         tool: None,
-        channel: AnswerChannel::Held,
+        channel,
         subagent_id: None,
         revision: None,
     })
@@ -1960,7 +2004,10 @@ mod tests {
         );
         assert_eq!(first.header.as_deref(), Some("Colour"));
         assert_eq!(clean.questions.len(), MAX_QUESTIONS);
-        assert_eq!(clean.questions[1].options.len(), MAX_OPTIONS);
+        assert_eq!(
+            clean.questions[1].options.len(),
+            MAX_OPTIONS + MAX_APPENDED_OPTIONS
+        );
         for text in clean
             .questions
             .iter()
@@ -2538,6 +2585,141 @@ mod tests {
             answer_keys(&AgentType::Codex, &nine, &[resolved(&nine, 9)]),
             Ok(vec!["9".to_string()])
         );
+    }
+
+    /// Scenario: Claude Code's `AskUserQuestion`, an OpenCode form and a Pi
+    /// select each ask a question of seventeen options, one more than the
+    /// deck offers. Each whole form is keyboard-only: it is shown, but no
+    /// option is offered and every answer is refused. The same questions at
+    /// sixteen options stay answerable, with the options the deck appends
+    /// after them still there.
+    #[spec("question/model/006")]
+    #[test]
+    fn question_model_006_a_question_with_more_than_sixteen_options_is_keyboard_only() {
+        let options = |n: usize| -> Vec<Value> {
+            (1..=n)
+                .map(|i| serde_json::json!({"label": format!("Option {i}")}))
+                .collect()
+        };
+        let claude = |n: usize| {
+            let input = serde_json::json!({"questions": [
+                {"question": "First?", "header": "First", "options": options(2), "multiSelect": false},
+                {"question": "Second?", "header": "Second", "options": options(n), "multiSelect": false},
+            ]});
+            claude_permission_request(
+                "toolu_wide".into(),
+                "AskUserQuestion",
+                Some(&input),
+                None,
+                None,
+                1,
+                None,
+            )
+            .question
+            .sanitized()
+            .expect("still shown")
+        };
+        let opencode = |n: usize| {
+            let props = serde_json::json!({"id": "que_wide", "questions": [
+                {"question": "First?", "header": "First", "options": options(2)},
+                {"question": "Second?", "header": "Second", "options": options(n)},
+            ]});
+            opencode_question_asked(&props, 1)
+                .expect("a form")
+                .sanitized()
+                .expect("still shown")
+        };
+        let pi = |n: usize| {
+            let dialog = PiDialog {
+                id: "pi_wide".into(),
+                kind: "select".into(),
+                title: "Which?".into(),
+                message: None,
+                options: (1..=n).map(|i| format!("Option {i}")).collect(),
+                placeholder: None,
+            };
+            pi_dialog(&dialog, 1)
+                .expect("a dialog")
+                .sanitized()
+                .expect("still shown")
+        };
+        let both = |second: u32| [answer(0, &[1], None), answer(1, &[second], None)];
+
+        for (agent, wide) in [("claude", claude(17)), ("opencode", opencode(17))] {
+            assert_eq!(
+                wide.questions[1].options[0].label, "Option 1",
+                "{agent}: shown"
+            );
+            assert_eq!(
+                wide.channel,
+                AnswerChannel::Unsupported,
+                "{agent}: keyboard-only"
+            );
+            assert!(!wide.has_answerable_option(), "{agent}: nothing is offered");
+            for second in [1, MAX_OPTIONS as u32] {
+                assert_eq!(
+                    wide.validate(&both(second), false),
+                    Err(AnswerRefusal::Unsupported),
+                    "{agent}: option {second} is not offered from a partial list"
+                );
+            }
+        }
+        let wide_pi = pi(17);
+        assert_eq!(
+            wide_pi.channel,
+            AnswerChannel::Unsupported,
+            "pi: keyboard-only"
+        );
+        assert!(!wide_pi.has_answerable_option(), "pi: nothing is offered");
+        assert_eq!(
+            wide_pi.validate(&[answer(0, &[1], None)], false),
+            Err(AnswerRefusal::Unsupported)
+        );
+
+        let full = claude(16);
+        assert_eq!(full.channel, AnswerChannel::Held);
+        let labels: Vec<&str> = full.questions[1]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(labels.len(), 18, "{labels:?}");
+        assert_eq!(labels[15], "Option 16");
+        assert_eq!(labels[16..], ["Type something.", "Chat about this"]);
+        assert!(full.validate(&both(16), false).is_ok());
+        assert!(
+            full.validate(
+                &[answer(0, &[1], None), answer(1, &[17], Some("my own"))],
+                false
+            )
+            .is_ok(),
+            "Claude Code's own free-text option is still offered"
+        );
+
+        let full = opencode(16);
+        assert_eq!(full.channel, AnswerChannel::Held);
+        assert_eq!(full.questions[1].options.len(), 17);
+        assert_eq!(full.questions[1].options[16].label, "Type your own answer");
+        assert!(full.validate(&both(16), false).is_ok());
+
+        let full = pi(16);
+        assert_eq!(full.channel, AnswerChannel::Held);
+        assert!(full.validate(&[answer(0, &[16], None)], false).is_ok());
+
+        // The room sanitizing leaves for appended options covers every
+        // agent's, so a question at sixteen loses none of them.
+        for agent in [
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Codex,
+            AgentType::Devin,
+            AgentType::None,
+        ] {
+            let appended =
+                agent_tables(&agent).map_or(0, |t| t.menu(MenuKind::ChoiceAppended).len());
+            assert!(appended <= MAX_APPENDED_OPTIONS, "{agent:?}: {appended}");
+        }
     }
 
     /// Scenario: Every shape an answer can be wrong in is refused with the

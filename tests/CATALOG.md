@@ -7979,6 +7979,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** Codex's own UI (digits `1`–`9` only, read from Codex 0.160.0's `request_user_input` source, not measured live); the desktop's keyboard-only row (`question/desktop/*`).
 - **Platform coverage:** mac+linux.
 
+##### question/model/006 — A question with more than sixteen options of its own makes its whole form keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Claude Code `AskUserQuestion`, an OpenCode `question.asked` and a Pi `select` dialog built by the deck's own parsers).
+- **Asserts:** a form whose second question has seventeen options is shown with the channel `unsupported`, offers no option, and refuses an answer picking option 1 or option 16 as `unsupported`, for Claude Code and OpenCode; a Pi select of seventeen is the same; at sixteen options each stays held and answerable, Claude Code's Type something. and Chat about this and OpenCode's Type your own answer still listed after the sixteenth, Claude Code's free-text option still answerable; every agent's appended options fit `MAX_APPENDED_OPTIONS`.
+- **Does not assert:** that any agent sends a question of more than sixteen options; the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/detect
 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
