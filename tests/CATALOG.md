@@ -8140,10 +8140,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** A real model fetching the content.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/006 — Own-hook status gates the doorbell, and restart resets the startup guard.
+##### inbox/codex/006 — Own-hook status and an empty recognised composer gate the doorbell; restart resets the startup guard.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (wrapped screen recorder and real hook CLI).
-- **Asserts:** Busy status withholds bytes; after an own hook, Idle permits a ring on an unfamiliar screen; replacement generation on a startup dialog receives zero bytes.
+- **Asserts:** Busy status withholds bytes; after an own hook, Idle still holds an unfamiliar screen until the empty composer appears; replacement generation on a startup dialog receives zero bytes.
 - **Does not assert:** Cross-version compatibility.
 - **Platform coverage:** mac+linux.
 
@@ -8234,3 +8234,12 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
+
+#### inbox/codex
+
+##### inbox/codex/012 — A draft retained after paste-burst Enter prevents all doorbell input.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** wrapped Codex-composer stand-in retaining its visible text after Enter.
+- **Asserts:** zero new input bytes while a draft remains, both before and after an own hook; Ctrl+U clears it and permits a separate fixed doorbell.
+- **Does not assert:** Codex's real paste-burst timing; the fixture recreates the measured retained-draft end-state.
+- **Cost:** none.

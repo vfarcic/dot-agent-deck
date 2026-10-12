@@ -45,6 +45,7 @@ base = os.environ['INBOX_CODEX_BASE']
 with open(base + '.pid','w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes','ab',buffering=0)
 previous = None
+draft = bytearray()
 while True:
     with open(base + '.screen') as f: screen = f.read()
     if screen != previous:
@@ -54,6 +55,14 @@ while True:
         chunk = os.read(0,4096)
         if not chunk: break
         capture.write(chunk)
+        if os.path.exists(base + '.keep'):
+            for c in chunk:
+                if c == 21: draft.clear()
+                elif c == 13: pass # Codex's paste-burst Enter keeps the draft.
+                else: draft.append(c)
+            with open(base + '.empty') as f: empty = f.read()
+            shown = empty.replace('Ask Codex to do anything', draft.decode() if draft else 'Ask Codex to do anything')
+            with open(base + '.screen', 'w') as f: f.write(shown)
 "#).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.path().display());
@@ -247,7 +256,50 @@ fn codex_005_recognised_composer_rings_before_first_hook() {
     );
 }
 
-/// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task; only its own Stop permits a ring. Restart in the same pane on a startup dialog and verify that the previous generation's hook-seen state cannot permit any input.
+/// Scenario: Type into synthetic Codex and press Enter during its paste burst, which leaves the draft visible. A queued message must send zero bytes while that text remains, even after a native hook; clearing the composer must let the fixed doorbell ring separately.
+#[spec("inbox/codex/012")]
+#[test]
+fn codex_012_retained_paste_burst_draft_holds_doorbell() {
+    for own_hook in [false, true] {
+        let codex = Codex::new(COMPOSER);
+        if own_hook {
+            codex.run_hook("SessionStart", None);
+        }
+        let base = codex.pane.capture.with_extension("keep");
+        std::fs::write(&base, "").unwrap();
+        std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
+        let mut input = common::AttachInput::attach(&codex.daemon.attach_socket, &codex.pane.agent);
+        input.write("human-retained-draft\r");
+        assert!(
+            common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+                .contains("› human-retained-draft")),
+            "stand-in must keep the human draft visibly on Enter"
+        );
+        let before = bytes(&codex.pane);
+        let id = codex.queued(BODY);
+        assert!(
+            !common::wait_until(Duration::from_millis(1300), || bytes(&codex.pane) != before),
+            "retained visible Codex draft must receive ZERO doorbell bytes (own_hook={own_hook}); before={before:?}; after={:?}\nPane:\n{}",
+            bytes(&codex.pane),
+            screen(&codex.daemon, &codex.pane)
+        );
+        state(&codex.daemon, &codex.pane, &id, "queued");
+        input.write("\x15");
+        assert!(
+            common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+                .contains("Ask Codex to do anything")),
+            "Ctrl+U must empty composer"
+        );
+        assert!(
+            common::wait_until(WAIT, || bytes(&codex.pane)
+                .ends_with(format!("{}\r", fixed_line(&id)).as_bytes())),
+            "empty composer must release doorbell: {:?}",
+            bytes(&codex.pane)
+        );
+    }
+}
+
+/// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must still wait for an empty recognised composer; restarting in the same pane on a startup dialog must keep every byte out of that dialog.
 #[spec("inbox/codex/006")]
 #[test]
 fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
@@ -256,8 +308,8 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     codex.paint(UNKNOWN);
     let id = codex.queued(BODY);
     codex.no_bytes();
-    // An own Idle hook permits ringing after the first hook even when the
-    // composer is absent. Stop hand-over itself is pinned separately below.
+    // Own-hook status is necessary, but never licenses input into an unknown
+    // screen or a visibly occupied composer. Stop hand-over is pinned below.
     let request = json!({"session_id":"codex-inbox-session", "pane_id":codex.pane.id,
         "agent_id":codex.pane.agent, "token":codex.pane.token, "agent_type":"codex",
         "event_type":"idle", "timestamp":chrono::Utc::now(), "cwd":codex.daemon.home,
@@ -266,6 +318,8 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     socket.shutdown(std::net::Shutdown::Write).unwrap();
     let mut response = Vec::new();
     std::io::Read::read_to_end(&mut socket, &mut response).unwrap();
+    codex.no_bytes();
+    codex.paint(COMPOSER);
     assert!(common::wait_until(WAIT, || bytes(&codex.pane)
         .windows(fixed_line(&id).len())
         .any(|w| w == fixed_line(&id).as_bytes())));
