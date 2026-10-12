@@ -2482,8 +2482,11 @@ impl HookLoopLimits {
 }
 
 /// What [`handle_question_signal`] needs from the connection it runs on.
-struct QuestionConnection<'a, R> {
+struct QuestionConnection<'a, R, W> {
     reader: &'a mut R,
+    /// Where the `held` line goes, for a producer that asked for it
+    /// (`QuestionSignal::confirm_hold`).
+    writer: &'a mut W,
     /// The connection's hook-pool slot, given back once a hold is registered
     /// (audit A6).
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
@@ -2522,24 +2525,27 @@ struct QuestionConnection<'a, R> {
 /// (it did not survive sanitizing, or the event was refused) and the producer
 /// is released at once. Once held, the connection gives its hook-pool slot back
 /// and waits under [`MAX_HELD_QUESTIONS`] and the hold deadline instead (audit
-/// A6).
+/// A6). A producer that asked (`QuestionSignal::confirm_hold`) is told at
+/// that point, with a `held` line, so it can tell this daemon from an older one
+/// that never answers a `question` at all.
 ///
 /// Returns the reply line to write — with, for an answer, where to report
 /// what became of it ([`crate::agent_pty::ReplyDelivery`]) — or `None` when
 /// the producer's connection closed while it waited: the producer is gone, so
 /// the question goes too (Claude Code kills its hook when the keyboard answers
 /// No or Esc [observed]); the status is left for the next event to decide.
-async fn handle_question_signal<R>(
+async fn handle_question_signal<R, W>(
     signal: crate::event::QuestionSignal,
     attested_agent: Option<String>,
     unproven: bool,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    conn: QuestionConnection<'_, R>,
+    conn: QuestionConnection<'_, R, W>,
 ) -> Option<crate::agent_pty::HeldReply>
 where
     R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     use crate::question::{QuestionReply, ReleaseReason};
     let reply = |reply: QuestionReply| crate::agent_pty::HeldReply {
@@ -2550,6 +2556,7 @@ where
         pane_id,
         mut event,
         hold,
+        confirm_hold,
         ..
     } = signal;
     // The pane the provenance gate attested, not whatever the event claims —
@@ -2612,6 +2619,17 @@ where
     // Held: the hook-pool slot goes back, so this wait never queues another
     // producer's hook (audit A6). `_budget` bounds it instead.
     drop(conn.slot.take());
+    if confirm_hold && let Ok(json) = serde_json::to_string(&QuestionReply::held(&id)) {
+        // A failed write means the producer is gone, which the read below
+        // sees as well.
+        let _ = async {
+            conn.writer
+                .write_all(format!("{json}\n").as_bytes())
+                .await?;
+            conn.writer.flush().await
+        }
+        .await;
+    }
     // Any read outcome means the producer is gone or misbehaving: a holding
     // producer sends nothing more on this connection.
     let gone = crate::bounded_read::read_capped_line(conn.reader, HELD_CONNECTION_READ_CAP);
@@ -5636,6 +5654,7 @@ async fn run_hook_loop_with_limits(
                                         &pty_registry,
                                         QuestionConnection {
                                             reader: &mut reader,
+                                            writer: &mut write_half,
                                             slot: &mut permit,
                                             holds: &hold_limit,
                                             hold_deadline: limits.hold_deadline,
@@ -12904,6 +12923,7 @@ mod hook_provenance_audit_tests {
                     event: event_of(event),
                     hold: false,
                     ack: false,
+                    confirm_hold: false,
                 },
             )))
             .unwrap();
@@ -14405,7 +14425,7 @@ mod question_hold_tests {
     use super::*;
     use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
     use crate::event::{AgentEvent, AgentType, EventType};
-    use crate::question::{QuestionAnswer, QuestionReply, ReplyOutcome};
+    use crate::question::{QuestionAnswer, QuestionReply, ReleaseReason, ReplyOutcome};
     use spec::spec;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
@@ -14512,6 +14532,7 @@ mod question_hold_tests {
                     event: question_event(&agent, id),
                     hold: true,
                     ack: false,
+                    confirm_hold: false,
                 }));
             let sock = sock.clone();
             async move {
@@ -14593,6 +14614,117 @@ mod question_hold_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: On the real hook loop, a held question whose producer asks
+    /// the daemon to confirm the hold gets a `held` line as soon as the hold
+    /// is registered, and the reply that ends the hold after it. A producer
+    /// that does not ask gets no `held` line: the first line it reads is the
+    /// reply that ends its hold.
+    #[spec("question/hold/022")]
+    #[tokio::test]
+    async fn question_hold_022_a_producer_that_asks_is_told_the_hold_started() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let token = registry.hook_token_of(&agent).expect("a hook token");
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(PANE.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move {
+                run_hook_loop(
+                    listener,
+                    state,
+                    event_tx,
+                    registry,
+                    Arc::new(Notify::new()),
+                    wtr,
+                )
+                .await
+            }
+        });
+        let hold = |id: &str, confirm_hold: bool| {
+            let msg =
+                crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
+                    pane_id: PANE.to_string(),
+                    token: Some(token.clone()),
+                    event: question_event(&agent, id),
+                    hold: true,
+                    ack: false,
+                    confirm_hold,
+                }));
+            let sock = sock.clone();
+            async move {
+                let mut stream = UnixStream::connect(&sock).await.expect("connect");
+                let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+                stream.write_all(line.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                tokio::io::BufReader::new(stream)
+            }
+        };
+        async fn next_reply(
+            reader: &mut tokio::io::BufReader<UnixStream>,
+            what: &str,
+        ) -> QuestionReply {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .unwrap_or_else(|_| panic!("{what} arrives"))
+                .unwrap();
+            serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("{what}: {e}: {line:?}"))
+        }
+
+        let mut confirmed = hold("q-confirmed", true).await;
+        assert_eq!(
+            next_reply(&mut confirmed, "the held line").await,
+            QuestionReply::held("q-confirmed")
+        );
+        assert!(registry.question_holds().is_held(PANE, "q-confirmed"));
+
+        let mut unconfirmed = hold("q-unconfirmed", false).await;
+        assert_eq!(
+            next_reply(&mut confirmed, "the superseded release").await,
+            QuestionReply::released("q-confirmed", ReleaseReason::Superseded),
+            "the reply that ends a confirmed hold follows its held line"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !registry.question_holds().is_held(PANE, "q-unconfirmed") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the unconfirmed hold never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let mut newest = hold("q-newest", true).await;
+        assert_eq!(
+            next_reply(&mut unconfirmed, "the unconfirmed hold's first line").await,
+            QuestionReply::released("q-unconfirmed", ReleaseReason::Superseded),
+            "a producer that did not ask is never sent a held line"
+        );
+        assert_eq!(
+            next_reply(&mut newest, "the newest held line").await,
+            QuestionReply::held("q-newest")
+        );
+
+        drop(newest);
+        handle.abort();
+        registry.shutdown_all();
+    }
+
     /// The status event and the pending question one producer report yields on
     /// the real hook loop: `raw` parsed by the hook CLI's one parser
     /// ([`crate::hook::hook_payload_event`]) for `agent`, held by the daemon,
@@ -14650,6 +14782,7 @@ mod question_hold_tests {
             event,
             hold: true,
             ack: false,
+            confirm_hold: false,
         }));
         let mut producer = UnixStream::connect(&sock).await.expect("connect");
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -14809,6 +14942,7 @@ mod question_hold_tests {
             event: question_event(&agent, "q-gone"),
             hold: true,
             ack: false,
+            confirm_hold: false,
         }));
         let mut producer = UnixStream::connect(&sock).await.expect("connect");
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -14982,6 +15116,7 @@ mod question_hold_tests {
                     event,
                     hold: true,
                     ack,
+                    confirm_hold: false,
                 }));
             let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
             let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -15682,6 +15817,7 @@ mod question_hold_tests {
                     event,
                     hold: false,
                     ack: false,
+                    confirm_hold: false,
                 },
             )))
             .unwrap()
@@ -15996,6 +16132,7 @@ mod question_hold_tests {
             event: asked,
             hold: true,
             ack: true,
+            confirm_hold: false,
         }));
         let mut producer = UnixStream::connect(&deck.sock).await.expect("connect");
         producer

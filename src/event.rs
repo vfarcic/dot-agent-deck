@@ -2995,6 +2995,15 @@ pub struct QuestionSignal {
     /// OpenCode's reply API, which can refuse it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ack: bool,
+    /// PRD #1631 (PR #1698 review): when the daemon starts holding the
+    /// question, it says so at once, with a [`crate::question::QuestionReply`]
+    /// whose outcome is `held`, before the reply that ends the hold. A
+    /// producer that asks for it can tell a daemon that took the hold from
+    /// one that never will: a daemon from before `question` existed reads the
+    /// line as a malformed event and answers nothing, and the producer then
+    /// sends the event as a plain one so the card still reads Needs Input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_hold: bool,
 }
 
 impl QuestionSignal {

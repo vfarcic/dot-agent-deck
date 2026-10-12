@@ -8427,6 +8427,20 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** the desktop's sentence for an unconfirmed answer (`question_desktop_every_refusal_has_its_sentence`).
 - **Platform coverage:** mac+linux.
 
+##### question/hold/021 — A hold the daemon never takes is shown as a plain prompt at once.
+- **Layer:** L1/fast unit (`src/hook.rs`, `hold_question_within_at` against a stand-in socket).
+- **Agent:** none (a captured Claude Code `PermissionRequest`).
+- **Asserts:** the held message asks the daemon to confirm the hold; against a daemon that reads it and answers nothing with the connection open (what 0.46.0 does with an unknown `question`), or one that closes the connection, the hook gives up within the hold-start bound and sends the event again as a plain `PermissionRequest` without its question; a daemon that says `held` and later releases the question gets no plain event, and the release is the reply the hook acts on.
+- **Does not assert:** the daemon writing the `held` line (`question/hold/022`), or a provenance refusal's fallback (`question/hold/002`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/022 — A producer that asks is told the hold started.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop over a Unix socket).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** a held question sent with `confirm_hold` gets a `held` line once the hold is registered, then the release that ends it when a newer question supersedes it; a held question sent without `confirm_hold` gets no `held` line, and its first line is the release.
+- **Does not assert:** what the hook does without a `held` line (`question/hold/021`).
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.

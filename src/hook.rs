@@ -197,7 +197,6 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             let _ = writeln!(out, "{decision}");
             let _ = out.flush();
         }
-        send_plain_if_refused(event, reply.as_ref());
         return ExitCode::SUCCESS;
     }
 
@@ -386,10 +385,11 @@ fn send_question_unheld_at(
                 event: event.clone(),
                 hold: false,
                 ack: false,
+                confirm_hold: false,
             }));
         if let Ok(json) = serde_json::to_string(&signal)
             && let (SocketReply::Line(line), _) =
-                request_from_socket_at_detailed_with(path, &json, Some(wait), true)
+                request_from_socket_at_detailed(path, &json, Some(wait))
             && let Ok(reply) = serde_json::from_str::<crate::question::QuestionReply>(&line)
             && !reply.refused()
         {
@@ -447,12 +447,12 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 }
 
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
-/// and wait up to `deadline` for the daemon's one reply line. `None` on an
-/// unreachable or older daemon (which answers nothing, and closes the
-/// connection only once its own idle bound passes), a closed connection or an
-/// unparseable line. A caller acts on the reply only through
-/// [`crate::question::QuestionReply::answers_for`], which also refuses a reply
-/// naming another question.
+/// and wait up to `deadline` for the daemon's reply, falling back to a plain
+/// event when the hold never starts ([`settle_hold`]). `None` when there is no
+/// reply: the hold never started, or it ended without one (a closed
+/// connection, the deadline, an unparseable line). A caller acts on the reply
+/// only through [`crate::question::QuestionReply::answers_for`], which also
+/// refuses a reply naming another question.
 fn hold_question(
     event: &AgentEvent,
     deadline: std::time::Duration,
@@ -460,22 +460,57 @@ fn hold_question(
     hold_question_at(&client_socket_path(), event, deadline)
 }
 
-/// PRD #1631: when the daemon's provenance gate refused the held question, the
-/// event it carried was not applied — send it again as a plain event, without
-/// the question, so the card still reads Needs Input, exactly as it would have
-/// before the deck could answer questions.
-fn send_plain_if_refused(event: AgentEvent, reply: Option<&crate::question::QuestionReply>) {
-    send_plain_if_refused_at(&client_socket_path(), event, reply);
+/// PRD #1631 (PR #1698 review): how long a holding producer waits for the
+/// daemon to say it holds the question ([`crate::question::ReplyOutcome::Held`])
+/// before deciding it never will. A daemon that knows `question` says so as
+/// soon as it has applied the event; one from before `question` existed
+/// (0.46.0 and earlier) logs the line as a malformed event and answers
+/// nothing, keeping the connection open until its own 60 s idle bound. Past
+/// this the producer shows the prompt as a plain event, so the card reads
+/// Needs Input within seconds instead of never.
+pub const HOLD_START_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How a held `question` message ended, as its producer saw it.
+#[derive(Debug)]
+enum HoldEnd {
+    /// The daemon never took the hold: none could be reached, or it said
+    /// neither "held" nor anything else it could have meant within
+    /// [`HOLD_START_WAIT`] — an older daemon that does not know `question`,
+    /// a closed connection, a line that is not a reply. Nothing it carried
+    /// was applied.
+    Unstarted,
+    /// The daemon's reply: an answer, a release, or a refusal — after a
+    /// `held` line, or in place of one when there was no hold to start.
+    Reply(crate::question::QuestionReply),
+    /// The daemon held the question, and the connection closed or the
+    /// deadline passed with no reply after it.
+    Ended,
 }
 
-fn send_plain_if_refused_at(
+/// PRD #1631: what a producer does once its hold is over, and the reply it
+/// acts on. A hold that never started, or one the provenance gate refused,
+/// applied nothing: the event goes again as a plain one, without the
+/// question, so the card still reads Needs Input exactly as it would have
+/// before the deck could answer questions. A hold the daemon took already
+/// showed the question, and is left as it ended.
+fn settle_hold(
     path: &std::path::Path,
-    mut event: AgentEvent,
-    reply: Option<&crate::question::QuestionReply>,
-) {
-    if reply.is_some_and(crate::question::QuestionReply::refused) {
+    event: &AgentEvent,
+    end: HoldEnd,
+) -> Option<crate::question::QuestionReply> {
+    let applied_nothing = match &end {
+        HoldEnd::Unstarted => true,
+        HoldEnd::Reply(reply) => reply.refused(),
+        HoldEnd::Ended => false,
+    };
+    if applied_nothing {
+        let mut event = event.clone();
         event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
         send_plain_at(path, &event);
+    }
+    match end {
+        HoldEnd::Reply(reply) => Some(reply),
+        HoldEnd::Unstarted | HoldEnd::Ended => None,
     }
 }
 
@@ -489,23 +524,90 @@ fn send_plain_at(path: &std::path::Path, event: &AgentEvent) {
     }
 }
 
+/// [`hold_question`] against an explicit endpoint.
 fn hold_question_at(
     path: &std::path::Path,
     event: &AgentEvent,
     deadline: std::time::Duration,
 ) -> Option<crate::question::QuestionReply> {
+    hold_question_within_at(path, event, deadline, HOLD_START_WAIT)
+}
+
+/// [`hold_question_at`], giving the daemon `start_wait` to say it holds the
+/// question.
+fn hold_question_within_at(
+    path: &std::path::Path,
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+    start_wait: std::time::Duration,
+) -> Option<crate::question::QuestionReply> {
+    let (end, _) = start_hold_at(path, event, deadline, start_wait, false);
+    settle_hold(path, event, end)
+}
+
+/// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
+/// that asks the daemon to confirm the hold, and wait for how it ends: up to
+/// `start_wait` for the daemon's first line, then, once it says `held`, up to
+/// `deadline` (counted from the start) for the reply. The connection comes
+/// back with a reply, so a producer that acknowledges (`ack`) can write its
+/// acknowledgement on it.
+fn start_hold_at(
+    path: &std::path::Path,
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+    start_wait: std::time::Duration,
+    ack: bool,
+) -> (HoldEnd, Option<crate::platform::ipc::IpcClient>) {
+    use crate::question::{QuestionReply, ReplyOutcome};
+    let Some(pane_id) = event.pane_id.clone() else {
+        return (HoldEnd::Unstarted, None);
+    };
     let signal = crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
-        pane_id: event.pane_id.clone()?,
+        pane_id,
         token: crate::hook_provenance::token_from_env(),
         event: event.clone(),
         hold: true,
-        ack: false,
+        ack,
+        confirm_hold: true,
     }));
-    let json = serde_json::to_string(&signal).ok()?;
-    let SocketReply::Line(line) = request_held_at(path, &json, deadline) else {
-        return None;
+    let Ok(json) = serde_json::to_string(&signal) else {
+        return (HoldEnd::Unstarted, None);
     };
-    serde_json::from_str(&line).ok()
+    let started = std::time::Instant::now();
+    let until = started + deadline;
+    let start_by = until.min(started + start_wait);
+    let Ok(mut stream) =
+        crate::platform::ipc::IpcClient::connect_timeout(path, start_wait.min(deadline))
+    else {
+        return (HoldEnd::Unstarted, None);
+    };
+    // No half-close after the write: the daemon reads a held connection for
+    // EOF to learn that the producer stopped waiting (Claude Code kills the
+    // hook when the keyboard answers No [observed]), so a half-close would
+    // read as exactly that the moment the request landed.
+    if stream.set_timeouts(deadline).is_err()
+        || !matches!(
+            write_request_line(&mut stream, format!("{json}\n").as_bytes()),
+            RequestWrite::Written
+        )
+    {
+        return (HoldEnd::Unstarted, None);
+    }
+    let mut carry = Vec::new();
+    let mut next_reply = |stream: &mut crate::platform::ipc::IpcClient, by| {
+        read_reply_line_carrying(stream, Some(by), &mut carry)
+            .ok()
+            .and_then(|line| serde_json::from_str::<QuestionReply>(&line).ok())
+    };
+    match next_reply(&mut stream, start_by) {
+        Some(reply) if reply.outcome == ReplyOutcome::Held => {}
+        Some(reply) => return (HoldEnd::Reply(reply), Some(stream)),
+        None => return (HoldEnd::Unstarted, None),
+    }
+    match next_reply(&mut stream, until) {
+        Some(reply) => (HoldEnd::Reply(reply), Some(stream)),
+        None => (HoldEnd::Ended, None),
+    }
 }
 
 /// PRD #1631: the `await-answer` verb, for producers that are not a hook
@@ -576,7 +678,6 @@ fn opencode_question_event(
 fn opencode_await_answer(raw: &str) -> Option<Value> {
     let (event, question, properties) = opencode_question_event(raw)?;
     let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
-    send_plain_if_refused(event, reply.as_ref());
     crate::question::opencode_reply(&question, &properties, &reply?)
 }
 
@@ -596,38 +697,6 @@ fn read_stdin_line_within(wait: std::time::Duration) -> Option<String> {
         let _ = tx.send(read.ok().filter(|n| *n > 0).map(|_| line));
     });
     rx.recv_timeout(wait).ok().flatten()
-}
-
-/// [`hold_question_at`] for a producer that acknowledges: the held message
-/// carries `ack`, and the connection is handed back with the reply so the
-/// acknowledgement can follow on it.
-fn hold_question_acked_at(
-    path: &std::path::Path,
-    event: &AgentEvent,
-    deadline: std::time::Duration,
-) -> Option<(
-    crate::question::QuestionReply,
-    crate::platform::ipc::IpcClient,
-)> {
-    let signal = crate::event::DaemonMessage::Question(Box::new(crate::event::QuestionSignal {
-        pane_id: event.pane_id.clone()?,
-        token: crate::hook_provenance::token_from_env(),
-        event: event.clone(),
-        hold: true,
-        ack: true,
-    }));
-    let json = serde_json::to_string(&signal).ok()?;
-    let until = std::time::Instant::now() + deadline;
-    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, deadline).ok()?;
-    stream.set_timeouts(deadline).ok()?;
-    if !matches!(
-        write_request_line(&mut stream, format!("{json}\n").as_bytes()),
-        RequestWrite::Written
-    ) {
-        return None;
-    }
-    let line = read_reply_line(&mut stream, Some(until)).ok()?;
-    Some((serde_json::from_str(&line).ok()?, stream))
 }
 
 /// PRD #1631: the OpenCode plugin's `await-answer --ack`. Holds the question
@@ -659,9 +728,8 @@ fn opencode_hold_acked_at(
     out: &mut dyn std::io::Write,
     ack_line: impl FnOnce() -> Option<String>,
 ) {
-    let held = hold_question_acked_at(path, &event, AWAIT_ANSWER_DEADLINE);
-    send_plain_if_refused_at(path, event, held.as_ref().map(|(reply, _)| reply));
-    let Some((reply, mut stream)) = held else {
+    let (end, stream) = start_hold_at(path, &event, AWAIT_ANSWER_DEADLINE, HOLD_START_WAIT, true);
+    let (Some(reply), Some(mut stream)) = (settle_hold(path, &event, end), stream) else {
         return;
     };
     if reply.answers_for(&question.id).is_none() {
@@ -698,7 +766,6 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
     );
     event.set_question(&question);
     let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
-    send_plain_if_refused(event, reply.as_ref());
     crate::question::pi_value(&dialog, &question, &reply?)
 }
 
@@ -2162,28 +2229,6 @@ fn request_from_socket_at_detailed(
     json: &str,
     timeout: Option<std::time::Duration>,
 ) -> (SocketReply, Option<NoReplyCause>) {
-    request_from_socket_at_detailed_with(path, json, timeout, true)
-}
-
-/// PRD #1631: a held request — [`request_from_socket_at`] WITHOUT the
-/// half-close after the write. The daemon reads the held connection for EOF to
-/// learn that the producer stopped waiting (Claude Code kills the hook when the
-/// keyboard answers No [observed]), so a half-close would read as exactly that
-/// the moment the request landed.
-fn request_held_at(
-    path: &std::path::Path,
-    json: &str,
-    timeout: std::time::Duration,
-) -> SocketReply {
-    request_from_socket_at_detailed_with(path, json, Some(timeout), false).0
-}
-
-fn request_from_socket_at_detailed_with(
-    path: &std::path::Path,
-    json: &str,
-    timeout: Option<std::time::Duration>,
-    half_close: bool,
-) -> (SocketReply, Option<NoReplyCause>) {
     // The total-operation deadline starts here, before connect, rather than
     // being re-armed with a fresh full budget once the connection is
     // established and the request written below. Connect and the write are
@@ -2261,12 +2306,7 @@ fn request_from_socket_at_detailed_with(
     // single request and doesn't block waiting for more (it reads in a loop).
     // Best-effort: on a transport without a half-close primitive (Windows named
     // pipes) this is a no-op, which is why the read below must not depend on EOF.
-    //
-    // PRD #1631: except for a held request, whose connection the daemon reads
-    // for EOF to learn that the producer stopped waiting.
-    if half_close {
-        let _ = stream.shutdown_write();
-    }
+    let _ = stream.shutdown_write();
     // Read exactly the ONE reply line the daemon writes, rather than to EOF.
     //
     // PRD #163 M4: reading to EOF made this a deadlock on Windows. The daemon
@@ -2481,8 +2521,25 @@ fn read_reply_line(
     stream: &mut crate::platform::ipc::IpcClient,
     deadline: Option<std::time::Instant>,
 ) -> Result<String, ReplyReadError> {
+    read_reply_line_carrying(stream, deadline, &mut Vec::new())
+}
+
+/// [`read_reply_line`] for a connection that carries more than one line:
+/// bytes read past the newline are kept in `carry`, and the next call starts
+/// from them, so a second line that arrived in the same read is not lost
+/// (PRD #1631: a hold's `held` line and the reply after it).
+fn read_reply_line_carrying(
+    stream: &mut crate::platform::ipc::IpcClient,
+    deadline: Option<std::time::Instant>,
+    carry: &mut Vec<u8>,
+) -> Result<String, ReplyReadError> {
     let mut buf = [0u8; 512];
-    let mut line = Vec::new();
+    let mut line = std::mem::take(carry);
+    if let Some(newline_pos) = line.iter().position(|&b| b == b'\n') {
+        carry.extend_from_slice(&line[newline_pos + 1..]);
+        line.truncate(newline_pos);
+        return reply_line_text(line);
+    }
     loop {
         if let Some(deadline) = deadline {
             // `checked_duration_since` yields `Some(ZERO)` at the exact instant
@@ -2587,10 +2644,15 @@ fn read_reply_line(
         }
         if let Some(newline_pos) = buf[..n].iter().position(|&b| b == b'\n') {
             line.extend_from_slice(&buf[..newline_pos]);
+            carry.extend_from_slice(&buf[newline_pos + 1..n]);
             break;
         }
         line.extend_from_slice(&buf[..n]);
     }
+    reply_line_text(line)
+}
+
+fn reply_line_text(line: Vec<u8>) -> Result<String, ReplyReadError> {
     match String::from_utf8(line) {
         Ok(line) => Ok(line.trim_end_matches('\r').to_string()),
         Err(_) => Err(ReplyReadError::InvalidUtf8),
@@ -5803,6 +5865,111 @@ mod question_tests {
 
         assert!(QuestionReply::released(&q.id, ReleaseReason::Refused).refused());
         assert!(!released.refused());
+    }
+
+    /// Scenario: A held Claude Code permission hook meets a daemon that never
+    /// takes the hold — one that reads the `question` line and then answers
+    /// nothing with the connection still open, as a 0.46.0 daemon does, or one
+    /// that closes the connection — and sends the event again as a plain one,
+    /// without its question, within the hold-start bound instead of at the end
+    /// of its wait. A daemon that says it holds the question and later
+    /// releases it gets no plain event.
+    #[cfg(unix)]
+    #[spec("question/hold/021")]
+    #[test]
+    fn question_hold_021_a_hold_the_daemon_never_takes_is_shown_plainly_at_once() {
+        use std::io::BufRead as _;
+        use std::time::{Duration, Instant};
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Daemon {
+            Silent,
+            Closes,
+            HoldsThenReleases,
+        }
+        const START_WAIT: Duration = Duration::from_millis(500);
+        const DEADLINE: Duration = Duration::from_secs(20);
+        let payload = fixture("claude-permission-bash.json");
+        let (event, q) = held_event(&payload);
+        let held = serde_json::to_string(&QuestionReply::held(&q.id)).unwrap();
+        let released =
+            serde_json::to_string(&QuestionReply::released(&q.id, ReleaseReason::Cleared)).unwrap();
+        let run = |daemon: Daemon| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let (returned, hook_returned) = std::sync::mpsc::channel::<()>();
+            let (held, released) = (held.clone(), released.clone());
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut sent = String::new();
+                reader.read_line(&mut sent).unwrap();
+                let kept = match daemon {
+                    Daemon::Silent => Some(reader),
+                    Daemon::Closes => None,
+                    Daemon::HoldsThenReleases => {
+                        writeln!(reader.get_mut(), "{held}").unwrap();
+                        writeln!(reader.get_mut(), "{released}").unwrap();
+                        Some(reader)
+                    }
+                };
+                // The plain event, if any, is sent before the hook returns.
+                hook_returned
+                    .recv_timeout(DEADLINE * 2)
+                    .expect("the hook returns");
+                listener.set_nonblocking(true).unwrap();
+                let plain = listener.accept().ok().map(|(stream, _)| {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    serde_json::from_str::<AgentEvent>(line.trim()).unwrap()
+                });
+                drop(kept);
+                (serde_json::from_str::<Value>(&sent).unwrap(), plain)
+            });
+            let started = Instant::now();
+            let got = hold_question_within_at(&path, &event, DEADLINE, START_WAIT);
+            let took = started.elapsed();
+            returned.send(()).unwrap();
+            let (sent, plain) = server.join().unwrap();
+            assert_eq!(sent["hold"], true, "{daemon:?}");
+            assert_eq!(
+                sent["confirm_hold"], true,
+                "{daemon:?}: the hook asks the daemon to say it holds the question"
+            );
+            (got, plain, took)
+        };
+
+        for daemon in [Daemon::Silent, Daemon::Closes] {
+            let (got, plain, took) = run(daemon);
+            assert_eq!(got, None, "{daemon:?}: no decision");
+            assert!(
+                took < START_WAIT + Duration::from_secs(5),
+                "{daemon:?}: the hook gave up on the hold after {took:?}, not within the \
+                 {START_WAIT:?} hold-start bound"
+            );
+            let plain = plain.unwrap_or_else(|| {
+                panic!(
+                    "{daemon:?}: the hook sent no plain event, so the card never reads Needs Input"
+                )
+            });
+            assert_eq!(plain.event_type, EventType::PermissionRequest);
+            assert_eq!(plain.pane_id.as_deref(), Some("pane-held"));
+            assert!(!carries_question_metadata(&plain), "{daemon:?}");
+        }
+
+        let (got, plain, _) = run(Daemon::HoldsThenReleases);
+        assert_eq!(
+            got,
+            Some(QuestionReply::released(&q.id, ReleaseReason::Cleared)),
+            "the reply after the held line is the one the hook acts on"
+        );
+        assert!(
+            plain.is_none(),
+            "a question the daemon held is already on the card: {plain:?}"
+        );
     }
 }
 

@@ -341,6 +341,10 @@ impl ReplyAck {
 pub enum ReplyOutcome {
     Answered,
     Released,
+    /// The daemon holds the question: the reply that ends the hold follows on
+    /// the same connection. Sent only to a producer that asked for it
+    /// ([`crate::event::QuestionSignal::confirm_hold`]).
+    Held,
     #[serde(other)]
     Unknown,
 }
@@ -384,6 +388,17 @@ impl QuestionReply {
             outcome: ReplyOutcome::Released,
             answers: Vec::new(),
             reason: Some(reason),
+        }
+    }
+
+    /// The line a daemon writes when it starts holding `question_id` for a
+    /// producer that asked to be told ([`ReplyOutcome::Held`]).
+    pub fn held(question_id: &str) -> Self {
+        Self {
+            question_id: question_id.to_string(),
+            outcome: ReplyOutcome::Held,
+            answers: Vec::new(),
+            reason: None,
         }
     }
 
