@@ -156,7 +156,7 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
     );
 }
 
-/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; after Idle, the pane fetches it without the seed being typed.
+/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; Codex interface readiness may allow a fixed doorbell, and after Idle the pane fetches the seed without its content being typed.
 #[spec("inbox/route/004")]
 #[test]
 fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
@@ -174,7 +174,7 @@ fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
                 .to_ascii_lowercase()
                 .contains("queued")
         );
-        assert!(bytes(&pane).is_empty(), "seed must wait in inbox, not PTY");
+        route::only_doorbells(&pane, &messages);
         route::fetched(
             &daemon,
             &pane,

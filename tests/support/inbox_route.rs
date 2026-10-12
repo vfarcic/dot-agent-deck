@@ -180,6 +180,24 @@ pub fn fetch_enable(pane: &Pane) {
     std::fs::write(pane.capture.with_extension("fetch-enabled"), "go").unwrap();
 }
 
+/// Before fetching, the Codex wrapper may already permit a fixed doorbell.
+/// Accept only known message lines (or an in-flight prefix of the last one),
+/// never seed or report content masquerading as an automatic write.
+pub fn only_doorbells(pane: &Pane, messages: &[Value]) {
+    let captured = String::from_utf8(inbox::bytes(pane)).expect("fixture input is UTF-8");
+    let lines: Vec<_> = captured.split('\r').collect();
+    for (index, line) in lines.iter().enumerate() {
+        assert!(
+            line.is_empty()
+                || messages.iter().any(|message| {
+                    let fixed = inbox::fixed_line(message["id"].as_str().unwrap());
+                    *line == fixed || (index == lines.len() - 1 && fixed.starts_with(line))
+                }),
+            "seed must wait in inbox; automatic input must be fixed doorbells: {captured:?}"
+        );
+    }
+}
+
 pub fn fetched(
     endpoint: &impl Endpoint,
     pane: &Pane,
@@ -560,7 +578,7 @@ pub fn client_seed(case: u8) {
     assert!(!String::from_utf8_lossy(&inbox::bytes(&pane)).contains("one extra effector"));
     count(&deck, &pane, 1);
     assert!(
-        deck.wait_for_grid_string_within("one extra effector", WAIT),
+        deck.wait_for_grid_string_within(&format!("[end of dot-agent-deck message {id}]"), WAIT),
         "fetched seed must render in attached pane: {}",
         deck.snapshot_grid()
     );
@@ -617,7 +635,13 @@ pub fn client_orchestration(reassert: bool) {
         inbox::state(&deck, &pane, id, "acknowledged");
         count(&deck, &pane, 2);
     }
-    let fetched = std::fs::read_to_string(pane.capture.with_extension("fetches")).unwrap();
+    let path = pane.capture.with_extension("fetches");
+    assert!(
+        common::wait_until(WAIT, || std::fs::read_to_string(&path)
+            .is_ok_and(|text| text.contains("orchestrator-context"))),
+        "acknowledged remit must finish the in-pane fetch subprocess"
+    );
+    let fetched = std::fs::read_to_string(path).unwrap();
     assert!(
         fetched.contains("orchestrator-context"),
         "client remit fetched: {fetched}"
@@ -736,11 +760,8 @@ pub fn dispatch_return(case: u8) {
     let child = observe(&deck, &target.into_inner().unwrap());
     // Both the dispatch seed and callback use the inbox. The child has not
     // announced readiness, but its task must already be queued and bound.
-    count(&deck, &child, 1);
-    assert!(
-        inbox::bytes(&child).is_empty(),
-        "dispatch must not type the unit seed"
-    );
+    let child_messages = count(&deck, &child, 1);
+    only_doorbells(&child, &child_messages);
     if case == 2 {
         deck.send_keys(b"\x04");
         deck.wait_for_string("Command Mode");
