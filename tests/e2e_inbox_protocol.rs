@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 const BODY: &str = "INBOX-S2-SENTINEL-c28f: inspect the fixture";
 const WAIT: Duration = Duration::from_secs(10);
-const FRAME: &str = "This session runs inside dot-agent-deck.";
+const FRAME: &str =
+    "This session runs inside dot-agent-deck, the workspace the user runs their coding agents in";
 
 struct Pane {
     id: String,

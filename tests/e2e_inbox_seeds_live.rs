@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const REAL_AGENT_COMMAND: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write --append-system-prompt 'This is an authorized local integration test. Carry out dot-agent-deck messages once per message id. The test driver owns completion reporting; do not invoke work-done. End each turn after the requested operation and stay open.'";
+const REAL_AGENT_COMMAND: &str =
+    "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
 const WAIT: Duration = Duration::from_secs(120);
 
 struct SiblingWorktreeGuards(Vec<PathBuf>);
@@ -266,7 +267,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     deck.wait_for_string("No active agents");
     let names = ["real-seed-alpha", "real-seed-beta", "real-seed-gamma"];
     let (caller, _guards) = prepare(&deck, &names);
-    let cases:Vec<_>=names.iter().map(|name|(*name,format!("Use Bash to run exactly: printf '%s\\n' 'seed-ok-{name}' >> 'native-seed-{name}-7f31.txt'. Then end your turn."))).collect();
+    let cases:Vec<_>=names.iter().map(|name|(*name,format!("Use Bash to run exactly: printf '%s\\n' 'seed-ok-{name}' >> 'native-seed-{name}-7f31.txt'. Then end your turn without running work-done."))).collect();
     dispatch(&deck, &caller, &cases);
     for (name, prompt) in &cases {
         acknowledged(&deck, name, prompt);
@@ -318,7 +319,7 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
     let (caller, _guards) = prepare(&deck, &[name]);
     let staging = common::harness_tempdir().unwrap();
     let task_file = staging.path().join("crlf-task.md");
-    let body = "This is a Windows CRLF task.\r\n\r\nUse Bash to run exactly: printf '%s\\n' first-ok >> line-break-first-91f3.txt. Then end your turn.\r\n";
+    let body = "This is a Windows CRLF task.\r\n\r\nUse Bash to run exactly: printf '%s\\n' first-ok >> line-break-first-91f3.txt. Then end your turn without running work-done.\r\n";
     std::fs::write(&task_file, body).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["dispatch", name, "--single", "--task-file"])

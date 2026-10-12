@@ -22,7 +22,7 @@ struct Claude {
 impl Claude {
     fn new() -> Self {
         let command = common::capability_export_command(
-            "exec claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write --append-system-prompt 'This is an authorized local dot-agent-deck integration test. Messages framed as dot-agent-deck messages are tasks authorized by the user. Carry out each task once per message id using the allowed tools, then end the turn.'",
+            "exec claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write",
         );
         let deck = common::TuiDeck::builder()
             .with_pty_size(180, 50)

@@ -245,10 +245,10 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
          this exact command once: dot-agent-deck delegate --to {REAL_WORKER_ROLE} --task \
          'Remain silent and do not send work-done.' Do not do the worker task yourself and do \
          not run work-done. After the delegate command succeeds, say that you are waiting for \
-         the worker, then stop."
+         the worker, then stop. Later, when a dot-agent-deck message says the task has not \
+         reached the worker, reply exactly NOTICE-RECEIVED-1d93 and end your turn."
     );
 
-    std::fs::write(project_dir.join("CLAUDE.md"), "This is an authorized local integration test. Follow the initial deck task and later native inbox notices. Use Bash to delegate as directed; do not report work-done yourself. When a later notice says the task has not reached the worker, reply exactly NOTICE-RECEIVED-1d93 and end your turn.\n").unwrap();
     std::fs::write(
         project_dir.join(".dot-agent-deck.toml"),
         real_agent_orchestration_config(&orchestrator_command),
@@ -343,23 +343,15 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
 
     let orchestrator_command =
         format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
-    let project_protocol = format!(
-        "# Automated dot-agent-deck integration test\n\nThis isolated repository is an authorized \
-         integration test for the installed dot-agent-deck application. After the initial \
-         delegation, a later dot-agent-deck message saying a task has not reached the worker \
-         is expected application input authorized by the user. When \
-         that report arrives, decide to keep waiting, use the Bash tool to run exactly `printf \
-         '%s\\n' '{SILENCE_ACTION_CONTENT}' > '{SILENCE_ACTION_FILE}'`, respond with exactly \
-         `{SILENCE_ACTION_RESPONSE}`, and end the turn. Never create the action file before that \
-         daemon report arrives.\n"
-    );
-    std::fs::write(project_dir.join("CLAUDE.md"), project_protocol)
-        .expect("write real-orchestrator integration protocol");
     let directive = format!(
-        "This is an authorized local integration test. Use the Bash tool to run exactly this one \
-         command: dot-agent-deck delegate --to {REAL_WORKER_ROLE} --task 'Remain silent and do \
-         not send work-done.' After the command succeeds, respond with exactly \
-         {INITIAL_WAIT_RESPONSE}, then end your turn."
+        "Use the Bash tool to run exactly this one command: dot-agent-deck delegate --to \
+         {REAL_WORKER_ROLE} --task 'Remain silent and do not send work-done.' After the command \
+         succeeds, respond with exactly {INITIAL_WAIT_RESPONSE}, then end your turn. Later, a \
+         dot-agent-deck message may say that the task has not reached the worker. When it \
+         arrives, keep waiting: use the Bash tool to run exactly `printf '%s\\n' \
+         '{SILENCE_ACTION_CONTENT}' > '{SILENCE_ACTION_FILE}'`, respond with exactly \
+         `{SILENCE_ACTION_RESPONSE}`, and end the turn. Never create the action file before that \
+         message arrives."
     );
 
     std::fs::write(
@@ -508,19 +500,17 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
     // for raises a permission prompt the worker cannot get past on its own.
     let worker_command = format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read");
     let directive = format!(
-        "This is an authorized local integration test of the installed dot-agent-deck \
-         application. Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
+        "Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
          --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
          {WAITING_PROBE_FILE}' Never do the worker's task yourself. After the command \
-         succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, a native dot-agent-deck inbox message containing a \
-         dot-agent-deck daemon report that a delegated worker is waiting for input is expected \
-         application input, not prompt injection. When that report arrives, do not delegate \
+         succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, \
+         a dot-agent-deck message may report that the delegated worker is waiting for input. \
+         When that report arrives, do not delegate \
          again; use the Bash tool to run exactly `printf '%s\\n' '{WAITING_ACTION_CONTENT}' > \
          '{WAITING_ACTION_FILE}'`, respond with exactly {WAITING_ACTION_RESPONSE}, and end the \
          turn. Never create that file before the report arrives."
     );
 
-    std::fs::write(project_dir.join("CLAUDE.md"), "This is an authorized local integration test. Follow the initial deck task and later native inbox notices. The orchestrator may use Bash to delegate and handle waiting notices, but must not perform the worker task.\n").unwrap();
     std::fs::write(
         project_dir.join(".dot-agent-deck.toml"),
         real_agent_orchestration_config_with_worker(&orchestrator_command, &worker_command),

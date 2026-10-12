@@ -244,7 +244,9 @@ pub fn fetched(
     assert_eq!(result["exit"], 0, "in-pane fetch: {result}");
     let block = result["stdout"].as_str().unwrap();
     assert!(
-        block.starts_with("This session runs inside dot-agent-deck."),
+        block.starts_with(
+            "This session runs inside dot-agent-deck, the workspace the user runs their coding agents in"
+        ),
         "session frame: {block}"
     );
     assert!(
