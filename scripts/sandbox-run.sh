@@ -83,10 +83,11 @@ byte_len() {
   printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
 }
 
-# The slug for the branch CHECKOUT is on, at most $1 bytes long. Every slug
-# starts with `branch-` or `commit-`, which no file of the sandbox layout from
-# before per-branch sandboxes did (attach.sock, state, deck.log, …), so a branch
-# can never be named onto one of that layout's files in the same ROOT.
+# The slug for the branch CHECKOUT is on, at most $1 bytes long, or a refusal
+# when even its shortest form is longer. Every slug starts with `branch-` or
+# `commit-`, which no file of the sandbox layout from before per-branch
+# sandboxes did (attach.sock, state, deck.log, …), so a branch can never be
+# named onto one of that layout's files in the same ROOT.
 sandbox_slug() {
   local budget=$1 kind raw clean slug hash keep
   # The full ref, stripped by hand: `--short` abbreviates to `heads/main` when
@@ -99,19 +100,36 @@ sandbox_slug() {
   else
     die "cannot tell which branch $checkout is on (is it a git checkout?) — pass SANDBOX=<dir> to name a sandbox"
   fi
-  # A branch name may hold `/` and other bytes a path component should not, so
-  # anything outside [A-Za-z0-9._-] becomes `-`. That can make two branches
-  # (`a/b` and `a-b`) read the same, so a changed or cut name also carries
-  # eight hex digits of a CRC of the full name (POSIX cksum, the same on Linux
-  # and macOS), which keeps them apart. So does a name with an uppercase
-  # letter: macOS's default APFS is case-insensitive, so `Main` and `main`
-  # would otherwise be one directory. `clean` is ASCII, so its length in
-  # characters is its length in bytes.
+  # A slug comes in two forms: KIND-NAME, the name as it is, and
+  # KIND-PREFIX-HASH, a prefix of the name with anything outside
+  # [A-Za-z0-9._-] turned into `-`, then `-` and eight hex digits of a CRC of
+  # the full name (POSIX cksum, the same on Linux and macOS).
+  #
+  # The plain form is kept to names it cannot confuse, and the rest are hashed:
+  #
+  # - a name with a byte outside [A-Za-z0-9._-]: `a/b` and `a-b` would read
+  #   the same once `/` is replaced;
+  # - a name with an uppercase letter: macOS's default APFS is
+  #   case-insensitive, so `Main` and `main` would be one directory;
+  # - a name that already ENDS the way a hashed slug does, in `-` and eight
+  #   lowercase hex digits: the plain form of `a-b-<hash of a/b>` would be the
+  #   hashed form of `a/b` (PR #1672 review);
+  # - a name whose plain form is longer than the budget.
+  #
+  # So a plain slug never ends in `-<8 hex>` and a hashed one always does: the
+  # two forms cannot meet. Two plain slugs are equal only for one name, and two
+  # hashed ones only when the names share both the kept prefix and the CRC.
+  # `clean` is ASCII, so its length in characters is its length in bytes.
   clean=$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
   slug="$kind-$clean"
   if [ "$clean" != "$raw" ] ||
     [ "$(printf '%s' "$clean" | LC_ALL=C tr -d 'A-Z')" != "$clean" ] ||
+    printf '%s' "$clean" | LC_ALL=C grep -Eq -- '-[0-9a-f]{8}$' ||
     [ "${#slug}" -gt "$budget" ]; then
+    # The shortest hashed slug keeps one byte of the name: KIND, `-`, one
+    # byte, `-` and the eight-digit hash.
+    [ "$budget" -ge $((${#kind} + 11)) ] ||
+      die "$sandbox_root is too long to hold this ${kind}'s sandbox ($kind-$clean needs at least $((${#kind} + 11)) bytes of its name, and $budget fit) with socket paths inside the $socket_path_max bytes a Unix socket path can hold here — pass SANDBOX=<a shorter dir>"
     hash=$(printf '%s' "$raw" | cksum)
     # bash's printf, not awk's: some awks clamp %x at 2^31 - 1.
     hash=$(printf '%08x' "${hash%% *}")
@@ -132,12 +150,12 @@ check_socket_path_fits() {
 dir_abs=$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd) || die "DIR $dir is not a directory"
 sandbox_root="$dir_abs/.dad-sandbox"
 if [ -z "$sandbox" ]; then
-  slug_budget=$((socket_path_max - $(byte_len "$sandbox_root") - 13))
-  # The shortest slug a long branch name can be cut to is `branch-` plus one
-  # byte, `-` and the eight-digit hash: 17 bytes. A detached HEAD's is 19.
-  [ "$slug_budget" -ge 19 ] ||
-    die "$sandbox_root is too long to hold a per-branch sandbox whose socket paths fit in the $socket_path_max bytes a Unix socket path can hold here — pass SANDBOX=<a shorter dir>"
-  sandbox="$sandbox_root/$(sandbox_slug "$slug_budget")"
+  # The refusal, when even this checkout's shortest slug cannot fit, is
+  # sandbox_slug's: it depends on the name, so a short branch still runs from a
+  # DIR too deep for a long one. The assignment carries its exit status, so
+  # `set -e` stops here on it.
+  slug=$(sandbox_slug $((socket_path_max - $(byte_len "$sandbox_root") - 13)))
+  sandbox="$sandbox_root/$slug"
 fi
 
 # Before per-branch sandboxes every branch shared ROOT itself as its sandbox,

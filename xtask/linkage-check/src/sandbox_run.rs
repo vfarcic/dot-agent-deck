@@ -427,6 +427,108 @@ fn a_socket_path_past_the_bound_is_refused_with_the_reason() {
     assert!(!explicit.exists(), "it created a SANDBOX it refused");
 }
 
+/// Scenario: run on `a/b`, whose sandbox is `branch-a-b-<hash>`, then on a
+/// branch literally named `a-b-<that hash>`; the second gets a sandbox of its
+/// own, because a name that already ends like a hashed slug is hashed too.
+#[test]
+fn a_name_shaped_like_a_hashed_slug_cannot_take_its_sandbox() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "a_name_shaped_like_a_hashed_slug_cannot_take_its_sandbox",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    f.git(&["checkout", "-q", "-b", "a/b"]);
+    let rewritten = f.tui_socket();
+    let rewritten_name = sandbox_of(&rewritten)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let literal = rewritten_name
+        .strip_prefix("branch-")
+        .expect("a branch's slug starts with `branch-`")
+        .to_string();
+    assert!(
+        literal.starts_with("a-b-") && literal.len() == "a-b-".len() + 8,
+        "`a/b` carries an eight-digit hash: {rewritten_name}"
+    );
+    f.git(&["checkout", "-q", "-b", &literal]);
+    let lookalike = f.tui_socket();
+    assert_ne!(
+        lookalike, rewritten,
+        "branch `{literal}` shares `a/b`'s sandbox"
+    );
+    let lookalike_name = sandbox_of(&lookalike)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        lookalike_name.starts_with(&format!("branch-{literal}-"))
+            && lookalike_name.len() == format!("branch-{literal}-").len() + 8,
+        "a name ending like a hashed slug carries a hash of its own: {lookalike_name}"
+    );
+}
+
+/// Scenario: point DIR at a directory deep enough to leave 12 bytes of slug,
+/// room for `branch-main` (11) but not for a detached HEAD's `commit-<sha>`
+/// (19) nor any hashed slug (17 at the least); `main` runs there, and a
+/// detached HEAD is refused naming the bound and SANDBOX= as the way out.
+#[test]
+fn a_short_branch_runs_where_only_its_own_slug_fits() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "a_short_branch_runs_where_only_its_own_slug_fits",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    // The script's budget is max - len(DIR/.dad-sandbox) - 13, and
+    // `/.dad-sandbox` is 13 bytes, so 12 bytes of slug need a DIR of
+    // max - 38 bytes.
+    let dir_len = socket_path_max() - 38;
+    let parent_len = f.root.to_str().unwrap().len() + 1;
+    let deep = f.root.join("d".repeat(dir_len - parent_len));
+    assert_eq!(deep.to_str().unwrap().len(), dir_len);
+    fs::create_dir_all(&deep).unwrap();
+
+    let out = f.run("tui", &deep, "", "release", &[]);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "a branch whose slug fits was refused: {text}"
+    );
+    let socket = field(&out, "TUI-SOCKET=");
+    assert_eq!(
+        Path::new(&socket),
+        deep.join(".dad-sandbox/branch-main/attach.sock")
+    );
+    assert!(socket.len() < socket_path_max(), "{socket}");
+
+    f.git(&["checkout", "-q", "--detach"]);
+    let out = f.run("tui", &deep, "", "release", &[]);
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a detached HEAD's slug cannot fit, yet it ran: {text}"
+    );
+    assert!(text.contains("pass SANDBOX="), "{text}");
+    assert!(text.contains(&socket_path_max().to_string()), "{text}");
+    let entries: Vec<_> = fs::read_dir(deep.join(".dad-sandbox"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("branch-main")],
+        "it created a sandbox it refused"
+    );
+}
+
 /// A UTF-8 locale bash honours here, or `None` when there is none. Under one,
 /// `${#var}` counts characters rather than bytes, which is the condition the
 /// multibyte test needs; without one that test would pass vacuously.
@@ -667,12 +769,136 @@ sleep 600;
 /// `DAD_SANDBOX_RUN_VITE_PORT`: 1420 is in use whenever a `tauri dev` runs on
 /// the machine, which is the ordinary state of a desktop developer's box, and
 /// the script's preflight would refuse.
-fn free_port() -> String {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("bind a loopback port")
-        .port()
-        .to_string()
+///
+/// **Held, not just picked** (PR #1672 review). A port read off a listener
+/// that is then dropped is free only until another process binds it, and the
+/// preflight would then refuse it and fail the test. So the port stays bound,
+/// by a socket that never listens, for as long as the [`HeldPort`] lives: no
+/// other process can bind the same address, and the script's probe — a
+/// connect — is refused, which is the answer "free" it needs. The probe tries
+/// `::1` as well, so that address is held too wherever this host has IPv6.
+struct HeldPort {
+    port: u16,
+    _sockets: Vec<std::os::fd::OwnedFd>,
+}
+
+/// A TCP socket bound to `addr` that never listens, or the bind's error.
+fn bound_not_listening(addr: std::net::IpAddr, port: u16) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let family = match addr {
+        std::net::IpAddr::V4(_) => libc::AF_INET,
+        std::net::IpAddr::V6(_) => libc::AF_INET6,
+    };
+    // SAFETY: `socket` takes no pointers; a non-negative return is a new fd
+    // this function owns, which `OwnedFd` closes on every path below.
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `socket` and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let rc = match addr {
+        std::net::IpAddr::V4(v4) => {
+            // SAFETY: an all-zero `sockaddr_in` is a valid value of a
+            // plain-integer struct; the fields `bind` reads are set below.
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = port.to_be();
+            sa.sin_addr.s_addr = u32::from(v4).to_be();
+            // SAFETY: `sa` is a live `sockaddr_in` and the length passed is
+            // its own size.
+            unsafe {
+                libc::bind(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    (&sa as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            // `::1` only, so this bind cannot also claim the IPv4 port.
+            let on: libc::c_int = 1;
+            // SAFETY: `on` is a live `c_int` and the length is its size.
+            unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    (&on as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            // SAFETY: as for `sockaddr_in` above.
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = port.to_be();
+            sa.sin6_addr.s6_addr = v6.octets();
+            // SAFETY: `sa` is a live `sockaddr_in6` and the length passed is
+            // its own size.
+            unsafe {
+                libc::bind(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    (&sa as *const libc::sockaddr_in6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// The port the kernel gave a socket bound to port 0.
+fn bound_port(fd: &std::os::fd::OwnedFd) -> u16 {
+    // SAFETY: an all-zero `sockaddr_in` is a valid value; `getsockname`
+    // writes at most `len` bytes into it and updates `len`.
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            std::os::fd::AsRawFd::as_raw_fd(fd),
+            (&mut sa as *mut libc::sockaddr_in).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "getsockname: {}", std::io::Error::last_os_error());
+    u16::from_be(sa.sin_port)
+}
+
+fn free_port() -> HeldPort {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    // Bounded: each attempt fails only when another process holds `::1` on
+    // the port the kernel just gave `127.0.0.1`.
+    for _ in 0..20 {
+        let v4 =
+            bound_not_listening(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).expect("bind a loopback port");
+        let port = bound_port(&v4);
+        match bound_not_listening(IpAddr::V6(Ipv6Addr::LOCALHOST), port) {
+            Ok(v6) => {
+                return HeldPort {
+                    port,
+                    _sockets: vec![v4, v6],
+                };
+            }
+            // No IPv6 loopback here, so nothing can listen on `::1` either.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)
+                ) =>
+            {
+                return HeldPort {
+                    port,
+                    _sockets: vec![v4],
+                };
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) => continue,
+            Err(e) => panic!("bind [::1]:{port}: {e}"),
+        }
+    }
+    panic!("no loopback port free on both 127.0.0.1 and ::1 in 20 attempts");
 }
 
 /// Kills a leftover desktop group if the test fails before the script's own
@@ -739,7 +965,8 @@ fn run_all_keeps_the_tui_in_the_terminals_foreground_group() {
     );
     cmd.env("PATH", path);
     cmd.env("DAD_TEST_MARK", &mark);
-    cmd.env("DAD_SANDBOX_RUN_VITE_PORT", free_port());
+    let port = free_port();
+    cmd.env("DAD_SANDBOX_RUN_VITE_PORT", port.port.to_string());
     cmd.cwd(&f.root);
     let mut child = pty
         .slave
@@ -910,6 +1137,7 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
         std::env::var("PATH").unwrap_or_default()
     );
     let port = free_port();
+    let port_arg = port.port.to_string();
     let out = f.run_with_env(
         "all",
         &f.cfg(),
@@ -920,7 +1148,7 @@ fn run_all_stops_a_desktop_whose_session_is_not_made_yet() {
             ("PATH", &path),
             ("DAD_TEST_MARK", mark.to_str().unwrap()),
             ("DAD_TEST_EXITED", exited.to_str().unwrap()),
-            ("DAD_SANDBOX_RUN_VITE_PORT", &port),
+            ("DAD_SANDBOX_RUN_VITE_PORT", &port_arg),
         ],
     );
     fs::write(&exited, "").unwrap();
