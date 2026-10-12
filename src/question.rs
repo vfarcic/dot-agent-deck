@@ -37,7 +37,8 @@ pub const MAX_PROMPT_BYTES: usize = 500;
 pub const MAX_LABEL_BYTES: usize = 120;
 /// Longest option description, scope or tool detail kept, in bytes.
 pub const MAX_DESCRIPTION_BYTES: usize = 300;
-/// Most questions one form may carry; a longer form is cut.
+/// Most questions one form may carry; a longer form shows its first ones and
+/// is keyboard-only ([`PendingQuestion::sanitized`]).
 pub const MAX_QUESTIONS: usize = 8;
 /// Most options one question may carry; a longer list is cut.
 pub const MAX_OPTIONS: usize = 16;
@@ -446,6 +447,10 @@ impl PendingQuestion {
         if !is_valid_question_id(&self.id) {
             return None;
         }
+        // A form longer than the deck shows stays on the card, its first
+        // questions shown, but keyboard-only: an answer to the questions shown
+        // would be sent as the whole form's (PR #1698 review).
+        let oversized = self.questions.len() > MAX_QUESTIONS;
         let mut questions = Vec::new();
         for question in self.questions.into_iter().take(MAX_QUESTIONS) {
             let options: Vec<QuestionOption> = question
@@ -491,7 +496,11 @@ impl PendingQuestion {
             questions,
             raised_at_ms: self.raised_at_ms,
             tool,
-            channel: self.channel,
+            channel: if oversized {
+                AnswerChannel::Unsupported
+            } else {
+                self.channel
+            },
             subagent_id: clean_opt(self.subagent_id, MAX_LABEL_BYTES),
             revision: self.revision,
         })
@@ -1498,6 +1507,10 @@ pub fn opencode_reply(
         }
         QuestionKind::Choice => {
             let payload_questions = props.get("questions")?.as_array()?;
+            // Every question OpenCode asked is answered, or none is.
+            if payload_questions.len() != question.questions.len() {
+                return None;
+            }
             let mut out = vec![Value::Null; question.questions.len()];
             for answer in answers {
                 let index = answer.question_index as usize;
@@ -2361,6 +2374,70 @@ mod tests {
             alwayses
                 .iter()
                 .all(|o| o.keyboard_only && o.scope.is_none())
+        );
+    }
+
+    /// Scenario: OpenCode asks a form of nine questions, one more than the
+    /// deck shows. The card shows the first eight, but the form is
+    /// keyboard-only: no client can answer it, and an answer to the eight it
+    /// shows — forged past the daemon — is never posted to OpenCode as the
+    /// whole form's answer.
+    #[spec("question/model/004")]
+    #[test]
+    fn question_model_004_a_form_with_more_questions_than_shown_is_keyboard_only() {
+        let questions: Vec<Value> = (0..=MAX_QUESTIONS)
+            .map(|i| {
+                serde_json::json!({
+                    "question": format!("Question {i}?"),
+                    "header": format!("Q{i}"),
+                    "options": [{"label": "Yes"}, {"label": "No"}],
+                    "custom": false,
+                })
+            })
+            .collect();
+        let props = serde_json::json!({"id": "que_oversized", "questions": questions});
+        let built = opencode_question_asked(&props, 1).expect("a form");
+        assert_eq!(built.questions.len(), MAX_QUESTIONS + 1);
+        let mut event: crate::event::AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s-oversized",
+            "agent_type": "open_code",
+            "event_type": "waiting_for_input",
+            "timestamp": "2026-10-04T10:00:00Z",
+        }))
+        .unwrap();
+        event.set_question(&built);
+        let shown = event.question().expect("the form is still shown");
+        assert_eq!(
+            shown.questions.len(),
+            MAX_QUESTIONS,
+            "the first eight are shown"
+        );
+        assert_eq!(shown.channel, AnswerChannel::Unsupported, "keyboard-only");
+        assert!(!shown.has_answerable_option());
+        let eight: Vec<QuestionAnswer> = (0..MAX_QUESTIONS as u32)
+            .map(|i| answer(i, &[1], None))
+            .collect();
+        assert_eq!(
+            shown.validate(&eight, false),
+            Err(AnswerRefusal::Unsupported),
+            "no client can answer it"
+        );
+        let forged = QuestionReply::answered(
+            &shown.id,
+            (0..MAX_QUESTIONS as u32)
+                .map(|i| ResolvedAnswer {
+                    question_index: i,
+                    option_indices: vec![1],
+                    labels: vec!["Yes".into()],
+                    roles: vec![OptionRole::Choice],
+                    text: None,
+                })
+                .collect(),
+        );
+        assert_eq!(
+            opencode_reply(&shown, &props, &forged),
+            None,
+            "eight answers are not posted as the answer to nine questions"
         );
     }
 

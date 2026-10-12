@@ -7965,6 +7965,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the desktop's own display scrub (`safe_display_text`).
 - **Platform coverage:** mac+linux.
 
+##### question/model/004 — A form with more questions than the deck shows is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (an OpenCode `question.asked` of nine questions built by the deck's own parser).
+- **Asserts:** after an event's sanitizing the card shows the first eight questions with the channel `unsupported`, no client answer to the eight is accepted (`unsupported`), and a reply naming eight answers forged past the daemon is never turned into OpenCode's reply.
+- **Does not assert:** the desktop's keyboard-only row for such a form (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/detect
 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
