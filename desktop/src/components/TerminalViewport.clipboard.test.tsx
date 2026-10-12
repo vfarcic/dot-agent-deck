@@ -243,17 +243,41 @@ describe("TerminalViewport honours an agent's OSC 52 copy (issue 1705)", () => {
     writeClipboardText.mockImplementation(() => new Promise<undefined>((resolve) => finishes.push(() => resolve(undefined))));
     try {
       const { emit, parsed } = mountTerminal({ backlog: READY });
-      emit(`${osc52("older")}${osc52("newer")}`);
+      emit(`${osc52("older")}${osc52("overtaken")}${osc52("newer")}`);
       await parsed();
       await waitFor(() => expect(writeClipboardText).toHaveBeenCalledTimes(1));
       await new Promise((resolve) => setTimeout(resolve, 0));
-      // The newer copy waits for the older one rather than racing it.
+      // The newer copies wait for the older one rather than racing it, and
+      // only the newest of them is kept: the overtaken one would only have
+      // been overwritten.
       expect(writeClipboardText.mock.calls).toEqual([["older"]]);
       finishes[0]();
       await waitFor(() => expect(writeClipboardText.mock.calls).toEqual([["older"], ["newer"]]));
       finishes[1]();
     } finally {
       writeClipboardText.mockImplementation(async () => undefined);
+    }
+  });
+
+  /**
+   * Scenario: the platform never answers one clipboard write. The agent's next
+   * copy still reaches the clipboard once that write has had its time.
+   */
+  it("does not let a clipboard write that never finishes hold up the next copy", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    writeClipboardText.mockImplementationOnce(() => new Promise<undefined>(() => {}));
+    try {
+      const { emit, parsed } = mountTerminal({ backlog: READY });
+      emit(osc52("stuck"));
+      await parsed();
+      await vi.waitFor(() => expect(writeClipboardText).toHaveBeenCalledTimes(1));
+      emit(osc52("next"));
+      await parsed();
+      expect(writeClipboardText).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(writeClipboardText).toHaveBeenLastCalledWith("next"));
+    } finally {
+      vi.useRealTimers();
     }
   });
 

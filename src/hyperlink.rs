@@ -106,16 +106,7 @@ impl Osc8Filter {
                         self.text_buf.push(byte);
                     }
                 }
-                FilterState::Esc => {
-                    if byte == b']' {
-                        self.osc_num.clear();
-                        self.state = FilterState::OscDigits;
-                    } else {
-                        self.text_buf.push(0x1b);
-                        self.text_buf.push(byte);
-                        self.state = FilterState::Normal;
-                    }
-                }
+                FilterState::Esc => self.after_esc(byte),
                 FilterState::OscDigits => {
                     if byte.is_ascii_digit() {
                         self.osc_num.push(byte);
@@ -175,6 +166,11 @@ impl Osc8Filter {
                         self.complete_osc_other(&[0x07]);
                     } else if byte == 0x1b {
                         self.state = FilterState::OscOtherEsc;
+                    } else if self.osc_other_is_clipboard && matches!(byte, 0x18 | 0x1a) {
+                        // CAN and SUB cancel a control string. The request is
+                        // dropped and the byte goes on to vt100 as in ground.
+                        self.abort_clipboard_request();
+                        self.text_buf.push(byte);
                     } else {
                         self.push_osc_other(byte);
                     }
@@ -182,6 +178,14 @@ impl Osc8Filter {
                 FilterState::OscOtherEsc => {
                     if byte == b'\\' {
                         self.complete_osc_other(&[0x1b, b'\\']);
+                    } else if self.osc_other_is_clipboard {
+                        // ESC that does not start ST ends an OSC string and
+                        // begins a new escape. Drop the clipboard request
+                        // rather than absorb what follows, so a request cut
+                        // off partway (an agent killed mid-copy) cannot hide
+                        // the pane's later output (issue #1705).
+                        self.abort_clipboard_request();
+                        self.after_esc(byte);
                     } else {
                         self.push_osc_other(0x1b);
                         self.push_osc_other(byte);
@@ -223,6 +227,28 @@ impl Osc8Filter {
             sequence.extend_from_slice(terminator);
             self.text_buf.extend_from_slice(&sequence);
         }
+        self.state = FilterState::Normal;
+    }
+
+    /// The byte after an `ESC` in ground state: `]` starts an OSC, anything
+    /// else is passed on to vt100 with the `ESC` in front of it.
+    fn after_esc(&mut self, byte: u8) {
+        if byte == b']' {
+            self.osc_num.clear();
+            self.state = FilterState::OscDigits;
+        } else {
+            self.text_buf.push(0x1b);
+            self.text_buf.push(byte);
+            self.state = FilterState::Normal;
+        }
+    }
+
+    /// Issue #1705: an OSC 52 request ended without its terminator. Nothing of
+    /// it is lifted out or passed on.
+    fn abort_clipboard_request(&mut self) {
+        self.osc_other_buf.clear();
+        self.osc_other_is_clipboard = false;
+        self.osc_other_oversized = false;
         self.state = FilterState::Normal;
     }
 
@@ -366,6 +392,30 @@ mod tests {
         // The next request is buffered normally again.
         f.process(b"\x1b]52;c;aGk=\x07");
         assert_eq!(f.take_clipboard_requests(), vec![b"c;aGk=".to_vec()]);
+    }
+
+    /// Issue #1705: an OSC 52 request cut off by another escape, or cancelled
+    /// by CAN or SUB, is dropped and does not swallow the output after it.
+    #[test]
+    fn unterminated_clipboard_request_does_not_hide_later_output() {
+        let mut f = Osc8Filter::new();
+        assert_eq!(
+            f.process(b"\x1b]52;c;aGk\x1b[31mred"),
+            vec![Osc8Segment::Text(b"\x1b[31mred".to_vec())]
+        );
+        assert!(f.take_clipboard_requests().is_empty());
+
+        let mut f = Osc8Filter::new();
+        assert_eq!(
+            f.process(b"\x1b]52;c;aGk\x18after"),
+            vec![Osc8Segment::Text(b"\x18after".to_vec())]
+        );
+        assert!(f.take_clipboard_requests().is_empty());
+
+        // A cut-off request followed at once by a complete one: the second is kept.
+        let mut f = Osc8Filter::new();
+        assert!(f.process(b"\x1b]52;c;aGk\x1b]52;c;eW8=\x07").is_empty());
+        assert_eq!(f.take_clipboard_requests(), vec![b"c;eW8=".to_vec()]);
     }
 
     /// Issue #1705: only OSC 52 is lifted out; OSC 5, OSC 520 and a title

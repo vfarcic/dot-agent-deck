@@ -11,17 +11,45 @@ import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } 
 import { keepSelectionAcrossResize } from "../lib/terminalSelection";
 
 /**
- * Issue #1705 — every clipboard write from an agent's terminal, in the order
- * it was asked for. `writeClipboardText` is asynchronous (an import, then an
- * IPC round trip), so two copies started back to back, from one pane or from
- * two, could finish out of order and leave the older text on the clipboard.
- * Each write starts only once the one before it has settled. A write the
- * platform refuses has no better outcome than the unchanged clipboard it
- * leaves, so a failure ends that write and not the queue.
+ * Issue #1705 — clipboard writes from agents' terminals, one at a time and
+ * newest last. `writeClipboardText` is asynchronous (an import, then an IPC
+ * round trip), so two copies started back to back, from one pane or from two,
+ * could finish out of order and leave the older text on the clipboard.
+ *
+ * So one write is in flight at a time, and while it is, only the NEWEST copy
+ * waits behind it: each copy replaces the last on the clipboard, so a copy
+ * overtaken before its turn would only be overwritten, and keeping one bounds
+ * what a stream of copies can hold. A write that has not settled after
+ * `CLIPBOARD_WRITE_TIMEOUT_MS` stops holding up the next, so a platform call
+ * that never returns cannot hold a pending copy forever. A write the platform
+ * refuses has no better outcome than the unchanged clipboard it leaves, so a
+ * failure ends that write and not the queue.
  */
-let clipboardWrites: Promise<void> = Promise.resolve();
+const CLIPBOARD_WRITE_TIMEOUT_MS = 5_000;
+let clipboardWriting = false;
+let pendingClipboardText: string | undefined;
 function copyInOrder(text: string): void {
-  clipboardWrites = clipboardWrites.then(() => writeClipboardText(text)).catch(() => undefined);
+  pendingClipboardText = text;
+  if (!clipboardWriting) void drainClipboardWrites();
+}
+async function drainClipboardWrites(): Promise<void> {
+  clipboardWriting = true;
+  try {
+    while (pendingClipboardText !== undefined) {
+      const text = pendingClipboardText;
+      pendingClipboardText = undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        writeClipboardText(text).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, CLIPBOARD_WRITE_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+  } finally {
+    clipboardWriting = false;
+  }
 }
 
 interface TerminalViewportProps {
