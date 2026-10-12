@@ -59,10 +59,13 @@ pub fn observe(endpoint: &impl Endpoint, agent: &str) -> Pane {
     let cwd = Path::new(record.cwd.as_deref().expect("stand-in cwd"));
     let base = cwd.join(format!(".route-{agent}"));
     let pid_path = base.with_extension("pid");
+    // Match the doorbell fixture: startup gets the harness's load-scaled
+    // child boot ceiling, independently of message-behavior waits.
+    let boot_budget = common::child_boot_budget();
     assert!(
-        common::wait_until(WAIT, || std::fs::read_to_string(&pid_path)
+        common::wait_until(boot_budget, || std::fs::read_to_string(&pid_path)
             .is_ok_and(|s| s.parse::<u32>().is_ok())),
-        "stand-in must start: {agent}"
+        "stand-in must start within {boot_budget:?}: {agent}"
     );
     let token = tokio::runtime::Runtime::new()
         .unwrap()

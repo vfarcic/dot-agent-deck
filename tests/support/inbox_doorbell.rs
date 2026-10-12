@@ -157,12 +157,16 @@ while True:
         .block_on(common::recorded_hook_capability(daemon.cwd(), &agent))
         .expect("stand-in capability");
     let pid_path = base.with_extension("pid");
-    assert!(common::wait_until(WAIT, || std::fs::read_to_string(
-        &pid_path
-    )
-    .ok()
-    .and_then(|text| text.parse::<u32>().ok())
-    .is_some()));
+    // This is child startup, not the doorbell's behavior deadline. Use the
+    // harness's load-scaled boot ceiling for a stand-in not yet scheduled.
+    let boot_budget = common::child_boot_budget();
+    assert!(
+        common::wait_until(boot_budget, || std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            .is_some()),
+        "stand-in {name} must export its pid within {boot_budget:?}"
+    );
     let pane = Pane {
         id: name.into(),
         agent,
@@ -171,8 +175,11 @@ while True:
         capture: base.with_extension("bytes"),
         attach_socket: daemon.attach_socket().to_path_buf(),
     };
-    assert!(common::wait_until(WAIT, || screen(daemon, &pane)
-        .contains("DOORBELL-STANDIN-READY")));
+    assert!(
+        common::wait_until(boot_budget, || screen(daemon, &pane)
+            .contains("DOORBELL-STANDIN-READY")),
+        "stand-in {name} must render readiness within {boot_budget:?}"
+    );
     pane
 }
 
