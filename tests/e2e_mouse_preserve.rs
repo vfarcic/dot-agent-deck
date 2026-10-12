@@ -240,7 +240,7 @@ fn preserve_disabled_button_is_inert() {
     deck.send_bytes(b"?");
     deck.wait_until_grid("help overlay open", |g| {
         assert_no_side_effect(g);
-        g.contains("works from any pane")
+        g.contains("chords work from any pane")
     });
 
     // Close the overlay and wait for the dashboard's own empty-state line to
@@ -253,6 +253,6 @@ fn preserve_disabled_button_is_inert() {
     deck.send_bytes(b"?");
     deck.wait_until_grid("help closed and the empty dashboard repainted", |g| {
         assert_no_side_effect(g);
-        !g.contains("works from any pane") && g.contains("No active agents. Press")
+        !g.contains("chords work from any pane") && g.contains("No active agents. Press")
     });
 }

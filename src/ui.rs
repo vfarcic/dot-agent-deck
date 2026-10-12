@@ -20054,7 +20054,7 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         ),
         // PRD #336: `toggle_orchestration_split` is NOT listed here, for the
         // same reason PRD #241 review F6 moved `close_pane` out — it is
-        // command-mode only, so this heading's "works from any pane" promise
+        // command-mode only, so this heading's "chords work from any pane" promise
         // would be false. It is listed under "Dashboard (command mode)" below.
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
