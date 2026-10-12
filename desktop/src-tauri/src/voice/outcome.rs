@@ -153,7 +153,9 @@ pub const FILTER_DASHBOARD_ROW: &str = "filter_dashboard";
 /// ([`facet_note`]); and one the user SAID that matches nothing or several
 /// refuses the row as a required param would — a popover for a daemon the user
 /// did not ask about is no answer to the one they did — while one only the
-/// model supplied is set aside as if none was named.
+/// model supplied is set aside before it is resolved, as if none was named.
+/// All daemons, the Daemon selector's entry for every daemon at once, is
+/// refused: the figures are per daemon, so the user is asked which.
 pub const SHOW_HOST_METRICS_ROW: &str = "show_host_metrics";
 /// One reading of a pick in [`UNGROUNDED_READS_AS`]: the row it is answered
 /// as, and the requirement that has to hold for it to be read that way.
@@ -1192,6 +1194,14 @@ pub async fn handle_utterance_with_modes(
                 param: spec.name.clone(),
             });
         };
+        // PR #1672 — a daemon the user did not SAY is set aside before it is
+        // resolved, and the dashboard decides as if none was named
+        // ([`SHOW_HOST_METRICS_ROW`]): with several daemons showing a Host
+        // button, a name only the model supplied would otherwise open one the
+        // user never asked about instead of asking which.
+        if row.id == SHOW_HOST_METRICS_ROW && !said(spoken, transcript.text()) {
+            continue;
+        }
         // An observed-name param the model supplied while labels are withheld:
         // this request could not show the model the name, so it is never
         // resolved. (A REQUIRED one never gets here — `needs_labels` refused
@@ -1228,6 +1238,26 @@ pub async fn handle_utterance_with_modes(
                     safe_message(&param.label)
                 ));
             }
+            // PR #1672 — All daemons is a selection, not a daemon with a Host
+            // button: the figures are per daemon, so the user is asked to name
+            // one rather than told the figures are showing when nothing opens.
+            Ok(param)
+                if row.id == SHOW_HOST_METRICS_ROW
+                    && param.kind == ParamKind::DeckRef
+                    && param.value == super::ALL_DECKS_ID =>
+            {
+                return finish(VoiceOutcome::ParamUnresolved {
+                    sentence: heard(
+                        &transcript,
+                        "the Host figures are shown one daemon at a time, so say which daemon",
+                    ),
+                    action: row.id.clone(),
+                    param: spec.name.clone(),
+                    spoken: spoken.to_string(),
+                    transcript,
+                    nothing_matched: false,
+                });
+            }
             // **An optional param that resolves is named in the report**
             // (PRD #1223), whether or not the user said it. A row's report may
             // not interpolate an optional param — it may have nothing to say —
@@ -1251,9 +1281,6 @@ pub async fn handle_utterance_with_modes(
             Err(unmet) if row.id == FILTER_DASHBOARD_ROW => {
                 notes.push(unmet.unfiltered_note(spec.kind, spoken, &transcript, decks));
             }
-            // PR #1672 — a daemon only the model supplied is set aside, and the
-            // dashboard decides as if none was named ([`SHOW_HOST_METRICS_ROW`]).
-            Err(_) if row.id == SHOW_HOST_METRICS_ROW && !said(spoken, transcript.text()) => {}
             // **An optional param that fails is DROPPED, and the action
             // proceeds without it** (PRD #1223) — whichever way it failed:
             // matching nothing, matching several, or withheld from the model.
@@ -8206,6 +8233,87 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
             "{outcome:?}"
         );
+    }
+
+    /// Scenario (PR #1672): with several daemons on the dashboard the user
+    /// says only "show host", and the model fills in a daemon that does exist.
+    /// The user named none, so it is set aside before it is resolved and the
+    /// row dispatches with no daemon: the dashboard then asks which daemon
+    /// (`chooseHostDeck`) rather than opening that one's popover.
+    #[tokio::test]
+    async fn voice_outcome_show_host_sets_aside_an_unspoken_daemon_that_resolves() {
+        for supplied in ["build box", "deploy@build-box.example.com:2222", "local"] {
+            let resolver = StubResolver::new().answering(
+                "show host",
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", supplied),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), "show host").await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new("show host"),
+                    action: SHOW_HOST_METRICS_ROW.to_string(),
+                    invoke: "showHostMetrics".to_string(),
+                    params: Vec::new(),
+                    sentence: "Showing the Host figures.".to_string(),
+                    then_submit: false,
+                },
+                "{supplied:?}"
+            );
+        }
+    }
+
+    /// Scenario (PR #1672): "show host for all daemons" resolves to the Daemon
+    /// selector's All daemons entry, which has no Host button of its own. The
+    /// row is refused in words asking which daemon, rather than reporting the
+    /// figures as shown while no popover opens.
+    #[tokio::test]
+    async fn voice_outcome_show_host_for_all_daemons_asks_which_daemon() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        });
+        for (said, supplied) in [
+            ("show host for all daemons", "all daemons"),
+            ("host for all demons", "all demons"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", supplied),
+            );
+            let outcome = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks,
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            let VoiceOutcome::ParamUnresolved {
+                action, sentence, ..
+            } = &outcome
+            else {
+                panic!("{said:?}: expected a refusal, got {outcome:?}");
+            };
+            assert_eq!(action, SHOW_HOST_METRICS_ROW);
+            assert_eq!(
+                sentence,
+                &format!(
+                    "Heard: \u{201c}{said}\u{201d} — the Host figures are shown one daemon \
+                     at a time, so say which daemon."
+                ),
+            );
+            assert!(!sentence.contains("Showing"), "{sentence}");
+        }
     }
 
     /// Scenario (PR #1672): "show host" over an agent's pane, or with the New
