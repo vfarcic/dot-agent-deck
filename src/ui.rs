@@ -7633,7 +7633,7 @@ fn open_console_output() -> std::io::Result<std::fs::File> {
 }
 
 /// Minimal base64 encoder (no external dependency needed).
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -15286,6 +15286,14 @@ pub fn run_tui(
         // leave PaneInput — closing the server/UI race the pre-forward snapshot
         // can't. Drained each frame from the embedded controller's queue.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            // Issue #1705: an agent asked its terminal to copy text (OSC 52).
+            // The pane's terminal is the deck's parser, so pass the copy on to
+            // the user's own terminal — write-only, validated by
+            // `osc52::osc52_copy_text`, and only the newest when several
+            // arrived in one frame, since each would replace the last.
+            if let Some(text) = embedded.take_clipboard_copies().pop() {
+                copy_to_clipboard_osc52(&text);
+            }
             let rejections = embedded.take_stream_rejections();
             if !rejections.is_empty() {
                 let focused = embedded.focused_pane_id();

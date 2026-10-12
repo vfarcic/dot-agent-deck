@@ -42,9 +42,13 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     /** Every `keydown` that reached xterm's own listener, by key. */
     keysSeen: string[] = [];
     getSelection(): string { return this.selection; }
+    hasSelection(): boolean { return this.selection !== ""; }
+    clearSelection(): void { this.selection = ""; }
+    /* Issue #1705's OSC 52 handler; `TerminalViewport.clipboard.test.tsx` drives it through the real xterm. */
+    readonly parser = { registerOscHandler: (): { dispose: () => void } => ({ dispose: () => {} }) };
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { this.host = host; host.appendChild(this.textarea); }
-    write(): void {}
+    write(_data?: unknown, callback?: () => void): void { callback?.(); }
     reset(): void {}
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }

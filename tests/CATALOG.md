@@ -2336,6 +2336,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the exact sanitization output beyond "no raw control bytes survive into the rendered grid" (the pure-data `validate_tab_membership_*` tests pin the per-field policy).
 - **Platform coverage:** mac+linux.
 
+#### embed/clipboard
+
+##### embed/clipboard/001 — An agent's own clipboard copy in a pane reaches the user's terminal through the TUI (issue #1705).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness), in `tests/e2e_agent_clipboard.rs`. Asserts on the deck's raw OUTPUT byte stream (`stream_text`), because the harness PTY is the deck's controlling terminal and the copy is an escape sequence written to it, not a rendered cell.
+- **Agent:** none — the `--continue` pane runs `bash`, standing in for an agent: an OSC 52 set-clipboard request is the same bytes whichever program writes them, and the shell computes the copied text so neither it nor its base64 is ever typed.
+- **Asserts:** after the shell writes `ESC]52;c;<base64>BEL` for a computed line, the deck writes exactly one `ESC]52;c;<base64>ESC\` carrying that line to its terminal; the read request (`ESC]52;c;?BEL`) the same command writes is not passed on, so the stream holds exactly one OSC 52.
+- **Does not assert:** that a real terminal puts the text on its clipboard (that is the user's terminal's setting); that a copy inside the scrollback the daemon replays on an attach is not copied again (the pane reader skips each attach's first frame, which is that replay; no test drives a reattach); the desktop app's half, which is `TerminalViewport.clipboard.test.tsx` and the driver tier's `terminal_004`.
+- **Platform coverage:** mac+linux.
+
 #### embed/key-forwarding
 
 ##### embed/key-forwarding/001 — Shift+Enter typed into a focused embedded agent pane inserts a NEWLINE into the agent's draft instead of SUBMITTING it (PRD #227).

@@ -23,6 +23,8 @@ vi.mock("@xterm/addon-webgl", () => ({
     dispose(): void {}
   } as unknown as typeof import("@xterm/addon-webgl").WebglAddon,
 }));
+const { writeClipboardText } = vi.hoisted(() => ({ writeClipboardText: vi.fn(async (_text: string) => undefined) }));
+vi.mock("../lib/clipboard", () => ({ writeClipboardText }));
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     activate(): void {}
@@ -396,5 +398,49 @@ describe("TerminalViewport copy and editing keys share one terminal (issues 1403
     expect(sent).toEqual([]);
     press(editKey);
     expect(sent).toEqual([bytes]);
+  });
+});
+
+describe("TerminalViewport plain Ctrl+C over a selection (issue 1705)", () => {
+  const ctrlC: Key = { key: "c", code: "KeyC", keyCode: 67, ctrlKey: true };
+
+  async function mountWithSelection() {
+    const mounted = mountTerminal();
+    const terminal = getTerminal(undefined, "agent-1");
+    if (!terminal) throw new Error("the viewport registered no terminal");
+    await new Promise<void>((resolve) => terminal.write("exit status 0", resolve));
+    terminal.select(0, 0, "exit status 0".length);
+    writeClipboardText.mockClear();
+    return { ...mounted, terminal };
+  }
+
+  /**
+   * Scenario: on Windows, select text in an agent's terminal and press plain
+   * Ctrl+C, as in Windows Terminal. The text is copied and the selection
+   * cleared, nothing reaches the agent, and a second Ctrl+C interrupts it.
+   */
+  it("Windows: copies the selection and clears it, then the next Ctrl+C interrupts", async () => {
+    onPlatform("windows");
+    const { sent, press, terminal } = await mountWithSelection();
+    press(ctrlC);
+    expect(writeClipboardText).toHaveBeenCalledWith("exit status 0");
+    expect(terminal.hasSelection()).toBe(false);
+    expect(sent).toEqual([]);
+    press(ctrlC);
+    expect(sent).toEqual(["\x03"]);
+    expect(writeClipboardText).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: on macOS and on Linux, select text in an agent's terminal and
+   * press plain Ctrl+C. It is not the copy key there: the agent receives its
+   * interrupt and the clipboard is left alone.
+   */
+  it.each<["mac" | "linux"]>([["mac"], ["linux"]])("%s: plain Ctrl+C interrupts even over a selection", async (platform) => {
+    onPlatform(platform);
+    const { sent, press } = await mountWithSelection();
+    press(ctrlC);
+    expect(sent).toEqual(["\x03"]);
+    expect(writeClipboardText).not.toHaveBeenCalled();
   });
 });

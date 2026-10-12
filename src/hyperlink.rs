@@ -4,6 +4,10 @@
 //! hyperlinks.  The vt100 crate does not support OSC 8, so this module
 //! intercepts the raw PTY byte stream, strips OSC 8 sequences, and records
 //! which screen rows have hyperlink URLs.
+//!
+//! It also lifts OSC 52 clipboard requests out of the stream (issue #1705):
+//! the pane parser would only drop them, and a copy the agent asked for is
+//! one the deck can pass on to the user's own terminal (see [`crate::osc52`]).
 
 use std::collections::HashMap;
 
@@ -47,6 +51,13 @@ pub struct Osc8Filter {
     osc_params: Vec<u8>,
     osc_uri: Vec<u8>,
     osc_other_buf: Vec<u8>,
+    /// Issue #1705: the OSC being buffered in `osc_other_buf` is an OSC 52
+    /// clipboard request (`ESC ] 52 ;`), lifted out on completion rather than
+    /// passed to vt100.
+    osc_other_is_clipboard: bool,
+    /// Issue #1705: completed OSC 52 requests, everything after `52;`, in
+    /// arrival order, for [`Osc8Filter::take_clipboard_requests`].
+    clipboard_requests: Vec<Vec<u8>>,
 }
 
 impl Default for Osc8Filter {
@@ -65,7 +76,17 @@ impl Osc8Filter {
             osc_params: Vec::new(),
             osc_uri: Vec::new(),
             osc_other_buf: Vec::new(),
+            osc_other_is_clipboard: false,
+            clipboard_requests: Vec::new(),
         }
+    }
+
+    /// Issue #1705: the OSC 52 clipboard requests completed since the last
+    /// call, each as everything after `52;` (targets, `;`, payload), unvalidated
+    /// — [`crate::osc52::osc52_copy_text`] decides what each is worth. They are
+    /// removed from the stream, so the pane parser never sees them.
+    pub fn take_clipboard_requests(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.clipboard_requests)
     }
 
     pub fn process(&mut self, input: &[u8]) -> Vec<Osc8Segment> {
@@ -98,6 +119,7 @@ impl Osc8Filter {
                         self.osc_params.clear();
                         self.state = FilterState::Osc8Params;
                     } else {
+                        self.osc_other_is_clipboard = self.osc_num == b"52" && byte == b';';
                         self.osc_other_buf.clear();
                         self.osc_other_buf.push(0x1b);
                         self.osc_other_buf.push(b']');
@@ -145,10 +167,7 @@ impl Osc8Filter {
                 }
                 FilterState::OscOther => {
                     if byte == 0x07 {
-                        self.osc_other_buf.push(byte);
-                        self.text_buf
-                            .extend_from_slice(&std::mem::take(&mut self.osc_other_buf));
-                        self.state = FilterState::Normal;
+                        self.complete_osc_other(&[0x07]);
                     } else if byte == 0x1b {
                         self.state = FilterState::OscOtherEsc;
                     } else {
@@ -157,11 +176,7 @@ impl Osc8Filter {
                 }
                 FilterState::OscOtherEsc => {
                     if byte == b'\\' {
-                        self.osc_other_buf.push(0x1b);
-                        self.osc_other_buf.push(b'\\');
-                        self.text_buf
-                            .extend_from_slice(&std::mem::take(&mut self.osc_other_buf));
-                        self.state = FilterState::Normal;
+                        self.complete_osc_other(&[0x1b, b'\\']);
                     } else {
                         self.osc_other_buf.push(0x1b);
                         self.osc_other_buf.push(byte);
@@ -187,6 +202,20 @@ impl Osc8Filter {
             }),
             None => segments.push(Osc8Segment::Text(bytes)),
         }
+    }
+
+    /// A non-OSC-8 sequence ended with `terminator`. An OSC 52 request is
+    /// lifted out (issue #1705); anything else goes on to vt100 unchanged.
+    fn complete_osc_other(&mut self, terminator: &[u8]) {
+        let mut sequence = std::mem::take(&mut self.osc_other_buf);
+        if std::mem::take(&mut self.osc_other_is_clipboard) {
+            // `ESC ] 5 2 ;` is the first five bytes; the rest is the request.
+            self.clipboard_requests.push(sequence.split_off(5));
+        } else {
+            sequence.extend_from_slice(terminator);
+            self.text_buf.extend_from_slice(&sequence);
+        }
+        self.state = FilterState::Normal;
     }
 
     fn complete_osc8(&mut self) {
@@ -255,6 +284,47 @@ mod tests {
     use super::*;
 
     // -- Osc8Filter tests --
+
+    /// Issue #1705: an OSC 52 request, with either terminator, is lifted out of
+    /// the stream whole — the text around it still reaches vt100, the request
+    /// does not.
+    #[test]
+    fn clipboard_request_is_lifted_out_with_either_terminator() {
+        let mut f = Osc8Filter::new();
+        let segs = f.process(b"before\x1b]52;c;aGk=\x07middle\x1b]52;;eW8=\x1b\\after");
+        assert_eq!(segs, vec![Osc8Segment::Text(b"beforemiddleafter".to_vec())]);
+        assert_eq!(
+            f.take_clipboard_requests(),
+            vec![b"c;aGk=".to_vec(), b";eW8=".to_vec()]
+        );
+        assert!(
+            f.take_clipboard_requests().is_empty(),
+            "taken requests are gone"
+        );
+    }
+
+    /// Issue #1705: a request split across PTY reads is still lifted out whole,
+    /// and only once it completes.
+    #[test]
+    fn clipboard_request_split_across_chunks() {
+        let mut f = Osc8Filter::new();
+        assert!(f.process(b"\x1b]5").is_empty());
+        assert!(f.process(b"2;c;aG").is_empty());
+        assert!(f.take_clipboard_requests().is_empty(), "not complete yet");
+        assert_eq!(f.process(b"k=\x1b"), vec![]);
+        assert_eq!(f.process(b"\\x"), vec![Osc8Segment::Text(b"x".to_vec())]);
+        assert_eq!(f.take_clipboard_requests(), vec![b"c;aGk=".to_vec()]);
+    }
+
+    /// Issue #1705: only OSC 52 is lifted out; OSC 5, OSC 520 and a title
+    /// still reach vt100 unchanged.
+    #[test]
+    fn other_oscs_still_pass_through() {
+        let mut f = Osc8Filter::new();
+        let input: &[u8] = b"\x1b]0;title\x07\x1b]5;x\x07\x1b]520;y\x07";
+        assert_eq!(f.process(input), vec![Osc8Segment::Text(input.to_vec())]);
+        assert!(f.take_clipboard_requests().is_empty());
+    }
 
     #[test]
     fn plain_text_passes_through() {

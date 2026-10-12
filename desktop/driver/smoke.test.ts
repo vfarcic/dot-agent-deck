@@ -224,6 +224,65 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
   });
 });
 
+/// Scenario: in a shell agent's pane, start a stand-in for an agent that owns
+/// the mouse, as Claude Code does: it turns on mouse reporting, waits for the
+/// user's drag to be released, and asks the terminal to copy a line with OSC
+/// 52. Drag across a printed line and find that the terminal made no selection
+/// of its own, and that the line the agent asked for is on the system
+/// clipboard. Then the control, once the stand-in has given the mouse back:
+/// select a line in the terminal itself and copy it with Ctrl+Shift+C.
+test("terminal_004 an agent that owns the mouse copies to the clipboard with OSC 52", async () => {
+  const command = "bash --noprofile --norc";
+  await withDeck("terminal_004", { daemonFirst: true, defaultCommand: command }, async (deck) => {
+    await deck.element(connected, "the deck group to report connected");
+    const input = await openShellPane(deck);
+    await deck.traceTerminals();
+
+    await deck.session.type(input, `echo dad-mouse-row-$((6*7))${ENTER}`);
+    const row = "dad-mouse-row-42";
+    // The press that focuses the window can resize the grid (see `selectRow`),
+    // so make it now, before anything listens for the mouse, and let it settle.
+    await deck.session.clickAt((await waitFor(`${row} on its own row`, () => deck.rowSpan(row))).from);
+    await deck.gridSettled();
+
+    // The stand-in: SGR button tracking on, then read the mouse reports until
+    // the release (SGR ends a release with `m`), then copy with OSC 52 and give
+    // the mouse back. The copied text is computed by the shell, so it can only
+    // reach the clipboard through the agent's request, never from the screen.
+    const copied = "dad-osc52-42-ok";
+    await deck.session.type(
+      input,
+      "printf '\\e[?1000h\\e[?1002h\\e[?1006h'; echo armed-$((1+1)); "
+        + "while IFS= read -rsn1 c; do [ \"$c\" = m ] && break; done; "
+        + "printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 -w0)\"; "
+        + "printf '\\e[?1006l\\e[?1002l\\e[?1000l'; echo released-$((1+1))"
+        + ENTER,
+    );
+    await waitFor("the stand-in to turn on mouse reporting", async () =>
+      (await deck.terminalTexts()).some(({ text }) => text.split("\n").includes("armed-2")),
+    );
+    const span = await waitFor(`${row} on its own row with the mouse reported`, () => deck.rowSpan(row));
+    await deck.session.drag(span.from, span.to);
+    await waitFor("the stand-in to see the release", async () =>
+      (await deck.terminalTexts()).some(({ text }) => text.split("\n").includes("released-2")),
+    );
+    // The precondition the report describes: the drag went to the agent, so
+    // the terminal holds nothing for a copy key to copy.
+    assert.deepEqual(
+      (await deck.selections()).filter((selection) => selection !== ""),
+      [],
+      "the terminal made a selection of its own while the agent owned the mouse",
+    );
+    await waitFor(`the clipboard to hold ${copied}`, async () => (await deck.clipboardText()) === copied);
+
+    // The control: with the mouse back, a selection is the terminal's own, and
+    // the copy key copies it.
+    await deck.selectRow(row);
+    await deck.session.chord([CONTROL, SHIFT, "c"]);
+    await waitFor(`the clipboard to hold ${row}`, async () => (await deck.clipboardText()) === row);
+  });
+});
+
 /**
  * Issue #1457 — press on the row whose text is exactly `text`, bring the window
  * to the front while the button is held, finish the drag across that row and
