@@ -663,6 +663,31 @@ fn an_explicit_sandbox_is_used_as_given() {
     );
 }
 
+/// Scenario: run with SANDBOX set to a short symlink whose target's path is
+/// past the socket-path bound; the run is accepted and the TUI is handed the
+/// socket under the symlink, because the bound applies to the path a socket is
+/// bound at, not to where a symlink in it leads (PR #1672 review).
+#[test]
+fn an_explicit_sandbox_is_bounded_by_its_path_not_its_symlinks_target() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "an_explicit_sandbox_is_bounded_by_its_path_not_its_symlinks_target",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    let deep = f.root.join("d".repeat(socket_path_max()));
+    fs::create_dir_all(&deep).unwrap();
+    let link = f.root.join("ln");
+    std::os::unix::fs::symlink(&deep, &link).unwrap();
+    let out = f.run("tui", &f.cfg(), link.to_str().unwrap(), "release", &[]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert_eq!(
+        Path::new(&field(&out, "TUI-SOCKET=")),
+        link.join("attach.sock")
+    );
+}
+
 /// Scenario: `task run` on `main`, then `task run-stop` with no SANDBOX; the
 /// stop is aimed at the socket the run used. On another branch that never ran,
 /// `run-stop` finds nothing to stop rather than reaching `main`'s daemon.

@@ -169,8 +169,10 @@ old_sandbox_note() {
 }
 
 # An explicit SANDBOX is checked before anything creates it, against its path
-# as written made absolute; the check after it is resolved below also catches a
-# symlink in it that leads somewhere longer.
+# as written made absolute, and again below against the exact string the socket
+# paths are built from. Neither resolves a symlink, and neither needs to: the
+# bound applies to the path a socket is bound at, not to where a symlink in it
+# leads (PR #1672 review).
 case $sandbox in
   /*) check_socket_path_fits "$sandbox" ;;
   *) check_socket_path_fits "$PWD/$sandbox" ;;
