@@ -994,6 +994,9 @@ export interface DialogOptions {
 
 const WRAPPED = "__dotAgentDeckQuestionWrapper";
 
+/** The `ctx.ui` objects the deck wrapped, and which of their methods. */
+const WRAPPED_ON = new WeakMap<object, Set<string>>();
+
 /**
  * Race the original dialog against the deck's answer. Whichever settles first
  * wins: a deck answer aborts the dialog through the signal Pi documents for
@@ -1093,7 +1096,10 @@ function raceDialog(
  * read-only leaves that method alone, and the function never throws. Returns
  * how many methods it wrapped. Idempotent: a method already wrapped is left as
  * it is, so re-applying on every `session_start` (Pi rebuilds the object when
- * it rebinds its UI) is safe.
+ * it rebinds its UI) is safe. A method is recognised as wrapped by the marker
+ * on it, and by the object having had that method wrapped before — the marker
+ * alone is hidden once another extension decorates the deck's wrapper, which
+ * would wrap it a second time and open two waits for one dialog (PR #1698).
  */
 export function installQuestionWrappers(ui: unknown, deps: QuestionDeps): number {
 	if (!ui || typeof ui !== "object") {
@@ -1104,13 +1110,23 @@ export function installQuestionWrappers(ui: unknown, deps: QuestionDeps): number
 	const replace = (name: "select" | "confirm" | "input", wrapper: (...args: never[]) => Promise<unknown>) => {
 		try {
 			const original = target[name];
-			if (typeof original !== "function" || (original as unknown as Record<string, unknown>)[WRAPPED]) {
+			const installed = WRAPPED_ON.get(target);
+			if (
+				typeof original !== "function" ||
+				(original as unknown as Record<string, unknown>)[WRAPPED] ||
+				installed?.has(name)
+			) {
 				return;
 			}
 			Object.defineProperty(wrapper, WRAPPED, { value: true });
 			target[name] = wrapper as never;
 			if (target[name] === wrapper) {
 				wrapped += 1;
+				if (installed) {
+					installed.add(name);
+				} else {
+					WRAPPED_ON.set(target, new Set([name]));
+				}
 			}
 		} catch {
 			// Read-only or otherwise unwritable: leave Pi's own method alone.

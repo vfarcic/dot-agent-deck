@@ -200,6 +200,25 @@ describe("question/detect/008 — Pi ctx.ui wrapper", () => {
 		assert.equal(ui.select, first);
 	});
 
+	test("another extension's decorator between two session starts leaves one wait", async () => {
+		const select = fakeDialog();
+		const ui: Record<string, unknown> = { select: select.method };
+		const deck = fakeDeck();
+		assert.equal(installQuestionWrappers(ui, deck.deps), 1);
+		// Another extension decorates the deck's wrapper, hiding its marker.
+		const wrapped = ui.select as (...args: unknown[]) => Promise<unknown>;
+		const decorated = (...args: unknown[]) => wrapped(...args);
+		ui.select = decorated;
+		// Pi's next session_start re-applies the deck's wrappers.
+		assert.equal(installQuestionWrappers(ui, deck.deps), 0, "the decorated wrapper is not wrapped again");
+		assert.equal(ui.select, decorated);
+		const pending = (ui.select as (t: string, o: string[]) => Promise<unknown>)("Pick", ["Red", "Blue"]);
+		await tick();
+		assert.equal(deck.runs.length, 1, "one dialog opens one wait");
+		deck.runs[0].reply('{"value":"Red"}\n');
+		assert.equal(await pending, "Red");
+	});
+
 	test("a missing or read-only ctx.ui is left alone and never throws", () => {
 		const deck = fakeDeck();
 		assert.equal(installQuestionWrappers(undefined, deck.deps), 0);
