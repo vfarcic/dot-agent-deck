@@ -8079,6 +8079,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** live agent behaviour or question answering.
 - **Platform coverage:** mac+linux.
 
+##### question/detect/016 — An `await-answer` child that fails before handing off falls back to the plain event.
+- **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder).
+- **Agent:** none (recorder; captured OpenCode 1.18.34 `permission.asked`).
+- **Asserts:** a `permission.asked` whose child exits non-zero, one whose child is killed, and a `question.asked` whose child exits non-zero are each forwarded once as the plain event with its request id, which the hook CLI reads as Needs Input; a child that exits 0 adds no report. Skips where `node` is missing.
+- **Does not assert:** a spawn that fails outright (a missing binary also takes the plain event's own route away); a real OpenCode.
+- **Platform coverage:** mac+linux.
+
 #### question/state
 
 ##### question/state/001 — A question event sets the pending question and Needs Input.

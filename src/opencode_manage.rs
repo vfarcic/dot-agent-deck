@@ -351,12 +351,17 @@ const replyThroughOpenCode = async (client, answer) => {{
 // line, which the child passes to the deck — so the deck reports the answer
 // sent only once OpenCode took it. When OpenCode did not, the question is
 // raised again, so it is pending in the deck once more and can be answered.
-// Answers whether a child was started: one that names no request, or whose
-// child cannot be spawned, is not held, and the caller reports it plainly.
-const awaitAnswer = (client, payload) => {{
+// `fallback` reports the question plainly, so the card still shows it: it runs
+// once when the question cannot be held — it names no request, or its child
+// cannot be spawned — and once when the child fails before it is done with the
+// question (it cannot be started, exits non-zero, or is killed by anything but
+// this plugin). `await-answer` exits 0 on every outcome it handles, a refusal
+// it reports plainly itself included, so a clean exit adds no second report.
+const awaitAnswer = (client, payload, fallback) => {{
   const requestId = payload?.properties?.id;
   if (typeof requestId !== "string" || !requestId) {{
-    return false;
+    fallback?.();
+    return;
   }}
   stopHeldAnswer(requestId);
   resolvedRequests.delete(requestId);
@@ -366,9 +371,23 @@ const awaitAnswer = (client, payload) => {{
       stdio: ["pipe", "pipe", "ignore"],
     }});
   }} catch (_) {{
-    return false;
+    fallback?.();
+    return;
   }}
   heldAnswers.set(requestId, child);
+  // A child this plugin stopped (`stopHeldAnswer`, shutdown) or that printed
+  // the deck's answer is no longer in `heldAnswers`, so its end is no failure.
+  let failed = false;
+  const failedEarly = (code, signal) => {{
+    if (failed || shuttingDown || heldAnswers.get(requestId) !== child) {{
+      return;
+    }}
+    if (code === 0 && !signal) {{
+      return;
+    }}
+    failed = true;
+    fallback?.();
+  }};
   const forget = () => {{
     if (heldAnswers.get(requestId) === child) {{
       heldAnswers.delete(requestId);
@@ -404,18 +423,23 @@ const awaitAnswer = (client, payload) => {{
     const ack = await replyThroughOpenCode(client, answer);
     acknowledge(ack);
     if (!ack.delivered && !shuttingDown && !resolvedRequests.has(requestId)) {{
-      awaitAnswer(client, payload);
+      awaitAnswer(client, payload, fallback);
     }}
   }});
-  child.on("error", forget);
-  child.on("close", forget);
+  child.on("error", () => {{
+    failedEarly(null, "error");
+    forget();
+  }});
+  child.on("close", (code, signal) => {{
+    failedEarly(code, signal);
+    forget();
+  }});
   // A child that exits first turns a later write into an EPIPE on the stream,
   // which must not surface as an unhandled error inside OpenCode.
   child.stdin?.on("error", () => {{}});
   try {{
     child.stdin?.write(JSON.stringify(payload) + "\n");
   }} catch (_) {{}}
-  return true;
 }};
 
 const questionPayload = (event, directory) => {{
@@ -1214,9 +1238,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             prompt: permissionPrompt(props),
           }});
           if (eventType === "permission.asked") {{
-            if (!awaitAnswer(ctx?.client, {{ ...payload, properties: props }})) {{
-              sendEvent(payload);
-            }}
+            awaitAnswer(ctx?.client, {{ ...payload, properties: props }}, () => sendEvent(payload));
             return;
           }}
           payload.request_id = props.requestID ?? props.id;
@@ -1228,13 +1250,13 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       }}
       if (eventType === "permission.asked" || eventType === "question.asked") {{
         // PRD #1631: reported through `await-answer`, which also waits for
-        // the deck's answer. A permission that cannot be held is reported
-        // plainly, with no `properties`, so the card still shows it.
+        // the deck's answer. A prompt that cannot be held, or whose child
+        // fails before it is done with it, is reported plainly, with no
+        // `properties`, so the card still shows it.
         const payload = questionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);
-        if (!awaitAnswer(ctx?.client, payload) && eventType === "permission.asked") {{
-          sendEvent(permissionPayload(event, directory));
-        }}
+        const plain = permissionPayload(event, directory);
+        awaitAnswer(ctx?.client, payload, () => sendEvent(plain));
         return;
       }}
       if (
@@ -4490,5 +4512,128 @@ writeFileSync("{posts}", JSON.stringify(posts));
         };
         resolved("permission.replied", "per_hold");
         resolved("question.rejected", "que_rejected");
+    }
+
+    /// Scenario: Load the generated plugin under Node with its binary pinned
+    /// to a recorder whose `await-answer` dies before it hands the question to
+    /// the deck — exiting with an error, or killed — and send it a permission
+    /// prompt and a question form. Each is then reported as the plain event,
+    /// so the card still shows Needs Input; a child that ends normally, having
+    /// handled its question, adds no second report.
+    #[cfg(unix)]
+    #[spec("question/detect/016")]
+    #[test]
+    fn question_detect_016_an_await_answer_child_that_fails_early_falls_back_to_the_plain_event() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let permission: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions/opencode-permission-asked.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  case "$input" in
+    *per_crash*|*que_crash*) exit 3 ;;
+    *per_killed*) kill -9 $$ ;;
+    *) exit 0 ;;
+  esac
+else
+  cat >> '{payloads}'
+  echo >> '{payloads}'
+fi
+"#,
+                payloads = payloads.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{plugin}";
+const hooks = await plugin({{ directory: "/work", client: {{}} }});
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const asked = {permission};
+for (const id of ["per_crash", "per_killed", "per_quiet"]) {{
+  await hooks.event({{ event: {{ type: "permission.asked", properties: {{ ...asked, id }} }} }});
+}}
+await hooks.event({{ event: {{ type: "question.asked", properties: {{ id: "que_crash", sessionID: asked.sessionID, questions: [{{ question: "Pick?", header: "Pick", options: [{{ label: "A" }}] }}] }} }} }});
+await wait(1500);
+"#,
+                plugin = plugin.display(),
+                permission = permission,
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+
+        let forwarded: Vec<serde_json::Value> = std::fs::read_to_string(&payloads)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let reported = |event: &str, id: &str| {
+            forwarded
+                .iter()
+                .filter(|p| p["event"] == event && p["request_id"] == id)
+                .count()
+        };
+        assert_eq!(
+            reported("permission.asked", "per_crash"),
+            1,
+            "{forwarded:#?}"
+        );
+        assert_eq!(
+            reported("permission.asked", "per_killed"),
+            1,
+            "{forwarded:#?}"
+        );
+        assert_eq!(reported("question.asked", "que_crash"), 1, "{forwarded:#?}");
+        assert_eq!(
+            reported("permission.asked", "per_quiet"),
+            0,
+            "a child that handled its question adds no report: {forwarded:#?}"
+        );
+        let plain: crate::hook::OpenCodeHookInput = serde_json::from_value(
+            forwarded
+                .iter()
+                .find(|p| p["request_id"] == "que_crash")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::hook::build_opencode_event(plain).map(|e| e.event_type),
+            Some(crate::event::EventType::WaitingForInput),
+            "the plain question reads as Needs Input"
+        );
     }
 }
