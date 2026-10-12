@@ -7965,6 +7965,43 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** reading the real process environment.
 - **Platform coverage:** mac+linux+windows.
 
+#### inbox/status
+
+##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
+- **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
+- **Agent:** none.
+- **Asserts:** INBOX and WAKE columns, distinct queued/fetched counts, empty-inbox dash, native/turn-end/doorbell/none display spellings.
+- **Does not assert:** live daemon population or dashboard cards; live population is `/003`.
+- **Platform coverage:** all.
+
+##### inbox/status/002 — Status JSON preserves the per-agent inbox summary at schema version 2.
+- **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and serialization.
+- **Agent:** none.
+- **Asserts:** queued, fetched, undeliverable, last_acked_at, wake and component survive projection for four agents; additive schema version remains 2.
+- **Does not assert:** the CLI subprocess or acknowledgement timestamp format; live acknowledgement is `/003`.
+- **Platform coverage:** all.
+
+##### inbox/status/003 — ListAgents carries live per-agent inbox counts and the currently armed wake path.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and attach/hook sockets.
+- **Agent:** none (raw Python stand-in; no credential).
+- **Asserts:** AgentRecord.inbox separates queued/fetched counts by agent, tracks ack time, and changes doorbell → native → doorbell on waiter arm/EOF, then turn_end on announce; armed component is pi_extension.
+- **Does not assert:** native delivery to a real model, user-facing dashboard badges or status subprocess formatting.
+- **Platform coverage:** mac+linux.
+
+##### inbox/status/004 — Attached clients receive each direct-message lifecycle transition as a recognized Inbox broadcast.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and streaming attach subscription.
+- **Agent:** none (raw Python stand-in; no credential).
+- **Asserts:** Queued → Fetched → Queued (stream nack) → Fetched → Acknowledged and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
+- **Does not assert:** offers, publishes, real agent adapters or frontend rendering.
+- **Platform coverage:** mac+linux.
+
+##### inbox/status/005 — Hello carries the stable deck token used by inbox message ids.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and attach socket.
+- **Agent:** none (raw Python stand-in; no credential).
+- **Asserts:** Two Hello replies name the same eight-character deck_id, and a posted message id uses that token.
+- **Does not assert:** persistence across daemon restart; the deck-id persistence round trip is `inbox/core/002`.
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
