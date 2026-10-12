@@ -186,9 +186,12 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
             <span>{displayText(session.agentLabel, DISPLAY_LIMITS.name)}</span>
           </div>
           <div className="pr-browser-actions">
-            <button type="button" className="pr-browser-control" onClick={onBack} title="Back" aria-label="Back"><ArrowLeft size={14} aria-hidden="true" /><span>Back</span></button>
-            <button type="button" className="pr-browser-control" onClick={onOpenExternal} title="Open in your browser" aria-label="Open in browser"><ExternalLink size={14} aria-hidden="true" /><span>Open in browser</span></button>
-            <button type="button" className="pr-browser-control" onClick={onClose} title="Close (Esc)" aria-label="Close pull request"><X size={14} aria-hidden="true" /><span>Close</span></button>
+            {/* The app's own controls, as every other overlay draws them: text
+                actions as compact secondary buttons, and Close as the icon
+                button in the corner that Settings and New agent use. */}
+            <button type="button" className="button secondary compact" onClick={onBack} title="Back" aria-label="Back"><ArrowLeft size={13} aria-hidden="true" /><span>Back</span></button>
+            <button type="button" className="button secondary compact" onClick={onOpenExternal} title="Open in your browser" aria-label="Open in browser"><ExternalLink size={13} aria-hidden="true" /><span>Open in browser</span></button>
+            <button type="button" className="icon-button" onClick={onClose} title="Close (Esc)" aria-label="Close pull request"><X size={16} aria-hidden="true" /></button>
           </div>
         </header>
         {problem && <p className="pr-browser-problem" role="alert" title={displayText(problem, DISPLAY_LIMITS.message)}>{displayText(problem, DISPLAY_LIMITS.message)}</p>}

@@ -493,6 +493,47 @@ impl Bounds {
             height: (self.height * sy).min(height - y).max(1.0),
         }
     }
+
+    /// The frame on `surface`, in the logical pixels `add_child` and
+    /// `set_bounds` place a webview in.
+    ///
+    /// Mapped onto the main webview's own rectangle (`Webview::bounds`),
+    /// origin and size, because that is the page the frame was measured in —
+    /// what the Linux overlay maps onto too (its allocation). Both rectangles
+    /// are in the same coordinates: wry measures the main webview and places
+    /// this one against the same parent view. Not onto `Window::inner_size`
+    /// from the window's origin, which assumes the main webview fills the
+    /// content view from its top-left corner; on macOS nothing in AppKit
+    /// holds it there (see `the_page_never_covers_the_toolbar`). The window's
+    /// size is only the fallback for a main webview that cannot report its
+    /// own.
+    pub fn on(self, surface: Surface) -> Placed {
+        let Some(main) = surface.main_webview else {
+            let content = surface.window_content.to_logical::<f64>(surface.scale);
+            return self.onto(content.width, content.height);
+        };
+        let origin = main.position.to_logical::<f64>(surface.scale);
+        let size = main.size.to_logical::<f64>(surface.scale);
+        let placed = self.onto(size.width, size.height);
+        Placed {
+            x: origin.x + placed.x,
+            y: origin.y + placed.y,
+            ..placed
+        }
+    }
+}
+
+/// What the platform reports about the place the PR webview goes, measured
+/// when it is placed.
+#[derive(Debug, Clone, Copy)]
+pub struct Surface {
+    /// The window's scale factor: physical pixels per logical pixel.
+    pub scale: f64,
+    /// The main webview's own rectangle in the window (`Webview::bounds`) —
+    /// the page the frame was measured in. `None` when it cannot be read.
+    pub main_webview: Option<tauri::Rect>,
+    /// The window's content size (`Window::inner_size`).
+    pub window_content: tauri::PhysicalSize<u32>,
 }
 
 struct AppEffects<R: Runtime>(AppHandle<R>);
@@ -879,12 +920,24 @@ impl Bounds {
     /// The frame on `window`'s content area, in logical pixels — what
     /// `add_child` and `set_bounds` place a webview in.
     fn onto_window<R: Runtime>(self, window: &tauri::Window<R>) -> Result<Placed, String> {
+        Ok(self.on(Surface::of(window)?))
+    }
+}
+
+impl Surface {
+    /// What `window` reports now.
+    fn of<R: Runtime>(window: &tauri::Window<R>) -> Result<Self, String> {
         let scale = window.scale_factor().map_err(|error| error.to_string())?;
-        let size = window
-            .inner_size()
-            .map_err(|error| error.to_string())?
-            .to_logical::<f64>(scale);
-        Ok(self.onto(size.width, size.height))
+        let window_content = window.inner_size().map_err(|error| error.to_string())?;
+        let main_webview = window
+            .app_handle()
+            .get_webview(MAIN_WEBVIEW_LABEL)
+            .and_then(|main| main.bounds().ok());
+        Ok(Self {
+            scale,
+            main_webview,
+            window_content,
+        })
     }
 }
 
@@ -1946,6 +1999,145 @@ mod tests {
         };
         let placed = overflowing.onto(1440.0, 920.0);
         assert!(placed.x + placed.width <= 1440.0, "{placed:?}");
+    }
+
+    /// The reported defect: on macOS the GitHub page was drawn over the
+    /// toolbar, leaving only the tops of Close, Back and Open in browser.
+    ///
+    /// The frame is measured in the main webview's CSS pixels, so it is only
+    /// right when it is mapped onto the main webview's own rectangle. On macOS
+    /// and Windows it used to be mapped onto `Window::inner_size` from the
+    /// window's origin, which is that rectangle only while the main webview
+    /// sits at the content view's top-left corner and fills it. On macOS
+    /// nothing in AppKit keeps it there: with Tauri's `unstable` feature the
+    /// main webview is itself a child webview, which wry gives only a
+    /// `ViewMinYMargin` autoresizing mask: AppKit keeps its distance from the
+    /// top and never resizes it, and only Tauri's own bounds calls size it.
+    /// Each case gives the rectangle the platform reports for the main
+    /// webview, and the page must start at or below the toolbar's bottom edge
+    /// and stay inside the main webview. The first macOS case models the
+    /// reported symptom (the cause on the user's Mac is inferred, not
+    /// observed): a main webview one title bar (28 points) below the content
+    /// view's top put the page 28 points too high, over all but the top of
+    /// the toolbar. The Linux and Windows cases, where the main webview
+    /// fills the window, are the controls.
+    #[test]
+    fn the_page_never_covers_the_toolbar() {
+        use tauri::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
+
+        // `styles.css`: the overlay's 14px padding, the panel's 1px border,
+        // then the 40px toolbar, its bottom border included (`border-box`).
+        // `pull_request_001` measures the frame's top at 55 in the real app.
+        const TOOLBAR_BOTTOM: f64 = 14.0 + 1.0 + 40.0;
+        let frame_in = |css_width: f64, css_height: f64| Bounds {
+            x: 15.0,
+            y: TOOLBAR_BOTTOM,
+            width: css_width - 30.0,
+            height: css_height - TOOLBAR_BOTTOM - 15.0,
+            viewport_width: css_width,
+            viewport_height: css_height,
+        };
+        let logical = |y: f64, width: f64, height: f64| tauri::Rect {
+            position: LogicalPosition::new(0.0, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        };
+        let physical = |width: u32, height: u32| tauri::Rect {
+            position: PhysicalPosition::new(0, 0).into(),
+            size: PhysicalSize::new(width, height).into(),
+        };
+        // (case, surface, the main webview's top and size in logical pixels,
+        // its size in CSS pixels)
+        let cases = [
+            (
+                "macOS, main webview a title bar below the content view's top, scale 1",
+                Surface {
+                    scale: 1.0,
+                    main_webview: Some(logical(28.0, 1440.0, 892.0)),
+                    window_content: PhysicalSize::new(1440, 920),
+                },
+                (28.0, 1440.0, 892.0),
+                (1440.0, 892.0),
+            ),
+            (
+                "macOS, main webview a title bar below the content view's top, scale 2, app zoom 125%",
+                Surface {
+                    scale: 2.0,
+                    main_webview: Some(logical(28.0, 1728.0, 1089.0)),
+                    window_content: PhysicalSize::new(3456, 2234),
+                },
+                (28.0, 1728.0, 1089.0),
+                (1728.0 / 1.25, 1089.0 / 1.25),
+            ),
+            (
+                "macOS, main webview larger than the content size the window reports, scale 2",
+                Surface {
+                    scale: 2.0,
+                    main_webview: Some(logical(0.0, 1728.0, 1117.0)),
+                    window_content: PhysicalSize::new(2880, 1840),
+                },
+                (0.0, 1728.0, 1117.0),
+                (1728.0, 1117.0),
+            ),
+            (
+                "Linux, scale 1, WebKitGTK at 100 DPI",
+                Surface {
+                    scale: 1.0,
+                    main_webview: Some(logical(0.0, 1440.0, 920.0)),
+                    window_content: PhysicalSize::new(1440, 920),
+                },
+                (0.0, 1440.0, 920.0),
+                (1440.0 / 1.04, 920.0 / 1.04),
+            ),
+            (
+                "Linux, scale 2",
+                Surface {
+                    scale: 2.0,
+                    main_webview: Some(logical(0.0, 1440.0, 920.0)),
+                    window_content: PhysicalSize::new(2880, 1840),
+                },
+                (0.0, 1440.0, 920.0),
+                (1440.0, 920.0),
+            ),
+            (
+                "Windows, scale 2",
+                Surface {
+                    scale: 2.0,
+                    main_webview: Some(physical(2880, 1840)),
+                    window_content: PhysicalSize::new(2880, 1840),
+                },
+                (0.0, 1440.0, 920.0),
+                (1440.0, 920.0),
+            ),
+            (
+                "a main webview that cannot report its bounds, scale 2",
+                Surface {
+                    scale: 2.0,
+                    main_webview: None,
+                    window_content: PhysicalSize::new(2880, 1840),
+                },
+                (0.0, 1440.0, 920.0),
+                (1440.0, 920.0),
+            ),
+        ];
+        for (case, surface, (top, width, height), (css_width, css_height)) in cases {
+            let placed = frame_in(css_width, css_height).on(surface);
+            let toolbar_bottom = top + TOOLBAR_BOTTOM * height / css_height;
+            assert!(
+                placed.y >= toolbar_bottom - 0.5,
+                "{case}: the page starts at y={:.1}, above the toolbar's bottom edge at y={toolbar_bottom:.1}, so it covers the toolbar ({placed:?})",
+                placed.y
+            );
+            assert!(
+                placed.y + placed.height <= top + height + 0.5
+                    && placed.x + placed.width <= width + 0.5,
+                "{case}: the page runs past the main webview's {width}x{height} at y={top} ({placed:?})"
+            );
+            assert!(
+                placed.x >= 15.0 * width / css_width - 0.5
+                    && placed.y + placed.height >= top + height - 15.0 * height / css_height - 1.0,
+                "{case}: the page does not fill its frame ({placed:?})"
+            );
+        }
     }
 
     /// Decision 4: the files that grant permissions name only the app's own
