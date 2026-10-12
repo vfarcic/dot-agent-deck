@@ -63,7 +63,7 @@ desktopScenario("host-metrics", async (page) => {
   await page.getByTestId("host-metrics-button").click();
   await expect(page.getByTestId("host-metrics")).toContainText("0.42 across 16 cores");
   await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
-  await expect(page.getByTestId("host-metrics")).toContainText("0 ms");
+  await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
 });
 
 /** Select the fixture project's directory in the shared New agent form. */
