@@ -14,8 +14,8 @@ name: Tag Release
 # back to Cargo.toml's `0.1.0` placeholder; the version has to be IN the tree the
 # tag points at. What was avoidable is a person pushing it — and that is all this
 # workflow changes. The identity it pushes under, `RELEASE_TOKEN`, is the same
-# admin PAT that `release.yml` and `docs-publish.yml` already use for their own
-# direct pushes to `main`. No new secret, no new bypass actor, no ruleset edit.
+# admin PAT that `release.yml` already uses for its own direct push to `main`.
+# No new secret, no new bypass actor, no ruleset edit.
 #
 # WHY THE TAG IS CREATED HERE TOO, rather than left to a human `git push --tags`:
 # a workflow triggered BY a tag cannot create the commit that tag points at. The
@@ -72,12 +72,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Fail at step 1, not at the push. Same guard, same reasoning and very
-      # nearly the same words as `release.yml`'s `prepare` and
-      # `docs-publish.yml`'s `publish`: `main` is ruleset-protected and
-      # `github-actions[bot]` is deliberately NOT a bypass actor, because
-      # GITHUB_TOKEN cannot be one on a user-owned repository.
+      # nearly the same words as `release.yml`'s `prepare`: `main` is
+      # ruleset-protected and `github-actions[bot]` is deliberately NOT a
+      # bypass actor, because GITHUB_TOKEN cannot be one on a user-owned
+      # repository.
       #
-      # What it does NOT cover, stated for the same reason those two state it:
+      # What it does NOT cover, stated for the same reason that one states it:
       # this tests emptiness only, so a token that is present but expired,
       # revoked or under-scoped passes here and fails later at the push. That is
       # deliberate — probing the token costs an API call and adds a failure mode
@@ -365,10 +365,10 @@ jobs:
         # The residual half of the old skill's Step 3. On the normal path the pin
         # commit above is HEAD and carries no skip marker, so this does nothing.
         # It matters on the no-op path: if the pin was already correct, HEAD is
-        # whatever `main` last received — and `docs-publish.yml` ends every
-        # release by committing `chore: update docs chart to <tag> [skip ci]`, so
-        # main's tip very often DOES carry the marker. Tagging it would skip the
-        # release workflow silently.
+        # whatever `main` last received, and nothing stops that from carrying a
+        # marker. Until #514 `docs-publish.yml` ended every release by committing
+        # `chore: update docs chart to <tag> [skip ci]`, so main's tip very often
+        # did. Tagging such a commit would skip the release workflow silently.
         run: |
           set -euo pipefail
           HEAD_MSG=$(git log -1 --format='%B' HEAD)
@@ -411,9 +411,9 @@ jobs:
           # The tag push is what triggers release.yml. It fires because this push
           # is made under the RELEASE_TOKEN PAT rather than GITHUB_TOKEN: events
           # raised by GITHUB_TOKEN do not start new workflow runs, PAT-raised
-          # ones do. The in-repo evidence is docs-publish.yml, whose PAT push to
-          # `main` carries `[skip ci]` precisely because it would otherwise
-          # trigger ci.yml.
+          # ones do. The in-repo evidence is release.yml's changelog commit: its
+          # PAT push to `main` starts a `push` run of ci.yml (v0.46.0's,
+          # f8ae73d8, did).
           git push origin "refs/tags/v${VERSION}"
 
       - name: Summary

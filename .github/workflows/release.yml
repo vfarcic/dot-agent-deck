@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 concurrency:
   group: release
@@ -71,8 +70,8 @@ jobs:
         # `${{ … }}` expression is substituted as *raw text* before bash parses
         # the line, so a crafted `workflow_dispatch` input — or a tag name,
         # which may legally contain quotes, `;` and `$(…)` — would otherwise
-        # execute as shell code in a pipeline that holds `contents`/`packages`
-        # write and, downstream, the Homebrew/Scoop publishing tokens. Bound
+        # execute as shell code in a pipeline that holds `contents` write
+        # and, downstream, the Homebrew/Scoop publishing tokens. Bound
         # through `env:` the value is only ever data.
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -1017,11 +1016,10 @@ jobs:
     if: ${{ !cancelled() && !inputs.skip_desktop }}
     runs-on: macos-latest
     environment: desktop-signing
-    # Job-level permissions replace the workflow-level `contents: write` /
-    # `packages: write`. This job needs no GITHUB_TOKEN scope: it has no
-    # checkout and calls no GitHub API (its network calls go to Apple), and
-    # same-run artifact transfer authenticates with the runner's own token
-    # rather than GITHUB_TOKEN.
+    # Job-level permissions replace the workflow-level `contents: write`. This
+    # job needs no GITHUB_TOKEN scope: it has no checkout and calls no GitHub
+    # API (its network calls go to Apple), and same-run artifact transfer
+    # authenticates with the runner's own token rather than GITHUB_TOKEN.
     permissions: {}
     # Notarization waits on Apple, and the job submits twice (the app, then the
     # disk image). Bounded so a stuck notary queue cannot hold the runner, and
@@ -2033,7 +2031,7 @@ jobs:
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE the workflow-level set, which is what is
     # wanted here: this job gets the two scopes attestation needs and drops the
-    # `contents: write` / `packages: write` it has no use for.
+    # `contents: write` it has no use for.
     permissions:
       contents: read
       id-token: write
@@ -2170,28 +2168,17 @@ jobs:
   docs:
     needs: [prepare, finalize]
     uses: ./.github/workflows/docs-publish.yml
+    # A called workflow's permissions can only narrow the caller's, so this
+    # caps the callee at what it uses: it checks out and deploys to Netlify,
+    # and pushes nothing to the repository or to a registry.
+    permissions:
+      contents: read
     # A reusable workflow invoked via `uses:` receives NO secrets unless the
-    # caller forwards them, so without this line `secrets.RELEASE_TOKEN` is
-    # empty inside docs-publish.yml and its push to `main` cannot bypass the
-    # `main-protected` ruleset. That is exactly how v0.35.9's "Commit chart
-    # changes" step failed, with `GH013: … Changes must be made through a pull
-    # request` — and because the image had already reached GHCR by then, the
-    # symptom was a docs site that never rolled forward rather than an
-    # obviously broken release. (The callee now guards for an empty token in
-    # its first step, so the same mistake fails before anything is published.)
-    #
-    # `inherit` is broader than this job needs: it forwards every repository
-    # secret, including HOMEBREW_TAP_TOKEN and SCOOP_BUCKET_TOKEN, which are
-    # cross-repo write credentials that docs-publish.yml never reads. Narrowing
-    # it to an explicit `RELEASE_TOKEN` map is tracked in #514 — deliberately
-    # not done inline, because the callee is also `workflow_dispatch`-able and
-    # that path has to be canaried first (governance.md step 5). Keep the
-    # forwarding until then; do not read this line as an endorsement of
-    # `inherit` over a narrow map. The narrow map must also carry
-    # NETLIFY_AUTH_TOKEN and NETLIFY_SITE_ID, which the callee's Netlify
-    # deploy reads.
-    secrets: inherit
+    # caller forwards them. Exactly the two the callee declares, never
+    # `secrets: inherit`, which would also hand it RELEASE_TOKEN and the
+    # cross-repo HOMEBREW_TAP_TOKEN / SCOOP_BUCKET_TOKEN it never reads (#514).
+    secrets:
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
     with:
-      image_tag: v${{ needs.prepare.outputs.version }}
-      chart_version: ${{ needs.prepare.outputs.version }}
-      push_latest: true
+      version_label: v${{ needs.prepare.outputs.version }}
