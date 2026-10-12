@@ -81,7 +81,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
-import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
@@ -2245,8 +2245,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!ours()) return true;
     const verdict = answered.verdict;
     if (verdict.kind === "not_answer") return false;
+    /* The whole staleness rule, not only the question's identity: the
+       terminal hidden, the agent replaced, a confirmation opened or the deck
+       changed while the answer was worked out opens no countdown or
+       confirmation over it (PR #1698 review). */
+    const lost = questionLost(
+      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, deck },
+      { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
+    );
+    if (lost) {
+      dropQuestion(questionLostSentence(lost));
+      return true;
+    }
     const now = paneRef.current;
-    if (!now || now.deckId !== target.deckId || now.agentId !== target.agentId || now.question?.id !== target.questionId || now.question.revision !== target.revision) {
+    if (now?.question?.revision !== target.revision) {
       dropQuestion(QUESTION_MOVED_ON);
       return true;
     }
@@ -4696,12 +4708,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
               PRD #1631 — the answer to the agent's question, filling in: the
               form in Rust's words, then the countdown to sending it, which
               the user can stop with the button or by saying "cancel". The
-              form's words are the agent's labels, so they cross
-              `displayText` like every other free-form string here.
+              form's words are the agent's labels, so they are sanitized like
+              every other free-form string here — but never cut: this is what
+              will be sent, so all of it is shown, wrapping (PR #1698 review).
+              Rust builds it from the daemon's snapshot, whose every field the
+              daemon caps (`PendingQuestion::sanitized`), so it is bounded.
             */}
             {questionForm && (
               <p className="voice-dictation" data-testid="voice-question" role="timer">
-                {displayText(questionForm.summary, DISPLAY_LIMITS.message)}
+                {sanitizeText(questionForm.summary)}
                 {questionForm.cancelling
                   ? " — cancelling…"
                   : questionForm.sending
@@ -4804,13 +4819,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         confirmation, which names what it covers. A child of the row for the
         numbered choice's reason above, raised the same way while it is open.
         Confirm (or saying "confirm") starts the countdown; Cancel, the scrim
-        or saying "cancel" sends nothing.
+        or saying "cancel" sends nothing. The body is the whole grant, never
+        cut (PR #1698 review): a scope is at most 300 bytes
+        (`scope_shown_whole`), or the option is keyboard-only.
       */}
       {questionForm?.confirming && questionForm.always !== undefined && (
         <ConfirmDialog
           state={{
             title: "Always allow?",
-            body: displayText(questionForm.always, DISPLAY_LIMITS.message),
+            body: sanitizeText(questionForm.always),
             label: "Confirm",
             busyLabel: "Confirming…",
             action: async () => { confirmAlways(); },

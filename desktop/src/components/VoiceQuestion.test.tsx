@@ -452,6 +452,84 @@ describe("answering an agent's question by voice", () => {
   });
 
   /**
+   * Scenario (question/desktop/010, PR #1698 review): the user says "always",
+   * and while the app is still working out the answer they switch the pane to
+   * another tab. When the answer comes back, no "Always allow?" confirmation
+   * opens over the hidden terminal; the same for "yes", which starts no
+   * countdown. Nothing is sent, and the panel says why.
+   */
+  it("question/desktop/010: an answer worked out while the terminal was hidden opens nothing", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => SENT);
+    let release: (() => void) | undefined;
+    resolveVoiceQuestion.mockImplementation(async (_target: VoiceQuestionTarget, utterance: string) => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return questionAnswers(utterance);
+    });
+    const hidden = { ...pane(), terminalHidden: true };
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    for (const said of ["always", "yes"]) {
+      await speak(voice, said);
+      expect(resolveVoiceQuestion).toHaveBeenCalled();
+      view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={hidden} selectedDeckId="local" />);
+      await flush();
+      release?.();
+      await flush();
+      expect(screen.queryByRole("alertdialog"), said).toBeNull();
+      expect(screen.queryByTestId("voice-question"), said).toBeNull();
+      expect(screen.getByTestId("voice-report"), said).toHaveTextContent("its terminal is not shown");
+      await waitOut(VOICE_DICTATION_SEND_MS * 2);
+      expect(sendVoiceAnswer).not.toHaveBeenCalled();
+      view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+      await flush();
+    }
+  });
+
+  /**
+   * Scenario (question/desktop/005, PR #1698 review): "always" for a grant
+   * whose scope is as long as the deck accepts — 300 characters — opens a
+   * confirmation that shows all of it, and once confirmed the countdown shows
+   * the whole of what it will send; a form whose summary runs past a line is
+   * shown whole in its countdown too. Nothing being granted is cut.
+   */
+  it("question/desktop/005: a long grant is shown whole in its confirmation and its countdown", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => SENT);
+    const scope = `commands matching \`${"make target-".repeat(24)}*\``;
+    expect(scope.length).toBeGreaterThanOrEqual(300);
+    const always = `This will always allow ${scope}. Confirm?`;
+    const summary = `Answer — ${Array.from({ length: 8 }, (_, i) => `Question ${i}: a rather long option label ${i}`).join("; ")}`;
+    expect(summary.length).toBeGreaterThan(240);
+    resolveVoiceQuestion.mockImplementation(async (_target: VoiceQuestionTarget, utterance: string) => ({
+      verdict: utterance === "always"
+        ? { kind: "answered", form: [{ questionIndex: 0, optionIndices: [2] }], complete: true, summary: `Always allow — ${scope}`, always }
+        : { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary },
+      resolveMs: 12,
+      backend: "stub",
+    }));
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    await speak(voice, "always");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent(always);
+    expect(dialog).not.toHaveTextContent("…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+    await flush();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(`Always allow — ${scope} — sending in 5 s.`);
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(`${summary} — sending in 5 s.`);
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+  });
+
+  /**
    * Scenario (question/desktop/011, audit A8): the countdown runs out and the
    * answer is on its way, but the deck is slow to take it. The row keeps the
    * answer and its Cancel while it is sending. The user changes pane: the
