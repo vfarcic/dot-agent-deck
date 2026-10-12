@@ -5896,8 +5896,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/spawn/012 — A real script-launched Codex role badges at spawn before its first prompt.
 - **Layer:** L2 PTY-attached real-agent orchestration flow; runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
-- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command whose config declares `agent = "codex"`.
-- **Asserts:** the bespoke script starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
+- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command, opening on the environment assignment `CODEX_LAUNCH_PROBE=1685`, whose config declares `agent = "codex"`.
+- **Asserts:** the bespoke script starts with the assignment in its environment (issue #1685: before the fix the wrapper was handed the assignment as its program and nothing started), it starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
 - **Does not assert:** prompt delivery, model prose, tool execution, `clear = true` respawn, or post-prompt native hook behavior.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
@@ -5907,6 +5907,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic Codex recorder.
 - **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
 - **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/014 — A Codex command that begins with an environment assignment or a shell compound starts under the wrapper (issue #1685).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` with `DOT_AGENT_DECK_WRAP_BIN` pointed at a shim that records the wrapper's argv word by word and then execs the REAL built wrapper).
+- **Agent:** a `codex-standin` script explicitly declared as Codex (`AgentType::Codex`), which records that it started and the assignment it sees, under an isolated `HOME`/`CODEX_HOME` and no pane id, so the wrapper installs no Codex hooks.
+- **Asserts:** `CODEX_WRAPPER_PROBE=1 <standin>` and `(umask 077; : > <marker>); exec <standin>` each reach the wrapper as `wrap --agent codex -- /bin/sh -c <command>`, with the command as one argument, and their agent starts (the assignment visible to it, the compound's subshell having run); the plain `<standin> --flag` control keeps the direct `-- <standin> --flag` shape and starts. Measured RED before the fix: the assignment was handed to the wrapper as its program and the agent never started, and the compound was a syntax error in the shell before the wrapper ran.
+- **Does not assert:** a real Codex process, or the hook install and trust for a shell-routed command inside a pane (the `pane_id` path `codex/hooks/002` covers for a non-`codex` launcher); the user's `$SHELL` (pinned to `/bin/sh` here; the classification and the argv shape for another shell are unit-tested in `src/wrap.rs`); detection of an undeclared compound as Codex.
 - **Platform coverage:** mac+linux.
 
 #### codex/hooks
