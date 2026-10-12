@@ -42,6 +42,9 @@ pub const MAX_DESCRIPTION_BYTES: usize = 300;
 pub const MAX_QUESTIONS: usize = 8;
 /// Most options one question may carry; a longer list is cut.
 pub const MAX_OPTIONS: usize = 16;
+/// The options a Codex form question can be answered with by one digit,
+/// `1`-`9` [read from Codex 0.160.0's `request_user_input` source].
+pub const CODEX_DIGIT_OPTIONS: u32 = 9;
 /// Longest question id accepted. An id is a routing key, so an id that is too
 /// long or carries anything outside `[A-Za-z0-9_-]` drops the whole question
 /// rather than being repaired.
@@ -1262,6 +1265,12 @@ pub fn codex_prefix_scope(command: &str) -> Option<String> {
 /// a [`QuestionKind::Choice`] form answered by one digit per question. The id
 /// is the call's `tool_use_id`, so its `PostToolUse` clears exactly this form.
 /// Codex reports no multi-select field [observed], so none is single-select.
+///
+/// A question with more than [`CODEX_DIGIT_OPTIONS`] options of its own makes
+/// the whole form keyboard-only (PR #1698 review): Codex takes an option by
+/// digit only for `1`-`9`, and past that only by moving its highlight, which
+/// the deck cannot see. Offering the first nine alone would let a user who
+/// heard a partial list ask for an option that was never offered.
 pub fn codex_request_user_input(
     tool_use_id: Option<&str>,
     tool_input: Option<&Value>,
@@ -1269,12 +1278,14 @@ pub fn codex_request_user_input(
     version: Option<(u64, u64, u64)>,
 ) -> Option<PendingQuestion> {
     let tables = agent_tables(&AgentType::Codex);
+    let mut beyond_digits = false;
     let questions = tool_input?
         .get("questions")?
         .as_array()?
         .iter()
         .map(|question| {
             let mut options = payload_options(question);
+            beyond_digits |= options.len() > CODEX_DIGIT_OPTIONS as usize;
             let next = options.len() as u32 + 1;
             options.extend(table_options(
                 tables,
@@ -1306,7 +1317,11 @@ pub fn codex_request_user_input(
             detail: None,
             use_id: tool_use_id.map(str::to_string),
         }),
-        channel: channel_for(tables, version, AnswerChannel::Keys),
+        channel: if beyond_digits {
+            AnswerChannel::Unsupported
+        } else {
+            channel_for(tables, version, AnswerChannel::Keys)
+        },
         subagent_id: None,
         revision: None,
     })
@@ -1727,7 +1742,9 @@ pub fn answer_keys(
             ordered
                 .into_iter()
                 .map(|answer| match answer.option_indices.as_slice() {
-                    [index] if (1..=9).contains(index) && answer.text.is_none() => {
+                    [index]
+                        if (1..=CODEX_DIGIT_OPTIONS).contains(index) && answer.text.is_none() =>
+                    {
                         Ok(index.to_string())
                     }
                     _ => Err(AnswerRefusal::Unsupported),
@@ -2453,6 +2470,73 @@ mod tests {
             opencode_reply(&shown, &props, &forged),
             None,
             "eight answers are not posted as the answer to nine questions"
+        );
+    }
+
+    /// Scenario: Codex asks a form whose second question has ten options, one
+    /// more than a digit can pick. The whole form is keyboard-only: no option
+    /// is offered, picking option 10 is refused before any countdown, and no
+    /// key is typed for it. A form whose questions have nine options each
+    /// stays answerable by keys, its ninth option typed as `9`.
+    #[spec("question/model/005")]
+    #[test]
+    fn question_model_005_a_codex_question_with_more_than_nine_options_is_keyboard_only() {
+        let options = |n: usize| -> Vec<Value> {
+            (1..=n)
+                .map(|i| serde_json::json!({"label": format!("Option {i}")}))
+                .collect()
+        };
+        let form = |second: usize| {
+            let input = serde_json::json!({"questions": [
+                {"id": "first", "question": "First?", "options": options(2)},
+                {"id": "second", "question": "Second?", "options": options(second)},
+            ]});
+            codex_request_user_input(Some("call_wide"), Some(&input), 1, None)
+                .expect("a form")
+                .sanitized()
+                .expect("still shown")
+        };
+
+        let wide = form(10);
+        assert_eq!(wide.questions[1].options[9].label, "Option 10", "shown");
+        assert_eq!(wide.channel, AnswerChannel::Unsupported, "keyboard-only");
+        assert!(!wide.has_answerable_option(), "nothing is offered");
+        assert_eq!(
+            wide.validate(&[answer(0, &[1], None), answer(1, &[10], None)], false),
+            Err(AnswerRefusal::Unsupported),
+            "option 10 is refused before the countdown, not after it"
+        );
+        assert_eq!(
+            wide.validate(&[answer(0, &[1], None), answer(1, &[2], None)], false),
+            Err(AnswerRefusal::Unsupported),
+            "options 1-9 are not offered alone either"
+        );
+        let resolved = |q: &PendingQuestion, index: u32| ResolvedAnswer {
+            question_index: 1,
+            option_indices: vec![index],
+            labels: vec![q.questions[1].options[index as usize - 1].label.clone()],
+            roles: vec![OptionRole::Choice],
+            text: None,
+        };
+        assert_eq!(
+            answer_keys(&AgentType::Codex, &wide, &[resolved(&wide, 10)]),
+            Err(AnswerRefusal::Unsupported),
+            "no digit picks option 10"
+        );
+
+        let nine = form(9);
+        assert_eq!(nine.channel, AnswerChannel::Keys);
+        assert!(
+            nine.questions[1].options[9].keyboard_only,
+            "the tenth row is Codex's own None of the above"
+        );
+        assert!(
+            nine.validate(&[answer(0, &[1], None), answer(1, &[9], None)], false)
+                .is_ok()
+        );
+        assert_eq!(
+            answer_keys(&AgentType::Codex, &nine, &[resolved(&nine, 9)]),
+            Ok(vec!["9".to_string()])
         );
     }
 

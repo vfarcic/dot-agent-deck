@@ -7972,6 +7972,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the desktop's keyboard-only row for such a form (`question/desktop/*`).
 - **Platform coverage:** mac+linux.
 
+##### question/model/005 — A Codex form with a question of more than nine options is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Codex `request_user_input` built by the deck's own parser).
+- **Asserts:** a form whose second question has ten options shows all ten with the channel `unsupported`, offers no option, and refuses an answer picking option 10, or one picking only options 1–9, as `unsupported`; `answer_keys` types nothing for option 10; a form of nine options per question stays on `keys` and types `9` for the ninth, with Codex's appended None of the above tenth and keyboard-only.
+- **Does not assert:** Codex's own UI (digits `1`–`9` only, read from Codex 0.160.0's `request_user_input` source, not measured live); the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/detect
 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.

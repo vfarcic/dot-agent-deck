@@ -135,7 +135,7 @@ Two outcomes are not "nothing was sent":
 | Agent | By voice | By keyboard only |
 | --- | --- | --- |
 | Claude Code 2.1.136 or newer | Permission prompts: **Yes**, the "always" option, **No**. Multiple-choice questions and forms, including questions with several answers and **Type something.** Plan approval: **Yes, auto-accept edits** and **Yes, manually approve edits**. | **Chat about this**; plan approval's **Tell Claude what to change**; forms from MCP servers; the folder-trust question when Claude Code starts. |
-| Codex | Command approvals: **Yes, proceed**, the "don't ask again" option, **No**. Multiple-choice questions and forms in Plan mode, one answer per question. | **None of the above**; the folder-trust question when Codex starts. |
+| Codex | Command approvals: **Yes, proceed**, the "don't ask again" option, **No**. Multiple-choice questions and forms in Plan mode, one answer per question. | **None of the above**; a question with more than nine options, which makes its whole form keyboard-only; the folder-trust question when Codex starts. |
 | OpenCode | Permission prompts: **Allow once**, **Allow always**, **Reject**. Question menus and forms, including questions with several answers and **Type your own answer**. | — |
 | Pi | Pi asks no questions of its own. The dialogs other Pi extensions show: a choice from a list, a yes-or-no confirmation, and a box to type into. | Other extension dialogs, such as an editor or a custom screen. |
 | Devin | Permission prompts: **Allow once** and deny. **Untested**: built from Devin's documentation and not yet tried with a running Devin. | Every other permission option. |
