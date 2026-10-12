@@ -8,7 +8,7 @@ mod route;
 
 use spec::spec;
 
-/// Scenario: Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Exactly one seed waits in its inbox and is fetched after Idle without typed seed bytes or a typed retry.
+/// Scenario: Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Before fetching, the pane may receive only fixed doorbells; after Idle it fetches and visibly renders exactly one seed without typed seed content.
 #[spec("codex/wrap/007")]
 #[test]
 fn codex_wrap_007_untrusted_codex_pane_receives_its_seed_once() {

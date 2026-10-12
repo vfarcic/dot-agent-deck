@@ -5500,10 +5500,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** what the delegate gate then does with the signal (`orchestration/delegate/029`); the fork-time event's own card-surfacing role (`orchestration/delegate/007`); real codex-cli boot output (`codex/live/001`).
 - **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
-##### codex/wrap/007 — Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Exactly one seed waits in its inbox and is fetched after Idle without typed seed bytes or a typed retry.
+##### codex/wrap/007 — Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Before fetching, the pane may receive only fixed doorbells; after Idle it fetches and visibly renders exactly one seed without typed seed content.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Exactly one seed waits in its inbox and is fetched after Idle without typed seed bytes or a typed retry.
+- **Asserts:** Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Before fetching, the pane may receive only fixed doorbells; after Idle it fetches and visibly renders exactly one seed without typed seed content.
 - **Test:** `codex_wrap_007_untrusted_codex_pane_receives_its_seed_once` in `tests/e2e_codex_seed_delivery.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
