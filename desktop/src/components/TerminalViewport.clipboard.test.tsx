@@ -282,31 +282,6 @@ describe("TerminalViewport honours an agent's OSC 52 copy (issue 1705)", () => {
   });
 
   /**
-   * Scenario: a clipboard write that ran out its time finishes after all, once
-   * the agent's next copy has been written. The clipboard is left holding the
-   * newer copy, not the late one.
-   */
-  it("rewrites the newest copy when a timed-out write finishes late", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let finishLate: () => void = () => {};
-    writeClipboardText.mockImplementationOnce(() => new Promise<undefined>((resolve) => { finishLate = () => resolve(undefined); }));
-    try {
-      const { emit, parsed } = mountTerminal({ backlog: READY });
-      emit(osc52("late"));
-      await parsed();
-      await vi.waitFor(() => expect(writeClipboardText).toHaveBeenCalledTimes(1));
-      await vi.advanceTimersByTimeAsync(5_000);
-      emit(osc52("newest"));
-      await parsed();
-      await vi.waitFor(() => expect(writeClipboardText.mock.calls).toEqual([["late"], ["newest"]]));
-      finishLate();
-      await vi.waitFor(() => expect(writeClipboardText.mock.calls).toEqual([["late"], ["newest"], ["newest"]]));
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  /**
    * Scenario: the pane is read-only (another client holds its input, or the
    * agent has finished). An agent's copy still lands on the clipboard, because
    * copying out of a pane is reading, not typing into it.

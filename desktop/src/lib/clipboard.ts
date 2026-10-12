@@ -17,8 +17,42 @@
  * bridge) it falls back to the web API, which is all a browser has.
  */
 export async function writeClipboardText(text: string): Promise<void> {
+  const write = ++writesStarted;
+  newestText = text;
+  await platformWrite(text);
+  settled(write);
+}
+
+/*
+ * Issue #1705 — the clipboard ends on the NEWEST write, whoever made it.
+ *
+ * Each write is an import and an IPC round trip, and two in flight at once can
+ * finish in either order: an agent's copy, a Reader's Copy all, a notice's
+ * Copy button. A write that finishes after a newer one has already finished
+ * landed last and left older text on the clipboard, so the newest text is
+ * written again. While the newest write is still in flight nothing is done:
+ * it lands after this one anyway. Every writer in the app goes through here,
+ * which is why the repair lives here and not in any one caller's queue.
+ */
+let writesStarted = 0;
+let newestFinished = 0;
+let newestText = "";
+
+function settled(write: number): void {
+  if (write > newestFinished) {
+    newestFinished = write;
+    return;
+  }
+  if (newestFinished === writesStarted) void writeClipboardText(newestText).catch(() => undefined);
+}
+
+/** Loaded once and shared, so writes started together wait on one import. */
+let pluginInvoke: Promise<typeof import("@tauri-apps/api/core")["invoke"]> | undefined;
+
+async function platformWrite(text: string): Promise<void> {
   if (window.__TAURI_INTERNALS__) {
-    const { invoke } = await import("@tauri-apps/api/core");
+    pluginInvoke ??= import("@tauri-apps/api/core").then((core) => core.invoke);
+    const invoke = await pluginInvoke;
     await invoke("plugin:clipboard-manager|write_text", { text });
     return;
   }
