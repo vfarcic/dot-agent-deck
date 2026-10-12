@@ -85,16 +85,20 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
                 // socket inherits the listener's O_NONBLOCK (Linux's does
                 // not), and the read would fail with `WouldBlock`; make it
                 // blocking, bounded by the same deadline as the accept loop.
+                //
+                // The bound is best-effort. macOS refuses `SO_RCVTIMEO` with
+                // EINVAL once the peer has closed its end, which a short-lived
+                // hook can do before this line runs. A peer that is gone
+                // cannot hang the read: it returns what is buffered and then
+                // EOF, so a refused timeout costs nothing.
                 stream
                     .set_nonblocking(false)
                     .expect("make the accepted stream blocking");
-                stream
-                    .set_read_timeout(Some(
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .max(Duration::from_millis(1)),
-                    ))
-                    .expect("bound the read of the emitted AgentEvent");
+                let _ = stream.set_read_timeout(Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                ));
                 let mut line = String::new();
                 std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
