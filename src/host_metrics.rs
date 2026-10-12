@@ -767,6 +767,15 @@ struct MacVmCounts {
     compressed: u64,
 }
 
+// `<mach/mach_host.h>`: the kernel's page size. `libc` does not declare it.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn host_page_size(
+        host: libc::mach_port_t,
+        out_page_size: *mut libc::vm_size_t,
+    ) -> libc::kern_return_t;
+}
+
 /// One `host_statistics64(HOST_VM_INFO64)` reading.
 ///
 /// **`mach_host_self` comes from `libc`, which marks it deprecated** in favour
@@ -775,15 +784,6 @@ struct MacVmCounts {
 /// call that would need it, so allowing the lint is the smaller addition than
 /// a new dependency. The port is taken once per process: each call adds a
 /// reference to the same host port, which nothing here would release.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    /// `<mach/mach_host.h>`: the kernel's page size. `libc` does not declare it.
-    fn host_page_size(
-        host: libc::mach_port_t,
-        out_page_size: *mut libc::vm_size_t,
-    ) -> libc::kern_return_t;
-}
-
 #[cfg(target_os = "macos")]
 fn macos_vm_counts() -> Option<MacVmCounts> {
     static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
