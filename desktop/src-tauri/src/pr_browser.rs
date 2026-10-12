@@ -2238,14 +2238,17 @@ mod tests {
     /// main webview is itself a child webview, which wry gives only a
     /// `ViewMinYMargin` autoresizing mask: AppKit keeps its distance from the
     /// top and never resizes it, and only Tauri's own bounds calls size it.
-    /// Each case gives the rectangle the platform reports for the main
-    /// webview, and the page must start at or below the toolbar's bottom edge
-    /// and stay inside the main webview. The first macOS case models the
-    /// reported symptom (the cause on the user's Mac is inferred, not
-    /// observed): a main webview one title bar (28 points) below the content
-    /// view's top put the page 28 points too high, over all but the top of
-    /// the toolbar. The Linux and Windows cases, where the main webview
-    /// fills the window, are the controls.
+    /// Each case supplies the rectangle the platform would report for the
+    /// main webview — the displacement is given here, not measured on a Mac —
+    /// and the page must start at or below the toolbar's bottom edge and stay
+    /// inside the main webview. The first macOS case models the reported
+    /// symptom (the cause on the user's Mac is inferred, not observed): a main
+    /// webview one title bar (28 points) below the content view's top put the
+    /// page 28 points too high, over all but the top of the toolbar. The
+    /// Windows case with an offset origin gives it in physical pixels at
+    /// scale 2, the unit WebView2's bounds come in. The Linux cases are an
+    /// arithmetic control only: on Linux the page is placed by
+    /// `overlay::place` after it opens, not by `Bounds::on`.
     #[test]
     fn the_page_never_covers_the_toolbar() {
         use tauri::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -2262,90 +2265,104 @@ mod tests {
             viewport_width: css_width,
             viewport_height: css_height,
         };
-        let logical = |y: f64, width: f64, height: f64| tauri::Rect {
-            position: LogicalPosition::new(0.0, y).into(),
-            size: LogicalSize::new(width, height).into(),
+        let logical = |y: f64, width: f64, height: f64| {
+            Ok(tauri::Rect {
+                position: LogicalPosition::new(0.0, y).into(),
+                size: LogicalSize::new(width, height).into(),
+            })
         };
-        let physical = |width: u32, height: u32| tauri::Rect {
-            position: PhysicalPosition::new(0, 0).into(),
-            size: PhysicalSize::new(width, height).into(),
+        let physical = |x: i32, y: i32, width: u32, height: u32| {
+            Ok(tauri::Rect {
+                position: PhysicalPosition::new(x, y).into(),
+                size: PhysicalSize::new(width, height).into(),
+            })
         };
-        // (case, surface, the main webview's top and size in logical pixels,
-        // its size in CSS pixels)
+        // (case, surface, the main webview's left, top and size in logical
+        // pixels, its size in CSS pixels)
         let cases = [
             (
                 "macOS, main webview a title bar below the content view's top, scale 1",
                 Surface {
                     scale: 1.0,
-                    main_webview: Some(logical(28.0, 1440.0, 892.0)),
+                    main_webview: logical(28.0, 1440.0, 892.0),
                     window_content: PhysicalSize::new(1440, 920),
                 },
-                (28.0, 1440.0, 892.0),
+                (0.0, 28.0, 1440.0, 892.0),
                 (1440.0, 892.0),
             ),
             (
                 "macOS, main webview a title bar below the content view's top, scale 2, app zoom 125%",
                 Surface {
                     scale: 2.0,
-                    main_webview: Some(logical(28.0, 1728.0, 1089.0)),
+                    main_webview: logical(28.0, 1728.0, 1089.0),
                     window_content: PhysicalSize::new(3456, 2234),
                 },
-                (28.0, 1728.0, 1089.0),
+                (0.0, 28.0, 1728.0, 1089.0),
                 (1728.0 / 1.25, 1089.0 / 1.25),
             ),
             (
                 "macOS, main webview larger than the content size the window reports, scale 2",
                 Surface {
                     scale: 2.0,
-                    main_webview: Some(logical(0.0, 1728.0, 1117.0)),
+                    main_webview: logical(0.0, 1728.0, 1117.0),
                     window_content: PhysicalSize::new(2880, 1840),
                 },
-                (0.0, 1728.0, 1117.0),
+                (0.0, 0.0, 1728.0, 1117.0),
                 (1728.0, 1117.0),
             ),
             (
                 "Linux, scale 1, WebKitGTK at 100 DPI",
                 Surface {
                     scale: 1.0,
-                    main_webview: Some(logical(0.0, 1440.0, 920.0)),
+                    main_webview: logical(0.0, 1440.0, 920.0),
                     window_content: PhysicalSize::new(1440, 920),
                 },
-                (0.0, 1440.0, 920.0),
+                (0.0, 0.0, 1440.0, 920.0),
                 (1440.0 / 1.04, 920.0 / 1.04),
             ),
             (
                 "Linux, scale 2",
                 Surface {
                     scale: 2.0,
-                    main_webview: Some(logical(0.0, 1440.0, 920.0)),
+                    main_webview: logical(0.0, 1440.0, 920.0),
                     window_content: PhysicalSize::new(2880, 1840),
                 },
-                (0.0, 1440.0, 920.0),
+                (0.0, 0.0, 1440.0, 920.0),
                 (1440.0, 920.0),
             ),
             (
                 "Windows, scale 2",
                 Surface {
                     scale: 2.0,
-                    main_webview: Some(physical(2880, 1840)),
+                    main_webview: physical(0, 0, 2880, 1840),
                     window_content: PhysicalSize::new(2880, 1840),
                 },
-                (0.0, 1440.0, 920.0),
+                (0.0, 0.0, 1440.0, 920.0),
                 (1440.0, 920.0),
             ),
             (
-                "a main webview that cannot report its bounds, scale 2",
+                "Windows, main webview at physical (100, 56) in the content area, scale 2",
                 Surface {
                     scale: 2.0,
-                    main_webview: None,
+                    main_webview: physical(100, 56, 2780, 1784),
                     window_content: PhysicalSize::new(2880, 1840),
                 },
-                (0.0, 1440.0, 920.0),
+                (50.0, 28.0, 1390.0, 892.0),
+                (1390.0, 892.0),
+            ),
+            (
+                "a main webview that cannot report its bounds and fills the window, scale 2",
+                Surface {
+                    scale: 2.0,
+                    main_webview: Err("no bounds".into()),
+                    window_content: PhysicalSize::new(2880, 1840),
+                },
+                (0.0, 0.0, 1440.0, 920.0),
                 (1440.0, 920.0),
             ),
         ];
-        for (case, surface, (top, width, height), (css_width, css_height)) in cases {
-            let placed = frame_in(css_width, css_height).on(surface);
+        for (case, surface, (left, top, width, height), (css_width, css_height)) in cases {
+            let placed = frame_in(css_width, css_height).on(&surface);
             let toolbar_bottom = top + TOOLBAR_BOTTOM * height / css_height;
             assert!(
                 placed.y >= toolbar_bottom - 0.5,
@@ -2354,15 +2371,173 @@ mod tests {
             );
             assert!(
                 placed.y + placed.height <= top + height + 0.5
-                    && placed.x + placed.width <= width + 0.5,
-                "{case}: the page runs past the main webview's {width}x{height} at y={top} ({placed:?})"
+                    && placed.x + placed.width <= left + width + 0.5,
+                "{case}: the page runs past the main webview's {width}x{height} at ({left}, {top}) ({placed:?})"
             );
             assert!(
-                placed.x >= 15.0 * width / css_width - 0.5
+                placed.x >= left + 15.0 * width / css_width - 0.5
                     && placed.y + placed.height >= top + height - 15.0 * height / css_height - 1.0,
                 "{case}: the page does not fill its frame ({placed:?})"
             );
         }
+    }
+
+    /// What the fallback does: a main webview whose bounds cannot be read is
+    /// assumed to fill the window from its top-left corner, so the frame is
+    /// mapped onto `inner_size` from there — the placement from before
+    /// `Bounds::on`. With a main webview that is in fact one title bar (28
+    /// points) lower and that much shorter, the page lands where the old
+    /// placement put it: about 26 points above the toolbar's bottom edge,
+    /// covering most of the toolbar. The warning names the fallback and the
+    /// error, so a placement made this way can be told apart in the log.
+    #[test]
+    fn the_fallback_places_from_the_window_corner() {
+        use tauri::PhysicalSize;
+
+        let frame = Bounds {
+            x: 15.0,
+            y: 55.0,
+            width: 1410.0,
+            height: 822.0,
+            viewport_width: 1440.0,
+            viewport_height: 892.0,
+        };
+        let surface = Surface {
+            scale: 2.0,
+            main_webview: Err("the webview is gone".into()),
+            window_content: PhysicalSize::new(2880, 1840),
+        };
+        let placed = frame.on(&surface);
+        assert_eq!(
+            placed,
+            frame.onto(1440.0, 920.0),
+            "the fallback maps onto inner_size from the window's corner"
+        );
+        // Where the toolbar's bottom edge really is, in the main webview one
+        // title bar down.
+        let toolbar_bottom = 28.0 + 55.0;
+        assert!(
+            (toolbar_bottom - placed.y - 26.3).abs() < 0.5,
+            "with an offset main webview the fallback puts the page about 26 points over the toolbar ({placed:?})"
+        );
+
+        let warning = fallback_warning("the webview is gone");
+        assert!(warning.starts_with(PLACEMENT_LOG_PREFIX), "{warning}");
+        assert!(
+            warning.contains("the webview is gone")
+                && warning.contains("fallback")
+                && warning.contains("inner_size()"),
+            "{warning}"
+        );
+        let line = placement_line(&surface, frame, placed);
+        assert!(
+            line.contains("bounds() unavailable (the webview is gone), fallback in use"),
+            "{line}"
+        );
+    }
+
+    /// A placement line carries everything the placement was computed from,
+    /// with the kind of each rectangle the platform reported.
+    #[test]
+    fn a_placement_line_names_its_inputs_and_result() {
+        use tauri::{LogicalPosition, LogicalSize, PhysicalSize};
+
+        let surface = Surface {
+            scale: 2.0,
+            main_webview: Ok(tauri::Rect {
+                position: LogicalPosition::new(0.0, 28.0).into(),
+                size: LogicalSize::new(1440.0, 892.0).into(),
+            }),
+            window_content: PhysicalSize::new(2880, 1840),
+        };
+        let frame = Bounds {
+            x: 15.0,
+            y: 55.0,
+            width: 1410.0,
+            height: 822.0,
+            viewport_width: 1440.0,
+            viewport_height: 892.0,
+        };
+        let line = placement_line(&surface, frame, frame.on(&surface));
+        assert_eq!(
+            line,
+            "dot-agent-deck-desktop: PR page placement: main webview bounds() origin logical (0.00, 28.00) size logical 1440.00x892.00; inner_size() physical 2880x1840; scale factor 2; frame from the page x=15.00 y=55.00 1410.00x822.00 in a 1440.00x892.00 page (CSS px); applied to the PR webview logical x=15.00 y=83.00 1410.00x822.00"
+        );
+    }
+
+    /// The first placement after an open is printed, a repeat is not, a
+    /// change inside the interval is held and printed by the flush, and the
+    /// fallback warning comes once per open.
+    #[test]
+    fn placements_are_logged_on_open_and_on_change_at_most_once_an_interval() {
+        let log = PlacementLog::new(Duration::from_secs(1));
+        let at = |y: f64| Placed {
+            x: 15.0,
+            y,
+            width: 100.0,
+            height: 100.0,
+        };
+        let start = Instant::now();
+        let after = |ms: u64| start + Duration::from_millis(ms);
+        let line = |text: &'static str| move || text.to_string();
+
+        log.opened();
+        assert_eq!(
+            log.placed(start, at(55.0), None, line("first")).lines,
+            ["first"]
+        );
+        assert_eq!(
+            log.placed(after(10), at(55.0), None, line("same")),
+            PlacementReport::default()
+        );
+
+        // A resize drag: the first change is held with a flush scheduled for
+        // the end of the interval, the next replaces it without scheduling
+        // another, and the flush prints the last one.
+        let report = log.placed(after(200), at(60.0), None, line("drag 1"));
+        assert_eq!(
+            report,
+            PlacementReport {
+                lines: vec![],
+                flush_after: Some(Duration::from_millis(800))
+            }
+        );
+        assert_eq!(
+            log.placed(after(400), at(65.0), None, line("drag 2")),
+            PlacementReport::default()
+        );
+        assert_eq!(log.flush(after(1000)).as_deref(), Some("drag 2"));
+        assert_eq!(log.flush(after(1001)), None);
+        assert_eq!(
+            log.placed(after(1100), at(65.0), None, line("settled")),
+            PlacementReport::default()
+        );
+
+        // After the interval a change prints at once.
+        assert_eq!(
+            log.placed(after(2100), at(70.0), None, line("moved")).lines,
+            ["moved"]
+        );
+
+        // A change that goes back to the printed placement drops what was held.
+        log.placed(after(2200), at(75.0), None, line("held"));
+        log.placed(after(2300), at(70.0), None, line("back"));
+        assert_eq!(log.flush(after(3100)), None);
+
+        // The fallback warning: once per open, and again after the next open.
+        let first = log.placed(after(5000), at(80.0), Some("gone"), line("fallback"));
+        assert_eq!(
+            first.lines,
+            [fallback_warning("gone"), "fallback".to_string()]
+        );
+        let again = log.placed(after(5010), at(80.0), Some("gone"), line("fallback"));
+        assert!(again.lines.is_empty(), "{again:?}");
+        log.opened();
+        let reopened = log.placed(after(5020), at(80.0), Some("gone"), line("reopened"));
+        assert_eq!(
+            reopened.lines,
+            [fallback_warning("gone"), "reopened".to_string()]
+        );
     }
 
     /// Decision 4: the files that grant permissions name only the app's own
