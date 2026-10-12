@@ -224,6 +224,7 @@ impl Remote {
             &AttachRequest::Hello {
                 client_version: dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
                 client_build_version: None,
+                follow_on: false,
             },
         )
         .ok()

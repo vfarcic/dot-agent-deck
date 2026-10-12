@@ -290,6 +290,13 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# The close scenario adds a third interactive turn after the real dispatch and
+# completion, so retain its own assertion diagnostics on a loaded host. Its
+# pane/daemon lifetime cap is pinned to the same 900s in the test helper.
+[[profile.default.overrides]]
+filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # Issue #1616: `scheduler/dispatch/028` waits in five phases on a real
 # interactive Haiku — the first turn starting (90s), its output (90s), the card
 # settling Idle (120s), the follow-up's turn starting (60s) and its output

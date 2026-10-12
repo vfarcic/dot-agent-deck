@@ -362,7 +362,7 @@ fn names_a_relative_path(command: &str) -> bool {
     })
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
         .replace("..", "_")
         .replace('\0', "")
@@ -901,49 +901,50 @@ pub async fn handle_dispatch(
 
     let notifier = StderrNotifier;
 
-    match spawn(
-        req,
-        &ctx.registry,
-        &notifier,
-        Some(&ctx.event_tx),
-        false,
-        ctx.state.as_ref(),
-    )
-    .await
-    {
+    // PRD #1589 D5: a dispatch with a caller is a unit the `close` verb can
+    // later be authorized against, so it is recorded — inside the spawn, before
+    // its task is delivered (see `spawn_dispatched_unit`). A dispatch with no
+    // caller (an internal caller with nobody to report to) records nothing.
+    let spawned = match ctx.caller.as_ref() {
+        Some(caller) => {
+            crate::spawn::spawn_dispatched_unit(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+                crate::dispatched_units::UnitOrigin {
+                    name: name.to_string(),
+                    worktree: paths.worktree_dir.clone(),
+                    branch: paths.branch.clone(),
+                    clone_dir: clone_dir.clone(),
+                    dispatcher: crate::dispatched_units::Dispatcher {
+                        pane_id: caller.pane_id.clone(),
+                        agent_id: caller.agent_id.clone(),
+                    },
+                },
+                caller.clone(),
+            )
+            .await
+        }
+        None => {
+            spawn(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+            )
+            .await
+        }
+    };
+    match spawned {
         Ok(handle) => {
-            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
-            // the single agent's pane, or the orchestration's start role — which is
-            // the pane a `work-done --done` will arrive under. Registered here, at
-            // the first moment that pane id exists, rather than by the daemon after
-            // this call returns: every instant between the spawn and the
-            // registration is an instant in which a completion resolves to nothing.
-            if let Some(caller) = ctx.caller.clone() {
-                tracing::debug!(
-                    unit_pane_id = %handle.delivery_pane_id,
-                    unit_agent_id = %handle.delivery_agent_id,
-                    caller_pane_id = %caller.pane_id,
-                    // PRD #220 Phase 2 review (finding A4), missed here and caught
-                    // by PR #1081's review (Greptile finding 3): the unit name is
-                    // producer-supplied and rode into this field raw, where a bare
-                    // LF forges a log line, a CR overwrites the one being written
-                    // and a bidi override reorders whatever renders it.
-                    unit = %crate::config_validation::escape_field_for_log(
-                        &caller.unit_name,
-                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-                    ),
-                    "dispatch: retained the caller for this unit's completion report"
-                );
-                // Bound to the unit's AGENT as well as its pane: a pane id is a
-                // recycled handle, and a predecessor's late EOF would otherwise
-                // evict this route out from under the agent that now holds the
-                // pane (PR #1081 review, Greptile finding 1).
-                ctx.registry.register_dispatch_return(
-                    &handle.delivery_pane_id,
-                    &handle.delivery_agent_id,
-                    caller,
-                );
-            }
+            // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
+            // unit's completion report inside the spawn, before the task was
+            // delivered — see `crate::spawn::spawn_dispatched_unit`.
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: true,
@@ -958,15 +959,22 @@ pub async fn handle_dispatch(
                 // The base clause is appended rather than interpolated into both
                 // arms so a failed probe degrades to the pre-#674 sentence exactly,
                 // instead of leaving a dangling "cut from ".
+                //
+                // PRD #1589: the branch is named too, so a runner can record the
+                // branch each unit works on as dispatch created it — what
+                // `/issue-queue` intersects with the merged branches before a
+                // `close --all` — instead of reconstructing it from the name.
                 message: {
                     let opened = match &handle.kind {
                         SpawnKind::Orchestration { name: orch } => format!(
-                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                         SpawnKind::SingleAgent => format!(
-                            "{SPAWNED_OPENING} agent for '{name}' in {}",
-                            paths.worktree_dir.display()
+                            "{SPAWNED_OPENING} agent for '{name}' in {} on branch {}",
+                            paths.worktree_dir.display(),
+                            paths.branch
                         ),
                     };
                     let mut msg = match &base {
@@ -2274,6 +2282,16 @@ mod tests {
             "the reported shape must say orchestration, got: {}",
             result.message
         );
+        // PRD #1589: the reply names the branch the unit works on, which is what
+        // `/issue-queue` records per unit for its `close --all` ledger.
+        assert!(
+            result.message.contains(&format!(
+                "in {} on branch agent/dispatch-team-unit",
+                worktree.display()
+            )),
+            "the success reply must name the worktree and its branch, got: {}",
+            result.message
+        );
 
         // Issue #1233: the orchestration's own per-publish file, not the
         // compatibility mirror beside it.
@@ -2770,6 +2788,200 @@ mod tests {
         );
         assert!(!worktree_dir.exists());
         assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"));
+    }
+
+    /// Scenario: reviewer nit-R1 (PRD #1589) — a dispatched orchestration is
+    /// closed while it is starting, and its dispatch resumes while the close
+    /// still holds the instance: one role stopped, the other still running in
+    /// the worktree. The dispatch answers that it was closed, and its rollback
+    /// finds a live role and retains the worktree; the close then stops that
+    /// role and removes the worktree itself, reporting it. The worktree is
+    /// never left behind with nothing to reclaim it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_closed_mid_construction_leaves_no_orphaned_worktree() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::spawn::{RoleSpawn, SpawnTarget};
+        struct SilentNotifier;
+        impl crate::scheduler::Notifier for SilentNotifier {
+            fn notify(&self, _event: crate::scheduler::NotifyEvent) {}
+        }
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let worktree_dir = repo.parent().unwrap().join("repo-dispatch-nit-r1");
+        let branch = "agent/dispatch-nit-r1";
+        create_worktree(
+            &repo,
+            &worktree_dir,
+            branch,
+            false,
+            Creator::dispatch("nit-r1"),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _keep) = tokio::sync::broadcast::channel(1024);
+        let worktrees = new_worktree_registry();
+        record_worktree(&worktrees, &worktree_dir, &repo, RemovalPolicy::KeepIfDirty);
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+
+        let (dispatch_reached, dispatch_release) =
+            registry.pause_at_for_test("dispatch-publication");
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let role = |idx: usize, name: &str| RoleSpawn {
+                agent_type: None,
+                role_index: idx,
+                role_name: name.to_string(),
+                command: "sleep 30".to_string(),
+                is_start_role: idx == 0,
+            };
+            let req = SpawnRequest {
+                task_name: "dispatch-nit-r1".to_string(),
+                working_dir: worktree_dir.to_string_lossy().into_owned(),
+                command: None,
+                prompt: "unused".to_string(),
+                resolved_target: Some(SpawnTarget::Orchestration {
+                    name: "nit-r1".to_string(),
+                    roles: vec![role(0, "orchestrator"), role(1, "worker")],
+                    config: Box::new(OrchestrationConfig {
+                        default: false,
+                        name: "nit-r1".to_string(),
+                        roles: vec![OrchestrationRoleConfig {
+                            agent: None,
+                            name: "orchestrator".to_string(),
+                            command: "sleep 30".to_string(),
+                            start: true,
+                            description: None,
+                            prompt_template: None,
+                            clear: false,
+                        }],
+                    }),
+                }),
+                compose_orchestrator_context: None,
+            };
+            let origin = crate::dispatched_units::UnitOrigin {
+                name: "nit-r1".to_string(),
+                worktree: worktree_dir.clone(),
+                branch: branch.to_string(),
+                clone_dir: repo.clone(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "nobody".to_string(),
+                },
+            };
+            let caller = crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".to_string(),
+                agent_id: "nobody".to_string(),
+                unit_name: "nit-r1".to_string(),
+            };
+            tokio::spawn(async move {
+                crate::spawn::spawn_dispatched_unit(
+                    req,
+                    &registry,
+                    &SilentNotifier,
+                    Some(&event_tx),
+                    true,
+                    Some(&state),
+                    origin,
+                    caller,
+                )
+                .await
+                .map(|handle| handle.unit_id)
+            })
+        };
+        dispatch_reached
+            .await
+            .expect("the dispatch reaches its publication");
+        let orchestrator = registry
+            .agent_records()
+            .into_iter()
+            .find(|r| {
+                matches!(
+                    &r.tab_membership,
+                    Some(crate::agent_pty::TabMembership::Orchestration {
+                        is_start_role: true,
+                        ..
+                    })
+                )
+            })
+            .and_then(|r| r.pane_id_env)
+            .expect("the orchestrator was published");
+
+        let (close_reached, close_release) = registry.pause_at_for_test("close-after-first-stop");
+        let close = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let worktrees = worktrees.clone();
+            tokio::spawn(async move {
+                crate::close_agents::handle_close_agents(
+                    crate::daemon_protocol::CloseSelector::OrchestrationOf {
+                        pane_id: orchestrator,
+                    },
+                    None,
+                    false,
+                    false,
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &worktrees,
+                )
+                .await
+            })
+        };
+        close_reached
+            .await
+            .expect("the close stops the orchestrator and pauses");
+
+        let _ = dispatch_release.send(());
+        let result = spawned.await.unwrap();
+        assert!(
+            matches!(&result, Err(crate::spawn::SpawnError::Agent(m))
+                if m == crate::spawn::CLOSED_WHILE_STARTING),
+            "{result:?}"
+        );
+        let rollback =
+            rollback_dispatched_worktree(&registry, &worktrees, &worktree_dir, &repo, branch).await;
+        assert_eq!(
+            rollback,
+            RollbackOutcome::Retained { live: 1 },
+            "the close is still stopping the worker, so the rollback leaves the tree"
+        );
+        assert!(
+            worktrees.lock().unwrap().contains_key(&worktree_dir),
+            "a retained tree keeps the entry a later cleanup finds it by"
+        );
+
+        let _ = close_release.send(());
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(
+            target.outcome,
+            crate::daemon_protocol::CloseOutcome::Closed,
+            "{target:?}"
+        );
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(crate::daemon_protocol::WorktreeVerdictKind::Removed),
+            "the close that owns the teardown reclaims the tree: {target:?}"
+        );
+        assert!(!worktree_dir.exists(), "the worktree is not orphaned");
+        assert!(!worktrees.lock().unwrap().contains_key(&worktree_dir));
+        assert!(registry.agent_records().is_empty());
+        assert_eq!(registry.dispatched_units().live().count(), 0);
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a

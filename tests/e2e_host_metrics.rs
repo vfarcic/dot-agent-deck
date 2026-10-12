@@ -95,6 +95,7 @@ async fn protocol_host_metrics_001_socket_reports_host_numbers_without_paths() {
         &AttachRequest::Hello {
             client_version: dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         },
     )
     .await;

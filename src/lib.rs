@@ -7,6 +7,10 @@ pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
+// PRD #1589: the daemon side of `close` — resolve, authorize, refuse or close.
+pub mod close_agents;
+// PRD #1589: the `close` command's request building and report rendering.
+pub mod close_cli;
 pub mod codex_hooks_manage;
 pub mod codex_rollout_tail;
 pub mod config;
@@ -34,6 +38,8 @@ pub mod directory_listing;
 // Issue #544: automatic first writes wait while the user has an unsent draft.
 pub mod dispatch;
 pub mod dispatch_return;
+// PRD #1589: the record of dispatched units the `close` verb is authorized from.
+pub mod dispatched_units;
 pub mod draft_deferral;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
@@ -63,6 +69,7 @@ pub mod host_metrics;
 // crate switches it off. Every `git` the crate spawns is built here.
 pub(crate) mod git_env;
 pub mod hook;
+pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
@@ -133,6 +140,10 @@ mod test_temp;
 mod test_budget;
 #[cfg(test)]
 mod test_isolation;
+// Issue #1637: test-only. A Unix-style fixture path is not absolute on Windows,
+// so tests of absolute-vs-relative classification spell their paths through it.
+#[cfg(test)]
+mod test_paths;
 // Issue #1132: test-only, and shared for the same reason as the two above —
 // unit tests in `spawn.rs`, `ui.rs` and `state.rs` all drive the same `/bin/cat`
 // PTY byte target, and the content-keyed waits that make their assertions

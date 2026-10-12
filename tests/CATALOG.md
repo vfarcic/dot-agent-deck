@@ -2596,6 +2596,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/009 — Same-release stamped hooks update the card without a stale-binary notice.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; synthetic Claude hook lines.
+- **Asserts:** session, Working and Idle states render after stamped hooks; Hello carries no notice for either the daemon's build or an equal release triple with a different build id and a different sender path.
+- **Does not assert:** a real agent producing the stamps, or an older release's notice.
+- **Platform coverage:** mac+linux.
+
 #### hooks/ingest
 
 ##### hooks/ingest/001 — An over-long hook line is refused at the production cap rather than buffered, and the daemon keeps serving (issues #903 / #319).
@@ -2771,6 +2778,78 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
+
+##### hooks/install/015 — Automatic startup takes over an older pin only from a newer installed durable copy.
+- **Layer:** fast real-binary subprocess integration, isolated HOME under `CARGO_TARGET_TMPDIR`.
+- **Agent:** none; version-reporting shell stubs stand in for the old and newer installed pins.
+- **Asserts:** a real copy in HOME's `.local/bin` replaces the `0.0.1` pin in place, leaves one deck handler per installed event and preserves the user's handler slot and matcher; a `999.0.0` pin is kept.
+- **Does not assert:** ties, failed version probes or other agents' writers (unit-covered).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/016 — A newer temporary copy on PATH cannot take over a durable old pin.
+- **Layer:** fast real-binary subprocess integration, isolated HOME.
+- **Agent:** none; old pin reports `0.0.1`.
+- **Asserts:** automatic startup from a scratch copy on PATH keeps the old binary, one handler per installed event and the user's shared rule.
+- **Does not assert:** other ephemeral classifiers or explicit installation.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/017 — Automatic startup refuses to pin a translocated sidecar and names /Applications.
+- **Layer:** fast real-binary subprocess integration.
+- **Agent:** none.
+- **Asserts:** a real copy under an `AppTranslocation` bundle-shaped path with no fallback writes no Claude settings and logs the move-to-Applications remedy.
+- **Does not assert:** macOS's actual translocation machinery, or the absolute `/Volumes/<name>` prefix, covered by `platform::paths::tests::step_3_refuses_a_mounted_or_translocated_copy`.
+- **Platform coverage:** mac+linux.
+
+#### hooks/stale
+
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and both versions survive and no cut-down command is shown; an empty list draws nothing.
+- **Does not assert:** the dashboard's placement or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hook.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, resized to 80 columns the row still names the agent, `0.0.1` and this deck's version with no cut-off remedy, and back at full width a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Does not assert:** a real Claude emitting hooks, desktop rendering, takeover from an eligible binary, or a `brew upgrade` command (the sandbox's installed link makes the remedy this deck's own `hooks install`; `hooks/stale/006` covers the Homebrew row in L1); the built target binary and separate HOME keep takeover ineligible.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hooks.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
+- **Does not assert:** TUI rendering or real-agent work.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice. [reel]
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** real Claude Code, interactive Haiku `claude-haiku-4-5-20251001`, with imported credentials, seeded project trust and Bash allowed.
+- **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
+- **Does not assert:** an actual old release binary, the desktop strip, or model-specific prose; the wrapper changes stamp metadata but preserves event content and provenance.
+- **Platform coverage:** mac+linux; local credentials required, never CI.
+
+##### hooks/stale/005 — A command remedy is shown only beside the agents and both versions.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows the agents and both versions with the whole upgrade-or-reinstall advice, no part of the command and no clipped `⚠ Cl…` lead; at 300 columns it shows the command whole beside the full sentence.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/006 — A short command stays whole on a narrow row, with the facts shortened instead.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** at 80 and 100 columns, the two-agent Homebrew notice shows `Run: brew upgrade dot-agent-deck` whole, the first agent and both versions, fits the row, and shows no cut-off upgrade-or-reinstall advice.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/007 — The count of further notices survives a narrow row.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** with two notices, the row ends with `(+1 more)` at 40, 80 and 180 columns, and at 80 it still names the first agent and both versions.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
 
 ### Pane / agent lifecycle
 
@@ -4884,6 +4963,77 @@ without depending on the config struct API.
 - **Asserts:** a freshly dispatched worktree starts clean (the premise that makes the cleanup meaningful); the dialog warns while the tree is genuinely dirty; after the file is removed and the tree verified clean again, confirming REMOVES the worktree and the deck makes no `KEPT, not deleted` claim.
 - **Why it exists:** the close dialog's warning is necessarily a PREDICTION — the agent is still running while the modal is open. Reusing that frozen answer as the post-close report produces a confident lie in both directions: a "kept at `<path>`" message about a directory that was deleted, or silence about one that was newly dirtied and kept. This pins the fix, which is that the post-close report comes from the daemon's own post-cleanup verdict (`remove_worktree`'s return value, broadcast as `BroadcastMsg::WorktreeKept`), measured after `close_agent` reaped the agent so nothing can still be writing to the tree.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
+- **Platform coverage:** mac+linux.
+
+#### dispatch/close-verb
+
+##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities under the default provenance policy.
+- **Asserts:** attested `work-done --done` returns to the caller; `close <name>` exits 0 and says `closed`; the unit disappears from `ListAgents`, its clean worktree is removed before the reply, its branch remains and the dispatcher remains registered.
+- **Platform coverage:** mac+linux (Unix PTY/socket harness).
+
+##### dispatch/close-verb/002 — Closing a completed orchestration names every role, orchestrator first.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon and attached TUI (`tests/e2e_close_verb.rs`).
+- **Agent:** none — two identity-recording `cat` roles.
+- **Asserts:** a two-role dispatch reports terminal completion; close exits 0, names each pane with the orchestrator first, removes every role from `ListAgents` and retains its dispatcher. The reply order is the observable stop-order contract; internal stop sequencing belongs to the daemon tests.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/003 — An unreported unit refuses name and pane selectors, then closes with an explicit force disclosure.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** both selector spellings exit 1 with JSON `refused` / `not-reported` and keep the target registered; force exits 0, says `closed` and `forced`, and removes the target.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/004 — A sibling dispatcher cannot close another dispatcher's unit, including with force.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — distinct live caller panes with their own minted agent identities and tokens.
+- **Asserts:** the sibling's requests exit 1 with JSON `refused` / `not-your-unit`; the unit and both dispatchers remain registered.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/005 — A person shell closes a completed unit and its tab disappears from an already attached TUI.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_close_verb.rs`); records a cast but is not reel eligible.
+- **Agent:** none — identity-recording `cat` roles; close runs with all three caller identity variables absent.
+- **Asserts:** the dispatched orchestration tab is visible before close; the person command exits 0 and the tab disappears from the same attached TUI; the roles disappear and the dispatcher remains registered.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/006 — Closing a dirty dispatched unit preserves its uncommitted work and explains why.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** close exits 0 and says `closed`, `kept` and `uncommitted`; the agent disappears from `ListAgents` and the sentinel file remains intact in the kept worktree.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/007 — A dispatched team remains closeable by name after its orchestrator closes first.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` roles.
+- **Asserts:** existing `StopAgent` removes the completed team's orchestrator while its worker stays registered; close by dispatch name exits 0 and removes that worker while retaining the dispatcher.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/008 — An interactive Haiku dispatcher closes the completed single unit it dispatched, through the real close CLI. [reel]
+- **Layer:** L2 PTY-attached real-agent, lane 2, local only (`tests/e2e_dispatcher_mode.rs`).
+- **Agent:** real interactive Claude Code on Haiku for dispatcher and unit, with imported credentials, pre-seeded project trust and allowed Bash/Read/Write tools; no print mode.
+- **Asserts:** the dispatcher invokes `dispatch --single`; the isolated unit discovers a committed sentinel whose full filename was absent from its prompt; its completion appears in the dispatcher's rendered pane; a subsequent directive causes that dispatcher to invoke `close <name>` itself; the unit's card and worktree disappear while the original dispatcher remains registered. Shares the genuine return-path setup with `dispatch/return/006`.
+- **Platform coverage:** mac+linux; credentialed tests run on the developer's machine and nowhere in CI.
+
+##### dispatch/close-verb/009 — Bulk confirmation closes the two completed units that a preview leaves running.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --all --json` lists both reported single units, exits 0 and stops nothing; `close --all --yes --json` exits 0 and reports those same ids closed, removes both agents and clean worktrees, and retains the dispatcher.
+- **Does not assert:** an interactive confirmation prompt or a concurrent change between preview and apply.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/010 — Closing a completed single unit by pane removes its clean worktree and reports the verdict.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --pane <pane> --json` exits 0, removes the completed single unit and its clean worktree before replying, reports `removed` for that path, keeps the dispatch branch and retains the dispatcher.
+- **Does not assert:** worktree retention while orchestration siblings still use it, or dirty-worktree cleanup (006).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/011 — A stable unit id from the bulk listing closes exactly the selected unit.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** a two-unit JSON listing supplies a stable `unit_id`; `close --unit-id <id> --json` exits 0 and reports only that id closed, removes its agent and worktree, and leaves the other unit, its worktree and the dispatcher alive.
+- **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single
