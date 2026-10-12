@@ -247,9 +247,22 @@ fn wait_for_role(deck: &TuiDeck, role: &str) {
     );
 }
 
+/// The base ceiling, before [`common::load_scaled`], on a released stand-in's
+/// outcome reaching the card: its hook events each run the deck's hook CLI as a
+/// process of its own, and its rollout append is then read by the daemon. That
+/// chain is boots and scheduling, so it stretches with load. A flat 20 s failed
+/// `scheduler_idle_worker_024` at load 68 on 16 CPUs (`cpu some` 73.7%) with
+/// the worker card still Idle and its last event 19 s old; the same test
+/// passes alone in about 41 s.
+const STANDIN_OUTCOME_BASE: Duration = Duration::from_secs(20);
+
+/// The base ceiling, before [`common::load_scaled`], on the daemon's
+/// blocked-worker notice reaching the orchestrator once the card is Blocked.
+const BLOCKED_NOTICE_BASE: Duration = Duration::from_secs(10);
+
 fn assert_blocked(deck: &TuiDeck, role: &str, kind: &str) {
     assert!(
-        common::wait_until(Duration::from_secs(20), || {
+        common::wait_until(common::load_scaled(STANDIN_OUTCOME_BASE), || {
             role_status(deck, role).as_deref() == Some("Blocked")
                 && has_role_badge(&deck.snapshot_grid(), role, "Blocked")
         }),
@@ -705,8 +718,9 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
         ))
     };
     assert!(
-        common::wait_until(Duration::from_secs(10), || notice_text()
-            .contains(BLOCKED_NOTICE)),
+        common::wait_until(common::load_scaled(BLOCKED_NOTICE_BASE), || {
+            notice_text().contains(BLOCKED_NOTICE)
+        }),
         "orchestrator did not receive blocked notice: {}",
         notice_text()
     );
@@ -761,8 +775,9 @@ fn scheduler_idle_worker_024_blocked_worker_notices_orchestrator_once() {
         ))
     };
     assert!(
-        common::wait_until(Duration::from_secs(10), || notice_text()
-            .contains(BLOCKED_NOTICE)),
+        common::wait_until(common::load_scaled(BLOCKED_NOTICE_BASE), || {
+            notice_text().contains(BLOCKED_NOTICE)
+        }),
         "orchestrator did not receive blocked notice: {}",
         notice_text()
     );
@@ -873,7 +888,7 @@ fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     release_standin(&bare_fifo, &deck, "bare");
     assert_blocked(&deck, "marker", "usage_limit");
     assert!(
-        common::wait_until(Duration::from_secs(20), || {
+        common::wait_until(common::load_scaled(STANDIN_OUTCOME_BASE), || {
             role_status(&deck, "bare").as_deref() == Some("Error")
                 && has_role_badge(&deck.snapshot_grid(), "bare", "Error")
         }),
