@@ -524,21 +524,101 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// returned unchanged (never double-wrapped), so restoring an already-bare saved
 /// command re-wraps exactly once. Non-Wrapper agents (and the neutral unknown
 /// type) are returned unchanged.
-pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
+///
+/// Issue #1685: the `<command>` after `--` is split into the wrapper's argv by
+/// the shell that runs the rewritten line, and the wrapper execs the first word.
+/// That is right for a plain program invocation and wrong for anything the
+/// shell has to run itself: a leading `FOO=1` became the program the wrapper
+/// tried to spawn, and a leading `( … )` was a syntax error before the wrapper
+/// ran at all. Such a command ([`runs_as_plain_argv`] is false) comes back as
+/// [`LaunchCommand::Argv`] instead — the wrapper with `shell`, the shell the
+/// seam would run any agent's command line under, running the command
+/// verbatim. An argv rather than a line, so the command is never quoted for
+/// an outer shell, whose dialect (fish) need not match POSIX quoting.
+///
+/// Such a command can also move Codex away from what `codex_spawn_prep`
+/// prepared: `CODEX_HOME=… codex` and `cd … && codex` start, but in a home or
+/// directory the wrapper did not install and trust its hooks for, as
+/// `env CODEX_HOME=… codex` and launcher scripts already did (#1703).
+pub fn wrap_launch_command(command: &str, agent_type: &AgentType, shell: &str) -> LaunchCommand {
     let spec = crate::agent_registry::spec(agent_type);
     if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
-        return command.to_string();
+        return LaunchCommand::Line(command.to_string());
     }
     let deck = deck_binary_for_wrap();
     if is_wrap_invocation(command, &deck) {
-        return command.to_string();
+        return LaunchCommand::Line(command.to_string());
     }
     // Prefer the registry detection basename (the stable `--agent` alias the
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    format!("{deck} wrap --agent {name} -- {command}")
+    if runs_as_plain_argv(command) {
+        return LaunchCommand::Line(format!("{deck} wrap --agent {name} -- {command}"));
+    }
+    LaunchCommand::Argv(
+        [
+            deck.as_str(),
+            "wrap",
+            "--agent",
+            name,
+            "--",
+            shell,
+            crate::platform::shell::shell_command_flag(),
+            command,
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )
 }
+
+/// What the spawn seam runs for an agent's command, from [`wrap_launch_command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchCommand {
+    /// A command line, run the way the seam runs any command: exec'd directly
+    /// when it is one word, otherwise under `<shell> -c`.
+    Line(String),
+    /// An argv the seam execs as it stands, without a shell in front.
+    Argv(Vec<String>),
+}
+
+/// Whether the shell that runs `<deck> wrap … -- <command>` hands the wrapper
+/// the argv the user meant (issue #1685): no control operator, grouping or
+/// newline that would end the wrapper's arguments early, and a first word the
+/// wrapper can exec — not a `NAME=value` assignment and not a word only the
+/// shell runs ([`SHELL_ONLY_WORDS`]).
+///
+/// A redirection (`>log`, `2>&1`, `&>log`) does not count. That shell applies
+/// it to the wrapper, whose per-descriptor routing hands it on to the agent
+/// while still reading the agent's output (PRD #20 finding #11); inside the
+/// wrapper it would send that output past it.
+///
+/// Errs towards `false`: a command that fails it is run by the user's shell
+/// inside the wrapper, which is correct for a plain invocation too, only a
+/// different launch shape. A quoted `;` therefore counts, and so does any
+/// `$( … )`.
+fn runs_as_plain_argv(command: &str) -> bool {
+    let without_redirections = command
+        .replace("&>", ">")
+        .replace(">&", ">")
+        .replace("<&", "<");
+    if without_redirections.contains(['\n', ';', '&', '|', '(', ')']) {
+        return false;
+    }
+    command.split_whitespace().next().is_none_or(|first| {
+        !crate::event::is_env_assignment(first) && !SHELL_ONLY_WORDS.contains(&first)
+    })
+}
+
+/// Reserved words, and builtins with no executable of their own, that can open
+/// an agent's launch command — words a wrapper handed them as a program could
+/// not exec. Not exhaustive: a word missing here keeps the plain launch, which
+/// is what every command had before issue #1685.
+const SHELL_ONLY_WORDS: &[&str] = &[
+    "!", "{", "[[", "if", "case", "for", "select", "while", "until", "function", "time", "coproc",
+    "exec", "cd", ".", "source", "eval", "export", "set", "unset", "umask", "ulimit", "trap",
+    "readonly", "local", "declare", "typeset", "alias", "builtin", "command",
+];
 
 /// Test-only override for the binary [`wrap_launch_command`] names. Set to an
 /// absolute path so a test can point the rewrite at a recorder instead of the
@@ -3387,7 +3467,7 @@ mod tests {
         // assert the shape: some `dot-agent-deck` followed by the exact wrap
         // invocation. Under `cargo test` the resolved binary is the sibling the
         // build just produced, so this is usually an absolute path.
-        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        let rewritten = line(wrap_launch_command("codex", &AgentType::Codex, "/bin/sh"));
         let (program, rest) = rewritten
             .split_once(' ')
             .expect("rewritten command has a program and arguments");
@@ -3411,7 +3491,7 @@ mod tests {
     /// program is the binary sitting next to the test harness.
     #[test]
     fn wrap_launch_command_names_this_build_not_path() {
-        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        let rewritten = line(wrap_launch_command("codex", &AgentType::Codex, "/bin/sh"));
         let program = rewritten.split_once(' ').expect("program present").0;
         let sibling_name = crate::platform::paths::durable_binary_file_name();
         let sibling = std::env::current_exe().ok().and_then(|exe| {
@@ -3441,16 +3521,19 @@ mod tests {
     /// transform only fires for the Wrapper strategy.
     #[test]
     fn wrap_launch_command_leaves_non_wrapper_agents_bare() {
-        assert_eq!(
-            wrap_launch_command("claude", &AgentType::ClaudeCode),
-            "claude"
-        );
-        assert_eq!(
-            wrap_launch_command("opencode", &AgentType::OpenCode),
-            "opencode"
-        );
-        assert_eq!(wrap_launch_command("pi", &AgentType::Pi), "pi");
-        assert_eq!(wrap_launch_command("cat", &AgentType::None), "cat");
+        for (command, agent) in [
+            ("claude", AgentType::ClaudeCode),
+            ("opencode", AgentType::OpenCode),
+            ("pi", AgentType::Pi),
+            ("cat", AgentType::None),
+            // Shell syntax is not a reason to wrap a non-Wrapper agent either.
+            ("FOO=1 claude", AgentType::ClaudeCode),
+        ] {
+            assert_eq!(
+                wrap_launch_command(command, &agent, "/bin/sh"),
+                LaunchCommand::Line(command.to_string())
+            );
+        }
     }
 
     /// Idempotent: a command that is already a `dot-agent-deck wrap …`
@@ -3458,20 +3541,102 @@ mod tests {
     /// restore never double-wraps.
     #[test]
     fn wrap_launch_command_is_idempotent() {
-        assert_eq!(
-            wrap_launch_command(
-                "dot-agent-deck wrap --agent codex -- codex",
-                &AgentType::Codex
-            ),
-            "dot-agent-deck wrap --agent codex -- codex"
+        for command in [
+            "dot-agent-deck wrap --agent codex -- codex",
+            "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex",
+            // Issue #1685: a wrapped command that is shell syntax is still not
+            // wrapped a second time.
+            "dot-agent-deck wrap --agent codex -- FOO=1 codex",
+        ] {
+            assert_eq!(
+                wrap_launch_command(command, &AgentType::Codex, "/bin/sh"),
+                LaunchCommand::Line(command.to_string())
+            );
+        }
+    }
+
+    /// Issue #1685: a Codex command the shell has to run itself is handed to
+    /// the given shell inside the wrapper, verbatim and as one argument, while
+    /// a plain invocation keeps the line form `codex/spawn/006`–`010` pin.
+    #[test]
+    fn wrap_launch_command_hands_shell_syntax_to_the_shell_inside_the_wrapper() {
+        for command in [
+            "CODEX_WRAPPER_PROBE=1 codex",
+            "(umask 077; mkdir -p x); exec codex",
+            "exec codex --model 'o4 mini'",
+        ] {
+            let LaunchCommand::Argv(argv) =
+                wrap_launch_command(command, &AgentType::Codex, "/usr/bin/fish")
+            else {
+                panic!("{command:?} must reach the wrapper through the shell");
+            };
+            assert_eq!(
+                argv[1..],
+                [
+                    "wrap",
+                    "--agent",
+                    "codex",
+                    "--",
+                    "/usr/bin/fish",
+                    crate::platform::shell::shell_command_flag(),
+                    command,
+                ],
+                "{command:?}"
+            );
+        }
+        let plain = line(wrap_launch_command(
+            "devbox run codex-big",
+            &AgentType::Codex,
+            "/bin/sh",
+        ));
+        assert!(
+            plain.ends_with(" wrap --agent codex -- devbox run codex-big"),
+            "{plain:?}"
         );
-        assert_eq!(
-            wrap_launch_command(
-                "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex",
-                &AgentType::Codex
-            ),
-            "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex"
-        );
+    }
+
+    /// Issue #1685: the classification behind the two launch shapes.
+    #[test]
+    fn runs_as_plain_argv_rejects_what_only_a_shell_can_run() {
+        for plain in [
+            "codex",
+            "codex --model mini -c 'model_reasoning_effort=\"low\"'",
+            "/opt/bin/codex --cd /tmp/a=b",
+            "\"/opt/OpenAI Codex/codex\" --model mini",
+            "env FOO=1 codex",
+            "devbox run codex-big",
+            "sh -c 'codex'",
+            "codex 2>/dev/null",
+            "codex >log 2>&1",
+            "codex &>log </dev/null",
+            "",
+        ] {
+            assert!(runs_as_plain_argv(plain), "{plain:?}");
+        }
+        for shell_syntax in [
+            "FOO=1 codex",
+            "_X=a=b codex",
+            "(umask 077; true); exec codex",
+            "cd /tmp && codex",
+            "codex; echo done",
+            "codex | tee log",
+            "codex |& tee log",
+            "codex & wait",
+            "codex\necho done",
+            "exec codex",
+            "{ codex; }",
+            "if true; then codex; fi",
+            "codex --prompt \"$(cat prompt)\"",
+        ] {
+            assert!(!runs_as_plain_argv(shell_syntax), "{shell_syntax:?}");
+        }
+    }
+
+    fn line(launch: LaunchCommand) -> String {
+        match launch {
+            LaunchCommand::Line(line) => line,
+            LaunchCommand::Argv(argv) => panic!("expected a command line, got argv {argv:?}"),
+        }
     }
 
     /// The idempotency guard recognises a `dot-agent-deck wrap` invocation (with

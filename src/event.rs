@@ -172,7 +172,7 @@ fn is_shell_command_flag(arg: &str) -> bool {
 /// (e.g. `FOO=1`) rather than a program or path. Conservative: `NAME` must be a
 /// shell-identifier-shaped run before the first `=`, so a path that merely
 /// contains `=` isn't misread as an assignment.
-fn is_env_assignment(token: &str) -> bool {
+pub(crate) fn is_env_assignment(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) => {
             !name.is_empty()

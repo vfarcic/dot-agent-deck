@@ -189,8 +189,10 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
 }
 
 /// Scenario: Start a real cheap-model Codex through a bespoke launcher script
-/// used by an orchestration role that declares Codex. Before any prompt is
-/// submitted, the role card must already read Codex and the real CLI must be live.
+/// used by an orchestration role that declares Codex, with the role command
+/// opening on an environment assignment the launcher must see (issue #1685).
+/// Before any prompt is submitted, the role card must already read Codex and the
+/// real CLI must be live.
 #[spec("codex/spawn/012")]
 #[test]
 #[cfg(unix)]
@@ -216,10 +218,10 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
     let launch_record = work.join("real-script-codex.log");
     write_executable(
         &work.join("run-codex.sh"),
-        "#!/bin/sh\nprintf 'REAL_CODEX %s\\n' \"$*\" >> real-script-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
+        "#!/bin/sh\nprintf 'REAL_CODEX probe=%s %s\\n' \"${CODEX_LAUNCH_PROBE:-unset}\" \"$*\" >> real-script-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
     );
     let command = format!(
-        "./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        "CODEX_LAUNCH_PROBE=1685 ./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
         common::codex_test_model(),
     );
     std::fs::write(
@@ -259,9 +261,13 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
             .is_some_and(|prompt| !prompt.is_empty())
     });
 
+    // Issue #1685: a command opening on an assignment used to hand the wrapper
+    // the assignment as its program, and the launcher never ran.
+    let saw_assignment = real_launch.contains("REAL_CODEX probe=1685 ");
+
     assert!(
-        codex_badge && no_prompt_event && grid.contains("Idle"),
-        "the real script-launched Codex role must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
+        saw_assignment && codex_badge && no_prompt_event && grid.contains("Idle"),
+        "the real script-launched Codex role, started through a leading assignment, must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, saw_assignment={saw_assignment}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
     );
 }
 
