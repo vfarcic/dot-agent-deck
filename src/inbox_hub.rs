@@ -24,8 +24,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, ones
 use tracing::{debug, info, warn};
 
 use crate::event::{
-    BroadcastMsg, InboxComponent, InboxDelivery, InboxNotice, InboxStreamControl, InboxWaitMode,
-    InboxWaitReply, InboxWake,
+    BroadcastMsg, InboxBudget, InboxComponent, InboxDelivery, InboxNotice, InboxStreamControl,
+    InboxWaitMode, InboxWaitReply, InboxWake,
 };
 use crate::inbox::{
     AckHow, AckOutcome, BodyTrust, Consumer, Content, DeckId, Inbox, InboxEvent, InboxLimits,
@@ -65,8 +65,8 @@ pub const ENV_KEEPALIVE_MS: &str = "DOT_AGENT_DECK_INBOX_KEEPALIVE_MS";
 /// an armed waiter beside a queued message.
 pub const ENV_TEST_PAUSE_WAITER_DELIVERY: &str = "DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY";
 
-/// How much of a body is shown inline when the whole message does not fit the
-/// component's budget.
+/// How much of a body is shown inline, in the budget's unit, when the whole
+/// message does not fit the component's budget.
 pub const INLINE_HEAD_CHARS: usize = 2048;
 
 /// The opener every rendered block starts with, before the id.
@@ -871,10 +871,29 @@ impl InboxHub {
         max_chars: Option<usize>,
         ack: Option<AckHow>,
     ) -> Vec<InboxDelivery> {
+        self.fetch_within(
+            pane_id,
+            agent_id,
+            consumer,
+            max_chars.map(InboxBudget::Chars),
+            ack,
+        )
+    }
+
+    /// [`Self::fetch`] within a budget in either unit ([`fitting`] says what
+    /// counts against it).
+    pub fn fetch_within(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        consumer: Consumer,
+        budget: Option<InboxBudget>,
+        ack: Option<AckHow>,
+    ) -> Vec<InboxDelivery> {
         let deliveries = {
             let mut st = self.lock();
             let now = Instant::now();
-            let count = fitting(&st.inbox, pane_id, agent_id, max_chars);
+            let count = fitting(&st.inbox, pane_id, agent_id, budget);
             if count == 0 {
                 return Vec::new();
             }
@@ -888,7 +907,7 @@ impl InboxHub {
                     .fetch(now, pane_id, agent_id, consumer, Some(count)),
             };
             drain_events(&mut st);
-            fetched.iter().map(|m| render(m, max_chars)).collect()
+            fetched.iter().map(|m| render_within(m, budget)).collect()
         };
         self.changed.notify_one();
         deliveries
@@ -1111,8 +1130,10 @@ impl InboxHub {
                 .inbox
                 .fetch(now, pane_id, agent_id, consumer.clone(), Some(count));
             drain_events(&mut st);
-            let batch: Vec<InboxDelivery> =
-                fetched.iter().map(|m| render(m, Some(budget))).collect();
+            let batch: Vec<InboxDelivery> = fetched
+                .iter()
+                .map(|m| render_within(m, Some(budget)))
+                .collect();
             let list = st.waiters.get_mut(&key).expect("waiter list checked above");
             let tx = list.last().expect("waiter checked above").tx.clone();
             if mode == InboxWaitMode::Once {
@@ -1140,24 +1161,30 @@ impl InboxHub {
     }
 }
 
-/// How many of `agent_id`'s queued messages fit `max_chars`, in the order a
-/// fetch takes them. At least one when any is queued: a single message too big
-/// for the budget is rendered with its head only.
-fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, max_chars: Option<usize>) -> usize {
+/// The separator every hand-over puts before each block.
+pub const BLOCK_SEPARATOR: &str = "\n\n";
+
+/// How many of `agent_id`'s queued messages fit `budget`, in the order a fetch
+/// takes them. Each block is counted with the [`BLOCK_SEPARATOR`] ahead of it,
+/// so a caller that heads the blocks with framing asks for its budget less the
+/// framing and stays within the whole. At least one when any is queued: a
+/// single message too big for the budget is rendered with its head only.
+fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
     let queued = inbox.list(pane_id).into_iter().filter(|m| {
         m.state == MessageState::Queued
             && m.recipient
                 .as_ref()
                 .is_some_and(|r| r.admits(pane_id, agent_id))
     });
-    let Some(budget) = max_chars else {
+    let Some(budget) = budget else {
         return queued.count();
     };
     let mut used = 0usize;
     let mut count = 0usize;
     for message in queued {
-        let len = render(message, Some(budget)).text.chars().count();
-        if count > 0 && used + len > budget {
+        let len = budget.measure(&render_within(message, Some(budget)).text)
+            + budget.measure(BLOCK_SEPARATOR);
+        if count > 0 && used + len > budget.limit() {
             break;
         }
         used += len;
@@ -1398,6 +1425,12 @@ fn defuse_markers(body: &str) -> String {
 
 /// Render `message` as the block an agent sees, within `max_chars` when given.
 pub fn render(message: &Message, max_chars: Option<usize>) -> InboxDelivery {
+    render_within(message, max_chars.map(InboxBudget::Chars))
+}
+
+/// [`render`] within a budget in either unit. A body that does not fit keeps
+/// a head of [`INLINE_HEAD_CHARS`] in the budget's unit.
+pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDelivery {
     let id = message.id.as_str();
     let from = sender_label(&message.from, message.body_trust);
     let body = match message.body_trust {
@@ -1424,11 +1457,11 @@ pub fn render(message: &Message, max_chars: Option<usize>) -> InboxDelivery {
         format!("{head}\n{preface}{body}{separator}{closer}")
     };
     let mut text = assemble(&body);
-    if let Some(budget) = max_chars
-        && text.chars().count() > budget
+    if let Some(budget) = budget
+        && budget.measure(&text) > budget.limit()
     {
-        let head: String = body.chars().take(INLINE_HEAD_CHARS).collect();
-        let rest = body.chars().count().saturating_sub(INLINE_HEAD_CHARS);
+        let head = budget.head(&body, INLINE_HEAD_CHARS);
+        let rest = body.chars().count() - head.chars().count();
         let tail = match &message.spill_path {
             Some(path) => format!("The full message is in {}.", path.display()),
             None => format!("({rest} more characters of this message did not fit.)"),

@@ -333,6 +333,7 @@ pub fn fetch(json: bool) -> ExitCode {
         token: identity.token,
         consumer: InboxFetchConsumer::Cli,
         max_chars: None,
+        max_bytes: None,
         ack: true,
     });
     let line = match request(&message) {

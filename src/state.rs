@@ -11614,13 +11614,32 @@ impl AppState {
     /// idle — its newest session reports Idle, and that Idle is not only a
     /// Codex wrapper's fork-time start, which the wrapper sends before the agent
     /// has drawn anything. Its interface-ready start is what stands in for Idle
-    /// before the first prompt (design §2.7).
+    /// before the first prompt (design §2.7). For Codex that Idle can arrive
+    /// while a start dialog is up, so until Codex's own hooks report, the
+    /// doorbell's writer also waits for its composer (PRD #1666 S7).
+    ///
+    /// PRD #1666 S7: once the agent's own hooks have reported, only the
+    /// sessions they wrote count. A wrapper keeps its own session for the
+    /// events it writes about its child, and its output frames keep that
+    /// session fresh without moving its status, so read by recency alone its
+    /// boot-time Idle would outvote Codex's own Thinking.
     pub fn agent_doorbell_idle(&self, agent_id: &str, pane_id: &str) -> bool {
-        self.sessions
+        let wrapper_only = |s: &&SessionState| {
+            s.recent_events.iter().all(|event| {
+                event.is_wrapper_session_start() || event.is_wrapper_output_classified()
+            })
+        };
+        let sessions: Vec<&SessionState> = self
+            .sessions
             .values()
             .filter(|s| {
                 s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == Some(pane_id)
             })
+            .collect();
+        let own_hooks_reported = sessions.iter().any(|s| !wrapper_only(s));
+        sessions
+            .into_iter()
+            .filter(|s| !own_hooks_reported || !wrapper_only(s))
             .max_by(|a, b| {
                 a.last_activity
                     .cmp(&b.last_activity)

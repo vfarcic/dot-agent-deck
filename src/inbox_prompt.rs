@@ -29,7 +29,7 @@ use regex::Regex;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    AgentEvent, DaemonMessage, InboxFetchConsumer, InboxFetchRequest, InboxWaitReply,
+    AgentEvent, DaemonMessage, InboxBudget, InboxFetchConsumer, InboxFetchRequest, InboxWaitReply,
 };
 
 /// Event metadata, set by the hook: every deck message id the prompt carries,
@@ -125,22 +125,46 @@ pub fn in_deck_pane() -> bool {
 }
 
 /// Fetch, and acknowledge in the same step, what is waiting for this pane's
-/// agent, up to `budget` characters including `framing`, which heads it. `None`
-/// outside a deck pane, without a token, when the daemon does not answer, or
-/// when nothing is waiting. Bounded by the hook socket's 5 s request timeout.
-pub fn doorbell_injection(budget: usize, framing: &str) -> Option<Injection> {
+/// agent, within `budget` including `framing`, which heads it. `None` outside a
+/// deck pane, without a token, when the daemon does not answer, or when nothing
+/// is waiting. Bounded by the hook socket's 5 s request timeout.
+pub fn doorbell_injection(budget: InboxBudget, framing: &str) -> Option<Injection> {
+    hand_over(InboxFetchConsumer::DoorbellHook, budget, framing)
+}
+
+/// PRD #1666 S7: [`doorbell_injection`] for a hook that hands the messages over
+/// as its turn ends (Codex's `Stop`).
+pub fn turn_end_hand_over(budget: InboxBudget, framing: &str) -> Option<Injection> {
+    hand_over(InboxFetchConsumer::TurnEndHook, budget, framing)
+}
+
+fn hand_over(
+    consumer: InboxFetchConsumer,
+    budget: InboxBudget,
+    framing: &str,
+) -> Option<Injection> {
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
         .ok()
         .filter(|pane| !pane.is_empty())?;
     let token = crate::hook_provenance::token_from_env()?;
+    // The daemon counts each block with its separator, so the framing is all
+    // that is taken off here.
+    let rest = budget.less(framing).limit().max(1);
+    let (max_chars, max_bytes) = match budget {
+        InboxBudget::Chars(_) => (rest, None),
+        // A daemon without `max_bytes` reads `max_chars`, which a byte count
+        // bounds from above.
+        InboxBudget::Bytes(_) => (rest, Some(rest)),
+    };
     let request = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id,
         agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID)
             .ok()
             .filter(|agent| !agent.is_empty()),
         token: Some(token),
-        consumer: InboxFetchConsumer::DoorbellHook,
-        max_chars: Some(budget.saturating_sub(framing.chars().count() + 2).max(1)),
+        consumer,
+        max_chars: Some(max_chars),
+        max_bytes,
         ack: true,
     });
     let json = serde_json::to_string(&request).ok()?;
@@ -151,7 +175,7 @@ pub fn doorbell_injection(budget: usize, framing: &str) -> Option<Injection> {
         .filter(|messages| !messages.is_empty())?;
     let mut context = framing.to_string();
     for message in &messages {
-        context.push_str("\n\n");
+        context.push_str(crate::inbox_hub::BLOCK_SEPARATOR);
         context.push_str(&message.text);
     }
     Some(Injection {

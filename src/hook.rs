@@ -175,6 +175,19 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     {
         println!("{stdout}");
     }
+    // PRD #1666 S7: Codex's side. A `Stop` that hands messages over keeps the
+    // turn going, so it reports no Idle: the doorbell must not ring for the
+    // rest while Codex works on what it was just given.
+    if agent == "codex" && crate::inbox_prompt::in_deck_pane() {
+        match codex_inbox_hooks(&input, &mut event, &mut announce) {
+            CodexInbox::Nothing => {}
+            CodexInbox::Print(stdout) => println!("{stdout}"),
+            CodexInbox::ContinueTurn(stdout) => {
+                println!("{stdout}");
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
 
     // PRD #1497: the turn's final reply, for the daemon's reading
     // subscribers. Read from the raw payload, so a reply of a strange shape
@@ -251,7 +264,10 @@ fn claude_inbox_hooks(
     let hook_event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
     match hook_event_name {
         "SessionStart" => {
-            *announce = claude_native_announce();
+            *announce = inbox_announce(
+                crate::event::InboxComponent::ClaudeHooks,
+                crate::event::InboxWake::Native,
+            );
             Some(crate::inbox_prompt::hook_output(
                 "SessionStart",
                 crate::inbox_hub::SESSION_FRAMING,
@@ -270,6 +286,66 @@ fn claude_inbox_hooks(
     }
 }
 
+/// What the deck's Codex hook does for the inbox with one payload.
+enum CodexInbox {
+    Nothing,
+    /// Print this, then report the event as usual.
+    Print(String),
+    /// Print this and report nothing: the turn goes on.
+    ContinueTurn(String),
+}
+
+/// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
+/// pane. Codex is woken by the doorbell when idle; its hooks run outside its
+/// sandbox, so they, not the model, fetch and acknowledge.
+///
+/// - `SessionStart` queues an `inbox_announce` `TurnEnd` line, sent ahead of
+///   the status event.
+/// - `UserPromptSubmit` answers a doorbell line with the waiting content as
+///   `additionalContext` ([`deck_prompt_submit`]).
+/// - `Stop` hands over what is waiting as `{"decision":"block","reason":…}`,
+///   so Codex continues the turn with it. Nothing waiting, or no answer from
+///   the daemon, and the turn ends as usual.
+///
+/// Every hand-over is headed by [`crate::inbox_hub::AGENT_FRAMING`] and stays
+/// within [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does
+/// not fit stays queued for the next `Stop` or doorbell.
+fn codex_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> CodexInbox {
+    let Ok(payload) = serde_json::from_str::<Value>(input) else {
+        return CodexInbox::Nothing;
+    };
+    let budget = crate::event::InboxComponent::CodexHooks.inline_budget();
+    let framing = crate::inbox_hub::AGENT_FRAMING;
+    match payload.get("hook_event_name").and_then(Value::as_str) {
+        Some("SessionStart") => {
+            *announce = inbox_announce(
+                crate::event::InboxComponent::CodexHooks,
+                crate::event::InboxWake::TurnEnd,
+            );
+            CodexInbox::Nothing
+        }
+        Some("UserPromptSubmit") => payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .and_then(|prompt| deck_prompt_submit(prompt, budget, framing, event))
+            .map_or(CodexInbox::Nothing, CodexInbox::Print),
+        Some("Stop") => crate::inbox_prompt::turn_end_hand_over(budget, framing).map_or(
+            CodexInbox::Nothing,
+            |hand_over| {
+                CodexInbox::ContinueTurn(
+                    serde_json::json!({"decision": "block", "reason": hand_over.context})
+                        .to_string(),
+                )
+            },
+        ),
+        _ => CodexInbox::Nothing,
+    }
+}
+
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
 /// every agent whose hook accepts `hookSpecificOutput.additionalContext`
 /// shares it (Claude Code now, Codex in S7), each with its own `budget` and
@@ -277,7 +353,7 @@ fn claude_inbox_hooks(
 /// scan and no daemon call.
 pub fn deck_prompt_submit(
     prompt: &str,
-    budget: usize,
+    budget: crate::event::InboxBudget,
     framing: &str,
     event: &mut AgentEvent,
 ) -> Option<String> {
@@ -299,9 +375,12 @@ pub fn deck_prompt_submit(
         .map(|injection| crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context))
 }
 
-/// The `inbox_announce` line Claude Code's `SessionStart` hook sends, or `None`
+/// The `inbox_announce` line an agent's `SessionStart` hook sends, or `None`
 /// without the pane's token (the daemon would refuse it).
-fn claude_native_announce() -> Option<String> {
+fn inbox_announce(
+    component: crate::event::InboxComponent,
+    wake: crate::event::InboxWake,
+) -> Option<String> {
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
         .ok()
         .filter(|pane| !pane.is_empty())?;
@@ -312,9 +391,9 @@ fn claude_native_announce() -> Option<String> {
             .ok()
             .filter(|agent| !agent.is_empty()),
         token: Some(token),
-        component: crate::event::InboxComponent::ClaudeHooks,
+        component,
         component_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        wake: crate::event::InboxWake::Native,
+        wake,
         #[cfg(unix)]
         pid: Some(std::os::unix::process::parent_id()),
         #[cfg(not(unix))]

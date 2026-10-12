@@ -30,6 +30,10 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", "codex-hook-pane")
         .env("DOT_AGENT_DECK_AGENT_ID", "codex-hook-agent")
+        // A developer running this from a deck pane inherits that pane's
+        // capability token; with one, the hook's inbox calls (PRD #1666 S7)
+        // would reach this socket ahead of the event it reads.
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

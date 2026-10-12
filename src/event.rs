@@ -2922,17 +2922,70 @@ pub enum InboxComponent {
 }
 
 impl InboxComponent {
-    /// How many characters of rendered messages one hand-over to this
-    /// component may carry. Claude caps hook output at 10,000 characters.
-    pub fn inline_budget(self) -> usize {
+    /// How much one hand-over to this component may carry, framing included.
+    /// Claude caps hook output at 10,000 characters. Codex middle-truncates a
+    /// hook's text at about 2,500 tokens and spills the whole of it to a
+    /// group-readable file, so its budget is counted in UTF-8 bytes, which
+    /// stay under that for prose and code (PRD #1666 S7).
+    pub fn inline_budget(self) -> InboxBudget {
         match self {
-            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => 9_000,
-            InboxComponent::CodexHooks => 9_000,
+            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => InboxBudget::Chars(9_000),
+            InboxComponent::CodexHooks => InboxBudget::Bytes(6_000),
             InboxComponent::OpenCodePlugin
             | InboxComponent::PiExtension
             | InboxComponent::DevinHooks
-            | InboxComponent::Other => 64 * 1024,
+            | InboxComponent::Other => InboxBudget::Chars(64 * 1024),
         }
+    }
+}
+
+/// PRD #1666 S7: a hand-over's size limit, in the unit the receiving agent
+/// counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxBudget {
+    Chars(usize),
+    /// UTF-8 bytes.
+    Bytes(usize),
+}
+
+impl InboxBudget {
+    /// The size of `text` in this budget's unit.
+    pub fn measure(self, text: &str) -> usize {
+        match self {
+            InboxBudget::Chars(_) => text.chars().count(),
+            InboxBudget::Bytes(_) => text.len(),
+        }
+    }
+
+    pub fn limit(self) -> usize {
+        match self {
+            InboxBudget::Chars(n) | InboxBudget::Bytes(n) => n,
+        }
+    }
+
+    /// This budget less what `text` takes, in the same unit.
+    pub fn less(self, text: &str) -> Self {
+        let rest = self.limit().saturating_sub(self.measure(text));
+        match self {
+            InboxBudget::Chars(_) => InboxBudget::Chars(rest),
+            InboxBudget::Bytes(_) => InboxBudget::Bytes(rest),
+        }
+    }
+
+    /// The longest prefix of `text` within `max` of this budget's unit, cut at
+    /// a character boundary.
+    pub fn head(self, text: &str, max: usize) -> &str {
+        let end = match self {
+            InboxBudget::Chars(_) => text.char_indices().nth(max).map_or(text.len(), |(i, _)| i),
+            InboxBudget::Bytes(_) => {
+                let mut end = max.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                end
+            }
+        };
+        &text[..end]
     }
 }
 
@@ -3031,6 +3084,12 @@ pub struct InboxFetchRequest {
     /// is unlimited (the CLI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chars: Option<usize>,
+    /// PRD #1666 S7: the most UTF-8 bytes of rendered messages the caller can
+    /// take, for an agent that counts bytes (Codex). Additive: a daemon that
+    /// does not know it falls back on `max_chars`, which such a caller sets to
+    /// the same number as an upper bound. When both are set this one governs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// Acknowledge what is handed over in the same step: the hand-over is
     /// itself the delivery.
     #[serde(default)]

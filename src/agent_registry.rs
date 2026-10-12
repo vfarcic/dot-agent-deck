@@ -387,6 +387,14 @@ pub struct AgentSpec {
     /// where they are unmeasured (Devin) or there is no agent to press them at
     /// (the neutral placeholder). See [`PromptKeys`].
     pub prompt_keys: Option<PromptKeys>,
+    /// PRD #1666 S7 (decision A): recognises this agent's empty composer in
+    /// the pane's screen rows, for an agent whose wrapper reports it Idle while
+    /// a start dialog may still be up. Until the agent's own hooks report, the
+    /// doorbell writes no byte unless this matches
+    /// ([`crate::agent_pty::AgentPtyRegistry::write_doorbell`]). `None` where
+    /// the agent's status comes only from its own hooks, so it reads Unknown,
+    /// and is never rung, until they report.
+    pub doorbell_composer: Option<fn(&[String]) -> bool>,
 }
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
@@ -575,6 +583,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
             max_literal_write_chars: Some(800),
         },
     }),
+    doorbell_composer: None,
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -611,6 +620,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
             max_literal_write_chars: None,
         },
     }),
+    doorbell_composer: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -644,6 +654,7 @@ pub static PI: AgentSpec = AgentSpec {
             max_literal_write_chars: None,
         },
     }),
+    doorbell_composer: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -692,7 +703,54 @@ pub static CODEX: AgentSpec = AgentSpec {
             max_literal_write_chars: Some(1000),
         },
     }),
+    // PRD #1666 S7: Codex's wrapper reports raw input while its start
+    // dialogs are up, so the doorbell needs the composer itself.
+    doorbell_composer: Some(codex_composer_on_screen),
 };
+
+/// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
+/// row each — show Codex's empty composer, as measured on Codex 0.160.0:
+///
+/// ```text
+/// › Ask Codex to do anything
+///
+///   GPT-5.6-Luna low · /path/to/project
+///   ? for shortcuts                                  ⚠ 1 warning · f2 to view
+/// ```
+///
+/// The footer `? for shortcuts` must be the last row with text, and a `›`
+/// prompt row that is not a numbered choice must sit at most
+/// [`CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER`] rows above it. Codex's start
+/// dialogs (update, folder trust, hooks review) put `›` on a numbered choice
+/// and end in a key-hint footer instead, so none of them matches; nor does any
+/// screen this does not know.
+///
+/// **This is the one place that knows what Codex's composer looks like.** A
+/// Codex release that redraws it makes this return `false`, and the effect is
+/// the safe one: a Codex generation is not rung until its own first hook event
+/// (its first prompt), never typed into a screen the deck does not recognise.
+/// Re-measure and update this function, and the fixture
+/// `tests/fixtures/codex-inbox/composer.txt`, together.
+pub fn codex_composer_on_screen(rows: &[String]) -> bool {
+    let Some(footer) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    if !rows[footer].starts_with("? for shortcuts") {
+        return false;
+    }
+    let first = footer.saturating_sub(CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER);
+    rows[first..footer].iter().rev().any(|row| {
+        row.strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    })
+}
+
+/// How far above [`codex_composer_on_screen`]'s footer the prompt row may be:
+/// the prompt, a blank row, the model line, plus room for a wrapped prompt.
+const CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER: usize = 6;
 
 /// Devin CLI — native-hooks strategy. The second agent to reuse
 /// [`IntegrationStrategy::NativeHooks`], and the reason the strategy dispatch had
@@ -739,6 +797,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     // PRD #1541: unsupported, not measured — Devin was logged out on the box
     // the key table was measured on, so none of its keys could be verified.
     prompt_keys: None,
+    doorbell_composer: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -762,6 +821,7 @@ pub static NONE: AgentSpec = AgentSpec {
     startup_auto_install: None,
     // Not an agent: there is nothing to press keys at.
     prompt_keys: None,
+    doorbell_composer: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -862,6 +922,42 @@ pub fn resolve_type_alias(alias: &str) -> Option<AgentType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rows the doorbell's gate reads for a fixture screen: one trimmed
+    /// row per line, as `crate::pane_screen_text` produces them.
+    fn rows(screen: &str) -> Vec<String> {
+        screen.lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    /// PRD #1666 S7: the Codex composer recogniser accepts the measured 0.160.0
+    /// composer, with or without the warning indicator on its footer row, and
+    /// refuses every measured start dialog, an unknown dialog, a composer with
+    /// output below it, and a blank screen.
+    #[test]
+    fn codex_composer_is_recognised_and_dialogs_are_not() {
+        let composer = include_str!("../tests/fixtures/codex-inbox/composer.txt");
+        assert!(codex_composer_on_screen(&rows(composer)));
+        let warned = composer.replace(
+            "? for shortcuts",
+            "? for shortcuts                       ⚠ 1 warning · f2 to view",
+        );
+        assert!(codex_composer_on_screen(&rows(&warned)));
+        for dialog in [
+            include_str!("../tests/fixtures/codex-inbox/update.txt"),
+            include_str!("../tests/fixtures/codex-inbox/folder.txt"),
+            include_str!("../tests/fixtures/codex-inbox/hooks.txt"),
+            include_str!("../tests/fixtures/codex-inbox/unknown.txt"),
+        ] {
+            assert!(!codex_composer_on_screen(&rows(dialog)), "{dialog}");
+        }
+        assert!(!codex_composer_on_screen(&rows(&format!(
+            "{composer}\n  something printed below"
+        ))));
+        let numbered = composer.replace("› Ask Codex to do anything", "› 1. Ask Codex");
+        assert!(!codex_composer_on_screen(&rows(&numbered)));
+        assert!(!codex_composer_on_screen(&rows("\n\n")));
+        assert!(!codex_composer_on_screen(&[]));
+    }
 
     // Pure-data registry lookups — plain `#[test]` unit tests (no `#[spec]` /
     // CATALOG reproducer needed; these assert compiled-in data, not runtime

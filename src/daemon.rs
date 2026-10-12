@@ -1820,6 +1820,20 @@ async fn ingest_hook_event(
     };
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
+    // PRD #1666 S7: an attested report the agent's own hooks wrote, as opposed
+    // to one its wrapper wrote about it, proves the agent is past its start
+    // screens for the doorbell ([`AgentPtyRegistry::note_own_hook`]).
+    let own_hook = match (&attested_agent, &event.pane_id) {
+        (Some(agent), Some(pane))
+            if !unproven
+                && event.agent_id.as_deref().is_none_or(|named| named == agent)
+                && !event.is_wrapper_session_start()
+                && !event.is_wrapper_output_classified() =>
+        {
+            Some((pane.clone(), agent.clone()))
+        }
+        _ => None,
+    };
     let ingested = ingest_event_unless(
         state,
         event_tx,
@@ -1830,6 +1844,9 @@ async fn ingest_hook_event(
         replaced,
     )
     .await;
+    if ingested && let Some((pane, agent)) = own_hook {
+        registry.note_own_hook(&pane, &agent);
+    }
     if !ingested {
         // Qodo, PR #1559: logged like the gate's own refusals — the escaped
         // pane and a stable reason code, never the token — so a report the
@@ -3870,11 +3887,15 @@ fn handle_inbox_fetch(
         InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
         InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
     };
-    let messages = registry.inbox().fetch(
+    let budget = req
+        .max_bytes
+        .map(crate::event::InboxBudget::Bytes)
+        .or(req.max_chars.map(crate::event::InboxBudget::Chars));
+    let messages = registry.inbox().fetch_within(
         &req.pane_id,
         agent_id,
         consumer,
-        req.max_chars,
+        budget,
         req.ack.then_some(how),
     );
     info!(

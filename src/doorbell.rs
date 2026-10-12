@@ -22,6 +22,12 @@
 //!    Error, or Unknown (no hook yet), nor the Idle of a Codex wrapper's
 //!    fork-time start alone — and its session has not declared the pane
 //!    history-only or view-only;
+//!    - until the agent's own hooks have reported for this generation, an
+//!      agent whose spec names a composer (Codex) is written to only while that
+//!      composer is on screen: its wrapper reports Idle as soon as Codex takes
+//!      raw input, which is while its start dialogs are still up, and any byte
+//!      can answer one of those. Checked under the pane's writer, for the CRs
+//!      too ([`crate::agent_pty::AgentPtyRegistry::write_doorbell`]);
 //! 4. the user has no unsent draft in the pane — with no cap: the doorbell
 //!    waits for the user however long they take;
 //! 5. the ring is due on the schedule ([`DoorbellConfig::schedule`]).

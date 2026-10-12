@@ -2596,6 +2596,10 @@ pub enum DoorbellWrite {
     NotOwner,
     /// The pane's PTY is not taking input; nothing was written.
     NotReading,
+    /// PRD #1666 S7: the agent has not reported through its own hooks yet and
+    /// its composer is not on screen, so whatever is there — a start dialog,
+    /// known or not — gets no byte; nothing was written.
+    NoComposer,
     /// A write failed part-way or could not be encoded.
     Failed,
 }
@@ -3403,6 +3407,13 @@ pub struct RunningAgent {
     /// tell a worker that is still starting from one that is up. Per record,
     /// so a respawn starts booting again.
     pub boot: AgentBoot,
+    /// PRD #1666 S7: an event from the agent's OWN hooks has arrived for this
+    /// generation — not one the wrapper hosting it wrote. Until then an agent
+    /// whose spec names a composer
+    /// ([`crate::agent_registry::AgentSpec::doorbell_composer`]) is rung only
+    /// while that composer is on screen ([`AgentPtyRegistry::write_doorbell`]).
+    /// Per record, so a respawn starts unseen.
+    pub own_hook_seen: bool,
 }
 
 /// Issue #1650: an agent's boot, as the delegate path's `clear = false` gate
@@ -11057,6 +11068,7 @@ impl AgentPtyRegistry {
                 spawned: Some(tokio::time::Instant::now()),
                 ready: None,
             },
+            own_hook_seen: false,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -11848,8 +11860,13 @@ impl AgentPtyRegistry {
     ///   waits for the user however long they take, and the caller re-asks on
     ///   its next tick.
     ///
-    /// No echo wait, no screen read and no retry: whether the message arrived is
-    /// the inbox's to say, not the screen's.
+    /// * **composer** — until the agent reports through its own hooks, an agent
+    ///   whose spec names a composer recogniser is written to only while the
+    ///   recogniser matches the pane's screen (PRD #1666 S7, decision A).
+    ///
+    /// No echo wait and no retry: whether the message arrived is the inbox's
+    /// to say, not the screen's. The screen is read only for the composer gate,
+    /// which can only withhold bytes.
     pub async fn write_doorbell(
         &self,
         pane_id: &str,
@@ -11891,6 +11908,18 @@ impl AgentPtyRegistry {
         }
         if self.draft_pending(pane_id) {
             return DoorbellWrite::DraftPending;
+        }
+        // PRD #1666 S7 (decision A): before the agent's own first hook event a
+        // wrapped agent's screen may be a start dialog, where any byte —
+        // the line, a pre-ring CR or a cleanup CR — can answer it. So every
+        // write then waits for the composer, read under the writer.
+        if let Some(composer) = self.doorbell_composer_gate(expected_agent_id)
+            && !self
+                .screen_rows(expected_agent_id)
+                .await
+                .is_some_and(|rows| composer(&rows))
+        {
+            return DoorbellWrite::NoComposer;
         }
         let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
         if pre_cr {
@@ -13106,6 +13135,8 @@ impl AgentPtyRegistry {
             // Issue #1650: dropped — the replacement boots afresh, and
             // `spawn_agent` stamps its own record.
             boot: _,
+            // PRD #1666 S7: dropped — the replacement has not reported yet.
+            own_hook_seen: _,
             // The replacement gets a writer, and a PTY thread, of its own.
             pty_progress: _,
         } = removed;
@@ -14208,6 +14239,46 @@ impl AgentPtyRegistry {
     /// Issue #1650: record `agent_id`'s first readiness signal, if it is the
     /// live agent on `pane_id`. Later signals are ignored: the gate asks when
     /// the agent first became ready, not when it last announced itself.
+    /// PRD #1666 S7: record that `agent_id`, on `pane_id`, reported through its
+    /// own hooks ([`RunningAgent::own_hook_seen`]).
+    pub fn note_own_hook(&self, pane_id: &str, agent_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.pane_id_env.as_deref() == Some(pane_id)
+        {
+            agent.own_hook_seen = true;
+        }
+    }
+
+    /// PRD #1666 S7: the composer recogniser the doorbell must satisfy before
+    /// it writes to `agent_id`, or `None` when it need not: the agent's own
+    /// hooks have reported for this generation, or its spec names none.
+    fn doorbell_composer_gate(&self, agent_id: &str) -> Option<fn(&[String]) -> bool> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.agents.get(agent_id)?;
+        if agent.own_hook_seen {
+            return None;
+        }
+        crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?).doorbell_composer
+    }
+
+    /// The screen `agent_id`'s pane shows, one trimmed row each, or `None`
+    /// when it cannot be read.
+    async fn screen_rows(&self, agent_id: &str) -> Option<Vec<String>> {
+        let (bus, rows, cols) = {
+            let inner = self.inner.lock().unwrap();
+            let agent = inner.agents.get(agent_id)?;
+            (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::pane_screen_text::visible_rows_and_cursor(&bus.snapshot(), rows, cols)
+                .map(|(rows, _, _)| rows)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     pub fn note_boot_readiness(&self, pane_id: &str, agent_id: &str, interface: bool) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(agent) = inner.agents.get_mut(agent_id)
@@ -15434,6 +15505,7 @@ impl AgentPtyRegistry {
                 quota_block: None,
                 authoring_kind: None,
                 boot: AgentBoot::default(),
+                own_hook_seen: false,
             },
         );
         id
