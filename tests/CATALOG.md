@@ -631,6 +631,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the figures' own truncation at the narrowest width; the desktop popover (covered by `host-metrics.spec.ts`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/host-metrics/012 — On every terminal width, a reading in a level's colour carries its whole level word.
+- **Layer:** L1 (TestBackend, the live `render_host_metrics_overlay` through `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** for every terminal width from 34 columns down to 1, with a critical disk, a warning disk and a warning load: where the overlay body holds the word `critical`, `critical` appears once and `warning` twice, whole and in their levels' colours, in parentheses whenever the body holds them too; on a narrower terminal no cell is drawn in a level's colour (PR #1672 review).
+- **Does not assert:** the figures' own truncation; the "too narrow" line's wording; the desktop popover (covered by `host-metrics.spec.ts`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/config-gen
 
 ##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.

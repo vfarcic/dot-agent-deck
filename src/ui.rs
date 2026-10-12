@@ -20302,6 +20302,12 @@ fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option
     }
 }
 
+/// PR #1672 review: the narrowest overlay body that draws readings — the width
+/// of the widest level word without its parentheses, `critical`. A narrower
+/// body says it is too narrow instead, so no reading is drawn in its level's
+/// colour with its word cut.
+const HOST_METRICS_MIN_BODY_WIDTH: usize = "critical".len();
+
 /// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
 /// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
 /// TUI has held the answer, added to its sample age.
@@ -20309,7 +20315,8 @@ fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option
 /// `width` is the body's width in columns. A judged row that does not fit it
 /// gives its level word a line of its own below the value, so a narrow
 /// terminal cuts the figures' tail rather than the word — the signal that does
-/// not depend on colour (PR #1672 review).
+/// not depend on colour (PR #1672 review). Below
+/// [`HOST_METRICS_MIN_BODY_WIDTH`] it draws no reading at all.
 fn host_metrics_lines(
     view: &HostMetricsView,
     held: std::time::Duration,
@@ -20349,11 +20356,19 @@ fn host_metrics_lines(
                 Span::styled(format!("{value} {word}"), style),
             ])];
         }
-        // Under the value when the word fits there, else at the body's indent.
-        let indent = if prefix.width() + word.width() <= usize::from(width) {
+        // Under the value when the word fits there; else as far in as the body's
+        // indent allows; else without its parentheses, which a body of
+        // `HOST_METRICS_MIN_BODY_WIDTH` columns still holds (PR #1672 review).
+        let width = usize::from(width);
+        let word = if word.width() <= width {
+            word
+        } else {
+            word.trim_matches(|c| c == '(' || c == ')')
+        };
+        let indent = if prefix.width() + word.width() <= width {
             prefix.width()
         } else {
-            2
+            width.saturating_sub(word.width()).min(2)
         };
         vec![
             Line::from(vec![Span::raw(prefix), Span::styled(value, style)]),
@@ -20393,6 +20408,13 @@ fn host_metrics_lines(
             lines.push(Line::from(
                 "  Its daemon is an older version, or runs on Windows.",
             ));
+        }
+        HostMetricsView::Report(HostMetricsReport::Available(_))
+            if usize::from(width) < HOST_METRICS_MIN_BODY_WIDTH =>
+        {
+            // Too narrow for even a bare level word: no reading at all, rather
+            // than a coloured one whose word is cut (PR #1672 review).
+            lines.push(Line::from("  Too narrow to show readings"));
         }
         HostMetricsView::Report(HostMetricsReport::Available(metrics)) => {
             let gib = |bytes: Option<u64>| bytes.map_or_else(|| UNKNOWN.to_string(), format_gib);

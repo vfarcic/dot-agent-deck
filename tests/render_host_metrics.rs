@@ -338,17 +338,10 @@ fn dashboard_host_metrics_010_values_are_coloured_by_their_level_with_words() {
     insta::assert_snapshot!(rendered);
 }
 
-/// Scenario: Open the host overlay on a terminal 60 columns wide, then on one
-/// 34 wide, with a critical disk, a warning disk and a warning load. A row too
-/// long for the overlay puts its `(critical)` or `(warning)` on the line below
-/// its figures, so the word is still shown in full on both widths, in the
-/// level's colour; a row that fits keeps the word beside its figures.
-#[spec("dashboard/host-metrics/011")]
-#[test]
-fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
-    use ratatui::style::Color;
+/// A critical disk, a warning disk, a warning load and two ok readings.
+fn judged_report() -> HostMetricsReport {
     let gib = 1024_u64.pow(3);
-    let report = HostMetricsReport::Available(
+    HostMetricsReport::Available(
         serde_json::from_value(json!({
             "disks": [
                 {"role": "working_root", "free_bytes": 4 * gib, "total_bytes": 100 * gib, "level": "critical"},
@@ -365,7 +358,19 @@ fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
             "sample_age_ms": 10
         }))
         .expect("a judged daemon sample"),
-    );
+    )
+}
+
+/// Scenario: Open the host overlay on a terminal 60 columns wide, then on one
+/// 34 wide, with a critical disk, a warning disk and a warning load. A row too
+/// long for the overlay puts its `(critical)` or `(warning)` on the line below
+/// its figures, so the word is still shown in full on both widths, in the
+/// level's colour; a row that fits keeps the word beside its figures.
+#[spec("dashboard/host-metrics/011")]
+#[test]
+fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
+    use ratatui::style::Color;
+    let report = judged_report();
     for width in [60, 34] {
         let buffer = render_host_metrics_overlay_to_buffer(&report, width, 32);
         let rendered = text(&buffer);
@@ -405,5 +410,68 @@ fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
             assert_line_has(&rendered, "Load per core", &["(warning)"]);
             insta::assert_snapshot!(rendered);
         }
+    }
+}
+
+/// Scenario: Open the host overlay with a critical disk, a warning disk and a
+/// warning load on every terminal width from 34 columns down to 1. Wherever the
+/// overlay has room for the word `critical`, every non-ok reading shows its
+/// whole level word in its level's colour — in parentheses when they fit too;
+/// below that, it draws no reading at all rather than one in a level's colour
+/// with its word cut.
+#[spec("dashboard/host-metrics/012")]
+#[test]
+fn dashboard_host_metrics_012_level_words_survive_every_narrow_width() {
+    use ratatui::style::Color;
+    let report = judged_report();
+    // The overlay is the terminal less two columns, its body two less again.
+    const MIN_TERMINAL_WIDTH: u16 = 4 + "critical".len() as u16;
+    for width in 1..=34_u16 {
+        let body = usize::from(width.saturating_sub(4));
+        let buffer = render_host_metrics_overlay_to_buffer(&report, width, 32);
+        let rendered = text(&buffer);
+        let area = buffer.area();
+        let health = |c: Color| matches!(c, Color::Red | Color::Yellow | Color::Green);
+        if width < MIN_TERMINAL_WIDTH {
+            assert!(
+                !buffer.content().iter().any(|cell| health(cell.fg)),
+                "{width} wide draws a reading without room for its word\n{rendered}"
+            );
+            continue;
+        }
+        assert_eq!(
+            rendered.matches("critical").count(),
+            1,
+            "{width} wide\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("warning").count(),
+            2,
+            "{width} wide\n{rendered}"
+        );
+        if body >= "(critical)".len() {
+            assert!(rendered.contains("(critical)"), "{width} wide\n{rendered}");
+        }
+        if body >= "(warning)".len() {
+            assert_eq!(
+                rendered.matches("(warning)").count(),
+                2,
+                "{width} wide\n{rendered}"
+            );
+        }
+        let colour_of = |word: &str| {
+            for y in area.y..area.bottom() {
+                let row: String = (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if let Some(at) = row.find(word) {
+                    let x = area.x + row[..at].chars().count() as u16;
+                    return buffer[(x, y)].fg;
+                }
+            }
+            panic!("no {word}\n{rendered}");
+        };
+        assert_eq!(colour_of("critical"), Color::Red, "{width} wide");
+        assert_eq!(colour_of("warning"), Color::Yellow, "{width} wide");
     }
 }
