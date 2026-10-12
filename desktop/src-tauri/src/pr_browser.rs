@@ -633,11 +633,22 @@ const PLACEMENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Default, PartialEq)]
 pub struct PlacementReport {
     pub lines: Vec<String>,
-    pub flush_after: Option<Duration>,
+    pub flush: Option<ScheduledFlush>,
+}
+
+/// A flush [`PlacementLog::placed`] asks for: call [`PlacementLog::flush`]
+/// with `epoch` once `after` has passed.
+#[derive(Debug, PartialEq)]
+pub struct ScheduledFlush {
+    pub after: Duration,
+    /// Which open the held line belongs to, so a flush that comes due after
+    /// the next open leaves that open's line alone.
+    pub epoch: u64,
 }
 
 #[derive(Debug)]
 struct PlacementLogState {
+    epoch: u64,
     last_line: Option<Instant>,
     logged: Option<Placed>,
     held: Option<(Placed, String)>,
@@ -646,8 +657,9 @@ struct PlacementLogState {
 }
 
 impl PlacementLogState {
-    const fn new() -> Self {
+    const fn new(epoch: u64) -> Self {
         Self {
+            epoch,
             last_line: None,
             logged: None,
             held: None,
@@ -662,8 +674,9 @@ impl PlacementLogState {
 /// `interval`. A change inside the interval is held and printed by
 /// [`PlacementLog::flush`] once the interval is over, so the rectangle a
 /// resize drag ends on is printed even when nothing is placed after it. The
-/// fallback warning is printed once per open. The clock is a parameter, as in
-/// [`HandOffGate`].
+/// fallback warning is printed once per open. A line still held when the next
+/// page opens is printed by that open, and a flush scheduled before an open
+/// prints nothing after it. The clock is a parameter, as in [`HandOffGate`].
 #[derive(Debug)]
 pub struct PlacementLog {
     interval: Duration,
@@ -674,14 +687,18 @@ impl PlacementLog {
     pub const fn new(interval: Duration) -> Self {
         Self {
             interval,
-            state: Mutex::new(PlacementLogState::new()),
+            state: Mutex::new(PlacementLogState::new(0)),
         }
     }
 
     /// A pull request is opening: its first placement is printed whatever
-    /// came before, and so is the fallback warning.
-    pub fn opened(&self) {
-        *self.lock() = PlacementLogState::new();
+    /// came before, and so is the fallback warning. Returns the line the page
+    /// before it still held, which is printed now rather than dropped.
+    pub fn opened(&self) -> Option<String> {
+        let mut state = self.lock();
+        let held = state.held.take().map(|(_, line)| line);
+        *state = PlacementLogState::new(state.epoch.wrapping_add(1));
+        held
     }
 
     /// The page was placed at `placed` at `now`. `fallback` is why the main
@@ -714,7 +731,10 @@ impl PlacementLog {
                 state.held = Some((placed, line()));
                 if !state.flush_scheduled {
                     state.flush_scheduled = true;
-                    report.flush_after = Some(self.interval - since);
+                    report.flush = Some(ScheduledFlush {
+                        after: self.interval - since,
+                        epoch: state.epoch,
+                    });
                 }
             }
             _ => {
@@ -727,9 +747,13 @@ impl PlacementLog {
         report
     }
 
-    /// The line [`PlacementLog::placed`] held back, if one is still waiting.
-    pub fn flush(&self, now: Instant) -> Option<String> {
+    /// The line [`PlacementLog::placed`] held back, if one is still waiting
+    /// and no page has opened since the flush was scheduled for `epoch`.
+    pub fn flush(&self, epoch: u64, now: Instant) -> Option<String> {
         let mut state = self.lock();
+        if state.epoch != epoch {
+            return None;
+        }
         state.flush_scheduled = false;
         let (placed, line) = state.held.take()?;
         state.last_line = Some(now);
@@ -1131,7 +1155,9 @@ pub async fn open<R: Runtime>(
     let _session = SESSION.lock().await;
     admit_open(&CLEARING)?;
     let generation = GENERATIONS.begin();
-    PLACEMENT_LOG.opened();
+    if let Some(line) = PLACEMENT_LOG.opened() {
+        eprintln!("{line}");
+    }
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
         if let Err(error) = webview.navigate(url) {
             // The replaced page stays; its effects are its own again.
@@ -1217,20 +1243,20 @@ fn log_placement(surface: &Surface, bounds: Bounds, placed: Placed) {
     for line in report.lines {
         eprintln!("{line}");
     }
-    let Some(after) = report.flush_after else {
+    let Some(ScheduledFlush { after, epoch }) = report.flush else {
         return;
     };
     let spawned = std::thread::Builder::new()
         .name("pr-browser-placement-log".into())
         .spawn(move || {
             std::thread::sleep(after);
-            if let Some(line) = PLACEMENT_LOG.flush(Instant::now()) {
+            if let Some(line) = PLACEMENT_LOG.flush(epoch, Instant::now()) {
                 eprintln!("{line}");
             }
         });
     // Without the thread, print the held line now rather than never.
     if spawned.is_err()
-        && let Some(line) = PLACEMENT_LOG.flush(now)
+        && let Some(line) = PLACEMENT_LOG.flush(epoch, now)
     {
         eprintln!("{line}");
     }
@@ -2712,15 +2738,18 @@ mod tests {
             report,
             PlacementReport {
                 lines: vec![],
-                flush_after: Some(Duration::from_millis(800))
+                flush: Some(ScheduledFlush {
+                    after: Duration::from_millis(800),
+                    epoch: 1
+                })
             }
         );
         assert_eq!(
             log.placed(after(400), at(65.0), None, line("drag 2")),
             PlacementReport::default()
         );
-        assert_eq!(log.flush(after(1000)).as_deref(), Some("drag 2"));
-        assert_eq!(log.flush(after(1001)), None);
+        assert_eq!(log.flush(1, after(1000)).as_deref(), Some("drag 2"));
+        assert_eq!(log.flush(1, after(1001)), None);
         assert_eq!(
             log.placed(after(1100), at(65.0), None, line("settled")),
             PlacementReport::default()
@@ -2735,7 +2764,7 @@ mod tests {
         // A change that goes back to the printed placement drops what was held.
         log.placed(after(2200), at(75.0), None, line("held"));
         log.placed(after(2300), at(70.0), None, line("back"));
-        assert_eq!(log.flush(after(3100)), None);
+        assert_eq!(log.flush(1, after(3100)), None);
 
         // The fallback warning: once per open, and again after the next open.
         let first = log.placed(after(5000), at(80.0), Some("gone"), line("fallback"));
@@ -2751,6 +2780,56 @@ mod tests {
             reopened.lines,
             [fallback_warning("gone"), "reopened".to_string()]
         );
+    }
+
+    /// Page A closes with a line held and page B opens before A's flush is
+    /// due: B's open prints A's held line, A's flush then prints nothing and
+    /// leaves B's held line for B's own flush, and B's first placement is
+    /// printed as the first after an open.
+    #[test]
+    fn a_flush_from_before_an_open_leaves_the_next_page_alone() {
+        let log = PlacementLog::new(Duration::from_secs(1));
+        let at = |y: f64| Placed {
+            x: 15.0,
+            y,
+            width: 100.0,
+            height: 100.0,
+        };
+        let start = Instant::now();
+        let after = |ms: u64| start + Duration::from_millis(ms);
+        let line = |text: &'static str| move || text.to_string();
+
+        log.opened();
+        assert_eq!(
+            log.placed(start, at(55.0), None, line("a first")).lines,
+            ["a first"]
+        );
+        let a = log
+            .placed(after(200), at(60.0), None, line("a held"))
+            .flush
+            .expect("A's held line schedules a flush");
+        assert_eq!(a.after, Duration::from_millis(800));
+
+        assert_eq!(log.opened().as_deref(), Some("a held"));
+        assert_eq!(
+            log.placed(after(300), at(70.0), None, line("b first"))
+                .lines,
+            ["b first"]
+        );
+        let b = log
+            .placed(after(400), at(75.0), None, line("b held"))
+            .flush
+            .expect("B's held line schedules its own flush");
+        assert_eq!(b.after, Duration::from_millis(900));
+        assert_ne!(a.epoch, b.epoch);
+
+        assert_eq!(log.flush(a.epoch, after(1000)), None, "A's flush fired");
+        assert_eq!(
+            log.flush(b.epoch, after(1300)).as_deref(),
+            Some("b held"),
+            "B's flush"
+        );
+        assert_eq!(log.flush(b.epoch, after(1301)), None);
     }
 
     /// Decision 4: the files that grant permissions name only the app's own
