@@ -535,6 +535,11 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// seam would run any agent's command line under, running the command
 /// verbatim. An argv rather than a line, so the command is never quoted for
 /// an outer shell, whose dialect (fish) need not match POSIX quoting.
+///
+/// Such a command can also move Codex away from what `codex_spawn_prep`
+/// prepared: `CODEX_HOME=… codex` and `cd … && codex` start, but in a home or
+/// directory the wrapper did not install and trust its hooks for, as
+/// `env CODEX_HOME=… codex` and launcher scripts already did (#1703).
 pub fn wrap_launch_command(command: &str, agent_type: &AgentType, shell: &str) -> LaunchCommand {
     let spec = crate::agent_registry::spec(agent_type);
     if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
