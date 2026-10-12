@@ -442,6 +442,32 @@ pub const PLAIN_LETTER_ALIASES: [Action; 6] = [
     Action::ToggleZoom,
 ];
 
+/// The mirror of [`PLAIN_LETTER_ALIASES`] (PR #1672): the actions whose default
+/// plain letter also answers to `Ctrl+<letter>` **in command mode** — `m`
+/// (host metrics), `s` (Schedules), `g` (generate config), `u` (upgrade) and
+/// `r` (rename). Command mode only, never global: in a pane `Ctrl+R`, `Ctrl+U`,
+/// `Ctrl+S`, `Ctrl+G` and `Ctrl+M` still reach the program byte for byte
+/// (reverse search, kill line, an agent's editor).
+///
+/// Left out on purpose: navigation (`j k h l`), the digits, `?`, `/`, `y`,
+/// `n`, `Enter` and `Esc`, which have no command a `Ctrl` form would name.
+///
+/// `Ctrl+M` is the same byte as `Enter` in a terminal that does not
+/// disambiguate escape codes, so there it arrives as `Enter` and focuses the
+/// pane, as `Enter` always has; only a terminal that reports it as `Ctrl+M`
+/// (kitty's keyboard protocol, which the TUI asks for) reaches this alias.
+///
+/// Same rule as the plain letters ([`KeybindingConfig::command_mode_alias`]):
+/// only while the action is on its default letter, and only while no other
+/// action is bound to the `Ctrl` chord.
+pub const CTRL_LETTER_ALIASES: [Action; 5] = [
+    Action::HostMetrics,
+    Action::OpenScheduledTasks,
+    Action::GenerateConfig,
+    Action::OpenUpgrade,
+    Action::Rename,
+];
+
 /// A single parsed key binding.
 ///
 /// `chord == None` means the action is **unbound** (config value `""`): it is
@@ -681,21 +707,32 @@ impl KeybindingConfig {
         matches_binding(key, &self.binding(action))
     }
 
-    /// The plain letter `action` also answers to in command mode, if it has
-    /// one under this config. See [`PLAIN_LETTER_ALIASES`] for the rule.
-    pub fn plain_alias(&self, action: Action) -> Option<char> {
-        if !PLAIN_LETTER_ALIASES.contains(&action) {
+    /// The other form of `action`'s default key that it also answers to in
+    /// command mode, if it has one under this config: the plain letter of a
+    /// default `Ctrl+<letter>` chord ([`PLAIN_LETTER_ALIASES`]), or the
+    /// `Ctrl+<letter>` chord of a default plain letter
+    /// ([`CTRL_LETTER_ALIASES`]). One rule for both directions: the action is
+    /// still on its default key — a remapped action gets none, since the user
+    /// chose its key — and no other action is bound to the alias.
+    pub fn command_mode_alias(&self, action: Action) -> Option<Binding> {
+        let (from, to) = if PLAIN_LETTER_ALIASES.contains(&action) {
+            (KeyModifiers::CONTROL, KeyModifiers::NONE)
+        } else if CTRL_LETTER_ALIASES.contains(&action) {
+            (KeyModifiers::NONE, KeyModifiers::CONTROL)
+        } else {
             return None;
-        }
+        };
         let default = parse_binding(action.default_notation()).ok()?;
-        // A remapped action gets no alias: the user chose its key.
         if self.binding(action) != default {
             return None;
         }
-        let (KeyCode::Char(letter), KeyModifiers::CONTROL) = default.chord()? else {
+        let (KeyCode::Char(letter), mods) = default.chord()? else {
             return None;
         };
-        let plain = normalize_chord(KeyCode::Char(letter), KeyModifiers::NONE);
+        if mods != from {
+            return None;
+        }
+        let alias = normalize_chord(KeyCode::Char(letter), to);
         let taken = ACTIONS.iter().any(|spec| {
             spec.action != action
                 // `n` denies a pending permission and makes a new agent
@@ -705,18 +742,41 @@ impl KeybindingConfig {
                 && self
                     .binding(spec.action)
                     .chord()
-                    .is_some_and(|(code, mods)| normalize_chord(code, mods) == plain)
+                    .is_some_and(|(code, mods)| normalize_chord(code, mods) == alias)
         });
-        (!taken).then_some(letter)
+        (!taken).then(|| Binding::bound(alias.0, alias.1))
+    }
+
+    /// The plain letter `action` also answers to in command mode, if it has
+    /// one under this config. See [`PLAIN_LETTER_ALIASES`] for the rule.
+    pub fn plain_alias(&self, action: Action) -> Option<char> {
+        match self.command_mode_alias(action)?.chord()? {
+            (KeyCode::Char(letter), KeyModifiers::NONE) => Some(letter),
+            _ => None,
+        }
+    }
+
+    /// The letter whose `Ctrl` chord `action` also answers to in command mode,
+    /// if it has one under this config. See [`CTRL_LETTER_ALIASES`].
+    pub fn ctrl_alias(&self, action: Action) -> Option<char> {
+        match self.command_mode_alias(action)?.chord()? {
+            (KeyCode::Char(letter), KeyModifiers::CONTROL) => Some(letter),
+            _ => None,
+        }
+    }
+
+    /// `true` iff `key` is `action`'s command-mode alias
+    /// ([`Self::command_mode_alias`]), in either direction. Only command mode
+    /// reads it.
+    pub fn matches_command_mode_alias(&self, action: Action, key: &KeyEvent) -> bool {
+        self.command_mode_alias(action)
+            .is_some_and(|alias| matches_binding(key, &alias))
     }
 
     /// `true` iff `key` is `action`'s plain-letter alias ([`Self::plain_alias`]).
     /// Only command mode reads it; a key with any modifier never matches.
     pub fn matches_plain_alias(&self, action: Action, key: &KeyEvent) -> bool {
-        self.plain_alias(action).is_some_and(|letter| {
-            normalize_chord(key.code, key.modifiers)
-                == normalize_chord(KeyCode::Char(letter), KeyModifiers::NONE)
-        })
+        self.plain_alias(action).is_some() && self.matches_command_mode_alias(action, key)
     }
 
     /// Find the (first, in canonical order) action triggered by `key`, if any.

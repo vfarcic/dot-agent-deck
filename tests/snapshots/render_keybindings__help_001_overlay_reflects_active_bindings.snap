@@ -31,12 +31,12 @@ expression: text
         │  z / Ctrl+z         Zoom focused pane                                                               │         
         │  /                  Filter agents                   Session                                         │         
         │  Esc                Clear filter                                                                    │         
-        │  r                  Rename agent                    Panes auto-saved continuously.                  │         
-        │  g                  Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
+        │  r / Ctrl+r         Rename agent                    Panes auto-saved continuously.                  │         
+        │  g / Ctrl+g         Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
         │  y / n              Approve / deny permission                                                       │         
-        │  s                  Schedules manager                                                               │         
-        │  m                  Host of this deck                                                               │         
-        │  u                  Upgrade (update badge)                                                          │         
+        │  s / Ctrl+s         Schedules manager                                                               │         
+        │  m / Ctrl+m         Host of this deck                                                               │         
+        │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

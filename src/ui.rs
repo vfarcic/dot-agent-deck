@@ -9605,7 +9605,12 @@ fn handle_normal_key(
     if kb.matches(KbAction::Help, &key) {
         return Action::ToggleHelp;
     }
-    if kb.matches(KbAction::Rename, &key) && total > 0 {
+    // PR #1672: each plain-letter command below also answers to `Ctrl` with
+    // its letter here, in command mode only ([`crate::keybindings::CTRL_LETTER_ALIASES`]);
+    // in a pane those chords never reach this handler and go to the program.
+    let pressed =
+        |action: KbAction| kb.matches(action, &key) || kb.matches_command_mode_alias(action, &key);
+    if pressed(KbAction::Rename) && total > 0 {
         return Action::EnterRename;
     }
     if kb.matches(KbAction::FocusPane, &key) && total > 0 {
@@ -9613,7 +9618,7 @@ fn handle_normal_key(
     }
     // generate_config (default `g`) — a first-class remappable action so it
     // participates in conflict detection and renders via display_notation.
-    if kb.matches(KbAction::GenerateConfig, &key) && total > 0 {
+    if pressed(KbAction::GenerateConfig) && total > 0 {
         return Action::RequestConfigGen;
     }
     // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
@@ -9645,17 +9650,17 @@ fn handle_normal_key(
     // (PRD #80 parity). The legacy uppercase `S` (Shift+s) stays a hardcoded
     // non-configurable alias — mirroring the Down/Up aliases kept beside j/k —
     // so existing muscle memory keeps working while lowercase `s` is added.
-    if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
+    if pressed(KbAction::OpenScheduledTasks) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
     }
     // PRD #1258 M3: the host-of-this-deck overlay (default `m`). Needs no card,
     // so it opens on an empty dashboard too.
-    if kb.matches(KbAction::HostMetrics, &key) {
+    if pressed(KbAction::HostMetrics) {
         return Action::OpenHostMetrics;
     }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
-    if kb.matches(KbAction::OpenUpgrade, &key) {
+    if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
@@ -9800,7 +9805,7 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
 }
 
 /// PRD #1258 M3: keys while the host overlay is up. Escape, `q` and the
-/// overlay's own binding close it; Ctrl+C keeps its PRD #40 safety net and
+/// overlay's own binding (and its `Ctrl` form, PR #1672) close it; Ctrl+C keeps its PRD #40 safety net and
 /// opens the quit flow, as from every other modal.
 fn handle_host_metrics_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -9810,6 +9815,7 @@ fn handle_host_metrics_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfi
     }
     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
         || kb.matches(KbAction::HostMetrics, &key)
+        || kb.matches_command_mode_alias(KbAction::HostMetrics, &key)
     {
         return Action::CloseHostMetrics;
     }
@@ -20039,10 +20045,16 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     // PRD #1258: an action with a plain-letter alias lists the letter first
     // (`n / Ctrl+n`). The letter works in command mode only — which is where
     // this overlay opens — and the chord from any pane, as the heading says.
+    // PR #1672: the reverse too — a plain-letter action lists its `Ctrl` form
+    // after it (`m / Ctrl+m`), command mode only like the letters.
     let lettered = |action: KbAction| -> String {
-        match keybindings.plain_alias(action) {
-            Some(letter) => format!("{letter} / {}", n(action)),
-            None => n(action),
+        match (
+            keybindings.plain_alias(action),
+            keybindings.ctrl_alias(action),
+        ) {
+            (Some(letter), _) => format!("{letter} / {}", n(action)),
+            (None, Some(letter)) => format!("{} / Ctrl+{letter}", n(action)),
+            (None, None) => n(action),
         }
     };
 
@@ -20115,9 +20127,9 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         help_key_line(&lettered(KbAction::ToggleZoom), "Zoom focused pane"),
         help_key_line(&n(KbAction::Filter), "Filter agents"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
-        help_key_line(&n(KbAction::Rename), "Rename agent"),
+        help_key_line(&lettered(KbAction::Rename), "Rename agent"),
         help_key_line(
-            &n(KbAction::GenerateConfig),
+            &lettered(KbAction::GenerateConfig),
             "Generate .dot-agent-deck.toml",
         ),
         help_key_line(
@@ -20128,11 +20140,11 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             ),
             "Approve / deny permission",
         ),
-        help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
-        help_key_line(&n(KbAction::HostMetrics), "Host of this deck"),
+        help_key_line(&lettered(KbAction::OpenScheduledTasks), "Schedules manager"),
+        help_key_line(&lettered(KbAction::HostMetrics), "Host of this deck"),
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
-        help_key_line(&n(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -31885,6 +31897,63 @@ mod tests {
         assert!(matches!(
             press(1, Some(SessionStatus::Idle), &new_moved),
             Action::Continue
+        ));
+    }
+
+    /// Scenario: In command mode, press `Ctrl+r`, `Ctrl+g`, `Ctrl+s`,
+    /// `Ctrl+m` and `Ctrl+u` with a card selected: each does what its plain
+    /// letter does — rename, generate config, the Schedules manager, the host
+    /// overlay and the upgrade dialog. `Enter` still focuses the pane. With
+    /// `rename` remapped, `Ctrl+r` does nothing; with `scroll_pane_up` on
+    /// `Ctrl+u`, `Ctrl+u` is not the upgrade dialog. `Ctrl+m` closes the open
+    /// host overlay as `m` does.
+    #[spec("keybindings/letters/006")]
+    #[test]
+    fn letters_006_ctrl_forms_of_the_letter_commands_act_in_command_mode() {
+        let ctrl = |ch: char| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        let press = |key: KeyEvent, kb: &KeybindingConfig| {
+            handle_normal_key(key, &mut default_ui(), 1, Some(SessionStatus::Idle), kb)
+        };
+        let defaults = KeybindingConfig::default();
+        assert!(matches!(press(ctrl('r'), &defaults), Action::EnterRename));
+        assert!(matches!(
+            press(ctrl('g'), &defaults),
+            Action::RequestConfigGen
+        ));
+        assert!(matches!(
+            press(ctrl('s'), &defaults),
+            Action::OpenScheduledTasks
+        ));
+        assert!(matches!(
+            press(ctrl('m'), &defaults),
+            Action::OpenHostMetrics
+        ));
+        assert!(matches!(press(ctrl('u'), &defaults), Action::OpenUpgrade));
+        // The byte `Ctrl+m` shares with Enter arrives as Enter in a terminal
+        // that does not disambiguate, and Enter is unchanged.
+        assert!(matches!(
+            press(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &defaults),
+            Action::Focus
+        ));
+
+        let (renamed, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\nrename = \"F7\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(press(ctrl('r'), &renamed), Action::Continue));
+
+        let (scroll_on_u, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\nscroll_pane_up = \"Ctrl+u\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!matches!(
+            press(ctrl('u'), &scroll_on_u),
+            Action::OpenUpgrade
+        ));
+
+        let mut ui = default_ui();
+        ui.mode = UiMode::HostMetrics;
+        assert!(matches!(
+            handle_host_metrics_key(ctrl('m'), &mut ui, &defaults),
+            Action::CloseHostMetrics
         ));
     }
 

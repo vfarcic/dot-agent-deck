@@ -39,12 +39,12 @@ expression: buf
    │  z / ctrl+z         zoom focused pane                                                               │    
    │  /                  filter agents                   session                                         │    
    │  esc                clear filter                                                                    │    
-   │  r                  rename agent                    panes auto-saved continuously.                  │    
-   │  g                  generate .dot-agent-deck.toml   restored automatically on launch.               │    
+   │  r / ctrl+r         rename agent                    panes auto-saved continuously.                  │    
+   │  g / ctrl+g         generate .dot-agent-deck.toml   restored automatically on launch.               │    
    │  y / n              approve / deny permission                                                       │    
-   │  s                  schedules manager                                                               │    
-   │  m                  host of this deck                                                               │    
-   │  u                  upgrade (update badge)                                                          │    
+   │  s / ctrl+s         schedules manager                                                               │    
+   │  m / ctrl+m         host of this deck                                                               │    
+   │  u / ctrl+u         upgrade (update badge)                                                          │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    

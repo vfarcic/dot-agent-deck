@@ -122,7 +122,7 @@ An agent you start yourself, outside the deck, still gets a card when its hooks 
 
 Before you start more agents on a deck, you can check how much room its machine has left. Both clients show the same figures for the machine the deck's daemon runs on. For a remote deck that is the remote machine, not the one you are sitting at.
 
-- **TUI:** in command mode, press `m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
+- **TUI:** in command mode, press `m` or `Ctrl+m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
 - **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a small **Host** button beside the daemon's name. Its colour tells you at a glance how that machine is doing (see below), so with several daemons shown you can compare every machine at once. Click it, or reach it with `Tab` and press `Enter`, to open the **Host of this deck** figures; `Esc` or a click elsewhere closes them. With voice on, "show host" or "show resource usage" opens them too ([Voice Control](desktop/voice.md#checking-a-daemons-machine)). The figures refresh at least every five seconds, and whenever the dashboard re-reads that daemon.
 
 **TUI:**

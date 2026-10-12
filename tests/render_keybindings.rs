@@ -439,6 +439,93 @@ fn letters_002_plain_letters_act_in_command_mode_and_type_in_a_pane() {
     }
 }
 
+/// Scenario: Read which `Ctrl` chord each plain-letter command answers to in
+/// command mode, under the defaults and under remaps, then press those chords
+/// in a pane. `m`, `s`, `g`, `u` and `r` answer to `Ctrl` with their letter;
+/// the navigation letters, `y`, `n`, `?` and `/` get none; remapping a command
+/// or binding its chord to another command takes the chord away. In a pane
+/// every one of the five chords is sent to the program as its own control
+/// byte, and none of them is a global command.
+#[spec("keybindings/letters/005")]
+#[test]
+fn letters_005_each_default_letter_command_has_its_ctrl_form() {
+    let defaults = KeybindingConfig::default();
+    for (action, letter) in [
+        (KbAction::HostMetrics, 'm'),
+        (KbAction::OpenScheduledTasks, 's'),
+        (KbAction::GenerateConfig, 'g'),
+        (KbAction::OpenUpgrade, 'u'),
+        (KbAction::Rename, 'r'),
+    ] {
+        assert_eq!(defaults.ctrl_alias(action), Some(letter), "{action:?}");
+        assert_eq!(defaults.plain_alias(action), None, "{action:?}");
+        let chord = KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
+        assert!(
+            defaults.matches_command_mode_alias(action, &chord),
+            "{action:?}"
+        );
+        // The chord's own byte goes to the program in a pane.
+        match key_action_for_mode(&defaults, UiMode::PaneInput, &chord) {
+            Some(UiAction::ForwardToPane(bytes)) => {
+                assert_eq!(bytes, vec![letter as u8 & 0x1f], "Ctrl+{letter}")
+            }
+            other => panic!("pane-mode Ctrl+{letter} must reach the pane, got {other:?}"),
+        }
+        // No mode resolves it as a global command.
+        assert!(
+            key_action_for_mode(&defaults, UiMode::Normal, &chord).is_none(),
+            "Ctrl+{letter} is not global"
+        );
+    }
+    // Left out on purpose, and the Ctrl-chord actions mirror the other way.
+    for action in [
+        KbAction::MoveDown,
+        KbAction::MoveUp,
+        KbAction::MoveLeft,
+        KbAction::MoveRight,
+        KbAction::Filter,
+        KbAction::Help,
+        KbAction::FocusPane,
+        KbAction::ClearFilter,
+        KbAction::ApprovePermission,
+        KbAction::DenyPermission,
+        KbAction::NewPane,
+        KbAction::Dashboard,
+    ] {
+        assert_eq!(defaults.ctrl_alias(action), None, "{action:?}");
+    }
+
+    // A remap takes the chord away; restating the default does not.
+    let (remapped, warnings) =
+        KeybindingConfig::from_toml_str("[dashboard]\nrename = \"x\"\nhost_metrics = \"F2\"\n")
+            .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(remapped.ctrl_alias(KbAction::Rename), None);
+    assert_eq!(remapped.ctrl_alias(KbAction::HostMetrics), None);
+    assert_eq!(remapped.ctrl_alias(KbAction::OpenUpgrade), Some('u'));
+    let (restated, _) =
+        KeybindingConfig::from_toml_str("[dashboard]\nopen_upgrade = \"u\"\n").unwrap();
+    assert_eq!(restated.ctrl_alias(KbAction::OpenUpgrade), Some('u'));
+
+    // A chord bound to another command is that command's.
+    let (conflict, warnings) = KeybindingConfig::from_toml_str(
+        "[dashboard]\nscroll_pane_up = \"Ctrl+u\"\n[global]\ntoggle_layout = \"Ctrl+s\"\n",
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(conflict.ctrl_alias(KbAction::OpenUpgrade), None);
+    assert_eq!(conflict.ctrl_alias(KbAction::OpenScheduledTasks), None);
+    let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    assert!(conflict.matches(KbAction::ScrollPaneUp, &ctrl_u));
+    assert!(!conflict.matches_command_mode_alias(KbAction::OpenUpgrade, &ctrl_u));
+    // `Ctrl+M` is its own chord, not Enter's: the focus key keeps Enter.
+    assert_eq!(defaults.notation(KbAction::FocusPane), "Enter");
+    assert!(!defaults.matches_command_mode_alias(
+        KbAction::HostMetrics,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+}
+
 /// Every [`UiMode`]. [`every_ui_mode_is_listed`] stops a new mode from being
 /// left out of it silently.
 const EVERY_UI_MODE: [UiMode; 15] = [

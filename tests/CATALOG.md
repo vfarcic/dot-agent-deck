@@ -545,7 +545,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay, and the plain-letter commands list their `Ctrl` form after the letter (`m / Ctrl+m`, PR #1672).
 - **Does not assert:** dynamic content (none today).
 - **Platform coverage:** mac+linux+windows.
 
@@ -3660,6 +3660,27 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** with the pane focused, `tz` and Enter are echoed back by `cat` (the line shows twice) and no `Layout:` status appears; after `Ctrl+D`, a plain `t` produces the `Layout:` status the `Ctrl+t` toggle does (PR #1672 review).
 - **Does not assert:** the other letters through the live loop (their resolution is `keybindings/letters/002`); `n` on a waiting card (`keybindings/letters/003`); what the toggled layout looks like (`render/layout/001`).
+- **Platform coverage:** mac+linux.
+
+##### keybindings/letters/005 — Each default plain-letter command has its `Ctrl` form in command mode, and a remap or a conflict takes it away; in a pane the chord reaches the program.
+- **Layer:** L1 (`KeybindingConfig::ctrl_alias` from parsed TOML, and the in-process key mapper `key_action_for_mode`).
+- **Agent:** none.
+- **Asserts:** under the defaults `host_metrics`, `open_scheduled_tasks`, `generate_config`, `open_upgrade` and `rename` answer to `Ctrl+m`, `Ctrl+s`, `Ctrl+g`, `Ctrl+u` and `Ctrl+r` and have no plain alias; in `UiMode::PaneInput` each chord is forwarded as its own control byte, and in `UiMode::Normal` none is a global command; navigation, filter, help, focus, clear-filter, approve/deny and the `Ctrl+` actions get no `Ctrl` form; remapping `rename` or `host_metrics` removes its chord while restating `open_upgrade`'s default does not; `scroll_pane_up = "Ctrl+u"` and `toggle_layout = "Ctrl+s"` take those chords; `Enter` is not `Ctrl+m`'s alias (PR #1672).
+- **Does not assert:** the command-mode dispatch (covered by `keybindings/letters/006`); a real terminal's encoding of `Ctrl+M` (legacy terminals send it as `Enter`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/006 — A `Ctrl` form performs its letter's command in command mode, and `Enter` still focuses.
+- **Layer:** unit (`handle_normal_key` and `handle_host_metrics_key` in `src/ui.rs`).
+- **Agent:** none.
+- **Asserts:** with a card selected, `Ctrl+r`, `Ctrl+g`, `Ctrl+s`, `Ctrl+m` and `Ctrl+u` return `EnterRename`, `RequestConfigGen`, `OpenScheduledTasks`, `OpenHostMetrics` and `OpenUpgrade`; `Enter` returns `Focus`; with `rename` remapped `Ctrl+r` does nothing, and with `scroll_pane_up` on `Ctrl+u` it is not the upgrade dialog; `Ctrl+m` closes the open host overlay (PR #1672).
+- **Does not assert:** the dialogs those actions open (covered by their own tests); the live loop (covered by `keybindings/letters/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/007 — Through the live loop, `Ctrl+R` in a pane reaches the program, and `Ctrl+S` in command mode opens Schedules.
+- **Layer:** L2 (PTY + vt100, the real binary and daemon; a restored pane running `cat` as the stand-in program, and a seeded schedule).
+- **Agent:** none.
+- **Asserts:** with the pane focused, `ab` then `Ctrl+R` makes the pane's terminal reprint the line (`ab^R`), no rename opens and `cat` echoes the line after Enter, and the Schedules manager does not open; after `Ctrl+D`, `Ctrl+S` opens it, listing the seeded task (PR #1672).
+- **Does not assert:** the other chords through the live loop (their resolution is `keybindings/letters/006`); `Ctrl+M` in a terminal that disambiguates it (the harness sends legacy bytes).
 - **Platform coverage:** mac+linux.
 
 #### keybindings/unbind
