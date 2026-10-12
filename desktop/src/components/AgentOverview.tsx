@@ -1073,6 +1073,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [decks]);
   const closeHostMetrics = useCallback((deckId: string) => setHostOpen((open) => (open === deckId ? undefined : open)), []);
   /*
+    PR #1672 — the open popover goes with its button. A daemon that
+    disconnects or stops sending figures loses its Host button, and the
+    popover is closed with it, so it does not reappear unasked when they come
+    back.
+  */
+  useEffect(() => {
+    if (hostOpen === undefined) return;
+    const shown = decks.some((deck) => deck.connected && deck.snapshot.connection.deckId === hostOpen && deck.snapshot.hostMetrics !== undefined);
+    if (!shown) setHostOpen(undefined);
+  }, [decks, hostOpen]);
+  /*
     Issue #1492 — the dashboard scrolls in its own region, and a row acted on
     by number or by name is scrolled into view first, so it is on screen
     behind the pane that opens over it, and on screen when that pane closes.

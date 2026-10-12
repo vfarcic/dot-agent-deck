@@ -143,6 +143,30 @@ describe("the Host popover by voice (PR #1672)", () => {
     fireEvent.click(remote);
     expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
   });
+
+  /** Scenario: the build box's Host popover is open when that daemon disconnects, and then again when it stops sending figures; each time it comes back, its Host button is there and the popover stays closed until it is clicked. */
+  it("does not reopen a popover whose daemon went away and came back", async () => {
+    const voice = microphone();
+    const fleet = createFixtureFleet("fleet");
+    const at = fleet.findIndex((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID);
+    const remote = fleet[at];
+    const shell = (decks: DeckSnapshot[]) => <DeckShell runtime={runtime(voice, decks)} initialView={{ kind: "overview" }} />;
+    const replaced = (deck: DeckSnapshot) => fleet.map((candidate, index) => (index === at ? deck : candidate));
+    const view = render(shell(fleet));
+    fireEvent.click(within(section(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("host-metrics-button"));
+    expect(within(section(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("host-metrics-popover")).toBeInTheDocument();
+
+    for (const away of [
+      { ...remote, connection: { ...remote.connection, status: "disconnected" as const } },
+      { ...remote, hostMetrics: undefined },
+    ]) {
+      view.rerender(shell(replaced(away)));
+      expect(within(section(FIXTURE_REMOTE_DAEMON_ID)).queryByTestId("host-metrics-button")).toBeNull();
+      view.rerender(shell(fleet));
+      expect(within(section(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("host-metrics-button")).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+    }
+  });
 });
 
 describe("which daemon's Host figures a request opens (PR #1672)", () => {
