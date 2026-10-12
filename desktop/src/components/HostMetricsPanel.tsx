@@ -121,6 +121,9 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
     it past the right edge and give the page a horizontal scrollbar. Measured
     after layout and shifted left by exactly the overflow, never past the left
     margin; its CSS width already never exceeds the viewport less both margins.
+    Measured again whenever the window is resized while it is open, so the
+    shift follows the window both ways (PR #1672 review); measured from the
+    anchor, not from the popover's already-shifted box.
   */
   const popover = useRef<HTMLDivElement>(null);
   const [shift, setShift] = useState(0);
@@ -129,14 +132,19 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
       setShift(0);
       return;
     }
-    const element = popover.current;
-    const anchor = root.current;
-    if (!element || !anchor) return;
-    const margin = POPOVER_VIEWPORT_MARGIN;
-    const anchorLeft = anchor.getBoundingClientRect().left;
-    const width = element.getBoundingClientRect().width;
-    const overflow = anchorLeft + width - (window.innerWidth - margin);
-    setShift(overflow > 0 ? Math.min(overflow, Math.max(0, anchorLeft - margin)) : 0);
+    const measure = () => {
+      const element = popover.current;
+      const anchor = root.current;
+      if (!element || !anchor) return;
+      const margin = POPOVER_VIEWPORT_MARGIN;
+      const anchorLeft = anchor.getBoundingClientRect().left;
+      const width = element.getBoundingClientRect().width;
+      const overflow = anchorLeft + width - (window.innerWidth - margin);
+      setShift(overflow > 0 ? Math.min(overflow, Math.max(0, anchorLeft - margin)) : 0);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
   }, [open]);
 
   return (

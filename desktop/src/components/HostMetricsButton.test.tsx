@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { HostMetricsReport } from "../types";
 import { HostMetricsButton } from "./HostMetricsPanel";
 
@@ -105,6 +105,43 @@ describe("HostMetricsButton", () => {
       expect(reached).toEqual([]);
     } finally {
       window.removeEventListener("keydown", listener);
+    }
+  });
+
+  /** Scenario: a popover opened from a button near the window's right edge is shifted left by its overflow; widening the window while it is open moves it back under its button, narrowing it again shifts it further, and closing it stops it listening for resizes. */
+  it("re-places its open popover when the window is resized", () => {
+    const anchorLeft = 500;
+    const popoverWidth = 300;
+    const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const left = this.classList.contains("host-metrics-anchor") ? anchorLeft : 0;
+      const width = this.classList.contains("host-metrics-popover") ? popoverWidth : 0;
+      return { left, width, x: left, y: 0, top: 0, right: left + width, bottom: 0, height: 0, toJSON: () => ({}) } as DOMRect;
+    });
+    const initialWidth = window.innerWidth;
+    const resizeTo = (width: number) => act(() => {
+      window.innerWidth = width;
+      window.dispatchEvent(new Event("resize"));
+    });
+    const removed = vi.spyOn(window, "removeEventListener");
+    try {
+      window.innerWidth = 700;
+      render(<HostMetricsButton report={report({ disk: "critical" })} deckLabel="Local daemon" />);
+      const button = screen.getByTestId("host-metrics-button");
+      fireEvent.click(button);
+      const popover = () => screen.getByTestId("host-metrics-popover");
+      // 500 + 300 overflows a 700-wide window less its 12px margin by 112.
+      expect(popover().style.left).toBe("-112px");
+      resizeTo(1200);
+      expect(popover().style.left).toBe("");
+      resizeTo(600);
+      expect(popover().style.left).toBe("-212px");
+      fireEvent.click(button);
+      expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+      expect(removed.mock.calls.some(([type]) => type === "resize")).toBe(true);
+    } finally {
+      window.innerWidth = initialWidth;
+      rect.mockRestore();
+      removed.mockRestore();
     }
   });
 

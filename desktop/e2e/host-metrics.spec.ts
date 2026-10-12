@@ -288,3 +288,29 @@ test("the host popover stays inside a narrow window", async ({ page }) => {
     await expect(card.getByTestId("host-metrics-popover")).toHaveCount(0);
   }
 });
+
+/** Scenario: Open each deck's host popover in a wide window, then narrow the window while it stays open; the popover moves to stay inside the window and the page gains no horizontal scrolling. Widen the window again and the popover returns under its button. */
+test("the host popover follows a window resized while it is open", async ({ page }) => {
+  const { localCard, remoteCard } = await overview(page, judged(), available(true));
+  const wide = page.viewportSize() ?? { width: 1280, height: 900 };
+  const scrollWidth = () => page.evaluate(() => document.documentElement.scrollWidth);
+  for (const card of [localCard, remoteCard]) {
+    await page.setViewportSize(wide);
+    await openHost(card);
+    const popover = card.getByTestId("host-metrics-popover");
+    await page.setViewportSize({ width: 480, height: wide.height });
+    await expect(popover).toBeVisible();
+    await expect.poll(async () => {
+      const box = await popover.boundingBox();
+      return box ? box.x >= 0 && box.x + box.width <= 480 : false;
+    }).toBe(true);
+    expect(await scrollWidth()).toBeLessThanOrEqual(480);
+    await page.setViewportSize(wide);
+    await expect(popover).toBeVisible();
+    const button = await card.getByTestId("host-metrics-button").boundingBox();
+    if (!button) throw new Error("the host button has no box");
+    await expect.poll(async () => (await popover.boundingBox())?.x).toBeCloseTo(button.x, 0);
+    await page.keyboard.press("Escape");
+    await expect(popover).toHaveCount(0);
+  }
+});
