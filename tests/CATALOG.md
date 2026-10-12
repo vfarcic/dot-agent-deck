@@ -8086,6 +8086,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** a spawn that fails outright (a missing binary also takes the plain event's own route away); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
+##### question/detect/017 — An OpenCode subagent's question form is filed as that subagent's.
+- **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder).
+- **Agent:** none (recorder; captured OpenCode `question.asked`, its `sessionID` set to a child session).
+- **Asserts:** a child session's `question.asked` is handed to `await-answer` under the root session with the child's `subagent_id`, and decodes as that subagent's `WaitingForInput` with a question naming the subagent; its `question.replied` and `question.rejected` are forwarded under the root with the child's id and request id, and decode as the subagent's answered prompt; applied to a card, the question and the wait are the subagent's, and the reply clears the question and takes the card off Needs Input. Red before the fix: the child's question events carried no `subagent_id`. Skips where `node` is missing.
+- **Does not assert:** the daemon holding and answering the child's question (`question/hold/019` does that for a child's permission prompt, on the same path); a real OpenCode subagent.
+- **Platform coverage:** mac+linux.
+
 #### question/state
 
 ##### question/state/001 — A question event sets the pending question and Needs Input.
@@ -8439,6 +8446,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Agent:** none (a `/bin/sh` stand-in pane).
 - **Asserts:** a held question sent with `confirm_hold` gets a `held` line once the hold is registered, then the release that ends it when a newer question supersedes it; a held question sent without `confirm_hold` gets no `held` line, and its first line is the release.
 - **Does not assert:** what the hook does without a `held` line (`question/hold/021`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/023 — A late frame from a superseded session revives no question.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop and the daemon's own ingest).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** with a held question on the pane, the same agent's new hook session (a `SessionStart` under a new session id) releases the producer; a late question and a late `ToolStart` from the old session, stamped newer than anything the new session sent, then leave no question pending on the pane, on the agent's snapshot or for an answer, which is refused `no_pending_question`; and the pane has one card, since the reuse guard files both sessions of one agent on it.
+- **Does not assert:** a different agent's late frames, which admission refuses before ingest (issue #320).
 - **Platform coverage:** mac+linux.
 
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]

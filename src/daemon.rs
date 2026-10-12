@@ -16078,6 +16078,83 @@ mod question_hold_tests {
         );
     }
 
+    /// Scenario: An agent waits on a held question, then starts a new hook
+    /// session on the same pane (a `/clear`), which lets the old question's
+    /// producer go. Late frames from the old session — a question of its own
+    /// and a tool starting — then arrive stamped newer than anything the new
+    /// session sent. The old question comes back nowhere: not as the pane's
+    /// question, not on the agent's snapshot, and not to an answer.
+    #[spec("question/hold/023")]
+    #[tokio::test]
+    async fn question_hold_023_a_late_event_from_a_superseded_session_does_not_revive_its_question()
+    {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-revive").await;
+        let old_session = format!("{}-session", a.pane);
+        let producer = deck.hold(&a, "q-old").await;
+        deck.until_held(&a, "q-old").await;
+
+        // The same agent starts a new conversation on the pane.
+        let mut start = deck.question_on(&a, "q-old", "touch x");
+        start.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        start.event_type = EventType::SessionStart;
+        start.tool_name = None;
+        start.session_id = format!("{}-new-session", a.pane);
+        start.timestamp = chrono::Utc::now() + chrono::Duration::seconds(1);
+        ingest_event(&deck.state, &deck.event_tx, &deck.registry, start).await;
+        let reply = reply_on(producer)
+            .await
+            .expect("the old question's producer is let go");
+        assert_eq!(reply.outcome, ReplyOutcome::Released);
+        assert_eq!(deck.pending(&a).await, None);
+
+        // Late frames from the old conversation, stamped newest: a question
+        // of its own, which is stripped, and a tool starting.
+        let mut late_question = deck.question_on(&a, "q-late", "touch y");
+        late_question.timestamp = chrono::Utc::now() + chrono::Duration::seconds(5);
+        assert_eq!(late_question.session_id, old_session);
+        ingest_event(&deck.state, &deck.event_tx, &deck.registry, late_question).await;
+        let mut late_tool = deck.question_on(&a, "q-old", "touch x");
+        late_tool
+            .metadata
+            .remove(crate::event::QUESTION_METADATA_KEY);
+        late_tool.event_type = EventType::ToolStart;
+        late_tool.timestamp = chrono::Utc::now() + chrono::Duration::seconds(6);
+        ingest_event(&deck.state, &deck.event_tx, &deck.registry, late_tool).await;
+
+        assert_eq!(deck.pending(&a).await, None, "the old question is not back");
+        {
+            let state = deck.state.read().await;
+            // Why it cannot come back: a session the pane moved past is one the
+            // same agent left (`is_superseded_session`), and the reuse guard
+            // files every session of one agent on one pane on the same card, so
+            // there is no older card for a late frame to make the newest.
+            assert_eq!(
+                state
+                    .sessions
+                    .values()
+                    .filter(|s| s.pane_id.as_deref() == Some(a.pane.as_str()))
+                    .count(),
+                1,
+                "both conversations are on the agent's one card"
+            );
+            assert_eq!(state.pending_question_id_on_pane(&a.pane), None);
+            assert_eq!(state.pending_question_for(&a.id, Some(&a.pane)), None);
+            let snapshot = state
+                .live_session_for(&a.id, Some(&a.pane))
+                .expect("the agent's card");
+            assert_eq!(
+                snapshot.pending_question, None,
+                "the snapshot shows no question"
+            );
+        }
+        assert_eq!(
+            deck.answer(&a, "q-old").await,
+            Err(crate::question::AnswerRefusal::NoPendingQuestion),
+            "the old question is not answerable"
+        );
+    }
+
     /// Scenario: An OpenCode subagent's child session asks a permission, and
     /// the plugin's `await-answer` child holds it on the deck as the plugin
     /// sends it: filed under the main session with the child's id. The deck

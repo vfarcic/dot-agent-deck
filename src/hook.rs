@@ -448,11 +448,16 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
 /// and wait up to `deadline` for the daemon's reply, falling back to a plain
-/// event when the hold never starts ([`settle_hold`]). `None` when there is no
-/// reply: the hold never started, or it ended without one (a closed
-/// connection, the deadline, an unparseable line). A caller acts on the reply
-/// only through [`crate::question::QuestionReply::answers_for`], which also
-/// refuses a reply naming another question.
+/// event when the hold never starts ([`settle_hold`]). `None` when no
+/// [`crate::question::QuestionReply`] came back. That is a missing line — no
+/// daemon, a closed connection, the deadline — or a line that arrived but does
+/// not parse as a reply. Both are handled alike; what follows depends on when.
+/// In place of the daemon's first line, the hold never started and the plain
+/// event is sent. After the daemon's `held` line, the hold ended without a
+/// reply and nothing more is sent, since the question is already on the card.
+/// A caller acts on the reply only through
+/// [`crate::question::QuestionReply::answers_for`], which also refuses a reply
+/// naming another question.
 fn hold_question(
     event: &AgentEvent,
     deadline: std::time::Duration,
@@ -482,8 +487,8 @@ enum HoldEnd {
     /// The daemon's reply: an answer, a release, or a refusal — after a
     /// `held` line, or in place of one when there was no hold to start.
     Reply(crate::question::QuestionReply),
-    /// The daemon held the question, and the connection closed or the
-    /// deadline passed with no reply after it.
+    /// The daemon held the question, and then the connection closed, the
+    /// deadline passed, or a line arrived that is not a reply.
     Ended,
 }
 
@@ -1526,7 +1531,12 @@ pub(crate) fn build_opencode_event_with_question(
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
     let mut metadata = HashMap::new();
-    if input.event == "permission.replied" {
+    // An answered prompt: a permission, or a question form answered or
+    // dismissed. Read only on a subagent's report, below.
+    if matches!(
+        input.event.as_str(),
+        "permission.replied" | "question.replied" | "question.rejected"
+    ) {
         metadata.insert(
             crate::event::PERMISSION_STATE_METADATA_KEY.to_string(),
             crate::event::PERMISSION_STATE_REPLIED.to_string(),
@@ -1564,9 +1574,10 @@ pub(crate) fn build_opencode_event_with_question(
     // Issue #1678: a child session's report is its subagent's (issue #1354),
     // so it does not move the card's status and the daemon counts the child as
     // background work after the turn ends. Only on the events the plugin tags:
-    // a child's lifecycle, tool calls and permission prompts. A child's
-    // answered prompt arrives as a `Thinking` marked replied, which ends that
-    // subagent's wait and nothing else (`AgentEvent::is_subagent_permission_reply`).
+    // a child's lifecycle, tool calls, permission prompts and (PRD #1631)
+    // question forms. A child's answered prompt arrives as a `Thinking` marked
+    // replied, which ends that subagent's wait and nothing else
+    // (`AgentEvent::is_subagent_permission_reply`).
     if let Some(subagent_id) = input.subagent_id.filter(|_| {
         matches!(
             input.event.as_str(),
@@ -1576,6 +1587,9 @@ pub(crate) fn build_opencode_event_with_question(
                 | "tool.execute.after"
                 | "permission.asked"
                 | "permission.replied"
+                | "question.asked"
+                | "question.replied"
+                | "question.rejected"
         )
     }) {
         metadata.insert(

@@ -1225,11 +1225,18 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         recordReplyDelta(event?.properties);
         return;
       }}
-      if (eventType === "permission.asked" || eventType === "permission.replied") {{
+      if (
+        eventType === "permission.asked" ||
+        eventType === "permission.replied" ||
+        eventType === "question.asked" ||
+        eventType === "question.replied" ||
+        eventType === "question.rejected"
+      ) {{
         // Issue #1678: a child session's prompt is its subagent's, filed under
         // the root with the child's id, like its tool calls. PRD #1631: and,
         // like the root's, the ask goes through `await-answer` so the deck can
-        // answer it, and the reply names the request it answers.
+        // answer it, and the reply names the request it answers. A question
+        // form is the subagent's in the same way as a permission prompt.
         const props = event?.properties ?? {{}};
         const askingId = props.sessionID ?? props.sessionId;
         if (isChildSession(askingId)) {{
@@ -1237,7 +1244,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             event: eventType,
             prompt: permissionPrompt(props),
           }});
-          if (eventType === "permission.asked") {{
+          if (eventType === "permission.asked" || eventType === "question.asked") {{
             awaitAnswer(ctx?.client, {{ ...payload, properties: props }}, () => sendEvent(payload));
             return;
           }}
@@ -4512,6 +4519,121 @@ writeFileSync("{posts}", JSON.stringify(posts));
         };
         resolved("permission.replied", "per_hold");
         resolved("question.rejected", "que_rejected");
+    }
+
+    /// Scenario: Load the generated plugin under Node and have a subagent's
+    /// child session ask a question form, which OpenCode then reports answered,
+    /// and ask a second one, which it reports dismissed. The plugin files each
+    /// under the main session with the child's id, as it does the child's
+    /// permission prompts: the card shows the subagent's question and its wait,
+    /// and the answer ends that subagent's wait and clears its question.
+    #[cfg(unix)]
+    #[spec("question/detect/017")]
+    #[test]
+    fn question_detect_017_an_opencode_subagents_question_is_filed_as_the_subagents() {
+        use crate::event::EventType;
+        use crate::state::{AppState, SessionStatus};
+        let mut asked: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions/opencode-question-asked.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        asked["sessionID"] = "child".into();
+        let question_id = asked["id"].as_str().unwrap().to_string();
+        let mut dismissed = asked.clone();
+        dismissed["id"] = "que_dismissed".into();
+        let Some((payloads, awaits)) = run_plugin_driver_with_awaits(
+            &format!(
+                r#"
+const hooks = await plugin({{ directory: "/work" }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+await send("session.created", {{ sessionID: "root", info: {{ id: "root", directory: "/work" }} }});
+await send("session.created", {{ sessionID: "child", info: {{ id: "child", parentID: "root", directory: "/work" }} }});
+await send("session.status", {{ sessionID: "child", status: {{ type: "busy" }} }});
+await send("question.asked", {asked});
+await awaited(1);
+await send("question.replied", {{ sessionID: "child", requestID: "{question_id}", answers: [["Blue"]] }});
+await send("question.asked", {dismissed});
+await awaited(2);
+await send("question.rejected", {{ sessionID: "child", requestID: "que_dismissed" }});
+"#
+            ),
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "question.replied", "child"),
+                row("root", "question.rejected", "child"),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        assert_eq!(awaits.len(), 2, "{awaits:#?}");
+        let held = awaits
+            .iter()
+            .find(|p| p["properties"]["id"] == question_id.as_str())
+            .unwrap_or_else(|| panic!("the child's question was not held: {awaits:#?}"));
+        assert_eq!(held["session_id"], "root");
+        assert_eq!(held["subagent_id"], "child", "{held}");
+        let (asked_event, question) = crate::hook::build_opencode_event_with_question(
+            serde_json::from_value(held.clone()).unwrap(),
+        )
+        .expect("an event");
+        let question = question.expect("the child's form is a question");
+        assert_eq!(asked_event.event_type, EventType::WaitingForInput);
+        assert!(asked_event.is_from_subagent(), "the ask is the subagent's");
+        assert_eq!(question.subagent_id.as_deref(), Some("child"));
+
+        let decode = |payload: &serde_json::Value| {
+            crate::hook::build_opencode_event(serde_json::from_value(payload.clone()).unwrap())
+                .expect("every payload maps to an event")
+        };
+        let replied = decode(&payloads[2]);
+        assert!(replied.is_subagent_permission_reply(), "{replied:?}");
+        assert_eq!(replied.resolved_question_id(), Some(question_id.as_str()));
+        let rejected = decode(&payloads[3]);
+        assert!(rejected.is_subagent_permission_reply(), "{rejected:?}");
+        assert_eq!(rejected.resolved_question_id(), Some("que_dismissed"));
+
+        // What the card makes of it: the subagent's question and wait, which
+        // its answer ends, returning the card to the main thread's status.
+        let mut state = AppState::default();
+        state.register_pane("pane-oc".into());
+        let on_pane = |mut event: crate::event::AgentEvent| {
+            event.pane_id = Some("pane-oc".into());
+            event.agent_id = Some("7".into());
+            event
+        };
+        state.apply_event(on_pane(decode(&payloads[0])));
+        state.apply_event(on_pane(asked_event));
+        {
+            let card = &state.sessions["root"];
+            assert_eq!(card.status, SessionStatus::WaitingForInput);
+            assert_eq!(
+                card.pending_question
+                    .as_ref()
+                    .and_then(|q| q.subagent_id.as_deref()),
+                Some("child")
+            );
+            assert_eq!(
+                card.subagent_wait.as_ref().map(|w| w.subagent_ids.clone()),
+                Some(vec!["child".to_string()]),
+                "the wait is the subagent's"
+            );
+        }
+        state.apply_event(on_pane(replied));
+        let card = &state.sessions["root"];
+        assert_eq!(card.pending_question, None);
+        assert_ne!(card.status, SessionStatus::WaitingForInput);
     }
 
     /// Scenario: Load the generated plugin under Node with its binary pinned

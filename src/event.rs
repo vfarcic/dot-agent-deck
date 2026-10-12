@@ -1060,9 +1060,11 @@ pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_d
 
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+/// PRD #1631: a question form's answer or dismissal is marked replied too.
 pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
 
-/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt.
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt
+/// or question form.
 pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
@@ -1290,7 +1292,8 @@ impl AgentEvent {
     /// Issue #1678: is this a subagent's answered permission prompt — a
     /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
     /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
-    /// the OpenCode hook builds from a child session's `permission.replied`?
+    /// the OpenCode hook builds from a child session's `permission.replied`
+    /// (and, PRD #1631, its `question.replied` or `question.rejected`)?
     /// It ends that subagent's share of a wait and says nothing about the main
     /// thread. `false` for every event an older hook CLI builds.
     pub fn is_subagent_permission_reply(&self) -> bool {
