@@ -8067,9 +8067,13 @@ pub(crate) async fn answer_question_at(
             Ok(Ok(ReplyDelivery::NotAccepted(detail))) => {
                 // The agent never took it and is still asking: the producer
                 // raises it again, and the deck must be able to answer it.
+                // Only this answer's mark goes: one a later answer made while
+                // this one waited is that answer's (PR #1698 review).
+                let lifecycle = registry.question_answers().lock_lifecycle(pane).await;
                 registry
                     .question_answers()
-                    .unmark_answered(pane, &question.id);
+                    .unmark_answered(pane, &question.id, revision);
+                drop(lifecycle);
                 warn!(
                     agent_id = %agent_id,
                     question_id = %question.id,
@@ -14926,6 +14930,106 @@ mod question_answer_tests {
         assert_eq!(
             fx.answer("call_mark", &[(0, &[1], None)], false).await,
             Err(AnswerRefusal::Stale { current_id: None })
+        );
+    }
+
+    /// Scenario: The deck answers a held permission prompt and waits for the
+    /// agent to say it took the answer. Meanwhile the pane's agent is replaced,
+    /// and the new agent asks another question and then the same prompt id
+    /// again, both answered by voice. When the first agent's late "not taken"
+    /// arrives, the new agent's answered prompt stays answered, so the same
+    /// prompt raised again is refused rather than answered a second time.
+    #[spec("question/answer/018")]
+    #[tokio::test]
+    async fn question_answer_018_a_late_refusal_leaves_a_later_answer_settled() {
+        const RESPAWNED: &str = "question-answer-respawned";
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let hold = |agent_id: &str, session_id: &str, question: &PendingQuestion| {
+            let mut event = fx.event(EventType::PermissionRequest);
+            event.session_id = session_id.into();
+            event.agent_id = Some(agent_id.into());
+            event.set_question(question);
+            let (state, event_tx, registry, agent_id) = (
+                fx.state.clone(),
+                fx.event_tx.clone(),
+                fx.registry.clone(),
+                agent_id.to_string(),
+            );
+            async move {
+                crate::daemon::register_and_publish_held(
+                    &state, &event_tx, &registry, PANE, &agent_id, event,
+                )
+                .await
+                .expect("the question is held")
+            }
+        };
+        // A producer that acknowledges, and says it took the answer.
+        let delivered = |rx: tokio::sync::oneshot::Receiver<crate::agent_pty::HeldReply>| {
+            tokio::spawn(async move {
+                if let Ok(held) = rx.await
+                    && let Some(delivery) = held.delivery
+                {
+                    let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+                }
+            })
+        };
+
+        // The first agent's answer is handed over and waits for its
+        // acknowledgement, with its mark settled.
+        let first_hold = hold(&fx.agent_id, SESSION, &claude_bash()).await.rx;
+        let first = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        let late = first_hold
+            .await
+            .expect("the first answer reaches its producer")
+            .delivery
+            .expect("the answer waits for the agent to take it");
+
+        // The pane's agent is replaced, and the new one asks another
+        // question, then the same id again; both are answered.
+        let respawned = fx
+            .registry
+            .respawn_agent_for_pane(PANE, "/bin/cat")
+            .await
+            .expect("respawn the pane's agent");
+        let mut start = fx.event(EventType::SessionStart);
+        start.session_id = RESPAWNED.into();
+        start.agent_id = Some(respawned.clone());
+        start.agent_type = AgentType::ClaudeCode;
+        fx.state.write().await.apply_event(start);
+        let mut other = claude_bash();
+        other.id = "q-other".into();
+        delivered(hold(&respawned, RESPAWNED, &other).await.rx);
+        assert_eq!(
+            fx.answer_as(&respawned, "q-other", &[(0, &[1], None)], false)
+                .await,
+            Ok(())
+        );
+        delivered(hold(&respawned, RESPAWNED, &claude_bash()).await.rx);
+        assert_eq!(
+            fx.answer_as(&respawned, "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Ok(()),
+            "the new agent's question under the reused id is answerable"
+        );
+
+        // The first agent's late refusal arrives.
+        late.send(crate::agent_pty::ReplyDelivery::NotAccepted(
+            "the agent exited".into(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(AnswerRefusal::WriteFailed { .. })
+        ));
+
+        // The new agent's producer raises its answered question again: it is
+        // refused, not answered twice.
+        let _again = hold(&respawned, RESPAWNED, &claude_bash()).await;
+        assert_eq!(
+            fx.answer_as(&respawned, "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Err(AnswerRefusal::Stale { current_id: None }),
+            "the answered question is not answered a second time"
         );
     }
 

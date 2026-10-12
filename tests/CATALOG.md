@@ -8302,6 +8302,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** whether the replacement was a new prompt or a redraw of the answered one, which the deck cannot tell apart.
 - **Platform coverage:** mac+linux.
 
+##### question/answer/018 — A late "not taken" leaves a later answer to the same id settled.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, held producers whose acknowledgement the test sends by hand).
+- **Agent:** none (`/bin/cat` stand-ins for Claude Code, before and after a respawn of the pane).
+- **Asserts:** while a held answer waits for its acknowledgement, the pane's agent is respawned and the new one has another question and then the same question id answered; when the first answer's acknowledgement then reports the agent did not take it, that answer is refused `write_failed`, and the new agent's answered question raised again is refused as stale rather than handed to its producer a second time (PR #1698 review: the "not taken" forgets only its own revision's mark).
+- **Does not assert:** that the refused answer's own question is answerable again, which `question/hold/015` covers; the hook loop's acknowledgement reading.
+- **Platform coverage:** mac+linux.
+
 #### question/desktop
 
 The desktop half of answering by voice. These tests live in the desktop crate (`desktop/src-tauri/src/voice/question_tests.rs`, run by `cargo test-fast`) and the webview (`desktop/src/components/VoiceQuestion.test.tsx`, run by `pnpm test` in `desktop/`), which linkage-check does not walk, so they are named here by test rather than as `#[spec]` IDs.

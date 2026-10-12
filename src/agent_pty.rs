@@ -6096,14 +6096,19 @@ impl QuestionAnswers {
         }
     }
 
-    /// Forget that the deck answered `question_id` on `pane_id`, when it is
-    /// still the last one it did — the agent reported that it did not take
-    /// the answer, so the same question raised again must be answerable.
-    pub fn unmark_answered(&self, pane_id: &str, question_id: &str) {
+    /// Forget that the deck answered `question_id` at `revision` on
+    /// `pane_id`, when that answer's mark is still the pane's — the agent
+    /// reported that it did not take the answer, so the same question raised
+    /// again must be answerable. Bound to the revision as
+    /// [`Self::settle_answered`] is: a mark a later answer to a same-id
+    /// question made while this one waited for its acknowledgement is that
+    /// answer's, and stays (PR #1698 review). Called under the pane's question
+    /// lifecycle, as the settle is.
+    pub fn unmark_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
         let mut answered = self.answered.lock().unwrap();
         if answered
             .get(pane_id)
-            .is_some_and(|mark| mark.id == question_id)
+            .is_some_and(|mark| mark.id == question_id && mark.revision == revision)
         {
             answered.remove(pane_id);
         }
