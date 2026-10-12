@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { chromium } from "@playwright/test";
 
 import { TUI_HTML_DIR } from "./support";
+import { warmUpWith } from "./warm-up";
 
 /** How long the warm-up waits for a page and its fonts before giving up on it. */
 const WARM_UP_BUDGET_MS = 180_000;
@@ -30,7 +31,10 @@ const WARM_UP_BUDGET_MS = 180_000;
  * long that took. It writes no image and asserts nothing. When the fonts have
  * not settled within the budget it warns and lets the run go on, because it is
  * only a warm-up: three minutes is not a cold start, so the shots that follow
- * are likely to fail on their own budgets, and that failure names a shot.
+ * are likely to fail on their own budgets, and that failure names a shot. Any
+ * other failure — the browser, the page, the fonts wait itself — warns and
+ * lets the run go on the same way; `warm-up.ts` holds that logic, apart from
+ * Playwright, so `warm-up.test.ts` can drive each failure.
  *
  * **The budget is enforced here, not by Playwright** (PR #1672 review).
  * `page.setDefaultTimeout` bounds actions and navigations, not
@@ -43,38 +47,19 @@ const WARM_UP_BUDGET_MS = 180_000;
  * project's test would not match; `globalSetup` runs whatever the filter.
  */
 export default async function warmUp(): Promise<void> {
-  const started = Date.now();
-  const first = TUI_HTML_DIR && fs.existsSync(TUI_HTML_DIR)
-    ? fs.readdirSync(TUI_HTML_DIR).filter((file) => file.endsWith("-tui.html")).sort()[0]
-    : undefined;
-  const browser = await chromium.launch();
+  let first: string | undefined;
   try {
-    const page = await browser.newPage();
-    page.setDefaultTimeout(WARM_UP_BUDGET_MS);
-    if (first) {
-      await page.goto(pathToFileURL(path.join(TUI_HTML_DIR!, first)).href);
-    } else {
-      await page.setContent('<p style="font-family: monospace">0</p><p>0</p>');
-    }
-    const fonts = page.evaluate(async () => {
-      await document.fonts.ready;
-    });
-    // When the budget wins, closing the browser below rejects this evaluate;
-    // that rejection is the expected end of an abandoned wait, not an error.
-    fonts.catch(() => undefined);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const settled = await Promise.race([
-      fonts.then(() => true),
-      new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), WARM_UP_BUDGET_MS);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (!settled) {
-      console.warn(`chromium warm-up: fonts had not settled after ${WARM_UP_BUDGET_MS}ms; continuing without the warm-up`);
-      return;
-    }
-  } finally {
-    await browser.close();
+    first = TUI_HTML_DIR && fs.existsSync(TUI_HTML_DIR)
+      ? fs.readdirSync(TUI_HTML_DIR).filter((file) => file.endsWith("-tui.html")).sort()[0]
+      : undefined;
+  } catch (error) {
+    // A directory it cannot list is no reason to stop the run either: warm up
+    // on the stand-in page instead.
+    console.warn(`chromium warm-up: cannot list ${TUI_HTML_DIR} (${String(error)}); warming up on a stand-in page`);
   }
-  console.log(`chromium warm-up: ${Date.now() - started}ms to settled fonts`);
+  await warmUpWith({
+    launch: () => chromium.launch(),
+    url: first ? pathToFileURL(path.join(TUI_HTML_DIR!, first)).href : undefined,
+    budgetMs: WARM_UP_BUDGET_MS,
+  });
 }
