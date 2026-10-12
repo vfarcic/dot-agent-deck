@@ -97,7 +97,11 @@ fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
 #[spec("inbox/doorbell/004")]
 #[test]
 fn doorbell_004_native_announce_gets_arm_grace() {
-    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "1200")]);
+    // Keep the TurnEnd observation window shorter than Native grace even
+    // when the harness widens process-scheduling budgets under host load.
+    let grace = common::load_scaled(Duration::from_millis(1200));
+    let grace_ms = grace.as_millis().to_string();
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", &grace_ms)]);
     let pane = pane(&daemon, "native-grace");
     status(&daemon, &pane, "idle", "claude_code");
     announce(&daemon, &pane, "native");
@@ -110,7 +114,7 @@ fn doorbell_004_native_announce_gets_arm_grace() {
     );
     ring(&daemon, &pane, &id);
     assert!(
-        started.elapsed() >= Duration::from_millis(1100),
+        started.elapsed() >= grace - Duration::from_millis(100),
         "native grace expired too early"
     );
 
@@ -119,7 +123,9 @@ fn doorbell_004_native_announce_gets_arm_grace() {
     announce(&daemon, &turn_end, "turn_end");
     let id = enqueue(&daemon, &turn_end, BODY);
     assert!(
-        common::wait_until(Duration::from_millis(1000), || !rings(&turn_end).is_empty()),
+        common::wait_until(common::load_scaled(Duration::from_millis(1000)), || {
+            !rings(&turn_end).is_empty()
+        }),
         "TurnEnd is unarmed and must not inherit Native grace"
     );
     ring(&daemon, &turn_end, &id);
@@ -129,7 +135,10 @@ fn doorbell_004_native_announce_gets_arm_grace() {
 #[spec("inbox/doorbell/005")]
 #[test]
 fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
+    let scratch = common::harness_tempdir().unwrap();
+    let log = scratch.path().join("doorbell.log");
     let daemon = daemon(&[
+        ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
         ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "300,500,700,900"),
         ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "30000"),
     ]);
@@ -142,9 +151,15 @@ fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
         "Queued task must re-ring through final repeated interval: {:?}",
         rings(&pane)
     );
-    let observed = rings(&pane);
-    for (pair, delay) in observed.windows(2).zip([0.3, 0.5, 0.7, 0.9, 0.9]) {
-        let elapsed = pair[1]["time"].as_f64().unwrap() - pair[0]["time"].as_f64().unwrap();
+    // A starved stand-in can read several completed rings in one os.read.
+    // Its read timestamps measure scheduling, not the daemon's ring policy.
+    // Match six submitted lines to six daemon completion boundaries instead.
+    assert!(common::wait_until(WAIT, || {
+        ring_times(&log, &pane).len() >= 6
+    }));
+    let observed = ring_times(&log, &pane);
+    for (pair, delay) in observed.windows(2).take(5).zip([0.3, 0.5, 0.7, 0.9, 0.9]) {
+        let elapsed = (pair[1] - pair[0]).num_microseconds().unwrap() as f64 / 1_000_000.0;
         // 150ms pre-ring flush/submit can add delay; a lower bound pins the
         // policy without treating a loaded machine as a functional failure.
         assert!(
@@ -165,6 +180,23 @@ fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
     hook(&daemon, ack);
     state(&daemon, &pane, &id, "acknowledged");
     unchanged(&pane, Duration::from_millis(1100));
+}
+
+fn ring_times(path: &std::path::Path, pane: &inbox::Pane) -> Vec<chrono::DateTime<chrono::Utc>> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.contains("doorbell rang") && line.contains(&format!("agent_id={}", pane.agent))
+        })
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .expect("daemon ring log RFC3339 timestamp")
+        })
+        .collect()
 }
 
 /// Scenario: Queue three tasks while the pane is busy, then report Idle. One fixed line must cover the batch, carry a queued id, and a single fetch must return and acknowledge all three bodies.
