@@ -14826,6 +14826,12 @@ pub fn run_tui(
         // `terminal.draw` below, i.e. before any key is handled, so navigation
         // never reads a value from before the first frame.
 
+        // PRD #1258 M3: land the host overlay's answer and refresh it while
+        // open. Before the frame is drawn, so an answer that landed since the
+        // last pass is on screen in this one, not a 16 ms input poll later,
+        // and its shown age starts from what the daemon reported.
+        poll_host_metrics(&mut ui, std::time::Instant::now());
+
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
@@ -15425,9 +15431,6 @@ pub fn run_tui(
         // PRD #127 M3.1: deliver any single-agent card `seed_prompt`s whose pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
-
-        // PRD #1258 M3: land the host overlay's answer and refresh it while open.
-        poll_host_metrics(&mut ui, std::time::Instant::now());
 
         // PRD #20 R20-007 (finding #10): consume any typed stream rejections the
         // daemon pushed asynchronously (a key/paste refused because the focused
