@@ -1371,6 +1371,7 @@ mod tests {
                 // between that overlay and an agent pane is decided at dispatch.
                 ("close", "closeTopmost", vec![]),
                 ("open_settings", "openSettings", vec!["deck", "overview"]),
+                ("show_host_metrics", "showHostMetrics", vec!["overview"]),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2480,6 +2481,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "show_host_metrics",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

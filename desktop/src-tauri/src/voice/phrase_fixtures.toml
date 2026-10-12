@@ -565,6 +565,83 @@ screen = "overview"
 action = "open_settings"
 outcome = "dispatch"
 
+# PR #1672 — a daemon's Host figures (`show_host_metrics`). The first two are
+# the phrasings the user tried on a Mac and expects to work; the next three are
+# the Host button's own labels (the label rule); the rest are natural ones. The
+# collision fixtures pin that Settings and switching daemon keep their words.
+# Not yet measured against a live backend.
+[[fixtures]]
+name = "show-host-open-host-info"
+utterance = "open host info"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-resource-usage"
+utterance = "show resource usage"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-host"
+utterance = "Host"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-warning"
+utterance = "Host warning"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-critical"
+utterance = "Host critical"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-disk-space"
+utterance = "how much disk space is left?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-machine-doing"
+utterance = "how is the machine doing?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-named-daemon"
+utterance = "show host for the build box"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-not-switch-deck"
+utterance = "switch daemon to the build box"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-unavailable"
+utterance = "open host info"
+screen = "agent"
+action = "show_host_metrics"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "open-settings-unavailable"
 utterance = "open settings"

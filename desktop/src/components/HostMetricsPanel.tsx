@@ -73,9 +73,13 @@ const POPOVER_VIEWPORT_MARGIN = 12;
  * and discloses {@link HostMetricsPanel} in a popover that Escape and a press
  * anywhere else close. A deck whose daemon does not report its host opens the
  * same popover saying so.
+ *
+ * Whether it is open is the overview's (PR #1672): a click asks to open it
+ * through `onOpen`, which the overview routes through the voice action
+ * registry, so the button and the spoken "show host" are one action.
+ * Every close is `onClose`.
  */
-export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsReport; deckLabel: string }) {
-  const [open, setOpen] = useState(false);
+export function HostMetricsButton({ report, deckLabel, open, onOpen, onClose }: { report: HostMetricsReport; deckLabel: string; open: boolean; onOpen: () => void; onClose: () => void }) {
   const root = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const popoverId = useId();
@@ -93,11 +97,15 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
     below, which closes, stops the key so the app-wide Escape does not act on
     it too, and hands focus back to the button.
   */
+  /* The latest close, so the listeners below are bound once per opening
+     rather than again on every render that hands down a new callback. */
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
     if (!open) return;
     const dismiss = (event: Event) => {
       if (event.target instanceof Node && root.current?.contains(event.target)) return;
-      setOpen(false);
+      close.current();
     };
     const dismissOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -123,6 +131,11 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
   */
   const popover = useRef<HTMLDivElement>(null);
   const [shift, setShift] = useState(0);
+  /* Opened by voice, the button may be scrolled out of the dashboard's view:
+     bring the popover into it, as a spoken agent row is (issue #1492). */
+  useEffect(() => {
+    if (open) popover.current?.scrollIntoView?.({ block: "nearest" });
+  }, [open]);
   useLayoutEffect(() => {
     if (!open) {
       setShift(0);
@@ -150,7 +163,7 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
       onKeyDown={(event) => {
         if (event.key !== "Escape" || !open) return;
         event.stopPropagation();
-        setOpen(false);
+        onClose();
         button.current?.focus();
       }}
     >
@@ -164,7 +177,7 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
         aria-controls={open ? popoverId : undefined}
         aria-label={`${HOST_TITLE}, ${deckLabel}${state ? `: ${state}` : ""}`}
         title={`${HOST_TITLE}${state ? `: ${state}` : ""}`}
-        onClick={() => setOpen((wasOpen) => !wasOpen)}
+        onClick={() => (open ? onClose() : onOpen())}
       >
         <Gauge size={13} aria-hidden="true" />
         <span>{word ? `${HOST_BUTTON_TEXT}: ${word}` : HOST_BUTTON_TEXT}</span>

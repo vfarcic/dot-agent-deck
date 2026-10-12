@@ -502,6 +502,59 @@ asks_to     = "open settings"
 try_saying  = "open settings"
 heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 
+# PR #1672 — the Host button beside each daemon's name on the agent dashboard
+# (PRD #1258), by voice. The button dispatches through the same registry entry
+# (`showHostMetrics`), so this row exposes the click rather than a second route
+# to the popover.
+#
+# **The button's labels are in `heard_as` and the description** (the label
+# rule, `docs/develop/voice-first-design.md`): it reads "Host", "Host: warning"
+# or "Host: critical", and its accessible name is "Host of this deck, <daemon>",
+# all grounded by `host`. The rest are the user's own words for the same thing,
+# measured by nobody yet against a live backend: "open host info", "show
+# resource usage", "disk space", "how is the machine doing". None of them is
+# another row's word.
+#
+# **Which daemon.** The optional `deck` is resolved against every observed
+# daemon, like `switch_deck`'s, and not the New agent dialog's eligible set: a
+# daemon that cannot take a new agent still has a Host button. One that resolves
+# is opened and named ("Daemon: build box."); none is ever implied here. With no
+# daemon named the dashboard decides (`chooseHostDeck` in
+# `desktop/src/lib/hostMetrics.ts`): the one daemon showing a Host button opens,
+# and with several it asks which, rather than guessing. A daemon the user named
+# that resolves to nothing, or to several, refuses the row as a required
+# param would, the several as the numbered choice: a popover for a daemon the
+# user did not ask about is not an answer to the one they did
+# (`outcome::SHOW_HOST_METRICS_ROW`).
+#
+# `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` because
+# the buttons are on the agent dashboard only, and the New agent dialog is
+# modal over them. It shows figures and nothing else, so it is outside D5.
+[[commands]]
+id          = "show_host_metrics"
+description = """Open a daemon's Host figures: the popover that the Host button beside the
+daemon's name on the agent dashboard opens, with the free disk space, the load per core and the
+memory of the machine that daemon runs on. Use for host, show host, open host, open host info, host
+info, host warning, host critical, host of this deck, show resource usage, resources, disk space,
+how much disk is left, memory, CPU, load, metrics, or how is the machine doing. When the user names
+the daemon (which a user may also call a deck) — "host for the build box", "show the build box
+resource usage" — set `deck` to the daemon they meant, exactly as listed in `decks`; otherwise
+leave `deck` out. This only shows figures: it starts, stops and changes nothing. It is not
+`switch_deck`, which changes which daemon is shown, and not `open_settings`."""
+invoke      = "showHostMetrics"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the Host figures open from the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Showing the Host figures."
+asks_to     = "show a daemon's Host figures"
+try_saying  = "show host"
+heard_as    = ["host", "resource", "usage", "disk", "machine", "memory", "cpu", "load", "metrics"]
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
+
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry
 # (`switchDeck`), so this row exposes the click rather than a second route to

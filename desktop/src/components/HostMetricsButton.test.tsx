@@ -1,7 +1,14 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { HostMetricsReport } from "../types";
 import { HostMetricsButton } from "./HostMetricsPanel";
+
+/** The button with its open state held the way the overview holds it. */
+function Stateful({ report, deckLabel }: { report: HostMetricsReport; deckLabel: string }) {
+  const [open, setOpen] = useState(false);
+  return <HostMetricsButton report={report} deckLabel={deckLabel} open={open} onOpen={() => setOpen(true)} onClose={() => setOpen(false)} />;
+}
 
 /*
  * PRD #1258 — the deck header's compact host button: coloured by the worst
@@ -28,26 +35,26 @@ function report(levels: { disk?: "ok" | "warn" | "critical"; load?: "ok" | "warn
 describe("HostMetricsButton", () => {
   /** Scenario: a deck with a critical disk and a warning load gets a critical button that says so in its text, tooltip and accessible name; one with only ok readings an ok button; one without levels a neutral button whose name states nothing. */
   it("is coloured by the worst level and names it in words", () => {
-    const { rerender } = render(<HostMetricsButton report={report({ disk: "critical", load: "warn" })} deckLabel="Local daemon" />);
+    const { rerender } = render(<Stateful report={report({ disk: "critical", load: "warn" })} deckLabel="Local daemon" />);
     const button = screen.getByTestId("host-metrics-button");
     expect(button.className).toContain("host-button-critical");
     expect(button.getAttribute("aria-label")).toBe("Host of this deck, Local daemon: critical");
     expect(button.getAttribute("title")).toBe("Host of this deck: critical");
     expect(button.textContent).toBe("Host: critical");
 
-    rerender(<HostMetricsButton report={report({ disk: "ok", load: "ok" })} deckLabel="Local daemon" />);
+    rerender(<Stateful report={report({ disk: "ok", load: "ok" })} deckLabel="Local daemon" />);
     expect(button.className).toContain("host-button-ok");
     expect(button.getAttribute("aria-label")).toBe("Host of this deck, Local daemon: ok");
     expect(button.textContent).toBe("Host");
 
-    rerender(<HostMetricsButton report={report({})} deckLabel="Local daemon" />);
+    rerender(<Stateful report={report({})} deckLabel="Local daemon" />);
     expect(button.className).toContain("host-button-none");
     expect(button.getAttribute("aria-label")).toBe("Host of this deck, Local daemon");
   });
 
   /** Scenario: the button opens a disclosure popover with the coloured, worded values; Escape inside it closes it and returns focus to the button; a press inside keeps it open and a press outside closes it. */
   it("opens a popover that Escape and an outside press close", () => {
-    render(<div><HostMetricsButton report={report({ disk: "critical" })} deckLabel="Local daemon" /><p data-testid="outside">elsewhere</p></div>);
+    render(<div><Stateful report={report({ disk: "critical" })} deckLabel="Local daemon" /><p data-testid="outside">elsewhere</p></div>);
     const button = screen.getByTestId("host-metrics-button");
     expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
     fireEvent.click(button);
@@ -73,7 +80,7 @@ describe("HostMetricsButton", () => {
 
   /** Scenario: with the popover open and focus elsewhere — the palette, a terminal — an Escape raised there closes the popover but still reaches a window listener and leaves focus where it was. */
   it("lets an Escape raised outside the popover through", () => {
-    render(<div><HostMetricsButton report={report({ disk: "warn" })} deckLabel="Local daemon" /><input data-testid="outside" /></div>);
+    render(<div><Stateful report={report({ disk: "warn" })} deckLabel="Local daemon" /><input data-testid="outside" /></div>);
     const button = screen.getByTestId("host-metrics-button");
     const outside = screen.getByTestId("outside");
     const reached: string[] = [];
@@ -94,7 +101,7 @@ describe("HostMetricsButton", () => {
 
   /** Scenario: an Escape raised inside the open popover does not reach a window listener, so the app-wide Escape does not also act on it. */
   it("keeps an Escape raised inside the popover to itself", () => {
-    render(<HostMetricsButton report={report({ disk: "warn" })} deckLabel="Local daemon" />);
+    render(<Stateful report={report({ disk: "warn" })} deckLabel="Local daemon" />);
     const reached: string[] = [];
     const listener = (event: KeyboardEvent) => reached.push(event.key);
     window.addEventListener("keydown", listener);
@@ -125,7 +132,7 @@ describe("HostMetricsButton", () => {
     const removed = vi.spyOn(window, "removeEventListener");
     try {
       window.innerWidth = 700;
-      render(<HostMetricsButton report={report({ disk: "critical" })} deckLabel="Local daemon" />);
+      render(<Stateful report={report({ disk: "critical" })} deckLabel="Local daemon" />);
       const button = screen.getByTestId("host-metrics-button");
       fireEvent.click(button);
       const popover = () => screen.getByTestId("host-metrics-popover");
@@ -147,7 +154,7 @@ describe("HostMetricsButton", () => {
 
   /** Scenario: a deck whose daemon does not report its host gets a neutral button that says so, and its popover gives the same not-available sentences as the TUI. */
   it("says a deck without host metrics does not report them", () => {
-    render(<HostMetricsButton report={{ status: "not-available" }} deckLabel="build@remote-host" />);
+    render(<Stateful report={{ status: "not-available" }} deckLabel="build@remote-host" />);
     const button = screen.getByTestId("host-metrics-button");
     expect(button.className).toContain("host-button-none");
     expect(button.getAttribute("aria-label")).toBe("Host of this deck, build@remote-host: not available from this deck");

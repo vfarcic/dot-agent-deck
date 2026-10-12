@@ -1300,6 +1300,17 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Opening settings.",
   },
   {
+    // PR #1672 — a daemon's Host figures, on the dashboard with the New agent
+    // dialog closed, as `commands.toml` says.
+    phrases: ["show host", "host", "open host info", "show resource usage", "how is the machine doing"],
+    action: "show_host_metrics",
+    invoke: "showHostMetrics",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "the Host figures open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Showing the Host figures.",
+  },
+  {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
     // this row, because the two are one word apart in speech. Callable on all
     // three screens for `voice_off`'s reason: the real row has no `screens`

@@ -130,3 +130,46 @@ export function hostStateWords(report: HostMetricsReport): string | undefined {
     default: return undefined;
   }
 }
+
+/**
+ * PR #1672 — one daemon section of the dashboard, as the Host voice command
+ * sees it: its key, the name its header shows, and whether its Host button is
+ * on screen (connected, with figures from its daemon).
+ */
+export interface HostDeckChoice {
+  deckId: string | undefined;
+  name: string;
+  connected: boolean;
+  hasFigures: boolean;
+}
+
+/** No daemon on the dashboard shows a Host button. */
+export const HOST_VOICE_NONE = "No daemon on the dashboard has Host figures to show.";
+/** A daemon was named that the dashboard does not show. */
+export const HOST_VOICE_NOT_SHOWN = "That daemon is not on the dashboard, so its Host figures cannot be shown.";
+
+/** Several daemons show a Host button and none was named. */
+export function hostVoiceWhich(names: readonly string[]): string {
+  return `Several daemons are on the dashboard: say which one, like “host ${names[0]}”.`;
+}
+
+/**
+ * PR #1672 — which daemon's Host popover a "show host" opens. A named daemon
+ * (`deckId`, what the row's `deck_ref` resolved to, or the button's own) opens
+ * when its Host button is on screen, and is refused in words otherwise. With
+ * none named, the one daemon showing a Host button opens; with several, the
+ * user is asked to name one rather than one being guessed.
+ */
+export function chooseHostDeck(decks: readonly HostDeckChoice[], deckId: string | undefined): { open: string } | { refused: string } {
+  if (deckId !== undefined) {
+    const deck = decks.find((candidate) => candidate.deckId === deckId);
+    if (!deck) return { refused: HOST_VOICE_NOT_SHOWN };
+    if (!deck.connected) return { refused: `“${deck.name}” is not connected, so it has no Host figures to show.` };
+    if (!deck.hasFigures) return { refused: `“${deck.name}” has not sent its Host figures yet.` };
+    return { open: deckId };
+  }
+  const shown = decks.filter((deck) => deck.deckId !== undefined && deck.connected && deck.hasFigures);
+  if (shown.length === 0) return { refused: HOST_VOICE_NONE };
+  if (shown.length > 1) return { refused: hostVoiceWhich(shown.map((deck) => deck.name)) };
+  return { open: shown[0].deckId! };
+}
