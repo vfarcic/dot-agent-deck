@@ -46,11 +46,15 @@ describe("writeClipboardText when writes finish out of order (issue 1705)", () =
   /** Make each platform write wait until the test finishes it, in any order. */
   function deferredWrites() {
     const finishes = new Map<string, () => void>();
+    const failures = new Map<string, () => void>();
     window.__TAURI_INTERNALS__ = {};
     invoke.mockImplementation(((_cmd: string, args: { text: string }) =>
-      new Promise<undefined>((resolve) => finishes.set(args.text, () => resolve(undefined)))) as never);
+      new Promise<undefined>((resolve, reject) => {
+        finishes.set(args.text, () => resolve(undefined));
+        failures.set(args.text, () => reject(new Error("refused")));
+      })) as never);
     const texts = () => invoke.mock.calls.map((call) => (call as unknown as [string, { text: string }])[1].text);
-    return { finishes, texts };
+    return { finishes, failures, texts };
   }
 
   /**
@@ -91,5 +95,45 @@ describe("writeClipboardText when writes finish out of order (issue 1705)", () =
     await third;
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(texts()).toEqual(["A", "B", "C"]);
+  });
+
+  /**
+   * Scenario: three copies start; the newest is refused, the middle one lands,
+   * and the oldest lands after it. The refused copy changed nothing, so the
+   * clipboard should end on the middle one, and it is written again.
+   */
+  it("treats a refused write as settled, so it does not block the repair", async () => {
+    const { finishes, failures, texts } = deferredWrites();
+    const a = writeClipboardText("A");
+    const b = writeClipboardText("B");
+    const c = writeClipboardText("C");
+    await vi.waitFor(() => expect(texts()).toEqual(["A", "B", "C"]));
+    failures.get("C")!();
+    await expect(c).rejects.toThrow("refused");
+    finishes.get("B")!();
+    await b;
+    finishes.get("A")!();
+    await a;
+    await vi.waitFor(() => expect(texts()).toEqual(["A", "B", "C", "B"]));
+    finishes.get("B")!();
+  });
+
+  /**
+   * Scenario: a repair is itself refused. It is not tried again, so a
+   * clipboard that keeps refusing cannot start an endless loop of writes.
+   */
+  it("does not retry a repair that is refused", async () => {
+    const { finishes, failures, texts } = deferredWrites();
+    const a = writeClipboardText("A2");
+    const b = writeClipboardText("B2");
+    await vi.waitFor(() => expect(texts()).toEqual(["A2", "B2"]));
+    finishes.get("B2")!();
+    await b;
+    finishes.get("A2")!();
+    await a;
+    await vi.waitFor(() => expect(texts()).toEqual(["A2", "B2", "B2"]));
+    failures.get("B2")!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(texts()).toEqual(["A2", "B2", "B2"]);
   });
 });
