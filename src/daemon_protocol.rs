@@ -13973,6 +13973,7 @@ mod question_answer_tests {
             None,
             Some("touch x".into()),
             Some(&serde_json::json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])),
+            None,
             1,
             None,
         )
@@ -15077,6 +15078,7 @@ mod question_answer_tests {
                 "Bash",
                 None,
                 Some("rm -rf build".into()),
+                None,
                 None,
                 1,
                 None,

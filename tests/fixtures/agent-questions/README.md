@@ -5,6 +5,7 @@ Hook, plugin-bus and extension payloads that raise a question, used by the `ques
 | File | Agent and version | Source |
 | --- | --- | --- |
 | `claude-permission-bash.json` | Claude Code 2.1.289, `PermissionRequest` for `Bash` | captured (M1) |
+| `claude-permission-bash-auto-mode.json` | Claude Code 2.1.296, `PermissionRequest` for `Bash` in the `default` mode with no `permission_suggestions` — the prompt that draws Yes, "Yes, and switch to auto mode" and No | **reconstructed** from 2.1.296's own bundle: the `PermissionRequest` hook input schema (`hook_event_name`, `tool_name`, `tool_input`, optional `permission_suggestions`) and the base fields every hook carries (`session_id`, `prompt_id`, `permission_mode`); not captured live |
 | `claude-permission-write.json` | Claude Code 2.1.289, `PermissionRequest` for `Write` | captured (follow-up b) |
 | `claude-permission-plan.json` | Claude Code 2.1.289, `PermissionRequest` for `ExitPlanMode` | captured (follow-up b) |
 | `claude-ask-user-question-form.json` | Claude Code 2.1.289, `PermissionRequest` for a two-question `AskUserQuestion`, the second `multiSelect` | **reconstructed** in the shape follow-up b observed (the single-question capture's fields, two questions) — the two-question capture was not kept |

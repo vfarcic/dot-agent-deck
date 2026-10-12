@@ -14492,6 +14492,7 @@ mod question_hold_tests {
             None,
             Some("touch x".into()),
             None,
+            None,
             1,
             None,
         )

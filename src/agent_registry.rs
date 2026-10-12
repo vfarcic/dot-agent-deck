@@ -471,6 +471,9 @@ pub enum TableWhen {
     SuggestionSetMode,
     /// Claude Code's "always" option beside any other suggestion.
     SuggestionOther,
+    /// Claude Code's "Yes, and switch to auto mode", which its Bash prompt
+    /// draws in the default and accept-edits permission modes.
+    AutoModeOffer,
 }
 
 #[derive(Debug)]
@@ -572,6 +575,25 @@ pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
                 when(
                     table_option("Yes, and don't ask again", AllowAlways, None),
                     TableWhen::SuggestionOther,
+                ),
+                // Read from 2.1.296's own bundle (PR #1698): its Bash prompt
+                // puts this after the "always" option and before No whenever
+                // the permission mode is `default` or `acceptEdits` and auto
+                // mode is available to the account. The payload says nothing
+                // about that availability, so the producer lists it in those
+                // two modes for Bash; where Claude leaves it out, the deck's
+                // No is one number higher than the screen's, and the number
+                // the screen gives No names this keyboard-only option, which
+                // is refused rather than read as another one. Keyboard-only:
+                // picking it switches Claude's mode on Claude's side, which a
+                // hook decision cannot do.
+                when(
+                    keyboard_only(table_option(
+                        "Yes, and switch to auto mode",
+                        AllowAlways,
+                        None,
+                    )),
+                    TableWhen::AutoModeOffer,
                 ),
                 table_option("No", Deny, None),
             ],

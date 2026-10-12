@@ -1295,6 +1295,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_detail.clone(),
         metadata.get("tool_use_id").map(String::as_str),
         extra.get("permission_suggestions"),
+        extra.get("permission_mode").and_then(Value::as_str),
     );
 
     let mut event = AgentEvent {
@@ -1332,6 +1333,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
 ///
 /// The agent's version is not in any of these payloads, so the tables are used
 /// as verified (`None`).
+#[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
     hook_event_name: &str,
@@ -1340,6 +1342,7 @@ fn hook_question(
     tool_detail: Option<String>,
     tool_use_id: Option<&str>,
     permission_suggestions: Option<&Value>,
+    permission_mode: Option<&str>,
 ) -> Option<crate::question::PendingQuestion> {
     let now = Utc::now().timestamp_millis();
     let id = crate::question::mint_question_id;
@@ -1351,6 +1354,7 @@ fn hook_question(
                 tool_input,
                 tool_detail,
                 permission_suggestions,
+                permission_mode,
                 now,
                 None,
             )
@@ -5181,7 +5185,9 @@ mod question_tests {
     /// Scenario: Claude Code 2.1.289's captured `PermissionRequest` for a Bash
     /// command, whose first suggestion is `addDirectories`, becomes a held
     /// Permission question: Yes, "Yes, and always allow access to <dir> from
-    /// this project" with the directory as its scope, and No.
+    /// this project" with the directory as its scope, the keyboard-only "Yes,
+    /// and switch to auto mode" Claude draws for Bash in the default mode, and
+    /// No.
     #[spec("question/detect/001")]
     #[test]
     fn question_detect_001_claude_bash_permission_request() {
@@ -5199,6 +5205,7 @@ mod question_tests {
             vec![
                 "Yes",
                 "Yes, and always allow access to /work/proj from this project",
+                "Yes, and switch to auto mode",
                 "No"
             ]
         );
@@ -5208,9 +5215,11 @@ mod question_tests {
             vec![
                 OptionRole::AllowOnce,
                 OptionRole::AllowAlways,
+                OptionRole::AllowAlways,
                 OptionRole::Deny
             ]
         );
+        assert!(q.questions[0].options[2].keyboard_only);
         // The confirmation says what is sent: the suggestion's destination
         // is `session`, whatever Claude's own label says.
         assert_eq!(
@@ -5225,6 +5234,75 @@ mod question_tests {
                 .is_none(),
             "no pane id in a unit test, so nothing to hold for"
         );
+    }
+
+    /// Scenario: Claude Code 2.1.296 asks to run a Bash command in the default
+    /// permission mode with no suggestion, and draws Yes, "Yes, and switch to
+    /// auto mode" and No. The deck lists the same three options with the same
+    /// numbers — the auto-mode one keyboard-only, since the hook cannot switch
+    /// modes — so "3" is No, as on screen. In another mode, or for another
+    /// tool, Claude draws no such option and neither does the deck.
+    #[spec("question/detect/018")]
+    #[test]
+    fn question_detect_018_claude_bash_lists_the_auto_mode_option_claude_draws() {
+        let payload = fixture("claude-permission-bash-auto-mode.json");
+        let q = question_for(AgentType::ClaudeCode, &payload);
+        assert_eq!(
+            labels(&q, 0),
+            vec!["Yes", "Yes, and switch to auto mode", "No"]
+        );
+        let options = &q.questions[0].options;
+        let numbers: Vec<u32> = options.iter().map(|o| o.index).collect();
+        assert_eq!(numbers, vec![1, 2, 3], "the numbers Claude draws");
+        assert_eq!(options[0].role, OptionRole::AllowOnce);
+        assert!(!options[0].keyboard_only);
+        assert!(
+            options[1].keyboard_only,
+            "the hook cannot switch Claude's mode, so the deck never picks it"
+        );
+        assert_eq!(options[1].scope, None);
+        assert_eq!(options[2].role, OptionRole::Deny);
+        assert!(!options[2].keyboard_only);
+
+        // Beside a suggestion, the "always" option comes first, then auto
+        // mode, then No — Claude's own order.
+        let mut suggested = fixture("claude-permission-bash.json");
+        assert_eq!(suggested["permission_mode"], "default");
+        let q = question_for(AgentType::ClaudeCode, &suggested);
+        assert_eq!(
+            labels(&q, 0),
+            vec![
+                "Yes",
+                "Yes, and always allow access to /work/proj from this project",
+                "Yes, and switch to auto mode",
+                "No"
+            ]
+        );
+        assert_eq!(
+            q.questions[0].options[1].scope.as_deref(),
+            Some("access to /work/proj for the rest of this session"),
+            "the auto-mode option does not take the suggestion's scope"
+        );
+        assert_eq!(q.questions[0].options[2].scope, None);
+
+        // Not offered outside the default and accept-edits modes, nor for a
+        // tool whose dialog has no such option.
+        for mode in ["plan", "auto", "bypassPermissions", "dontAsk"] {
+            suggested["permission_mode"] = Value::from(mode);
+            let q = question_for(AgentType::ClaudeCode, &suggested);
+            assert!(
+                !labels(&q, 0).contains(&"Yes, and switch to auto mode"),
+                "{mode}"
+            );
+        }
+        suggested["permission_mode"] = Value::from("acceptEdits");
+        let q = question_for(AgentType::ClaudeCode, &suggested);
+        assert!(labels(&q, 0).contains(&"Yes, and switch to auto mode"));
+        let write = question_for(
+            AgentType::ClaudeCode,
+            &fixture("claude-permission-write.json"),
+        );
+        assert!(!labels(&write, 0).contains(&"Yes, and switch to auto mode"));
     }
 
     /// Scenario: Claude Code's captured `PermissionRequest` for a Write, whose
@@ -5805,7 +5883,7 @@ mod question_tests {
             serde_json::json!([payload["permission_suggestions"][0]]),
             "only the update the option stands for"
         );
-        let deny = decision(&[(0, &[3], None)]);
+        let deny = decision(&[(0, &[4], None)]);
         assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
 
         let form = fixture("claude-ask-user-question-form.json");

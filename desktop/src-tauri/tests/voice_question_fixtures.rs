@@ -66,7 +66,7 @@ const OPENCODE_PERMISSION: &str =
 #[derive(Debug, Clone, Copy)]
 enum Planted {
     /// Claude Code's Bash permission: 1 Yes, 2 always allow access to the
-    /// directory, 3 No.
+    /// directory, 3 the keyboard-only "Yes, and switch to auto mode", 4 No.
     ClaudeBash,
     /// Codex's command approval: 1 Yes, proceed, 2 don't ask again for the
     /// prefix, 3 No, and tell Codex what to do differently.
@@ -97,6 +97,8 @@ enum Expect {
     },
     /// Not about the question — on to ordinary command handling.
     NotAnswer,
+    /// Refused, with a sentence containing this.
+    Refused(&'static str),
 }
 
 struct Fixture {
@@ -154,13 +156,13 @@ fn fixtures() -> Vec<Fixture> {
             "claude-permission-no",
             ClaudeBash,
             "no",
-            answer(&[(0, &[3])]),
+            answer(&[(0, &[4])]),
         ),
         f(
             "claude-permission-dont-run-that",
             ClaudeBash,
             "no, don't run that",
-            answer(&[(0, &[3])]),
+            answer(&[(0, &[4])]),
         ),
         f(
             "claude-permission-always-allow",
@@ -174,11 +176,13 @@ fn fixtures() -> Vec<Fixture> {
             "open the dashboard",
             Expect::NotAnswer,
         ),
+        // PR #1698: "yes" fits both "Yes, proceed" and "Yes, and don't ask
+        // again …" and is neither whole, so it chooses nothing and names both.
         f(
             "codex-permission-yes",
             CodexPermission,
             "yes",
-            answer(&[(0, &[1])]),
+            Expect::Refused("could be 1"),
         ),
         f(
             "codex-permission-go-ahead",
@@ -274,6 +278,7 @@ fn build(planted: Planted) -> PendingQuestion {
             payload.get("tool_input"),
             detail,
             payload.get("permission_suggestions"),
+            payload["permission_mode"].as_str(),
             1,
             None,
         )
@@ -345,6 +350,7 @@ fn observed(verdict: &QuestionVerdict) -> String {
 fn matches(expect: &Expect, verdict: &QuestionVerdict) -> bool {
     match (expect, verdict) {
         (Expect::NotAnswer, QuestionVerdict::NotAnswer) => true,
+        (Expect::Refused(part), QuestionVerdict::Refused { sentence }) => sentence.contains(part),
         (
             Expect::Answer {
                 form: expected,
@@ -403,7 +409,7 @@ async fn voice_question_fixtures_match_the_default_backend() {
             Expect::Text {
                 question, option, ..
             } => vec![(*question, vec![*option])],
-            Expect::NotAnswer => Vec::new(),
+            Expect::NotAnswer | Expect::Refused(_) => Vec::new(),
         };
         {
             for (at, options) in &form {
@@ -475,6 +481,7 @@ async fn voice_question_fixtures_match_the_default_backend() {
                 &[],
                 None,
                 Transcript::new(fixture.utterance),
+                false,
             ),
         )
         .await;

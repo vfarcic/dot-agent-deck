@@ -910,9 +910,11 @@ fn scope_shown_whole(scope: &str) -> bool {
 /// wrote from what the answer will grant, or — when there is none that can be
 /// shown whole — make it keyboard-only with nothing to confirm.
 fn settle_always_scope(options: &mut [QuestionOption], scope: Option<String>) {
+    // A keyboard-only option is never sent, so it grants nothing to confirm:
+    // Claude's "switch to auto mode" stays without the suggestion's scope.
     for option in options
         .iter_mut()
-        .filter(|o| o.role == OptionRole::AllowAlways)
+        .filter(|o| o.role == OptionRole::AllowAlways && !o.keyboard_only)
     {
         match &scope {
             Some(scope) => option.scope = Some(scope.clone()),
@@ -1010,6 +1012,16 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
     template.replace("{dir}", &dirs).replace("{mode}", mode)
 }
 
+/// Whether Claude Code's prompt for `tool_name` draws "Yes, and switch to auto
+/// mode" in `permission_mode`, as far as the payload can tell: its Bash prompt
+/// offers it in the `default` and `acceptEdits` modes [read from 2.1.296's
+/// bundle]. Whether auto mode is available to the account is not in the
+/// payload, so this can say yes for a prompt that leaves it out (see the
+/// table entry in [`crate::agent_registry::CLAUDE_CODE_QUESTIONS`]).
+fn claude_offers_auto_mode(tool_name: &str, permission_mode: Option<&str>) -> bool {
+    tool_name == "Bash" && matches!(permission_mode, Some("default" | "acceptEdits"))
+}
+
 /// PRD #1631: the question a Claude Code `PermissionRequest` hook payload asks.
 ///
 /// - `AskUserQuestion` → a [`QuestionKind::Choice`] form, one question per
@@ -1023,16 +1035,20 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
 /// - any other tool → [`QuestionKind::Permission`]: Yes, the "always" option
 ///   named by the payload's first `permission_suggestions` entry when there is
 ///   one — its scope written from that entry, or keyboard-only when it cannot
-///   be described — and No; held.
+///   be described — then, for `Bash` in the `default` or `acceptEdits`
+///   `permission_mode`, Claude's keyboard-only "Yes, and switch to auto mode",
+///   and No; held.
 ///
 /// `version` is the Claude Code version when known; the hook does not know it,
 /// and passes `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn claude_permission_request(
     id: String,
     tool_name: &str,
     tool_input: Option<&Value>,
     tool_detail: Option<String>,
     permission_suggestions: Option<&Value>,
+    permission_mode: Option<&str>,
     raised_at_ms: i64,
     version: Option<(u64, u64, u64)>,
 ) -> BuiltQuestion {
@@ -1131,12 +1147,17 @@ pub fn claude_permission_request(
                 Some(value) => claude_suggestion_fill(value, template),
                 None => template.to_string(),
             };
+            let auto_mode = claude_offers_auto_mode(tool_name, permission_mode);
             let mut options = table_options(
                 tables,
                 MenuKind::Permission,
                 version,
                 1,
-                &|when| when == TableWhen::Always || Some(when) == wanted,
+                &|when| {
+                    when == TableWhen::Always
+                        || Some(when) == wanted
+                        || (when == TableWhen::AutoModeOffer && auto_mode)
+                },
                 &fill,
             );
             // The confirmation names exactly what the decision will send, or
@@ -2101,6 +2122,7 @@ mod tests {
             payload.get("tool_input"),
             Some("touch created_m1.txt".into()),
             suggestions,
+            None,
             1,
             None,
         )
@@ -2170,6 +2192,7 @@ mod tests {
                 None,
                 None,
                 Some(&serde_json::json!([{"type": "setMode", "mode": mode, "destination": "session"}])),
+                None,
                 1,
                 None,
             )
@@ -2191,9 +2214,17 @@ mod tests {
         // decision even if a reply claimed it.
         let odd =
             serde_json::json!([{"type": "replaceRules", "rules": [], "destination": "session"}]);
-        let question =
-            claude_permission_request("q-odd".into(), "Bash", None, None, Some(&odd), 1, None)
-                .question;
+        let question = claude_permission_request(
+            "q-odd".into(),
+            "Bash",
+            None,
+            None,
+            Some(&odd),
+            None,
+            1,
+            None,
+        )
+        .question;
         let always = &question.questions[0].options[1];
         assert_eq!(always.role, OptionRole::AllowAlways);
         assert!(always.keyboard_only && always.scope.is_none());
@@ -2227,6 +2258,7 @@ mod tests {
                 None,
                 Some("ls".into()),
                 Some(suggestions),
+                None,
                 1,
                 None,
             )
@@ -2652,6 +2684,7 @@ mod tests {
                 Some(&input),
                 None,
                 None,
+                None,
                 1,
                 None,
             )
@@ -2792,6 +2825,7 @@ mod tests {
             "toolu_unlabeled".into(),
             "AskUserQuestion",
             Some(&claude_input),
+            None,
             None,
             None,
             1,
