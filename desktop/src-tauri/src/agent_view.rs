@@ -246,6 +246,10 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // PRD #1666 S3: an inbox message changed state. Nothing this view
+            // folds reads inbox state yet; the counts ride every fetch's
+            // `AgentRecord::inbox`.
+            BroadcastMsg::Inbox(_) => {}
             // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
             // not know. It marks a fetch for the same reason the two above do —
             // this view is a FOLD, and a message it could not read is a hole in
@@ -441,6 +445,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 

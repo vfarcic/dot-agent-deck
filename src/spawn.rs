@@ -2252,6 +2252,7 @@ fn drain_pre_write_events(
             Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Inbox(_)
                 | BroadcastMsg::Unknown,
             ) => {
                 continue;
@@ -8744,6 +8745,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 

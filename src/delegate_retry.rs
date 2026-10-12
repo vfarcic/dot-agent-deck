@@ -1234,6 +1234,7 @@ impl Watch {
                     Ok(
                         BroadcastMsg::OrchestrationSurface(_)
                         | BroadcastMsg::WorktreeKept(_)
+                        | BroadcastMsg::Inbox(_)
                         | BroadcastMsg::Unknown,
                     ) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => return Err(RetryEnd::Lagged),

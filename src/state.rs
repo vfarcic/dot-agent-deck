@@ -5442,6 +5442,7 @@ async fn wait_for_worker_event(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Inbox(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -6195,6 +6196,7 @@ async fn run_delegate_late_readiness_recovery(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Inbox(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -7412,6 +7414,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Inbox(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -7645,6 +7648,7 @@ pub(crate) async fn hold_readiness_buffer(
                     BroadcastMsg::Event(_)
                     | BroadcastMsg::OrchestrationSurface(_)
                     | BroadcastMsg::WorktreeKept(_)
+                    | BroadcastMsg::Inbox(_)
                     | BroadcastMsg::Unknown,
                 ) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -7879,6 +7883,7 @@ pub(crate) async fn wait_for_prompt_submission(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Inbox(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;

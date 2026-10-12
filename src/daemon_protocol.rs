@@ -342,6 +342,20 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// client should actually read — the same reason the PRD #819 verbs have
 /// capability strings.
 ///
+/// **10 → 11 (PRD #1666).** The deck now delivers every message to an agent
+/// through a per-agent inbox, and the clients stop typing messages into panes
+/// themselves: a seed, an orchestrator's role context and the
+/// configuration-generation prompt are handed to the daemon with
+/// [`AttachRequest::PostMessage`]. [`AttachRequest::PostMessage`] and
+/// [`AttachRequest::ListInbox`] are capability-gated, and
+/// [`crate::event::BroadcastMsg::Inbox`] is a kind an older client reads as
+/// `Unknown`, so none of them would need the bump on its own. The bump is for
+/// the pairing: a new client paired with an older daemon could deliver nothing
+/// to that daemon's agents without keeping the typing path PRD #1666 deletes,
+/// so the two refuse each other instead. The meaning that moved behind the
+/// unversioned hook socket is declared separately, as
+/// `1666-inbox-replaces-typed-delivery` in [`CONTRACT_BREAKS`].
+///
 /// **PRD #1105 narrows the bump rule the paragraphs above restate, and
 /// contributes no bump of its own for [`AttachRequest::FocusGained`].** The 10
 /// is issue #1049's, for `StopDaemon`. `focus-gained` ships under that number
@@ -550,7 +564,7 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// deliberately not on. The bump is what makes a skew *nameable* — the number
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Issue #1383: the longest the daemon may hold the Enter of one
 /// [`AttachRequest::WriteAndSubmit`] waiting for its payload to render on a
@@ -1263,6 +1277,17 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // `orchestration_id` stays optional on the wire. What changed is which
     // starts are refused, which a version number cannot express.
     "463-orchestration-start-requires-instance-token",
+    // PRD #1666, the 10 -> 11 bump. Messages to agents -- a delegate's task, a
+    // work-done report, a dispatch's result, the deck's notices, a seed -- are
+    // posted to the recipient's inbox instead of typed into its pane: the
+    // agent's own component fetches and acknowledges them, and an agent with
+    // none armed gets one fixed doorbell line. The hook socket is unversioned
+    // and its messages keep their shape; what moved is what they mean -- an
+    // `ack` names an inbox message id (the typed delivery's `d-` ids retire
+    // with it, later in the same PRD), and an agent whose hooks, plugin or
+    // extension predate the inbox gets the doorbell instead of the typed task. Listed beside the bump for #1049's
+    // reason: `changelog.d/1666.breaking.md` exists.
+    "1666-inbox-replaces-typed-delivery",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -2522,6 +2547,16 @@ pub enum AttachRequest {
         spill_path: Option<String>,
         origin: crate::inbox_hub::PostOrigin,
     },
+    /// PRD #1666 S3: list the inbox of `pane_id` — every message addressed to
+    /// it, live and recent history — or, with no pane, of the whole deck. The
+    /// reply rides back on [`AttachResponse::inbox_messages`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INBOX`]**, as
+    /// [`Self::PostMessage`] is.
+    ListInbox {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+    },
     /// PRD #1487: restart this daemon — onto the build now installed at its own
     /// path ([`RestartSuccessor::Installed`]), or for a client that starts its
     /// own build afterwards ([`RestartSuccessor::ClientSpawns`]). The reply
@@ -3197,6 +3232,17 @@ pub struct AttachResponse {
     /// older client ignores the key and an older daemon omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// PRD #1666 S3: this deck's id, the 8-character token in every inbox
+    /// address and message id (`m-<deck>-…`), on the live daemon's `Hello`
+    /// reply only. It is persisted in the daemon's state directory, so it is the
+    /// same across restarts and for every daemon sharing that directory.
+    /// Additive and optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deck_id: Option<String>,
+    /// PRD #1666 S3: the answer to [`AttachRequest::ListInbox`]. `None` on every
+    /// other response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_messages: Option<Vec<crate::inbox::MessageSummary>>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -4898,6 +4944,9 @@ async fn handle_connection(
             // from the same registry and the same reported identity, after the
             // live join for the same reason.
             crate::agent_pty::attach_prompt_keys(&mut records);
+            // PRD #1666 S3: each agent's inbox, after the live join, which
+            // decides whether the doorbell can reach it.
+            crate::agent_pty::attach_inbox_summaries(&registry, &mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -6349,6 +6398,9 @@ async fn handle_connection(
                 .with_guarded_send()
                 .with_capabilities()
                 .with_instance_id();
+            // PRD #1666 S3: the deck token every inbox address and message id
+            // carries.
+            resp.deck_id = Some(registry.inbox().deck().to_string());
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -6738,6 +6790,19 @@ async fn handle_connection(
                 spill_path,
                 origin,
             );
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ListInbox { pane_id } => {
+            let hub = registry.inbox();
+            let messages = match pane_id.as_deref() {
+                Some(pane) => hub.list(pane),
+                None => hub.list_all(),
+            };
+            let resp = AttachResponse {
+                ok: true,
+                inbox_messages: Some(messages),
+                ..AttachResponse::default()
+            };
             write_resp(&mut stream, &resp).await?
         }
     }
@@ -9815,6 +9880,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -9839,6 +9905,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -10015,6 +10082,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -10379,6 +10447,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
@@ -11070,6 +11139,51 @@ mod tests {
     /// `hello()` (what the static `daemon hello` probe prints) leaves it off
     /// the wire, a reply from a daemon predating it decodes as `None`, and the
     /// live handler's `with_instance_id` sets this process's identity.
+    /// PRD #1666 S3: `ListInbox` is spelled `list-inbox` with an optional
+    /// pane, and `deck_id` / `inbox_messages` are additive on the reply.
+    #[test]
+    fn list_inbox_and_deck_id_wire_shapes() {
+        let all: AttachRequest = serde_json::from_str(r#"{"op":"list-inbox"}"#).unwrap();
+        assert!(matches!(all, AttachRequest::ListInbox { pane_id: None }));
+        let one = AttachRequest::ListInbox {
+            pane_id: Some("w".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&one).unwrap(),
+            serde_json::json!({"op":"list-inbox","pane_id":"w"})
+        );
+        let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
+        assert!(!plain.as_object().unwrap().contains_key("deck_id"));
+        assert!(!plain.as_object().unwrap().contains_key("inbox_messages"));
+        let legacy: AttachResponse =
+            serde_json::from_str(r#"{"ok":true,"server_version":11}"#).unwrap();
+        assert!(legacy.deck_id.is_none() && legacy.inbox_messages.is_none());
+    }
+
+    /// PRD #1666 S3: `BroadcastMsg::Inbox` is internally tagged `inbox` with
+    /// its fields flattened beside the tag, and round-trips.
+    #[test]
+    fn inbox_broadcast_is_flat_and_round_trips() {
+        let msg = BroadcastMsg::Inbox(crate::event::InboxNotice {
+            pane_id: "w".to_string(),
+            agent_id: Some("7".to_string()),
+            message_id: "m-k3xzq2ab-0f3c9a71d2e4b850".to_string(),
+            subject: "task from orchestrator".to_string(),
+            from_label: "the orchestrator".to_string(),
+            state: crate::inbox::StateName::Undeliverable,
+            reason: Some(crate::inbox::UndeliverableReason::AgentExited),
+        });
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind":"inbox","pane_id":"w","agent_id":"7",
+                "message_id":"m-k3xzq2ab-0f3c9a71d2e4b850","subject":"task from orchestrator",
+                "from_label":"the orchestrator","state":"undeliverable","reason":"agent_exited"})
+        );
+        let back: BroadcastMsg = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(back).unwrap(), value);
+    }
+
     #[test]
     fn instance_id_is_additive_and_names_this_process() {
         let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();

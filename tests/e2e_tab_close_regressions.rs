@@ -214,6 +214,7 @@ async fn handle_connection(
                 crashed: None,
                 orchestrator_context_path: None,
                 authoring_kind: None,
+                inbox: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -315,6 +316,7 @@ fn orchestration_record(
         crashed: None,
         orchestrator_context_path: None,
         authoring_kind: None,
+        inbox: None,
     }
 }
 

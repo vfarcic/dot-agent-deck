@@ -915,6 +915,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         state.write().await.set_last_command_store(Arc::new(store));
     }
     let event_tx = daemon.event_tx;
+    // PRD #1666 S3: every inbox state change reaches attached clients.
+    pty_registry.inbox().set_broadcast(event_tx.clone());
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
@@ -4326,7 +4328,9 @@ async fn run_hook_loop_with_idle_timeout(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    pty_registry.inbox().announce(&req.pane_id, &agent_id, req.wake);
+                                    pty_registry
+                                        .inbox()
+                                        .announce(&req.pane_id, &agent_id, req.wake, req.component);
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         component = ?req.component,

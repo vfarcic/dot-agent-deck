@@ -8,7 +8,7 @@ If you are not sure where to start, turn on logging ([Enabling Debug Logs](#enab
 dot-agent-deck daemon status
 ```
 
-`daemon status` prints each managed agent's pane id, label, working directory, orchestration role, status and active tool. It only reads: it never starts a daemon, and it reports a missing or unreachable daemon instead of starting one. Add `--json` for machine-readable output.
+`daemon status` prints each managed agent's pane id, label, working directory, orchestration role, status and active tool, and its inbox: INBOX counts the messages waiting for the agent and those it has taken but not yet acknowledged (`2q 1f`, or `-` when there are none), and WAKE says how a new message reaches it — `native` when the agent's own hooks, plugin or extension take it, `turn-end` when the agent takes it at the end of its turn, `doorbell` when the deck types a one-line notice into the pane once the agent is idle, and `none` when the agent has reported no status yet, so nothing can reach it. It only reads: it never starts a daemon, and it reports a missing or unreachable daemon instead of starting one. Add `--json` for machine-readable output.
 
 ## Logs and diagnostics
 

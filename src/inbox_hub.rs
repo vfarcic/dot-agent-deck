@@ -20,11 +20,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::event::{
-    InboxComponent, InboxDelivery, InboxStreamControl, InboxWaitMode, InboxWaitReply, InboxWake,
+    BroadcastMsg, InboxComponent, InboxDelivery, InboxNotice, InboxStreamControl, InboxWaitMode,
+    InboxWaitReply, InboxWake,
 };
 use crate::inbox::{
     AckHow, AckOutcome, BodyTrust, Consumer, Content, DeckId, Inbox, InboxLimits, Message,
@@ -87,6 +88,63 @@ impl PostOrigin {
     }
 }
 
+/// PRD #1666 S3: how a message for an agent reaches it right now — the `wake`
+/// of [`InboxSummary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakePath {
+    /// An inbox component is armed for the agent and hands messages over
+    /// itself.
+    Native,
+    /// The agent's component takes messages at the end of each turn (Codex).
+    TurnEnd,
+    /// Nothing is armed, so the deck rings the doorbell when the agent is idle.
+    Doorbell,
+    /// Nothing is armed and the agent has reported no status, so the doorbell
+    /// has no idle moment to ring at.
+    None,
+}
+
+impl WakePath {
+    /// The spelling `daemon status` prints in its WAKE column.
+    pub fn label(self) -> &'static str {
+        match self {
+            WakePath::Native => "native",
+            WakePath::TurnEnd => "turn-end",
+            WakePath::Doorbell => "doorbell",
+            WakePath::None => "none",
+        }
+    }
+}
+
+/// PRD #1666 S3: one agent generation's inbox, as `ListAgents` and
+/// `daemon status` report it ([`crate::agent_pty::AgentRecord::inbox`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InboxSummary {
+    /// Messages waiting to be taken.
+    pub queued: usize,
+    /// Messages taken and not yet acknowledged.
+    pub fetched: usize,
+    /// Messages that could not be delivered, among the recent history.
+    pub undeliverable: usize,
+    /// When the agent last acknowledged a message, among the recent history.
+    #[serde(default)]
+    pub last_acked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How a new message would reach the agent now.
+    pub wake: WakePath,
+    /// The component behind `wake` (`pi_extension`, `claude_waiter`, …), when
+    /// one is armed or announced.
+    #[serde(default)]
+    pub component: Option<String>,
+}
+
+/// The wire spelling of `component`, for [`InboxSummary::component`].
+fn component_name(component: InboxComponent) -> Option<String> {
+    serde_json::to_value(component)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
 /// What a waiter's connection task is told.
 #[derive(Debug)]
 pub enum WaiterSignal {
@@ -143,6 +201,7 @@ struct Waiter {
 #[derive(Debug, Clone, Copy)]
 struct Announcement {
     wake: InboxWake,
+    component: InboxComponent,
     /// When it was announced: a `Native` component's arm grace runs from here.
     at: Instant,
 }
@@ -168,6 +227,9 @@ struct HubState {
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
     next_conn: u64,
+    /// Where state changes are broadcast to attached clients, once the daemon
+    /// has installed its event channel ([`InboxHub::set_broadcast`]).
+    broadcast: Option<broadcast::Sender<BroadcastMsg>>,
 }
 
 /// The daemon's inbox and the components armed on it. See the module docs.
@@ -215,6 +277,7 @@ impl InboxHub {
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
                 next_conn: 1,
+                broadcast: None,
             }),
             changed: Arc::new(Notify::new()),
             keepalive,
@@ -239,6 +302,12 @@ impl InboxHub {
 
     fn lock(&self) -> MutexGuard<'_, HubState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// PRD #1666 S3: broadcast every later state change to attached clients as
+    /// [`BroadcastMsg::Inbox`].
+    pub fn set_broadcast(&self, tx: broadcast::Sender<BroadcastMsg>) {
+        self.lock().broadcast = Some(tx);
     }
 
     pub fn deck(&self) -> DeckId {
@@ -344,14 +413,82 @@ impl InboxHub {
     }
 
     /// Record what an agent's component said it can do.
-    pub fn announce(&self, pane_id: &str, agent_id: &str, wake: InboxWake) {
+    pub fn announce(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        wake: InboxWake,
+        component: InboxComponent,
+    ) {
         self.lock().announced.insert(
             (pane_id.to_string(), agent_id.to_string()),
             Announcement {
                 wake,
+                component,
                 at: Instant::now(),
             },
         );
+    }
+
+    /// PRD #1666 S3: `agent_id` in `pane_id`'s inbox counts and how a message
+    /// reaches it now. An armed waiter is `native`; otherwise a `turn_end`
+    /// announcement is `turn_end`; otherwise the doorbell. (A `native`
+    /// announcement with no waiter armed is the doorbell: that is what rings.)
+    pub fn summary(&self, pane_id: &str, agent_id: &str) -> InboxSummary {
+        let st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let now = Instant::now();
+        let mut summary = InboxSummary {
+            queued: 0,
+            fetched: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: WakePath::Doorbell,
+            component: None,
+        };
+        let mut last_acked: Option<Instant> = None;
+        for m in st.inbox.list(pane_id).into_iter().filter(|m| {
+            m.recipient
+                .as_ref()
+                .is_some_and(|r| r.admits(pane_id, agent_id))
+        }) {
+            match &m.state {
+                MessageState::Queued => summary.queued += 1,
+                MessageState::Fetched { .. } => summary.fetched += 1,
+                MessageState::Undeliverable { .. } => summary.undeliverable += 1,
+                MessageState::Acknowledged { at, .. } => {
+                    last_acked = Some(last_acked.map_or(*at, |t| t.max(*at)));
+                }
+                MessageState::Claimed { .. } => {}
+            }
+        }
+        summary.last_acked_at = last_acked.and_then(|at| {
+            chrono::Duration::from_std(now.saturating_duration_since(at))
+                .ok()
+                .map(|ago| chrono::Utc::now() - ago)
+        });
+        if let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) {
+            summary.wake = WakePath::Native;
+            summary.component = component_name(waiter.component);
+        } else if let Some(announced) = st.announced.get(&key) {
+            if announced.wake == InboxWake::TurnEnd {
+                summary.wake = WakePath::TurnEnd;
+            }
+            summary.component = component_name(announced.component);
+        }
+        summary
+    }
+
+    /// PRD #1666 S3: `agent_id` in `pane_id` exited. Its bound messages become
+    /// undeliverable, and what it had announced is forgotten.
+    pub fn agent_exited(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        st.inbox.agent_exited(Instant::now(), pane_id, agent_id);
+        st.announced
+            .remove(&(pane_id.to_string(), agent_id.to_string()));
+        drain_events(&mut st);
+        drop(st);
+        self.changed.notify_one();
     }
 
     /// What `agent_id` in `pane_id` last announced, if anything.
@@ -475,6 +612,13 @@ impl InboxHub {
             self.dispatch_agent(pane_id, agent_id);
         }
         count
+    }
+
+    /// Every message the inbox holds, live and recent history, across panes.
+    pub fn list_all(&self) -> Vec<MessageSummary> {
+        let st = self.lock();
+        let now = Instant::now();
+        st.inbox.all().iter().map(|m| m.summary(now)).collect()
     }
 
     /// Every message for `pane_id`, live and recent history.
@@ -634,7 +778,8 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, max_chars: Option<usize
     count
 }
 
-/// Log the inbox's state changes. Their broadcast to clients is S3's.
+/// Log the inbox's state changes and broadcast each one to attached clients.
+/// An offer back in its pool has no pane to show it on, so it is only logged.
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
         debug!(
@@ -642,6 +787,19 @@ fn drain_events(st: &mut HubState) {
             state = %event.state,
             "inbox: state change"
         );
+        let (Some(tx), Some(recipient)) = (st.broadcast.as_ref(), event.recipient) else {
+            continue;
+        };
+        // A send with no subscriber is not an error worth reporting.
+        let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
+            pane_id: recipient.pane_id,
+            agent_id: recipient.agent_id,
+            message_id: event.message_id.to_string(),
+            subject: event.subject,
+            from_label: sender_label(&event.from, event.body_trust),
+            state: event.state,
+            reason: event.undeliverable_reason,
+        }));
     }
 }
 
@@ -883,6 +1041,106 @@ mod tests {
 
     fn hub() -> InboxHub {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
+    }
+
+    /// PRD #1666 S3: the summary counts one generation's messages and names
+    /// the path a new one would take, in precedence order.
+    #[tokio::test]
+    async fn summary_counts_one_generation_and_names_its_wake_path() {
+        let hub = hub();
+        hub.post_direct(Recipient::bound("p", "a"), content("one"))
+            .unwrap();
+        hub.post_direct(Recipient::bound("p", "a"), content("two"))
+            .unwrap();
+        hub.post_direct(Recipient::bound("p", "b"), content("other generation"))
+            .unwrap();
+        let taken = hub.fetch("p", "a", Consumer::FetchCli, Some(1), None);
+        assert_eq!(taken.len(), 1);
+        let s = hub.summary("p", "a");
+        assert_eq!((s.queued, s.fetched, s.undeliverable), (1, 1, 0));
+        assert_eq!(s.wake, WakePath::Doorbell);
+        assert_eq!(s.component, None);
+        assert_eq!(s.last_acked_at, None);
+
+        assert_eq!(
+            hub.ack(&taken[0].id, "p", "a", AckHow::Explicit),
+            AckOutcome::Acknowledged
+        );
+        assert!(hub.summary("p", "a").last_acked_at.is_some());
+
+        // A Native announcement with nothing armed is still the doorbell.
+        hub.announce("p", "a", InboxWake::Native, InboxComponent::ClaudeWaiter);
+        assert_eq!(hub.summary("p", "a").wake, WakePath::Doorbell);
+        hub.announce("p", "a", InboxWake::TurnEnd, InboxComponent::CodexHooks);
+        let s = hub.summary("p", "a");
+        assert_eq!(s.wake, WakePath::TurnEnd);
+        assert_eq!(s.component.as_deref(), Some("codex_hooks"));
+
+        // An armed waiter wins over any announcement, and names itself.
+        let waiter = hub
+            .arm("p", "a", InboxWaitMode::Stream, InboxComponent::PiExtension)
+            .unwrap();
+        let s = hub.summary("p", "a");
+        assert_eq!(s.wake, WakePath::Native);
+        assert_eq!(s.component.as_deref(), Some("pi_extension"));
+        assert!(hub.disarm("p", "a", waiter.conn_id));
+        assert_eq!(hub.summary("p", "a").wake, WakePath::TurnEnd);
+
+        // The other generation's message is its own.
+        assert_eq!(hub.summary("p", "b").queued, 1);
+    }
+
+    /// PRD #1666 S3: every state change is broadcast with the message's pane,
+    /// subject and sender label, and an exit makes the generation's messages
+    /// undeliverable without touching another generation's.
+    #[test]
+    fn every_state_change_is_broadcast_and_an_exit_is_undeliverable() {
+        use crate::inbox::{StateName, UndeliverableReason};
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        let mut next = || match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => notice,
+            other => panic!("expected an inbox broadcast, got {other:?}"),
+        };
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("hello"))
+            .unwrap()
+            .to_string();
+        let posted = next();
+        assert_eq!(posted.pane_id, "p");
+        assert_eq!(posted.agent_id.as_deref(), Some("a"));
+        assert_eq!(posted.message_id, id);
+        assert_eq!(posted.subject, "subject");
+        assert_eq!(
+            posted.from_label,
+            "dot-agent-deck (the prompt this session was started with)"
+        );
+        assert_eq!(posted.state, StateName::Queued);
+        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        assert_eq!(next().state, StateName::Fetched);
+        assert!(hub.nack(&id, "p", "a"));
+        assert_eq!(next().state, StateName::Queued);
+
+        let other = hub
+            .post_direct(Recipient::bound("p", "b"), content("keep"))
+            .unwrap();
+        assert_eq!(next().state, StateName::Queued);
+        hub.agent_exited("p", "a");
+        let lost = next();
+        assert_eq!(lost.message_id, id);
+        assert_eq!(lost.state, StateName::Undeliverable);
+        assert_eq!(lost.reason, Some(UndeliverableReason::AgentExited));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let kept = hub.list("p");
+        assert!(
+            kept.iter()
+                .any(|m| m.id == other && m.state == StateName::Queued)
+        );
+        assert_eq!(hub.summary("p", "a").undeliverable, 1);
     }
 
     #[tokio::test]

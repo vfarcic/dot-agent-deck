@@ -1635,6 +1635,7 @@ impl DaemonClient {
                     crashed: None,
                     orchestrator_context_path: None,
                     authoring_kind: None,
+                    inbox: None,
                 })
                 .collect(),
             schedule_revision,
@@ -1822,6 +1823,89 @@ impl DaemonClient {
             ));
         }
         Ok(GatedQuery::Answered(()))
+    }
+
+    /// PRD #1666 S3 — post a deck-generated message (a seed, an orchestrator's
+    /// role context, the configuration-generation prompt) to `pane_id`'s inbox,
+    /// bound to `expected_agent_id` when given. Answers the message id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_INBOX`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn post_message(
+        &self,
+        pane_id: &str,
+        expected_agent_id: Option<&str>,
+        subject: &str,
+        body: &str,
+        spill_path: Option<&str>,
+        origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::PostMessage {
+                pane_id: pane_id.to_string(),
+                expected_agent_id: expected_agent_id.map(str::to_string),
+                subject: subject.to_string(),
+                body: body.to_string(),
+                spill_path: spill_path.map(str::to_string),
+                origin,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "post-message failed".into()),
+            ));
+        }
+        resp.id
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Server("post-message answered no message id".into()))
+    }
+
+    /// PRD #1666 S3 — the inbox of `pane_id`, or of the whole deck with no
+    /// pane: every message, live and recent history.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_INBOX`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn list_inbox(
+        &self,
+        pane_id: Option<&str>,
+    ) -> Result<GatedQuery<Vec<crate::inbox::MessageSummary>>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ListInbox {
+                pane_id: pane_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "list-inbox failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(
+            resp.inbox_messages.unwrap_or_default(),
+        ))
     }
 
     /// PRD #1223 M7 — start an AUTHORING agent: the daemon composes `kind`'s
@@ -7055,6 +7139,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -7121,6 +7206,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -7150,6 +7236,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

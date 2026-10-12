@@ -783,6 +783,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         crashed: None,
         orchestrator_context_path: None,
         authoring_kind: None,
+        inbox: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -810,6 +811,7 @@ fn agent_record_omits_agent_type_when_none() {
         crashed: None,
         orchestrator_context_path: None,
         authoring_kind: None,
+        inbox: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -936,6 +938,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -953,6 +956,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);

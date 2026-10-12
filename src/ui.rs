@@ -44628,6 +44628,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
             prompt_keys: None,
         };
         crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));

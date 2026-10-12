@@ -2333,6 +2333,14 @@ fn pump_reader(
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
+    // PRD #1666 S3: whatever the exit, messages bound to this agent can no
+    // longer reach it. Deliberate closes included: the entry is gone by now, but
+    // its messages are not.
+    if let Some(pane_id) = pane_id_env.as_deref()
+        && let Some(registry) = registry.upgrade()
+    {
+        registry.inbox().agent_exited(pane_id, &agent_id);
+    }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
@@ -3755,6 +3763,22 @@ pub struct AgentRecord {
         deserialize_with = "lenient_authoring_kind"
     )]
     pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    /// PRD #1666 S3: this agent generation's inbox — how many messages wait for
+    /// it, how many it has taken without acknowledging, how many could not be
+    /// delivered, when it last acknowledged one, and how a new one would reach
+    /// it. Stamped at the wire boundary by [`attach_inbox_summaries`], after the
+    /// `ListAgents` live join, because whether the doorbell can reach the agent
+    /// depends on whether it has reported a status.
+    ///
+    /// `None` for an agent with no pane id (nothing can address it) and from a
+    /// daemon predating the field. Read leniently, so a summary this build
+    /// cannot parse costs the card its inbox line rather than the whole reply.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_inbox_summary"
+    )]
+    pub inbox: Option<crate::inbox_hub::InboxSummary>,
 }
 
 impl AgentRecord {
@@ -3807,6 +3831,34 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
     }
+}
+
+/// PRD #1666 S3: stamp each record's [`AgentRecord::inbox`] from `registry`'s
+/// inbox. Run after the live join: an agent that has reported no status gives
+/// the doorbell no idle moment to ring at, so its `doorbell` wake is reported
+/// as `none`.
+pub fn attach_inbox_summaries(registry: &AgentPtyRegistry, records: &mut [AgentRecord]) {
+    let hub = registry.inbox();
+    for record in records {
+        record.inbox = record.pane_id_env.as_deref().map(|pane| {
+            let mut summary = hub.summary(pane, &record.id);
+            if summary.wake == crate::inbox_hub::WakePath::Doorbell && record.live.is_none() {
+                summary.wake = crate::inbox_hub::WakePath::None;
+            }
+            summary
+        });
+    }
+}
+
+/// See [`AgentRecord::inbox`].
+fn lenient_inbox_summary<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::inbox_hub::InboxSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -14673,6 +14725,7 @@ impl AgentPtyRegistry {
             crashed: agent.crashed,
             orchestrator_context_path: None,
             authoring_kind: agent.authoring_kind,
+            inbox: None,
         })
     }
 
@@ -15054,6 +15107,7 @@ impl AgentPtyRegistry {
                 // `AgentRecord::orchestrator_context_path`.
                 orchestrator_context_path: None,
                 authoring_kind: agent.authoring_kind,
+                inbox: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -21571,7 +21625,51 @@ mod spawn_tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
+    }
+
+    /// PRD #1666 S3: a record with a pane gets its generation's summary; one
+    /// that has reported no status reads `none` instead of `doorbell`; one with
+    /// no pane gets no summary at all.
+    #[test]
+    fn attach_inbox_summaries_reports_none_until_a_status_arrives() {
+        let registry = AgentPtyRegistry::new();
+        registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound("p", "1"),
+                crate::inbox::Content {
+                    from: crate::inbox::Sender::Deck {
+                        reason: "seed".to_string(),
+                    },
+                    subject: "s".to_string(),
+                    body: "b".to_string(),
+                    body_trust: crate::inbox::BodyTrust::Trusted,
+                    spill_path: None,
+                    id: None,
+                },
+            )
+            .unwrap();
+        let silent = AgentRecord {
+            pane_id_env: Some("p".into()),
+            ..typed_record(None, None)
+        };
+        let reported = AgentRecord {
+            pane_id_env: Some("p".into()),
+            ..typed_record(None, Some(None))
+        };
+        let paneless = typed_record(None, Some(None));
+        let mut records = vec![silent, reported, paneless];
+        attach_inbox_summaries(&registry, &mut records);
+        let silent = records[0].inbox.as_ref().unwrap();
+        assert_eq!(silent.queued, 1);
+        assert_eq!(silent.wake, crate::inbox_hub::WakePath::None);
+        assert_eq!(
+            records[1].inbox.as_ref().unwrap().wake,
+            crate::inbox_hub::WakePath::Doorbell
+        );
+        assert!(records[2].inbox.is_none());
     }
 
     /// Every agent type resolves to the binary somebody could type, and the two
@@ -21684,6 +21782,7 @@ mod spawn_tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -22896,6 +22995,7 @@ mod spawn_tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

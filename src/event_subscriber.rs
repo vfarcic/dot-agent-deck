@@ -104,6 +104,10 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
                         state.write().await.queue_worktree_kept(kept);
                     }
+                    // PRD #1666 S3: an inbox message changed state. The
+                    // dashboard does not show inbox state yet, and the counts
+                    // reach it on every `list_agents` anyway.
+                    Ok(Some(BroadcastMsg::Inbox(_))) => {}
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored
                     // rather than escalated — there is no payload to act

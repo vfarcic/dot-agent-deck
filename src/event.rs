@@ -2663,6 +2663,17 @@ pub enum BroadcastMsg {
     /// it ships with.
     #[serde(rename = "worktree_kept")]
     WorktreeKept(crate::issue_dispatch_run::KeptWorktree),
+    /// PRD #1666 S3: a message in an agent's inbox changed state — posted
+    /// (`queued`), taken (`fetched`), handed back (`queued` again),
+    /// acknowledged, or found undeliverable (its agent exited, or it was taken
+    /// too many times without an acknowledgement). Sent for every change, so a
+    /// client can follow one message from post to delivery.
+    ///
+    /// A new `kind`, which is one of the reasons PRD #1666 moved
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] to 11; a client from before
+    /// it reads the tag as [`Self::Unknown`].
+    #[serde(rename = "inbox")]
+    Inbox(InboxNotice),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -2711,6 +2722,26 @@ pub enum BroadcastMsg {
     /// makes the NEXT `BroadcastMsg` variant additive.
     #[serde(other)]
     Unknown,
+}
+
+/// PRD #1666 S3: the payload of [`BroadcastMsg::Inbox`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxNotice {
+    /// The pane the message is addressed to.
+    pub pane_id: String,
+    /// The agent generation the message is bound to, when it is bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub message_id: String,
+    /// The one-line subject, for a card or a status line.
+    pub subject: String,
+    /// Who the message is from, as the agent sees it labelled.
+    pub from_label: String,
+    /// The state the message is in now.
+    pub state: crate::inbox::StateName,
+    /// Why, when `state` is `undeliverable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::inbox::UndeliverableReason>,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,

@@ -595,6 +595,9 @@ pub struct InboxEvent {
     /// The holder after the change; `None` for an offer back in its pool.
     pub recipient: Option<Recipient>,
     pub from: Sender,
+    /// Whether the body is the deck's or another agent's, which decides how
+    /// the sender is labelled.
+    pub body_trust: BodyTrust,
     pub subject: String,
     pub state: StateName,
     pub undeliverable_reason: Option<UndeliverableReason>,
@@ -1558,6 +1561,7 @@ impl Inbox {
             kind: message.kind.name(),
             recipient: message.recipient.clone(),
             from: message.from.clone(),
+            body_trust: message.body_trust,
             subject: message.subject.clone(),
             state: name,
             undeliverable_reason: match &message.state {
