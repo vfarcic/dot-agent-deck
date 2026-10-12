@@ -8026,7 +8026,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/008 — Pi dialogs map to held questions and back, and the deck's `ctx.ui` wrapper races them.
 - **Layer:** L1/fast unit (`src/hook.rs`), running `pi-extension/test/questions.test.ts` under Node when it can strip TypeScript types (23.6+).
 - **Agent:** none (stand-in `ctx.ui` and `exec`).
-- **Asserts:** a `select`, `confirm` and `input` description become held questions and each answer maps back to the option string, true/false or the typed text; the wrapper builds the `await-answer` argv, a deck answer aborts the original dialog and resolves the caller, a keyboard answer aborts the `await-answer` child, an empty reply leaves the dialog to the keyboard, wrapping twice wraps once, and a missing or read-only `ctx.ui` is left alone.
+- **Asserts:** a `select`, `confirm` and `input` description become held questions and each answer maps back to the option string, true/false or the typed text; the wrapper builds the `await-answer` argv, a deck answer aborts the original dialog and resolves the caller, a keyboard answer aborts the `await-answer` child, an empty reply leaves the dialog to the keyboard, a deck that cannot be launched leaves it to the keyboard too, wrapping twice wraps once, and a missing or read-only `ctx.ui` is left alone.
 - **Does not assert:** a real Pi (`question/live/*`); the JS half where Node is older than 23.6, which prints `SKIP:`.
 - **Platform coverage:** mac+linux.
 

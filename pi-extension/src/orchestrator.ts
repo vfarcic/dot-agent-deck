@@ -1060,6 +1060,8 @@ function raceDialog(
 		try {
 			deck = deps.exec(buildAwaitAnswerArgv(dialog), execAbort.signal);
 		} catch {
+			// No deck could be launched: the keyboard's handlers, attached
+			// above, settle the race, as when the deck answers nothing.
 			return;
 		}
 		deck.then(

@@ -172,6 +172,24 @@ describe("question/detect/008 — Pi ctx.ui wrapper", () => {
 		assert.equal(deck.runs.length, 0, "await-answer is not started");
 	});
 
+	test("a deck that cannot be launched leaves the dialog to the keyboard", async () => {
+		const confirm = fakeDialog();
+		const ui: Record<string, unknown> = { confirm: confirm.method };
+		const deps: QuestionDeps = {
+			exec: () => {
+				throw new Error("spawn dot-agent-deck ENOENT");
+			},
+			mintId: () => "q-0123456789abcdef0123456789abcdef",
+		};
+		installQuestionWrappers(ui, deps);
+		const pending = (ui.confirm as (t: string, m: string) => Promise<unknown>)("Allow rm?", "Run rm -rf build?");
+		await tick();
+		assert.equal(confirm.calls.length, 1, "the original dialog is shown");
+		assert.equal(confirm.calls[0].signal?.aborted, false, "and left open");
+		confirm.calls[0].answer(true);
+		assert.equal(await pending, true, "the keyboard's answer settles the caller");
+	});
+
 	test("wrapping twice leaves one wrapper", () => {
 		const select = fakeDialog();
 		const ui: Record<string, unknown> = { select: select.method };
