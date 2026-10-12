@@ -5667,7 +5667,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/004 — The documented Codex hook-install CLI succeeds (PRD #20 §4.2.1).
 - **Layer:** L1/fast real-binary subprocess integration with an isolated home and deterministic Codex app-server stand-in.
 - **Agent:** synthetic Codex installation environment.
-- **Asserts:** `dot-agent-deck hooks install --agent codex` exits successfully and creates `hooks.json` instead of reporting `No hook installer for agent Codex`.
+- **Asserts:** the install CLI creates hooks.json in the separate scratch CODEX_HOME, pins the seeded durable binary, installs one synchronous SessionStart/UserPromptSubmit/Stop command each, and leaves HOME/.codex absent.
 - **Does not assert:** uninstall scoping (covered by `codex/trust/003`) or dashboard rendering.
 - **Platform coverage:** mac+linux.
 
@@ -8102,6 +8102,64 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Test:** `claude_014_live_killed_waiter_falls_back_to_injection` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** macOS process discovery.
 - **Platform coverage:** linux.
+
+#### inbox/codex
+
+##### inbox/codex/001 — The update-now startup dialog receives zero input bytes.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (raw-mode Codex screen recorder behind the real wrapper).
+- **Asserts:** Queuing a task sends neither the doorbell nor a bare CR into the measured update dialog.
+- **Does not assert:** A real Codex update or model turn.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/002 — The folder-trust startup dialog receives zero input bytes.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (wrapped screen recorder).
+- **Asserts:** Raw-input readiness cannot permit a doorbell or bare CR into folder trust.
+- **Does not assert:** Filesystem trust changes in a real Codex.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/003 — The hooks-review startup dialog receives zero input bytes.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (wrapped screen recorder).
+- **Asserts:** The pending task leaves the hooks-review selection untouched, with zero PTY input.
+- **Does not assert:** Real hook trust hashing, covered by codex/trust.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/004 — Unknown startup screens hold delivery until a recognised composer and suppress cleanup CRs.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (wrapped screen recorder).
+- **Asserts:** An unknown dialog gets zero bytes; painting the empty composer permits exactly the fixed doorbell; returning to an unknown dialog before fetch prevents a cleanup CR.
+- **Does not assert:** Future Codex screen wording.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/005 — A positively recognised composer permits a doorbell before the first own hook.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (wrapped screen recorder).
+- **Asserts:** A fresh Codex generation at its composer receives only the fixed submitted line without launch-prompt arguments.
+- **Does not assert:** A real model fetching the content.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/006 — Own-hook status gates the doorbell, and restart resets the startup guard.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (wrapped screen recorder and real hook CLI).
+- **Asserts:** Busy status withholds bytes; after an own hook, Idle permits a ring on an unfamiliar screen; replacement generation on a startup dialog receives zero bytes.
+- **Does not assert:** Cross-version compatibility.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/007 — Stop blocks with framed inbox content within 6000 bytes and keeps overflow queued.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (real Codex hook CLI).
+- **Asserts:** Busy Stop emits decision:block with a bounded framed reason, acknowledges handed-over ids, retains overflow and prints no block once empty; no PTY input is used.
+- **Does not assert:** Real Codex compliance with the reason.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/008 — Codex doorbell submission injects and acknowledges content within its byte budget.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** none (real Codex hook CLI).
+- **Asserts:** Doorbell UserPromptSubmit returns additionalContext within 6000 UTF-8 bytes, acknowledges handed-over ids, retains overflow and preserves human history while labelling the event with ✉.
+- **Does not assert:** A sandboxed model shell fetch; trusted hooks run outside the sandbox.
+- **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
 

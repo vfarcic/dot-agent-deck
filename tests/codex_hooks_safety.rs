@@ -1009,7 +1009,7 @@ fn own_home_entry(command: &str, index: usize, hash: &str) -> Value {
     )
 }
 
-/// Scenario: Run the documented Codex hook installation command against an isolated home, an isolated `$HOME` holding a seeded durable deck, and a deterministic app-server stand-in. The command must succeed, materialize Codex hook definitions, and pin the seeded durable binary rather than anything the host happens to have installed.
+/// Scenario: Run Codex hook installation against a scratch CODEX_HOME and a separate scratch HOME with a seeded durable deck and deterministic app-server. SessionStart, UserPromptSubmit and Stop must each install one synchronous inbox-capable hook in CODEX_HOME, pin the seeded deck and leave HOME/.codex absent.
 #[spec("codex/hooks/004")]
 #[test]
 fn codex_hooks_004_cli_install_succeeds() {
@@ -1040,6 +1040,30 @@ fn codex_hooks_004_cli_install_succeeds() {
         written.contains(durable.to_str().expect("durable path is UTF-8")),
         "the install pinned something other than the durable binary seeded in this fixture, so \
          the test's outcome is being decided by host state:\n{written}"
+    );
+    let settings: Value = serde_json::from_str(&written).unwrap();
+    for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+        let handlers: Vec<_> = settings["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|rule| rule["hooks"].as_array().unwrap())
+            .filter(|handler| {
+                handler["command"]
+                    .as_str()
+                    .is_some_and(|cmd| cmd.ends_with(DECK_COMMAND_SUFFIX))
+            })
+            .collect();
+        assert_eq!(handlers.len(), 1, "one inbox-relevant {event} hook");
+        assert_eq!(handlers[0]["type"], "command");
+        assert_ne!(
+            handlers[0]["async"], true,
+            "{event} must return its hand-over synchronously"
+        );
+    }
+    assert!(
+        !deck_home.path().join(".codex").exists(),
+        "CODEX_HOME confines the install"
     );
 }
 
