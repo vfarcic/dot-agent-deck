@@ -21,12 +21,15 @@
 //!    deck's hook socket path and nothing else. That is precisely the shape
 //!    issue #1077 describes: a same-uid process that learned a pane id (here
 //!    handed to it; in the wild, read off `daemon status`) and signals as that
-//!    pane. It must reach the orchestrator's pane with nothing — and, since
+//!    pane. It must reach the orchestrator's inbox with nothing — and, since
 //!    issue #1129, must be TOLD it was refused rather than exiting 0 on a report
 //!    that went nowhere.
 //! 2. **Legitimate** — the same binary, same verb, run by the worker's OWN
 //!    pane, so the daemon's spawn gave it the capability token. It must reach
-//!    the orchestrator's pane exactly as it always did.
+//!    the orchestrator's inbox exactly as it always did (PRD #1666: the deck
+//!    posts a report to the orchestrator's inbox rather than typing it into
+//!    its pane, and the `cat` orchestrator here has no hooks to fetch it, so
+//!    the test reads the inbox over the attach socket).
 //!
 //! The order is load-bearing. The forgery is sent FIRST and the legitimate
 //! signal second, so the legitimate report's arrival is itself the proof that
@@ -37,6 +40,8 @@
 //! credential, so CI runs it on every PR.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -200,9 +205,16 @@ fn open_orchestration(deck: &TuiDeck) {
 }
 
 /// `(worker pane id, orchestrator registry agent id)` once both role panes are
-/// registered — the pane id the forgery will claim, and the PTY the daemon
-/// writes feedback into.
+/// registered — the pane id the forgery will claim, and the orchestrator's
+/// agent.
 fn orchestration_ids(deck: &TuiDeck) -> (String, String) {
+    let (worker, orchestrator, _) = orchestration_ids_with_pane(deck);
+    (worker, orchestrator)
+}
+
+/// [`orchestration_ids`] plus the orchestrator's `DOT_AGENT_DECK_PANE_ID`,
+/// the inbox every work-done report is posted to.
+fn orchestration_ids_with_pane(deck: &TuiDeck) -> (String, String, String) {
     let ids = RefCell::new(None);
     let ready = common::wait_until(Duration::from_secs(20), || {
         let records = common::agent_records_on(deck.attach_socket_path());
@@ -215,17 +227,19 @@ fn orchestration_ids(deck: &TuiDeck) -> (String, String) {
                 _ => None,
             });
         let orchestrator = records.iter().find_map(|record| {
-            matches!(
+            if !matches!(
                 &record.tab_membership,
                 Some(TabMembership::Orchestration {
                     is_start_role: true,
                     ..
                 })
-            )
-            .then(|| record.id.clone())
+            ) {
+                return None;
+            }
+            Some((record.id.clone(), record.pane_id_env.clone()?))
         });
-        if let (Some(worker), Some(orchestrator)) = (worker, orchestrator) {
-            *ids.borrow_mut() = Some((worker, orchestrator));
+        if let (Some(worker), Some((orchestrator, orchestrator_pane))) = (worker, orchestrator) {
+            *ids.borrow_mut() = Some((worker, orchestrator, orchestrator_pane));
             return true;
         }
         false
@@ -238,35 +252,28 @@ fn orchestration_ids(deck: &TuiDeck) -> (String, String) {
     ids.into_inner().expect("the ready poll stores both ids")
 }
 
-/// The orchestrator PTY's scrollback straight from the daemon — the bytes it
-/// wrote, before any rendering is involved.
-fn orchestrator_pty(deck: &TuiDeck, orchestrator_agent_id: &str) -> String {
-    String::from_utf8_lossy(&common::pane_snapshot_on(
-        deck.attach_socket_path(),
-        orchestrator_agent_id,
-    ))
-    .into_owned()
-}
-
 /// Release one of the worker's two trigger files and wait for the report it
-/// gates to reach the orchestrator's PTY.
-fn release_and_await(deck: &TuiDeck, trigger: &str, sentinel: &str, orchestrator_agent: &str) {
+/// gates to reach the orchestrator's inbox.
+fn release_and_await(deck: &TuiDeck, trigger: &str, sentinel: &str, orchestrator_pane: &str) {
     std::fs::write(deck.workdir().join(trigger), b"go\n")
         .unwrap_or_else(|e| panic!("create the worker's trigger file {trigger}: {e}"));
-    let landed = common::wait_until(Duration::from_secs(60), || {
-        orchestrator_pty(deck, orchestrator_agent).contains(sentinel)
-    });
+    let landed = inbox_view::wait_for(
+        deck.attach_socket_path(),
+        orchestrator_pane,
+        sentinel,
+        Duration::from_secs(60),
+    );
     assert!(
         landed,
         "the worker's OWN `work-done`, run from inside its pane with the token the daemon put \
-         in that pane's environment, never reached the orchestrator ({sentinel}) — the \
+         in that pane's environment, never reached the orchestrator's inbox ({sentinel}) — the \
          provenance gate is refusing legitimate traffic, which is worse than the forgery it \
-         exists to stop\nOrchestrator PTY:\n{}",
-        orchestrator_pty(deck, orchestrator_agent)
+         exists to stop\nOrchestrator inbox:\n{}",
+        inbox_view::text(deck.attach_socket_path(), orchestrator_pane)
     );
 }
 
-/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the two-role `hook-provenance` fixture. Let the worker report once from inside its own pane so the legitimate path is proven live, then run the REAL `dot-agent-deck work-done` binary from the test process carrying only the worker's `DOT_AGENT_DECK_PANE_ID` — the same-uid forgery of issue #1077 — then let the worker report a second time. The orchestrator's pane must carry both of the worker's own reports and must never carry the forged one, and the forged invocation must now exit non-zero naming the daemon's refusal (issue #1129).
+/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the two-role `hook-provenance` fixture. Let the worker report once from inside its own pane so the legitimate path is proven live, then run the REAL `dot-agent-deck work-done` binary from the test process carrying only the worker's `DOT_AGENT_DECK_PANE_ID` — the same-uid forgery of issue #1077 — then let the worker report a second time. The orchestrator's inbox must hold both of the worker's own reports and no inbox in the deck may ever hold the forged one, and the forged invocation must now exit non-zero naming the daemon's refusal (issue #1129).
 #[spec("orchestration/provenance/001")]
 #[test]
 fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands() {
@@ -287,15 +294,10 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
     open_orchestration(&deck);
     deck.wait_for_string("worker");
 
-    let (worker_pane, orchestrator_agent) = orchestration_ids(&deck);
+    let (worker_pane, _, orchestrator_pane) = orchestration_ids_with_pane(&deck);
 
     // ---- 1. THE LEGITIMATE PATH, PROVEN LIVE ----------------------------
-    release_and_await(
-        &deck,
-        "provenance-go-1",
-        ATTESTED_FIRST,
-        &orchestrator_agent,
-    );
+    release_and_await(&deck, "provenance-go-1", ATTESTED_FIRST, &orchestrator_pane);
 
     // ---- 2. THE FORGERY -------------------------------------------------
     // Everything a same-uid process on this box can obtain: the socket path
@@ -344,15 +346,23 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
         &deck,
         "provenance-go-2",
         ATTESTED_SECOND,
-        &orchestrator_agent,
+        &orchestrator_pane,
     );
 
     // ---- 4. THE FORGERY LANDED NOWHERE ----------------------------------
-    let pty = orchestrator_pty(&deck, &orchestrator_agent);
+    let forged_posts: Vec<_> = inbox_view::all_messages(deck.attach_socket_path())
+        .into_iter()
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(FORGED_SENTINEL))
+        })
+        .collect();
     assert!(
-        !pty.contains(FORGED_SENTINEL),
-        "a process that knew nothing but the worker's pane id made the daemon write into the \
-         ORCHESTRATOR's pane — the gate did not hold\nOrchestrator PTY:\n{pty}"
+        forged_posts.is_empty(),
+        "a process that knew nothing but the worker's pane id made the daemon post a report \
+         into an inbox — the gate did not hold\nForged messages: {forged_posts:?}"
     );
 }
 
@@ -418,10 +428,7 @@ fn squeezed_pty(deck: &TuiDeck, pane: &RolePane) -> String {
     .collect()
 }
 
-/// The daemon's task pointer for the fixture's `worker` role, whitespace-free.
-const WORKER_POINTER: &str = "worker-task-worker.md";
-
-/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the `stale-pane-identity` orchestration TWICE in one directory, so two orchestrators, A and B, are live at once. Inside B's own pane, run the real `delegate` with `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID` rewritten to A's — issue #712's stale identity from another dispatch, everything else as the daemon spawned it — and then delegate again with B's untouched environment. The stale delegate must exit non-zero with the daemon's refusal; B's own delegate must reach B's worker; and A's worker must never receive a task pointer.
+/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the `stale-pane-identity` orchestration TWICE in one directory, so two orchestrators, A and B, are live at once. Inside B's own pane, run the real `delegate` with `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID` rewritten to A's — issue #712's stale identity from another dispatch, everything else as the daemon spawned it — and then delegate again with B's untouched environment. The stale delegate must exit non-zero with the daemon's refusal; B's own delegate must reach B's worker's inbox; A's worker's inbox must stay empty; and no inbox may ever hold the stale task.
 #[spec("orchestration/provenance/002")]
 #[test]
 fn provenance_002_a_stale_pane_identity_cannot_route_into_another_live_orchestration() {
@@ -507,24 +514,44 @@ fn provenance_002_a_stale_pane_identity_cannot_route_into_another_live_orchestra
         b"go\n",
     )
     .expect("release B's own delegate");
-    let own_landed = common::wait_until(Duration::from_secs(60), || {
-        squeezed_pty(&deck, worker_b).contains(WORKER_POINTER)
+    let attach = deck.attach_socket_path();
+    let own_landed = inbox_view::wait_for(
+        attach,
+        &worker_b.pane_id,
+        "own-identity-task",
+        Duration::from_secs(60),
+    ) && common::wait_until(Duration::from_secs(10), || {
+        squeezed_pty(&deck, orch_b).contains("OWN-DELEGATE-EXIT=0")
     });
     let orch_b_pty = squeezed_pty(&deck, orch_b);
     assert!(
-        own_landed && orch_b_pty.contains("OWN-DELEGATE-EXIT=0"),
-        "control — B's delegate with its own untouched environment must reach B's worker; \
-         B's PTY = {orch_b_pty}\nB's worker PTY = {}\nA's worker PTY = {}",
-        squeezed_pty(&deck, worker_b),
-        squeezed_pty(&deck, worker_a)
+        own_landed,
+        "control — B's delegate with its own untouched environment must reach B's worker's \
+         inbox; B's PTY = {orch_b_pty}\nB's worker inbox = {}\nA's worker inbox = {}",
+        inbox_view::text(attach, &worker_b.pane_id),
+        inbox_view::text(attach, &worker_a.pane_id)
     );
 
     // ---- 3. A'S WORKER NEVER RECEIVED ANYTHING -----------------------------
-    let worker_a_pty = squeezed_pty(&deck, worker_a);
+    let worker_a_inbox = inbox_view::messages(attach, &worker_a.pane_id);
     assert!(
-        !worker_a_pty.contains(WORKER_POINTER),
-        "issue #712: A's worker received a task pointer, but nothing was ever delegated in A's \
-         orchestration — the stale identity routed B's work into it; A's worker PTY = \
-         {worker_a_pty}"
+        worker_a_inbox.is_empty(),
+        "issue #712: A's worker's inbox holds a message, but nothing was ever delegated in A's \
+         orchestration — the stale identity routed B's work into it; A's worker inbox = \
+         {worker_a_inbox:?}"
+    );
+    let stale_posts: Vec<_> = inbox_view::all_messages(attach)
+        .into_iter()
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("stale-identity-task"))
+        })
+        .collect();
+    assert!(
+        stale_posts.is_empty(),
+        "issue #712: the refused stale-identity delegate still posted its task; messages = \
+         {stale_posts:?}"
     );
 }

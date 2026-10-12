@@ -18,6 +18,8 @@
 //! compiles it.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,6 +29,30 @@ use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, TabMembership};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use spec::spec;
+
+/// The `DOT_AGENT_DECK_PANE_ID` of the live orchestration role `role` on the
+/// daemon behind `attach_socket`, once it is registered.
+fn role_pane(attach_socket: &Path, role: &str) -> Option<String> {
+    common::agent_records_on(attach_socket)
+        .into_iter()
+        .find(|record| {
+            matches!(
+                &record.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == role
+            )
+        })
+        .and_then(|record| record.pane_id_env)
+}
+
+/// Wait up to `timeout` for a message containing `needle` to be posted to the
+/// inbox of orchestration role `role` (PRD #1666: the deck posts the replayed
+/// orchestrator prompt to the start role's inbox rather than typing it).
+fn wait_for_role_inbox(attach_socket: &Path, role: &str, needle: &str, timeout: Duration) -> bool {
+    common::wait_until(timeout, || {
+        role_pane(attach_socket, role)
+            .is_some_and(|pane| inbox_view::count_containing(attach_socket, &pane, needle) > 0)
+    })
+}
 
 /// Stage a saved-session `session.toml` at `session_file` describing each
 /// `(name, command)` pane, all rooted at `dir` (which must already exist on
@@ -339,7 +365,7 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
 /// The daemon-empty restore must rebuild the orchestration tab: the `coder` and
 /// `reviewer` role panes appear as deck cards in their saved order, and — unlike
 /// warm hydration — the saved `orchestrator_prompt` is replayed to the start
-/// (orchestrator) role, which the recorder captures (echo-immune). RED today:
+/// (orchestrator) role, posted to its inbox. RED before PRD #89 M2b.3:
 /// there is no snapshot-fallback orchestration restore branch, so the saved pane
 /// comes back as a single plain dashboard card and neither the role panes nor
 /// the prompt replay ever materialize.
@@ -412,22 +438,23 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
     );
 
     // start_role_index honored + orchestrator_prompt replayed: the saved prompt
-    // is delivered to the START (orchestrator) role pane and recorded. The
-    // snapshot-fallback path replays it (M2b.3), unlike warm hydration
-    // (session/restore/007), so this line proves both the prompt replay and that
-    // the start role was identified from `start_role_index`.
-    let record = project_dir.path().join("record-orchestrator.log");
-    let replayed = common::wait_for_file_substr_count(
-        &record,
+    // is posted to the START (orchestrator) role's inbox. The snapshot-fallback
+    // path replays it (M2b.3), unlike warm hydration (session/restore/007), so
+    // this proves both the prompt replay and that the start role was
+    // identified from `start_role_index`.
+    let attach = deck.attach_socket_path();
+    let replayed = wait_for_role_inbox(
+        attach,
+        "orchestrator",
         "Build the feature end to end",
-        1,
         Duration::from_secs(15),
     );
     assert!(
         replayed,
         "PRD #89 M2b.3: the saved `orchestrator_prompt` must be replayed to the start \
-         (orchestrator) role on the snapshot-fallback path, but it was never delivered \
-         (no recorded line at {record:?}).\nFinal grid:\n{}",
+         (orchestrator) role on the snapshot-fallback path, but it never reached that role's \
+         inbox ({:?}).\nFinal grid:\n{}",
+        role_pane(attach, "orchestrator").map(|pane| inbox_view::messages(attach, &pane)),
         deck.snapshot_grid()
     );
 }
@@ -598,8 +625,8 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
 /// hand-stage a `session.toml` whose `[panes.orchestration]` block saves a
 /// `start_role_index` of 1 (`coder`) — a cursor that DIFFERS from the config
 /// default. Launch against a fresh (empty) daemon with NO flag. The saved start
-/// cursor must be HONORED: the replayed `orchestrator_prompt` must land on the
-/// role at the SAVED index (`coder`, index 1) and be recorded there, NOT on the
+/// cursor must be HONORED: the replayed `orchestrator_prompt` must be posted to
+/// the inbox of the role at the SAVED index (`coder`, index 1), NOT to the
 /// config-default start role (`orchestrator`, index 0) — and `daemon status`
 /// must mark that same saved role, and only it, as the orchestrator, so the
 /// pane holding the prompt is the pane allowed to delegate. RED today: the restore
@@ -660,37 +687,38 @@ fn restore_011_saved_start_role_index_is_honored_over_config_default() {
     );
 
     // HONORED: the role at the SAVED index (1 = `coder`) receives the replayed
-    // prompt. RED today: restore uses the config-default start (0 = orchestrator),
-    // so the coder recorder never sees the prompt and this times out.
-    let coder_record = project_dir.path().join("record-coder.log");
-    let honored = common::wait_for_file_substr_count(
-        &coder_record,
+    // prompt in its inbox. Before F3, restore used the config-default start
+    // (0 = orchestrator), so coder's inbox never held it and this timed out.
+    let attach = deck.attach_socket_path();
+    let honored = wait_for_role_inbox(
+        attach,
+        "coder",
         "Build the feature end to end",
-        1,
         Duration::from_secs(15),
     );
     assert!(
         honored,
         "PRD #89 review-fix F3: the SAVED `start_role_index` (1 = coder) must be honored on \
          restore — the orchestrator_prompt must be replayed to the role at the saved index — \
-         but `coder` never received it (no recorded line at {coder_record:?}). The restore \
-         path recomputes the start from the config default instead.\nFinal grid:\n{}",
+         but `coder`'s inbox never held it ({:?}). The restore path recomputes the start from \
+         the config default instead.\nFinal grid:\n{}",
+        role_pane(attach, "coder").map(|pane| inbox_view::messages(attach, &pane)),
         deck.snapshot_grid()
     );
 
     // And the config-default start role (0 = `orchestrator`) must NOT have
     // received it — proving the SAVED cursor, not the config `start` flag, drove
-    // delivery. (Single-shot delivery: once `coder` got it, this stays empty.)
-    let orchestrator_record = project_dir.path().join("record-orchestrator.log");
+    // delivery. (Single-shot replay: once `coder` got it, this stays empty.)
+    let orchestrator_pane =
+        role_pane(attach, "orchestrator").expect("the orchestrator role is registered");
     assert!(
-        !common::wait_for_file_substr_count(
-            &orchestrator_record,
-            "Build the feature end to end",
-            1,
-            Duration::from_secs(2),
-        ),
+        !common::wait_until(Duration::from_secs(2), || {
+            inbox_view::count_containing(attach, &orchestrator_pane, "Build the feature end to end")
+                > 0
+        }),
         "the config-default start role (`orchestrator`, index 0) must NOT receive the prompt \
-         when the saved cursor points elsewhere — but it did, at {orchestrator_record:?}."
+         when the saved cursor points elsewhere — but its inbox holds it: {:?}",
+        inbox_view::messages(attach, &orchestrator_pane)
     );
 
     // Issue #523 review: the saved cursor is the tab's ONE orchestrator, so the
@@ -770,10 +798,10 @@ fn restore_021_reattach_seats_the_tab_where_the_daemon_registered_its_orchestrat
     // seated on the saved cursor — and the daemon registers `coder` for it.
     let mut first = launch(&session_file);
     assert!(
-        common::wait_for_file_substr_count(
-            &project_dir.path().join("record-coder.log"),
+        wait_for_role_inbox(
+            &daemon.attach_socket,
+            "coder",
             "Build the feature end to end",
-            1,
             Duration::from_secs(15),
         ),
         "precondition: the restore must replay the prompt to the saved seat `coder`.\nGrid:\n{}",
