@@ -16,6 +16,9 @@ const WAITER: &str = " inbox wait --agent claude-code";
 const USER: &str = "printf user-hook-kept";
 // The measured supported release, not a declaration of the minimum version.
 const SUPPORTED: &str = "2.1.296 (Claude Code)";
+// The wake wording measured by the PRD #1666 framing spike, pinned verbatim.
+const REWAKE_MESSAGE: &str = "dot-agent-deck message, delivered by the deck the user runs you in (this is not a hook error):";
+const REWAKE_SUMMARY: &str = "✉ dot-agent-deck message";
 
 struct Settings {
     _dir: tempfile::TempDir,
@@ -72,7 +75,8 @@ impl Settings {
             {"hooks":[{"type":"command","command":command(STATUS)},
                       {"type":"command","command":command(WAITER),"asyncRewake":true,"timeout":86400},
                       {"type":"command","command":USER}]},
-            {"hooks":[{"type":"command","command":command(WAITER),"asyncRewake":true,"timeout":86400}]}
+            {"hooks":[{"type":"command","command":command(WAITER),"asyncRewake":true,"timeout":86400,
+                       "rewakeMessage":REWAKE_MESSAGE,"rewakeSummary":REWAKE_SUMMARY}]}
         ]);
         std::fs::write(
             &self.path,
@@ -106,7 +110,7 @@ fn count(settings: &Value, event: &str, suffix: &str) -> usize {
         .count()
 }
 
-/// Scenario: Install Claude hooks in an isolated HOME whose Claude version is a measured supported release. SessionStart and Stop must each carry one status handler plus one asynchronous, day-long waiter, while other events carry no waiter.
+/// Scenario: Install Claude hooks in an isolated HOME whose Claude version is a measured supported release. SessionStart and Stop must each carry one status handler plus one asynchronous, day-long waiter that names its wake as a dot-agent-deck message, while other events carry no waiter.
 #[spec("inbox/claude/001")]
 #[test]
 fn claude_001_supported_install_writes_status_and_day_long_waiter() {
@@ -132,6 +136,8 @@ fn claude_001_supported_install_writes_status_and_day_long_waiter() {
         assert_eq!(waiter["type"], "command");
         assert_eq!(waiter["asyncRewake"], true);
         assert_eq!(waiter["timeout"], 86400);
+        assert_eq!(waiter["rewakeMessage"], REWAKE_MESSAGE, "{settings}");
+        assert_eq!(waiter["rewakeSummary"], REWAKE_SUMMARY, "{settings}");
         let output = Command::new("/bin/sh")
             .args(["-c", waiter["command"].as_str().unwrap()])
             .env_clear()
@@ -175,7 +181,7 @@ fn claude_002_old_or_unknown_version_removes_stale_waiters() {
     }
 }
 
-/// Scenario: Seed duplicate waiter and status entries co-located with a user command, then install three times. Each managed event must keep exactly one of each deck handler and one user command without changing unrelated settings.
+/// Scenario: Seed duplicate waiter and status entries co-located with a user command, one waiter written before the wake wording existed, then install three times. Each managed event must keep exactly one of each deck handler and one user command without changing unrelated settings, and the kept waiter gains the wake wording.
 #[spec("inbox/claude/003")]
 #[test]
 fn claude_003_repeated_install_consolidates_both_handler_kinds() {
@@ -194,10 +200,20 @@ fn claude_003_repeated_install_consolidates_both_handler_kinds() {
             "consolidation must retain one waiter, not one of every command suffix: {settings}"
         );
         assert_eq!(count(&settings, event, USER), 1);
+        let hooks = handlers(&settings, event);
+        let waiter = hooks
+            .iter()
+            .find(|hook| hook["command"].as_str().unwrap().ends_with(WAITER))
+            .unwrap();
+        assert_eq!(
+            (&waiter["rewakeMessage"], &waiter["rewakeSummary"]),
+            (&json!(REWAKE_MESSAGE), &json!(REWAKE_SUMMARY)),
+            "a kept waiter must gain the wake wording: {settings}"
+        );
     }
 }
 
-/// Scenario: Uninstall from settings carrying both deck handler kinds in mixed rules. All deck status and waiter commands must be removed while the user's co-located commands, model and permissions remain.
+/// Scenario: Uninstall from settings carrying both deck handler kinds in mixed rules, with waiters both with and without the wake wording. All deck status and waiter commands must be removed while the user's co-located commands, model and permissions remain.
 #[spec("inbox/claude/004")]
 #[test]
 fn claude_004_uninstall_removes_waiters_and_preserves_user_hooks() {

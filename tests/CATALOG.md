@@ -8004,7 +8004,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.
 - **Agent:** none.
-- **Asserts:** A measured supported version (2.1.296) installs exactly one status handler and one `asyncRewake: true`, `timeout: 86400` waiter on SessionStart and Stop only; the installed command executes safely from a path with spaces and exits silently outside a deck.
+- **Asserts:** A measured supported version (2.1.296) installs exactly one status handler and one `asyncRewake: true`, `timeout: 86400` waiter on SessionStart and Stop only, carrying the measured `rewakeMessage` and `rewakeSummary` wording verbatim; the installed command executes safely from a path with spaces and exits silently outside a deck.
 - **Does not assert:** The exact minimum supported version or a real Claude wake.
 - **Platform coverage:** mac+linux.
 
@@ -8018,14 +8018,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/003 — Repeated installs consolidate both deck handler kinds without deleting a user's mixed-rule command.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated settings and supported-version stub.
 - **Agent:** none.
-- **Asserts:** Three installs over duplicate mixed rules keep one status handler, one waiter and one user command on each managed event.
+- **Asserts:** Three installs over duplicate mixed rules keep one status handler, one waiter and one user command on each managed event, and the kept waiter, written without them, gains `rewakeMessage` and `rewakeSummary`.
 - **Does not assert:** Concurrent installer locking, covered by hooks/install tests.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/004 — Uninstall removes both deck handler kinds and preserves co-located user hooks.
 - **Layer:** Unit (`tests/inbox_claude.rs`), public settings-path seam and temporary files.
 - **Agent:** none.
-- **Asserts:** Status and waiter commands are removed from duplicate mixed rules while user commands, model and permissions survive.
+- **Asserts:** Status and waiter commands, waiters with and without `rewakeMessage`/`rewakeSummary` alike, are removed from duplicate mixed rules while user commands, model and permissions survive.
 - **Does not assert:** Running the uninstall CLI or modifying the developer's global settings.
 - **Platform coverage:** mac+linux.
 

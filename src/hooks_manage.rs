@@ -66,8 +66,32 @@ pub(crate) const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration =
 /// treat it, and the `StopFailure` precedent above shows an unknown hook key
 /// can switch off every deck hook. So an older or unknown version gets no
 /// waiter, and the doorbell delivers to it instead. Lower this only with a
-/// measurement.
+/// measurement. The waiter's `rewakeMessage` / `rewakeSummary` keys ride the
+/// same gate; they are `@internal` in Claude Code ([`WAITER_REWAKE_MESSAGE`]).
 pub const CLAUDE_ASYNC_REWAKE_MIN: (u64, u64, u64) = (2, 1, 296);
+
+/// PRD #1666 S6: the text Claude Code puts ahead of a waiter's message when it
+/// wakes the session, in place of its default `Stop hook blocking error from
+/// command "<hook>":`. That default reads as a failure, and Claude Code also
+/// marks every wake NOT USER INPUT; together with a framing that called the
+/// block the user's request, Haiku sometimes refused the message as a prompt
+/// injection (framing spike, 2026-10-12).
+///
+/// `rewakeMessage` and [`WAITER_REWAKE_SUMMARY`]'s `rewakeSummary` are
+/// **`@internal` in Claude Code's settings schema**: measured present in
+/// 2.1.294, 2.1.295 and 2.1.296, but undocumented and free to be renamed. They
+/// sit under the same gate as the waiter ([`CLAUDE_ASYNC_REWAKE_MIN`]) for the
+/// reason that gate exists: the `StopFailure` precedent shows a hook key a
+/// release does not know can switch off every deck hook in the file, so no key
+/// is written to a release no run has seen accept it. If a later release drops
+/// them, the wake falls back to Claude Code's default wording and
+/// [`crate::inbox_hub::SESSION_FRAMING`] still explains it.
+pub const WAITER_REWAKE_MESSAGE: &str = "dot-agent-deck message, delivered by the deck the user runs you in (this is not a hook error):";
+
+/// PRD #1666 S6: the line the Claude pane shows for a waiter's wake (`●
+/// ✉ dot-agent-deck message`), in place of `Stop hook feedback`. `@internal`
+/// in Claude Code like [`WAITER_REWAKE_MESSAGE`], and gated with it.
+pub const WAITER_REWAKE_SUMMARY: &str = "✉ dot-agent-deck message";
 
 /// PRD #1666 S6: the deck's second Claude handler kind, the native inbox
 /// waiter, identified by this suffix the way the status handler is identified
@@ -706,13 +730,16 @@ fn waiter_command_for(status_command: &str) -> String {
 
 /// PRD #1666 S6: the native waiter's handler object. `asyncRewake` makes an
 /// exit 2 wake the session; the day-long `timeout` keeps an idle waiter alive
-/// ([`WAITER_TIMEOUT_SECS`]).
+/// ([`WAITER_TIMEOUT_SECS`]); `rewakeMessage` and `rewakeSummary` replace
+/// Claude Code's "Stop hook blocking error" wording ([`WAITER_REWAKE_MESSAGE`]).
 fn waiter_handler(command: &str) -> Value {
     json!({
         "type": "command",
         "command": command,
         "asyncRewake": true,
-        "timeout": WAITER_TIMEOUT_SECS
+        "timeout": WAITER_TIMEOUT_SECS,
+        "rewakeMessage": WAITER_REWAKE_MESSAGE,
+        "rewakeSummary": WAITER_REWAKE_SUMMARY
     })
 }
 
@@ -1026,8 +1053,15 @@ fn install_impl_in(
                         .and_then(|handlers| handlers.get_mut(handler_idx))
                         .and_then(Value::as_object_mut)
                     {
-                        handler.insert("asyncRewake".into(), Value::Bool(true));
-                        handler.insert("timeout".into(), json!(WAITER_TIMEOUT_SECS));
+                        // Every key but the command, so a waiter an older
+                        // build wrote gains the ones added since.
+                        if let Value::Object(wanted) = waiter_handler(&waiter_command) {
+                            for (key, value) in wanted {
+                                if key != "command" {
+                                    handler.insert(key, value);
+                                }
+                            }
+                        }
                     }
                 }
                 None => {

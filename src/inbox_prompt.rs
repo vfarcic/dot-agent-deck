@@ -125,15 +125,14 @@ pub fn in_deck_pane() -> bool {
 }
 
 /// Fetch, and acknowledge in the same step, what is waiting for this pane's
-/// agent, up to `budget` characters including the framing sentence. `None`
+/// agent, up to `budget` characters including `framing`, which heads it. `None`
 /// outside a deck pane, without a token, when the daemon does not answer, or
 /// when nothing is waiting. Bounded by the hook socket's 5 s request timeout.
-pub fn doorbell_injection(budget: usize) -> Option<Injection> {
+pub fn doorbell_injection(budget: usize, framing: &str) -> Option<Injection> {
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
         .ok()
         .filter(|pane| !pane.is_empty())?;
     let token = crate::hook_provenance::token_from_env()?;
-    let framing = crate::inbox_hub::SESSION_FRAMING;
     let request = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id,
         agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID)

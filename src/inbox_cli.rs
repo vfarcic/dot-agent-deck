@@ -15,7 +15,7 @@ use crate::event::{
     DaemonMessage, InboxComponent, InboxFetchConsumer, InboxFetchRequest, InboxListReply,
     InboxListRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession,
 };
-use crate::inbox_hub::SESSION_FRAMING;
+use crate::inbox_hub::AGENT_FRAMING;
 
 /// The most of a hook's stdin `inbox wait` reads.
 const MAX_HOOK_STDIN_BYTES: u64 = 1024 * 1024;
@@ -363,7 +363,7 @@ pub fn fetch(json: bool) -> ExitCode {
         println!("No dot-agent-deck messages are waiting.");
         return ExitCode::SUCCESS;
     }
-    println!("{SESSION_FRAMING}");
+    println!("{AGENT_FRAMING}");
     for message in &messages {
         println!();
         println!("{}", message.text);

@@ -262,6 +262,7 @@ fn claude_inbox_hooks(
             deck_prompt_submit(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks.inline_budget(),
+                crate::inbox_hub::SESSION_FRAMING,
                 event,
             )
         }
@@ -271,9 +272,15 @@ fn claude_inbox_hooks(
 
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
 /// every agent whose hook accepts `hookSpecificOutput.additionalContext`
-/// shares it (Claude Code now, Codex in S7), each with its own `budget`. An
-/// ordinary prompt costs a local scan and no daemon call.
-pub fn deck_prompt_submit(prompt: &str, budget: usize, event: &mut AgentEvent) -> Option<String> {
+/// shares it (Claude Code now, Codex in S7), each with its own `budget` and
+/// the `framing` that heads an injection. An ordinary prompt costs a local
+/// scan and no daemon call.
+pub fn deck_prompt_submit(
+    prompt: &str,
+    budget: usize,
+    framing: &str,
+    event: &mut AgentEvent,
+) -> Option<String> {
     let ids = crate::inbox_prompt::scan(prompt);
     if ids.is_empty() {
         return None;
@@ -281,7 +288,7 @@ pub fn deck_prompt_submit(prompt: &str, budget: usize, event: &mut AgentEvent) -
     let injection = if ids.rung.is_empty() {
         None
     } else {
-        crate::inbox_prompt::doorbell_injection(budget)
+        crate::inbox_prompt::doorbell_injection(budget, framing)
     };
     let fetched = injection
         .as_ref()
