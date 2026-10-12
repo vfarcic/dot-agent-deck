@@ -624,6 +624,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the levels' computation (covered by `protocol/host-metrics/012`); the desktop's colours (`desktop/e2e/host-metrics.spec.ts`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/host-metrics/011 — On a narrow terminal the overlay's level words are shown in full.
+- **Layer:** L1 (TestBackend + insta, the live `render_host_metrics_overlay` through `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** at 60 and 34 columns, a critical disk, a warning disk and a warning load still show `(critical)` once and `(warning)` twice, each in its level's colour; at 60 columns the disk row that does not fit carries its word on the line below, the load row that fits keeps it beside its figures, and the frame matches its snapshot (PR #1672 review).
+- **Does not assert:** the figures' own truncation at the narrowest width; the desktop popover (covered by `host-metrics.spec.ts`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/config-gen
 
 ##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
@@ -1393,6 +1400,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Asserts:** with `load_per_core_warn = 0.5` and an invalid `load_per_core_critical`, a host-metrics reply carries `level` `critical`, `warn` and `ok` on disks 4 %, 10 % and 50 % free, no `level` key on a disk with no free figure, `load_level` `warn` for 0.6 per core (the configured warn, and the default critical the invalid value fell back to), and no `memory_level` key when memory used is absent; the numbers are served too.
 - **Does not assert:** the clients' colours (covered by `dashboard/host-metrics/010` and the desktop's `host-metrics.spec.ts`); a real host's levels.
 - **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/015 — A misconfigured deck's threshold warnings reach the daemon's log once per distinct set, not once per sample.
+- **Layer:** unit (`thresholds_and_warnings` and `newly_raised` in `src/host_metrics.rs`, which `configured_thresholds` composes around `DashboardConfig::load_bounded_reporting`).
+- **Agent:** none.
+- **Asserts:** the loader's own warning (a `host_metrics` that is not a table) is carried beside the thresholds' warnings; a set read several times in a row is reported once; a changed set is reported again, and so is a set that returns after a read with no warnings (PR #1672 review).
+- **Does not assert:** the loader's warnings themselves (the `config.rs` unit test `a_reporting_bounded_load_returns_its_warnings_instead_of_logging_them`); the `tracing` output.
+- **Platform coverage:** mac+linux+windows.
 
 #### protocol/live-target
 
@@ -3630,7 +3644,7 @@ without depending on the config struct API.
 ##### keybindings/letters/002 — A plain letter performs its command in command mode and is typed into the pane in pane mode.
 - **Layer:** L1 (in-process production key mapper, `key_action_for_mode`).
 - **Agent:** none.
-- **Asserts:** in `UiMode::Normal`, plain `d`, `t`, `w`, `z` and `e` resolve to `DetachToNormal`, `ToggleLayout`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `toggle_layout` is remapped, `t` resolves nothing.
+- **Asserts:** in `UiMode::Normal`, plain `d`, `t`, `w`, `z` and `e` resolve to `DetachToNormal`, `ToggleLayout`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `toggle_layout` is remapped, `t` resolves nothing; in every `UiMode` other than `Normal` (a compile-time-exhaustive list), plain `d`, `t`, `w`, `z`, `e` and `n` resolve no global command — nothing, or in `PaneInput` the letter's own byte.
 - **Does not assert:** the tab and experimental-flag scoping applied at the live call site (the same scoping as the chords, covered by `orchestration/lock/001` and `orchestration/layout/005`, `/007`); `n` (covered by `keybindings/letters/003`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -3640,6 +3654,13 @@ without depending on the config struct API.
 - **Asserts:** with the selected card in `WaitingForInput`, `n` sends a deny; with it working, idle or unknown, or with no card, `n` returns `NewPane`; with `deny_permission` moved to another key, `n` is a new agent even on a waiting card; with `new_pane` remapped, `n` does nothing on an idle card.
 - **Does not assert:** the new-agent flow that follows (covered by its own tests).
 - **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/004 — Through the live loop, a plain `t` toggles the layout in command mode and reaches the pane's program in a pane.
+- **Layer:** L2 (PTY + vt100, the real binary and daemon; a restored pane running `cat` as the stand-in program).
+- **Agent:** none.
+- **Asserts:** with the pane focused, `tz` and Enter are echoed back by `cat` (the line shows twice) and no `Layout:` status appears; after `Ctrl+D`, a plain `t` produces the `Layout:` status the `Ctrl+t` toggle does (PR #1672 review).
+- **Does not assert:** the other letters through the live loop (their resolution is `keybindings/letters/002`); `n` on a waiting card (`keybindings/letters/003`); what the toggled layout looks like (`render/layout/001`).
+- **Platform coverage:** mac+linux.
 
 #### keybindings/unbind
 

@@ -337,3 +337,73 @@ fn dashboard_host_metrics_010_values_are_coloured_by_their_level_with_words() {
     assert_eq!(value_colour("Working root", "Working root"), Color::Reset);
     insta::assert_snapshot!(rendered);
 }
+
+/// Scenario: Open the host overlay on a terminal 60 columns wide, then on one
+/// 34 wide, with a critical disk, a warning disk and a warning load. A row too
+/// long for the overlay puts its `(critical)` or `(warning)` on the line below
+/// its figures, so the word is still shown in full on both widths, in the
+/// level's colour; a row that fits keeps the word beside its figures.
+#[spec("dashboard/host-metrics/011")]
+#[test]
+fn dashboard_host_metrics_011_level_words_survive_a_narrow_terminal() {
+    use ratatui::style::Color;
+    let gib = 1024_u64.pow(3);
+    let report = HostMetricsReport::Available(
+        serde_json::from_value(json!({
+            "disks": [
+                {"role": "working_root", "free_bytes": 4 * gib, "total_bytes": 100 * gib, "level": "critical"},
+                {"role": "worktree_parent", "free_bytes": 10 * gib, "total_bytes": 100 * gib, "level": "warn"},
+                {"role": "temp_root", "free_bytes": 50 * gib, "total_bytes": 100 * gib, "level": "ok"}
+            ],
+            "load_per_cpu": 1.0,
+            "cpu_count": 4,
+            "load_level": "warn",
+            "memory_used_bytes": 8 * gib,
+            "memory_available_bytes": 8 * gib,
+            "memory_level": "ok",
+            "sampled_at_ms": 1_700_000_000_000_u64,
+            "sample_age_ms": 10
+        }))
+        .expect("a judged daemon sample"),
+    );
+    for width in [60, 34] {
+        let buffer = render_host_metrics_overlay_to_buffer(&report, width, 32);
+        let rendered = text(&buffer);
+        assert_eq!(
+            rendered.matches("(critical)").count(),
+            1,
+            "{width} wide\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("(warning)").count(),
+            2,
+            "{width} wide\n{rendered}"
+        );
+        assert!(rendered.contains("Sample age"), "{width} wide\n{rendered}");
+        let area = buffer.area();
+        let colour_of = |word: &str| {
+            for y in area.y..area.bottom() {
+                let row: String = (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if let Some(at) = row.find(word) {
+                    let x = area.x + row[..at].chars().count() as u16;
+                    return buffer[(x, y)].fg;
+                }
+            }
+            panic!("no {word}\n{rendered}");
+        };
+        assert_eq!(colour_of("(critical)"), Color::Red, "{width} wide");
+        assert_eq!(colour_of("(warning)"), Color::Yellow, "{width} wide");
+        if width == 60 {
+            let disk = rendered
+                .lines()
+                .position(|l| l.contains("Working root"))
+                .unwrap();
+            let next = rendered.lines().nth(disk + 1).unwrap();
+            assert!(next.contains("(critical)"), "the word is below\n{rendered}");
+            assert_line_has(&rendered, "Load per core", &["(warning)"]);
+            insta::assert_snapshot!(rendered);
+        }
+    }
+}

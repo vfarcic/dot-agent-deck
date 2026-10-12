@@ -148,7 +148,7 @@ A figure the machine cannot report reads `unknown`, never `0`.
 
 ### Warning and critical figures
 
-The deck judges each disk, its load and its available memory against its own machine's totals, and both clients colour the figure by the result: green when it is fine, yellow for a warning and red when it is critical. A warning or critical figure is also followed by the word `(warning)` or `(critical)`, so you do not need to tell the colours apart. In the desktop app the **Host** button takes the colour of the deck's worst figure and says it, for example **Host: critical**.
+The deck judges each disk, its load and its available memory against its own machine's totals, and both clients colour the figure by the result: green when it is fine, yellow (amber in the desktop app) for a warning and red when it is critical. A warning or critical figure is also followed by the word `(warning)` or `(critical)`, so you do not need to tell the colours apart. In the desktop app the **Host** button takes the colour of the deck's worst figure and says it, for example **Host: critical**.
 
 | Figure | Warning | Critical |
 |---|---|---|
@@ -170,7 +170,7 @@ load_per_core_warn = 0.8
 load_per_core_critical = 1.5
 ```
 
-Or set one from the command line, for example `dot-agent-deck config set host_metrics.disk_free_warn_percent 20`. Percentages are from 0 to 100, and loads are 0 or more. A value that is not valid is ignored and that one limit keeps its default, which the daemon's log notes; so is a critical limit that is less strict than its warning. Changes apply within a few seconds, with no restart.
+Or set one from the command line, for example `dot-agent-deck config set host_metrics.disk_free_warn_percent 20`. Percentages are from 0 to 100, and loads are 0 or more. A value that is not valid is ignored and that one limit keeps its default, which the daemon's log notes. A critical limit that is less strict than its warning resets both limits of that pair to their defaults, which the log also notes; `config set` refuses a value that would do that and names the other limit to change first. Changes apply within a few seconds, with no restart.
 
 When a deck's daemon is from a release before this feature, or runs on Windows, the overlay and the desktop popover say **Host metrics are not available from this deck** instead of showing figures. Upgrade that daemon to see them (for a remote daemon in the desktop app, see [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)).
 

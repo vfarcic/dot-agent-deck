@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Gauge } from "lucide-react";
 import type { HostMetricsReport } from "../types";
 import { formatDisk, formatGib, formatLoad, formatSampleAge, HOST_BUTTON_TEXT, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
@@ -67,11 +67,14 @@ export function HostMetricsPanel({ report }: { report: HostMetricsReport }) {
   );
 }
 
+/** The gap the host popover keeps from each side of the window. */
+const POPOVER_VIEWPORT_MARGIN = 12;
+
 /**
  * PRD #1258 — the deck header's host button, beside the deck's name. It is
  * coloured by the worst level among the deck's readings (neutral when none
  * carries one), names that state in words in its accessible name and tooltip,
- * and opens {@link HostMetricsPanel} in a popover that Escape and a press
+ * and discloses {@link HostMetricsPanel} in a popover that Escape and a press
  * anywhere else close. A deck whose daemon does not report its host opens the
  * same popover saying so.
  */
@@ -85,9 +88,14 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
   const word = level === "warn" || level === "critical" ? state : undefined;
 
   /*
-    Dismissed the way the dashboard's Filter menu is: a press anywhere outside
-    this root, bound only while open; and Escape from anywhere, which also hands
-    focus back to the button so a keyboard user is not left on the page body.
+    Dismissed the way the dashboard's Columns picker is: a press, or an Escape,
+    raised anywhere OUTSIDE this root closes it, bound only while open and in
+    the capture phase so a sibling that stops Escape cannot keep it open. That
+    outside Escape is deliberately NOT stopped and focus is NOT moved: focus is
+    somewhere else — the command palette, an agent's terminal — and that press
+    is theirs. An Escape raised INSIDE the root is the root's own `onKeyDown`
+    below, which closes, stops the key so the app-wide Escape does not act on
+    it too, and hands focus back to the button.
   */
   useEffect(() => {
     if (!open) return;
@@ -97,9 +105,7 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
     };
     const dismissOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      event.stopPropagation();
-      setOpen(false);
-      button.current?.focus();
+      dismiss(event);
     };
     document.addEventListener("pointerdown", dismiss);
     document.addEventListener("keydown", dismissOnEscape, true);
@@ -109,8 +115,41 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
     };
   }, [open]);
 
+  /*
+    Kept inside the window: the popover hangs from the button's left edge, and
+    a button far to the right — a narrow window, a long deck name — would push
+    it past the right edge and give the page a horizontal scrollbar. Measured
+    after layout and shifted left by exactly the overflow, never past the left
+    margin; its CSS width already never exceeds the viewport less both margins.
+  */
+  const popover = useRef<HTMLDivElement>(null);
+  const [shift, setShift] = useState(0);
+  useLayoutEffect(() => {
+    if (!open) {
+      setShift(0);
+      return;
+    }
+    const element = popover.current;
+    const anchor = root.current;
+    if (!element || !anchor) return;
+    const margin = POPOVER_VIEWPORT_MARGIN;
+    const anchorLeft = anchor.getBoundingClientRect().left;
+    const width = element.getBoundingClientRect().width;
+    const overflow = anchorLeft + width - (window.innerWidth - margin);
+    setShift(overflow > 0 ? Math.min(overflow, Math.max(0, anchorLeft - margin)) : 0);
+  }, [open]);
+
   return (
-    <div className="host-metrics-anchor" ref={root}>
+    <div
+      className="host-metrics-anchor"
+      ref={root}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !open) return;
+        event.stopPropagation();
+        setOpen(false);
+        button.current?.focus();
+      }}
+    >
       <button
         ref={button}
         type="button"
@@ -118,7 +157,6 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
         data-testid="host-metrics-button"
         data-level={level ?? ""}
         aria-expanded={open}
-        aria-haspopup="dialog"
         aria-controls={open ? popoverId : undefined}
         aria-label={`${HOST_TITLE}, ${deckLabel}${state ? `: ${state}` : ""}`}
         title={`${HOST_TITLE}${state ? `: ${state}` : ""}`}
@@ -128,7 +166,14 @@ export function HostMetricsButton({ report, deckLabel }: { report: HostMetricsRe
         <span>{word ? `${HOST_BUTTON_TEXT}: ${word}` : HOST_BUTTON_TEXT}</span>
       </button>
       {open && (
-        <div className="host-metrics-popover" id={popoverId} role="dialog" aria-label={`${HOST_TITLE}, ${deckLabel}`} data-testid="host-metrics-popover">
+        <div
+          ref={popover}
+          className="host-metrics-popover"
+          id={popoverId}
+          aria-label={`${HOST_TITLE}, ${deckLabel}`}
+          data-testid="host-metrics-popover"
+          style={shift > 0 ? { left: -shift } : undefined}
+        >
           <HostMetricsPanel report={report} />
         </div>
       )}

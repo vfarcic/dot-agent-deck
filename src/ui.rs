@@ -20305,8 +20305,18 @@ fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option
 /// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
 /// says `unknown`; nothing absent is ever drawn as zero. `held` is how long the
 /// TUI has held the answer, added to its sample age.
-fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<Line<'static>> {
+///
+/// `width` is the body's width in columns. A judged row that does not fit it
+/// gives its level word a line of its own below the value, so a narrow
+/// terminal cuts the figures' tail rather than the word — the signal that does
+/// not depend on colour (PR #1672 review).
+fn host_metrics_lines(
+    view: &HostMetricsView,
+    held: std::time::Duration,
+    width: u16,
+) -> Vec<Line<'static>> {
     use crate::daemon_client::HostMetricsReport;
+    use unicode_width::UnicodeWidthStr;
     const UNKNOWN: &str = "unknown";
     let row = |label: &str, value: String| {
         Line::from(format!(
@@ -20317,23 +20327,42 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
     // PRD #1258: a reading the daemon judged carries its level's colour, and a
     // non-ok one its word as well, so the colour is never the only signal. No
     // level — an older daemon, or an absent number — leaves the value plain.
-    let judged =
-        |label: &str, value: String, level: Option<crate::daemon_protocol::HealthLevel>| {
-            let Some(level) = level else {
-                return row(label, value);
-            };
-            let word = host_metrics_level_word(level).map_or_else(String::new, |w| format!(" {w}"));
-            Line::from(vec![
-                Span::raw(format!(
-                    "  {label:<width$} ",
-                    width = HOST_METRICS_LABEL_WIDTH
-                )),
-                Span::styled(
-                    format!("{value}{word}"),
-                    Style::default().fg(palette::health_color(level)),
-                ),
-            ])
+    let judged = |label: &str,
+                  value: String,
+                  level: Option<crate::daemon_protocol::HealthLevel>|
+     -> Vec<Line<'static>> {
+        let Some(level) = level else {
+            return vec![row(label, value)];
         };
+        let style = Style::default().fg(palette::health_color(level));
+        let prefix = format!("  {label:<width$} ", width = HOST_METRICS_LABEL_WIDTH);
+        let Some(word) = host_metrics_level_word(level) else {
+            return vec![Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(value, style),
+            ])];
+        };
+        let fits = prefix.width() + value.width() + 1 + word.width() <= usize::from(width);
+        if fits {
+            return vec![Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(format!("{value} {word}"), style),
+            ])];
+        }
+        // Under the value when the word fits there, else at the body's indent.
+        let indent = if prefix.width() + word.width() <= usize::from(width) {
+            prefix.width()
+        } else {
+            2
+        };
+        vec![
+            Line::from(vec![Span::raw(prefix), Span::styled(value, style)]),
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(word.to_string(), style),
+            ]),
+        ]
+    };
     let mut lines = vec![Line::styled(
         "  Host of this deck",
         Style::default()
@@ -20374,7 +20403,7 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
                 .iter()
                 .take(crate::daemon_protocol::MAX_DISK_ROLES)
             {
-                lines.push(judged(
+                lines.extend(judged(
                     &host_metrics_role_label(&disk.role),
                     format!(
                         "{} free of {} total",
@@ -20394,13 +20423,13 @@ fn host_metrics_lines(view: &HostMetricsView, held: std::time::Duration) -> Vec<
             let cores = metrics
                 .cpu_count
                 .map_or_else(|| format!("{UNKNOWN} cores"), |n| format!("{n} cores"));
-            lines.push(judged(
+            lines.extend(judged(
                 "Load per core",
                 format!("{load} across {cores}"),
                 metrics.load_level,
             ));
             lines.push(row("Memory used", gib(metrics.memory_used_bytes)));
-            lines.push(judged(
+            lines.extend(judged(
                 "Memory available",
                 gib(metrics.memory_available_bytes),
                 metrics.memory_level,
@@ -20424,10 +20453,10 @@ fn render_host_metrics_overlay(
     view: &HostMetricsView,
     held: std::time::Duration,
 ) -> Vec<(Action, Rect)> {
-    let lines = host_metrics_lines(view, held);
     let area = frame.area();
     // Wide enough for a disk row with its level word (PRD #1258).
     let popup_width = 72u16.min(area.width.saturating_sub(2));
+    let lines = host_metrics_lines(view, held, popup_width.saturating_sub(2));
     // Body, then a blank row, the button row and the hint: plus the border.
     // Counted in `usize` and clamped before narrowing, so no line count can
     // overflow the `u16` (audit A2).

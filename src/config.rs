@@ -163,8 +163,9 @@ pub struct DashboardConfig {
     /// defaults). Kept as written, and validated per value where it is read, so
     /// one bad value falls back to its own default with a warning instead of
     /// failing the whole file, and a `config set` of another key writes the
-    /// table back unchanged. A `host_metrics` that is not a table is dropped
-    /// with a warning, likewise without failing the file.
+    /// table back unchanged. A `host_metrics` that is not a table reads as
+    /// empty, likewise without failing the file; the daemon's read
+    /// ([`DashboardConfig::load_bounded_reporting`]) reports it as a warning.
     #[serde(
         skip_serializing_if = "toml::Table::is_empty",
         deserialize_with = "deserialize_host_metrics_table"
@@ -173,21 +174,26 @@ pub struct DashboardConfig {
 }
 
 /// [`DashboardConfig::host_metrics`]'s lenient read: a table is kept as it is,
-/// anything else warns and reads as empty, so it never fails the whole config.
+/// anything else reads as empty, so it never fails the whole config. Silent:
+/// the warning is [`host_metrics_not_a_table`], raised by
+/// [`DashboardConfig::load_bounded_reporting`], which hands it to its caller
+/// rather than logging it on every read.
 fn deserialize_host_metrics_table<'de, D>(deserializer: D) -> Result<toml::Table, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     Ok(match toml::Value::deserialize(deserializer)? {
         toml::Value::Table(table) => table,
-        other => {
-            tracing::warn!(
-                "host_metrics in config.toml is a {}, not a table; using the default thresholds",
-                other.type_str()
-            );
-            toml::Table::new()
-        }
+        _ => toml::Table::new(),
     })
+}
+
+/// The warning for a `host_metrics` in `config.toml` that is not a table.
+fn host_metrics_not_a_table(value: &toml::Value) -> String {
+    format!(
+        "host_metrics in config.toml is a {}, not a table; using the default thresholds",
+        value.type_str()
+    )
 }
 
 impl Default for DashboardConfig {
@@ -248,22 +254,62 @@ impl DashboardConfig {
     }
 
     fn load_bounded_from(path: &Path) -> Self {
-        match read_dashboard_config_bounded(path) {
-            Ok(None) => Self::default(),
-            Ok(Some(contents)) => toml::from_str(&contents).unwrap_or_else(|_| {
-                tracing::warn!(
+        let (config, warnings) = Self::load_bounded_reporting_from(path);
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        config
+    }
+
+    /// [`Self::load_bounded`], returning its warnings instead of logging them,
+    /// for a caller that reads the file repeatedly and logs each distinct
+    /// warning once (PRD #1258: the host sampler reads its thresholds on every
+    /// sample). The warnings are a file the reader could not read, a file that
+    /// is not valid TOML or does not fit the config's shape — each of which
+    /// yields [`Self::default`] — and a `host_metrics` that is not a table,
+    /// which reads as empty while the rest of the file is kept.
+    pub fn load_bounded_reporting() -> (Self, Vec<String>) {
+        Self::load_bounded_reporting_from(&config_path())
+    }
+
+    fn load_bounded_reporting_from(path: &Path) -> (Self, Vec<String>) {
+        let contents = match read_dashboard_config_bounded(path) {
+            Ok(None) => return (Self::default(), Vec::new()),
+            Ok(Some(contents)) => contents,
+            Err(reason) => {
+                return (
+                    Self::default(),
+                    vec![format!(
+                        "config at {} not read ({reason}); using the defaults",
+                        path.display()
+                    )],
+                );
+            }
+        };
+        let Ok(mut table) = contents.parse::<toml::Table>() else {
+            return (
+                Self::default(),
+                vec![format!(
                     "invalid config at {}: malformed TOML; using the defaults",
                     path.display()
-                );
-                Self::default()
-            }),
-            Err(reason) => {
-                tracing::warn!(
-                    "config at {} not read ({reason}); using the defaults",
+                )],
+            );
+        };
+        let mut warnings = Vec::new();
+        if let Some(value) = table.get("host_metrics").filter(|v| !v.is_table()) {
+            warnings.push(host_metrics_not_a_table(value));
+            table.remove("host_metrics");
+        }
+        match toml::Value::Table(table).try_into() {
+            Ok(config) => (config, warnings),
+            // The error's `Display` is not used: it can quote the file.
+            Err(_) => (
+                Self::default(),
+                vec![format!(
+                    "invalid config at {}: a setting has the wrong type; using the defaults",
                     path.display()
-                );
-                Self::default()
-            }
+                )],
+            ),
         }
     }
 
@@ -363,6 +409,23 @@ impl DashboardConfig {
                     } else {
                         toml::Value::Float(number)
                     };
+                    // Refused, too, when it would invert its pair: the deck
+                    // would ignore it, and both of the pair, until fixed.
+                    let mut candidate = self.host_metrics.clone();
+                    candidate.insert(name.to_string(), stored.clone());
+                    let (effective, _) =
+                        crate::host_metrics::HealthThresholds::from_table(&candidate);
+                    if effective.value(name) != number {
+                        let other =
+                            crate::host_metrics::HealthThresholds::paired_key(name).unwrap_or(name);
+                        let other_value = threshold_as_read(&candidate, other);
+                        return Err(format!(
+                            "Invalid {key}: {value} with host_metrics.{other} = {other_value} \
+                             would make the critical limit less strict than the warning, and \
+                             the deck would use the defaults for both. Change \
+                             host_metrics.{other} first."
+                        ));
+                    }
                     self.host_metrics.insert(name.to_string(), stored);
                     Ok(())
                 }
@@ -370,6 +433,22 @@ impl DashboardConfig {
             },
         }
     }
+}
+
+/// The threshold `name` as [`crate::host_metrics::HealthThresholds::from_table`]
+/// reads it from `table` before checking its pair: the written number when it
+/// is one in range, else its default.
+fn threshold_as_read(table: &toml::Table, name: &str) -> f64 {
+    use crate::host_metrics::HealthThresholds;
+    table
+        .get(name)
+        .and_then(|value| match value {
+            toml::Value::Integer(n) => Some(*n as f64),
+            toml::Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .filter(|n| HealthThresholds::in_range(name, *n))
+        .unwrap_or_else(|| HealthThresholds::default().value(name))
 }
 
 /// The threshold name in a `host_metrics.<name>` config key, when it is one.
@@ -1761,6 +1840,57 @@ mod tests {
     use super::*;
     use spec::spec;
 
+    /// PRD #1258 (PR #1672 review): the reporting read hands back every warning
+    /// the plain bounded read would log — so the host sampler, which reads on
+    /// every sample, can log each one once — and still keeps the rest of a file
+    /// whose `host_metrics` is not a table.
+    #[test]
+    fn a_reporting_bounded_load_returns_its_warnings_instead_of_logging_them() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert_eq!((config.default_command.as_str(), warnings.len()), ("", 0));
+
+        std::fs::write(
+            &path,
+            "default_command = \"claude\"\n[host_metrics]\nload_per_core_warn = 1\n",
+        )
+        .unwrap();
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.default_command, "claude");
+        assert!(config.host_metrics.contains_key("load_per_core_warn"));
+
+        std::fs::write(&path, "default_command = \"claude\"\nhost_metrics = 5\n").unwrap();
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert_eq!(
+            config.default_command, "claude",
+            "the rest of the file survives"
+        );
+        assert!(config.host_metrics.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not a table"), "{warnings:?}");
+
+        for (contents, says) in [
+            ("default_command = [unclosed\n", "malformed TOML"),
+            ("bell = 5\n", "wrong type"),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+            assert_eq!(config.default_command, "", "{contents}: the defaults");
+            assert_eq!(warnings.len(), 1, "{contents}: {warnings:?}");
+            assert!(warnings[0].contains(says), "{contents}: {warnings:?}");
+            assert!(
+                !warnings[0].contains("unclosed"),
+                "no file content is quoted"
+            );
+        }
+
+        let (_, warnings) = DashboardConfig::load_bounded_reporting_from(dir.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not read"), "{warnings:?}");
+    }
+
     /// PRD #1223 audit A4: the daemon's bounded read of `config.toml` answers
     /// what `load` answers for an ordinary file — including one reached through
     /// a symlink — and falls back to the defaults for no file at all.
@@ -2504,8 +2634,10 @@ timeout_secs = 600
     /// PRD #1258: the `[host_metrics]` thresholds are kept as written, so a
     /// bad value never fails the rest of `config.toml` and a `config set` of
     /// another key writes them back unchanged; `config set` refuses a value
-    /// out of range, `config get` reports the threshold in effect, and a
-    /// `host_metrics` that is not a table is dropped without failing the file.
+    /// out of range or one that would make its pair's critical limit less
+    /// strict than its warning, `config get` reports the threshold in effect,
+    /// and a `host_metrics` that is not a table is dropped without failing the
+    /// file.
     #[test]
     fn host_metrics_thresholds_round_trip_and_are_validated_by_config_set() {
         let dc: DashboardConfig = toml::from_str(
@@ -2565,6 +2697,36 @@ timeout_secs = 600
         }
         assert!(dc.set_field("host_metrics.typo", "1").is_err());
         assert!(dc.get_field("host_metrics.typo").is_err());
+
+        // PR #1672 review: a value that would invert its pair is refused,
+        // naming the other limit, rather than written and then ignored.
+        let mut dc = DashboardConfig::default();
+        let err = dc
+            .set_field("host_metrics.disk_free_warn_percent", "3")
+            .unwrap_err();
+        assert!(
+            err.contains("host_metrics.disk_free_critical_percent = 5") && err.contains("first"),
+            "{err}"
+        );
+        assert!(dc.host_metrics.is_empty(), "nothing was written");
+        dc.set_field("host_metrics.disk_free_critical_percent", "2")
+            .unwrap();
+        dc.set_field("host_metrics.disk_free_warn_percent", "3")
+            .unwrap();
+        let err = dc
+            .set_field("host_metrics.load_per_core_critical", "0.5")
+            .unwrap_err();
+        assert!(
+            err.contains("host_metrics.load_per_core_warn = 0.8"),
+            "{err}"
+        );
+        dc.set_field("host_metrics.load_per_core_warn", "1.5")
+            .unwrap();
+        assert_eq!(
+            dc.get_field("host_metrics.load_per_core_warn").unwrap(),
+            "1.5",
+            "equal limits are allowed"
+        );
         for key in crate::host_metrics::HEALTH_THRESHOLD_KEYS {
             let full = format!("host_metrics.{key}");
             assert!(

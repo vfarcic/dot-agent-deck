@@ -58,7 +58,7 @@ In command mode you can drop the `Ctrl`: the letter alone does the same thing as
 
 `l` stays **next tab**, so the orchestration split keeps only `Ctrl+L`, and there is no plain `c`: quitting is always `Ctrl+C`. While you are typing in a pane, every letter goes to the program as before.
 
-A letter works only while its action is on its default `Ctrl+` key and no other action uses that letter. If you [remap](#customizing-keybindings) `new_pane`, `n` no longer starts an agent, and if you bind `d` to another action, `d` does that action instead. `?` and the bottom bar show the letters that work for you, for example `n / Ctrl+n`.
+A letter works only while its action is on its default `Ctrl+` key and no other action uses that letter. If you [remap](#customizing-keybindings) `new_pane`, `n` no longer starts an agent, and if you bind `d` to another action, `d` does that action instead. The help overlay (`?`) lists `d`, `n`, `w`, `t` and `z` beside their chords, for example `n / Ctrl+n`, and the bottom bar shows `d`, `n`, `w` and `t`; each drops a letter that a remap has taken away. `e` is listed in neither. The bar's `n/Ctrl+N` stays on **New Agent** even while the selected card shows **Needs Input**, where `n` denies instead.
 
 ### `Ctrl+W` closes only from command mode
 

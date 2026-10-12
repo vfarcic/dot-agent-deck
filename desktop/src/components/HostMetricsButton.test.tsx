@@ -45,7 +45,7 @@ describe("HostMetricsButton", () => {
     expect(button.getAttribute("aria-label")).toBe("Host of this deck, Local daemon");
   });
 
-  /** Scenario: the button opens the popover with the coloured, worded values; Escape closes it and returns focus to the button; a press inside keeps it open and a press outside closes it. */
+  /** Scenario: the button opens a disclosure popover with the coloured, worded values; Escape inside it closes it and returns focus to the button; a press inside keeps it open and a press outside closes it. */
   it("opens a popover that Escape and an outside press close", () => {
     render(<div><HostMetricsButton report={report({ disk: "critical" })} deckLabel="Local daemon" /><p data-testid="outside">elsewhere</p></div>);
     const button = screen.getByTestId("host-metrics-button");
@@ -53,12 +53,14 @@ describe("HostMetricsButton", () => {
     fireEvent.click(button);
     expect(button.getAttribute("aria-expanded")).toBe("true");
     const popover = screen.getByTestId("host-metrics-popover");
-    expect(popover.getAttribute("role")).toBe("dialog");
+    expect(popover.getAttribute("role")).toBeNull();
+    expect(button.getAttribute("aria-haspopup")).toBeNull();
+    expect(button.getAttribute("aria-controls")).toBe(popover.id);
     const disk = popover.querySelector(".host-metrics-row dd");
     expect(disk?.className).toBe("host-level-critical");
     expect(disk?.textContent).toBe("4 GiB free of 100 GiB total (critical)");
 
-    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.keyDown(screen.getByTestId("host-metrics"), { key: "Escape" });
     expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
     expect(document.activeElement).toBe(button);
 
@@ -67,6 +69,43 @@ describe("HostMetricsButton", () => {
     expect(screen.getByTestId("host-metrics-popover")).toBeTruthy();
     fireEvent.pointerDown(screen.getByTestId("outside"));
     expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+  });
+
+  /** Scenario: with the popover open and focus elsewhere — the palette, a terminal — an Escape raised there closes the popover but still reaches a window listener and leaves focus where it was. */
+  it("lets an Escape raised outside the popover through", () => {
+    render(<div><HostMetricsButton report={report({ disk: "warn" })} deckLabel="Local daemon" /><input data-testid="outside" /></div>);
+    const button = screen.getByTestId("host-metrics-button");
+    const outside = screen.getByTestId("outside");
+    const reached: string[] = [];
+    const listener = (event: KeyboardEvent) => reached.push(event.key);
+    window.addEventListener("keydown", listener);
+    try {
+      fireEvent.click(button);
+      expect(screen.getByTestId("host-metrics-popover")).toBeTruthy();
+      outside.focus();
+      fireEvent.keyDown(outside, { key: "Escape" });
+      expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+      expect(reached).toEqual(["Escape"]);
+      expect(document.activeElement).toBe(outside);
+    } finally {
+      window.removeEventListener("keydown", listener);
+    }
+  });
+
+  /** Scenario: an Escape raised inside the open popover does not reach a window listener, so the app-wide Escape does not also act on it. */
+  it("keeps an Escape raised inside the popover to itself", () => {
+    render(<HostMetricsButton report={report({ disk: "warn" })} deckLabel="Local daemon" />);
+    const reached: string[] = [];
+    const listener = (event: KeyboardEvent) => reached.push(event.key);
+    window.addEventListener("keydown", listener);
+    try {
+      fireEvent.click(screen.getByTestId("host-metrics-button"));
+      fireEvent.keyDown(screen.getByTestId("host-metrics"), { key: "Escape" });
+      expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+      expect(reached).toEqual([]);
+    } finally {
+      window.removeEventListener("keydown", listener);
+    }
   });
 
   /** Scenario: a deck whose daemon does not report its host gets a neutral button that says so, and its popover gives the same not-available sentences as the TUI. */

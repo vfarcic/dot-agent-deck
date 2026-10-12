@@ -302,3 +302,41 @@ fn scheduler_001_lowercase_s_opens_manager() {
     deck.wait_for_string("kbsopen");
     drop(dir);
 }
+
+/// Scenario: Launch the deck with a restored pane running `cat`, which opens
+/// focused, and type `tz` and Enter into it: `cat` echoes `tz` back and the
+/// layout does not change. Press `Ctrl+D` for command mode, then a plain `t`:
+/// the layout toggles and the bar says `Layout:`, as `Ctrl+t` would.
+#[spec("keybindings/letters/004")]
+#[test]
+fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("lp", "cat")
+        .launch_with_fixture("minimal");
+    // The restored pane opens focused: keys go to `cat`.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // In the pane, `t` and `z` are the program's: the tty echoes the line as
+    // typed and `cat` prints it back, so it shows twice, and neither letter
+    // toggles the layout or zooms.
+    deck.send_bytes(b"tz\r");
+    deck.wait_until_grid("cat echoed the typed letters", |g| {
+        // A row of the pane is its text between the pane's `│` borders.
+        g.lines()
+            .filter(|line| line.split('│').any(|cell| cell.trim() == "tz"))
+            .count()
+            >= 2
+    });
+    assert!(
+        !deck.snapshot_grid().contains("Layout:"),
+        "a `t` typed into the pane toggled the layout\n{}",
+        deck.snapshot_grid()
+    );
+
+    // In command mode the same plain `t` is the layout toggle.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+    deck.send_bytes(b"t");
+    deck.wait_for_string("Layout:");
+}

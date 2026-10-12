@@ -376,7 +376,8 @@ fn letters_001_each_default_ctrl_action_has_its_plain_letter() {
 /// Scenario: Press plain `d`, `t`, `w`, `z` and `e` in command mode and in a
 /// pane, through the same key resolution the live deck uses. In command mode
 /// each performs its `Ctrl+` chord's command; in a pane each letter is typed
-/// into the agent unchanged. Shift and Alt forms of a letter are not aliases.
+/// into the agent unchanged. Shift and Alt forms of a letter are not aliases,
+/// and in every other mode no plain `d t w z e n` is a global command.
 #[spec("keybindings/letters/002")]
 #[test]
 fn letters_002_plain_letters_act_in_command_mode_and_type_in_a_pane() {
@@ -420,4 +421,63 @@ fn letters_002_plain_letters_act_in_command_mode_and_type_in_a_pane() {
         KeybindingConfig::from_toml_str("[global]\ntoggle_layout = \"F6\"\n").unwrap();
     let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
     assert!(key_action_for_mode(&remapped, UiMode::Normal, &t).is_none());
+
+    // In every other mode no plain letter is a global command: each is left
+    // to that mode's own handler (a text field, a dialog), or, in a pane,
+    // typed into the program (PR #1672 review).
+    for mode in EVERY_UI_MODE.into_iter().filter(|m| *m != UiMode::Normal) {
+        for ch in ['d', 't', 'w', 'z', 'e', 'n'] {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            match key_action_for_mode(&config, mode, &key) {
+                None => {}
+                Some(UiAction::ForwardToPane(bytes)) if mode == UiMode::PaneInput => {
+                    assert_eq!(bytes, vec![ch as u8], "{mode:?}: {ch}")
+                }
+                other => panic!("{mode:?}: plain {ch} resolved {other:?}"),
+            }
+        }
+    }
+}
+
+/// Every [`UiMode`]. [`every_ui_mode_is_listed`] stops a new mode from being
+/// left out of it silently.
+const EVERY_UI_MODE: [UiMode; 15] = [
+    UiMode::Normal,
+    UiMode::Filter,
+    UiMode::Help,
+    UiMode::Rename,
+    UiMode::DirPicker,
+    UiMode::NewPaneForm,
+    UiMode::PaneInput,
+    UiMode::StarPrompt,
+    UiMode::ConfigGenPrompt,
+    UiMode::QuitConfirm,
+    UiMode::StopConfirm,
+    UiMode::ScheduledTasks,
+    UiMode::CloseConfirm,
+    UiMode::HostMetrics,
+    UiMode::Upgrade,
+];
+
+/// Fails to compile when `UiMode` gains a variant, so [`EVERY_UI_MODE`] is
+/// updated with it.
+#[allow(dead_code)]
+fn every_ui_mode_is_listed(mode: UiMode) {
+    match mode {
+        UiMode::Normal
+        | UiMode::Filter
+        | UiMode::Help
+        | UiMode::Rename
+        | UiMode::DirPicker
+        | UiMode::NewPaneForm
+        | UiMode::PaneInput
+        | UiMode::StarPrompt
+        | UiMode::ConfigGenPrompt
+        | UiMode::QuitConfirm
+        | UiMode::StopConfirm
+        | UiMode::ScheduledTasks
+        | UiMode::CloseConfirm
+        | UiMode::HostMetrics
+        | UiMode::Upgrade => {}
+    }
 }

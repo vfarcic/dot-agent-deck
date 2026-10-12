@@ -270,3 +270,21 @@ test("the host popover opens from the keyboard and closes on Escape and on an ou
   await page.mouse.click(5, 990);
   await expect(localCard.getByTestId("host-metrics-popover")).toHaveCount(0);
 });
+
+/** Scenario: In a narrow window, open each deck's host popover; it stays inside the window on both sides and opening it adds no horizontal scrolling to the page. */
+test("the host popover stays inside a narrow window", async ({ page }) => {
+  const { localCard, remoteCard } = await overview(page, judged(), available(true));
+  await page.setViewportSize({ width: 480, height: 900 });
+  const scrollWidth = () => page.evaluate(() => document.documentElement.scrollWidth);
+  for (const card of [localCard, remoteCard]) {
+    const before = await scrollWidth();
+    await openHost(card);
+    const box = await card.getByTestId("host-metrics-popover").boundingBox();
+    if (!box) throw new Error("the popover has no box");
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(480);
+    expect(await scrollWidth()).toBeLessThanOrEqual(before);
+    await page.keyboard.press("Escape");
+    await expect(card.getByTestId("host-metrics-popover")).toHaveCount(0);
+  }
+});

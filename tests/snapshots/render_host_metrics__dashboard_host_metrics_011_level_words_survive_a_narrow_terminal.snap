@@ -1,0 +1,28 @@
+---
+source: tests/render_host_metrics.rs
+expression: rendered
+---
+
+
+
+
+
+
+
+ ┌ Host ──────────────────────────────────────────────────┐
+ │  Host of this deck                                     │
+ │  The machine this deck's daemon runs on                │
+ │                                                        │
+ │  Working root       4 GiB free of 100 GiB total        │
+ │                     (critical)                         │
+ │  Worktree parent    10 GiB free of 100 GiB total       │
+ │                     (warning)                          │
+ │  Temp root          50 GiB free of 100 GiB total       │
+ │  Load per core      1.00 across 4 cores (warning)      │
+ │  Memory used        8 GiB                              │
+ │  Memory available   8 GiB                              │
+ │  Sample age         10 ms                              │
+ │                                                        │
+ │  [Close]                                               │
+ │  Press Esc to close                                    │
+ └────────────────────────────────────────────────────────┘

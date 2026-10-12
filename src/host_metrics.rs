@@ -446,6 +446,14 @@ impl HealthThresholds {
         (thresholds, warnings)
     }
 
+    /// The other threshold of `key`'s warning/critical pair (both named as in
+    /// [`HEALTH_THRESHOLD_KEYS`]), or `None` for a name that is not one.
+    pub fn paired_key(key: &str) -> Option<&'static str> {
+        let index = HEALTH_THRESHOLD_KEYS.iter().position(|k| *k == key)?;
+        // The keys are listed pairwise: warn, then its critical.
+        Some(HEALTH_THRESHOLD_KEYS[index ^ 1])
+    }
+
     fn slot(&mut self, key: &str) -> Option<&mut f64> {
         Some(match key {
             "disk_free_warn_percent" => &mut self.disk_free_warn_percent,
@@ -550,21 +558,41 @@ pub fn apply_health_levels(metrics: &mut HostMetrics, thresholds: &HealthThresho
         });
 }
 
-/// This deck's thresholds, read from its `config.toml` now. A warning is logged
-/// once per distinct set of warnings, not once per sample, so an open overlay
-/// polling a misconfigured deck does not fill the log.
+/// This deck's thresholds, read from its `config.toml` now. Every warning the
+/// read raises — a file that cannot be read or parsed, a `host_metrics` that
+/// is not a table, a threshold that falls back to its default — is logged once
+/// per distinct set of warnings, not once per sample, so an open overlay
+/// polling a misconfigured deck does not fill the log. A set that changes is
+/// logged again, and so is a set that returns after the file was fixed.
 fn configured_thresholds() -> HealthThresholds {
     static LAST_WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let (thresholds, warnings) =
-        HealthThresholds::from_table(&crate::config::DashboardConfig::load_bounded().host_metrics);
-    let mut last = LAST_WARNED.lock().unwrap_or_else(|p| p.into_inner());
-    if *last != warnings {
-        for warning in &warnings {
-            tracing::warn!("{warning}");
-        }
-        *last = warnings;
+        thresholds_and_warnings(crate::config::DashboardConfig::load_bounded_reporting());
+    for warning in newly_raised(&LAST_WARNED, warnings) {
+        tracing::warn!("{warning}");
     }
     thresholds
+}
+
+/// The thresholds in `config`, and every warning reading them raised: the
+/// loader's own, then [`HealthThresholds::from_table`]'s.
+fn thresholds_and_warnings(
+    (config, mut warnings): (crate::config::DashboardConfig, Vec<String>),
+) -> (HealthThresholds, Vec<String>) {
+    let (thresholds, table_warnings) = HealthThresholds::from_table(&config.host_metrics);
+    warnings.extend(table_warnings);
+    (thresholds, warnings)
+}
+
+/// `warnings`, when they differ from the set last seen in `last` (which they
+/// then replace); nothing when they are the same set.
+fn newly_raised(last: &std::sync::Mutex<Vec<String>>, warnings: Vec<String>) -> Vec<String> {
+    let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+    if *last == warnings {
+        return Vec::new();
+    }
+    *last = warnings.clone();
+    warnings
 }
 
 /// e2e seam for the docs screenshots: with the `e2e` feature, a sample given
@@ -748,6 +776,15 @@ struct MacVmCounts {
 /// a new dependency. The port is taken once per process: each call adds a
 /// reference to the same host port, which nothing here would release.
 #[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// `<mach/mach_host.h>`: the kernel's page size. `libc` does not declare it.
+    fn host_page_size(
+        host: libc::mach_port_t,
+        out_page_size: *mut libc::vm_size_t,
+    ) -> libc::kern_return_t;
+}
+
+#[cfg(target_os = "macos")]
 fn macos_vm_counts() -> Option<MacVmCounts> {
     static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
     // SAFETY: `mach_host_self` takes no arguments and returns a send right to
@@ -772,9 +809,23 @@ fn macos_vm_counts() -> Option<MacVmCounts> {
     if rc != libc::KERN_SUCCESS {
         return None;
     }
-    // SAFETY: `vm_page_size` is the kernel-initialised page size the
-    // statistics above count in; reading it has no precondition.
-    let page_size = unsafe { libc::vm_page_size } as u64;
+    // The KERNEL's page size, which is what `host_statistics64` counts in —
+    // not `libc::vm_page_size`, which is this process's. The two differ under
+    // Rosetta: the release ships an `x86_64-apple-darwin` build, which an
+    // Apple Silicon Mac runs translated with 4 KiB process pages while the
+    // kernel counts 16 KiB ones, so `vm_page_size` would put memory used 4× low
+    // (PR #1672 review). `host_page_size` answers the kernel's
+    // (`vm_kernel_page_size` in libsyscall). Not verified on a translated
+    // process from this tree: `the_memory_is_measurable_on_macos` runs the
+    // native build.
+    let mut page_size: libc::vm_size_t = 0;
+    // SAFETY: `host` is this host's port, and `host_page_size` writes one
+    // `vm_size_t` through the pointer, which points at a live local.
+    let rc = unsafe { host_page_size(host, &mut page_size) };
+    if rc != libc::KERN_SUCCESS || page_size == 0 {
+        return None;
+    }
+    let page_size = page_size as u64;
     Some(MacVmCounts {
         page_size,
         internal: u64::from(stats.internal_page_count),
@@ -1482,6 +1533,44 @@ mod health_level_tests {
         assert_eq!(
             level_when_above(1.01, t.load_per_core_warn, t.load_per_core_critical),
             HealthLevel::Critical
+        );
+    }
+
+    /// Scenario: read a config whose `host_metrics` is not a table, then one
+    /// with an invalid threshold, each several times as the sampler does on
+    /// every sample; the loader's warning and the threshold's both reach the
+    /// log once per distinct set, a changed set is logged again, and a set
+    /// that returns after a clean read is logged again too.
+    #[spec("protocol/host-metrics/015")]
+    #[test]
+    fn protocol_host_metrics_015_config_warnings_are_logged_once_per_set() {
+        let last = std::sync::Mutex::new(Vec::new());
+        let config =
+            |text: &str| -> crate::config::DashboardConfig { toml::from_str(text).unwrap() };
+
+        let not_a_table = vec!["host_metrics is a integer, not a table".to_string()];
+        let (t, warnings) =
+            thresholds_and_warnings((config("host_metrics = 5\n"), not_a_table.clone()));
+        assert_eq!(t, HealthThresholds::default());
+        assert_eq!(warnings, not_a_table, "the loader's warning is kept");
+        assert_eq!(newly_raised(&last, warnings.clone()), not_a_table);
+        assert!(newly_raised(&last, warnings.clone()).is_empty());
+        assert!(newly_raised(&last, warnings).is_empty());
+
+        let (t, warnings) = thresholds_and_warnings((
+            config("[host_metrics]\nload_per_core_warn = \"busy\"\n"),
+            Vec::new(),
+        ));
+        assert_eq!(t.load_per_core_warn, 0.8);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(newly_raised(&last, warnings.clone()), warnings, "a new set");
+        assert!(newly_raised(&last, warnings.clone()).is_empty());
+
+        assert!(newly_raised(&last, Vec::new()).is_empty(), "a clean read");
+        assert_eq!(
+            newly_raised(&last, warnings.clone()),
+            warnings,
+            "back after a fix"
         );
     }
 }
