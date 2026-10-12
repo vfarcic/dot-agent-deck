@@ -2154,7 +2154,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (questionFormRef.current?.confirming) dropQuestion(QUESTION_ALWAYS_DECLINED);
   }, [dropQuestion]);
   /* A countdown must not survive this panel, nor voice being turned off — and
-     an answer on its way is cancelled with it (audit A8). */
+     an answer on its way is cancelled with it (audit A8). The panel is mounted
+     once, for the life of the app's window, and every dependency here is
+     stable, so this runs only as the window's page goes away: a cancel that
+     fails then has no row, and nothing else on that page, to report it on.
+     What the answer did shows on the agent's card when the window is back:
+     whether its question is still waiting. */
   useEffect(() => () => {
     stopAnswerCountdown();
     const lease = questionFormRef.current?.sending ? questionFormRef.current.lease : undefined;
@@ -2179,7 +2184,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneQuestionHidden = pane?.terminalHidden;
   useEffect(() => {
     const lost = answerLost();
-    if (lost) dropQuestion(questionLostSentence(lost));
+    /* PR #1698 review: an answer already on its way is not called off because
+       the question moved on. Its own delivery is what clears it, and that
+       snapshot can arrive before the send returns; and the daemon refuses an
+       answer to a question that moved on before it was delivered, so the
+       send's outcome is what tells the user. Cancelling here only turned a
+       delivered answer into "Too late to cancel". The other reasons are about
+       what the user is looking at, which the daemon cannot see, so they still
+       cancel it. */
+    if (!lost || (lost.code === "question" && questionFormRef.current?.sending)) return;
+    dropQuestion(questionLostSentence(lost));
   }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
 
   /**

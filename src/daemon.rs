@@ -2876,6 +2876,40 @@ pub(crate) fn deck_question_event(
     }
 }
 
+/// PRD #1631 (PR #1698 review): the event the daemon ingests after it typed
+/// part of `question`'s answer and stopped, carrying the question as it now
+/// stands — keyboard-only, at a new revision — so every attached client's
+/// fold shows what the daemon's snapshot does. An `Unknown`: the card's
+/// status is left alone, and reading mode announces nothing from it.
+pub(crate) fn deck_keyboard_only_event(
+    session_id: String,
+    agent_type: crate::event::AgentType,
+    pane_id: Option<String>,
+    agent_id: Option<String>,
+    question: &crate::question::PendingQuestion,
+) -> AgentEvent {
+    let mut event = AgentEvent {
+        session_id,
+        agent_type,
+        event_type: crate::event::EventType::Unknown,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id,
+        agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    };
+    event.set_question(question);
+    event
+}
+
 /// Issue #714: the one notice to the orchestrator of a worker whose block
 /// `epoch` was just reported, if the worker still owes a `work-done`.
 ///

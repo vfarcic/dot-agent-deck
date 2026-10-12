@@ -222,10 +222,13 @@ describe("answering an agent's question by voice", () => {
   /**
    * Scenario (question/desktop/006, audit R5): the question keeps its id but
    * the deck registers it again — a new revision — while nothing else about
-   * the pane changes. A countdown is called off at once with nothing sent, and
-   * an answer already on its way has its lease cancelled at once.
+   * the pane changes. A countdown is called off at once with nothing sent. An
+   * answer already on its way is left to the deck, which refuses an answer to
+   * a revision that is no longer pending, and the row says what the deck
+   * answered (PR #1698 review: cancelling it turned a delivered answer into
+   * "too late to cancel").
    */
-  it("question/desktop/006: the same question id at a new revision calls the answer off at once", async () => {
+  it("question/desktop/006: the same question id at a new revision calls a countdown off at once and leaves a sent answer to the deck", async () => {
     const voice = microphone();
     let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
     const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
@@ -247,12 +250,15 @@ describe("answering an agent's question by voice", () => {
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
     const lease = sendVoiceAnswer.mock.calls[0][3];
+    expect(lease).toBeTruthy();
     view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane({ ...PERMISSION, revision: 9 })} selectedDeckId="local" />);
     await flush();
-    expect(cancelVoiceAnswer).toHaveBeenCalledWith(lease);
-    expect(screen.getByTestId("voice-question")).toHaveTextContent("cancelling…");
-    deliver?.({ kind: "cancelled", sentence: "Answer cancelled" });
+    expect(cancelVoiceAnswer).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending…");
+    deliver?.({ kind: "refused", code: "stale", sentence: QUESTION_MOVED_ON });
     await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_MOVED_ON);
     view.unmount();
   });
 
@@ -559,6 +565,38 @@ describe("answering an agent's question by voice", () => {
     expect(screen.queryByTestId("voice-question")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Too late to cancel — Allowed: touch x");
     view.unmount();
+  });
+
+  /**
+   * Scenario (question/desktop/011, PR #1698 review): the answer is on its way
+   * and the deck delivers it, so the question leaves the pane — and that
+   * snapshot reaches the panel before the send itself returns. Nothing the
+   * user did called the answer off, so its lease is not cancelled and the row
+   * says the answer went, not that it was too late to cancel. The same holds
+   * when another question arrives before the send returns.
+   */
+  it("question/desktop/011: an answer's own delivery clearing the question does not cancel it", async () => {
+    for (const next of [undefined, { ...PERMISSION, id: "q-2" }]) {
+      const voice = microphone();
+      let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+      const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+      const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+      await turnOnVoice();
+      await speak(voice, "yes");
+      await waitOut(VOICE_DICTATION_SEND_MS);
+      expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+
+      view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), question: next }} selectedDeckId="local" />);
+      await flush();
+      expect(cancelVoiceAnswer).not.toHaveBeenCalled();
+      expect(screen.getByTestId("voice-question")).toHaveTextContent("sending…");
+      deliver?.(SENT);
+      await flush();
+      expect(screen.queryByTestId("voice-question")).toBeNull();
+      expect(screen.getByTestId("voice-report")).toHaveTextContent("Allowed: touch x");
+      expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Too late");
+      view.unmount();
+    }
   });
 
   /**

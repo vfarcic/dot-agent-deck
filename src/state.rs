@@ -11823,14 +11823,17 @@ impl AppState {
     /// `pane_id` and could not finish, so the agent's prompt has moved past
     /// what the stored question describes. It stays pending — the agent is
     /// still waiting — but its channel becomes `Unsupported`, so every client
-    /// offers it to the keyboard only. Returns whether a question was marked.
+    /// offers it to the keyboard only, and it moves to `new_revision`, so a
+    /// client's answer worked out against the old one is stale. Returns the
+    /// question as marked, `None` when none was.
     pub fn mark_pending_question_keyboard_only(
         &mut self,
         pane_id: &str,
         question_id: &str,
         revision: Option<u64>,
-    ) -> bool {
-        let mut marked = false;
+        new_revision: u64,
+    ) -> Option<crate::question::PendingQuestion> {
+        let mut marked = None;
         for session in self.sessions.values_mut() {
             if session.pane_id.as_deref() == Some(pane_id)
                 && let Some(question) = session
@@ -11839,7 +11842,8 @@ impl AppState {
                     .filter(|q| q.id == question_id && q.revision == revision)
             {
                 question.channel = crate::question::AnswerChannel::Unsupported;
-                marked = true;
+                question.revision = Some(new_revision);
+                marked = Some(question.clone());
             }
         }
         marked

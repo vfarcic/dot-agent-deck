@@ -7930,10 +7930,51 @@ pub(crate) async fn answer_question_at(
                             // Part of the answer is in the agent's prompt: the
                             // stored question no longer describes what is on
                             // screen, so it is the keyboard's from here (S2).
-                            let _lifecycle = registry.question_answers().lock_lifecycle(pane).await;
-                            let mut guard = state.write().await;
-                            settle_unless_replaced(&guard);
-                            guard.mark_pending_question_keyboard_only(pane, &question.id, revision);
+                            let lifecycle = registry.question_answers().lock_lifecycle(pane).await;
+                            let marked = {
+                                let mut guard = state.write().await;
+                                settle_unless_replaced(&guard);
+                                let new_revision = registry.question_holds().mint_revision();
+                                guard
+                                    .mark_pending_question_keyboard_only(
+                                        pane,
+                                        &question.id,
+                                        revision,
+                                        new_revision,
+                                    )
+                                    .map(|marked| (marked, new_revision))
+                            };
+                            // PR #1698 review: published, at its new revision,
+                            // so no attached client keeps offering the
+                            // half-answered form until its next full listing,
+                            // and a voice answer another client is counting
+                            // down for the old revision is called off.
+                            if let Some((marked, new_revision)) = marked {
+                                let event = crate::daemon::deck_keyboard_only_event(
+                                    session_id.clone(),
+                                    agent_type.clone(),
+                                    pane_id.clone(),
+                                    Some(agent_id.to_string()),
+                                    &marked,
+                                );
+                                crate::daemon::ingest_event_in_lifecycle(
+                                    state,
+                                    event_tx,
+                                    registry,
+                                    &lifecycle,
+                                    event,
+                                    None,
+                                    |s: &mut crate::state::AppState| {
+                                        !s.pending_question_for(agent_id, pane_id.as_deref())
+                                            .is_some_and(|(_, q)| {
+                                                q.id == question.id
+                                                    && q.revision == Some(new_revision)
+                                            })
+                                    },
+                                )
+                                .await;
+                            }
+                            drop(lifecycle);
                             warn!(
                                 agent_id = %agent_id,
                                 question_id = %question.id,
@@ -14279,12 +14320,23 @@ mod question_answer_tests {
     /// question when the user types into the pane between two digits. The deck
     /// stops, the refusal says to finish by keyboard, and the question stays
     /// pending but is marked keyboard-only, so no client offers to answer the
-    /// half-answered form again.
+    /// half-answered form again: the change is broadcast at a new revision, so
+    /// a client folding the daemon's events sees it at once, and a voice answer
+    /// another client was counting down for the old revision is called off.
     #[spec("question/answer/008")]
     #[tokio::test]
     async fn question_answer_008_a_partly_typed_answer_leaves_the_question_keyboard_only() {
         let fx = Fixture::start(AgentType::Codex).await;
+        // A client attached to the daemon: it folds every broadcast event into
+        // its own state, as the TUI and the desktop's agent view do.
+        let mut events = fx.event_tx.subscribe();
+        let mut client = crate::state::AppState::default();
+        client.register_pane(PANE.to_string());
+        let mut start = fx.event(EventType::SessionStart);
+        start.agent_type = AgentType::Codex;
+        client.apply_event(start);
         fx.ask_ingested(&codex_form("call_half")).await;
+        let asked = fx.pending_question().await.expect("pending").revision;
         let answering = fx.answer_task("call_half", vec![one(0, 2), one(1, 1)], false);
         assert!(fx.screen_shows("2").await, "the first key went in");
         // Inside the gap before the second key, and after the deck's own key.
@@ -14301,6 +14353,31 @@ mod question_answer_tests {
         let question = fx.pending_question().await.expect("still pending");
         assert_eq!(question.id, "call_half");
         assert_eq!(question.channel, AnswerChannel::Unsupported);
+        assert_ne!(
+            question.revision, asked,
+            "keyboard-only is another question for a client's staleness check"
+        );
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                client.apply_event(event);
+            }
+        }
+        let seen = client
+            .pending_question_on_pane(PANE)
+            .expect("the client still shows the question");
+        assert_eq!(seen.id, "call_half");
+        assert_eq!(
+            seen.channel,
+            AnswerChannel::Unsupported,
+            "the client is told the question is keyboard-only"
+        );
+        assert!(!seen.has_answerable_option());
+        assert_eq!(seen.revision, question.revision);
+        assert_eq!(
+            client.sessions[SESSION].status,
+            SessionStatus::WaitingForInput,
+            "the card still waits on the question"
+        );
         assert_eq!(
             fx.answer("call_half", &[(0, &[2], None), (1, &[1], None)], false)
                 .await,

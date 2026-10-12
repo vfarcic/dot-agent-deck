@@ -639,6 +639,41 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
     assert_eq!(local.question_calls(), 0);
 }
 
+/// Scenario: The form the webview hands back for sending answers one question
+/// twice, or picks one option twice. The app refuses it as an answer it could
+/// not match, before anything is sent, as the daemon would; the same form with
+/// each question answered once is sent.
+#[test]
+fn question_desktop_002_a_form_answering_a_question_twice_is_not_sent() {
+    let question = map_pending_question(&form_question());
+    let refused_as_invalid = |form: &[Selection]| {
+        check_form("tester", &question, "q-form", form, false)
+            .is_err_and(|refused| refused.code == Some("invalid_answer"))
+    };
+    assert!(
+        refused_as_invalid(&[pick(0, &[1]), pick(1, &[1]), pick(0, &[1])]),
+        "the same question answered twice, the same way"
+    );
+    assert!(
+        refused_as_invalid(&[pick(0, &[1]), pick(1, &[1]), pick(0, &[2])]),
+        "the same question answered twice, two ways"
+    );
+    assert!(
+        refused_as_invalid(&[pick(0, &[1]), pick(1, &[2, 2])]),
+        "one option chosen twice on a multi-select"
+    );
+    assert!(
+        check_form(
+            "tester",
+            &question,
+            "q-form",
+            &[pick(0, &[1]), pick(1, &[1, 2])],
+            false
+        )
+        .is_ok()
+    );
+}
+
 /// Scenario: A two-question form is answered over several utterances: "red
 /// for colour" fills Colour, "small and large" fills the multi-select Size and
 /// completes the form, and a later "blue" replaces Colour's answer. Choosing

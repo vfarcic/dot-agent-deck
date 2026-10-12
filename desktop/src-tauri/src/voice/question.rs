@@ -665,6 +665,9 @@ fn check_selection(
     let mut options: Vec<&DesktopQuestionOption> = Vec::new();
     for index in &selection.option_indices {
         let option = q.option(*index).ok_or_else(|| couldnt_match(question))?;
+        if options.iter().any(|chosen| chosen.index == *index) {
+            return Err(couldnt_match(question));
+        }
         if !option.answerable {
             return Err(format!(
                 "\u{201c}{}\u{201d} has to be answered by keyboard.",
@@ -1142,7 +1145,15 @@ pub fn check_form(
     if !question.answerable {
         return Err(refused("unsupported", keyboard_only_agent(agent)));
     }
-    for selection in form {
+    for (at, selection) in form.iter().enumerate() {
+        // PR #1698 review: each question answered once, as the daemon's own
+        // validation demands — refused here, before anything is sent.
+        if form[..at]
+            .iter()
+            .any(|earlier| earlier.question_index == selection.question_index)
+        {
+            return Err(refused("invalid_answer", couldnt_match(question)));
+        }
         if let Err(sentence) = check_selection(question, selection) {
             return Err(refused("invalid_answer", sentence));
         }
