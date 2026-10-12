@@ -91,7 +91,7 @@ import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePage
 import { READING_ALREADY_OFF, READING_ALREADY_ON, READING_NOTICE_VOICE_KEY, readingNotice, type ReadingAgent } from "../lib/reading";
 import { useReadingMode } from "../hooks/useReadingMode";
 import type { VoicePaneAgent } from "../lib/promptKeys";
-import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
+import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, questionOptionsToSay, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { desktopFeaturesOf, type DeckFleet, type DeckRuntimeState } from "../types";
 
@@ -264,25 +264,29 @@ export function voiceNothingRan(why: string): string {
 /**
  * PRD #1631 — whether voice can take the answer to the question `pane`'s
  * agent waits on, and if not, why: its terminal is behind another tab
- * (`hidden`), typing mode is on so what is said is typed instead (`typing`),
- * or the deck cannot answer it by voice at all (`keyboard`). `answerQuestion`
- * offers no utterance to the question when it is `hidden` or `typing`, or has
- * no resolver; an unanswerable question is still offered, and Rust says why.
- * The refusals below say what to do from this.
+ * (`hidden`), or the deck cannot answer it by voice at all (`keyboard`).
+ * `answerQuestion` offers no utterance to the question when it is `hidden`,
+ * or has no resolver; an unanswerable question is still offered, and Rust
+ * says why. Typing mode does not stand in the way (PR #1698): an option said
+ * out loud is the answer whether or not the mode is on. The refusals below
+ * say what to do from this.
  */
-export type QuestionReach = "voice" | "hidden" | "typing" | "keyboard";
-export function questionReach(pane: Pick<VoicePane, "terminalHidden" | "question">, dictating: boolean, canResolve: boolean): QuestionReach {
+export type QuestionReach = "voice" | "hidden" | "keyboard";
+export function questionReach(pane: Pick<VoicePane, "terminalHidden" | "question">, canResolve: boolean): QuestionReach {
   if (pane.terminalHidden) return "hidden";
-  if (dictating) return "typing";
   if (!canResolve || pane.question?.answerable === false) return "keyboard";
   return "voice";
 }
-/** PRD #1631 — what the user does about a waiting question, for each {@link QuestionReach}: voice only where voice takes the answer. */
-export function voiceQuestionNextStep(reach: QuestionReach): string {
+/**
+ * PRD #1631 — what the user does about a waiting question, for each
+ * {@link QuestionReach}: voice only where voice takes the answer, naming what
+ * can be said there — `options`, from {@link questionOptionsToSay} — when
+ * there is anything.
+ */
+export function voiceQuestionNextStep(reach: QuestionReach, options = ""): string {
   switch (reach) {
-    case "voice": return "Answer it by voice, or use the keyboard.";
+    case "voice": return options ? `Answer it by saying an option or its number — ${options} — or use the keyboard.` : "Answer it by voice, or use the keyboard.";
     case "hidden": return "Open its terminal to answer it, or use the keyboard.";
-    case "typing": return "Say “type off” to answer it by voice, or use the keyboard.";
     case "keyboard": return "Answer it with the keyboard.";
   }
 }
@@ -293,16 +297,16 @@ export function voiceQuestionNextStep(reach: QuestionReach): string {
  * did not answer. In the agent's dialog a key can pick an option (Enter the
  * highlighted one, `Esc` a deny), so nothing is pressed.
  */
-export function voiceQuestionWaitingNoEnter(label: string, reach: QuestionReach): string {
-  return `Nothing was pressed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach)}`;
+export function voiceQuestionWaitingNoEnter(label: string, reach: QuestionReach, options = ""): string {
+  return `Nothing was pressed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach, options)}`;
 }
 /**
  * PRD #1631 — words voice would have typed into the open agent's pane while
  * it waits on a question: in its dialog a typed key can pick an option (a
  * number, or a `y`/`n` shortcut), so nothing is typed.
  */
-export function voiceQuestionWaitingNoTyping(label: string, reach: QuestionReach): string {
-  return `Nothing was typed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach)}`;
+export function voiceQuestionWaitingNoTyping(label: string, reach: QuestionReach, options = ""): string {
+  return `Nothing was typed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach, options)}`;
 }
 /**
  * PRD #1260 review — a pending one-shot send called off because the agent it
@@ -1742,10 +1746,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * because in the agent's dialog a key can pick an option with none of the
    * grounding, countdown or confirmation an answer by voice goes through.
    */
-  const questionWaiting = useCallback((aim: AgentAddress): { label: string; reach: QuestionReach } | undefined => {
+  const questionWaiting = useCallback((aim: AgentAddress): { label: string; reach: QuestionReach; options: string } | undefined => {
     const shown = paneRef.current;
     if (!shows(shown, aim) || !shown.question) return undefined;
-    return { label: shown.label, reach: questionReach(shown, panelStateRef.current.kind === "dictating", resolveVoiceQuestion !== undefined) };
+    const held = questionFormRef.current;
+    const form = held && held.target.questionId === shown.question.id ? held.form : [];
+    return { label: shown.label, reach: questionReach(shown, resolveVoiceQuestion !== undefined), options: questionOptionsToSay(shown.question, form) };
   }, [resolveVoiceQuestion]);
   /**
    * The write line of `aim`'s incarnation on screen: one per incarnation
@@ -2210,10 +2216,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * the question's; `false` means it was not about the question, and the
    * caller resolves it as an ordinary utterance.
    *
-   * Not while typing mode is on, where every utterance is the user's words for
-   * the prompt, and not while the pane shows another tab (audit A7): the user
-   * must be able to see the prompt they are answering, so there the utterance
-   * is an ordinary command.
+   * Typing mode or not (PR #1698): while a question waits nothing can be
+   * typed into the pane anyway, so an option said out loud is the answer,
+   * and words that are no option go on to be refused as typing. Typing mode
+   * stays on, and types again once the question is gone. Not while the pane
+   * shows another tab (audit A7): the user must be able to see the prompt
+   * they are answering, so there the utterance is an ordinary command.
    */
   const answerQuestion = useCallback(async (utterance: string, ours: () => boolean): Promise<boolean> => {
     const shown = paneRef.current;
@@ -2222,8 +2230,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        user to voice only where this offers the utterance to the question. An
        unanswerable question is still offered: Rust says why it cannot be
        answered. */
-    const reach = shown && question ? questionReach(shown, panelStateRef.current.kind === "dictating", resolveVoiceQuestion !== undefined) : undefined;
-    if (!shown || !question || !resolveVoiceQuestion || reach === "hidden" || reach === "typing") return false;
+    const reach = shown && question ? questionReach(shown, resolveVoiceQuestion !== undefined) : undefined;
+    if (!shown || !question || !resolveVoiceQuestion || reach === "hidden") return false;
     let held = questionFormRef.current;
     /* On its way already: only a cancel is the question's. */
     if (held?.sending) {
@@ -2261,7 +2269,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const spawnedAtMs = shown.spawnedAtMs;
     const deck = selectedDeckRef.current;
     setPhase("resolving");
-    const answered = await resolveVoiceQuestion(target, utterance, held?.form ?? [], held?.awaitingText);
+    /* In typing mode nothing said reaches the Commands service, so only an
+       option matched on this machine answers (PR #1698). */
+    const answered = await resolveVoiceQuestion(target, utterance, held?.form ?? [], held?.awaitingText, panelStateRef.current.kind === "dictating");
     if (!ours()) return true;
     const verdict = answered.verdict;
     if (verdict.kind === "not_answer") return false;
@@ -2560,7 +2570,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        with its agent waiting on a question: see `submitAgentPrompt`. */
     const waiting = questionWaiting(aim);
     if (waiting) {
-      setProblem(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach));
+      setProblem(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach, waiting.options));
       return;
     }
     try {
@@ -3709,7 +3719,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          turn. Checked at the turn, as the Enter is (`submitDictation`), not
          again by the bridge behind the user's own keystrokes still in flight. */
       const asked = questionWaiting(aim);
-      if (asked) throw new QuestionWaits(voiceQuestionWaitingNoTyping(asked.label, asked.reach));
+      if (asked) throw new QuestionWaits(voiceQuestionWaitingNoTyping(asked.label, asked.reach, asked.options));
       const record = promptFor(aim, incarnationOf(aim));
       if (sends) emptyRecord(record, false, PROMPT_EMPTIED.sent);
       const target = { deckId: aim.deckId, agentId: aim.agentId };
@@ -3754,7 +3764,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        refusal says to turn it off to answer by voice. */
     const asked = questionWaiting(aim);
     if (asked) {
-      reportRefused(voiceQuestionWaitingNoTyping(asked.label, asked.reach));
+      reportRefused(voiceQuestionWaitingNoTyping(asked.label, asked.reach, asked.options));
       return;
     }
     if (mode.kind === "dictating") {
@@ -3853,7 +3863,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        through, so nothing is pressed — whichever path resolved the submit. */
     const waiting = questionWaiting(target);
     if (waiting) {
-      reportRefused(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach));
+      reportRefused(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach, waiting.options));
       return;
     }
     /* PRD #1541 — what voice typed is on its way out, so there is nothing
@@ -3885,7 +3895,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        denies and a clear or scratch key edits a typed answer. */
     const asked = questionWaiting(aim);
     if (asked) {
-      reportRefused(voiceQuestionWaitingNoEnter(asked.label, asked.reach));
+      reportRefused(voiceQuestionWaitingNoEnter(asked.label, asked.reach, asked.options));
       return undefined;
     }
     if (!shown.promptKeys) {

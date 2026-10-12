@@ -110,6 +110,7 @@ async fn say(
         form,
         None,
         Transcript::new(said),
+        false,
     )
     .await
     .verdict
@@ -139,6 +140,7 @@ fn captured_form_question() -> PendingQuestion {
         "q-form".into(),
         "AskUserQuestion",
         payload.get("tool_input"),
+        None,
         None,
         None,
         1,
@@ -325,7 +327,7 @@ async fn question_desktop_007_borrowed_invalid_selections_are_still_refused() {
     }
     let question = map_pending_question(&captured_form_question());
     for (at, index) in [(99, 3), (0, 99)] {
-        let said = "small and large";
+        let said = "small and large for sizes";
         let answer = ModelAnswer::answer(at, &[index])
             .citing("large")
             .and(1, &[1, 3])
@@ -386,7 +388,9 @@ async fn question_desktop_007_grounding_keeps_a_selection_citing_its_own_words()
 async fn question_desktop_007_grounding_drops_strictly_contained_evidence() {
     let pending = captured_form_question();
     let question = map_pending_question(&pending);
-    let said = "small and large";
+    // Not "small and large" alone, which with Colour answered is Sizes' own
+    // options, matched locally with no model call.
+    let said = "small and large for sizes";
     // Exercise both model orderings: containment does not depend on which
     // question claimed its evidence first.
     for (colour_text, sizes_text) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -581,20 +585,25 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
             assert_eq!(form, &[pick(0, &[1])]);
             assert!(complete);
             assert!(always.is_none());
-            assert_eq!(summary, "Allow once — touch x");
+            assert_eq!(summary, "\u{201c}Yes\u{201d} (allow once) — touch x");
         }
         other => panic!("{other:?}"),
     }
     assert_eq!(sent_line(&question, &form_of(&verdict)), "Allowed: touch x");
 
     // An option that is not offered, and two options on a single choice.
-    for said in ["the fourth one please", "both of them"] {
+    for (said, expected) in [
+        (
+            "the fourth one please",
+            "There is no option 4, so nothing was chosen. The options are 1 \u{201c}Yes\u{201d}, 2 \u{201c}Yes, and don't ask again\u{201d}, 3 \u{201c}No\u{201d}.",
+        ),
+        (
+            "both of them",
+            "I couldn't match that to the options: 1 \u{201c}Yes\u{201d}, 2 \u{201c}Yes, and don't ask again\u{201d}, 3 \u{201c}No\u{201d}.",
+        ),
+    ] {
         match say(&resolver, &question, &[], said).await {
-            QuestionVerdict::Refused { sentence } => assert_eq!(
-                sentence,
-                "I couldn't match that to the options: Yes, Yes, and don't ask again, No.",
-                "{said}"
-            ),
+            QuestionVerdict::Refused { sentence } => assert_eq!(sentence, expected, "{said}"),
             other => panic!("{said}: {other:?}"),
         }
     }
@@ -631,7 +640,7 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
     assert_eq!(form_of(&verdict), [pick(0, &[3])]);
     assert_eq!(
         countdown_line(&question, &form_of(&verdict)),
-        "Deny — touch x"
+        "\u{201c}No\u{201d} (deny) — touch x"
     );
     // And so is a position on a one-question form.
     let verdict = say(&local, &question, &[], "option two").await;
@@ -701,7 +710,10 @@ async fn question_desktop_003_the_form_fills_in_across_utterances() {
             complete, summary, ..
         } => {
             assert!(!complete);
-            assert_eq!(summary, "So far — Colour: Red. Still to answer: Size.");
+            assert_eq!(
+                summary,
+                "So far — Colour: Red. Still to answer: Size (1 \u{201c}Small\u{201d}, 2 \u{201c}Large\u{201d}, 3 \u{201c}Type something.\u{201d})."
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -755,6 +767,7 @@ async fn question_desktop_003_the_form_fills_in_across_utterances() {
         &form_of(&waiting),
         Some(slot),
         Transcript::new("teal, like the sea"),
+        false,
     )
     .await;
     assert_eq!(dictated.resolve_ms, None, "dictation asks no model");
@@ -782,7 +795,10 @@ async fn question_desktop_003_the_form_fills_in_across_utterances() {
                 confirm,
                 "This will always allow commands matching `touch *`. Confirm?"
             );
-            assert_eq!(summary, "Always allow — commands matching `touch *`");
+            assert_eq!(
+                summary,
+                "\u{201c}Yes, and don't ask again\u{201d} (always allow) — commands matching `touch *`"
+            );
             assert!(
                 check_form("tester", &permission_question, "q-permission", &form, false)
                     .is_err_and(|refused| refused.code == Some("always_not_confirmed")),
@@ -911,6 +927,7 @@ async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
             &[],
             Some(free_text),
             Transcript::new(&said),
+            false,
         )
         .await;
         assert_eq!(
@@ -929,6 +946,7 @@ async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
         &[],
         Some(free_text),
         Transcript::new("I was talking on the phone"),
+        false,
     )
     .await;
     match &words.verdict {
@@ -1211,7 +1229,7 @@ async fn question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_sa
                 ..
             } => {
                 assert_eq!(form, [pick(0, &[1])], "{said}");
-                assert!(summary.contains("Allow once"), "{said}: {summary}");
+                assert!(summary.contains("(allow once)"), "{said}: {summary}");
             }
             other => panic!("{said}: the residual is armed, not refused: {other:?}"),
         }
@@ -1248,4 +1266,588 @@ async fn question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_sa
     assert_eq!(verbatim_slice("go ahead", "ahead go"), None);
     assert_eq!(verbatim_slice("go ahead", "  "), None);
     assert_eq!(verbatim_slice("no", "no way"), None);
+}
+
+// ---------------------------------------------------------------------------
+// PR #1698 — answering the way a person says it, against every agent's real
+// option list (`question/desktop/020`–`027`).
+// ---------------------------------------------------------------------------
+
+fn agent_fixture(name: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/agent-questions")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture")).unwrap()
+}
+
+/// Claude Code 2.1.296's Bash prompt as the user saw it: 1 Yes, 2 "Yes, and
+/// switch to auto mode" (keyboard-only), 3 No.
+fn claude_auto_mode() -> DesktopPendingQuestion {
+    let payload = agent_fixture("claude-permission-bash-auto-mode.json");
+    map_pending_question(
+        &dot_agent_deck::question::claude_permission_request(
+            "q-claude".into(),
+            "Bash",
+            payload.get("tool_input"),
+            Some("git push origin main".into()),
+            payload.get("permission_suggestions"),
+            payload["permission_mode"].as_str(),
+            1,
+            None,
+        )
+        .question,
+    )
+}
+
+/// Codex 0.160.0's approval: 1 "Yes, proceed", 2 "Yes, and don't ask again
+/// for commands that start with the prefix shown", 3 "No, and tell Codex what
+/// to do differently".
+fn codex_permission() -> DesktopPendingQuestion {
+    let payload = agent_fixture("codex-permission-request.json");
+    let command = payload["tool_input"]["command"].as_str();
+    map_pending_question(&dot_agent_deck::question::codex_permission_request(
+        "q-codex".into(),
+        "Bash",
+        command.map(str::to_string),
+        command,
+        1,
+        None,
+    ))
+}
+
+/// OpenCode 1.18.34's permission row, which draws no numbers: 1 Allow once,
+/// 2 Allow always, 3 Reject — the left-to-right places.
+fn opencode_permission() -> DesktopPendingQuestion {
+    map_pending_question(
+        &dot_agent_deck::question::opencode_permission_asked(
+            &agent_fixture("opencode-permission-asked.json"),
+            1,
+        )
+        .unwrap(),
+    )
+}
+
+/// Pi's `ctx.ui.select`, numbered by place, and its `confirm`: 1 Yes, 2 No.
+fn pi_select() -> DesktopPendingQuestion {
+    map_pending_question(
+        &dot_agent_deck::question::pi_dialog(
+            &dot_agent_deck::question::PiDialog {
+                id: "q-pi".into(),
+                kind: "select".into(),
+                title: "Deploy where?".into(),
+                message: None,
+                options: vec!["Staging".into(), "Production".into(), "Nowhere yet".into()],
+                placeholder: None,
+            },
+            1,
+        )
+        .unwrap(),
+    )
+}
+
+/// Devin 3000.11.3's documented prompt (unverified, #1699): 1 Allow once, six
+/// keyboard-only options, 8 Deny.
+fn devin_permission() -> DesktopPendingQuestion {
+    map_pending_question(&dot_agent_deck::question::devin_permission_request(
+        "q-devin".into(),
+        "exec",
+        Some("ls".into()),
+        1,
+        None,
+    ))
+}
+
+/// Codex's two-question `request_user_input`: Colour (Red, Green, Blue, and
+/// the keyboard-only "None of the above"), Size (Small, Large, …).
+fn codex_form() -> DesktopPendingQuestion {
+    let payload = agent_fixture("codex-request-user-input.json");
+    map_pending_question(
+        &dot_agent_deck::question::codex_request_user_input(
+            payload["tool_use_id"].as_str(),
+            payload.get("tool_input"),
+            1,
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+/// OpenCode's two-question form: Colour (Red, Green, Blue, Type your own
+/// answer), Sizes — multi-select — (Small, Medium, Large, Type your own
+/// answer).
+fn opencode_form() -> DesktopPendingQuestion {
+    map_pending_question(
+        &dot_agent_deck::question::opencode_question_asked(
+            &agent_fixture("opencode-question-asked.json"),
+            1,
+        )
+        .unwrap(),
+    )
+}
+
+/// What one utterance chose, locally: `(question, options)`, or the verdict
+/// when it chose nothing.
+async fn chose(
+    question: &DesktopPendingQuestion,
+    form: &[Selection],
+    said: &str,
+) -> Result<Vec<(u32, Vec<u32>)>, QuestionVerdict> {
+    let resolver = StubResolver::new();
+    let verdict = say(&resolver, question, form, said).await;
+    assert_eq!(
+        resolver.question_calls(),
+        0,
+        "{said:?} is matched here, with no model call"
+    );
+    match verdict {
+        QuestionVerdict::Answered { form, .. } => Ok(form
+            .into_iter()
+            .map(|s| (s.question_index, s.option_indices))
+            .collect()),
+        other => Err(other),
+    }
+}
+
+fn refusal(verdict: Result<Vec<(u32, Vec<u32>)>, QuestionVerdict>) -> String {
+    match verdict {
+        Err(QuestionVerdict::Refused { sentence }) => sentence,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Scenario (question/desktop/020): with each agent's real permission prompt
+/// waiting, the user picks an option by its number — "2", "two", "second",
+/// "option two", "number two", "the second one" — or "the last one". The
+/// number is the one the agent draws beside the option (or its place in
+/// OpenCode's unnumbered row), so on Claude Code's prompt "3" is No, as on
+/// screen; a number the agent draws beside nothing is refused, naming the
+/// options with their numbers.
+#[tokio::test]
+async fn question_desktop_020_an_option_is_chosen_by_its_number() {
+    let cases: [(&str, DesktopPendingQuestion, u32); 5] = [
+        ("claude", claude_auto_mode(), 3),
+        ("codex", codex_permission(), 2),
+        ("opencode", opencode_permission(), 2),
+        ("pi", pi_select(), 2),
+        ("devin", devin_permission(), 8),
+    ];
+    for (agent, question, number) in &cases {
+        let word = [
+            "", "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ][*number as usize];
+        let ordinal = [
+            "", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+        ][*number as usize];
+        for said in [
+            number.to_string(),
+            word.to_string(),
+            ordinal.to_string(),
+            format!("option {word}"),
+            format!("option {number}"),
+            format!("number {word}"),
+            format!("the {ordinal} one"),
+            format!("um, {word} please"),
+        ] {
+            assert_eq!(
+                chose(question, &[], &said)
+                    .await
+                    .map_err(|v| format!("{v:?}")),
+                Ok(vec![(0, vec![*number])]),
+                "{agent}: {said:?}"
+            );
+        }
+    }
+    // Claude's own case: "two" names the keyboard-only auto-mode option the
+    // screen shows at 2, which voice cannot pick — never No.
+    assert_eq!(
+        refusal(chose(&claude_auto_mode(), &[], "two").await),
+        "\u{201c}Yes, and switch to auto mode\u{201d} has to be answered by keyboard."
+    );
+    assert_eq!(
+        chose(&claude_auto_mode(), &[], "the last one")
+            .await
+            .unwrap(),
+        [(0, vec![3])]
+    );
+    assert_eq!(
+        refusal(chose(&codex_permission(), &[], "option four").await),
+        "There is no option 4, so nothing was chosen. The options are 1 \u{201c}Yes, proceed\u{201d}, 2 \u{201c}Yes, and don't ask again for commands that start with the prefix shown\u{201d}, 3 \u{201c}No, and tell Codex what to do differently\u{201d}."
+    );
+}
+
+/// Scenario (question/desktop/021): the user says a distinctive part of one
+/// option's label — "proceed" and "don't ask again" on Codex, "always" on
+/// OpenCode, "production" on Pi, "auto mode" on Claude Code — and that option
+/// is chosen, with the "always allow" confirmation where it grants for good.
+/// Claude's auto-mode option is keyboard-only, so naming it is refused with
+/// that reason rather than read as another option.
+#[tokio::test]
+async fn question_desktop_021_part_of_one_label_chooses_it() {
+    assert_eq!(
+        chose(&codex_permission(), &[], "proceed").await.unwrap(),
+        [(0, vec![1])]
+    );
+    assert_eq!(
+        chose(&codex_permission(), &[], "don't ask again")
+            .await
+            .unwrap(),
+        [(0, vec![2])]
+    );
+    assert_eq!(
+        chose(&codex_permission(), &[], "no, and tell codex")
+            .await
+            .unwrap(),
+        [(0, vec![3])]
+    );
+    assert_eq!(
+        chose(&opencode_permission(), &[], "always").await.unwrap(),
+        [(0, vec![2])]
+    );
+    assert_eq!(
+        chose(&pi_select(), &[], "production please").await.unwrap(),
+        [(0, vec![2])]
+    );
+    let resolver = StubResolver::new();
+    assert_eq!(
+        say(&resolver, &pi_select(), &[], "the nowhere one").await,
+        QuestionVerdict::NotAnswer,
+        "not a part: \"one\" is not in the label, so the model is asked"
+    );
+    for said in [
+        "auto mode",
+        "switch to auto mode",
+        "yes, switch to auto mode",
+        "swich to auto mode",
+    ] {
+        assert_eq!(
+            refusal(chose(&claude_auto_mode(), &[], said).await),
+            "\u{201c}Yes, and switch to auto mode\u{201d} has to be answered by keyboard.",
+            "{said:?}"
+        );
+    }
+    // The always option still asks for its confirmation.
+    let resolver = StubResolver::new();
+    match say(&resolver, &opencode_permission(), &[], "allow always").await {
+        QuestionVerdict::Answered { always, .. } => assert!(always.is_some()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Scenario (question/desktop/022, the user's own case): Claude Code shows Yes,
+/// "Yes, and switch to auto mode" and No, and the user says "Yes" — or "yes
+/// please", "um, yes", "Yes, do it". A whole label wins over another that
+/// merely starts with it, so Yes is chosen, and the countdown names the option
+/// it will send, "“Yes” (allow once) — git push origin main". Each agent's
+/// countdown names the option the same way.
+#[tokio::test]
+async fn question_desktop_022_a_whole_label_wins_and_the_countdown_names_it() {
+    let question = claude_auto_mode();
+    for said in ["Yes", "yes.", "yes please", "um, yes", "Yes, do it", "YES"] {
+        assert_eq!(
+            chose(&question, &[], said).await.unwrap(),
+            [(0, vec![1])],
+            "{said:?}"
+        );
+    }
+    let resolver = StubResolver::new();
+    match say(&resolver, &question, &[], "Yes").await {
+        QuestionVerdict::Answered {
+            summary, complete, ..
+        } => {
+            assert!(complete);
+            assert_eq!(
+                summary,
+                "\u{201c}Yes\u{201d} (allow once) — git push origin main"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    match say(&resolver, &question, &[], "no").await {
+        QuestionVerdict::Answered { summary, .. } => {
+            assert_eq!(summary, "\u{201c}No\u{201d} (deny) — git push origin main")
+        }
+        other => panic!("{other:?}"),
+    }
+    for (question, said, expected) in [
+        (
+            codex_permission(),
+            "proceed",
+            "\u{201c}Yes, proceed\u{201d} (allow once) — touch codex_b.txt",
+        ),
+        (
+            opencode_permission(),
+            "reject",
+            "\u{201c}Reject\u{201d} (deny) — touch oc_a.txt",
+        ),
+        (
+            devin_permission(),
+            "allow once",
+            "\u{201c}Allow once\u{201d} (allow once) — ls",
+        ),
+        (pi_select(), "staging", "Answer — Deploy where?: Staging"),
+    ] {
+        match say(&resolver, &question, &[], said).await {
+            QuestionVerdict::Answered { summary, .. } => assert_eq!(summary, expected, "{said:?}"),
+            other => panic!("{said:?}: {other:?}"),
+        }
+    }
+    match say(&resolver, &opencode_permission(), &[], "allow always").await {
+        QuestionVerdict::Answered { summary, .. } => {
+            assert!(
+                summary.starts_with("\u{201c}Allow always\u{201d} (always allow) — "),
+                "{summary}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Scenario (question/desktop/023): the user says words that fit more than
+/// one option and match none whole — "yes" to Codex (Yes, proceed / Yes, and
+/// don't ask again …), "allow" to OpenCode (Allow once / Allow always). Nothing
+/// is chosen, and the refusal names the options it could be with their
+/// numbers, so the user can say one.
+#[tokio::test]
+async fn question_desktop_023_words_that_fit_several_options_choose_none() {
+    assert_eq!(
+        refusal(chose(&codex_permission(), &[], "yes").await),
+        "\u{201c}yes\u{201d} could be 1 \u{201c}Yes, proceed\u{201d} or 2 \u{201c}Yes, and don't ask again for commands that start with the prefix shown\u{201d} — say its number or more of its words. Nothing was chosen."
+    );
+    assert_eq!(
+        refusal(chose(&opencode_permission(), &[], "allow").await),
+        "\u{201c}allow\u{201d} could be 1 \u{201c}Allow once\u{201d} or 2 \u{201c}Allow always\u{201d} — say its number or more of its words. Nothing was chosen."
+    );
+    // Said more fully, it is one option.
+    assert_eq!(
+        chose(&codex_permission(), &[], "yes proceed")
+            .await
+            .unwrap(),
+        [(0, vec![1])]
+    );
+    assert_eq!(
+        chose(&opencode_permission(), &[], "allow once")
+            .await
+            .unwrap(),
+        [(0, vec![1])]
+    );
+    // A number that names two options — the one drawn with it and one whose
+    // label is that number — is refused too.
+    let mut counts = pi_select();
+    counts.questions[0].options[0].label = "3".into();
+    assert!(
+        refusal(chose(&counts, &[], "three").await)
+            .contains("could be 1 \u{201c}3\u{201d} or 3 \u{201c}Nowhere yet\u{201d}")
+    );
+}
+
+/// Scenario (question/desktop/024): the user says something that is no
+/// option's label, part or number — "go to the overview" — so nothing is
+/// chosen here and the Commands model is asked; when it says this is not an
+/// answer, the utterance goes on to ordinary command handling. A model answer
+/// the question cannot take is refused naming every option with its number.
+#[tokio::test]
+async fn question_desktop_024_words_that_match_nothing_choose_nothing() {
+    for question in [
+        claude_auto_mode(),
+        codex_permission(),
+        opencode_permission(),
+        pi_select(),
+        devin_permission(),
+    ] {
+        let resolver = StubResolver::new();
+        assert_eq!(
+            say(&resolver, &question, &[], "go to the overview").await,
+            QuestionVerdict::NotAnswer
+        );
+        assert_eq!(resolver.question_calls(), 1, "the model was asked");
+    }
+    let resolver = StubResolver::new().answering_question(
+        "both of them",
+        ModelAnswer::answer(0, &[1, 3]).citing("both of them"),
+    );
+    match say(&resolver, &claude_auto_mode(), &[], "both of them").await {
+        QuestionVerdict::Refused { sentence } => assert_eq!(
+            sentence,
+            "I couldn't match that to the options: 1 \u{201c}Yes\u{201d}, 3 \u{201c}No\u{201d}."
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Scenario (question/desktop/025): a question the deck can only send to the
+/// keyboard — a Codex form question with more than nine options, a channel
+/// the deck cannot use — is never half-matched: its number, its label or part
+/// of it are refused with "answer it by keyboard", and nothing is chosen.
+#[tokio::test]
+async fn question_desktop_025_a_keyboard_only_question_refuses_every_way_of_naming_an_option() {
+    let options: Vec<serde_json::Value> = (1..=10)
+        .map(|i| serde_json::json!({"label": format!("Option {i}")}))
+        .collect();
+    let wide = map_pending_question(
+        &dot_agent_deck::question::codex_request_user_input(
+            Some("call_wide"),
+            Some(&serde_json::json!({"questions": [{"header": "Pick", "id": "pick", "question": "Which?", "options": options}]})),
+            1,
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(!wide.answerable);
+    let unsupported = map_pending_question(&permission(AnswerChannel::Unsupported));
+    for (question, said) in [
+        (&wide, "option two"),
+        (&wide, "2"),
+        (&wide, "Option 10"),
+        (&unsupported, "yes"),
+        (&unsupported, "3"),
+        (&unsupported, "don't ask again"),
+    ] {
+        assert_eq!(
+            refusal(chose(question, &[], said).await),
+            "tester's questions have to be answered by keyboard.",
+            "{said:?}"
+        );
+    }
+}
+
+/// Scenario (question/desktop/026): a two-question form — Codex's
+/// `request_user_input`, OpenCode's form, Claude Code's `AskUserQuestion` — is
+/// answered one question at a time. A number or part of a label goes to the
+/// first question not yet answered; the row then names the next question with
+/// its options numbered, since the agent does not show it yet; when every
+/// question has an answer the countdown names them all. On a multi-select
+/// question several options are said joined by "and" — "one and three",
+/// "small and large".
+#[tokio::test]
+async fn question_desktop_026_a_form_is_answered_question_by_question() {
+    let resolver = StubResolver::new();
+    // Codex: "two" is Green on Colour, then "two" is Large on Size.
+    let codex = codex_form();
+    let first = say(&resolver, &codex, &[], "two").await;
+    match &first {
+        QuestionVerdict::Answered {
+            summary,
+            complete,
+            form,
+            ..
+        } => {
+            assert_eq!(form, &[pick(0, &[2])]);
+            assert!(!complete);
+            assert_eq!(
+                summary,
+                "So far — Colour: Green. Still to answer: Size (1 \u{201c}Small\u{201d}, 2 \u{201c}Large\u{201d})."
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let second = say(&resolver, &codex, &form_of(&first), "the second one").await;
+    match &second {
+        QuestionVerdict::Answered {
+            summary,
+            complete,
+            form,
+            ..
+        } => {
+            assert_eq!(form, &[pick(0, &[2]), pick(1, &[2])]);
+            assert!(complete);
+            assert_eq!(summary, "Answer — Colour: Green; Size: Large");
+        }
+        other => panic!("{other:?}"),
+    }
+    // OpenCode: "blue", then Sizes, a multi-select, by numbers and by labels.
+    let opencode = opencode_form();
+    let colour = form_of(&say(&resolver, &opencode, &[], "blue").await);
+    assert_eq!(colour, [pick(0, &[3])]);
+    for (said, expected) in [
+        ("one and three", vec![1, 3]),
+        ("small and large", vec![1, 3]),
+        ("small, medium and large please", vec![1, 2, 3]),
+        ("medum and large", vec![2, 3]),
+    ] {
+        let verdict = say(&resolver, &opencode, &colour, said).await;
+        assert_eq!(
+            form_of(&verdict),
+            [pick(0, &[3]), pick(1, &expected)],
+            "{said:?}"
+        );
+    }
+    // One of the parts naming no option asks the model rather than half-taking it.
+    assert_eq!(
+        say(&resolver, &opencode, &colour, "small and a hamster").await,
+        QuestionVerdict::NotAnswer
+    );
+    // Claude: the captured form, Colour then multi-select Sizes.
+    let claude = map_pending_question(&captured_form_question());
+    let colour = form_of(&say(&resolver, &claude, &[], "green").await);
+    let sizes = say(&resolver, &claude, &colour, "1 and 3").await;
+    assert_eq!(form_of(&sizes), [pick(0, &[2]), pick(1, &[1, 3])]);
+    // A whole label on the other question is still that question's.
+    let late = say(&resolver, &codex, &[], "large").await;
+    assert_eq!(form_of(&late), [pick(1, &[2])]);
+}
+
+/// Scenario (question/desktop/027): "no" on Codex's approval, whose deny
+/// option is "No, and tell Codex what to do differently", picks it as the only
+/// option starting so, and Devin's "deny" picks its Deny though six
+/// keyboard-only options sit between, and "reject it" is OpenCode's Reject.
+/// "Stop" with nothing answered is not a
+/// label anywhere and goes on to the model, which may call it a command.
+#[tokio::test]
+async fn question_desktop_027_a_short_word_picks_the_one_option_that_has_it() {
+    assert_eq!(
+        chose(&codex_permission(), &[], "no").await.unwrap(),
+        [(0, vec![3])]
+    );
+    assert_eq!(
+        chose(&devin_permission(), &[], "deny").await.unwrap(),
+        [(0, vec![8])]
+    );
+    assert_eq!(
+        chose(&opencode_permission(), &[], "reject it")
+            .await
+            .unwrap(),
+        [(0, vec![3])]
+    );
+    let resolver = StubResolver::new();
+    assert_eq!(
+        say(&resolver, &codex_permission(), &[], "stop").await,
+        QuestionVerdict::NotAnswer
+    );
+    assert_eq!(resolver.question_calls(), 1);
+}
+
+/// Scenario (question/desktop/029, the Rust half): in typing mode the webview
+/// asks for a local-only match. "Yes" to Claude Code's prompt is still Yes,
+/// and "two" is still refused as keyboard-only, with no model call; "go ahead",
+/// which only the Commands model could read, is not an answer and reaches no
+/// model, since in typing mode nothing said is sent to the Commands service.
+#[tokio::test]
+async fn question_desktop_029_typing_mode_matches_on_this_machine_only() {
+    let resolver = StubResolver::new()
+        .answering_question("go ahead", ModelAnswer::answer(0, &[1]).citing("go ahead"));
+    let question = claude_auto_mode();
+    let local = |said: &'static str| {
+        resolve(
+            &resolver,
+            "tester",
+            &question,
+            &[],
+            None,
+            Transcript::new(said),
+            true,
+        )
+    };
+    assert_eq!(form_of(&local("Yes").await.verdict), [pick(0, &[1])]);
+    assert!(matches!(
+        local("two").await.verdict,
+        QuestionVerdict::Refused { .. }
+    ));
+    let ahead = local("go ahead").await;
+    assert_eq!(ahead.verdict, QuestionVerdict::NotAnswer);
+    assert_eq!(ahead.resolve_ms, None);
+    assert_eq!(
+        resolver.question_calls(),
+        0,
+        "nothing reached the Commands model"
+    );
 }

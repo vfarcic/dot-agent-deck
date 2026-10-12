@@ -51,6 +51,7 @@ pub mod human_voice;
 pub mod lease;
 pub mod numbers;
 pub mod openai;
+pub mod option_match;
 pub mod outcome;
 pub mod prompt;
 pub mod question;

@@ -3874,6 +3874,9 @@ async fn pending_question_on(
 /// A `not_answer` verdict is the webview's cue to resolve the utterance as a
 /// command ([`desktop_voice_resolve`]). Nothing here sends anything to the
 /// agent: [`desktop_voice_answer_question`] does, after the countdown.
+/// `local_only` is the webview's typing mode (PR #1698): then nothing said is
+/// sent to the Commands service, and only an option matched on this machine
+/// answers the question. Absent reads as off, as an older webview sends it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn desktop_voice_question(
@@ -3886,6 +3889,7 @@ async fn desktop_voice_question(
     utterance: String,
     form: Vec<voice::question::Selection>,
     awaiting_text: Option<voice::question::TextSlot>,
+    local_only: Option<bool>,
 ) -> Result<voice::question::QuestionResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3931,6 +3935,7 @@ async fn desktop_voice_question(
         &form,
         awaiting_text,
         voice::Transcript::new(utterance),
+        local_only.unwrap_or(false),
     )
     .await)
 }

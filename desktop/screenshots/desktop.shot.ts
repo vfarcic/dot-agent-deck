@@ -217,8 +217,10 @@ desktopScenario("voice-choice", async (page) => {
 // PRD #1631 — answering an agent's question, desktop-only (the TUI has no
 // voice). The `docs-question` fixture stops the Desktop implementation agent
 // (Codex) on a command approval; with its pane open, the scripted microphone
-// says "yes", and the image shows the voice row's answer — Allow once and the
-// command — with its countdown and Cancel, beside the prompt in the pane.
+// says "go ahead" — not "yes", which on Codex's prompt fits two options and
+// chooses nothing (PR #1698) — and the image shows the voice row's answer,
+// naming the option and the command, with its countdown and Cancel, beside
+// the prompt in the pane.
 desktopScenario("voice-question", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
@@ -228,14 +230,14 @@ desktopScenario("voice-question", async (page) => {
       zoom: { level: 1 },
     }));
   });
-  await page.goto("/?fixture=1&state=docs-question&voice=yes");
+  await page.goto("/?fixture=1&state=docs-question&voice=go%20ahead");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
-  await expect(page.getByTestId("voice-question")).toContainText("Allow once — npm install --save-dev msw — sending in");
+  await expect(page.getByTestId("voice-question")).toContainText("“Yes, proceed” (allow once) — npm install --save-dev msw — sending in");
   await expect(page.getByTestId("voice-question-cancel")).toBeVisible();
 });
 

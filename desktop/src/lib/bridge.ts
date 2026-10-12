@@ -1901,7 +1901,7 @@ export interface DeckBridge {
    * The question is read Rust-side from the deck's snapshot; `target` names
    * the one the panel saw.
    */
-  resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto>;
+  resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly?: boolean): Promise<QuestionResultDto>;
   /**
    * PRD #1631 — send a whole answered form once the countdown ran out
    * (`desktop_voice_answer_question`), under `lease`, which
@@ -4859,9 +4859,9 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
   }
 
-  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto> {
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly = false): Promise<QuestionResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null });
+    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null, localOnly });
   }
 
   async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {

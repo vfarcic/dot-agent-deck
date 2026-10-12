@@ -15,10 +15,12 @@
 //! as answered so far, and answers with option numbers, `cancel`, or
 //! `not_answer`. A `not_answer` falls through to ordinary command handling.
 //!
-//! Two short local paths come first and spend no model call: an utterance that
-//! is exactly one option's label ("No", "Yes, proceed"), or exactly a position
-//! on a one-question form ("two", "option two"); and a free-text option the
-//! form is waiting on, whose text is the next utterance verbatim.
+//! Two local paths come first and spend no model call: a free-text option the
+//! form is waiting on, whose text is the next utterance verbatim; and the
+//! options matched the way a person says them — a whole label, a number, an
+//! ordinal, part of one label, several joined by "and" —
+//! ([`super::option_match`]), which refuses words that fit several options
+//! rather than guessing. Only what neither path takes goes to the model.
 //!
 //! **Whatever chose the options, [`validate`] has the last word**, against the
 //! question as the deck's snapshot holds it: the question and option numbers
@@ -62,8 +64,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Transcript;
-use super::choice::ordinal;
 use super::dictation::{DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES};
+use super::option_match::{OptionMatch, match_options, numbered_options};
 use super::outcome::{said_whole, whole_utterance};
 use super::resolver::{IntentError, IntentResolver};
 use super::table::spoken_words;
@@ -406,7 +408,10 @@ pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<Vec<ModelSel
 /// `form` is the answer so far and `awaiting_text` the free-text option it is
 /// waiting for the words of — both the webview's, and both checked against
 /// `question` here rather than trusted. `agent` is the name the deck shows,
-/// for the "answer by keyboard" sentence.
+/// for the "answer by keyboard" sentence. `local_only` is set in typing mode
+/// (PR #1698), where nothing said reaches the Commands service: only what is
+/// matched here is an answer, and the rest is `not_answer`, with no model
+/// call.
 pub async fn resolve(
     resolver: &dyn IntentResolver,
     agent: &str,
@@ -414,6 +419,7 @@ pub async fn resolve(
     form: &[Selection],
     awaiting_text: Option<TextSlot>,
     transcript: Transcript,
+    local_only: bool,
 ) -> QuestionResult {
     let backend = resolver.backend_name();
     let finish = |verdict, resolve_ms| QuestionResult {
@@ -467,8 +473,28 @@ pub async fn resolve(
         };
         return finish(verdict, None);
     }
-    if let Some(answer) = fast_path(question, &words) {
-        return finish(judge(agent, question, &form, answer, &[]), None);
+    // The options as a person says them, matched here. On a question the deck
+    // cannot answer, anything that names its options is sent to the keyboard
+    // rather than half-matched.
+    match match_options(question, &form, transcript.text()) {
+        OptionMatch::Unmatched => {}
+        _ if !question.answerable => {
+            return finish(
+                QuestionVerdict::Refused {
+                    sentence: keyboard_only_agent(agent),
+                },
+                None,
+            );
+        }
+        OptionMatch::Chosen(answer) => {
+            return finish(judge(agent, question, &form, answer, &[]), None);
+        }
+        OptionMatch::Refused(sentence) => {
+            return finish(QuestionVerdict::Refused { sentence }, None);
+        }
+    }
+    if local_only {
+        return finish(QuestionVerdict::NotAnswer, None);
     }
     let started = std::time::Instant::now();
     let answered = resolver
@@ -517,35 +543,7 @@ fn names_an_answerable_option(question: &DesktopPendingQuestion, words: &[String
             .any(|option| option.answerable && spoken_words(&option.label) == words)
 }
 
-/// The local fast path: an utterance that is exactly one option's label, or
-/// exactly a position on a one-question form. `None` when it is neither, or
-/// when the label names options on more than one question.
-fn fast_path(question: &DesktopPendingQuestion, words: &[String]) -> Option<ModelAnswer> {
-    if words.is_empty() {
-        return None;
-    }
-    let mut named = question.questions.iter().enumerate().flat_map(|(at, q)| {
-        q.options
-            .iter()
-            .filter(|option| spoken_words(&option.label) == words)
-            .map(move |option| (at, option.index))
-    });
-    if let Some((at, index)) = named.next() {
-        return named
-            .next()
-            .is_none()
-            .then(|| ModelAnswer::answer(at as i64, &[i64::from(index)]));
-    }
-    if let [only] = question.questions.as_slice()
-        && let Some(ordinal) = ordinal(words)
-    {
-        let at = ordinal.index(only.options.len())?;
-        return Some(ModelAnswer::answer(0, &[i64::from(only.options[at].index)]));
-    }
-    None
-}
-
-/// A model's (or the fast path's) answer, validated and merged into `form`.
+/// A model's (or [`match_options`]'s) answer, validated and merged into `form`.
 ///
 /// `dropped` are the selections [`ground`] took out for borrowing another
 /// question's words or citing a fragment of its evidence. They are validated
@@ -827,17 +825,23 @@ fn single_option<'a>(
     }
 }
 
-/// The countdown line for a complete form: "Allow once — touch x",
-/// "Deny — …", "Always allow — {scope}", or "Answer — Colour: Red; Size: Large".
+/// The countdown line for a complete form. It names the option chosen as the
+/// agent shows it (PR #1698), so a misheard choice can be called off before
+/// it is sent: "“Yes” (allow once) — touch x", "“No” (deny) — …", "“Yes, and
+/// don't ask again” (always allow) — {scope}", or "Answer — Colour: Red;
+/// Size: Large".
 pub fn countdown_line(question: &DesktopPendingQuestion, form: &[Selection]) -> String {
     if let Some(option) = single_option(question, form) {
+        let named = |role: &str, about: String| {
+            format!("\u{201c}{}\u{201d} ({role}) — {about}", option.label)
+        };
         match option.role.as_str() {
-            "allow_once" => return format!("Allow once — {}", what(question)),
-            "deny" => return format!("Deny — {}", what(question)),
+            "allow_once" => return named("allow once", what(question)),
+            "deny" => return named("deny", what(question)),
             "allow_always" => {
-                return format!(
-                    "Always allow — {}",
-                    option.scope.clone().unwrap_or_else(|| what(question))
+                return named(
+                    "always allow",
+                    option.scope.clone().unwrap_or_else(|| what(question)),
                 );
             }
             _ => {}
@@ -885,12 +889,12 @@ fn progress_line(
     form: &[Selection],
     awaiting_text: Option<TextSlot>,
 ) -> String {
-    let left: Vec<&str> = question
+    let left: Vec<&DesktopQuestion> = question
         .questions
         .iter()
         .enumerate()
         .filter(|(at, _)| !form.iter().any(|s| s.question_index == *at as u32))
-        .map(|(_, q)| question_name(q))
+        .map(|(_, q)| q)
         .collect();
     let mut line = if form.is_empty() {
         "Nothing answered yet".to_string()
@@ -906,28 +910,44 @@ fn progress_line(
             ". Say the words for \u{201c}{}\u{201d}",
             option.label
         ));
-    } else if !left.is_empty() {
-        line.push_str(&format!(". Still to answer: {}", left.join("; ")));
+    } else if let Some((next, rest)) = left.split_first() {
+        // The next question with its options numbered: the agent shows only
+        // the question it is on, so these are not on screen yet.
+        let options = numbered_options(next);
+        let mut names = vec![if options.is_empty() {
+            question_name(next).to_string()
+        } else {
+            format!("{} ({options})", question_name(next))
+        }];
+        names.extend(rest.iter().map(|q| question_name(q).to_string()));
+        line.push_str(&format!(". Still to answer: {}", names.join("; ")));
     }
     line.push('.');
     line
 }
 
-/// "I couldn't match that to the options: …", naming what can be said.
+/// "I couldn't match that to the options: 1 “Yes”, 3 “No”.", naming what
+/// can be said, with the numbers the agent draws — per question on a form.
 fn couldnt_match(question: &DesktopPendingQuestion) -> String {
-    let labels: Vec<&str> = question
+    let lists: Vec<String> = question
         .questions
         .iter()
-        .flat_map(|q| q.options.iter())
-        .filter(|option| option.answerable)
-        .map(|option| option.label.as_str())
+        .map(|q| (q, numbered_options(q)))
+        .filter(|(_, options)| !options.is_empty())
+        .map(|(q, options)| {
+            if question.questions.len() == 1 {
+                options
+            } else {
+                format!("{}: {options}", question_name(q))
+            }
+        })
         .collect();
-    if labels.is_empty() {
+    if lists.is_empty() {
         return "That question has to be answered by keyboard.".to_string();
     }
     format!(
         "I couldn't match that to the options: {}.",
-        labels.join(", ")
+        lists.join("; ")
     )
 }
 

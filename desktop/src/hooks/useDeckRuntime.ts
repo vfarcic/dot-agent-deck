@@ -407,7 +407,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const answerVoiceNumber = useCallback((utterance: string, heard: VoiceNumberedListDto, generation: number) => bridge.answerVoiceNumber(utterance, heard, generation), [bridge]);
-  const resolveVoiceQuestion = useCallback((target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto) => bridge.resolveVoiceQuestion(target, utterance, form, awaitingText), [bridge]);
+  const resolveVoiceQuestion = useCallback((target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly?: boolean) => bridge.resolveVoiceQuestion(target, utterance, form, awaitingText, localOnly), [bridge]);
   const sendVoiceAnswer = useCallback((target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string) => bridge.sendVoiceAnswer(target, form, confirmedAlways, lease), [bridge]);
   const cancelVoiceAnswer = useCallback((lease: string) => bridge.cancelVoiceAnswer(lease), [bridge]);
   const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);

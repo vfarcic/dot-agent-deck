@@ -832,7 +832,7 @@ export function resolveFixtureQuestion(question: PendingQuestionDto | undefined,
   const option = role && question?.questions.length === 1 ? question.questions[0].options.find((candidate) => candidate.role === role && candidate.answerable) : undefined;
   if (!question || !option) return notAnswer;
   const what = question.tool?.detail ?? question.tool?.name ?? question.questions[0].prompt;
-  const summary = role === "allow_once" ? `Allow once — ${what}` : role === "deny" ? `Deny — ${what}` : `Always allow — ${option.scope ?? what}`;
+  const summary = role === "allow_once" ? `“${option.label}” (allow once) — ${what}` : role === "deny" ? `“${option.label}” (deny) — ${what}` : `“${option.label}” (always allow) — ${option.scope ?? what}`;
   return {
     verdict: {
       kind: "answered",

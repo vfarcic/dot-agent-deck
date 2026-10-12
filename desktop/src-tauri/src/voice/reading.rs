@@ -163,8 +163,10 @@ pub enum TurnEvent {
     Failed { reply: String },
     /// The agent is asking permission. `wants` is what it is asking to do, in
     /// one line — "run cargo publish", "Bash: cargo publish" — and may be empty
-    /// when the agent did not say.
-    Permission { wants: String },
+    /// when the agent did not say. `options` is how to answer it by voice —
+    /// " Say 1 for Yes, or 3 for No." ([`options_sentence`]) — or empty when
+    /// the event carries no question voice can answer.
+    Permission { wants: String, options: String },
     /// A notification that the agent is waiting on a permission prompt, with
     /// no question of its own: Claude Code's `permission_prompt`. Said like a
     /// [`TurnEvent::Permission`], except when it describes a prompt already
@@ -361,6 +363,10 @@ pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent
     match event.event_type {
         EventType::PermissionRequest => Some(TurnEvent::Permission {
             wants: permission_wants(event),
+            options: event
+                .question()
+                .map(|question| options_sentence(&question))
+                .unwrap_or_default(),
         }),
         EventType::WaitingForInput => event
             .metadata
@@ -369,7 +375,11 @@ pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent
             .then(|| {
                 let wants = permission_wants(event);
                 if event.metadata.contains_key(QUESTION_METADATA_KEY) {
-                    TurnEvent::Permission { wants }
+                    let options = event
+                        .question()
+                        .map(|question| options_sentence(&question))
+                        .unwrap_or_default();
+                    TurnEvent::Permission { wants, options }
                 } else {
                     TurnEvent::PermissionNotice { wants }
                 }
@@ -833,6 +843,64 @@ pub fn permission_sentence(agent: &str, wants: &str) -> String {
     )
 }
 
+/// The most options [`options_sentence`] reads out; the rest are counted.
+pub const MAX_OPTIONS_READ: usize = 6;
+/// The longest option label [`options_sentence`] reads out.
+const MAX_OPTION_LABEL_CHARS: usize = 120;
+
+/// PR #1698: how to answer a prompt by voice, read after it so the user knows
+/// what to say — " Say 1 for Yes, or 3 for No." — with the numbers the agent
+/// draws beside its options. Only the options voice can pick are read, so a
+/// number skipped is one to answer by keyboard. On a form, the first
+/// question's: " First, Colour: say 1 for Red, 2 for Green, or 3 for Blue."
+/// Empty when voice can answer none of them.
+pub fn options_sentence(question: &dot_agent_deck::question::PendingQuestion) -> String {
+    use dot_agent_deck::question::AnswerChannel;
+    if !matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys) {
+        return String::new();
+    }
+    let Some(first) = question.questions.first() else {
+        return String::new();
+    };
+    let options: Vec<String> = first
+        .options
+        .iter()
+        .filter(|option| option.answerable())
+        .map(|option| {
+            let label = one_line(&option.label, MAX_OPTION_LABEL_CHARS);
+            format!(
+                "{} for {}",
+                option.index,
+                label.trim_end_matches(['.', ' '])
+            )
+        })
+        .collect();
+    if options.is_empty() {
+        return String::new();
+    }
+    let read: Vec<String> = options.iter().take(MAX_OPTIONS_READ).cloned().collect();
+    let more = options.len() - read.len();
+    let list = if more > 0 {
+        format!("{}, or one of {more} more", read.join("; "))
+    } else {
+        match read.as_slice() {
+            [only] => only.clone(),
+            [first, second] => format!("{first} or {second}"),
+            [init @ .., last] => format!("{}; or {last}", init.join("; ")),
+            [] => String::new(),
+        }
+    };
+    if question.questions.len() > 1 {
+        let name = first.header.as_deref().unwrap_or(&first.prompt);
+        format!(
+            " First, {}: say {list}.",
+            one_line(name, MAX_OPTION_LABEL_CHARS)
+        )
+    } else {
+        format!(" Say {list}.")
+    }
+}
+
 /// [`permission_sentence`] without the agent's name: "Asking for permission:
 /// run cargo publish."
 pub fn bare_permission_sentence(wants: &str) -> String {
@@ -866,13 +934,16 @@ pub fn bare_blocked_sentence(cause: BlockCause) -> String {
 /// The sentence for an alert, both ways.
 fn alert_sentence(agent: &str, event: &TurnEvent) -> Option<ReadingSentence> {
     Some(match event {
-        TurnEvent::Permission { wants } | TurnEvent::PermissionNotice { wants } => {
-            ReadingSentence {
-                kind: ReadingSentenceKind::Permission,
-                text: permission_sentence(agent, wants),
-                bare: bare_permission_sentence(wants),
-            }
-        }
+        TurnEvent::Permission { wants, options } => ReadingSentence {
+            kind: ReadingSentenceKind::Permission,
+            text: format!("{}{options}", permission_sentence(agent, wants)),
+            bare: format!("{}{options}", bare_permission_sentence(wants)),
+        },
+        TurnEvent::PermissionNotice { wants } => ReadingSentence {
+            kind: ReadingSentenceKind::Permission,
+            text: permission_sentence(agent, wants),
+            bare: bare_permission_sentence(wants),
+        },
         TurnEvent::PermissionAnswered => {
             ReadingSentence::same(ReadingSentenceKind::PermissionAnswered, String::new())
         }
@@ -1181,6 +1252,7 @@ mod tests {
             "coder",
             TurnEvent::Permission {
                 wants: "run cargo publish".to_string(),
+                options: String::new(),
             },
             &summariser,
         )
@@ -1501,6 +1573,87 @@ mod tests {
         sentences
     }
 
+    /// Scenario (question/desktop/028, PR #1698): with reading on, Claude Code
+    /// asks to run `git push origin main` and draws Yes, "Yes, and switch to
+    /// auto mode" and No. The announcement ends by saying how to answer by
+    /// voice, with the numbers on screen: "Say 1 for Yes or 3 for No." — the
+    /// keyboard-only auto-mode option is not offered. A Codex approval reads
+    /// its three options, an OpenCode form reads its first question's, and a
+    /// question voice cannot answer reads none.
+    #[tokio::test]
+    async fn question_desktop_028_a_prompt_is_announced_with_the_numbers_to_say() {
+        let fixture = |name: &str| -> serde_json::Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/agent-questions")
+                .join(name);
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let payload = fixture("claude-permission-bash-auto-mode.json");
+        let claude = dot_agent_deck::question::claude_permission_request(
+            "q-claude".into(),
+            "Bash",
+            payload.get("tool_input"),
+            Some("git push origin main".into()),
+            None,
+            payload["permission_mode"].as_str(),
+            1,
+            None,
+        )
+        .question;
+        let mut event = status("a", EventType::PermissionRequest);
+        event.tool_name = Some("Bash".to_string());
+        event.tool_detail = Some("git push origin main".to_string());
+        event.set_question(&claude);
+        let announced = announce(
+            "coder",
+            status_turn_event(&event, "a").expect("a permission prompt"),
+            &Recording::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            announced.text,
+            "The coder is asking for permission: Bash: git push origin main. Say 1 for Yes or 3 for No."
+        );
+        assert_eq!(
+            announced.bare,
+            "Asking for permission: Bash: git push origin main. Say 1 for Yes or 3 for No."
+        );
+
+        let codex = dot_agent_deck::question::codex_permission_request(
+            "q-codex".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        assert_eq!(
+            options_sentence(&codex),
+            " Say 1 for Yes, proceed; 2 for Yes, and don't ask again for commands that start with the prefix shown; or 3 for No, and tell Codex what to do differently."
+        );
+        let form = dot_agent_deck::question::opencode_question_asked(
+            &fixture("opencode-question-asked.json"),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            options_sentence(&form),
+            " First, Colour: say 1 for Red; 2 for Green; 3 for Blue; or 4 for Type your own answer."
+        );
+        let mut keyboard = claude.clone();
+        keyboard.channel = dot_agent_deck::question::AnswerChannel::Unsupported;
+        assert_eq!(options_sentence(&keyboard), "");
+        // A notice with no question of its own reads no options.
+        let notice = delayed_permission_notice();
+        assert_eq!(
+            status_turn_event(&notice, "a"),
+            Some(TurnEvent::PermissionNotice {
+                wants: String::new()
+            })
+        );
+    }
+
     fn delayed_permission_notice() -> AgentEvent {
         let mut notice = status("a", EventType::WaitingForInput);
         notice.metadata.insert(
@@ -1519,6 +1672,7 @@ mod tests {
             "Bash",
             None,
             Some("touch x".into()),
+            None,
             None,
             1,
             None,
@@ -1558,7 +1712,7 @@ mod tests {
                 .iter()
                 .map(|s| s["text"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["The tester is asking for permission: Bash: touch x."],
+            ["The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No."],
             "the delayed permission_prompt must not announce the same pending prompt again"
         );
 
@@ -1583,8 +1737,8 @@ mod tests {
                 .map(|s| s["text"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "The tester is asking for permission: Bash: touch x.",
-                "The tester is asking for permission: Bash: touch y."
+                "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
+                "The tester is asking for permission: Bash: touch y. Say 1 for Yes or 2 for No."
             ],
             "two announced prompts owe two notices; neither delayed notice may speak"
         );
@@ -1614,7 +1768,7 @@ mod tests {
                 .map(|s| s["text"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "The tester is asking for permission: Bash: touch x.",
+                "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
                 "The tester is asking for permission: clock-skewed notice.",
             ],
             "a negative timestamp gap announces the notice without paying the hook's debt"
@@ -1636,7 +1790,7 @@ mod tests {
         assert_eq!(sentences.len(), 1, "the +6 second notice is absorbed");
         assert_eq!(
             sentences[0]["text"],
-            "The tester is asking for permission: Bash: touch x."
+            "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No."
         );
     }
 
@@ -1692,7 +1846,9 @@ mod tests {
                     .filter(|s| s["kind"] == "permission")
                     .map(|s| s["text"].as_str().unwrap())
                     .collect::<Vec<_>>();
-                let mut expected = vec!["The tester is asking for permission: Bash: touch x."];
+                let mut expected = vec![
+                    "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
+                ];
                 if notice_seconds > 30 {
                     expected.push("The tester is asking for permission: new Q2.");
                 }
@@ -1754,7 +1910,8 @@ mod tests {
         assert_eq!(
             status_turn_event(&permission, "a"),
             Some(TurnEvent::Permission {
-                wants: "Bash: cargo publish".to_string()
+                wants: "Bash: cargo publish".to_string(),
+                options: String::new(),
             })
         );
         assert_eq!(status_turn_event(&permission, "b"), None, "another agent's");
@@ -1996,7 +2153,8 @@ mod tests {
                     reply: "All tests pass.".to_string()
                 },
                 TurnEvent::Permission {
-                    wants: "Bash".to_string()
+                    wants: "Bash".to_string(),
+                    options: String::new(),
                 },
             ]
         );
@@ -2132,7 +2290,8 @@ mod tests {
         assert_eq!(
             heard,
             TurnEvent::Permission {
-                wants: "Bash".to_string()
+                wants: "Bash".to_string(),
+                options: String::new(),
             }
         );
         deck.abort();
@@ -2207,6 +2366,7 @@ mod tests {
         .unwrap();
         send.send(TurnEvent::Permission {
             wants: "run cargo publish".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -2241,6 +2401,7 @@ mod tests {
         .unwrap();
         send.send(TurnEvent::Permission {
             wants: "two".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -2581,6 +2742,7 @@ mod tests {
         let (send, events) = mpsc::channel(8);
         send.send(TurnEvent::Permission {
             wants: "run cargo publish".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -2685,6 +2847,7 @@ mod tests {
         for prompt in 0..100 {
             send.send(TurnEvent::Permission {
                 wants: format!("prompt {prompt}"),
+                options: String::new(),
             })
             .await
             .unwrap();

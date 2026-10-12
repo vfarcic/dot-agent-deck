@@ -143,7 +143,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "voice-question",
-        description: "The desktop agent pane with a Codex command approval waiting and \"yes\" heard: the voice row shows the answer, Allow once and the command, with its five-second countdown and Cancel.",
+        description: "The desktop agent pane with a Codex command approval waiting and \"go ahead\" heard: the voice row shows the answer, naming the option (Yes, proceed) and the command, with its five-second countdown and Cancel.",
         clients: &[Client::Desktop],
     },
     Scenario {

@@ -6,7 +6,8 @@
  *
  * Every sentence the user reads comes from Rust (`voice/question.rs`), except
  * the countdown's own called-off sentences below, which are about state only
- * the webview holds.
+ * the webview holds, and the options listed in a refusal to type or press a
+ * key while the question waits ({@link questionOptionsToSay}).
  */
 
 /** One option of a pending question, as the desktop crate projects it. Every text field is the agent's own, already scrubbed. */
@@ -82,6 +83,20 @@ export type AnswerOutcomeDto = {
 
 /** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id — and revision, audit A4 — it saw. */
 export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number };
+
+/**
+ * PR #1698 — the options of `question` voice can pick, with the numbers the
+ * agent draws beside them — "1 “Yes”, 3 “No”" — for the question a spoken
+ * number or label goes to: the first one `form` has not answered (the only
+ * one, for a single question). Empty when voice can pick none of them.
+ */
+export function questionOptionsToSay(question: PendingQuestionDto, form: QuestionSelectionDto[] = []): string {
+  const current = question.questions.length === 1
+    ? question.questions[0]
+    : question.questions.find((_, at) => !form.some((selection) => selection.questionIndex === at));
+  if (!current) return "";
+  return current.options.filter((option) => option.answerable).map((option) => `${option.index} “${option.label}”`).join(", ");
+}
 
 /** The countdown was running for a question that is no longer the one waiting. */
 export const QUESTION_MOVED_ON = "That question was answered or changed before I could send it — nothing was sent.";

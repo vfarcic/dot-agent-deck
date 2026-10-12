@@ -78,8 +78,8 @@ function questionAnswers(said: string): QuestionResultDto {
     resolveMs: 12,
     backend: "stub",
   });
-  if (said === "yes") return answered([{ questionIndex: 0, optionIndices: [1] }], "Allow once — touch x");
-  if (said === "always") return answered([{ questionIndex: 0, optionIndices: [2] }], "Always allow — commands matching `touch *`", ALWAYS);
+  if (said === "yes") return answered([{ questionIndex: 0, optionIndices: [1] }], "“Yes” (allow once) — touch x");
+  if (said === "always") return answered([{ questionIndex: 0, optionIndices: [2] }], "“Yes, and don't ask again” (always allow) — commands matching `touch *`", ALWAYS);
   return { verdict: { kind: "not_answer" }, resolveMs: 12, backend: "stub" };
 }
 
@@ -165,7 +165,7 @@ describe("answering an agent's question by voice", () => {
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Confirm" }));
     await flush();
     expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(screen.getByTestId("voice-question")).toHaveTextContent("Always allow — commands matching `touch *` — sending in 5 s.");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("“Yes, and don't ask again” (always allow) — commands matching `touch *` — sending in 5 s.");
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
@@ -191,7 +191,7 @@ describe("answering an agent's question by voice", () => {
 
   /**
    * Scenario (question/desktop/006): the user says "yes" and the countdown to
-   * "Allow once — touch x" starts. Before it runs out the agent's question
+   * "“Yes” (allow once) — touch x" starts. Before it runs out the agent's question
    * changes (answered by keyboard, or replaced), so the countdown stops and the
    * panel says nothing was sent. Each refusal the deck can send back is shown
    * as its own plain sentence, and an utterance that is not an answer goes on
@@ -204,7 +204,7 @@ describe("answering an agent's question by voice", () => {
     await turnOnVoice();
 
     await speak(voice, "yes");
-    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s.");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("“Yes” (allow once) — touch x — sending in 5 s.");
     await waitOut(2_000);
     view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane({ ...PERMISSION, id: "q-2" })} selectedDeckId="local" />);
     await flush();
@@ -510,7 +510,7 @@ describe("answering an agent's question by voice", () => {
     expect(summary.length).toBeGreaterThan(240);
     resolveVoiceQuestion.mockImplementation(async (_target: VoiceQuestionTarget, utterance: string) => ({
       verdict: utterance === "always"
-        ? { kind: "answered", form: [{ questionIndex: 0, optionIndices: [2] }], complete: true, summary: `Always allow — ${scope}`, always }
+        ? { kind: "answered", form: [{ questionIndex: 0, optionIndices: [2] }], complete: true, summary: `“Yes, and don't ask again” (always allow) — ${scope}`, always }
         : { kind: "answered", form: [{ questionIndex: 0, optionIndices: [1] }], complete: true, summary },
       resolveMs: 12,
       backend: "stub",
@@ -524,7 +524,7 @@ describe("answering an agent's question by voice", () => {
     expect(dialog).not.toHaveTextContent("…");
     fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
     await flush();
-    expect(screen.getByTestId("voice-question")).toHaveTextContent(`Always allow — ${scope} — sending in 5 s.`);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(`“Yes, and don't ask again” (always allow) — ${scope} — sending in 5 s.`);
     fireEvent.click(screen.getByTestId("voice-question-cancel"));
     await flush();
 
@@ -641,7 +641,7 @@ describe("answering an agent's question by voice", () => {
     await turnOnVoice();
 
     await speak(voice, "what time is it");
-    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s.");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("“Yes” (allow once) — touch x — sending in 5 s.");
     fireEvent.click(screen.getByTestId("voice-question-cancel"));
     await flush();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_ANSWER_CANCELLED);
@@ -649,9 +649,9 @@ describe("answering an agent's question by voice", () => {
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
 
     await speak(voice, "no don't run that");
-    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s.");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("“Yes” (allow once) — touch x — sending in 5 s.");
     await speak(voice, "cancel");
-    expect(screen.getByTestId("voice-question")).toHaveTextContent(`Allow once — touch x${QUESTION_COUNTDOWN_STOPPED}`);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(`“Yes” (allow once) — touch x${QUESTION_COUNTDOWN_STOPPED}`);
     await waitOut(VOICE_DICTATION_SEND_MS + 1_000);
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
   });
