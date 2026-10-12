@@ -899,8 +899,9 @@ fn loggable_env_value(raw: &str) -> String {
 /// documented "values above the cap are capped": an absurd number is a number,
 /// and the honest reading of it is "as long as you are allowed to ask for".
 /// Every caller passes a compile-time cap of at most 600 s (the readiness
-/// buffer and no-event window at 30 s, the waiting-notice debounce and the
-/// #544 draft-defer cap at 600 s), so the clamped result always fits in `u64`.
+/// buffer and no-event window at 30 s, the daemon start budget at 300 s, the
+/// waiting-notice debounce and the #544 draft-defer cap at 600 s), so the
+/// clamped result always fits in `u64`.
 pub(crate) fn parse_bounded_ms_override(
     var: &str,
     raw: &str,

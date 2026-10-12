@@ -62,6 +62,43 @@ use crate::daemon_client::LocalEndpoint;
 pub const DAEMON_START_POLL_TIMEOUT: Duration =
     crate::login_shell::CAPTURE_TIMEOUT.saturating_add(Duration::from_secs(5));
 
+/// Widens [`DAEMON_START_POLL_TIMEOUT`] for one launch, as an integer number of
+/// **milliseconds**. Read by [`ensure_external_daemon_or_die`] at use time.
+///
+/// It exists for the e2e harness, which pins it to a load-scaled multiple of
+/// the default on every `TuiDeck` launch. The pre-bind work the default is
+/// derived from is bounded by wall-clock timeouts, but the work *between* those
+/// timeouts — exec'ing the binary, each agent's install, the daemon's own
+/// startup up to `bind` — is not, and on a box whose IO is stalled most of the
+/// time it stretches past the fixed 15 s while the daemon is still healthy.
+/// PRD #1631's `question_live_005` failed exactly that way at `io full` 70.7%:
+/// the TUI gave up with "daemon failed to start within 15000ms".
+///
+/// It can only WIDEN the wait: a value below the default is raised to it, so a
+/// pin cannot reintroduce the too-short budget the default's derivation
+/// prevents. Values above [`MAX_DAEMON_START_POLL_TIMEOUT`] are clamped and an
+/// unparseable value is ignored, each with a `warn!`.
+pub const DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS: &str = "DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS";
+
+/// Ceiling for [`DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS`]: a mistyped value
+/// must not leave a TUI waiting for many minutes on a daemon that never binds.
+pub const MAX_DAEMON_START_POLL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The start budget for one launch: [`DAEMON_START_POLL_TIMEOUT`], widened by
+/// [`DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS`] when `raw` carries it.
+fn daemon_start_poll_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| {
+        crate::state::parse_bounded_ms_override(
+            DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS,
+            raw,
+            MAX_DAEMON_START_POLL_TIMEOUT,
+        )
+    })
+    .map_or(DAEMON_START_POLL_TIMEOUT, |pinned| {
+        pinned.max(DAEMON_START_POLL_TIMEOUT)
+    })
+}
+
 /// How often [`ensure_external_daemon_or_die`] re-checks for the endpoint.
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -410,16 +447,22 @@ pub fn via_daemon_enabled() -> bool {
 /// stderr and exits nonzero — there is no in-process fallback). Polling uses
 /// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
 /// former's docs for why the budget is derived from the daemon's own pre-bind
-/// work rather than hardcoded.
+/// work rather than hardcoded. [`DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS`] can
+/// widen it.
 pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
+    let poll_timeout = daemon_start_poll_timeout(
+        std::env::var(DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS)
+            .ok()
+            .as_deref(),
+    );
     ensure_daemon_running(
         endpoint,
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
         DAEMON_START_POLL_INTERVAL,
-        DAEMON_START_POLL_TIMEOUT,
+        poll_timeout,
     )
     .await
 }
@@ -453,6 +496,35 @@ mod tests {
             crate::login_shell::CAPTURE_TIMEOUT,
             crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
         );
+    }
+
+    /// PRD #1631: the start-budget override widens the wait, never narrows it
+    /// below the default, is capped, and ignores a value it cannot parse.
+    #[test]
+    fn the_start_budget_override_only_widens_and_is_capped() {
+        assert_eq!(daemon_start_poll_timeout(None), DAEMON_START_POLL_TIMEOUT);
+        assert_eq!(
+            daemon_start_poll_timeout(Some("60000")),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            daemon_start_poll_timeout(Some("1000")),
+            DAEMON_START_POLL_TIMEOUT,
+            "a pin below the default must not shorten the wait"
+        );
+        assert_eq!(
+            daemon_start_poll_timeout(Some("0")),
+            DAEMON_START_POLL_TIMEOUT
+        );
+        assert_eq!(
+            daemon_start_poll_timeout(Some("99999999999999999999999")),
+            MAX_DAEMON_START_POLL_TIMEOUT
+        );
+        assert_eq!(
+            daemon_start_poll_timeout(Some("fifteen")),
+            DAEMON_START_POLL_TIMEOUT
+        );
+        assert!(MAX_DAEMON_START_POLL_TIMEOUT > DAEMON_START_POLL_TIMEOUT);
     }
 
     /// Issue #1121 round two, B6: a non-primary endpoint — the pre-#1121

@@ -1368,6 +1368,18 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
+        // PRD #1631: the deck lazy-spawns its daemon and waits a fixed 15 s for
+        // it to bind (`DAEMON_START_POLL_TIMEOUT`). That wait is a boot, so it
+        // gets the load scaling `DaemonProc`'s own boot wait already has:
+        // `question_live_005` failed at `io full` 70.7% with "daemon failed to
+        // start within 15000ms". Measured when this deck launches, and pinned
+        // before the `with_env` layer so a test can still set its own.
+        final_env.insert(
+            dot_agent_deck::daemon_attach::DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS.into(),
+            load_scaled(dot_agent_deck::daemon_attach::DAEMON_START_POLL_TIMEOUT)
+                .as_millis()
+                .to_string(),
+        );
         // PRD #1487: `env_clear` above drops the test runner's own signal, so
         // pin the agent-config containment contract explicitly — every config
         // writer in the deck, its daemon and their children refuses a
