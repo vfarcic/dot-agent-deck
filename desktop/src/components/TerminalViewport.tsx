@@ -21,13 +21,18 @@ import { keepSelectionAcrossResize } from "../lib/terminalSelection";
  * overtaken before its turn would only be overwritten, and keeping one bounds
  * what a stream of copies can hold. A write that has not settled after
  * `CLIPBOARD_WRITE_TIMEOUT_MS` stops holding up the next, so a platform call
- * that never returns cannot hold a pending copy forever. A write the platform
- * refuses has no better outcome than the unchanged clipboard it leaves, so a
- * failure ends that write and not the queue.
+ * that never returns cannot hold a pending copy forever. Such a write is not
+ * cancelled, though, so if it does finish after a newer copy was written, its
+ * older text would be left on the clipboard: when it settles, the newest copy
+ * is written again. A write the platform refuses has no better outcome than
+ * the unchanged clipboard it leaves, so a failure ends that write and not the
+ * queue.
  */
 const CLIPBOARD_WRITE_TIMEOUT_MS = 5_000;
 let clipboardWriting = false;
 let pendingClipboardText: string | undefined;
+/** The text of the newest write started, which is what the clipboard should end up holding. */
+let newestClipboardText: string | undefined;
 function copyInOrder(text: string): void {
   pendingClipboardText = text;
   if (!clipboardWriting) void drainClipboardWrites();
@@ -38,14 +43,21 @@ async function drainClipboardWrites(): Promise<void> {
     while (pendingClipboardText !== undefined) {
       const text = pendingClipboardText;
       pendingClipboardText = undefined;
+      newestClipboardText = text;
+      const write = writeClipboardText(text).catch(() => undefined);
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        writeClipboardText(text).catch(() => undefined),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, CLIPBOARD_WRITE_TIMEOUT_MS);
+      const timedOut = await Promise.race([
+        write.then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), CLIPBOARD_WRITE_TIMEOUT_MS);
         }),
       ]);
       clearTimeout(timer);
+      if (timedOut) {
+        void write.then(() => {
+          if (newestClipboardText !== undefined && newestClipboardText !== text) copyInOrder(newestClipboardText);
+        });
+      }
     }
   } finally {
     clipboardWriting = false;
