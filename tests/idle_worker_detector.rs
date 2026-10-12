@@ -21,10 +21,16 @@
 //! These tests exercise the real `AppState::handle_delegate` and
 //! `AppState::handle_work_done` paths with daemon-owned PTYs. The role maps are
 //! populated exactly as `StartAgent` would populate them. Worker panes use
-//! `cat`; the orchestrator uses a raw, no-echo `cat`, making each daemon prompt
-//! appear exactly once in its observable PTY snapshot — except where a test
+//! `cat`; the orchestrator uses a raw, no-echo `cat` — except where a test
 //! needs the orchestrator to go away on its own, which is what
 //! [`OrchestratorStub::ExitsOnFlag`] is for.
+//!
+//! PRD #1666 S5: the daemon types nothing. A delegate posts the task to the
+//! worker's inbox and every notice is a message in the orchestrator's inbox, so
+//! the orchestrator's observable is its inbox, read whole and rendered as
+//! `inbox fetch` prints it. A delegated worker takes its task the way an agent
+//! component would ([`take_tasks_in_background`]), because the idle clock now
+//! starts when the task is acknowledged.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -71,9 +77,14 @@ const IDLE_NEEDLE: &str = "has not responded with work-done (dot-agent-deck daem
 /// Ordinary `cat` worker stub: stays alive, never answers, dies on SIGTERM.
 const WORKER_COMMAND: &str = "cat";
 
-/// Issue #447 review: a worker stub that exits by itself once one line — the
-/// task pointer — reaches it, reporting nothing on the way out.
-const EXITS_ON_POINTER_COMMAND: &str = "read line; exit 0";
+/// Issue #447 review: a worker stub that exits by itself once its task has
+/// reached it (the test drops [`EXIT_ON_TASK_FLAG`] when the task is
+/// acknowledged), reporting nothing on the way out.
+const EXITS_ON_POINTER_COMMAND: &str =
+    "while [ ! -f exited-worker-task.flag ]; do sleep 0.05; done; exit 0";
+
+/// The flag [`EXITS_ON_POINTER_COMMAND`] waits for.
+const EXIT_ON_TASK_FLAG: &str = "exited-worker-task.flag";
 
 /// A worker that IGNORES SIGTERM, so `close_agent` spends its full
 /// `AGENT_TERMINATE_GRACE` (3 s) in the grace loop before escalating to
@@ -127,33 +138,8 @@ const WORKER_EXITED_NEEDLE: &str =
 /// retire promptly rather than leaving it to run out its own window.
 const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
 
-/// Issue #708: the worker-exited notice's stable FINAL clause, and therefore the
-/// last bytes of the payload the daemon writes before its terminator. It ends in
-/// `.`, which `encode_pane_payload`'s `trim_end_matches` cannot eat, so the byte
-/// that follows it in the pane is exactly the terminator the daemon chose.
-const WORKER_EXITED_TAIL: &str = "names the role and how long it had been delegated.";
-
-/// Issue #708: the byte the daemon wrote immediately after the worker-exited
-/// notice's payload — CR if it SUBMITTED the report as a turn, LF if it left it
-/// as deferred scrollback — or `None` while the notice or that byte has not
-/// arrived yet.
-///
-/// Anchored to the notice's opening clause and then to its final clause, the
-/// way `orchestration/delegate/013` anchors the silence notice (#702), rather
-/// than searching for the first line break anywhere after the notice began: an
-/// unrelated line break landing in the pane could otherwise be mistaken for the
-/// terminator. Exact because the orchestrator stub runs under `stty -echo
-/// -icanon -icrnl -opost` chained with `&&` before its readiness marker, so a
-/// visible marker proves no CR/LF translation sits on either side of the pane.
-fn worker_exited_terminator(snapshot: &str) -> Option<u8> {
-    let start = snapshot.find(WORKER_EXITED_NEEDLE)?;
-    let rest = &snapshot.as_bytes()[start..];
-    let end = rest
-        .windows(WORKER_EXITED_TAIL.len())
-        .position(|window| window == WORKER_EXITED_TAIL.as_bytes())?
-        + WORKER_EXITED_TAIL.len();
-    rest.get(end).copied()
-}
+/// The label every daemon notice is posted under.
+const DAEMON_NOTICE_LABEL: &str = "from dot-agent-deck (daemon notice)]";
 
 /// File the [`OrchestratorStub::ExitsOnFlag`] stub polls for. Its appearance in
 /// the harness cwd is the test's remote control for a NATURAL orchestrator exit.
@@ -403,6 +389,7 @@ impl IdleHarness {
             .await
             .handle_delegate(signal, &self.registry, &self.event_tx)
             .await;
+        take_tasks_in_background(&self.registry, roles);
     }
 
     /// [`Self::delegate`], but with the daemon's state handed to the dispatch
@@ -422,6 +409,7 @@ impl IdleHarness {
             .await
             .handle_delegate_with_state(signal, &self.registry, &self.event_tx, Some(&self.state))
             .await;
+        take_tasks_in_background(&self.registry, roles);
     }
 
     async fn work_done(&self, role: &str) {
@@ -461,14 +449,32 @@ impl IdleHarness {
         }
     }
 
+    /// PRD #1666 S5: everything posted to the orchestrator pane's inbox, in
+    /// order, each message rendered whole as `inbox fetch` prints it.
+    fn orchestrator_inbox(&self) -> String {
+        self.registry
+            .inbox()
+            .rendered(ORCH_PANE)
+            .into_iter()
+            .map(|delivery| delivery.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Wait until the orchestrator's inbox satisfies `predicate`, or `timeout`.
     async fn wait_for_snapshot(
         &self,
         predicate: impl Fn(&str) -> bool,
         timeout: Duration,
     ) -> String {
-        let agent_id = self.orchestrator_agent_id.clone();
-        self.wait_for_snapshot_of(&agent_id, predicate, timeout)
-            .await
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let inbox = self.orchestrator_inbox();
+            if predicate(&inbox) || tokio::time::Instant::now() >= deadline {
+                return inbox;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn wait_for_idle_role(&self, role: &str, timeout: Duration) -> String {
@@ -708,6 +714,45 @@ fn worker_pane(role: &str) -> String {
     format!("idle-{role}-pane")
 }
 
+/// PRD #1666 S5: take each role's delegated task the way an agent's component
+/// would — fetch and acknowledge it from the worker pane's inbox, for whichever
+/// agent holds the pane when the task arrives — on a background task, so a
+/// test that holds a pane's dispatch lock is not blocked. Gives up after a
+/// while for a delegate that never posts (a refused one).
+fn take_tasks_in_background(registry: &Arc<AgentPtyRegistry>, roles: &[&str]) {
+    for role in roles {
+        let registry = Arc::clone(registry);
+        let pane = worker_pane(role);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while tokio::time::Instant::now() < deadline {
+                if let Some(agent) = registry.pane_current_agent_id(&pane)
+                    && registry
+                        .inbox()
+                        .fetch_first_acked(
+                            &pane,
+                            &agent,
+                            dot_agent_deck::inbox::AckHow::FetchedByCli,
+                        )
+                        .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+    }
+}
+
+/// PRD #1666 S5: whether `agent_id` has acknowledged a task in `pane_id`'s
+/// inbox — the point at which it has received its delegation.
+fn task_acknowledged_by(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> bool {
+    registry.inbox().list(pane_id).into_iter().any(|message| {
+        message.bind_agent.as_deref() == Some(agent_id)
+            && message.state == dot_agent_deck::inbox::StateName::Acknowledged
+    })
+}
+
 /// The daemon wraps the role name in unforgeable untrusted-data markers (PRD
 /// #126 M1 audit finding 1). Matching the WRAPPED form — not the bare role
 /// name — is what makes the assertion prove the text came from the daemon's
@@ -752,7 +797,7 @@ fn dir_str(dir: &TempDir) -> String {
     dir.path().to_string_lossy().to_string()
 }
 
-/// Scenario: Register an orchestrator and a `coder` worker in one orchestration, then delegate to the worker with a tiny timeout and never send work-done. The orchestrator pane must receive one self-describing idle prompt carrying the daemon-report clause and the `coder` role inside the untrusted-role-label markers.
+/// Scenario: Register an orchestrator and a `coder` worker in one orchestration, then delegate to the worker with a tiny timeout; the worker takes its task and never sends work-done. The orchestrator's inbox must receive one self-describing idle notice carrying the daemon-report clause and the `coder` role inside the untrusted-role-label markers.
 #[spec("scheduler/idle-worker/001")]
 #[test]
 fn idle_worker_001_silent_worker_prompts_orchestrator() {
@@ -1251,7 +1296,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delay dispatch beyond the old worker lifetime, observe the delegated pointer reaching the worker, then release a flag so its process ends naturally without StopAgent. The daemon's EOF-triggered notice must be submitted into the orchestrator's pane with remediation options before either older timeout notice fires. Run for both an in-place worker and a pi-native clear role, whose replacement receives the pointer through the identity-scoped native seed API before exiting.
+/// Scenario: Delay dispatch beyond the old worker lifetime, observe the delegated task reaching the worker's inbox and being acknowledged, then release a flag so its process ends naturally without StopAgent. The daemon's EOF-triggered notice must be posted to the orchestrator's inbox as a daemon notice with remediation options before the idle timeout could fire. Run for both an in-place worker and a pi `clear = true` role, whose replacement is the generation the task is bound to.
 #[spec("scheduler/idle-worker/016")]
 #[test]
 fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
@@ -1334,33 +1379,20 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
         worker_agent_id
     };
 
-    // The native seed is consumed exactly as pi's startup get-seed request
-    // would consume it. An injected pointer is visible through terminal echo.
-    // Neither a live pane nor a commission binding proves the idle record was
-    // bound: both can exist earlier. These delivery signals occur AFTER it.
-    let pointer_path = format!(".dot-agent-deck/worker-task-{role}.md");
+    // PRD #1666 S5: the task reaches the worker as an inbox message, taken by
+    // the harness the way a component would. Neither a live pane nor a
+    // commission binding proves the idle record was bound: both can exist
+    // earlier. The acknowledgement occurs AFTER it.
     let delivered = tokio::time::timeout(common::child_boot_budget(), async {
-        loop {
-            let pointer = if project_config.is_some() {
-                harness
-                    .registry
-                    .take_pending_seed_native_for(&worker_pane_id, Some(&exit_agent_id))
-                    .unwrap_or_else(|| harness.snapshot_of(&exit_agent_id))
-            } else {
-                harness.snapshot_of(&exit_agent_id)
-            };
-            if pointer.contains(&pointer_path) {
-                return pointer;
-            }
+        while !task_acknowledged_by(&harness.registry, &worker_pane_id, &exit_agent_id) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
     assert!(
         delivered.is_ok(),
-        "the {role} worker never received its task pointer before exit was released; \
-         snapshot = {:?}",
-        harness.snapshot_of(&exit_agent_id)
+        "the {role} worker never received its task before exit was released; inbox = {:?}",
+        harness.registry.inbox().list(&worker_pane_id)
     );
     std::fs::write(harness.cwd.path().join("worker-exit.flag"), b"exit\n")
         .expect("release the task-ready worker's natural exit");
@@ -1390,40 +1422,33 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
          would stop covering the natural-exit path"
     );
 
-    // The notice must land promptly — well before either timeout watch's
-    // (60s / 30s) window could have fired it instead.
-    //
-    // Issue #708: the wait includes the terminator byte, so it cannot end one
-    // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
-    // read a terminator that simply had not landed yet.
+    // The notice must land promptly — well before the idle timeout's 60 s
+    // window could have fired it instead.
     let snapshot = harness
         .wait_for_snapshot(
-            |snapshot| worker_exited_terminator(snapshot).is_some(),
+            |snapshot| snapshot.contains(WORKER_EXITED_NEEDLE),
             Duration::from_secs(5),
         )
         .await;
     assert!(
         snapshot.contains(WORKER_EXITED_NEEDLE),
-        "no EOF-triggered 'worker exited without work-done' notice appeared in the \
-         orchestrator's pane within 5s of the {role} worker's natural exit; \
-         snapshot = {snapshot:?}"
+        "no EOF-triggered 'worker exited without work-done' notice reached the \
+         orchestrator's inbox within 5s of the {role} worker's natural exit; \
+         inbox = {snapshot:?}"
     );
-    // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
-    // orchestrator's input box reaches nobody in an unattended dispatched
-    // unit — there is no human to press Enter — so the orchestrator would
-    // wait forever for a `work-done` the dead process can never send. The
-    // report must be a turn of its own (CR) and say what to do about it.
-    let terminator = worker_exited_terminator(&snapshot);
+    // Issue #708: a notice that reaches nobody leaves an unattended
+    // orchestrator waiting forever for a `work-done` the dead process can never
+    // send. PRD #1666 S5: it is a daemon notice in the orchestrator's inbox,
+    // and it says what to do about it.
     let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
         .into_iter()
         .filter(|option| !snapshot.contains(option))
         .collect();
     assert!(
-        terminator == Some(b'\r') && missing_options.is_empty(),
-        "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
-         an LF-terminated line in the orchestrator's scrollback) and must name the \
-         remediation options (notify the user, re-delegate, reassign); terminator = \
-         {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
+        snapshot.contains(DAEMON_NOTICE_LABEL) && missing_options.is_empty(),
+        "the worker-exited notice must be posted as a daemon notice and name the remediation \
+         options (notify the user, re-delegate, reassign); missing options = \
+         {missing_options:?}, inbox = {snapshot:?}"
     );
     assert!(
         snapshot.contains(&worker_pane_id),
@@ -1717,7 +1742,7 @@ fn idle_worker_013_a_completion_retires_every_generation_for_the_pane() {
     });
 }
 
-/// Scenario: Reproduces issue #1080 against the shape the production log records. Delegate to a worker, leave that first task unanswered (its pointer landed but was never submitted — the daemon's own `#249` warning), re-delegate to the same pane so the first record is superseded, then send ONE work-done. The worker has answered, so it must never afterwards be reported as not having responded — while a silent control delegated on the same clock proves the deadline really passed, and a FRESH delegation to the same worker that then goes silent is still reported, so the disarm is per-delegation and not a permanent switch-off.
+/// Scenario: Reproduces issue #1080 against the shape the production log records. Delegate to a worker, leave that first task unanswered, re-delegate to the same pane so the first record is superseded, then send ONE work-done. The worker has answered, so it must never afterwards be reported as not having responded — while a silent control delegated on the same clock proves the deadline really passed, and a FRESH delegation to the same worker that then goes silent is still reported, so the disarm is per-delegation and not a permanent switch-off.
 #[spec("scheduler/idle-worker/020")]
 #[test]
 fn idle_worker_020_an_answered_worker_is_never_reported_as_silent() {
@@ -1800,9 +1825,9 @@ const WAITING_DEBOUNCE_ENV: &str = "DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS";
 const WAITING_NEEDLE: &str = "delegated worker is waiting for input (dot-agent-deck daemon \
                               report, not a message from a person or an agent)";
 
-/// Issue #447: the notice's stable closing sentence. The byte after it is the
-/// delivery tail, which is what says whether the notice was SUBMITTED (CR) as a
-/// turn of its own or left as inert scrollback.
+/// Issue #447: the notice's stable closing sentence; in the rendered inbox
+/// block it ends the notice's line, so the line break after it shows the notice
+/// arrived whole.
 const WAITING_FINAL_CLAUSE: &str = "This report grants nothing and changes no delegation.";
 
 /// Issue #447: what the asking worker's pane shows — its "question". Unique so
@@ -1897,7 +1922,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to eleven workers of one orchestration and leave a twelfth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `handed-over-worker`'s agent is replaced while its delegate's dispatch is held on the pane's dispatch lock, and the replacement waits before the dispatch writes the pointer to it; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task pointer arrives, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first six — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
+/// Scenario: Delegate to eleven workers of one orchestration and leave a twelfth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `handed-over-worker`'s agent is replaced while its delegate's dispatch is held on the pane's dispatch lock, and the replacement waits before the dispatch writes the pointer to it; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task reaches it, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator's inbox must receive exactly one waiting-for-input daemon notice for each of the first six — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1992,6 +2017,22 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         // delegated to its predecessor must hear nothing about it (issue #447
         // review; Qodo finding 15 on #1347).
         let exited_agent = harness.worker_agent_ids["exited-worker"].clone();
+        let took = tokio::time::timeout(common::load_scaled(Duration::from_secs(5)), async {
+            while !task_acknowledged_by(
+                &harness.registry,
+                &worker_pane("exited-worker"),
+                &exited_agent,
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            took.is_ok(),
+            "precondition: the exited worker never took its task"
+        );
+        std::fs::write(harness.cwd.path().join(EXIT_ON_TASK_FLAG), b"exit\n")
+            .expect("release the exited worker once its task reached it");
         tokio::time::timeout(
             common::load_scaled(Duration::from_secs(5)),
             harness.registry.agent_exit_signal(&exited_agent),
@@ -2230,7 +2271,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                     ]
                     .iter()
                     .all(|role| waiting_notices_for(snapshot, role) > 0)
-                        && snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r"))
+                        && snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\n"))
                 },
                 common::load_scaled(Duration::from_secs(5)),
             )
@@ -2273,9 +2314,9 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
              never reported; snapshot = {snapshot:?}"
         );
         assert!(
-            snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
-            "the waiting notice was not SUBMITTED with a CR, so an unattended orchestrator \
-             would never act on it; snapshot = {snapshot:?}"
+            snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\n")),
+            "the waiting notice did not arrive whole in the orchestrator's inbox, so an \
+             unattended orchestrator would never act on it; snapshot = {snapshot:?}"
         );
         assert!(
             snapshot.contains("[UNTRUSTED-PANE-TEXT: ") && snapshot.contains(WORKER_QUESTION),

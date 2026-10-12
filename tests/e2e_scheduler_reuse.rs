@@ -36,6 +36,8 @@ mod inbox;
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_route.rs"]
 mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::time::Duration;
 
@@ -71,6 +73,19 @@ fn recorder_setup(
     (work, record_file, script.to_string_lossy().into_owned())
 }
 
+/// PRD #1666 S5: wait up to `timeout` until at least `n` messages carrying the
+/// prompt have been posted across the deck's inboxes — what a fire now does
+/// instead of typing the prompt into the recorder.
+fn wait_for_prompts(daemon: &common::DaemonProc, n: usize, timeout: Duration) -> bool {
+    common::wait_until(timeout, || {
+        view::all_messages(&daemon.attach_socket)
+            .into_iter()
+            .filter(|m| m.text.as_deref().is_some_and(|t| t.contains(PROMPT_MARKER)))
+            .count()
+            >= n
+    })
+}
+
 /// One `[[scheduled_tasks]]` block. The cron never fires on its own during the
 /// test window; tests trigger fires via run-now.
 fn task_block(name: &str, working_dir: &str, command: &str, new_tab_per_fire: bool) -> String {
@@ -87,15 +102,15 @@ fn task_block(name: &str, working_dir: &str, command: &str, new_tab_per_fire: bo
 }
 
 /// Scenario: Register a `new_tab_per_fire = false` (default) task and fire it
-/// twice via run-now (the second fire only after the first delivery is
-/// recorded, so it isn't skipped). Assert the daemon reuses one tab — the agent
-/// count never grows to 2 — and that the second fire delivers the prompt AGAIN
-/// (two recorded prompt lines), proving the prompt re-entered the existing tab.
+/// twice via run-now (the second fire only after the first prompt is posted, so
+/// it isn't skipped). Assert the daemon reuses one tab — the agent count never
+/// grows to 2 — and that the second fire posts the prompt AGAIN (two posted
+/// prompts), proving the prompt re-entered the existing tab.
 #[spec("scheduler/reuse/001")]
 #[test]
 fn reuse_001_default_reuses_one_tab() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let (work, record, command) = recorder_setup(scratch.path(), "reuse");
+    let (work, _record, command) = recorder_setup(scratch.path(), "reuse");
 
     let toml = task_block("reuse", &work.to_string_lossy(), &command, false);
     let daemon = common::spawn_daemon_serve(Some(&toml), "0");
@@ -105,8 +120,8 @@ fn reuse_001_default_reuses_one_tab() {
     daemon.run_now("reuse").expect("run-now reuse #1");
     daemon.wait_for_agent_count(1, Duration::from_secs(10));
     assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 1, Duration::from_secs(10)),
-        "first fire must deliver the prompt once"
+        wait_for_prompts(&daemon, 1, Duration::from_secs(10)),
+        "first fire must post the prompt once"
     );
 
     // Second fire must REUSE, not spawn — the agent count must never reach 2.
@@ -115,20 +130,20 @@ fn reuse_001_default_reuses_one_tab() {
 
     // ...and the second prompt must have been delivered into that one tab.
     assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(10)),
-        "a reuse fire must re-deliver the prompt into the existing tab (expected two recorded prompts)"
+        wait_for_prompts(&daemon, 2, Duration::from_secs(10)),
+        "a reuse fire must post the prompt again to the existing tab (expected two posted prompts)"
     );
 }
 
 /// Scenario: Register a `new_tab_per_fire = true` task and fire it twice (the
-/// second only after the first delivery is recorded). Assert two distinct tabs
-/// are opened (agent count 1 → 2, distinct pane ids) and both fires delivered
-/// the prompt.
+/// second only after the first prompt is posted). Assert two distinct tabs are
+/// opened (agent count 1 → 2, distinct pane ids) and both fires posted the
+/// prompt.
 #[spec("scheduler/reuse/002")]
 #[test]
 fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let (work, record, command) = recorder_setup(scratch.path(), "fresh");
+    let (work, _record, command) = recorder_setup(scratch.path(), "fresh");
 
     let toml = task_block("fresh", &work.to_string_lossy(), &command, true);
     let daemon = common::spawn_daemon_serve(Some(&toml), "0");
@@ -137,8 +152,8 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
     let first = daemon.wait_for_agent_count(1, Duration::from_secs(10));
     assert_eq!(first.len(), 1, "first fire spawns one tab");
     assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 1, Duration::from_secs(10)),
-        "first fire must deliver the prompt"
+        wait_for_prompts(&daemon, 1, Duration::from_secs(10)),
+        "first fire must post the prompt"
     );
 
     daemon.run_now("fresh").expect("run-now fresh #2");
@@ -156,8 +171,8 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
 
     // Both fires delivered their prompt.
     assert!(
-        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(10)),
-        "both per-fire tabs must receive the prompt"
+        wait_for_prompts(&daemon, 2, Duration::from_secs(10)),
+        "both per-fire tabs must be posted the prompt"
     );
 }
 

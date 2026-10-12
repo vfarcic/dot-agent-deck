@@ -496,6 +496,8 @@ pub struct Message {
     pub body_trust: BodyTrust,
     /// The `.dot-agent-deck/` file that carries the full body.
     pub spill_path: Option<PathBuf>,
+    /// See [`Content::preface`].
+    pub preface: Option<String>,
     pub created_at: Instant,
     pub state: MessageState,
     /// Hand-overs so far: each fetch counts one, and for an offer each
@@ -521,6 +523,7 @@ impl Message {
             pool,
             to: self.to.to_string(),
             recipient: self.recipient.clone(),
+            bind_agent: self.recipient.as_ref().and_then(|r| r.agent_id.clone()),
             from: self.from.clone(),
             subject: self.subject.clone(),
             body_trust: self.body_trust,
@@ -536,6 +539,7 @@ impl Message {
             },
             deliveries: self.deliveries,
             age_ms: millis(now.saturating_duration_since(self.created_at)),
+            text: None,
         }
     }
 
@@ -562,6 +566,11 @@ pub struct MessageSummary {
     pub pool: Option<String>,
     pub to: String,
     pub recipient: Option<Recipient>,
+    /// PRD #1666 S5: the agent generation the message is bound to (§2.1's
+    /// `bind_agent`, `recipient.agent_id`), named flat so a listing can be
+    /// matched against an agent id directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_agent: Option<String>,
     pub from: Sender,
     pub subject: String,
     pub body_trust: BodyTrust,
@@ -574,6 +583,11 @@ pub struct MessageSummary {
     pub ack_how: Option<AckHow>,
     pub deliveries: u32,
     pub age_ms: u64,
+    /// PRD #1666 S5: the message rendered whole, as the agent sees it — set
+    /// only when a listing asks for bodies
+    /// ([`crate::daemon_protocol::AttachRequest::ListInbox`]'s `bodies`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Per-pane counts for status and cards.
@@ -704,6 +718,32 @@ pub struct Content {
     pub spill_path: Option<PathBuf>,
     /// A sender-chosen id for an idempotent re-post; minted when `None`.
     pub id: Option<MessageId>,
+    /// PRD #1666 S5: deck-written text shown before the body, outside the
+    /// untrusted frame — what the deck itself says about an agent-authored
+    /// body (an unsolicited report, where the full text was saved).
+    pub preface: Option<String>,
+}
+
+impl Content {
+    /// PRD #1666 S5: a trusted message from the deck itself. `reason` names
+    /// what kind ([`Sender::Deck`]); the sender label is derived from it.
+    pub fn from_deck(
+        reason: impl Into<String>,
+        subject: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: Sender::Deck {
+                reason: reason.into(),
+            },
+            subject: subject.into(),
+            body: body.into(),
+            body_trust: BodyTrust::Trusted,
+            spill_path: None,
+            id: None,
+            preface: None,
+        }
+    }
 }
 
 /// Why a post was refused. Every bound refuses with one of these: the inbox
@@ -1460,6 +1500,7 @@ impl Inbox {
             body,
             body_trust: content.body_trust,
             spill_path: content.spill_path.clone(),
+            preface: content.preface.clone(),
             created_at: now,
             state: MessageState::Queued,
             deliveries: 0,
@@ -1855,6 +1896,7 @@ mod tests {
             body_trust: BodyTrust::Trusted,
             spill_path: None,
             id: None,
+            preface: None,
         }
     }
 

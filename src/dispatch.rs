@@ -897,6 +897,7 @@ pub async fn handle_dispatch(
         // in front of the pane mid-run and a coordinator waiting for an approval
         // never reaches the completion that would report it.
         compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
+        seed_reason: Some(crate::dispatch_return::dispatch_reason(name)),
     };
 
     let notifier = StderrNotifier;

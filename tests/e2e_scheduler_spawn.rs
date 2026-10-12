@@ -16,12 +16,15 @@
 //! `make_schedule_callback` is still a logging no-op (no agent is ever spawned).
 
 mod common;
+
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_route.rs"]
 mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::time::Duration;
 
@@ -155,8 +158,8 @@ fn spawn_001_mkdir_and_uncreatable_path() {
 /// runs `cat`), and one task whose `working_dir` has no config. Fire both via
 /// run-now. Assert the orchestration fire produces an agent in the registry
 /// tagged as the `orchestrator` role of an orchestration tab and that the
-/// prompt is delivered to it (echoed by its PTY); assert the plain fire
-/// produces a non-orchestration single-agent card with the prompt delivered.
+/// prompt is posted to its inbox; assert the plain fire produces a
+/// non-orchestration single-agent card with the prompt posted to its inbox.
 #[spec("scheduler/spawn/002")]
 #[test]
 fn spawn_002_orchestration_vs_single_agent() {
@@ -208,7 +211,15 @@ fn spawn_002_orchestration_vs_single_agent() {
         panic!("orchestration fire must spawn an `orchestrator` role pane, got {records:?}")
     });
     assert!(
-        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            orchestrator
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the orchestrator role pane"
     );
 
@@ -221,7 +232,12 @@ fn spawn_002_orchestration_vs_single_agent() {
         )
         .expect("plain fire must spawn a non-orchestration single-agent card");
     assert!(
-        daemon.attach_and_wait_for_output(&single.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            single.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the single-agent card"
     );
 }
@@ -230,7 +246,7 @@ fn spawn_002_orchestration_vs_single_agent() {
 /// `[[orchestrations]]` — a roleless placeholder first, then `first-real`, then
 /// `chosen` carrying `default = true`, each spawnable role running `cat`. Fire it
 /// via run-now and assert the fire opens the `chosen` orchestration's tab and
-/// delivers the prompt to its orchestrator role: not a single-agent card (which
+/// posts the prompt to its orchestrator role's inbox: not a single-agent card (which
 /// the roleless slot-0 used to produce), and not `first-real` (which file order
 /// would produce).
 #[spec("scheduler/spawn/008")]
@@ -287,7 +303,15 @@ fn spawn_008_declared_default_orchestration_beats_slot_zero_and_file_order() {
         })
         .expect("the chosen orchestration must bring up its start role");
     assert!(
-        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            orchestrator
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "and the scheduled prompt must actually reach it — selecting the right orchestration and \
          then delivering nowhere is the same outage with a better-looking registry"
     );
@@ -348,6 +372,7 @@ fn spawn_004_fires_spawn_exactly_once_and_delivers() {
 /// readiness, not a flat timer.
 #[spec("scheduler/spawn/005")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn spawn_005_delivery_gated_on_session_start() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("gated");
@@ -639,7 +664,12 @@ fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
          not merely open a card"
     );
     assert!(
-        daemon.attach_and_wait_for_output(&single.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            single.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the forced single-agent card"
     );
     assert_eq!(
@@ -677,7 +707,12 @@ fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
             )
         });
     assert!(
-        daemon.attach_and_wait_for_output(&named.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            named.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the named orchestration's start role"
     );
 

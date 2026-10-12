@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::event::{
@@ -28,8 +28,9 @@ use crate::event::{
     InboxWaitReply, InboxWake,
 };
 use crate::inbox::{
-    AckHow, AckOutcome, BodyTrust, Consumer, Content, DeckId, Inbox, InboxLimits, Message,
-    MessageId, MessageState, MessageSummary, PostError, Recipient, Sender,
+    AckHow, AckOutcome, BodyTrust, Consumer, Content, DeckId, Inbox, InboxEvent, InboxLimits,
+    Message, MessageId, MessageState, MessageSummary, PostError, Recipient, Sender, StateName,
+    UndeliverableReason,
 };
 
 /// The sentence that tells an agent what the deck's message blocks are. Claude
@@ -64,6 +65,19 @@ pub const BLOCK_OPENER: &str = "[dot-agent-deck message ";
 
 /// The closer every rendered block ends with, before the id.
 pub const BLOCK_CLOSER: &str = "[end of dot-agent-deck message ";
+
+/// PRD #1666 S5: how long a delegated task may stay unacknowledged before the
+/// orchestrator that sent it is told it has not reached the worker. The role
+/// the silent-worker watch had before the inbox.
+pub const DEFAULT_UNDELIVERED_NOTICE_AFTER: Duration = Duration::from_secs(300);
+
+/// Overrides [`DEFAULT_UNDELIVERED_NOTICE_AFTER`], in milliseconds.
+pub const ENV_UNDELIVERED_NOTICE_AFTER_MS: &str =
+    "DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS";
+
+/// The sender `reason` of a notice the deck itself writes to an agent; its
+/// label is "dot-agent-deck (daemon notice)".
+pub const NOTICE_REASON: &str = "notice";
 
 /// Where a deck-generated message posted by a client came from. The wire
 /// spelling is the sender's `reason`.
@@ -219,6 +233,40 @@ pub struct DoorbellFacts {
     pub native_announced_at: Option<Instant>,
 }
 
+/// PRD #1666 S5: how a delegated task's message ended, for the worker's
+/// idle-worker clock, which starts at the acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateEnd {
+    /// The worker acknowledged it at this instant.
+    Acknowledged(Instant),
+    /// It will never be acknowledged: superseded, or undeliverable.
+    Ended,
+}
+
+/// PRD #1666 S5: what a delegated task left owing on the worker's side — the
+/// commission and the idle-worker record its delegate armed — handed back when
+/// the task turns undeliverable because its worker exited, so the debt goes
+/// with the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegateLedger {
+    pub commission_arm_id: Option<u64>,
+    pub delegation_seq: Option<u64>,
+}
+
+/// PRD #1666 S5: a delegated task the deck reports on if it does not reach
+/// its worker. Replaces the silent-worker watch.
+struct DelegateWatch {
+    worker: Recipient,
+    role: String,
+    /// The orchestrator generation the report goes to, when one is known.
+    orchestrator: Option<Recipient>,
+    due: Instant,
+    /// The "has not reached the worker" notice was posted.
+    notified: bool,
+    end: Option<oneshot::Sender<DelegateEnd>>,
+    ledger: DelegateLedger,
+}
+
 type AgentKey = (String, String);
 
 struct HubState {
@@ -230,6 +278,18 @@ struct HubState {
     /// Where state changes are broadcast to attached clients, once the daemon
     /// has installed its event channel ([`InboxHub::set_broadcast`]).
     broadcast: Option<broadcast::Sender<BroadcastMsg>>,
+    /// PRD #1666 S5: delegated tasks not yet acknowledged, by message id.
+    delegates: HashMap<String, DelegateWatch>,
+    /// Notices a state change owes, posted once the lock is released
+    /// ([`InboxHub::post_owed_notices`]).
+    owed_notices: Vec<(Recipient, String)>,
+    /// Doorbell rings per agent generation, for the undelivered notice.
+    rings: HashMap<AgentKey, u32>,
+    /// What tasks that turned undeliverable because their worker exited left
+    /// owing, collected for [`InboxHub::agent_exited`]'s caller.
+    exited_ledgers: Vec<DelegateLedger>,
+    /// Ids minted for a delegated task that is not yet posted, nor abandoned.
+    pending_posts: std::collections::HashSet<String>,
 }
 
 /// The daemon's inbox and the components armed on it. See the module docs.
@@ -241,6 +301,8 @@ pub struct InboxHub {
     waiter_slots: Arc<Semaphore>,
     /// See [`ENV_TEST_PAUSE_WAITER_DELIVERY`].
     pause_waiter_delivery: bool,
+    /// See [`ENV_UNDELIVERED_NOTICE_AFTER_MS`].
+    undelivered_after: Duration,
 }
 
 impl std::fmt::Debug for InboxHub {
@@ -269,6 +331,26 @@ pub fn keepalive_from_env() -> Duration {
     }
 }
 
+/// [`DEFAULT_UNDELIVERED_NOTICE_AFTER`] or its override from
+/// [`ENV_UNDELIVERED_NOTICE_AFTER_MS`]. A zero or unparsable value is ignored
+/// with a warning.
+pub fn undelivered_after_from_env() -> Duration {
+    match std::env::var(ENV_UNDELIVERED_NOTICE_AFTER_MS) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    variable = ENV_UNDELIVERED_NOTICE_AFTER_MS,
+                    "ignoring an undelivered-notice override that is not a positive number of \
+                     milliseconds"
+                );
+                DEFAULT_UNDELIVERED_NOTICE_AFTER
+            }
+        },
+        Err(_) => DEFAULT_UNDELIVERED_NOTICE_AFTER,
+    }
+}
+
 impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
         Self {
@@ -278,17 +360,24 @@ impl InboxHub {
                 announced: HashMap::new(),
                 next_conn: 1,
                 broadcast: None,
+                delegates: HashMap::new(),
+                owed_notices: Vec::new(),
+                rings: HashMap::new(),
+                exited_ledgers: Vec::new(),
+                pending_posts: std::collections::HashSet::new(),
             }),
             changed: Arc::new(Notify::new()),
             keepalive,
             waiter_slots: Arc::new(Semaphore::new(MAX_INBOX_WAITERS)),
             pause_waiter_delivery: false,
+            undelivered_after: DEFAULT_UNDELIVERED_NOTICE_AFTER,
         }
     }
 
     /// A hub with the production limits, as overridden by the environment.
     pub fn from_env(deck: DeckId) -> Self {
         let mut hub = Self::new(deck, InboxLimits::from_env(), keepalive_from_env());
+        hub.undelivered_after = undelivered_after_from_env();
         hub.pause_waiter_delivery = std::env::var(ENV_TEST_PAUSE_WAITER_DELIVERY)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
         if hub.pause_waiter_delivery {
@@ -333,6 +422,218 @@ impl InboxHub {
             None => self.dispatch_pane(&to.pane_id),
         }
         Ok(id)
+    }
+
+    /// PRD #1666 S5: a fresh message id on this deck, for a producer that must
+    /// name its message before it can post it (a `delegate` reply names the
+    /// task's id before the respawn it waits for).
+    ///
+    /// The id is held as a pending post until the task is posted under it or
+    /// [`Self::abandon_post`] gives it up, so a caller can wait for the post
+    /// ([`Self::wait_for_posts`]).
+    pub fn mint_id(&self) -> MessageId {
+        let mut st = self.lock();
+        let id = MessageId::generate(st.inbox.deck());
+        st.pending_posts.insert(id.to_string());
+        id
+    }
+
+    /// PRD #1666 S5: the task minted under `id` will not be posted (its
+    /// dispatch ended without a worker to post it to).
+    pub fn abandon_post(&self, id: &str) {
+        if self.lock().pending_posts.remove(id) {
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// PRD #1666 S5: wait, at most `bound`, until none of `ids` is still a
+    /// pending post — each is posted or abandoned. Answers whether they all
+    /// settled in time.
+    pub async fn wait_for_posts(&self, ids: &[String], bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let pending = {
+                let st = self.lock();
+                ids.iter().any(|id| st.pending_posts.contains(id))
+            };
+            if !pending {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PRD #1666 S5: post a notice from the deck to `to`, labelled
+    /// "dot-agent-deck (daemon notice)".
+    pub fn post_notice(
+        &self,
+        to: Recipient,
+        subject: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Result<MessageId, PostError> {
+        self.post_direct(to, Content::from_deck(NOTICE_REASON, subject, body))
+    }
+
+    /// PRD #1666 S5: post a delegated task to `worker` and watch it. If it is
+    /// still unacknowledged after [`ENV_UNDELIVERED_NOTICE_AFTER_MS`], or turns
+    /// undeliverable for any reason but being superseded, `orchestrator` is
+    /// told. The receiver resolves when the task is acknowledged or ends
+    /// otherwise; it starts the worker's idle-worker clock.
+    ///
+    /// Every older task to the same pane still owed is superseded first: a newer
+    /// delegation replaces it.
+    pub fn post_delegate(
+        &self,
+        worker: Recipient,
+        role: &str,
+        orchestrator: Option<Recipient>,
+        ledger: DelegateLedger,
+        content: Content,
+    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostError> {
+        self.supersede_delegates_to(&worker.pane_id);
+        let (tx, rx) = oneshot::channel();
+        let id = {
+            let mut st = self.lock();
+            let now = Instant::now();
+            if let Some(id) = content.id.as_ref() {
+                st.pending_posts.remove(id.as_str());
+            }
+            let id = st.inbox.post_direct(now, worker.clone(), content)?;
+            drain_events(&mut st);
+            st.delegates.insert(
+                id.to_string(),
+                DelegateWatch {
+                    worker: worker.clone(),
+                    role: role.to_string(),
+                    orchestrator,
+                    due: now + self.undelivered_after,
+                    notified: false,
+                    end: Some(tx),
+                    ledger,
+                },
+            );
+            id
+        };
+        info!(message_id = %id, pane_id = %worker.pane_id, role, "inbox: delegated task posted");
+        self.changed.notify_one();
+        match &worker.agent_id {
+            Some(agent) => self.dispatch_agent(&worker.pane_id, agent),
+            None => self.dispatch_pane(&worker.pane_id),
+        }
+        Ok((id, rx))
+    }
+
+    /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
+    /// acknowledged, as superseded — a newer delegation, or the worker's
+    /// `work-done`, has made it moot. Superseded tasks are not reported.
+    pub fn supersede_delegates_to(&self, pane_id: &str) -> usize {
+        let retired = {
+            let mut st = self.lock();
+            let now = Instant::now();
+            let ids: Vec<String> = st
+                .delegates
+                .iter()
+                .filter(|(_, watch)| watch.worker.pane_id == pane_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut retired = 0;
+            for id in ids {
+                if st
+                    .inbox
+                    .retire(now, &id, pane_id, UndeliverableReason::Superseded)
+                {
+                    retired += 1;
+                } else if let Some(mut watch) = st.delegates.remove(&id) {
+                    // Already terminal without an event reaching the watch.
+                    if let Some(end) = watch.end.take() {
+                        let _ = end.send(DelegateEnd::Ended);
+                    }
+                }
+            }
+            drain_events(&mut st);
+            retired
+        };
+        if retired > 0 {
+            debug!(pane_id, retired, "inbox: older delegated tasks superseded");
+            self.changed.notify_one();
+        }
+        retired
+    }
+
+    /// PRD #1666 S5: the doorbell rang for `agent_id` in `pane_id`.
+    pub fn note_ring(&self, pane_id: &str, agent_id: &str) {
+        *self
+            .lock()
+            .rings
+            .entry((pane_id.to_string(), agent_id.to_string()))
+            .or_default() += 1;
+    }
+
+    /// Post every notice a state change has owed since the last call.
+    pub fn post_owed_notices(&self) {
+        let owed = std::mem::take(&mut self.lock().owed_notices);
+        for (to, body) in owed {
+            let pane_id = to.pane_id.clone();
+            if let Err(error) = self.post_notice(to, "task not delivered", body) {
+                warn!(pane_id = %pane_id, %error, "inbox: could not post an undelivered notice");
+            }
+        }
+    }
+
+    /// Post the "has not reached the worker" notice for every watched task
+    /// past its deadline and still owed.
+    fn notify_overdue_delegates(st: &mut HubState, now: Instant) {
+        let overdue: Vec<String> = st
+            .delegates
+            .iter()
+            .filter(|(_, watch)| !watch.notified && watch.due <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in overdue {
+            let Some(watch) = st.delegates.get(&id) else {
+                continue;
+            };
+            let worker = watch.worker.clone();
+            let state = st
+                .inbox
+                .get(&id, &worker.pane_id)
+                .map(|message| message.state.clone());
+            let held = match state {
+                Some(MessageState::Queued) => "still queued: the worker has not taken it",
+                Some(MessageState::Fetched { .. }) => {
+                    "fetched by the worker but not acknowledged: it may not have reached the \
+                     agent's session"
+                }
+                _ => continue,
+            };
+            let key = (
+                worker.pane_id.clone(),
+                worker.agent_id.clone().unwrap_or_default(),
+            );
+            let wake = if st.waiters.get(&key).is_some_and(|list| !list.is_empty()) {
+                WakePath::Native
+            } else if st
+                .announced
+                .get(&key)
+                .is_some_and(|a| a.wake == InboxWake::TurnEnd)
+            {
+                WakePath::TurnEnd
+            } else {
+                WakePath::Doorbell
+            };
+            let rings = st.rings.get(&key).copied().unwrap_or(0);
+            let body = compose_undelivered_notice(&id, &watch.role, held, wake, rings);
+            let orchestrator = watch.orchestrator.clone();
+            if let Some(watch) = st.delegates.get_mut(&id) {
+                watch.notified = true;
+            }
+            if let Some(to) = orchestrator {
+                st.owed_notices.push((to, body));
+            }
+        }
     }
 
     /// Register a waiter for `agent_id` in `pane_id`. Supersedes the oldest
@@ -481,14 +782,22 @@ impl InboxHub {
 
     /// PRD #1666 S3: `agent_id` in `pane_id` exited. Its bound messages become
     /// undeliverable, and what it had announced is forgotten.
-    pub fn agent_exited(&self, pane_id: &str, agent_id: &str) {
+    ///
+    /// PRD #1666 S5: answers what the delegated tasks it never acknowledged
+    /// left owing, so the caller can release that debt BEFORE the orchestrator
+    /// is told — the notices this exit owes are held until the caller runs
+    /// [`Self::post_owed_notices`].
+    pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
         let mut st = self.lock();
         st.inbox.agent_exited(Instant::now(), pane_id, agent_id);
-        st.announced
-            .remove(&(pane_id.to_string(), agent_id.to_string()));
+        let key = (pane_id.to_string(), agent_id.to_string());
+        st.announced.remove(&key);
+        st.rings.remove(&key);
         drain_events(&mut st);
+        let ledgers = std::mem::take(&mut st.exited_ledgers);
         drop(st);
         self.changed.notify_one();
+        ledgers
     }
 
     /// What `agent_id` in `pane_id` last announced, if anything.
@@ -576,6 +885,31 @@ impl InboxHub {
         deliveries
     }
 
+    /// PRD #1666 S5: hand `agent_id` its oldest queued message, rendered whole,
+    /// and acknowledge it in the same step — the `get-seed` alias.
+    pub fn fetch_first_acked(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        how: AckHow,
+    ) -> Option<InboxDelivery> {
+        let delivery = {
+            let mut st = self.lock();
+            let fetched = st.inbox.fetch_acked(
+                Instant::now(),
+                pane_id,
+                agent_id,
+                Consumer::FetchCli,
+                how,
+                Some(1),
+            );
+            drain_events(&mut st);
+            fetched.first().map(|m| render(m, None))
+        };
+        self.changed.notify_one();
+        delivery
+    }
+
     /// Acknowledge message `id` for `agent_id` in `pane_id`.
     pub fn ack(&self, id: &str, pane_id: &str, agent_id: &str, how: AckHow) -> AckOutcome {
         let mut st = self.lock();
@@ -593,6 +927,7 @@ impl InboxHub {
             drain_events(&mut st);
             requeued
         };
+        self.post_owed_notices();
         if requeued {
             self.dispatch_agent(pane_id, agent_id);
         }
@@ -608,6 +943,7 @@ impl InboxHub {
             drain_events(&mut st);
             count
         };
+        self.post_owed_notices();
         if count > 0 {
             self.dispatch_agent(pane_id, agent_id);
         }
@@ -619,6 +955,36 @@ impl InboxHub {
         let st = self.lock();
         let now = Instant::now();
         st.inbox.all().iter().map(|m| m.summary(now)).collect()
+    }
+
+    /// PRD #1666 S5: every message for `pane_id`, live and recent history,
+    /// rendered whole as `inbox fetch` would print it, with no state changed —
+    /// for an in-process observer reading what reached a pane.
+    pub fn rendered(&self, pane_id: &str) -> Vec<InboxDelivery> {
+        let st = self.lock();
+        st.inbox
+            .list(pane_id)
+            .into_iter()
+            .map(|m| render(m, None))
+            .collect()
+    }
+
+    /// PRD #1666 S5: [`Self::list`] (or, with no pane, [`Self::list_all`]) with
+    /// each message's rendered text filled in.
+    pub fn list_with_bodies(&self, pane_id: Option<&str>) -> Vec<MessageSummary> {
+        let st = self.lock();
+        let now = Instant::now();
+        let messages: Vec<&Message> = match pane_id {
+            Some(pane) => st.inbox.list(pane),
+            None => st.inbox.all().iter().collect(),
+        };
+        messages
+            .into_iter()
+            .map(|m| MessageSummary {
+                text: Some(render(m, None).text),
+                ..m.summary(now)
+            })
+            .collect()
     }
 
     /// Every message for `pane_id`, live and recent history.
@@ -637,9 +1003,12 @@ impl InboxHub {
     pub fn tick(&self) {
         {
             let mut st = self.lock();
-            st.inbox.tick(Instant::now());
+            let now = Instant::now();
+            st.inbox.tick(now);
             drain_events(&mut st);
+            Self::notify_overdue_delegates(&mut st, now);
         }
+        self.post_owed_notices();
         self.dispatch_all();
     }
 
@@ -654,7 +1023,17 @@ impl InboxHub {
                     let Some(hub) = hub.upgrade() else {
                         return;
                     };
-                    hub.lock().inbox.next_deadline()
+                    let st = hub.lock();
+                    let watched = st
+                        .delegates
+                        .values()
+                        .filter(|watch| !watch.notified)
+                        .map(|watch| watch.due)
+                        .min();
+                    match (st.inbox.next_deadline(), watched) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    }
                 };
                 // A deadline that is far away still re-plans every minute, so a
                 // missed notification costs at most that long.
@@ -782,6 +1161,7 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, max_chars: Option<usize
 /// An offer back in its pool has no pane to show it on, so it is only logged.
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
+        settle_delegate(st, &event);
         debug!(
             message_id = %event.message_id,
             state = %event.state,
@@ -801,6 +1181,130 @@ fn drain_events(st: &mut HubState) {
             reason: event.undeliverable_reason,
         }));
     }
+}
+
+/// PRD #1666 S5: end the watch on a delegated task once it is acknowledged or
+/// can no longer be, and owe its orchestrator a notice when it turned
+/// undeliverable for any reason but being superseded.
+fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
+    let id = event.message_id.as_str();
+    let end = match event.state {
+        StateName::Acknowledged => DelegateEnd::Acknowledged(Instant::now()),
+        StateName::Undeliverable => DelegateEnd::Ended,
+        _ => return,
+    };
+    let Some(mut watch) = st.delegates.remove(id) else {
+        return;
+    };
+    if let Some(tx) = watch.end.take() {
+        let _ = tx.send(end);
+    }
+    if end != DelegateEnd::Ended {
+        return;
+    }
+    let reason = match event.undeliverable_reason {
+        Some(UndeliverableReason::Superseded) | None => return,
+        Some(reason) => reason,
+    };
+    if reason == UndeliverableReason::AgentExited {
+        st.exited_ledgers.push(watch.ledger);
+    }
+    if let Some(to) = watch.orchestrator {
+        let body = compose_undeliverable_notice(id, &watch.role, reason);
+        st.owed_notices.push((to, body));
+    }
+}
+
+/// PRD #1666 S5: the notice an orchestrator gets when a task it delegated is
+/// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`].
+pub fn compose_undelivered_notice(
+    message_id: &str,
+    role: &str,
+    held: &str,
+    wake: WakePath,
+    rings: u32,
+) -> String {
+    let path = match wake {
+        WakePath::Native => "an inbox component is armed for the worker and hands messages over",
+        WakePath::TurnEnd => {
+            "the worker takes messages at the end of its turns, and the doorbell rings while it is idle"
+        }
+        WakePath::Doorbell | WakePath::None => {
+            "nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle"
+        }
+    };
+    format!(
+        "Task {message_id} to the worker in role {} has not reached the worker: it is {held}. \
+         Wake path: {}, {path}; the doorbell has rung {rings} time(s) for it so far. The deck \
+         keeps the task and keeps trying. Check the worker's pane; `dot-agent-deck inbox list \
+         --all` shows where the task is. Decide whether to wait, re-delegate with --supersede, \
+         or notify the user.",
+        crate::state::quote_untrusted_role(role),
+        wake.label(),
+    )
+}
+
+/// PRD #1666 S5: the notice an orchestrator gets when a task it delegated can
+/// never be delivered.
+pub fn compose_undeliverable_notice(
+    message_id: &str,
+    role: &str,
+    reason: UndeliverableReason,
+) -> String {
+    let why = match reason {
+        UndeliverableReason::AgentExited => {
+            "the worker it was addressed to exited before acknowledging it"
+        }
+        UndeliverableReason::MaxDeliver => {
+            "it was handed to the worker the most times the deck allows and was never acknowledged"
+        }
+        UndeliverableReason::InboxShut => "the deck is shutting down",
+        UndeliverableReason::Superseded => "a newer task replaced it",
+    };
+    format!(
+        "Task {message_id} to the worker in role {} is undeliverable: {why}. The worker did not \
+         receive it, and no work-done can arrive for it. Decide how to proceed - if this needs \
+         the user, notify the user; otherwise re-delegate or reassign the task.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
+/// PRD #1666 S5: post a deck-generated message bound to `to`, but only while
+/// the agent it is bound to is still `to.pane_id`'s live agent. A pane id is a
+/// recycled handle, and a message bound to an agent that has already left the
+/// pane would wait for it forever; the refusal says so instead.
+pub fn post_to_live(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    to: Recipient,
+    content: Content,
+) -> Result<MessageId, String> {
+    if let Some(agent) = to.agent_id.as_deref()
+        && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
+    {
+        return Err(format!(
+            "agent {agent} is no longer the live agent of pane {}",
+            to.pane_id
+        ));
+    }
+    registry
+        .inbox()
+        .post_direct(to, content)
+        .map_err(|error| error.to_string())
+}
+
+/// PRD #1666 S5: [`post_to_live`] for a notice from the deck, labelled
+/// "dot-agent-deck (daemon notice)".
+pub fn post_notice_to_live(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    to: Recipient,
+    subject: &str,
+    body: impl Into<String>,
+) -> Result<MessageId, String> {
+    post_to_live(
+        registry,
+        to,
+        Content::from_deck(NOTICE_REASON, subject, body),
+    )
 }
 
 /// The label a block names its sender by.
@@ -861,9 +1365,16 @@ pub fn render(message: &Message, max_chars: Option<usize>) -> InboxDelivery {
     };
     let opener = format!("{BLOCK_OPENER}{id} from {from}]");
     let closer = format!("{BLOCK_CLOSER}{id}]");
+    // PRD #1666 S5: what the deck says about the body, ahead of it and outside
+    // any untrusted frame. Its block markers are neutralised like a body's.
+    let preface = message
+        .preface
+        .as_deref()
+        .map(|text| format!("{}\n", defuse_markers(text).trim_end()))
+        .unwrap_or_default();
     let assemble = |body: &str| {
         let separator = if body.ends_with('\n') { "" } else { "\n" };
-        format!("{opener}\n{body}{separator}{closer}")
+        format!("{opener}\n{preface}{body}{separator}{closer}")
     };
     let mut text = assemble(&body);
     if let Some(budget) = max_chars
@@ -1036,6 +1547,7 @@ mod tests {
             body_trust: BodyTrust::Trusted,
             spill_path: None,
             id: None,
+            preface: None,
         }
     }
 

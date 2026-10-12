@@ -92,6 +92,38 @@ fn snapshot_contains(snapshot: &[u8], needle: &[u8]) -> bool {
     snapshot.windows(needle.len()).any(|w| w == needle)
 }
 
+/// PRD #1666 S5: wait until a delegated task is in `pane_id`'s inbox, bound
+/// to the agent that holds the pane now — what a delegate posts instead of
+/// typing a pointer. Answers whether it arrived.
+async fn wait_for_pane_task(registry: &AgentPtyRegistry, pane_id: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let arrived = registry
+            .pane_current_agent_id(pane_id)
+            .is_some_and(|agent| {
+                registry.inbox().list(pane_id).into_iter().any(|message| {
+                    message.bind_agent.as_deref() == Some(agent.as_str())
+                        && message.subject.starts_with("task from the orchestrator")
+                })
+            });
+        if arrived || tokio::time::Instant::now() >= deadline {
+            return arrived;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// PRD #1666 S5: everything posted to `pane_id`'s inbox, rendered whole.
+fn inbox_text(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    registry
+        .inbox()
+        .rendered(pane_id)
+        .into_iter()
+        .map(|delivery| delivery.text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn wait_for_pane_needle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -649,17 +681,10 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
-    let snapshot = wait_for_pane_needle(
-        &fx.daemon.registry,
-        WORKER_PANE,
-        POINTER,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&snapshot, POINTER),
-        "the recovered worker never received the task pointer; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     let _ = closing.await;
@@ -746,85 +771,22 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
 /// direction, and headroom is the only mitigation available.
 const DEAD_REPLACEMENT_NOTICE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Issue #708: the dead-replacement notice's opening clause and stable FINAL
-/// clause. The final clause ends in `.`, which `encode_pane_payload`'s
-/// `trim_end_matches` cannot eat, so the byte after it is exactly the
-/// terminator the daemon chose.
-const RESPAWN_NOTICE_NEEDLE: &[u8] =
-    b"delegated worker never came up (dot-agent-deck daemon report)";
-const RESPAWN_NOTICE_TAIL: &[u8] = b"daemon log names the role.";
-
-/// Issue #708: the byte the daemon wrote right after the dead-replacement
-/// notice's payload — CR if it SUBMITTED the report, LF if it left it as
-/// deferred scrollback — or `None` while the notice or that byte is still on its
-/// way. Anchored to the notice's own opening and final clauses, never to the
-/// first line break after the notice began, so an unrelated line break cannot be
-/// mistaken for the terminator in either direction.
-fn respawn_notice_terminator(snapshot: &[u8]) -> Option<u8> {
-    respawn_notice_terminators(snapshot)
-        .first()
-        .copied()
-        .flatten()
-}
-
-/// [`respawn_notice_terminator`] for EVERY dead-replacement notice in the pane,
-/// in order: one entry per opening clause, `None` for a notice whose final
-/// clause or terminator has not landed yet.
-fn respawn_notice_terminators(snapshot: &[u8]) -> Vec<Option<u8>> {
-    let starts: Vec<usize> = snapshot
-        .windows(RESPAWN_NOTICE_NEEDLE.len())
-        .enumerate()
-        .filter(|(_, w)| *w == RESPAWN_NOTICE_NEEDLE)
-        .map(|(i, _)| i)
-        .collect();
-    starts
-        .iter()
-        .map(|&start| {
-            let rest = &snapshot[start..];
-            let end = rest
-                .windows(RESPAWN_NOTICE_TAIL.len())
-                .position(|w| w == RESPAWN_NOTICE_TAIL)?
-                + RESPAWN_NOTICE_TAIL.len();
-            rest.get(end).copied()
-        })
-        .collect()
-}
-
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start
 /// while a marker file sits beside it, drop that marker once the first worker is
 /// confirmed up, then delegate. The replacement dies before it can announce
-/// itself, and the orchestrator must be TOLD — in its own pane, as a SUBMITTED
-/// turn naming what to do next, and within five seconds rather than the thirty a
-/// readiness wait would cost — instead of being left to wait for a `work-done`
-/// that can never arrive. The daemon must not log that death as a readiness
+/// itself, and the orchestrator must be TOLD — as a daemon notice in its inbox
+/// naming what to do next, within five seconds — instead of being left to wait
+/// for a `work-done` that can never arrive. The daemon must not log that death as a readiness
 /// timeout either (issue #1243).
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Issue #1243 review: the replacement here is a stand-in the deck cannot
-    // identify, which is exactly the worker the unidentified-agent timeout WARN
-    // is about — and it must NOT get that WARN, because it did not wait out any
-    // timeout: it died. Global rather than thread-local because this runtime is
-    // multi-threaded and the dispatch task can run on any worker — and a global
-    // subscriber is only this test's when the process is, so it is installed
-    // only under nextest's process-per-test mode (what `cargo test-fast` runs).
-    // Under plain `cargo test` siblings share the process: installing it there
-    // would capture THEIR warnings too, and could not be removed afterwards, so
-    // the log half is skipped instead (Qodo on PR #1331).
-    let captured = CapturedLog::default();
-    let log_capture_installed = std::env::var("NEXTEST_EXECUTION_MODE").as_deref()
-        == Ok("process-per-test")
-        && tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .with_writer(captured.clone())
-                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-                .with_ansi(false)
-                .finish(),
-        )
-        .is_ok();
-
+    // PRD #1666 S5: the delegate no longer waits for the replacement's
+    // readiness, so the issue #1243 log half — that a replacement which DIED is
+    // not logged as having waited out a readiness timeout — has no wait left to
+    // guard and was removed with it.
     // The stand-in refuses to start once a `die` marker exists beside it. The
     // TEST drops that marker, after confirming the first worker is up — so
     // "the replacement dies before it is ready" is a fact the test establishes,
@@ -872,37 +834,24 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
 
     delegate(&fx, "list the files in this directory").await;
 
-    // The user's altitude: something visible in the orchestrator's own pane.
+    // The user's altitude: a daemon notice in the orchestrator's inbox. PRD
+    // #1666 S5: the replacement can die before the task is posted ("never came
+    // up", naming the pane) or just after (the task turns undeliverable, naming
+    // the role); either way the orchestrator is told the task did not arrive.
     let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
-    let mut snapshot;
-    loop {
-        snapshot = fx
-            .daemon
-            .registry
-            .snapshot(&fx.orchestrator_agent_id)
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&snapshot);
-        // Issue #708: the terminator byte is part of the wait, so the loop
-        // cannot stop one byte early — the submit CR trails the payload by
-        // `SUBMIT_DELAY` — and report a terminator that had not landed yet.
-        if text.contains("delegated worker never came up")
-            && text.contains(WORKER_PANE)
-            && respawn_notice_terminator(&snapshot).is_some()
-        {
-            break;
+    let text = loop {
+        let text = inbox_text(&fx.daemon.registry, ORCH_PANE);
+        if dead_replacement_notices(&text) >= 1 {
+            break text;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "a `clear = true` delegate whose replacement worker died reported nothing to the \
-             orchestrator within {DEAD_REPLACEMENT_NOTICE_BUDGET:?} — either the notice is gone \
-             entirely, or the readiness wait no longer ends on the replacement's EOF and the \
-             orchestrator is sitting through it (#584; budget re-derived in #243 against a \
-             measured ~0.1 s). orchestrator pane = {:?}",
-            text
+             orchestrator within {DEAD_REPLACEMENT_NOTICE_BUDGET:?} (#584; budget re-derived in \
+             #243 against a measured ~0.1 s). orchestrator inbox = {text:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
+    };
     let worker_snapshot = fx
         .daemon
         .registry
@@ -913,31 +862,35 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         !snapshot_contains(&worker_snapshot, POINTER),
         "nothing may be written into a pane whose agent is not live"
     );
-    // Issue #708: SUBMITTED, not written. The orchestrator's `delegate` already
-    // exited 0, so in an unattended dispatched unit a notice left sitting in its
-    // input box reaches nobody and the orchestrator waits forever for a
-    // `work-done` that cannot arrive. The report must be a turn of its own (CR)
-    // and name what the orchestrator can do about it.
-    let text = String::from_utf8_lossy(&snapshot);
-    let terminator = respawn_notice_terminator(&snapshot);
+    // Issue #708: the orchestrator's `delegate` already exited 0, so in an
+    // unattended dispatched unit a notice that reaches nobody leaves the
+    // orchestrator waiting forever for a `work-done` that cannot arrive. The
+    // notice is a daemon notice in its inbox and names what to do next.
     let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
         .into_iter()
         .filter(|option| !text.contains(option))
         .collect();
     assert!(
-        terminator == Some(b'\r') && missing_options.is_empty(),
-        "the dead-replacement notice must be SUBMITTED as a turn (terminated by CR, not left as \
-         an LF-terminated line in the orchestrator's scrollback) and must name the remediation \
-         options (notify the user, re-delegate, reassign); terminator = {terminator:?}, missing \
-         options = {missing_options:?}, orchestrator pane = {text:?}"
+        text.contains("from dot-agent-deck (daemon notice)]") && missing_options.is_empty(),
+        "the dead-replacement notice must be posted as a daemon notice and name the remediation \
+         options (notify the user, re-delegate, reassign); missing options = \
+         {missing_options:?}, orchestrator inbox = {text:?}"
     );
-    // PRD #249 finding B3's precedent: this notice interpolates the worker's
-    // scrubbed pane id and nothing else, so the role name — which is
-    // caller-supplied config text — must not appear.
     assert!(
-        !String::from_utf8_lossy(&snapshot).contains("'coder'"),
-        "the notice must not interpolate the role name; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        fx.daemon
+            .registry
+            .inbox()
+            .list(ORCH_PANE)
+            .iter()
+            .all(|message| message.bind_agent.as_deref() == Some(fx.orchestrator_agent_id.as_str())),
+        "the notice must be bound to the orchestrator that delegated; inbox = {:?}",
+        fx.daemon.registry.inbox().list(ORCH_PANE)
+    );
+    // PRD #249 finding B3's precedent: the role name is caller-supplied config
+    // text, so it may appear only fenced as untrusted metadata.
+    assert!(
+        !text.contains("'coder'"),
+        "the notice must not interpolate the role name bare; inbox = {text:?}"
     );
 
     // Issue #1423: the worker was given nothing, so the delegation's idle-worker
@@ -967,78 +920,30 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     fx.daemon.registry.note_user_input(ORCH_PANE);
     delegate(&fx, "list the files in this directory").await;
     let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
-    let terminators = loop {
-        let snapshot = fx
-            .daemon
-            .registry
-            .snapshot(&fx.orchestrator_agent_id)
-            .unwrap_or_default();
-        let terminators = respawn_notice_terminators(&snapshot);
-        if terminators.len() >= 2 && terminators[1].is_some() {
-            break terminators;
+    loop {
+        let text = inbox_text(&fx.daemon.registry, ORCH_PANE);
+        if dead_replacement_notices(&text) >= 2 {
+            break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "the SECOND dead-replacement report never reached the orchestrator within \
              {DEAD_REPLACEMENT_NOTICE_BUDGET:?} of the user typing and a second delegate; \
-             terminators so far = {terminators:?}, orchestrator pane = {:?}",
-            String::from_utf8_lossy(&snapshot)
+             orchestrator inbox = {text:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert_eq!(
-        terminators[1],
-        Some(b'\r'),
-        "the second dead-replacement report must be SUBMITTED like the first; terminators = \
-         {terminators:?}"
-    );
-
-    if log_capture_installed {
-        let log = captured.text();
-        assert!(
-            log.contains("replacement worker is no longer the pane's live agent"),
-            "control: the capture must see the dead-replacement WARN, or its silence about the \
-             timeout below proves nothing; captured log = {log:?}"
-        );
-        assert!(
-            !log.contains("waited the full readiness timeout"),
-            "a replacement that DIED was logged as having waited out the readiness timeout, with \
-             advice to declare its agent — the wait ended on its EOF, not on the deadline \
-             (issue #1243 review); captured log = {log:?}"
-        );
-    } else {
-        println!(
-            "SKIP: log half — not a nextest process-per-test run, so a global subscriber here \
-             would not be this test's alone"
-        );
     }
 }
 
-/// Issue #1243 review: an in-memory `tracing` writer for `delegate/023`.
-#[derive(Clone, Default)]
-struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl CapturedLog {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for CapturedLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-    type Writer = CapturedLog;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
+/// PRD #1666 S5: how many notices in an orchestrator's inbox text say a
+/// delegated task did not reach a replacement worker that died — "never came
+/// up" when it died before the task was posted, "undeliverable" when it died
+/// just after.
+fn dead_replacement_notices(text: &str) -> usize {
+    text.matches("delegated worker never came up").count()
+        + text
+            .matches("is undeliverable: the worker it was addressed to exited")
+            .count()
 }
 
 /// Issue #1114: how long `delegate/032` keeps the worker pane in the window
@@ -1182,17 +1087,10 @@ async fn delegate_032_a_delegate_inside_the_pre_close_window_leaves_the_record_a
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
-    let snapshot = wait_for_pane_needle(
-        &fx.daemon.registry,
-        WORKER_PANE,
-        POINTER,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&snapshot, POINTER),
-        "the recovered worker never received the task pointer; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     let state = fx.daemon.state.read().await;
@@ -1278,17 +1176,10 @@ async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_r
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
-    let snapshot = wait_for_pane_needle(
-        &fx.daemon.registry,
-        WORKER_PANE,
-        POINTER,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&snapshot, POINTER),
-        "the recovered worker never received the task pointer; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     let state = fx.daemon.state.read().await;
@@ -1686,6 +1577,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
             compose_orchestrator_context: Some(
                 dot_agent_deck::orchestrator_context::Attendance::Unattended,
             ),
+            seed_reason: None,
         },
         &daemon.registry,
         &SilentNotifier,
@@ -1831,33 +1723,29 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     )
     .expect("deliver the control replacement's SessionStart");
 
-    // --- both workers actually receive the pointer.
-    let dispatched_snapshot = wait_for_pane_needle(
-        &daemon.registry,
-        &dispatched_worker,
-        POINTER,
-        Duration::from_secs(20),
-    )
-    .await;
+    // --- both workers actually receive the task.
     assert!(
-        snapshot_contains(&dispatched_snapshot, POINTER),
-        "the DISPATCHED orchestration's respawned worker never received the task pointer — the \
-         user-visible half of #584; snapshot = {:?}",
-        String::from_utf8_lossy(&dispatched_snapshot)
+        wait_for_pane_task(
+            &daemon.registry,
+            &dispatched_worker,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the DISPATCHED orchestration's respawned worker never received its task — the \
+         user-visible half of #584; inbox = {:?}",
+        daemon.registry.inbox().list(&dispatched_worker)
     );
-    let control_snapshot = wait_for_pane_needle(
-        &control.daemon.registry,
-        WORKER_PANE,
-        POINTER,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&control_snapshot, POINTER),
-        "the CONTROL orchestration's respawned worker never received the task pointer — a broken \
+        wait_for_pane_task(
+            &control.daemon.registry,
+            WORKER_PANE,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the CONTROL orchestration's respawned worker never received its task — a broken \
          control means the harness is wrong and the dispatched result above proves nothing; \
-         snapshot = {:?}",
-        String::from_utf8_lossy(&control_snapshot)
+         inbox = {:?}",
+        control.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     // --- and the two paths' relaunch parameters agree.

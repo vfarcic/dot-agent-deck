@@ -535,7 +535,43 @@ pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    format!("{deck} wrap --agent {name} -- {command}")
+    format!(
+        "{deck} wrap --agent {name} -- {}",
+        wrapped_child_command(command)
+    )
+}
+
+/// The child command a [`wrap_launch_command`] rewrite hands the wrapper. A
+/// plain argument list — words of characters that need no quoting, the first
+/// not an environment assignment — is passed as is, and the wrapper execs it.
+/// Anything with shell syntax (`;`, `(`, quotes, `$`, an assignment, …) goes
+/// through `/bin/sh -c` instead: prefixed bare, the outer shell would split the
+/// command around the wrapper or fail to parse it, so the wrapped agent never
+/// started (PRD #1666 S5, found by `inbox/route/004`).
+#[cfg(unix)]
+fn wrapped_child_command(command: &str) -> String {
+    let mut words = command.split(' ').filter(|word| !word.is_empty());
+    let first_is_plain = words
+        .clone()
+        .next()
+        .is_some_and(|first| !first.contains('='));
+    let plain = first_is_plain
+        && words.all(|word| crate::platform::paths::shell_quote_if_needed(word) == word);
+    if plain {
+        command.to_string()
+    } else {
+        format!(
+            "/bin/sh -c {}",
+            crate::platform::paths::shell_quote_if_needed(command)
+        )
+    }
+}
+
+/// Windows has no `/bin/sh` to hand a compound command to; the command goes
+/// through as it always has.
+#[cfg(not(unix))]
+fn wrapped_child_command(command: &str) -> String {
+    command.to_string()
 }
 
 /// Test-only override for the binary [`wrap_launch_command`] names. Set to an
@@ -3426,6 +3462,30 @@ mod tests {
             // the bin target) — falling back to the bare name is the contract.
             None => assert_eq!(program, "dot-agent-deck"),
         }
+    }
+
+    /// PRD #1666 S5: a command with shell syntax reaches the wrapper whole,
+    /// through `/bin/sh -c`, rather than being split around it by the outer
+    /// shell; a plain argument list is passed as is.
+    #[cfg(unix)]
+    #[test]
+    fn wrap_launch_command_hands_shell_syntax_to_sh() {
+        let tail = |command: &str| {
+            wrap_launch_command(command, &AgentType::Codex)
+                .split_once(" wrap --agent codex -- ")
+                .map(|(_, tail)| tail.to_string())
+                .expect("a wrap invocation")
+        };
+        assert_eq!(tail("codex --model gpt-5"), "codex --model gpt-5");
+        assert_eq!(
+            tail("(umask 077; true); exec codex"),
+            "/bin/sh -c '(umask 077; true); exec codex'"
+        );
+        assert_eq!(tail("FOO=1 codex"), "/bin/sh -c 'FOO=1 codex'");
+        assert_eq!(
+            tail("echo 'it''s'"),
+            "/bin/sh -c 'echo '\\''it'\\'''\\''s'\\'''"
+        );
     }
 
     /// Non-Wrapper agents (and the neutral unknown type) launch bare — the

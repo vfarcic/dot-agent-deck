@@ -22,6 +22,8 @@ mod inbox;
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_route.rs"]
 mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::cell::RefCell;
 use std::process::Output;
@@ -114,18 +116,24 @@ fn describe(output: &Output) -> String {
     )
 }
 
-/// Whether a worker logged as `name` (the fixture's `worker.py`) has READ the
-/// daemon's task pointer for `role` from its PTY.
-///
-/// Issue #1539: read from the worker's own log, never from the pane snapshot.
-/// The snapshot is the daemon's replay ring, which a resize drops, and the TUI
-/// resizes every role pane from its provisional spawn size once it lays out
-/// the freshly opened tab — so a pointer delivered in that window was really
-/// in the worker's input and still missing from the snapshot.
-fn worker_read_pointer(deck: &TuiDeck, name: &str, role: &str) -> bool {
-    std::fs::read(deck.workdir().join(format!("{name}-received.log"))).is_ok_and(|log| {
-        squeeze(&String::from_utf8_lossy(&log)).contains(&format!("worker-task-{role}.md"))
-    })
+/// Whether the agent that holds `role`'s pane now has been posted a task —
+/// PRD #1666 S5: what a delegate does instead of typing a pointer that the
+/// fixture's `worker.py` read from its PTY. `_name` is the fixture worker the
+/// test expects to hold the pane; the binding to the live agent is what checks
+/// it.
+fn worker_read_pointer(deck: &TuiDeck, _name: &str, role: &str) -> bool {
+    let Some(record) = role_record(deck, role) else {
+        return false;
+    };
+    let Some(pane) = record.pane_id_env.as_deref() else {
+        return false;
+    };
+    view::messages(deck.attach_socket_path(), pane)
+        .into_iter()
+        .any(|message| {
+            message.bind_agent.as_deref() == Some(record.id.as_str())
+                && message.subject.starts_with("task from the orchestrator")
+        })
 }
 
 /// [`worker_read_pointer`] for a role's own fixture worker.
@@ -212,7 +220,7 @@ fn start_successor(
         .expect("start a successor on the exited worker's pane id")
 }
 
-/// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `steady` and see the task pointer land, then let that worker report `work-done` and EXIT ON ITS OWN, and delegate to `steady` again: the real `delegate` CLI must exit non-zero naming `steady` as a role that reached no worker. Then let the `clear = true` worker `fresh` exit the same way and delegate to it: the CLI must exit 0 and a fresh `fresh` worker must come back holding the task pointer.
+/// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `steady` and see the task reach its inbox, then let that worker report `work-done` and EXIT ON ITS OWN, and delegate to `steady` again: the real `delegate` CLI must exit non-zero naming `steady` as a role that reached no worker. Then let the `clear = true` worker `fresh` exit the same way and delegate to it: the CLI must exit 0 and a fresh `fresh` worker must come back with the task in its inbox.
 #[spec("orchestration/delegate/049")]
 #[test]
 fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered() {
@@ -241,7 +249,7 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
     );
     assert!(
         common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, STEADY)),
-        "control — the first task pointer never reached the live `steady` worker"
+        "control — the first task never reached the live `steady` worker"
     );
     // Issue #1539: the TUI may still be laying out the new tab when the pointer
     // lands, and its resize drops the pane's replay ring. Doing that resize
@@ -249,7 +257,7 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
     resize_role_pane(&deck, STEADY);
     assert!(
         role_has_pointer(&deck, STEADY),
-        "issue #1539: a resize after delivery hid the first task pointer"
+        "issue #1539: a resize after delivery hid the first task"
     );
 
     // ---- THE NATURAL EXIT -------------------------------------------------
@@ -283,12 +291,11 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
          still be delivered — refusing it would turn a working delivery into a failure\n{}",
         describe(&third)
     );
-    // The replacement is a stand-in that reports no `SessionStart`, so the
-    // dispatch writes its pointer only once the delegate's readiness wait gives
-    // up — measured at 30.0 s. 90 s clears that with room for a busy box.
+    // PRD #1666 S5: the task is posted to the replacement as soon as the
+    // respawn produced it; nothing waits for a `SessionStart`.
     assert!(
         common::wait_until(Duration::from_secs(90), || role_has_pointer(&deck, FRESH)),
-        "the respawned `fresh` worker never received its task pointer; records = {:?}",
+        "the respawned `fresh` worker never received its task; records = {:?}",
         common::agent_records_on(deck.attach_socket_path())
     );
 }
@@ -300,7 +307,7 @@ fn work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its
     route::successor_worker_report();
 }
 
-/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture and delegate to the `clear = false` worker `quitter`; a second delegate to it is refused as busy while it lives and owes that task. Let it EXIT ON ITS OWN without reporting and start a different agent in the same pane through the daemon's real `StartAgent`. The real `delegate` CLI must then exit 0 without `--supersede`, and the successor must read the task pointer.
+/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture and delegate to the `clear = false` worker `quitter`; a second delegate to it is refused as busy while it lives and owes that task. Let it EXIT ON ITS OWN without reporting and start a different agent in the same pane through the daemon's real `StartAgent`. The real `delegate` CLI must then exit 0 without `--supersede`, and the task must be posted to the successor.
 #[spec("orchestration/delegate/051")]
 #[test]
 fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_busy() {
@@ -325,7 +332,7 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
     );
     assert!(
         common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, QUITTER)),
-        "control — the task pointer never reached the live `quitter` worker"
+        "control — the task never reached the live `quitter` worker"
     );
 
     // ---- CONTROL: the busy refusal is live while that worker owes it -------
@@ -376,7 +383,7 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
             "successor",
             QUITTER
         )),
-        "the successor never read the task pointer; records = {:?}",
+        "the successor never received the task; records = {:?}",
         common::agent_records_on(deck.attach_socket_path())
     );
 }

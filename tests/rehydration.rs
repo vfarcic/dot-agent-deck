@@ -1812,6 +1812,7 @@ async fn dispatch_orchestration(
             compose_orchestrator_context: Some(
                 dot_agent_deck::orchestrator_context::Attendance::Unattended,
             ),
+            seed_reason: None,
         },
         registry,
         &LoudNotifier,

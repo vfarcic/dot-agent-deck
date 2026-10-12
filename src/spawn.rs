@@ -148,6 +148,10 @@ pub struct SpawnRequest {
     /// starting the team with the orchestrator holding the bare task. `None` is
     /// unaffected — a path that composes nothing has no precondition to fail.
     pub compose_orchestrator_context: Option<crate::orchestrator_context::Attendance>,
+    /// PRD #1666 S5: the sender `reason` the first prompt is posted under,
+    /// which names it to the agent (`dispatch:<unit>`, `seed`). `None` is a
+    /// scheduled task: `schedule:<task_name>`.
+    pub seed_reason: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -663,7 +667,6 @@ pub async fn spawn(
             // fast-booting agent's `SessionStart` can't land on the broadcast
             // before our receiver attaches (mirrors
             // `state.rs::dispatch_one_owned`'s subscribe-before-respawn).
-            let event_rx = event_tx.map(|tx| tx.subscribe());
             let id = spawn_one(
                 registry,
                 command.as_deref(),
@@ -721,15 +724,11 @@ pub async fn spawn(
                     &id,
                 );
             }
-            run_delivery(
-                registry,
-                pane_id.clone(),
-                id.clone(),
-                event_rx,
-                req.prompt.clone(),
-                detach_delivery,
-            )
-            .await;
+            // PRD #1666 S5: the prompt is the pane's first inbox message, posted
+            // now and bound to the agent just spawned. Nothing waits for it to
+            // start a session; nothing is typed.
+            let _ = detach_delivery;
+            post_seed(registry, &pane_id, &id, &seed_reason(&req), &req.prompt);
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
@@ -834,7 +833,6 @@ pub async fn spawn(
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
             // the orchestrator pane's `SessionStart` can't be missed regardless
             // of spawn order (the orchestrator role is not necessarily first).
-            let event_rx = event_tx.map(|tx| tx.subscribe());
             // PRD #140 M1.3: one instance token per orchestration spawn
             // request, minted before the role loop and stamped on every
             // role's membership — the daemon-initiated counterpart of the
@@ -1131,15 +1129,14 @@ pub async fn spawn(
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
             let delivery_agent_id = agents[orch_idx].id.clone();
-            run_delivery(
+            // PRD #1666 S5: posted to the orchestrator role's inbox, as above.
+            post_seed(
                 registry,
-                delivery_pane_id.clone(),
-                delivery_agent_id.clone(),
-                event_rx,
-                prompt,
-                detach_delivery,
-            )
-            .await;
+                &delivery_pane_id,
+                &delivery_agent_id,
+                &seed_reason(&req),
+                &prompt,
+            );
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::Orchestration { name },
@@ -1404,6 +1401,43 @@ fn session_start_wait_timeout() -> Duration {
     clamped
 }
 
+/// PRD #1666 S5: post `prompt` as the first inbox message of the agent
+/// `agent_id` just spawned in `pane_id`, from the deck under `reason`. An empty
+/// prompt posts nothing. A refusal is logged: the pane is already open.
+pub(crate) fn post_seed(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    reason: &str,
+    prompt: &str,
+) -> Option<crate::inbox::MessageId> {
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    match crate::inbox_hub::post_to_live(
+        registry,
+        crate::inbox::Recipient::bound(pane_id, agent_id),
+        crate::inbox::Content::from_deck(reason, "first prompt", prompt),
+    ) {
+        Ok(id) => {
+            tracing::info!(pane_id, agent_id, message_id = %id, "spawn: first prompt posted");
+            Some(id)
+        }
+        Err(error) => {
+            tracing::warn!(pane_id, agent_id, %error, "spawn: the agent's inbox refused its first prompt");
+            None
+        }
+    }
+}
+
+/// PRD #1666 S5: the sender `reason` a spawn's first prompt is posted under —
+/// the request's own, else a scheduled task named after it.
+fn seed_reason(req: &SpawnRequest) -> String {
+    req.seed_reason
+        .clone()
+        .unwrap_or_else(|| format!("schedule:{}", req.task_name))
+}
+
 /// Deliver the prompt into a freshly-spawned pane, gated on the agent's
 /// readiness. Delivery failure is logged, not fatal — the tab is already open.
 ///
@@ -1431,6 +1465,7 @@ fn session_start_wait_timeout() -> Duration {
 /// `authoring_kind` for every agent but Pi — hence `pub(crate)`. That caller
 /// subscribes before spawning, as [`spawn`] does, and always detaches, because
 /// it is answering a `start-agent` round trip.
+#[allow(dead_code)] // PRD #1666: the typed spawn delivery, deleted at S12
 pub(crate) async fn run_delivery(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: String,
@@ -3720,8 +3755,17 @@ pub async fn spawn_or_reuse(
 
     match decision {
         ReuseDecision::Reuse { pane_id, agent_id } => {
-            // Re-deliver into the existing pane, honoring deliver-on-idle.
-            deliver_on_idle(registry, &pane_id, &agent_id, &req.prompt, debounce).await;
+            // PRD #1666 S5: posted to the reused pane's live agent. No idle
+            // debounce: the message waits in the inbox, and the doorbell's draft
+            // guard keeps it out of a user's unsent draft.
+            let _ = debounce;
+            post_seed(
+                registry,
+                &pane_id,
+                &agent_id,
+                &seed_reason(&req),
+                &req.prompt,
+            );
             Ok(())
         }
         ReuseDecision::SpawnFresh => {
@@ -3768,6 +3812,7 @@ pub async fn spawn_or_reuse(
 /// fire makes its own reuse decision, and retrying here could only re-target
 /// whichever process now holds the pane — the exact delivery this guard exists
 /// to prevent.
+#[allow(dead_code)] // PRD #1666: the typed reuse delivery, deleted at S12
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -7819,6 +7864,7 @@ mod tests {
                 }),
             }),
             compose_orchestrator_context: None,
+            seed_reason: None,
         };
 
         let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;
@@ -7923,6 +7969,7 @@ mod tests {
                 }),
             }),
             compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
+            seed_reason: None,
         }
     }
 
@@ -7958,6 +8005,7 @@ mod tests {
                 inherited: None,
             }),
             compose_orchestrator_context: None,
+            seed_reason: None,
         };
 
         let reservation = registry
@@ -9104,69 +9152,101 @@ mod tests {
         }
     }
 
-    /// Scenario: A scheduled task reuses its tab, and because the user has just
-    /// typed the queued prompt is parked for the whole deliver-on-idle debounce;
-    /// inside that window the agent the reuse decision resolved goes away and an
-    /// unrelated one inherits the same `DOT_AGENT_DECK_PANE_ID`. The delivery
-    /// must be refused as `WrongSession`, and none of the prompt's bytes may
-    /// reach the successor, whose scrollback still shows a later authorized
-    /// write.
+    /// Scenario: A scheduled task reuses its tab while the user has just typed
+    /// into it, so the fire posts its prompt to the inbox of the agent the reuse
+    /// decision resolved rather than typing it. That agent then goes away and an
+    /// unrelated one inherits the same `DOT_AGENT_DECK_PANE_ID`. The prompt
+    /// becomes undeliverable instead of passing to the successor: the
+    /// successor's inbox holds nothing, and none of the prompt's bytes reach
+    /// its pane, whose scrollback still shows a later authorized write.
     #[spec("scheduler/reuse/004")]
     #[tokio::test]
-    async fn reuse_004_a_hand_over_inside_the_debounce_refuses_the_queued_prompt() {
-        const PANE: &str = "reuse-handover-during-debounce";
+    async fn reuse_004_a_hand_over_after_the_post_never_reaches_the_successor() {
+        const PANE: &str = "reuse-handover-after-post";
+        const TASK: &str = "reuse-handover-task";
         const PROMPT: &str = "SCHEDULED-PROMPT-MUST-NOT-REACH-THE-SUCCESSOR-6a1e";
-        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-3c88";
-        const DEBOUNCE: Duration = Duration::from_millis(600);
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-HAND-OVER-3c88";
+
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let original = spawn_byte_target(&registry, PANE);
-
-        // The user typed a moment ago, so `decide_delivery_capped` parks the
-        // delivery for the whole debounce rather than writing immediately. That
-        // wait IS the race window — it is what the fire holds a bare pane id
-        // across — so without this the write happens before anything can change
-        // hands and the test measures nothing.
+        // A user draft no longer holds the post back: the doorbell's draft
+        // guard is what keeps the prompt out of the user's way.
         registry.note_user_input(PANE);
-
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-            .with_ansi(false)
-            .finish();
-        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
-
-        // Both halves run on this task, not on a spawned one, so the delivery's
-        // `warn!` lands in the thread-local subscriber above.
-        let (_, successor) = tokio::join!(
-            deliver_on_idle(&registry, PANE, &original, PROMPT, DEBOUNCE),
-            async {
-                tokio::time::sleep(DEBOUNCE / 4).await;
-                registry
-                    .close_agent(&original)
-                    .expect("close the agent the reuse decision resolved");
-                spawn_byte_target(&registry, PANE)
-            }
+        let reuse: ReuseRegistry = Arc::default();
+        reuse.lock().unwrap().insert(
+            TASK.to_string(),
+            ReuseEntry {
+                agent_ids: vec![original.clone()],
+                delivery_pane_id: PANE.to_string(),
+                kind: SpawnKind::SingleAgent,
+            },
         );
-        drop(subscriber_guard);
+        let req = SpawnRequest {
+            task_name: TASK.to_string(),
+            working_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: None,
+            prompt: PROMPT.to_string(),
+            resolved_target: None,
+            compose_orchestrator_context: None,
+            seed_reason: None,
+        };
+        spawn_or_reuse(
+            req,
+            false,
+            &registry,
+            &reuse,
+            &SilentNotifier,
+            Duration::from_millis(600),
+            None,
+            None,
+        )
+        .await
+        .expect("a reused tab takes the fire");
+
+        let posted = registry.inbox().list(PANE);
+        assert_eq!(posted.len(), 1, "one post per fire: {posted:?}");
+        let id = posted[0].id.to_string();
+        assert_eq!(
+            posted[0].bind_agent.as_deref(),
+            Some(original.as_str()),
+            "the prompt must be bound to the agent the reuse decision resolved"
+        );
+        assert_eq!(posted[0].state, crate::inbox::StateName::Queued);
+
+        registry
+            .close_agent(&original)
+            .expect("close the agent the reuse decision resolved");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry
+            .inbox()
+            .list(PANE)
+            .iter()
+            .any(|m| m.id.as_str() == id && m.state != crate::inbox::StateName::Undeliverable)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the bound prompt must become undeliverable once its agent exits: {:?}",
+                registry.inbox().list(PANE)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let successor = spawn_byte_target(&registry, PANE);
         assert_ne!(
             original, successor,
             "the hand-over must produce a NEW registry agent id"
         );
-
-        let log = String::from_utf8(captured.0.lock().unwrap().clone())
-            .expect("captured log must be valid UTF-8");
         assert!(
-            log.contains("scheduled reuse prompt refused"),
-            "the delivery must reach its identity gate and be REFUSED there, not merely fail to \
-             write; captured log = {log:?}"
-        );
-        assert!(
-            log.contains("WrongSession"),
-            "the pane has a live agent that is not the expected one, so the refusal must be \
-             WrongSession — anything else means the fixture never got the hand-over it needed; \
-             captured log = {log:?}"
+            registry
+                .inbox()
+                .doorbell_facts(PANE, &successor)
+                .queued
+                .is_empty(),
+            "the successor's inbox must not inherit the predecessor's prompt"
         );
 
         // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
@@ -9176,17 +9256,12 @@ mod tests {
             .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
             .await
             .expect("the barrier write must reach the registry");
-        assert_eq!(
-            barrier,
-            GuardedSend::Applied,
-            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
-             this test proves nothing about the refusal above"
-        );
+        assert_eq!(barrier, GuardedSend::Applied);
         let snapshot = wait_for_detached_payload_echo(&registry, &successor, BARRIER).await;
         assert!(
             !String::from_utf8_lossy(&snapshot).contains(PROMPT),
-            "a scheduled task's prompt was submitted into a process that merely inherited the \
-             pane id of the agent the reuse decision resolved; snapshot = {:?}",
+            "a scheduled task's prompt reached a process that merely inherited the pane id of \
+             the agent the reuse decision resolved; snapshot = {:?}",
             String::from_utf8_lossy(&snapshot)
         );
 

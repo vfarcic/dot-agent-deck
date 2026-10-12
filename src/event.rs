@@ -2377,6 +2377,11 @@ pub struct DelegateResponse {
     /// output. Additive on the hook socket like every field of this reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked: Vec<BlockedWorker>,
+    /// PRD #1666 S5: the inbox id of each task message this delegate posted,
+    /// one per worker pane it reached, so the orchestrator can follow each with
+    /// `dot-agent-deck inbox list`. Additive on the hook socket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_ids: Vec<String>,
 }
 
 /// Issue #714: one delegate target whose worker appears blocked by a provider
@@ -2429,6 +2434,7 @@ impl Default for DelegateResponse {
             busy: Vec::new(),
             superseded: Vec::new(),
             blocked: Vec::new(),
+            message_ids: Vec::new(),
         }
     }
 }

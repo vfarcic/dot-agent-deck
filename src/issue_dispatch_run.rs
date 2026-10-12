@@ -959,6 +959,8 @@ async fn dispatch_one_issue(
         // done, the value that belongs here is `Unattended`: a scheduled per-issue
         // dispatch has no one at the pane either (issue #703).
         compose_orchestrator_context: None,
+        // PRD #1666 S5: labelled as the session's starting prompt.
+        seed_reason: Some("seed".to_string()),
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
         return settle_failed_issue_spawn(

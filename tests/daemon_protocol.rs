@@ -2623,19 +2623,22 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
             Some(expected_start_type),
             "pi_start={pi_start}: the start role runs as its declared agent"
         );
+        // PRD #1666 S5: the seed is the pane's first inbox message.
+        let start_seed = server
+            .registry
+            .inbox()
+            .rendered(&start_pane)
+            .into_iter()
+            .map(|delivery| delivery.text)
+            .find(|text| text.contains(prepared.prompt.as_str()));
         assert_eq!(
-            server
-                .registry
-                .take_pending_seed_native_for(&start_pane, Some(&ids[0])),
-            pi_start.then(|| prepared.prompt.clone()),
-            "pi_start={pi_start}: only a Pi start role is seeded natively, with the \
+            start_seed.is_some(),
+            pi_start,
+            "pi_start={pi_start}: only a Pi start role is seeded by the deck, with the \
              preparation's own coordinator prompt"
         );
-        assert_eq!(
-            server
-                .registry
-                .take_pending_seed_native_for(&worker_pane, Some(&ids[1])),
-            None,
+        assert!(
+            server.registry.inbox().list(&worker_pane).is_empty(),
             "pi_start={pi_start}: a Pi worker role is never seeded — it is not the coordinator"
         );
         for id in ids {

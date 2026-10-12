@@ -124,6 +124,10 @@ use crate::state::SharedState;
 // Frame kinds
 // ---------------------------------------------------------------------------
 
+/// PRD #1666: the type of [`AttachRequest::PostMessage`]'s `origin`, re-exported
+/// with the protocol it belongs to so a client names it from here.
+pub use crate::inbox_hub::PostOrigin;
+
 pub const KIND_REQ: u8 = 0x01;
 pub const KIND_RESP: u8 = 0x02;
 pub const KIND_STREAM_OUT: u8 = 0x10;
@@ -2556,6 +2560,11 @@ pub enum AttachRequest {
     ListInbox {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<String>,
+        /// PRD #1666 S5: also answer each message rendered whole, as the agent
+        /// sees it ([`crate::inbox::MessageSummary::text`]). Additive: `false`
+        /// keeps the summaries-only reply.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        bodies: bool,
     },
     /// PRD #1487: restart this daemon — onto the build now installed at its own
     /// path ([`RestartSuccessor::Installed`]), or for a client that starts its
@@ -5451,11 +5460,6 @@ async fn handle_connection(
                     }
                 },
             };
-            // Subscribed BEFORE the spawn, as every readiness-gated delivery is
-            // (`crate::spawn::spawn`, `crate::state::dispatch_one_owned`), so a
-            // fast-booting agent's `SessionStart` cannot reach the broadcast
-            // before this receiver exists.
-            let authoring_rx = authoring_seed.as_ref().map(|_| event_tx.subscribe());
 
             // Issue #555: the orchestration run title is decided HERE, by the
             // daemon, and not by the form. The `Ctrl+n` form refuses a title a
@@ -5557,60 +5561,16 @@ async fn handle_connection(
                     if let Some(kind) = authoring_kind.or(client_seeded_kind) {
                         let _ = registry.set_authoring_kind(&id, kind);
                     }
-                    // PRD #1223 M7: deliver the authoring seed through the path
-                    // this agent already has, never a new one (#528). A Pi pane
-                    // takes PRD #201's native seed — the branch just below, which
-                    // the TUI's Pi orchestrators already use, pulled by the
-                    // extension's `get-seed` with the PTY safety net behind it.
-                    // Every other agent takes `crate::spawn`'s readiness-gated
-                    // delivery — the one `dispatch` and the scheduler use —
-                    // detached, so this reply is not held for the readiness wait.
-                    // Which agent it is comes from the deck's frozen launch record
-                    // (no hook event can rewrite it), else from the command — the
-                    // resolution `crate::spawn::spawn_one` applies, and the one the
-                    // TUI makes before seeding a Pi orchestrator natively.
-                    let mut seed = seed;
-                    if let (Some(pane_id), Some(authoring_seed), Some(rx)) =
-                        (pane_id_env.as_deref(), authoring_seed, authoring_rx)
-                    {
-                        let launched_as = registry
-                            .spawn_agent_type(&id)
-                            .or_else(|| AgentType::from_command(command.as_deref()));
-                        if launched_as == Some(AgentType::Pi) {
-                            seed = Some(authoring_seed);
-                        } else {
-                            crate::spawn::run_delivery(
-                                &registry,
-                                pane_id.to_string(),
-                                id.clone(),
-                                Some(rx),
-                                authoring_seed,
-                                true,
-                            )
-                            .await;
-                        }
-                    }
-                    // PRD #201 native prompt delivery: if the spawn carried a
-                    // seed (a Pi start-role orchestrator pane), stash it for the
-                    // pane's extension to pull natively via `get-seed`, and arm
-                    // the PTY-injection safety net in case the pull never comes.
-                    // Do this right after spawn so the seed is available before
-                    // pi boots + fires `session_start`. Non-seed spawns (every
-                    // other pane) skip this entirely and keep the legacy path.
-                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
-                        && !seed.trim().is_empty()
-                    {
-                        registry.set_pending_seed(pane_id, seed);
-                        // Issue #617 (finding 6): bind the fallback to the agent
-                        // this spawn just produced, so an injection that fires
-                        // after the pane has been recycled is refused rather
-                        // than typed into its new occupant.
-                        crate::agent_pty::arm_seed_fallback(
-                            registry.clone(),
-                            pane_id.to_string(),
-                            id.clone(),
-                            crate::agent_pty::seed_fallback_grace(),
-                        );
+                    // PRD #1666 S5: the seed — the client's, or the authoring
+                    // seed composed for this kind — is the pane's first inbox
+                    // message, for EVERY agent type, posted now and bound to the
+                    // agent just spawned. Nothing waits for the agent to start a
+                    // session and nothing is typed: a component takes it, the
+                    // doorbell names it, and a Pi extension that still pulls
+                    // with `get-seed` is served it from the inbox.
+                    let seed = authoring_seed.or(seed);
+                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref()) {
+                        crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed);
                     }
                     // Issue #454: NOTHING is registered in the daemon's
                     // `AppState` here, deliberately.
@@ -6792,11 +6752,12 @@ async fn handle_connection(
             );
             write_resp(&mut stream, &resp).await?
         }
-        AttachRequest::ListInbox { pane_id } => {
+        AttachRequest::ListInbox { pane_id, bodies } => {
             let hub = registry.inbox();
-            let messages = match pane_id.as_deref() {
-                Some(pane) => hub.list(pane),
-                None => hub.list_all(),
+            let messages = match (pane_id.as_deref(), bodies) {
+                (Some(pane), false) => hub.list(pane),
+                (None, false) => hub.list_all(),
+                (pane, true) => hub.list_with_bodies(pane),
             };
             let resp = AttachResponse {
                 ok: true,
@@ -6842,6 +6803,7 @@ fn post_message(
         body_trust: crate::inbox::BodyTrust::Trusted,
         spill_path: spill_path.map(std::path::PathBuf::from),
         id: None,
+        preface: None,
     };
     match registry
         .inbox()
@@ -11144,13 +11106,29 @@ mod tests {
     #[test]
     fn list_inbox_and_deck_id_wire_shapes() {
         let all: AttachRequest = serde_json::from_str(r#"{"op":"list-inbox"}"#).unwrap();
-        assert!(matches!(all, AttachRequest::ListInbox { pane_id: None }));
+        assert!(matches!(
+            all,
+            AttachRequest::ListInbox {
+                pane_id: None,
+                bodies: false
+            }
+        ));
         let one = AttachRequest::ListInbox {
             pane_id: Some("w".to_string()),
+            bodies: false,
         };
         assert_eq!(
             serde_json::to_value(&one).unwrap(),
             serde_json::json!({"op":"list-inbox","pane_id":"w"})
+        );
+        // PRD #1666 S5: `bodies` is additive and left off the wire when false.
+        let with_bodies = AttachRequest::ListInbox {
+            pane_id: None,
+            bodies: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&with_bodies).unwrap(),
+            serde_json::json!({"op":"list-inbox","bodies":true})
         );
         let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
         assert!(!plain.as_object().unwrap().contains_key("deck_id"));

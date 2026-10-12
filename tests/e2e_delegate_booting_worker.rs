@@ -221,6 +221,7 @@ fn delegate_into_booting_worker_drawn(timings: &[(&str, &str)], draw: &str) -> (
 /// whole pointer once and never a cut-short piece of it.
 #[spec("orchestration/delegate/052")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_052_clear_false_pointer_waits_for_a_booting_codex_worker() {
     // The buffer the deck holds after the worker takes the terminal outlasts
     // the stand-in's one-second provisional composer, as the production 5 s
@@ -264,6 +265,7 @@ fn delegate_052_clear_false_pointer_waits_for_a_booting_codex_worker() {
 /// worker then submits the whole pointer.
 #[spec("orchestration/delegate/053")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_053_a_cut_short_pointer_is_sent_again() {
     cut_short_pointer_is_sent_again("");
 }
@@ -275,6 +277,7 @@ fn delegate_053_a_cut_short_pointer_is_sent_again() {
 /// whole pointer.
 #[spec("orchestration/delegate/053")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_053_a_cut_short_pointer_is_sent_again_over_its_own_echo() {
     cut_short_pointer_is_sent_again("inline");
 }

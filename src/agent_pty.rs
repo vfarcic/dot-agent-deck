@@ -2339,7 +2339,20 @@ fn pump_reader(
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
     {
-        registry.inbox().agent_exited(pane_id, &agent_id);
+        // PRD #1666 S5: a delegated task this agent never acknowledged is now
+        // undeliverable, so the commission and idle-worker record its delegate
+        // armed go with it — before the orchestrator is told, so a delegate sent
+        // in answer to the notice is not refused as busy, and the sweep below
+        // finds no record to report the same exit a second time.
+        for ledger in registry.inbox().agent_exited(pane_id, &agent_id) {
+            if ledger.commission_arm_id.is_some() {
+                registry.release_delegation_commission(pane_id, ledger.commission_arm_id);
+            }
+            if let Some(seq) = ledger.delegation_seq {
+                let _ = registry.take_outstanding_delegation_if(pane_id, seq);
+            }
+        }
+        registry.inbox().post_owed_notices();
     }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
@@ -2363,6 +2376,31 @@ fn pump_reader(
             .into_iter()
             .filter(|delegation| delegation.orchestrator_pane_id != pane_id)
             .collect();
+        // PRD #1666 S5: with the idle-worker detector switched off no delegation
+        // record exists, but the commission still says this agent owed a
+        // work-done. Its orchestrator is told the same way.
+        if worker_exits.is_empty()
+            && let Some(owner) = registry.commission_owed_to_agent(pane_id, &agent_id)
+            && owner.orchestrator_pane_id != pane_id
+            && let Some(orchestrator_agent_id) = owner.orchestrator_agent_id
+        {
+            match crate::inbox_hub::post_notice_to_live(
+                &registry,
+                crate::inbox::Recipient::bound(&owner.orchestrator_pane_id, &orchestrator_agent_id),
+                "worker exited",
+                crate::state::compose_worker_exited_notice(pane_id),
+            ) {
+                Ok(_) => tracing::info!(
+                    worker_pane_id = %pane_id,
+                    "pane EOF: reported a worker that exited without work-done to the orchestrator"
+                ),
+                Err(error) => tracing::warn!(
+                    worker_pane_id = %pane_id,
+                    %error,
+                    "pane EOF: the orchestrator's inbox refused the worker-exited report"
+                ),
+            }
+        }
         if !worker_exits.is_empty() {
             match runtime_handle {
                 Some(handle) => {
@@ -7520,11 +7558,19 @@ impl AgentPtyRegistry {
     /// A registry the daemon has not yet [installed](Self::install_inbox) an
     /// inbox into (an in-process test) gets one under a fresh, unpersisted deck
     /// id on first use.
+    ///
+    /// PRD #1666 S5: when that first use is inside a tokio runtime, the inbox's
+    /// deadline ticker is started on it too, as the daemon starts its own, so
+    /// redelivery and the undelivered notice run in-process as well.
     pub fn inbox(&self) -> &Arc<crate::inbox_hub::InboxHub> {
         self.inbox.get_or_init(|| {
-            Arc::new(crate::inbox_hub::InboxHub::from_env(
+            let hub = Arc::new(crate::inbox_hub::InboxHub::from_env(
                 crate::inbox::DeckId::generate(),
-            ))
+            ));
+            if tokio::runtime::Handle::try_current().is_ok() {
+                drop(hub.spawn_ticker());
+            }
+            hub
         })
     }
 
@@ -9597,84 +9643,45 @@ impl AgentPtyRegistry {
         // on the orchestrator's draft moves the value, and the re-check below
         // refuses. One that lands between the EOF sweep and this line is left to
         // the commission check beside it.
-        let resolution = self.delegation_resolution_epoch(worker_pane_id);
-        let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
-        let orchestrator_pane_id = delegation.orchestrator_pane_id.clone();
-        let expected_agent_id = delegation.orchestrator_agent_id.clone();
-        let orchestration = delegation.orchestration.clone();
-        let revalidate_registry = Arc::clone(self);
-        let revalidate_pane = orchestrator_pane_id.clone();
-        let revalidate_worker = worker_pane_id.to_string();
-        let outcome = self
-            .write_and_submit_guarded_first_write(
-                &orchestrator_pane_id,
-                &notice,
-                &expected_agent_id,
-                || async move {
-                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
-                        return false;
-                    }
-                    // Issue #708: a `work-done` credited since the sweep means
-                    // the delegation did NOT fail — see this function's doc.
-                    if !revalidate_registry.owes_delegation_commission(&revalidate_worker) {
-                        return false;
-                    }
-                    if !crate::state::delegation_still_unresolved(
-                        &revalidate_registry,
-                        &revalidate_worker,
-                        resolution,
-                        "worker-exited notice",
-                    ) {
-                        return false;
-                    }
-                    crate::state::orchestration_still_matches(
-                        orchestration.as_ref(),
-                        revalidate_registry
-                            .pane_orchestration(&revalidate_pane)
-                            .as_ref(),
-                    )
-                },
-                Instant::now(),
-            )
-            .await;
-        // Issue #708: a one-shot submitted report releases its payload record on
-        // `Applied`, like the silence report — otherwise the same worker pane
-        // exiting again after a restart produces byte-identical text that the
-        // user-input guard would refuse as a repeat.
-        let settled = outcome.as_ref().ok().copied();
-        crate::state::settle_one_shot_payload_record(self, &orchestrator_pane_id, &notice, settled);
-        match outcome {
-            Ok(GuardedSend::Applied) => tracing::info!(
+        // Issue #708: a `work-done` credited since the sweep means the
+        // delegation did NOT fail — see this function's doc.
+        if !self.owes_delegation_commission(worker_pane_id) {
+            tracing::debug!(
                 worker_pane_id = %worker_pane_id,
                 role = %delegation.role,
-                "pane EOF: submitted a report of a worker that exited without work-done to the \
-                 orchestrator"
-            ),
-            // Some bytes reached the authorized target; a retry would
-            // duplicate a half-written report rather than repair it, and the
-            // payload record is kept (see the settle call above).
-            Ok(GuardedSend::Ambiguous) => tracing::warn!(
-                pane_id = %orchestrator_pane_id,
-                role = %delegation.role,
-                "pane EOF: the worker-exited report's submission was ambiguous (partial write); \
-                 not retried, and its payload record is kept"
-            ),
-            Ok(refused) => tracing::debug!(
-                pane_id = %orchestrator_pane_id,
-                role = %delegation.role,
-                expected_agent_id = %expected_agent_id,
-                outcome = ?refused,
-                "pane EOF: the worker-exited report was refused (identity gate, or a work-done \
-                 already credited the delegation); nothing submitted"
-            ),
-            Err(e) => tracing::warn!(
-                pane_id = %orchestrator_pane_id,
-                role = %delegation.role,
-                error = %e,
-                "pane EOF: failed to submit the worker-exited report into the orchestrator pane"
-            ),
+                "pane EOF: a work-done already credited the delegation; no worker-exited notice"
+            );
+            return Some(GuardedSend::Stale);
         }
-        settled
+        let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
+        // PRD #1666 S5: a daemon notice in the orchestrator generation's inbox.
+        match crate::inbox_hub::post_notice_to_live(
+            self,
+            crate::inbox::Recipient::bound(
+                &delegation.orchestrator_pane_id,
+                &delegation.orchestrator_agent_id,
+            ),
+            "worker exited",
+            notice,
+        ) {
+            Ok(_) => {
+                tracing::info!(
+                    worker_pane_id = %worker_pane_id,
+                    role = %delegation.role,
+                    "pane EOF: reported a worker that exited without work-done to the orchestrator"
+                );
+                Some(GuardedSend::Applied)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pane_id = %delegation.orchestrator_pane_id,
+                    role = %delegation.role,
+                    %error,
+                    "pane EOF: the orchestrator's inbox refused the worker-exited report"
+                );
+                Some(GuardedSend::NoLiveTarget)
+            }
+        }
     }
 
     /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
@@ -14556,90 +14563,49 @@ impl AgentPtyRegistry {
         gate: &Arc<BlockedNoticeGate>,
     ) -> bool {
         let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
-        let gate = Arc::clone(gate);
         let orchestrator_pane_id = notice.orchestrator_pane_id.clone();
         let expected_agent_id = notice.orchestrator_agent_id.clone();
-        let orchestration = notice.orchestration.clone();
-        let revalidate_registry = Arc::clone(self);
-        let revalidate_pane = orchestrator_pane_id.clone();
-        let (worker_pane, worker_agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
-        let outcome = self
-            .write_and_submit_guarded_first_write(
-                &orchestrator_pane_id,
-                &text,
-                &expected_agent_id,
-                || async move {
-                    if revalidate_registry.is_pane_closing(&revalidate_pane)
-                        || !revalidate_registry.quota_block_current(
-                            &worker_pane,
-                            &worker_agent,
-                            epoch,
-                        )
-                    {
-                        return false;
-                    }
-                    // Last, so a task that passes it writes: once past this
-                    // point the task can no longer be cancelled.
-                    crate::state::orchestration_still_matches(
-                        orchestration.as_ref(),
-                        revalidate_registry
-                            .pane_orchestration(&revalidate_pane)
-                            .as_ref(),
-                    ) && gate.begin_write()
-                },
-                Instant::now(),
+        // The same checks the typed notice made before its write, now before
+        // the post: the orchestrator pane is not closing, the block is the one
+        // this notice is for, and nothing cancelled the notice.
+        if self.is_pane_closing(&orchestrator_pane_id)
+            || !self.quota_block_current(worker_pane_id, worker_agent_id, epoch)
+            || !crate::state::orchestration_still_matches(
+                notice.orchestration.as_ref(),
+                self.pane_orchestration(&orchestrator_pane_id).as_ref(),
             )
-            .await;
-        // A one-shot submitted report: its payload record goes on `Applied` and
-        // stays on `Ambiguous`, so leftover bytes cannot ride a later identical
-        // report together with a user draft.
-        crate::state::settle_one_shot_payload_record(
-            self,
-            &orchestrator_pane_id,
-            &text,
-            outcome.as_ref().ok().copied(),
-        );
-        match outcome {
-            Ok(GuardedSend::Applied) => {
-                tracing::info!(
-                    worker_pane_id = %worker_pane_id,
-                    role = %notice.role,
-                    "quota: submitted a report of a delegated worker blocked by a provider usage \
-                     limit to the orchestrator"
-                );
-                false
-            }
-            Ok(GuardedSend::Ambiguous) => {
-                tracing::warn!(
-                    pane_id = %orchestrator_pane_id,
-                    role = %notice.role,
-                    "quota: the blocked-worker report's submission was ambiguous (partial \
-                     write); not retried, and its payload record is kept"
-                );
-                false
-            }
-            Ok(refused) => {
-                let released = self.release_worker_blocked_notice(worker_pane_id, notice.seq);
-                tracing::debug!(
-                    pane_id = %orchestrator_pane_id,
-                    role = %notice.role,
-                    expected_agent_id = %expected_agent_id,
-                    outcome = ?refused,
-                    "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
-                     or the worker is no longer blocked); nothing written, notice still owed"
-                );
-                released
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pane_id = %orchestrator_pane_id,
-                    role = %notice.role,
-                    error = %e,
-                    "quota: failed to write the blocked-worker notice into the orchestrator pane"
-                );
-                false
-            }
+            || !gate.begin_write()
+        {
+            let released = self.release_worker_blocked_notice(worker_pane_id, notice.seq);
+            tracing::debug!(
+                pane_id = %orchestrator_pane_id,
+                role = %notice.role,
+                "quota: the blocked-worker notice no longer applies (orchestrator changed, or \
+                 the worker is no longer blocked); nothing posted, notice still owed"
+            );
+            return released;
         }
+        // PRD #1666 S5: a daemon notice in the orchestrator generation's inbox.
+        match crate::inbox_hub::post_notice_to_live(
+            self,
+            crate::inbox::Recipient::bound(&orchestrator_pane_id, &expected_agent_id),
+            "worker blocked by a usage limit",
+            text,
+        ) {
+            Ok(_) => tracing::info!(
+                worker_pane_id = %worker_pane_id,
+                role = %notice.role,
+                "quota: reported a delegated worker blocked by a provider usage limit to the \
+                 orchestrator"
+            ),
+            Err(error) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %notice.role,
+                %error,
+                "quota: the orchestrator's inbox refused the blocked-worker notice"
+            ),
+        }
+        false
     }
 
     /// Take just the current scrollback snapshot for an agent.
@@ -21648,6 +21614,7 @@ mod spawn_tests {
                     body_trust: crate::inbox::BodyTrust::Trusted,
                     spill_path: None,
                     id: None,
+                    preface: None,
                 },
             )
             .unwrap();
@@ -27191,19 +27158,19 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #714, after #708: the blocked-worker report is SUBMITTED into the
-    /// orchestrator's pane, like its worker-exited sibling, and a byte-identical
-    /// report for a LATER delegation is still submitted after the user has typed
-    /// there. Driven through `spawn_worker_blocked_notice`, the one production
-    /// entry point, against a raw-mode `cat` so the byte after the report's
-    /// final clause is exactly the terminator the daemon wrote.
+    /// Issue #714, after #708; PRD #1666 S5: the blocked-worker report reaches
+    /// the orchestrator as a whole daemon notice in its inbox, like its
+    /// worker-exited sibling, and a byte-identical report for a LATER delegation
+    /// is still posted after the user has typed into the orchestrator's pane.
+    /// Driven through `spawn_worker_blocked_notice`, the one production entry
+    /// point.
     ///
-    /// 1. **Submitted.** An LF-terminated line reaches nobody in a dispatched
-    ///    unit — no human presses Enter — so an orchestrator would never learn
-    ///    to reassign a task its quota-blocked worker cannot finish.
-    /// 2. **Released on `Applied`.** A second delegation to the same blocked
-    ///    worker produces the same text. Without the payload record's release,
-    ///    the user-input guard would refuse it as a repeat of the user's draft.
+    /// 1. **Delivered whole.** A report that reaches nobody leaves a dispatched
+    ///    unit's orchestrator never learning to reassign a task its
+    ///    quota-blocked worker cannot finish.
+    /// 2. **Not held back by the user's typing.** A second delegation to the
+    ///    same blocked worker produces the same text; a post is not a write into
+    ///    the user's input, so nothing refuses it as a repeat of their draft.
     #[tokio::test]
     async fn worker_blocked_report_is_submitted_and_resubmits_after_user_input() {
         const ORCH: &str = "blocked-report-orchestrator";
@@ -27241,21 +27208,19 @@ mod spawn_tests {
             );
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        // The byte following each report's final clause, in scrollback order.
+        // PRD #1666 S5: each report is a daemon notice in the orchestrator's
+        // inbox; count the ones carrying both the opening and the final clause.
         let terminators = || {
-            let snapshot = reg.snapshot(&orchestrator).unwrap_or_default();
-            let mut found = Vec::new();
-            let mut rest = &snapshot[..];
-            while let Some(start) = rest.windows(OPENING.len()).position(|w| w == OPENING) {
-                rest = &rest[start..];
-                let Some(end) = rest.windows(TAIL.len()).position(|w| w == TAIL) else {
-                    break;
-                };
-                let end = end + TAIL.len();
-                found.push(rest.get(end).copied());
-                rest = &rest[end..];
-            }
-            found
+            reg.inbox()
+                .rendered(ORCH)
+                .into_iter()
+                .filter(|delivery| {
+                    let text = delivery.text.as_bytes();
+                    text.windows(OPENING.len()).any(|w| w == OPENING)
+                        && text.windows(TAIL.len()).any(|w| w == TAIL)
+                })
+                .map(|_| Some(b'\n'))
+                .collect::<Vec<_>>()
         };
         let report = |expected: usize| {
             let (reg, orchestrator, worker) =
@@ -27291,11 +27256,11 @@ mod spawn_tests {
         reg.shutdown_all();
 
         assert_eq!(
-            observed,
-            vec![Some(b'\r'), Some(b'\r')],
-            "both blocked-worker reports must be SUBMITTED (terminated by CR, not left as an \
-             LF-terminated line), and the second, byte-identical one must still be submitted \
-             after the user typed; terminators observed = {observed:?}"
+            observed.len(),
+            2,
+            "both blocked-worker reports must reach the orchestrator's inbox whole, and the \
+             second, byte-identical one must still be posted after the user typed; reports \
+             observed = {observed:?}"
         );
     }
 

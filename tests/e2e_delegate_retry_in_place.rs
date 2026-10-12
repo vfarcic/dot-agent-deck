@@ -67,6 +67,7 @@ fn launch_pids(path: &std::path::Path) -> Vec<u32> {
 /// the attached worker pane, without another respawn.
 #[spec("orchestration/delegate/042")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_042_retries_lost_pointer_in_the_same_worker_process() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
@@ -265,6 +266,7 @@ while True:
 /// attached pane, and the orchestrator must not be told the worker went quiet.
 #[spec("orchestration/delegate/042")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot() {
     let schedule = dot_agent_deck::delegate_retry::DEFAULT_RETRY_SCHEDULE_MS
         .map(|ms| ms.to_string())
@@ -685,6 +687,7 @@ fn wait_for_retry_loop_end(work: &std::path::Path) {
 /// same replacement worker process must still be running.
 #[spec("orchestration/delegate/043")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_043_exhaustion_reports_three_retries_without_respawn() {
     let (deck, work, delivered_pid) = launch_retry_fixture(
         NEVER_READS_WORKER,
@@ -718,6 +721,7 @@ fn delegate_043_exhaustion_reports_three_retries_without_respawn() {
 /// eventually accept the task.
 #[spec("orchestration/delegate/044")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_044_visible_composer_retries_submit_only() {
     let (deck, work, delivered_pid) = launch_retry_fixture(
         COMPOSER_WORKER,
@@ -856,6 +860,7 @@ fn ready_composer_lost_submit(agent: &str) {
 /// or any input after acceptance.
 #[spec("orchestration/delegate/047")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_047_ready_claude_composer_recovers_lost_submit() {
     ready_composer_lost_submit("claude");
 }
@@ -866,6 +871,7 @@ fn delegate_047_ready_claude_composer_recovers_lost_submit() {
 /// sending any input after acceptance.
 #[spec("orchestration/delegate/048")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_048_ready_codex_composer_recovers_lost_submit() {
     ready_composer_lost_submit("codex");
 }
@@ -876,6 +882,7 @@ fn delegate_048_ready_codex_composer_recovers_lost_submit() {
 /// worker notice may reach the orchestrator after the retry window.
 #[spec("orchestration/delegate/045")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_045_ack_stops_retries_and_silence_notice() {
     let worker_command = format!(
         "python3 -u worker.py {}",

@@ -19,7 +19,9 @@
 //!    [`DoorbellConfig::arm_grace`] has passed;
 //! 3. its last hook-reported status is **Idle** — never `WaitingForInput`
 //!    (dialogs and permission prompts), Thinking, Working, Compacting, Blocked,
-//!    Error, or Unknown (no hook yet);
+//!    Error, or Unknown (no hook yet), nor the Idle of a Codex wrapper's
+//!    fork-time start alone — and its session has not declared the pane
+//!    history-only or view-only;
 //! 4. the user has no unsent draft in the pane — with no cap: the doorbell
 //!    waits for the user however long they take;
 //! 5. the ring is due on the schedule ([`DoorbellConfig::schedule`]).
@@ -44,7 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent_pty::{AgentPtyRegistry, DoorbellWrite};
 use crate::inbox_hub::DoorbellFacts;
-use crate::state::{SessionStatus, SharedState};
+use crate::state::SharedState;
 
 /// How often the doorbell re-checks its conditions, in milliseconds.
 pub const ENV_TICK_MS: &str = "DOT_AGENT_DECK_DOORBELL_TICK_MS";
@@ -316,17 +318,23 @@ async fn run_tick(
     if keys.is_empty() {
         return;
     }
-    let statuses: Vec<Option<SessionStatus>> = {
+    // PRD #1666 S5: a pane whose session declared it cannot take input
+    // (history-only or view-only) is never rung, whatever its status says —
+    // the line would land in no live conversation.
+    let idles: Vec<bool> = {
         let state = state.read().await;
         keys.iter()
-            .map(|(pane, agent)| state.agent_status(agent, pane))
+            .map(|(pane, agent)| {
+                state.agent_doorbell_idle(agent, pane)
+                    && state.pane_writable(pane) == crate::event::Writable::Live
+            })
             .collect()
     };
     let now = Instant::now();
-    for ((pane, agent), status) in keys.into_iter().zip(statuses) {
+    for ((pane, agent), idle) in keys.into_iter().zip(idles) {
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
-            idle: status == Some(SessionStatus::Idle),
+            idle,
             draft: registry.draft_pending(&pane),
         };
         let action = {
@@ -367,6 +375,7 @@ async fn run_tick(
                 // is treated as rung: the next one flushes it first.
                 (DoorbellWrite::Written | DoorbellWrite::Failed, Action::Ring { id, .. }) => {
                     slot.bell.rang(Instant::now(), &queued);
+                    registry.inbox().note_ring(&pane, &agent);
                     info!(
                         pane_id = %pane,
                         agent_id = %agent,

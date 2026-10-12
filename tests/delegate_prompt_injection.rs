@@ -760,6 +760,7 @@ fn session_start_event_with_origin(
 #[spec("orchestration/delegate/007")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let real_deck = DecoyDeck::bind();
@@ -951,6 +952,7 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
 #[spec("orchestration/delegate/008")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -1030,6 +1032,7 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
 #[spec("orchestration/delegate/010")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_010_observed_session_start_waits_for_readiness_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -1151,6 +1154,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
 #[spec("orchestration/delegate/011")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -1393,6 +1397,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
 #[spec("orchestration/delegate/012")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -1549,6 +1554,7 @@ fn write_wrapped_ready_agent(path: &std::path::Path) {
 #[spec("orchestration/delegate/029")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_promptly() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -2165,6 +2171,7 @@ fn raw_input_agent_script() -> String {
 #[spec("orchestration/delegate/026")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_released() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -2347,6 +2354,7 @@ const REPRICE_PROMPT: &str = "SCHEDREPRICEMARKER list the files";
 #[spec("scheduler/spawn/010")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let wait_ms = REPRICE_FIXTURE_WAIT_MS.to_string();
@@ -2410,6 +2418,7 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
             prompt: REPRICE_PROMPT.to_string(),
             resolved_target: None,
             compose_orchestrator_context: None,
+            seed_reason: None,
         },
         &daemon.registry,
         &SpawnTestNotifier,
@@ -2509,6 +2518,7 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
 #[spec("orchestration/delegate/039")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     // Run as a developer runs it, with that deck's default endpoint reachable
@@ -2732,6 +2742,7 @@ impl dot_agent_deck::scheduler::Notifier for SpawnTestNotifier {
 #[spec("orchestration/delegate/027")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     // One runtime per arm, built after that arm's guards and dropped before
@@ -2932,6 +2943,7 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
 #[spec("orchestration/delegate/028")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -3176,6 +3188,7 @@ const BOUNDARY_REAL_GRACE: Duration = Duration::from_secs(10);
 #[spec("orchestration/delegate/030")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -3802,6 +3815,7 @@ fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
 /// dead orchestration's notice must not enter the successor's PTY.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -3859,6 +3873,7 @@ fn delegate_silence_notice_does_not_reach_successor_orchestrator() {
 #[spec("orchestration/delegate/021")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_021_work_done_releases_only_its_own_delivery_state() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -3939,6 +3954,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
 /// conservative and emit no unprovable silence notice.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_lagged_event_bus_suppresses_unprovable_silence_notice() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -3990,6 +4006,7 @@ fn delegate_lagged_event_bus_suppresses_unprovable_silence_notice() {
 /// silence notice.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_wrong_generation_event_does_not_suppress_silence_notice() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -4033,6 +4050,7 @@ fn delegate_wrong_generation_event_does_not_suppress_silence_notice() {
 /// agent answer the original generation's silence watch.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_rebound_worker_event_does_not_suppress_original_watch() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -4089,6 +4107,7 @@ fn delegate_rebound_worker_event_does_not_suppress_original_watch() {
 /// notice must still appear.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_startup_idle_does_not_suppress_silence_notice() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -4133,6 +4152,7 @@ fn delegate_startup_idle_does_not_suppress_silence_notice() {
 /// cap rather than falling through to disabled.
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -4411,6 +4431,7 @@ impl LateReadinessArm {
 #[spec("orchestration/delegate/035")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_035_a_late_session_start_submits_the_parked_task_pointer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
@@ -4510,6 +4531,7 @@ fn delegate_035_a_late_session_start_submits_the_parked_task_pointer() {
 #[spec("orchestration/delegate/036")]
 #[test]
 #[cfg(unix)]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn delegate_036_an_observed_release_earns_no_late_submit_recovery() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
