@@ -463,6 +463,15 @@ trait OrchestrationDaemon {
         delivery_id: &str,
         timeout: Duration,
     ) -> Result<SendResult, String>;
+    /// PRD #1666 S5: post the coordinator prompt to the start role's inbox,
+    /// bound to `expected_agent_id`. Answers the message id.
+    async fn post_coordinator_prompt(
+        &self,
+        pane_id: &str,
+        prompt: &str,
+        expected_agent_id: &str,
+        timeout: Duration,
+    ) -> Result<String, String>;
     async fn wait(&self, duration: Duration);
     fn now(&self) -> std::time::Instant;
 }
@@ -675,6 +684,35 @@ impl OrchestrationDaemon for DaemonClient {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(safe_message(error.to_string())),
             Err(_) => Err("orchestrator prompt delivery RPC timed out".into()),
+        }
+    }
+
+    async fn post_coordinator_prompt(
+        &self,
+        pane_id: &str,
+        prompt: &str,
+        expected_agent_id: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        match tokio::time::timeout(
+            timeout,
+            self.post_message(
+                pane_id,
+                Some(expected_agent_id),
+                "your role as orchestrator",
+                prompt,
+                None,
+                dot_agent_deck::daemon_protocol::PostOrigin::OrchestratorRemit,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(GatedQuery::Answered(id))) => Ok(id),
+            Ok(Ok(GatedQuery::Unsupported)) => {
+                Err("the deck has no agent inbox; upgrade it to deliver the context".into())
+            }
+            Ok(Err(error)) => Err(safe_message(error.to_string())),
+            Err(_) => Err("orchestrator context post timed out".into()),
         }
     }
 
@@ -967,7 +1005,33 @@ impl From<String> for LaunchFailure {
     }
 }
 
+/// PRD #1666 S5: hand the coordinator prompt to the start role's inbox. Nothing
+/// waits for the agent to start a session and nothing is typed: the message
+/// waits in the inbox until the agent's component takes it or the agent answers
+/// the doorbell. One post, not retried — a post the deck refused would only be
+/// refused again, and one that timed out may have landed.
 async fn deliver_coordinator_prompt<D: OrchestrationDaemon + Sync>(
+    daemon: &D,
+    _readiness: &mut D::ReadinessWatch,
+    pane_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    _created_at: std::time::Instant,
+) -> Result<(), String> {
+    daemon
+        .post_coordinator_prompt(pane_id, prompt, agent_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "orchestrator context was not posted: {}",
+                safe_message(error)
+            )
+        })
+}
+
+#[allow(dead_code)] // PRD #1666: the typed delivery, deleted at S12
+async fn deliver_coordinator_prompt_typed<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     readiness: &mut D::ReadinessWatch,
     pane_id: &str,
@@ -8834,9 +8898,11 @@ mod tests {
         pane_id: String,
         prompt: String,
         expected_agent_id: String,
+        #[allow(dead_code)] // PRD #1666: the typed submit's, deleted at S12
         expected_session_id: Option<String>,
+        #[allow(dead_code)] // PRD #1666: the typed submit's, deleted at S12
         delivery_id: String,
-        /// How long the delivery loop gave this attempt to be answered.
+        /// How long the delivery was given to be answered.
         timeout: Duration,
     }
 
@@ -9119,6 +9185,36 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| self.fallback_outcome.clone())
+        }
+
+        async fn post_coordinator_prompt(
+            &self,
+            pane_id: &str,
+            prompt: &str,
+            expected_agent_id: &str,
+            timeout: Duration,
+        ) -> Result<String, String> {
+            self.submissions.lock().unwrap().push(PromptSubmission {
+                pane_id: pane_id.to_string(),
+                prompt: prompt.to_string(),
+                expected_agent_id: expected_agent_id.to_string(),
+                expected_session_id: None,
+                delivery_id: String::new(),
+                timeout,
+            });
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.fallback_outcome.clone());
+            match outcome {
+                Ok(SendResult::Applied | SendResult::Queued) => {
+                    Ok("m-k3xzq2ab-00000000000000aa".to_string())
+                }
+                Ok(result) => Err(describe_send_result(result).to_string()),
+                Err(error) => Err(error),
+            }
         }
 
         async fn wait(&self, duration: Duration) {
@@ -9920,12 +10016,15 @@ command = "configured-planner"
         ]
     }
 
+    /// PRD #1666 S5: a non-Pi coordinator's context is posted to its start
+    /// role's inbox once, bound to the start role's agent, with no readiness
+    /// wait, no seed buffer and no retry.
     #[tokio::test]
-    async fn non_pi_launch_waits_for_readiness_and_retries_with_one_identity() {
+    async fn non_pi_launch_posts_its_context_once_to_the_start_role() {
         let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
-            [Ok(SendResult::NoLiveTarget), Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::NoLiveTarget),
         );
         let seed = "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md and wait.";
 
@@ -9949,39 +10048,28 @@ command = "configured-planner"
             launched.agent_ids,
             ["agent-0".to_string(), "agent-1".to_string()]
         );
-        assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 1);
         let started = daemon.started.lock().unwrap();
         assert_eq!(started.len(), 2);
-        assert_eq!(started[0].seed, None, "Claude must not arm Pi's fallback");
+        assert_eq!(started[0].seed, None, "the context is posted, not seeded");
         assert_eq!(started[1].seed, None);
         drop(started);
 
         let submissions = daemon.submissions.lock().unwrap();
-        assert_eq!(submissions.len(), 2);
-        assert_eq!(submissions[0].pane_id, submissions[1].pane_id);
+        assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].prompt, seed);
         assert_eq!(submissions[0].expected_agent_id, "agent-0");
-        assert_eq!(
-            submissions[0].expected_session_id.as_deref(),
-            Some("session-planner")
-        );
-        assert_eq!(submissions[0].delivery_id, submissions[1].delivery_id);
-        // Issue #1383: the daemon holds each submit's Enter for up to the echo
-        // bound, so an attempt given no more than that could time out on a
-        // write that is still going ahead.
-        for submission in submissions.iter() {
-            assert!(
-                submission.timeout > dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND,
-                "a seed attempt must outlast the daemon's echo wait: {:?}",
-                submission.timeout
-            );
-        }
+        let start_pane = daemon.started.lock().unwrap()[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == DOT_AGENT_DECK_PANE_ID)
+            .map(|(_, value)| value.clone())
+            .expect("the start role carries a pane id");
+        assert_eq!(submissions[0].pane_id, start_pane);
+        assert_eq!(submissions[0].timeout, COORDINATOR_DELIVERY_RPC_TIMEOUT);
         drop(submissions);
 
-        assert_eq!(
-            *daemon.sleeps.lock().unwrap(),
-            [desktop_seed_buffer(), send_retry_delay(1)]
-        );
+        assert!(daemon.readiness_waits.lock().unwrap().is_empty());
+        assert!(daemon.sleeps.lock().unwrap().is_empty());
         assert!(daemon.stopped.lock().unwrap().is_empty());
     }
 
@@ -10075,11 +10163,8 @@ command = "configured-planner"
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].prompt, prepared.prompt);
         assert_eq!(submissions[0].expected_agent_id, "agent-0");
-        assert_eq!(
-            submissions[0].expected_session_id.as_deref(),
-            Some("session-planner")
-        );
         drop(submissions);
+        assert!(daemon.readiness_waits.lock().unwrap().is_empty());
         assert!(daemon.stopped.lock().unwrap().is_empty());
     }
 
@@ -10783,8 +10868,10 @@ command = "configured-planner"
         assert!(daemon.sleeps.lock().unwrap().is_empty());
     }
 
+    /// PRD #1666 S5: a coordinator that announces nothing gets its context the
+    /// same way — posted at once, with no readiness timeout to sit out.
     #[tokio::test]
-    async fn hookless_coordinator_uses_timeout_fallback_without_session_guard() {
+    async fn a_hookless_coordinator_is_posted_without_a_readiness_wait() {
         let daemon = FakeOrchestrationDaemon::new(
             Ok(None),
             [Ok(SendResult::Applied)],
@@ -10806,18 +10893,16 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        assert_eq!(
-            *daemon.readiness_waits.lock().unwrap(),
-            [SPAWN_TIME_READINESS_TIMEOUT]
-        );
+        assert!(daemon.readiness_waits.lock().unwrap().is_empty());
         let submissions = daemon.submissions.lock().unwrap();
         assert_eq!(submissions.len(), 1);
-        assert_eq!(submissions[0].expected_session_id, None);
         assert!(daemon.sleeps.lock().unwrap().is_empty());
     }
 
+    /// PRD #1666 S5: a context post the deck refuses ends the launch, and every
+    /// role it started is stopped, last first. The post is not retried.
     #[tokio::test]
-    async fn delivery_deadline_rolls_back_every_started_role_in_reverse_order() {
+    async fn a_refused_context_post_rolls_back_every_started_role_in_reverse_order() {
         let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             std::iter::empty(),
@@ -10840,13 +10925,16 @@ command = "configured-planner"
         .unwrap_err();
         let error = &failure.message;
 
-        assert!(error.contains("60s deadline"), "unexpected error: {error}");
+        assert!(
+            error.contains("was not posted"),
+            "unexpected error: {error}"
+        );
         assert!(error.contains("stopped 2 already-started role(s)"));
         assert_eq!(
             *daemon.stopped.lock().unwrap(),
             ["agent-1".to_string(), "agent-0".to_string()]
         );
-        assert!(daemon.submissions.lock().unwrap().len() > 1);
+        assert_eq!(daemon.submissions.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

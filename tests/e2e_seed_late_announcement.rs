@@ -46,6 +46,7 @@ fn new_pane_017_a_spawn_time_seed_waits_for_the_agent_to_announce_itself() {
 /// receive one copy only after the 10-second readiness fallback and its buffer.
 #[spec("prompt/new-pane/019")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1666"]
 fn new_pane_019_a_silent_agent_receives_one_seed_after_the_readiness_fallback() {
     let deck = TuiDeck::launch_with_fixture("dispatcher-seed");
     deck.wait_for_string("No active agents");

@@ -38,6 +38,8 @@ mod inbox;
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_route.rs"]
 mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::time::Duration;
 
@@ -84,11 +86,6 @@ const SPAWN_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// delivery did NOT happen; raising those would invert what the test proves
 /// while making it slower. Leave them alone.
 const REASSERTION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long the fixture's delivery confirmation has to reach the daemon's
-/// APPLIED state. Paid on the fixture's `python3` fork, so it is a process
-/// start under whatever load the tier is carrying, not an IPC round trip.
-const CONFIRMATION_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long an event THIS FILE has already written to the hook socket has to
 /// show up in the daemon's applied state: one `ListAgents` round trip plus
@@ -194,6 +191,29 @@ fn wait_for_applied(
     })
 }
 
+/// PRD #1666 S5: where a remit is counted. The deck no longer types the remit
+/// pointer into the start role's pane; it posts it to that pane's inbox, so
+/// "the pointer was delivered N times" reads as "N remit messages carrying it
+/// were posted".
+#[cfg(unix)]
+struct RemitLog {
+    socket: std::path::PathBuf,
+    pane_id: String,
+}
+
+/// How many remit messages carrying [`DELIVERED_POINTER`] the start role's
+/// inbox holds.
+#[cfg(unix)]
+fn remit_count(log: &RemitLog) -> usize {
+    view::count_containing(&log.socket, &log.pane_id, DELIVERED_POINTER)
+}
+
+/// Wait up to `timeout` for at least `n` remits; answers whether they came.
+#[cfg(unix)]
+fn wait_for_remits(log: &RemitLog, n: usize, timeout: Duration) -> bool {
+    common::wait_until(timeout, || remit_count(log) >= n)
+}
+
 /// The number of [`DELIVERED_POINTER`] lines in the delivery log once that
 /// count has stopped moving for [`DELIVERY_SETTLE_QUIET_WINDOW`] — the
 /// BASELINE every later count assertion in this file measures from, in place
@@ -231,11 +251,11 @@ fn wait_for_applied(
 /// here reports it against the delivery that caused it rather than as a
 /// confusing off-by-N in the assertion behind it.
 #[cfg(unix)]
-fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path, ceiling: usize) -> usize {
+fn settled_pointer_count(deck: &TuiDeck, log: &RemitLog, ceiling: usize) -> usize {
     let last = std::cell::Cell::new(usize::MAX);
     let stable_since = std::cell::Cell::new(std::time::Instant::now());
     let settled = common::wait_until(DELIVERY_SETTLE_TIMEOUT, || {
-        let count = common::count_file_substr(log, DELIVERED_POINTER);
+        let count = remit_count(log);
         if count != last.get() {
             last.set(count);
             stable_since.set(std::time::Instant::now());
@@ -777,21 +797,13 @@ fn inject_clear_session_start(
 }
 
 /// Open the orchestration, write and launch the orchestrator's synthetic
-/// script, and confirm the spawn-time remit pointer lands once. Returns the
-/// daemon socket path, the start role's `(pane_id, agent_id)`, the log
-/// path every test in this file asserts delivery counts against, and the
-/// SETTLED baseline count of pointer lines that delivery left in it — both
-/// the script and the log live directly under `deck.workdir()`, the directory
-/// the orchestrator role pane actually runs in.
+/// script, and confirm the spawn-time remit lands once. Returns the daemon
+/// socket path, the start role's `(pane_id, agent_id)`, the [`RemitLog`] every
+/// test in this file asserts delivery counts against (the start role's inbox),
+/// and the SETTLED baseline count of remits the spawn-time delivery left in it.
 fn open_and_confirm_initial_delivery(
     deck: &TuiDeck,
-) -> (
-    std::path::PathBuf,
-    String,
-    String,
-    std::path::PathBuf,
-    usize,
-) {
+) -> (std::path::PathBuf, String, String, RemitLog, usize) {
     deck.wait_for_string("No active agents");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
@@ -809,75 +821,35 @@ fn open_and_confirm_initial_delivery(
         .expect("orchestrator role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
     let agent_id = record.id.clone();
 
-    let log = deck.workdir().join("orchestrator-prompt.log");
-    let initial_delivered =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, SPAWN_DELIVERY_TIMEOUT);
+    let log = RemitLog {
+        socket: socket.clone(),
+        pane_id: pane_id.clone(),
+    };
+    let initial_delivered = wait_for_remits(&log, 1, SPAWN_DELIVERY_TIMEOUT);
     assert!(
         initial_delivered,
         "precondition failed: the spawn-time orchestrator prompt never reached the \
-         start role's pane within {SPAWN_DELIVERY_TIMEOUT:?}\nFinal grid:\n{}",
+         start role's inbox within {SPAWN_DELIVERY_TIMEOUT:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
-    // THE BARRIER (issues #818, #832). The wait above returns the moment the
-    // log line lands, and the fixture script's read loop appends that line
-    // BEFORE forking the `python3` that reports the delivery back as a
-    // `thinking` event — so on its own it leaves that confirmation in flight.
-    // Every caller's next move is to inject a `Compacting` or a
-    // `/clear`-originated `SessionStart` for this same pane, and
-    // `AppState::apply_event`'s `EventType::Thinking` arm (`src/state.rs`)
-    // sets `session.status` unconditionally: the in-flight confirmation lands
-    // second and destroys the status the caller is about to poll for.
+    // PRD #1666 S5: the barrier that used to sit here (issues #818, #832)
+    // waited for the fixture's confirmation of a TYPED pointer to be applied,
+    // so it could not clobber the status a caller injects next. A posted remit
+    // produces no such confirmation, so there is nothing in flight to wait for.
     //
-    // That is not a slow-runner problem and it is not recoverable by waiting
-    // longer, which is why the fix is here rather than in the bounds. Measured
-    // on an idle 16-core box, `orchestration_remit_001` failed 2 of 5 solo
-    // runs before this barrier existed; under a 32-way CPU load, 2 of 4 — and
-    // an instrumented poll of the failing runs showed the pane sitting on
-    // `Thinking` with the delivered pointer as its `last_user_prompt` for the
-    // entire 10s, the injected `Compacting` never once sampled. Which side
-    // wins is decided by `python3` start-up latency against this process's own
-    // `ListAgents` round trip, so a saturated runner simply loses it more
-    // often than a dev box does (issue #818's bisect: five green lane-1 runs,
-    // then red on every branch from the merge of #789 onward).
-    //
-    // `last_user_prompt` is the confirmation's own applied footprint: the
-    // fixture's `confirm_submission` sends the delivered line as the event's
-    // `user_prompt`, and `apply_event` records it on the session. Once it is
-    // visible here the confirmation has been APPLIED, not merely sent, so the
-    // caller's injection is the last word on this pane's status.
-    let confirmation_applied =
-        wait_for_applied(&socket, &pane_id, CONFIRMATION_APPLIED_TIMEOUT, |s| {
-            s.last_user_prompt
-                .as_deref()
-                .is_some_and(|p| p.contains(DELIVERED_POINTER))
-        });
-    assert!(
-        confirmation_applied,
-        "precondition failed: the fixture script confirmed the spawn-time pointer over \
-         the hook socket, but the daemon never reported it as the start role's \
-         `last_user_prompt` within {CONFIRMATION_APPLIED_TIMEOUT:?} — without that the \
-         confirmation is still in flight and will overwrite whatever status the caller \
-         injects next.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // The settled baseline (see [`settled_pointer_count`]). Taken here, after
-    // the confirmation barrier above, so it accounts for the one replacement
-    // payload write an unconfirmed spawn-time delivery earns under load —
-    // which every caller would otherwise mistake for a re-assertion. The
-    // ceiling counts from ZERO because exactly one delivery — the spawn-time
-    // seed — has run by this point.
+    // The settled baseline (see [`settled_pointer_count`]): exactly one
+    // delivery — the spawn-time remit — has run by this point.
     let baseline = settled_pointer_count(deck, &log, MAX_POINTER_LINES_PER_DELIVERY);
 
     (socket, pane_id, agent_id, log, baseline)
 }
 
 /// Scenario: Open a real orchestration tab and let the start role's
-/// spawn-time remit pointer deliver once, then inject a `Compacting` event
-/// for that SAME start-role pane. The pointer must reach the pane's stdin a
-/// second time — the orchestrator's remit re-asserting itself on compaction,
-/// rather than only ever being delivered at spawn.
+/// spawn-time remit reach its inbox once, then inject a `Compacting` event
+/// for that SAME start-role pane. A second remit must be posted to that inbox
+/// — the orchestrator's remit re-asserting itself on compaction, rather than
+/// only ever being delivered at spawn.
 #[spec("orchestration/remit/001")]
 #[test]
 #[cfg(unix)]
@@ -895,12 +867,7 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
         &format!("{agent_id}-remit001-session"),
     );
 
-    let reasserted = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted = wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a Compacting event on the orchestrator start-role pane must re-deliver the \
@@ -945,12 +912,7 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &format!("{worker_agent_id}-remit002-worker-session"),
     );
 
-    let leaked_to_worker = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_to_worker = wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_to_worker,
         "a Compacting event on the non-start `worker` role's pane must not re-assert \
@@ -966,12 +928,8 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &orch_agent_id,
         &format!("{orch_agent_id}-remit002-orch-session"),
     );
-    let reasserted_on_start_role = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted_on_start_role =
+        wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a Compacting event on the orchestrator START role must still \
@@ -993,8 +951,8 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 /// spawn-time remit pointer deliver once, then inject a synthetic
 /// `SessionStart` for that SAME start-role pane carrying the
 /// `/clear`-originated marker (`CLEAR_SESSION_START_METADATA_KEY` /
-/// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
-/// stdin a second time — the orchestrator's remit re-asserting itself on
+/// `CLEAR_SESSION_START_METADATA_VALUE`). A second remit must be posted to
+/// the start role's inbox — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
 /// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
 /// comment is stamped into the fixed `.dot-agent-deck/orchestrator-context.md`
@@ -1031,12 +989,7 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         AgentType::ClaudeCode,
     );
 
-    let reasserted = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted = wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
@@ -1062,9 +1015,8 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     // on the literal "must not reach a third line".
     let settled_after_reassertion =
         settled_pointer_count(&deck, &log, baseline + MAX_POINTER_LINES_PER_DELIVERY);
-    let repeated_beyond_one_reassertion = common::wait_for_file_substr_count(
+    let repeated_beyond_one_reassertion = wait_for_remits(
         &log,
-        DELIVERED_POINTER,
         settled_after_reassertion + 1,
         Duration::from_millis(900),
     );
@@ -1144,12 +1096,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         AgentType::ClaudeCode,
     );
 
-    let leaked_to_worker = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_to_worker = wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_to_worker,
         "a `/clear`-originated SessionStart event on the non-start `worker` role's pane \
@@ -1167,12 +1114,8 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         &format!("{orch_agent_id}-remit005-orch-session"),
         AgentType::ClaudeCode,
     );
-    let reasserted_on_start_role = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted_on_start_role =
+        wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a `/clear`-originated SessionStart event on the orchestrator \
@@ -1222,12 +1165,8 @@ fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
         AgentType::Codex,
     );
 
-    let leaked_for_non_claude_agent_type = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_for_non_claude_agent_type =
+        wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_for_non_claude_agent_type,
         "a `/clear`-originated SessionStart event stamped with a non-Claude-Code \
@@ -1304,10 +1243,10 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         &format!("{agent_id}-remit007-session"),
     );
 
-    let reasserted_with_task = common::wait_for_file_substr_count(
-        &log,
+    let reasserted_with_task = view::wait_for(
+        &log.socket,
+        &log.pane_id,
         CARRY_OUT_TASK_POINTER,
-        1,
         REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(

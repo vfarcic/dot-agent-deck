@@ -176,9 +176,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             format!(
                 "#!/bin/sh\n\
                  {hook}\
-                 while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-                rec = record.to_string_lossy(),
+                 {answer}\n",
                 hook = common::claude_session_start_line(bin, "authoring"),
+                answer = record_and_answer_doorbell(bin, record),
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -559,11 +559,26 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
     drop(scratch);
 }
 
+/// PRD #1666 S5: the recorder loop a shim runs once it has announced itself.
+/// It appends every line typed into it to `record`, and when that line is the
+/// deck's doorbell it does what an agent does — runs `inbox fetch` in its own
+/// pane — and appends what it fetched, so the seed the deck posted to its inbox
+/// lands in `record` whole.
+fn record_and_answer_doorbell(bin: &str, record: &std::path::Path) -> String {
+    format!(
+        "while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; \
+         case \"$l\" in \" dot-agent-deck: message \"*) \"{bin}\" inbox fetch >> \"{rec}\" 2>&1;; \
+         esac; done",
+        rec = record.to_string_lossy(),
+    )
+}
+
 /// Write a recorder shim named `name` into `shim_dir`: it records its working
 /// directory (`pwd`) — the dir the agent was SPAWNED in — then opens the
 /// gated-delivery readiness gate (posts SessionStart via the real hook path) and
-/// appends every delivered line to `record`, so BOTH the spawn cwd AND the
-/// authoring seed a spawned agent receives are observable on disk. Distinct-name
+/// records what reaches it ([`record_and_answer_doorbell`]: the doorbell, then
+/// the seed it fetches from its inbox), so BOTH the spawn cwd AND the authoring
+/// seed a spawned agent receives are observable on disk. Distinct-name
 /// shims let a test tell WHICH agent command actually spawned; the recorded
 /// `pwd` lets a test assert the agent spawned in the PICKED directory. Mirrors
 /// the inline recorder in `manager_002`.
@@ -576,9 +591,10 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
             "#!/bin/sh\n\
              pwd >> \"{rec}\"\n\
              {hook}\
-             while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
+             {answer}\n",
             rec = record.to_string_lossy(),
             hook = common::claude_session_start_line(bin, "authoring"),
+            answer = record_and_answer_doorbell(bin, record),
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));

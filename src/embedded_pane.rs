@@ -2179,6 +2179,10 @@ const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 /// daemon would pin the TUI's blocking `block_on` indefinitely.
 const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #1666 S5: how long a post of a deck-generated message may take. A post
+/// writes nothing to a pane, so the daemon answers it at once.
+const POST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Bounded wait for the `attach` RPC inside `create_stream_pane`. Same
 /// rationale as [`HYDRATE_ATTACH_TIMEOUT`]: a single attach round-trip is
 /// well under a millisecond on a healthy daemon; capping at three seconds
@@ -4268,6 +4272,35 @@ impl PaneController for EmbeddedPaneController {
                     .await
             })
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
+    }
+
+    fn post_message(
+        &self,
+        pane_id: &str,
+        subject: &str,
+        body: &str,
+        origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<String, PaneError> {
+        let agent_id = self.pane_agent_id(pane_id);
+        let client = self.client.clone();
+        let reply = self.runtime.block_on(async move {
+            tokio::time::timeout(
+                POST_MESSAGE_TIMEOUT,
+                client.post_message(pane_id, agent_id.as_deref(), subject, body, None, origin),
+            )
+            .await
+        });
+        match reply {
+            Ok(Ok(GatedQuery::Answered(id))) => Ok(id),
+            Ok(Ok(GatedQuery::Unsupported)) => Err(PaneError::CommandFailed(
+                "the daemon has no agent inbox; upgrade it to deliver this message".to_string(),
+            )),
+            Ok(Err(e)) => Err(PaneError::CommandFailed(format!("post-message: {e}"))),
+            Err(_) => Err(PaneError::CommandFailed(format!(
+                "post-message timed out after {}ms",
+                POST_MESSAGE_TIMEOUT.as_millis()
+            ))),
+        }
     }
 
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {

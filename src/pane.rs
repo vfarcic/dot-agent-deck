@@ -661,6 +661,20 @@ pub trait PaneController: Send + Sync {
     /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
     /// overrides it to send the report on its runtime.
     fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
+    /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
+    /// role context, the configuration request — to `pane_id`'s inbox, bound to
+    /// the agent the pane holds now. Answers the message id. The default has no
+    /// inbox behind it and refuses; the daemon-backed `EmbeddedPaneController`
+    /// overrides it.
+    fn post_message(
+        &self,
+        _pane_id: &str,
+        _subject: &str,
+        _body: &str,
+        _origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<String, PaneError> {
+        Err(PaneError::NotAvailable)
+    }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

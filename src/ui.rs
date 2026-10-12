@@ -5507,6 +5507,59 @@ fn finalize_orchestrator_prompt(
     ui.orchestration_ready_since.remove(&tab_id);
 }
 
+/// PRD #1666 S5: hand an orchestration tab's start-role prompt — its role
+/// context, first sent or reasserted after compaction or `/clear` — to the
+/// start role's inbox. Nothing waits for the agent to be ready and nothing is
+/// typed: the message waits in the inbox until the agent's component takes it
+/// or the agent answers the doorbell. A post the daemon refuses is not retried
+/// every frame; the status line says why.
+#[allow(clippy::too_many_arguments)]
+fn post_orchestrator_prompt(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    now: std::time::Instant,
+    tab_id: TabId,
+    role_pane_ids: &[String],
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    let start_pane_id = role_pane_ids[start_role_index].clone();
+    let Some(prompt) = orchestrator_prompt.clone() else {
+        return;
+    };
+    match pane.post_message(
+        &start_pane_id,
+        "your role as orchestrator",
+        &prompt,
+        crate::inbox_hub::PostOrigin::OrchestratorRemit,
+    ) {
+        Ok(id) => {
+            tracing::info!(
+                pane_id = %start_pane_id,
+                message_id = %id,
+                "orchestrator prompt posted to the start role's inbox"
+            );
+            finalize_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                start_role_index,
+                role_statuses,
+                orchestrator_prompt,
+            );
+        }
+        Err(e) => abandon_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            orchestrator_prompt,
+            now,
+            format!("Orchestrator prompt not delivered ({e}); abandoned"),
+        ),
+    }
+}
+
 /// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
 /// orchestrator start-role prompt for ONE orchestration tab. Extracted from the
 /// render loop with an INJECTED `now` so the deadline / terminal-outcome policy
@@ -5515,7 +5568,7 @@ fn finalize_orchestrator_prompt(
 ///
 /// Preconditions (the caller's gate): `orchestrator_prompt.is_some()` and the
 /// tab is not already prompted.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)] // PRD #1666: typed path, deleted at S12
 fn deliver_orchestrator_prompt(
     ui: &mut UiState,
     pane: &dyn PaneController,
@@ -11205,9 +11258,16 @@ fn send_config_gen_prompt(
     tab_manager: &mut TabManager,
 ) {
     let prompt = crate::config_gen::config_gen_prompt(cwd);
-    match pane.write_to_pane(pane_id, &prompt) {
-        Ok(()) => {
-            // Focus the pane so the user can press Enter to execute.
+    // PRD #1666 S5: the request is a message in the agent's inbox, not text
+    // typed into its pane; the agent takes it the way it takes any other.
+    match pane.post_message(
+        pane_id,
+        "configuration request",
+        &prompt,
+        crate::inbox_hub::PostOrigin::ConfigGen,
+    ) {
+        Ok(_) => {
+            // Focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
                 // mirroring `switch_tab_with_focus` (capture-out → switch_to →
@@ -11225,7 +11285,7 @@ fn send_config_gen_prompt(
             let _ = pane.focus_pane(pane_id);
             ui.mode = UiMode::PaneInput;
             ui.status_message = Some((
-                "Config prompt sent — press Enter to execute.".to_string(),
+                "Config request sent to the agent's inbox.".to_string(),
                 std::time::Instant::now(),
             ));
         }
@@ -12236,9 +12296,10 @@ fn dispatch_action(
                             rows: spawn_rows,
                             cols: spawn_cols,
                             agent_type: spawn_agent_type,
-                            // PRD #201: single-pane spawn, not a Pi
-                            // orchestrator — no native seed.
-                            seed: None,
+                            // PRD #1666 S5: a built-in option's seed is the
+                            // pane's first inbox message, which the daemon
+                            // posts for every agent type at spawn.
+                            seed: req.seed_prompt.clone(),
                             // Issue #1540: this IS a New agent form submit,
                             // so a deck that keeps the last command records
                             // it once it has accepted the start.
@@ -12319,25 +12380,6 @@ fn dispatch_action(
                             // dashboard layout dims (above); the pre-draw
                             // `resize_panes_to_layout` reconciles it to the
                             // exact rect next frame. No resize here.
-                            // PRD #127: a single-agent card carrying a
-                            // `seed_prompt` (a built-in option — see
-                            // `BuiltinOption`) enqueues it for GATED
-                            // delivery — drained by
-                            // `process_pending_seed_prompts` once the agent
-                            // signals readiness (SessionStart) plus the
-                            // spawn-time buffer. A card without a seed
-                            // enqueues nothing (no-op for ordinary panes).
-                            if let Some(seed) = req.seed_prompt {
-                                ui.pending_seed_prompts.push(PendingSeedPrompt {
-                                    pane_id: new_id.clone(),
-                                    prompt: seed,
-                                    created_at: std::time::Instant::now(),
-                                    ready_since: None,
-                                });
-                                // PRD #20 R20-003/004: capture the queued-for
-                                // agent identity + a stable delivery id now.
-                                capture_prompt_delivery(ui, &new_id, pane);
-                            }
                             ui.status_message = Some((
                                 format!("Created agent {new_id} in {dir_str}"),
                                 std::time::Instant::now(),
@@ -15235,10 +15277,9 @@ pub fn run_tui(
                 && orchestrator_prompt.is_some()
                 && !ui.orchestration_prompted.contains(id)
             {
-                deliver_orchestrator_prompt(
+                post_orchestrator_prompt(
                     &mut ui,
                     &*pane,
-                    &snapshot,
                     orch_now,
                     *id,
                     role_pane_ids.as_slice(),
@@ -35010,29 +35051,47 @@ mod tests {
             dispatcher_seed_prompt().contains(QUOTED_OPENING),
             "the seed must quote the opening of the completion turn"
         );
-        let delivered = crate::dispatch_return::compose_completion_report(
+        // PRD #1666 S5: the completion is an inbox message; what the agent
+        // sees is its rendered block, whose deck-written preface carries the
+        // opening and whose body the untrusted frame.
+        let content = crate::dispatch_return::compose_completion_message(
             "drift-probe",
             "The unit's own account of what it did.",
             None,
         );
+        let preface = content.preface.clone().unwrap_or_default();
         assert!(
-            delivered.starts_with(QUOTED_OPENING),
+            preface.starts_with(QUOTED_OPENING),
             "the seed teaches an opening the daemon no longer sends; seed says \
-             {QUOTED_OPENING:?}, daemon sends:\n{delivered}"
+             {QUOTED_OPENING:?}, daemon sends:\n{preface}"
         );
-        // The seed also promises the name and the report arrive fenced. That is
-        // the sentence telling a tool-holding agent to read an unvetted
-        // repository's words as data, so pin it against the real frames too.
-        for frame in ["UNTRUSTED-ROLE-LABEL", "UNTRUSTED-WORKER-REPORT"] {
-            assert!(
-                dispatcher_seed_prompt().contains(frame),
-                "the seed must name the {frame:?} frame the agent will actually see"
-            );
-            assert!(
-                delivered.contains(frame),
-                "the daemon must still deliver the {frame:?} frame the seed promises:\n{delivered}"
-            );
-        }
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        registry
+            .inbox()
+            .post_direct(crate::inbox::Recipient::bound("probe", "1"), content)
+            .expect("post the probe completion");
+        let delivered = registry
+            .inbox()
+            .rendered("probe")
+            .into_iter()
+            .map(|d| d.text)
+            .collect::<String>();
+        assert!(
+            delivered.contains("from the dispatch of \"drift-probe\"]"),
+            "the unit's name rides the block's opener:\n{delivered}"
+        );
+        // The seed also promises the report arrives fenced. That is the
+        // sentence telling a tool-holding agent to read an unvetted
+        // repository's words as data, so pin it against the real frame too.
+        let frame = "UNTRUSTED-WORKER-REPORT";
+        assert!(
+            dispatcher_seed_prompt().contains(frame),
+            "the seed must name the {frame:?} frame the agent will actually see"
+        );
+        assert!(
+            delivered.contains(frame),
+            "the daemon must still deliver the {frame:?} frame the seed promises:\n{delivered}"
+        );
     }
 
     /// Issue #530: the seed must not teach the dispatcher that a clean exit
