@@ -247,28 +247,17 @@ fn wait_for_role(deck: &TuiDeck, role: &str) {
     );
 }
 
-/// The base ceiling, before [`common::load_scaled`], on a released stand-in's
-/// outcome reaching the card: its hook events each run the deck's hook CLI as a
-/// process of its own, and its rollout append is then read by the daemon. That
-/// chain is boots and scheduling, so it stretches with load. A flat 20 s failed
-/// `scheduler_idle_worker_024` at load 68 on 16 CPUs (`cpu some` 73.7%) with
-/// the worker card still Idle and its last event 19 s old; the same test
-/// passes alone in about 41 s.
-const STANDIN_OUTCOME_BASE: Duration = Duration::from_secs(20);
-
-/// The base ceiling, before [`common::load_scaled`], on the daemon's
-/// blocked-worker notice reaching the orchestrator once the card is Blocked.
-const BLOCKED_NOTICE_BASE: Duration = Duration::from_secs(10);
-
 fn assert_blocked(deck: &TuiDeck, role: &str, kind: &str) {
     assert!(
-        common::wait_until(common::load_scaled(STANDIN_OUTCOME_BASE), || {
+        common::wait_until(Duration::from_secs(20), || {
             role_status(deck, role).as_deref() == Some("Blocked")
                 && has_role_badge(&deck.snapshot_grid(), role, "Blocked")
         }),
-        "{role} never showed Blocked in daemon status and attached card: {}\n{}",
+        "{role} never showed Blocked in daemon status and attached card: {}\n{}\n{role} pane: {}\nstand-in trace:\n{}",
         status_document(deck),
-        deck.snapshot_grid()
+        deck.snapshot_grid(),
+        role_pane_text(deck, role),
+        std::fs::read_to_string(deck.workdir().join("quota-standin.trace")).unwrap_or_default()
     );
     let label = match kind {
         "credits_depleted" => "Credits",
@@ -341,8 +330,8 @@ fn install_structured_standin(bin: &Path, name: &str) {
     std::fs::create_dir_all(bin).expect("create bin");
     let script = r#"import json, os, subprocess, sys
 agent = sys.argv[1]
-if agent == 'codex' and len(sys.argv) > 2:
-    sys.exit(0)  # Startup's app-server trust probe is not the agent pane.
+if agent == 'codex' and 'app-server' in sys.argv[2:]:
+    sys.exit(0)  # The deck's `codex app-server` trust probe is not the agent pane.
 home = os.environ['HOME']
 if agent == 'claude':
     settings = os.path.join(home, '.claude', 'settings.json')
@@ -352,15 +341,25 @@ else:
     codex_home = os.environ.get('CODEX_HOME') or os.path.join(home, '.codex')
     hooks = json.load(open(os.path.join(codex_home, 'hooks.json')))['hooks']
     suffix = 'hook --agent codex'
+import time
+# What each stand-in process did, and when: `assert_blocked` prints it, since a
+# stand-in that never reports leaves nothing on its card to say why.
+def trace(line):
+    with open('quota-standin.trace', 'a') as out:
+        out.write('%.3f %d %s\n' % (time.time(), os.getpid(), line))
+trace('started ' + ' '.join(sys.argv[1:]))
 def send(event, **fields):
     commands = [h['command'] for rule in hooks[event] for h in rule['hooks']
                 if h['command'].endswith(suffix)]
     assert len(commands) == 1, (event, commands)
     payload = {'hook_event_name':event,'session_id':'quota-' + agent,**fields}
-    subprocess.run(commands[0], shell=True, input=json.dumps(payload), text=True,
-                   check=True, stdout=subprocess.DEVNULL)
+    trace('sending ' + event)
+    done = subprocess.run(commands[0], shell=True, input=json.dumps(payload), text=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    trace('sent %s: exit %d %s' % (event, done.returncode, done.stderr.strip()[-300:]))
+    done.check_returncode()
 with open(os.environ['QUOTA_TRIGGER_FIFO']) as trigger:
-    trigger.readline()
+    trace('trigger: ' + repr(trigger.readline()))
 path = os.environ['QUOTA_TRANSCRIPT_PATH']
 if agent == 'claude':
     send('SessionStart')
@@ -392,11 +391,16 @@ sys.stdin.buffer.read()
     } else {
         ""
     };
+    // `"$@"` reaches the script so the deck's `codex app-server` trust probe
+    // exits at once. Without it the probe ran a whole stand-in that waited on
+    // the trigger FIFO until the wrapper's `hooks/list` wait gave up — 30 s
+    // since `SPAWN_HOOKS_LIST_TIMEOUT`, the same as the pointer's readiness
+    // window — so the trigger could reach the probe instead of the agent.
     write_agent(
         bin,
         name,
         &format!(
-            "{version}exec python3 '{}/quota-standin.py' {name}",
+            "{version}exec python3 '{}/quota-standin.py' {name} \"$@\"",
             bin.display()
         ),
     );
@@ -718,9 +722,8 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
         ))
     };
     assert!(
-        common::wait_until(common::load_scaled(BLOCKED_NOTICE_BASE), || {
-            notice_text().contains(BLOCKED_NOTICE)
-        }),
+        common::wait_until(Duration::from_secs(10), || notice_text()
+            .contains(BLOCKED_NOTICE)),
         "orchestrator did not receive blocked notice: {}",
         notice_text()
     );
@@ -775,9 +778,8 @@ fn scheduler_idle_worker_024_blocked_worker_notices_orchestrator_once() {
         ))
     };
     assert!(
-        common::wait_until(common::load_scaled(BLOCKED_NOTICE_BASE), || {
-            notice_text().contains(BLOCKED_NOTICE)
-        }),
+        common::wait_until(Duration::from_secs(10), || notice_text()
+            .contains(BLOCKED_NOTICE)),
         "orchestrator did not receive blocked notice: {}",
         notice_text()
     );
@@ -888,7 +890,7 @@ fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     release_standin(&bare_fifo, &deck, "bare");
     assert_blocked(&deck, "marker", "usage_limit");
     assert!(
-        common::wait_until(common::load_scaled(STANDIN_OUTCOME_BASE), || {
+        common::wait_until(Duration::from_secs(20), || {
             role_status(&deck, "bare").as_deref() == Some("Error")
                 && has_role_badge(&deck.snapshot_grid(), "bare", "Error")
         }),
