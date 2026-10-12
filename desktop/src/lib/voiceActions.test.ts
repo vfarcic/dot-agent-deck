@@ -813,13 +813,24 @@ describe("the pull request browser by voice (PRD #1401)", () => {
   /** Scenario: "close" with the browser on top closes the browser, not the pane under it nor the voice overlay. */
   it("puts the browser at the top of close's order", async () => {
     const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
-    const context = { ...base(), closePullRequest: vi.fn(), dismissVoiceOverlay: vi.fn(), closeSettings: vi.fn() };
+    const context = { ...base(), closePullRequest: vi.fn(async () => undefined), dismissVoiceOverlay: vi.fn(), closeSettings: vi.fn() };
 
     expect(dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true })).toBe(true);
     expect(context.closePullRequest).toHaveBeenCalledTimes(1);
     expect(context.dismissVoiceOverlay).not.toHaveBeenCalled();
     expect(context.closeAgentView).not.toHaveBeenCalled();
     expect(context.closeSettings).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: "close" on the browser is reported once the page has closed, not when it was asked for. */
+  it("reports the browser's close once it has happened", async () => {
+    const { dispatchVoiceAction, PULL_REQUEST_CLOSED, PULL_REQUEST_CLOSING } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const work = Promise.resolve("The pull request page did not close: refused");
+    const context = { ...base(), reportPending: vi.fn(), closePullRequest: vi.fn(() => work) };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(context.reportPending).toHaveBeenCalledWith(PULL_REQUEST_CLOSING, work, PULL_REQUEST_CLOSED);
+    expect(context.closeAgentView).not.toHaveBeenCalled();
   });
 
   /** Scenario: with the browser not published (closed, or covered), close falls through as before. */

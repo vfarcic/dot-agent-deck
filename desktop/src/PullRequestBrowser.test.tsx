@@ -321,12 +321,12 @@ describe("PRD #1401 — the in-app pull request browser", () => {
    * Scenario: Escape in the app closes the browser and ONLY the browser — the
    * agent's pane underneath stays — and a second Escape then closes the pane.
    */
-  it("closes on Escape before anything under it", () => {
+  it("closes on Escape before anything under it", async () => {
     const { host } = fakeHost();
     renderShell(host);
     fireEvent.click(screen.getByTestId("pr-badge-7"));
 
-    fireEvent.keyDown(window, { key: "Escape" });
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
 
@@ -346,23 +346,23 @@ describe("PRD #1401 — the in-app pull request browser", () => {
   });
 
   /** Scenario: the agent ends while its pull request is open; the browser closes with it. */
-  it("closes when the agent is gone from a daemon that is answering", () => {
+  it("closes when the agent is gone from a daemon that is answering", async () => {
     const { host } = fakeHost();
     const shell = renderShell(host, [withPr, agent("8")]);
     fireEvent.click(screen.getByTestId("pr-badge-7"));
     expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
 
-    shell.rerenderWith([agent("8")]);
+    await act(async () => { shell.rerenderWith([agent("8")]); });
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
     expect(host.close).toHaveBeenCalled();
   });
 
   /** Scenario: leaving the agent's screen (its own Back to dashboard) closes the browser too. */
-  it("closes when the screen it was opened over is left", () => {
+  it("closes when the screen it was opened over is left", async () => {
     const { host } = fakeHost();
     renderShell(host);
     fireEvent.click(screen.getByTestId("pr-badge-7"));
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
+    await act(async () => { fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })); });
 
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
@@ -390,6 +390,174 @@ describe("PRD #1401 — the in-app pull request browser", () => {
 
     await act(async () => { dialog.remove(); });
     expect(host.setVisible).toHaveBeenLastCalledWith(true);
+  });
+});
+
+describe("PRD #1401 — the pull request browser when the host refuses", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const OTHER_URL = "https://github.com/vfarcic/dot-agent-deck/pull/23456";
+  const otherPr = agent("8", { number: 23456, url: OTHER_URL, state: "open" });
+
+  /** Two agents with pull requests on the deck, so a second badge can switch the open page. */
+  function renderDeck(host: PrBrowserHost) {
+    return render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, otherPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  /**
+   * Scenario: the platform refuses to close the page. The frame and its
+   * toolbar stay, saying why, so Close can try again; once a close succeeds
+   * the frame goes.
+   */
+  it("keeps the page and its Close when the host refuses to close it", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+
+    expect.soft(screen.queryByTestId("pr-browser"), "A refused close must leave the frame, or nothing can close the page").toBeInTheDocument();
+    expect.soft(screen.queryByRole("button", { name: "Close pull request" })).toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length, "The refusal must be visible").toBeGreaterThan(0);
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: Escape meets a refused close; the frame stays with the reason, and the next Escape closes it. */
+  it("retries a refused close on the next Escape", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length).toBeGreaterThan(0);
+
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: the agent ends while its pull request is open, and the page will
+   * not close (its pane closing too tries again, and is refused again); the
+   * frame stays with the reason, and Close retries once the platform lets it.
+   */
+  it("keeps the frame when the page will not close after its agent ended", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValue(new Error("The pull request page did not close: refused"));
+    const shell = renderShell(host, [withPr, agent("8")]);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { shell.rerenderWith([agent("8")]); });
+
+    expect(host.close).toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser"), "A page that did not close must keep its frame").toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length).toBeGreaterThan(0);
+
+    host.close.mockResolvedValue(undefined);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: with Coder 7's pull request open, open Coder 8's, and the host
+   * cannot switch the page. The toolbar still names the pull request on screen
+   * (#12345 for Coder 7), and says why the switch did not happen.
+   */
+  it("keeps the shown pull request when a switch to another fails", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    host.open.mockRejectedValueOnce(new Error("The pull request browser could not open: navigate failed"));
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+
+    expect(host.open).toHaveBeenLastCalledWith(OTHER_URL, expect.any(Object));
+    const browser = screen.getByTestId("pr-browser");
+    expect.soft(browser, "The toolbar must name the pull request the page still shows").toHaveAccessibleName("Pull request #12345 for Coder 7");
+    expect(screen.queryAllByText(/navigate failed/).length, "The failed switch must be visible").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: Close is pressed while a switch to Coder 8's pull request is
+   * still under way. The frame goes once the page has closed, and the switch
+   * settling afterwards does not bring it back.
+   */
+  it("stays closed when a switch settles after Close", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    let finishSwitch: () => void = () => undefined;
+    host.open.mockImplementationOnce(() => new Promise<undefined>((resolve) => { finishSwitch = () => resolve(undefined); }));
+    fireEvent.click(screen.getByTestId("pr-badge-8"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+
+    await act(async () => { finishSwitch(); });
+    expect(screen.queryByTestId("pr-browser"), "A late switch must not reopen a closed frame").not.toBeInTheDocument();
+  });
+
+  /** Scenario: a first open the host refuses is said in the frame; a switch that then succeeds shows its page, not the old failure. */
+  it("clears a failed first open once a switch succeeds", async () => {
+    const { host } = fakeHost();
+    host.open.mockRejectedValueOnce(new Error("The pull request browser could not open: no window"));
+    renderDeck(host);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(screen.getByTestId("pr-browser-frame")).toHaveTextContent("no window");
+
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.getByTestId("pr-browser-frame")).not.toHaveTextContent("no window");
+  });
+
+  /** Scenario: the page cannot be moved with its frame; the reason is shown under the toolbar. */
+  it("says when the page cannot follow its frame", async () => {
+    const { host } = fakeHost();
+    host.setBounds.mockRejectedValue(new Error("The pull request page could not move"));
+    renderShell(host);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(screen.queryAllByText(/could not move/).length, "A page left behind its frame must say so").toBeGreaterThan(0);
+  });
+
+  /** Scenario: one of the app's dialogs comes up and the page cannot be hidden under it; the reason is shown, and goes once hiding works. */
+  it("says when the page cannot be hidden under a dialog", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    host.setVisible.mockRejectedValueOnce(new Error("The pull request page could not be hidden"));
+    const dialog = document.createElement("div");
+    dialog.setAttribute("aria-modal", "true");
+    try {
+      await act(async () => { document.body.appendChild(dialog); });
+      expect(screen.queryAllByText(/could not be hidden/).length, "A page left over a dialog must say so").toBeGreaterThan(0);
+    } finally {
+      // Outside the rendered tree, so `cleanup` would leave it covering the next test's browser.
+      await act(async () => { dialog.remove(); });
+    }
+    expect(screen.queryAllByText(/could not be hidden/)).toHaveLength(0);
+  });
+
+  /** Scenario: the same switch succeeds; the toolbar names Coder 8's pull request once the page shows it. */
+  it("names the new pull request once a switch succeeds", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+
+    expect(host.open).toHaveBeenCalledTimes(2);
+    expect(host.open).toHaveBeenLastCalledWith(OTHER_URL, expect.any(Object));
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
   });
 });
 
@@ -619,6 +787,20 @@ describe("PRD #1401 — the pull request browser by voice", () => {
     await waitFor(() => expect(host.scroll).toHaveBeenCalledWith(move));
     expect(voice.declareVoiceScreen.mock.calls.some(([declared]) => declared === "pull_request")).toBe(true);
     expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+  });
+
+  /** Scenario: "close" meets a page the platform will not close; the browser stays, and voice says why instead of "Closed.". */
+  it("does not announce a voice close the host refused", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderVoice(host, dispatchOutcome("close", "closeTopmost", "close", "Closed."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.close).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect.soft(screen.queryByText(/^Closed\.$/)).not.toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length, "Voice or browser must explain the refused close").toBeGreaterThan(0);
   });
 
   /** Scenario: "close" with the pull request open closes it, and only it. */

@@ -148,6 +148,8 @@ export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
 export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
 /** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
 export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
+/** PRD #1401 — a pull request in the in-app browser: the view it opened over, and which frame it is in. */
+type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number };
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -653,7 +655,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * when its own subject goes.
    */
   const prBrowserHost = useContext(PrBrowserHostContext);
-  const [prBrowser, setPrBrowser] = useState<(PullRequestBrowserSession & { over: DeckView }) | undefined>(undefined);
+  /* `prBrowser` is the pull request the page SHOWS: a switch to another one
+     is held in `prBrowserRequest` until the host has put the page on it, so a
+     switch that failed leaves the toolbar naming the page still on screen.
+     `opened` numbers the frame — one per first open, kept across switches —
+     so a host call that settles late never ends a frame opened after it. */
+  const [prBrowser, setPrBrowser] = useState<OpenPrBrowser | undefined>(undefined);
+  const [prBrowserRequest, setPrBrowserRequest] = useState<OpenPrBrowser | undefined>(undefined);
+  const prBrowserOpened = useRef(0);
+  const prBrowserNow = useRef(prBrowser);
+  prBrowserNow.current = prBrowser;
   prBrowserOpen.current = prBrowser !== undefined;
   /* What the open page last failed to do, held against the session it failed
      in so a new page never inherits an old failure. Cleared by the next thing
@@ -669,6 +680,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       return text;
     });
   }, []);
+  /** The frame numbered `opened` is gone: forget it, and any switch it was waiting on. */
+  const forgetPrBrowser = useCallback((opened: number) => {
+    // voice-registry-exempt: the host has already closed the page (Close, Escape, voice's "close", the hand-off, or the page's own Escape), and this only forgets it
+    setPrBrowser((open) => (open?.opened === opened ? undefined : open));
+    // voice-registry-exempt: a switch the closed frame was waiting on, forgotten with it
+    setPrBrowserRequest((pending) => (pending?.opened === opened ? undefined : pending));
+  }, []);
+  /**
+   * The toolbar's Close, `Escape`, voice's "close", and the browser's subject
+   * going away. The frame goes only once the host has closed the page: a close
+   * the platform refused leaves the page on screen, so the frame stays with
+   * its Close and the reason under the toolbar, and the next close tries
+   * again. Settles to that reason, or `undefined`.
+   */
+  const closePrBrowser = useCallback((): Promise<string | undefined> => {
+    const open = prBrowserNow.current;
+    if (!open) return Promise.resolve(undefined);
+    return onPrBrowserPage(open, prBrowserHost.close()).then((failed) => {
+      if (failed === undefined) forgetPrBrowser(open.opened);
+      return failed;
+    });
+  }, [forgetPrBrowser, onPrBrowserPage, prBrowserHost]);
   const pullRequestContext = useMemo<PullRequestContext>(() => ({
     openPullRequest: (target) => {
       const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
@@ -678,7 +711,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       const pullRequest = agent.pullRequest;
       if (!pullRequest) return `${name} has no pull request.`;
       if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
-      setPrBrowser({ deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view });
+      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view };
+      /* With a page open this is a switch, which the page makes and only then
+         the toolbar shows (`switchPrBrowser`); the page already on it, with
+         no other switch waiting, needs nothing. */
+      if (prBrowser) {
+        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
+      } else {
+        prBrowserOpened.current += 1;
+        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
+      }
       return undefined;
     },
     /* Closed only once the system browser has the page: a hand-off that
@@ -688,13 +730,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       if (!prBrowser) return PULL_REQUEST_NONE_OPEN;
       const session = prBrowser;
       return onPrBrowserPage(session, prBrowserHost.openExternal()).then((failed) => {
-        if (failed === undefined) setPrBrowser((open) => (open === session ? undefined : open));
+        if (failed === undefined) forgetPrBrowser(session.opened);
         return failed;
       });
     },
-    closePullRequest: () => setPrBrowser(undefined),
+    closePullRequest: closePrBrowser,
     pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser, prBrowserHost.back()); },
-  }), [onPrBrowserPage, prBrowser, prBrowserHost, runtime.fleet, view]);
+  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.fleet, view]);
+  /* The page has moved to `request`, or failed to: the toolbar names it only
+     once the host has it there, and a failure is said under the toolbar of
+     the pull request still on screen. The host runs its calls in order, so a
+     switch that settles has put the page where it says, whatever else was
+     asked meanwhile; one about a frame that has since closed is ignored. */
+  const switchPrBrowser = useCallback((request: OpenPrBrowser, work: Promise<void>) => {
+    const shown = prBrowserNow.current;
+    const failure = shown ? onPrBrowserPage(shown, work) : work.then(() => undefined, () => undefined);
+    void failure.then((failed) => {
+      // voice-registry-exempt: the switch `openPullRequest` asked for has settled, and is no longer waiting
+      setPrBrowserRequest((pending) => (pending === request ? undefined : pending));
+      // voice-registry-exempt: the toolbar follows the page the host now shows; the switch itself was asked through `openPullRequest`
+      if (failed === undefined) setPrBrowser((open) => (open?.opened === request.opened ? request : open));
+    });
+  }, [onPrBrowserPage]);
   const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
   const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
   /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
@@ -702,9 +759,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId);
   const prBrowserViewLeft = prBrowser !== undefined && JSON.stringify(prBrowser.over) !== JSON.stringify(view);
   useEffect(() => {
-    // voice-registry-exempt: the browser's subject went away (its agent ended, or the view it was opened over was left), an invariant rather than something anybody asked for
-    if (prBrowserAgentGone || prBrowserViewLeft) setPrBrowser(undefined);
-  }, [prBrowserAgentGone, prBrowserViewLeft]);
+    /* The browser's subject went away (its agent ended, or the view it was
+       opened over was left): closed like any close, so a page the platform
+       will not close keeps its frame. */
+    if (prBrowserAgentGone || prBrowserViewLeft) void closePrBrowser();
+  }, [closePrBrowser, prBrowserAgentGone, prBrowserViewLeft]);
   /**
    * PRD #1260 — the pane on screen as the voice panel's dictation mode sees
    * it: whose it is, what the deck calls it, and why it cannot take input if
@@ -1202,14 +1261,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {prBrowser && (
           <PullRequestBrowser
             session={prBrowser}
+            request={prBrowserRequest}
+            onSwitch={switchPrBrowser}
             host={prBrowserHost}
             zoom={zoom.level}
             problem={prBrowserProblem?.session === prBrowser ? prBrowserProblem.text : undefined}
             onClose={() => VOICE_ACTIONS.closePullRequest.run(pullRequestContext)}
             onBack={() => VOICE_ACTIONS.pullRequestBack.run(pullRequestContext)}
             onOpenExternal={() => VOICE_ACTIONS.openPullRequestInBrowser.run(pullRequestContext)}
-            // voice-registry-exempt: the page closed itself (its own Escape) and Rust has already closed it; this only forgets it
-            onClosedByPage={() => setPrBrowser(undefined)}
+            onClosedByPage={() => forgetPrBrowser(prBrowser.opened)}
           />
         )}
       </KeyboardInput.Provider>

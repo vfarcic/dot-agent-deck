@@ -458,8 +458,12 @@ export type VoiceActionContext = {
    * **Published only while the browser is open and nothing of the app's is
    * over it**, for {@link dismissVoiceOverlay}'s reason: {@link closeTopmost}
    * reads its presence, and the browser is at the TOP of that order.
+   *
+   * Answers the close in flight, which settles to `undefined` once the page
+   * has closed, or to the sentence saying why it did not — in which case the
+   * browser stays open, says so too, and the next close tries again.
    */
-  closePullRequest: () => void;
+  closePullRequest: () => Promise<string | undefined>;
   /** PRD #1401 — the browser toolbar's Back: one step back in the page's history. */
   pullRequestBack: () => void;
 };
@@ -504,6 +508,10 @@ export type VoiceActionEntry = {
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
 /** …and once it has it: `open_pr_in_browser`'s own `report` in `commands.toml`, said when it is true. */
 export const PULL_REQUEST_HANDED_OFF = "Opened it in your browser.";
+/** PRD #1401 — what voice says while the pull request page is being closed. */
+export const PULL_REQUEST_CLOSING = "Closing the pull request…";
+/** …and once it has: `close`'s own `report` in `commands.toml`, said when it is true. */
+export const PULL_REQUEST_CLOSED = "Closed.";
 
 export const VOICE_ACTIONS = {
   // -- the ones the command table names today -----------------------------
@@ -672,10 +680,16 @@ export const VOICE_ACTIONS = {
      * at all, and `close` with it open answered "nothing to close".
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closePullRequest">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closePullRequest" | "reportPending">>,
       target: VoiceDispatchTarget,
     ) => {
-      if (context.closePullRequest) return context.closePullRequest();
+      /* Reported once the page has closed, for `openPullRequestInBrowser`'s
+         reason: a close the platform refused leaves the page on screen. */
+      if (context.closePullRequest) {
+        const closing = context.closePullRequest();
+        context.reportPending?.(PULL_REQUEST_CLOSING, closing, PULL_REQUEST_CLOSED);
+        return;
+      }
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
       if (context.closeNewAgent) {
         const refused = context.closeNewAgent();

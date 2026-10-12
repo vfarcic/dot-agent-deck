@@ -62,8 +62,15 @@ function useCovered(ref: React.RefObject<HTMLElement | null>): boolean {
  * The toolbar is the app's: Back, Open in browser and Close are buttons here,
  * outside the page, so the page cannot draw over them or press them. The frame
  * below it is where Rust draws the page; this component reports the frame's
- * rectangle on open and whenever it moves, and closes the page when it
- * unmounts, so the page can never outlive the screen that shows it.
+ * rectangle on open and whenever it moves.
+ *
+ * **What it names is what the page shows.** `session` is the pull request on
+ * screen; another one asked for while it is open arrives as `request`, which
+ * this component asks the host to switch the page to and hands the outcome to
+ * `onSwitch` — the owner names the new pull request only once the page is on
+ * it. Closing is the owner's too (`onClose`), and the frame goes only once the
+ * host has closed the page, so a page the platform would not close keeps its
+ * frame and its Close.
  *
  * **`Escape` closes it, and only it.** The listener is on `window` in the
  * capture phase and stops the event there, so the agent's pane, Settings and
@@ -72,8 +79,13 @@ function useCovered(ref: React.RefObject<HTMLElement | null>): boolean {
  * document at all; the page's own script turns an unused Escape into a close
  * (`pr_browser::ESCAPE_SCRIPT`) and {@link PrBrowserHost.onClosed} reports it.
  */
-export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBack, onOpenExternal, onClosedByPage }: {
-  session: PullRequestBrowserSession;
+export function PullRequestBrowser<S extends PullRequestBrowserSession>({ session, request, onSwitch, host, zoom, problem, onClose, onBack, onOpenExternal, onClosedByPage }: {
+  /** The pull request the page shows. */
+  session: S;
+  /** Another pull request asked for while this one is open; the page switches to it. */
+  request?: S;
+  /** The switch to `request` is under way: `work` settles when the page is on it, or rejects with why not. */
+  onSwitch: (request: S, work: Promise<void>) => void;
   host: PrBrowserHost;
   /** The app's zoom level. Not a factor anything multiplies by (see `bounds`): a change of it moves the frame, which is reported again. */
   zoom: number;
@@ -93,7 +105,13 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
   const overlayRef = useInertBackground<HTMLDivElement>(true);
   const frameRef = useRef<HTMLDivElement>(null);
   const covered = useCovered(overlayRef);
-  const [failure, setFailure] = useState<string>();
+  /* Why the first page did not open, against the address it was for, so a
+     later switch that succeeds is not shown under an old failure. */
+  const [failure, setFailure] = useState<{ url: string; text: string }>();
+  /* Why the page could not follow the frame, or hide under a dialog; cleared
+     by the next of each that succeeds. Shown under the toolbar, because the
+     page is drawn over the frame. */
+  const [placement, setPlacement] = useState<{ bounds?: string; visible?: string }>({});
 
   /* The frame and the page it sits in, both in CSS pixels; Rust places the
      browser in proportion to the page's real size (`pr_browser::Bounds`),
@@ -114,16 +132,35 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
   const boundsRef = useRef(bounds);
   boundsRef.current = bounds;
 
-  /* Open on the URL, and again on a new one (another agent's PR). */
+  /* Open on the pull request this frame was drawn for. Later ones arrive as
+     `request` (below), not as a new `session`, which the owner sets only
+     once the page shows it. */
+  const firstUrl = useRef(session.url);
   useLayoutEffect(() => {
     const rect = boundsRef.current();
     if (!rect) return;
+    const url = firstUrl.current;
     setFailure(undefined);
-    host.open(session.url, rect).catch((error: unknown) => setFailure(error instanceof Error ? error.message : String(error)));
-  }, [host, session.url]);
+    host.open(url, rect).catch((error: unknown) => setFailure({ url, text: problemText(error) }));
+  }, [host]);
 
-  /* Closed when this frame goes, whatever took it away. */
-  useEffect(() => () => { void host.close().catch(() => undefined); }, [host]);
+  /* Switch the page to another pull request. */
+  const onSwitchRef = useRef(onSwitch);
+  onSwitchRef.current = onSwitch;
+  useLayoutEffect(() => {
+    if (!request) return;
+    const rect = boundsRef.current();
+    if (!rect) return;
+    onSwitchRef.current(request, host.open(request.url, rect));
+  }, [host, request]);
+
+  /* A safety net, not the close: the owner closes the page before it takes
+     the frame away (`onClose`), so here it is already gone and this does
+     nothing. It closes one only when the whole shell goes, and then there is
+     no screen left to say a failure on, so it is printed. */
+  useEffect(() => () => {
+    void host.close().catch((error: unknown) => console.error(`dot-agent-deck-desktop: the pull request page did not close with the app's screen: ${problemText(error)}`));
+  }, [host]);
 
   /* Follow the frame. */
   useEffect(() => {
@@ -131,7 +168,12 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
     if (!frame) return;
     const report = () => {
       const rect = boundsRef.current();
-      if (rect) void host.setBounds(rect).catch(() => undefined);
+      if (rect) {
+        host.setBounds(rect).then(
+          () => setPlacement((was) => (was.bounds === undefined ? was : { ...was, bounds: undefined })),
+          (error: unknown) => setPlacement((was) => ({ ...was, bounds: problemText(error) })),
+        );
+      }
     };
     /* Once now as well: a zoom change re-runs this, and the frame it moved
        may not change the size the observer watches. */
@@ -145,7 +187,12 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
     };
   }, [host, zoom]);
 
-  useEffect(() => { void host.setVisible(!covered).catch(() => undefined); }, [covered, host]);
+  useEffect(() => {
+    host.setVisible(!covered).then(
+      () => setPlacement((was) => (was.visible === undefined ? was : { ...was, visible: undefined })),
+      (error: unknown) => setPlacement((was) => ({ ...was, visible: problemText(error) })),
+    );
+  }, [covered, host]);
 
   const onClosedByPageRef = useRef(onClosedByPage);
   onClosedByPageRef.current = onClosedByPage;
@@ -194,10 +241,12 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
             <button type="button" className="icon-button" onClick={onClose} title="Close (Esc)" aria-label="Close pull request"><X size={16} aria-hidden="true" /></button>
           </div>
         </header>
-        {problem && <p className="pr-browser-problem" role="alert" title={displayText(problem, DISPLAY_LIMITS.message)}>{displayText(problem, DISPLAY_LIMITS.message)}</p>}
+        {[problem, placement.bounds, placement.visible].map((text, index) => text && (
+          <p key={index} className="pr-browser-problem" role="alert" title={displayText(text, DISPLAY_LIMITS.message)}>{displayText(text, DISPLAY_LIMITS.message)}</p>
+        ))}
         <div ref={frameRef} className="pr-browser-frame" data-testid="pr-browser-frame">
-          {failure ? (
-            <p className="pr-browser-notice" role="alert">{failure}</p>
+          {failure?.url === session.url ? (
+            <p className="pr-browser-notice" role="alert">{failure.text}</p>
           ) : !host.available ? (
             <p className="pr-browser-notice">GitHub's page for {title} opens here in the app. Use Open in browser to see it now.</p>
           ) : null}
@@ -205,6 +254,10 @@ export function PullRequestBrowser({ session, host, zoom, problem, onClose, onBa
       </section>
     </div>
   );
+}
+
+function problemText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Whether the open browser is hidden under one of the app's dialogs — read at voice dispatch time. */
