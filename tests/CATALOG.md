@@ -8243,3 +8243,103 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** zero new input bytes while a draft remains, both before and after an own hook; Ctrl+U clears it and permits a separate fixed doorbell.
 - **Does not assert:** Codex's real paste-burst timing; the fixture recreates the measured retained-draft end-state.
 - **Cost:** none.
+
+#### inbox/opencode
+
+##### inbox/opencode/001 — Home delivery creates and navigates once, in stream order.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake OpenCode API executing real generated plugin files and the real inbox watcher CLI.
+- **Asserts:** create → navigate → promptAsync; argv model; two deliveries share one new session; unrelated assistant parents never ack and matching parents do.
+- **Does not assert:** OpenCode rendering or real event ordering.
+- **Cost:** none.
+
+##### inbox/opencode/002 — Existing root stays in place and a child view routes to its root.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake OpenCode API with a nested session tree and last-user selections.
+- **Asserts:** shown-session targeting, child-to-root navigation deferred while a dialog is open, target model and agent, plugin-confirmed ack and no composer mutation.
+- **Does not assert:** a real child-session display.
+- **Cost:** none.
+
+##### inbox/opencode/003 — Model and agent follow the process-user, argv, default fallback chain.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake OpenCode API running the generated TUI plugin.
+- **Asserts:** process-observed selection beats argv; argv supplies a model; no selection omits both; composer remains untouched.
+- **Does not assert:** a home-screen model picker with no user message (no measured read channel).
+- **Cost:** none.
+
+##### inbox/opencode/004 — Two module copies arm exactly one watcher.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** two imports of generated TUI plugin bytes in one fake host process.
+- **Asserts:** one watcher, one stream, one prompt and plugin-confirmed acknowledgement.
+- **Does not assert:** OpenCode's own plugin deduplication.
+- **Cost:** none.
+
+##### inbox/opencode/005 — Watcher EOF and TUI disposal close the stream and requeue unacked work.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** generated TUI plugin and real watcher with explicit fake lifecycle callbacks.
+- **Asserts:** child exit, zero armed streams and fetched-to-queued transition without ack.
+- **Does not assert:** recovery from SIGKILL of the entire host process.
+- **Cost:** none.
+
+##### inbox/opencode/006 — Aborted delivery is redelivered without premature acknowledgement.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake API withholding assistant-child events.
+- **Asserts:** redelivery after ack-wait, no premature ack, then plugin-confirmed ack for the matching assistant.
+- **Does not assert:** real agent cancellation behavior.
+- **Cost:** none.
+
+##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.
+- **Asserts:** mini and mini with a project path arm once; other main-thread modes arm nothing.
+- **Does not assert:** OpenCode's own choice of process or worker thread; the stand-in also runs the server module in a genuine Node worker to pin that guard.
+- **Cost:** none.
+
+##### inbox/opencode/008 — Mini delivers to its eager root and repaints after ack and idle.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** generated mini server plugin and fake API with real watcher stdin.
+- **Asserts:** opencode_mini component, root targeting, argv model, plugin-confirmed ack and two repaint controls.
+- **Does not assert:** real mini rendering.
+- **Cost:** none.
+
+##### inbox/opencode/009 — Only mini controls nudge PTY geometry while preserving scrollback.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** raw PTY SIGWINCH probe, no OpenCode or model.
+- **Asserts:** shrink by one, gap, restore, recorded rows/cols and scrollback unchanged, coalescing, real resize winning during the gap; full OpenCode, Pi and Claude controls ignored.
+- **Does not assert:** private geometry_changes or geometry_tx counters (needs an in-process registry seam).
+- **Cost:** none.
+
+##### inbox/opencode/010 — Full and mini OpenCode retain the unarmed doorbell fallback.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** raw byte recorder announced as each OpenCode component without a stream.
+- **Asserts:** initial grace, then fixed doorbell, fetch and acknowledgement.
+- **Does not assert:** plugin interception (covered by inbox/opencode/011).
+- **Cost:** none.
+
+##### inbox/opencode/011 — Submitted doorbell is replaced in place and acknowledged when its assistant starts.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** generated server plugin's real chat.message hook under a fake OpenCode host.
+- **Asserts:** original text-parts array receives framed fetched content; fetch does not ack; abort before assistant start permits redelivery; only the matching assistant parent acknowledges the retry; recalling a handled id leaves newer pending work untouched.
+- **Does not assert:** real OpenCode rendering or cancellation; the interception channel was measured separately in full TUI and mini.
+- **Cost:** none.
+
+##### inbox/opencode/012 — Real CLI installation preserves JSONC and repeats without rewriting.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** none; real hooks installer in a sandbox HOME.
+- **Asserts:** exact insertion preserving comments and user plugins; inode and timestamp identical on second install.
+- **Does not assert:** OpenCode loading the config.
+- **Cost:** none.
+
+##### inbox/opencode/013 — Explicit config refusal reports the repair and retains fallback delivery.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** raw recorder only, real CLI installer facing a scratch symlink.
+- **Asserts:** nonzero exit, actionable stdout naming the config, reason and entry, untouched symlink and target, generic fallback ring and fetch.
+- **Does not assert:** OpenCode's response to a missing plugin file.
+- **Cost:** none.
+
+##### inbox/opencode/014 — A delayed TUI stream arms before any spawn-time doorbell.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** real generated server and TUI plugins in a fake host, with a two-second TUI delay.
+- **Asserts:** early native announcement holds the spawn-time task, stream delivery and acknowledgement send zero composer input.
+- **Does not assert:** real OpenCode's boot event ordering.
+- **Cost:** none.
