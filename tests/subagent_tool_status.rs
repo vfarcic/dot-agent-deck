@@ -79,6 +79,22 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
                 // `question` envelope and waits for an answer on the same
                 // connection, so read ONE line rather than to EOF, unwrap the
                 // event, and release the hook.
+                //
+                // The stream is accepted while the hook is still running, so
+                // its line may not have arrived yet. On macOS an accepted
+                // socket inherits the listener's O_NONBLOCK (Linux's does
+                // not), and the read would fail with `WouldBlock`; make it
+                // blocking, bounded by the same deadline as the accept loop.
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted stream blocking");
+                stream
+                    .set_read_timeout(Some(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1)),
+                    ))
+                    .expect("bound the read of the emitted AgentEvent");
                 let mut line = String::new();
                 std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
