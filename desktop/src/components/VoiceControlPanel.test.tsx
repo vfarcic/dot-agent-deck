@@ -52,7 +52,10 @@ import {
   VOICE_SUBMIT_SETTLE_MS,
   VOICE_UNAVAILABLE,
   VOICE_UNDO_WINDOW_MS,
+  questionReach,
+  voiceQuestionNextStep,
   voiceQuestionWaitingNoEnter,
+  voiceQuestionWaitingNoTyping,
 } from "./VoiceControlPanel";
 
 type ResolveVoice = ReturnType<typeof vi.fn<(utterance: string) => Promise<VoiceResultDto>>>;
@@ -2789,7 +2792,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
       saved.push(structuredClone(next));
       return structuredClone(document);
     });
-    render(<DeckShell runtime={deck} />);
+    const view = render(<DeckShell runtime={deck} />);
     await flush();
     if (openPane) fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
     await turnVoiceOn(voice);
@@ -2811,7 +2814,18 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
       }
     };
     const agents = deck.snapshot.agents.map((agent) => agent.id);
-    return { deck, voice, steps, reader, spoken, finished, stopped, sinks, say, drain, saved, agents, document: () => document, releaseNotice: () => releaseNotice(), sessions: () => sessions };
+    /** PRD #1631 — the open agent starts waiting on `asked`, as a later snapshot reports it. */
+    const ask = async (asked: PendingQuestionDto) => {
+      const snapshot = {
+        ...deck.snapshot,
+        agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? { ...agent, status: "needs_input" as const, pendingQuestion: asked } : agent),
+      };
+      deck.snapshot = snapshot;
+      deck.fleet = [snapshot];
+      view.rerender(<DeckShell runtime={{ ...deck }} />);
+      await flush();
+    };
+    return { deck, voice, steps, reader, spoken, finished, stopped, sinks, say, drain, saved, agents, ask, document: () => document, releaseNotice: () => releaseNotice(), sessions: () => sessions };
   }
 
   /** Scenario (decisions 1–3): on the deck with no pane open, saying "reading on" turns the Settings switch on through the settings save, reads every agent on the deck, says "Reading on.", and shows the reading indicator. */
@@ -3209,7 +3223,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await flush();
     expect(enters(h.deck)).toEqual([]);
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoEnter("Plan / architecture"));
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoEnter("Plan / architecture", "voice"));
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Sent.");
   });
 
@@ -3229,31 +3243,141 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent("is waiting on a question");
   });
 
+  /** "type run the tests" as the submit-less dictation row resolves it. */
+  const dictates = (heard: string) => result({
+    kind: "dispatch", transcript: heard, action: "dictate_to_agent", invoke: "dictateToAgent",
+    params: [{ name: "prefix", kind: "spoken_prefix", spoken: "type", value: heard.replace(/^type /, ""), label: heard.replace(/^type /, "") }],
+    sentence: `Typed: “${heard.replace(/^type /, "")}”.`,
+  }, null, "local");
+  /** Every byte voice handed to Planner's pane. */
+  const written = (deck: DeckRuntimeState) => vi.mocked(deck.sendTerminalInput).mock.calls.map(([, data]) => data);
+  const notAnswer = () => vi.fn(async (): Promise<QuestionResultDto> => ({ verdict: { kind: "not_answer" }, resolveMs: 1, backend: "stub" }));
+  const answering = (resolveVoiceQuestion: ReturnType<typeof notAnswer>) => ({
+    resolveVoiceQuestion,
+    sendVoiceAnswer: vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" })),
+    cancelVoiceAnswer: vi.fn(async () => undefined),
+  });
+
   /**
    * Scenario (question/desktop/018): Planner waits on a permission prompt and
-   * the user says "type run the tests", which is not an answer to it. The
-   * words are typed as before, but when the five-second countdown to the
-   * send runs out nothing is pressed: the row says the question is waiting.
+   * the user says "type run the tests", which is not an answer to it. A typed
+   * key in the agent's dialog can pick an option, so not one byte is written
+   * to the pane, no countdown starts, and the row says nothing was typed
+   * because the question is waiting: answer it by voice, or use the keyboard.
    */
-  it("question/desktop/018: a dictation's countdown presses nothing while a question waits", async () => {
-    const resolveVoiceQuestion = vi.fn(async (): Promise<QuestionResultDto> => ({ verdict: { kind: "not_answer" }, resolveMs: 1, backend: "stub" }));
-    const h = await mount({
-      openPane: true, typing: true, question: WAITING,
-      questionBridge: { resolveVoiceQuestion, sendVoiceAnswer: vi.fn(async (): Promise<AnswerOutcomeDto> => ({ kind: "answered", sentence: "Allowed: touch x" })), cancelVoiceAnswer: vi.fn(async () => undefined) },
-    });
-    h.deck.resolveVoice.mockImplementation(async (heard) => result({
-      kind: "dispatch", transcript: heard, action: "dictate_to_agent", invoke: "dictateToAgent",
-      params: [{ name: "prefix", kind: "spoken_prefix", spoken: "type", value: "run the tests", label: "run the tests" }],
-      sentence: "Typed: “run the tests”.",
-    }, null, "local"));
+  it("question/desktop/018: a dictation types nothing while a question waits", async () => {
+    const resolveVoiceQuestion = notAnswer();
+    const h = await mount({ openPane: true, typing: true, question: WAITING, questionBridge: answering(resolveVoiceQuestion) });
+    h.deck.resolveVoice.mockImplementation(async (heard) => dictates(heard));
     await h.say("type run the tests");
     expect(resolveVoiceQuestion).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(h.deck.sendTerminalInput).mock.calls.some(([, data]) => data.startsWith("run the tests"))).toBe(true);
+    expect(written(h.deck)).toEqual([]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoTyping("Planner", "voice"));
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("sending in");
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS + VOICE_SUBMIT_SETTLE_MS * 2); });
+    await flush();
+    expect(written(h.deck)).toEqual([]);
+  });
+
+  /**
+   * Scenario (question/desktop/018): with Planner's pane open and no question
+   * waiting, "type run the tests" still types the words and starts the
+   * five-second countdown, which then presses Enter.
+   */
+  it("question/desktop/018: a dictation still types with no question waiting", async () => {
+    const h = await mount({ openPane: true, typing: true });
+    h.deck.resolveVoice.mockImplementation(async (heard) => dictates(heard));
+    await h.say("type run the tests");
+    expect(written(h.deck)).toEqual(["run the tests "]);
     expect(screen.getByTestId("voice-report")).toHaveTextContent("sending in 5 s");
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS + VOICE_SUBMIT_SETTLE_MS * 2); });
     await flush();
+    expect(enters(h.deck)).toHaveLength(1);
+  });
+
+  /**
+   * Scenario (question/desktop/018): "type run the tests" is typed into
+   * Planner's prompt with no question waiting, and Planner starts waiting on a
+   * permission prompt during the countdown. When the countdown runs out
+   * nothing is pressed, and the row says the question is waiting.
+   */
+  it("question/desktop/018: a countdown presses nothing once a question arrives", async () => {
+    const h = await mount({ openPane: true, typing: true, questionBridge: answering(notAnswer()) });
+    h.deck.resolveVoice.mockImplementation(async (heard) => dictates(heard));
+    await h.say("type run the tests");
+    expect(written(h.deck)).toEqual(["run the tests "]);
+    await h.ask(WAITING);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS + VOICE_SUBMIT_SETTLE_MS * 2); });
+    await flush();
     expect(enters(h.deck)).toEqual([]);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("is waiting on a question. Answer it by voice, or use the keyboard.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoEnter("Planner", "voice"));
+  });
+
+  /**
+   * Scenario (question/desktop/018): Planner waits on a permission prompt and
+   * typing mode is on, where what the user says is typed rather than offered
+   * to the question. "run the tests" types nothing and "send it" presses
+   * nothing, and each refusal says to turn typing off to answer it by voice,
+   * since in typing mode voice cannot take the answer.
+   */
+  it("question/desktop/018: in typing mode the refusal says to turn typing off first", async () => {
+    const h = await mount({ openPane: true, typing: true, question: WAITING, questionBridge: answering(notAnswer()) });
+    h.deck.resolveVoice.mockImplementation(async (heard) => heard === "typing on" ? result({ kind: "dispatch", transcript: heard, action: "dictation_on", invoke: "startDictation", params: [], sentence: "Typing on." }, null, "local")
+      : heard === "send it" ? submits(heard)
+      : result({ kind: "dispatch", transcript: heard, action: "dictate_to_agent", invoke: "dictateToAgent", params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: heard, label: heard }], sentence: `Typed: “${heard}”.` }, null, "local"));
+    await h.say("typing on");
+    expect(screen.getByTestId("voice-typing-indicator")).toHaveTextContent("Typing to Planner");
+    await h.say("run the tests");
+    expect(written(h.deck)).toEqual([]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoTyping("Planner", "typing"));
+    await h.say("send it");
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS * 2); });
+    await flush();
+    expect(written(h.deck)).toEqual([]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoEnter("Planner", "typing"));
+  });
+
+  /**
+   * Scenario (question/desktop/018): Planner is working and waits on a
+   * permission prompt. "interrupt", "clear the prompt" and "scratch that"
+   * each press keys in the agent's prompt — in its dialog, `Esc` denies the
+   * prompt — so none of them writes anything, and the row says the question
+   * is waiting.
+   */
+  it.each([
+    { said: "interrupt", action: "interrupt_agent", invoke: "interruptAgent" },
+    { said: "clear the prompt", action: "clear_prompt", invoke: "clearAgentPrompt" },
+    { said: "scratch that", action: "scratch_that", invoke: "scratchLastDictation" },
+  ])("question/desktop/018: $said presses nothing while a question waits", async ({ said, action, invoke }) => {
+    const h = await mount({ openPane: true, typing: true, question: WAITING, questionBridge: answering(notAnswer()) });
+    h.deck.resolveVoice.mockImplementation(async (heard) => result({ kind: "dispatch", transcript: heard, action, invoke, params: [], sentence: "Done." }, null, "local"));
+    await h.say(said);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS * 4); });
+    await flush();
+    expect(written(h.deck)).toEqual([]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoEnter("Planner", "voice"));
+  });
+
+  /**
+   * Scenario (question/desktop/018): the refusal's last sentence says how to
+   * answer, and it sends the user to voice only where voice takes the
+   * answer: an open terminal with typing mode off. A hidden terminal says to
+   * open it, typing mode says to turn it off, and a question voice cannot
+   * answer at all says to use the keyboard.
+   */
+  it("question/desktop/018: the refusal names what to do for each way voice cannot answer", () => {
+    const pane = { deckId: "d", agentId: "planner", label: "Planner", question: WAITING };
+    expect(questionReach(pane, false, true)).toBe("voice");
+    expect(questionReach({ ...pane, terminalHidden: true }, false, true)).toBe("hidden");
+    expect(questionReach(pane, true, true)).toBe("typing");
+    expect(questionReach(pane, false, false)).toBe("keyboard");
+    expect(questionReach({ ...pane, question: { ...WAITING, answerable: false } }, false, true)).toBe("keyboard");
+    expect(voiceQuestionNextStep("voice")).toBe("Answer it by voice, or use the keyboard.");
+    expect(voiceQuestionNextStep("hidden")).toBe("Open its terminal to answer it, or use the keyboard.");
+    expect(voiceQuestionNextStep("typing")).toBe("Say “type off” to answer it by voice, or use the keyboard.");
+    expect(voiceQuestionNextStep("keyboard")).toBe("Answer it with the keyboard.");
+    expect(voiceQuestionWaitingNoEnter("Planner", "hidden")).toBe("Nothing was pressed — Planner is waiting on a question. Open its terminal to answer it, or use the keyboard.");
+    expect(voiceQuestionWaitingNoTyping("Planner", "typing")).toBe("Nothing was typed — Planner is waiting on a question. Say “type off” to answer it by voice, or use the keyboard.");
   });
 
   /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */

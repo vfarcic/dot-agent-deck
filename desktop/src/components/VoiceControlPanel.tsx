@@ -262,13 +262,47 @@ export function voiceNothingRan(why: string): string {
   return `Nothing ran — ${why}. Say it again.`;
 }
 /**
- * PRD #1631 — a spoken submit ("go ahead", "send it", "enter") said while the
- * open agent waits on a question that the utterance did not answer. Enter in
- * the agent's dialog would pick whichever option it has highlighted, so
- * nothing is pressed.
+ * PRD #1631 — whether voice can take the answer to the question `pane`'s
+ * agent waits on, and if not, why: its terminal is behind another tab
+ * (`hidden`), typing mode is on so what is said is typed instead (`typing`),
+ * or the deck cannot answer it by voice at all (`keyboard`). `answerQuestion`
+ * offers no utterance to the question when it is `hidden` or `typing`, or has
+ * no resolver; an unanswerable question is still offered, and Rust says why.
+ * The refusals below say what to do from this.
  */
-export function voiceQuestionWaitingNoEnter(label: string): string {
-  return `Nothing was pressed — ${label} is waiting on a question. Answer it by voice, or use the keyboard.`;
+export type QuestionReach = "voice" | "hidden" | "typing" | "keyboard";
+export function questionReach(pane: Pick<VoicePane, "terminalHidden" | "question">, dictating: boolean, canResolve: boolean): QuestionReach {
+  if (pane.terminalHidden) return "hidden";
+  if (dictating) return "typing";
+  if (!canResolve || pane.question?.answerable === false) return "keyboard";
+  return "voice";
+}
+/** PRD #1631 — what the user does about a waiting question, for each {@link QuestionReach}: voice only where voice takes the answer. */
+export function voiceQuestionNextStep(reach: QuestionReach): string {
+  switch (reach) {
+    case "voice": return "Answer it by voice, or use the keyboard.";
+    case "hidden": return "Open its terminal to answer it, or use the keyboard.";
+    case "typing": return "Say “type off” to answer it by voice, or use the keyboard.";
+    case "keyboard": return "Answer it with the keyboard.";
+  }
+}
+/**
+ * PRD #1631 — a key voice would have pressed in the open agent's pane — a
+ * spoken submit ("go ahead", "send it", "enter"), the countdown's Enter, or a
+ * prompt command's keys — while the agent waits on a question the utterance
+ * did not answer. In the agent's dialog a key can pick an option (Enter the
+ * highlighted one, `Esc` a deny), so nothing is pressed.
+ */
+export function voiceQuestionWaitingNoEnter(label: string, reach: QuestionReach): string {
+  return `Nothing was pressed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach)}`;
+}
+/**
+ * PRD #1631 — words voice would have typed into the open agent's pane while
+ * it waits on a question: in its dialog a typed key can pick an option (a
+ * number, or a `y`/`n` shortcut), so nothing is typed.
+ */
+export function voiceQuestionWaitingNoTyping(label: string, reach: QuestionReach): string {
+  return `Nothing was typed — ${label} is waiting on a question. ${voiceQuestionNextStep(reach)}`;
 }
 /**
  * PRD #1260 review — a pending one-shot send called off because the agent it
@@ -743,6 +777,12 @@ class PaneMoved extends Error {
   constructor(readonly why: string) {
     super(`Nothing was sent — ${why}.`);
   }
+}
+/** PRD #1631 — a typed write refused because the agent started waiting on a question; nothing was written, and the message is the whole refusal. */
+class QuestionWaits extends Error {}
+/** PRD #1631 — a write that stopped partway, or was called off, because the agent started waiting on a question, as the `why` of its report. */
+function questionWaitingWhy(label: string): string {
+  return `${label} is waiting on a question`;
 }
 
 /**
@@ -1688,6 +1728,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     return shows(shown, aim) ? shown.spawnedAtMs : undefined;
   }, []);
   /**
+   * PRD #1631 — the question `aim`'s agent waits on, when `aim` is the pane on
+   * screen: its label and whether voice can take the answer
+   * ({@link questionReach}), or `undefined` with no question waiting. Every
+   * pane write voice makes — typing, an Enter, a prompt command's keys, an
+   * Undo's words — checks it and writes nothing while a question waits,
+   * because in the agent's dialog a key can pick an option with none of the
+   * grounding, countdown or confirmation an answer by voice goes through.
+   */
+  const questionWaiting = useCallback((aim: AgentAddress): { label: string; reach: QuestionReach } | undefined => {
+    const shown = paneRef.current;
+    if (!shows(shown, aim) || !shown.question) return undefined;
+    return { label: shown.label, reach: questionReach(shown, panelStateRef.current.kind === "dictating", resolveVoiceQuestion !== undefined) };
+  }, [resolveVoiceQuestion]);
+  /**
    * The write line of `aim`'s incarnation on screen: one per incarnation
    * ({@link lineKey}), so an agent replaced while a write to it never settled
    * does not hand that stuck line to its replacement.
@@ -2144,7 +2198,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const answerQuestion = useCallback(async (utterance: string, ours: () => boolean): Promise<boolean> => {
     const shown = paneRef.current;
     const question = shown?.question;
-    if (!shown || !question || shown.terminalHidden || !resolveVoiceQuestion || panelStateRef.current.kind === "dictating") return false;
+    /* The gate {@link questionReach} names, so a refusal elsewhere sends the
+       user to voice only where this offers the utterance to the question. An
+       unanswerable question is still offered: Rust says why it cannot be
+       answered. */
+    const reach = shown && question ? questionReach(shown, panelStateRef.current.kind === "dictating", resolveVoiceQuestion !== undefined) : undefined;
+    if (!shown || !question || !resolveVoiceQuestion || reach === "hidden" || reach === "typing") return false;
     let held = questionFormRef.current;
     /* On its way already: only a cancel is the question's. */
     if (held?.sending) {
@@ -2467,9 +2526,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PRD #1631 — a spoken send, a trailing one and the countdown each press
        their Enter here, and none is pressed while `aim`'s pane is on screen
        with its agent waiting on a question: see `submitAgentPrompt`. */
-    const shown = paneRef.current;
-    if (shows(shown, aim) && shown.question) {
-      setProblem(voiceQuestionWaitingNoEnter(shown.label));
+    const waiting = questionWaiting(aim);
+    if (waiting) {
+      setProblem(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach));
       return;
     }
     try {
@@ -2485,7 +2544,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (sendEpoch.current !== epoch || modeGeneration.current !== generation) return;
       setProblem(sentenceOf(cause));
     }
-  }, [notePaneWrite, noteSent, resetPrompt, sendTerminalInput]);
+  }, [notePaneWrite, noteSent, questionWaiting, resetPrompt, sendTerminalInput]);
   /**
    * Press Enter once every typed write since the last send has landed — the
    * guarded half of a spoken send, shared by "send it" and a trailing send
@@ -3614,6 +3673,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (modeGeneration.current !== generation) throw new PaneMoved("typing mode changed");
       const lost = paneLost(aim);
       if (lost) throw new PaneMoved(lost.why);
+      /* PRD #1631 — a question that arrived while the words waited their
+         turn. Checked at the turn, as the Enter is (`submitDictation`), not
+         again by the bridge behind the user's own keystrokes still in flight. */
+      const asked = questionWaiting(aim);
+      if (asked) throw new QuestionWaits(voiceQuestionWaitingNoTyping(asked.label, asked.reach));
       const record = promptFor(aim, incarnationOf(aim));
       if (sends) emptyRecord(record, false, PROMPT_EMPTIED.sent);
       const target = { deckId: aim.deckId, agentId: aim.agentId };
@@ -3627,7 +3691,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         throw cause;
       }
     });
-  }, [incarnationOf, notePaneWrite, onPane, paneLost, promptFor, resetPrompt, sendTerminalInput]);
+  }, [incarnationOf, notePaneWrite, onPane, paneLost, promptFor, questionWaiting, resetPrompt, sendTerminalInput]);
   const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
     const mode = panelStateRef.current;
     /* PRD #1260 — while dictating, the words go to the mode's own target and
@@ -3653,6 +3717,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        nobody added to. */
     const typed = dictationText(target.text ?? "");
     if (typed === "") return;
+    /* PRD #1631 — not one byte while the agent waits on a question: a typed
+       key in its dialog can pick an option. Typing mode stays on, and the
+       refusal says to turn it off to answer by voice. */
+    const asked = questionWaiting(aim);
+    if (asked) {
+      reportRefused(voiceQuestionWaitingNoTyping(asked.label, asked.reach));
+      return;
+    }
     if (mode.kind === "dictating") {
       /* The mode instance the words were typed for. Every exit and entry bumps
          it, and a same-id replacement ends the mode, so it names the pane's
@@ -3680,6 +3752,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
            a mode entered after it, nor overwrite that mode's report. */
         (cause) => {
           if (modeGeneration.current !== generation) return;
+          /* PRD #1631 — refused for the question alone, which ends when it is
+             answered: the mode stays on, and the row says what to do. */
+          if (cause instanceof QuestionWaits) {
+            setResult(undefined);
+            setProblem(cause.message);
+            return;
+          }
           setPanelState(IDLE);
           /* The dispatch's "Typed …" sentence is now false: the terminal
              refused the words it reports (Qodo on PR #1451). */
@@ -3716,7 +3795,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setProblem(sentenceOf(cause));
       },
     );
-  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, setPanelState, setPending, stopNudge, submitAfterWrites, trackWrite, writeTyped]);
+  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, questionWaiting, reportRefused, setPanelState, setPending, stopNudge, submitAfterWrites, trackWrite, writeTyped]);
 
   /**
    * Press Enter in the open agent's prompt, because the user said to.
@@ -3740,9 +3819,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        its dialog would pick the highlighted option, past the grounding, the
        countdown and the "always allow" confirmation answering by voice goes
        through, so nothing is pressed — whichever path resolved the submit. */
-    const shown = paneRef.current;
-    if (shows(shown, target) && shown.question) {
-      reportRefused(voiceQuestionWaitingNoEnter(shown.label));
+    const waiting = questionWaiting(target);
+    if (waiting) {
+      reportRefused(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach));
       return;
     }
     /* PRD #1541 — what voice typed is on its way out, so there is nothing
@@ -3751,7 +3830,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     resetPrompt(target, false, PROMPT_EMPTIED.sent);
     /* After the words this Enter is meant to send. */
     submitAfterWrites({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
-  }, [cancelPendingSend, paneLost, reportRefused, resetPrompt, setPending, stopNudge, submitAfterWrites]);
+  }, [cancelPendingSend, paneLost, questionWaiting, reportRefused, resetPrompt, setPending, stopNudge, submitAfterWrites]);
 
   /**
    * PRD #1541 — the checks every prompt command makes before it writes
@@ -3768,6 +3847,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const shown = paneRef.current;
     if (lost || !shows(shown, aim)) {
       reportRefused(lost ? answerRefusal(lost) : voiceNothingRan("the pane closed"));
+      return undefined;
+    }
+    /* PRD #1631 — its keys would land in the agent's dialog, where `Esc`
+       denies and a clear or scratch key edits a typed answer. */
+    const asked = questionWaiting(aim);
+    if (asked) {
+      reportRefused(voiceQuestionWaitingNoEnter(asked.label, asked.reach));
       return undefined;
     }
     if (!shown.promptKeys) {
@@ -3791,7 +3877,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       generation: modeGeneration.current,
       reported: reportGeneration.current,
     };
-  }, [current, paneLost, promptFor, reportRefused]);
+  }, [current, paneLost, promptFor, questionWaiting, reportRefused]);
   /**
    * PRD #1541 — run a prompt command's writes on `aim`'s line, each held to
    * the declaration, to the typing mode it was said in and to the command's
@@ -3815,6 +3901,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (modeGeneration.current !== run.generation) return "typing mode ended";
       const lost = contextLost(run.declared, current(), { pane: run.aim });
       if (lost) return lost.why;
+      const asked = questionWaiting(run.aim);
+      if (asked) return questionWaitingWhy(asked.label);
       return after?.holds?.();
     };
     const command = onPane(run.aim, "command", async () => {
@@ -3844,7 +3932,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (reportGeneration.current === run.reported) setProblem(cause instanceof PaneMoved ? stopped(cause.why) : sentenceOf(cause));
       },
     );
-  }, [current, guardedSend, onPane, trackWrite]);
+  }, [current, guardedSend, onPane, questionWaiting, trackWrite]);
 
   /**
    * PRD #1541 — interrupt the open agent's turn with the deck's interrupt key
@@ -3953,6 +4041,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const holds = () => {
       const moved = contextLost(declared, current(), { pane: aim });
       if (moved) return moved.why;
+      /* PRD #1631 — the words would be typed into the agent's dialog. */
+      const asked = questionWaiting(aim);
+      if (asked) return questionWaitingWhy(asked.label);
       return changed() ? PROMPT_CHANGED : undefined;
     };
     const refused = holds();
@@ -3985,7 +4076,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         else setProblem(restored > 0 ? `Stopped restoring ${label}'s prompt — ${cause.why}.` : `Nothing was restored — ${cause.why}.`);
       },
     );
-  }, [current, guardedSend, incarnationOf, onPane, promptFor, resetPrompt, trackWrite]);
+  }, [current, guardedSend, incarnationOf, onPane, promptFor, questionWaiting, resetPrompt, trackWrite]);
 
   /**
    * PRD #1541 — clear the open agent's prompt: the deck's clear key, pressed
