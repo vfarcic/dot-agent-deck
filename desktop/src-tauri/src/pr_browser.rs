@@ -495,20 +495,28 @@ impl Bounds {
     }
 
     /// The frame on `surface`, in the logical pixels `add_child` and
-    /// `set_bounds` place a webview in.
+    /// `set_bounds` place a webview in. This is the placement on macOS and
+    /// Windows, and the PR webview's initial rectangle on every platform; on
+    /// Linux the overlay places the page from then on (`overlay::place`).
     ///
     /// Mapped onto the main webview's own rectangle (`Webview::bounds`),
     /// origin and size, because that is the page the frame was measured in —
-    /// what the Linux overlay maps onto too (its allocation). Both rectangles
-    /// are in the same coordinates: wry measures the main webview and places
-    /// this one against the same parent view. Not onto `Window::inner_size`
-    /// from the window's origin, which assumes the main webview fills the
-    /// content view from its top-left corner; on macOS nothing in AppKit
-    /// holds it there (see `the_page_never_covers_the_toolbar`). The window's
-    /// size is only the fallback for a main webview that cannot report its
-    /// own.
-    pub fn on(self, surface: Surface) -> Placed {
-        let Some(main) = surface.main_webview else {
+    /// what the Linux overlay maps onto too (its allocation). In the current
+    /// arrangement both rectangles are in the same coordinates: the two
+    /// webviews are `WindowChild` siblings in tao's stock content view, which
+    /// is not flipped, and wry measures the main webview and places this one
+    /// against that same parent view. That rests on the arrangement: pinned
+    /// wry's getter always flips y, while its setter flips only when the
+    /// parent's `isFlipped()` is false. Not onto `Window::inner_size` from the
+    /// window's origin, which assumes the main webview fills the content view
+    /// from its top-left corner; on macOS nothing in AppKit holds it there
+    /// (see `the_page_never_covers_the_toolbar`). The window's size is only
+    /// the fallback for a main webview that cannot report its own, and it is
+    /// that old assumption: such a main webview that is offset or smaller
+    /// than the window gets a page displaced by the difference
+    /// (`the_fallback_places_from_the_window_corner`).
+    pub fn on(self, surface: &Surface) -> Placed {
+        let Ok(main) = surface.main_webview else {
             let content = surface.window_content.to_logical::<f64>(surface.scale);
             return self.onto(content.width, content.height);
         };
@@ -525,15 +533,195 @@ impl Bounds {
 
 /// What the platform reports about the place the PR webview goes, measured
 /// when it is placed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Surface {
     /// The window's scale factor: physical pixels per logical pixel.
     pub scale: f64,
     /// The main webview's own rectangle in the window (`Webview::bounds`) —
-    /// the page the frame was measured in. `None` when it cannot be read.
-    pub main_webview: Option<tauri::Rect>,
+    /// the page the frame was measured in — or why it could not be read.
+    pub main_webview: Result<tauri::Rect, String>,
     /// The window's content size (`Window::inner_size`).
     pub window_content: tauri::PhysicalSize<u32>,
+}
+
+/// The shortest time between two placement lines, so a resize drag, which
+/// reports the frame on every step, prints about one line a second.
+const PLACEMENT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What [`PlacementLog::placed`] says to print now, and when to call
+/// [`PlacementLog::flush`] for a line it held back.
+#[derive(Debug, Default, PartialEq)]
+pub struct PlacementReport {
+    pub lines: Vec<String>,
+    pub flush_after: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct PlacementLogState {
+    last_line: Option<Instant>,
+    logged: Option<Placed>,
+    held: Option<(Placed, String)>,
+    flush_scheduled: bool,
+    fallback_warned: bool,
+}
+
+impl PlacementLogState {
+    const fn new() -> Self {
+        Self {
+            last_line: None,
+            logged: None,
+            held: None,
+            flush_scheduled: false,
+            fallback_warned: false,
+        }
+    }
+}
+
+/// Which placements of the PR page are printed: the first after each open,
+/// then each change of the applied rectangle, at most one line per
+/// `interval`. A change inside the interval is held and printed by
+/// [`PlacementLog::flush`] once the interval is over, so the rectangle a
+/// resize drag ends on is printed even when nothing is placed after it. The
+/// fallback warning is printed once per open. The clock is a parameter, as in
+/// [`HandOffGate`].
+#[derive(Debug)]
+pub struct PlacementLog {
+    interval: Duration,
+    state: Mutex<PlacementLogState>,
+}
+
+impl PlacementLog {
+    pub const fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(PlacementLogState::new()),
+        }
+    }
+
+    /// A pull request is opening: its first placement is printed whatever
+    /// came before, and so is the fallback warning.
+    pub fn opened(&self) {
+        *self.lock() = PlacementLogState::new();
+    }
+
+    /// The page was placed at `placed` at `now`. `fallback` is why the main
+    /// webview's bounds could not be read, when they could not; `line`
+    /// describes the placement and is only built when it is printed or held.
+    pub fn placed(
+        &self,
+        now: Instant,
+        placed: Placed,
+        fallback: Option<&str>,
+        line: impl FnOnce() -> String,
+    ) -> PlacementReport {
+        let mut state = self.lock();
+        let mut report = PlacementReport::default();
+        if let Some(error) = fallback
+            && !state.fallback_warned
+        {
+            state.fallback_warned = true;
+            report.lines.push(fallback_warning(error));
+        }
+        if state.logged == Some(placed) {
+            state.held = None;
+            return report;
+        }
+        let since = state
+            .last_line
+            .map(|last| now.saturating_duration_since(last));
+        match since {
+            Some(since) if since < self.interval => {
+                state.held = Some((placed, line()));
+                if !state.flush_scheduled {
+                    state.flush_scheduled = true;
+                    report.flush_after = Some(self.interval - since);
+                }
+            }
+            _ => {
+                state.last_line = Some(now);
+                state.logged = Some(placed);
+                state.held = None;
+                report.lines.push(line());
+            }
+        }
+        report
+    }
+
+    /// The line [`PlacementLog::placed`] held back, if one is still waiting.
+    pub fn flush(&self, now: Instant) -> Option<String> {
+        let mut state = self.lock();
+        state.flush_scheduled = false;
+        let (placed, line) = state.held.take()?;
+        state.last_line = Some(now);
+        state.logged = Some(placed);
+        Some(line)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PlacementLogState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The app's one placement log.
+static PLACEMENT_LOG: PlacementLog = PlacementLog::new(PLACEMENT_LOG_INTERVAL);
+
+/// Every placement line starts with this, so it can be found in the
+/// desktop's output.
+pub const PLACEMENT_LOG_PREFIX: &str = "dot-agent-deck-desktop: PR page placement:";
+
+/// One placement, with everything it was computed from: the main webview's
+/// `bounds()`, `inner_size()`, the scale factor, the frame the page reported
+/// and the rectangle applied to the PR webview.
+pub fn placement_line(surface: &Surface, bounds: Bounds, placed: Placed) -> String {
+    let main = match &surface.main_webview {
+        Ok(rect) => format!(
+            "main webview bounds() origin {} size {}",
+            describe_position(rect.position),
+            describe_size(rect.size)
+        ),
+        Err(error) => format!("main webview bounds() unavailable ({error}), fallback in use"),
+    };
+    format!(
+        "{PLACEMENT_LOG_PREFIX} {main}; inner_size() physical {}x{}; scale factor {}; \
+         frame from the page x={:.2} y={:.2} {:.2}x{:.2} in a {:.2}x{:.2} page (CSS px); \
+         applied to the PR webview logical x={:.2} y={:.2} {:.2}x{:.2}",
+        surface.window_content.width,
+        surface.window_content.height,
+        surface.scale,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        bounds.viewport_width,
+        bounds.viewport_height,
+        placed.x,
+        placed.y,
+        placed.width,
+        placed.height,
+    )
+}
+
+/// The warning for a main webview whose bounds could not be read.
+pub fn fallback_warning(error: &str) -> String {
+    format!(
+        "{PLACEMENT_LOG_PREFIX} warning: the main webview's bounds() failed ({error}), so the page is placed by the fallback: the frame mapped onto inner_size() from the window's top-left corner, which is right only while the main webview fills the window from that corner"
+    )
+}
+
+fn describe_position(position: tauri::Position) -> String {
+    match position {
+        tauri::Position::Physical(at) => format!("physical ({}, {})", at.x, at.y),
+        tauri::Position::Logical(at) => format!("logical ({:.2}, {:.2})", at.x, at.y),
+    }
+}
+
+fn describe_size(size: tauri::Size) -> String {
+    match size {
+        tauri::Size::Physical(size) => format!("physical {}x{}", size.width, size.height),
+        tauri::Size::Logical(size) => format!("logical {:.2}x{:.2}", size.width, size.height),
+    }
 }
 
 struct AppEffects<R: Runtime>(AppHandle<R>);
@@ -855,6 +1043,7 @@ pub async fn open<R: Runtime>(
     let _session = SESSION.lock().await;
     admit_open(&CLEARING)?;
     let generation = GENERATIONS.begin();
+    PLACEMENT_LOG.opened();
     if let Some(webview) = app.get_webview(PR_WEBVIEW_LABEL) {
         if let Err(error) = webview.navigate(url) {
             // The replaced page stays; its effects are its own again.
@@ -920,7 +1109,42 @@ impl Bounds {
     /// The frame on `window`'s content area, in logical pixels — what
     /// `add_child` and `set_bounds` place a webview in.
     fn onto_window<R: Runtime>(self, window: &tauri::Window<R>) -> Result<Placed, String> {
-        Ok(self.on(Surface::of(window)?))
+        let surface = Surface::of(window)?;
+        let placed = self.on(&surface);
+        log_placement(&surface, self, placed);
+        Ok(placed)
+    }
+}
+
+/// Prints the placement through [`PLACEMENT_LOG`], to stderr as the app's
+/// other diagnostics are, and prints a held line once its interval is over.
+fn log_placement(surface: &Surface, bounds: Bounds, placed: Placed) {
+    let now = Instant::now();
+    let report = PLACEMENT_LOG.placed(
+        now,
+        placed,
+        surface.main_webview.as_ref().err().map(String::as_str),
+        || placement_line(surface, bounds, placed),
+    );
+    for line in report.lines {
+        eprintln!("{line}");
+    }
+    let Some(after) = report.flush_after else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("pr-browser-placement-log".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            if let Some(line) = PLACEMENT_LOG.flush(Instant::now()) {
+                eprintln!("{line}");
+            }
+        });
+    // Without the thread, print the held line now rather than never.
+    if spawned.is_err()
+        && let Some(line) = PLACEMENT_LOG.flush(now)
+    {
+        eprintln!("{line}");
     }
 }
 
@@ -932,7 +1156,8 @@ impl Surface {
         let main_webview = window
             .app_handle()
             .get_webview(MAIN_WEBVIEW_LABEL)
-            .and_then(|main| main.bounds().ok());
+            .ok_or_else(|| "the app has no main webview".to_string())
+            .and_then(|main| main.bounds().map_err(|error| error.to_string()));
         Ok(Self {
             scale,
             main_webview,

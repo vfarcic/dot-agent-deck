@@ -203,6 +203,64 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Close dispatched units, one agent, or one orchestration.
+    ///
+    /// Name units by the name they were dispatched under, or by the unit id a
+    /// listing printed with --unit-id, or close one pane with --pane, or every
+    /// role of an orchestration with --orchestration-of. --all lists every
+    /// unit you may close and closes nothing; --all --yes lists them, then
+    /// closes exactly those.
+    ///
+    /// Refused unless --force: a dispatched unit that has not reported
+    /// `work-done --done`, an agent that is mid-turn, and one role of a live
+    /// orchestration closed on its own. Run from an agent's pane, `close` acts
+    /// only on units that agent dispatched, never on its own pane or
+    /// orchestration, and --force does not change that.
+    ///
+    /// Exit status: 0 everything named was closed (or listed); 1 something was
+    /// refused or failed; 2 the running daemon is too old for `close`; 3 no
+    /// daemon is running.
+    Close {
+        /// Dispatched units to close, by the name given to `dispatch`.
+        #[arg(conflicts_with_all = ["unit_ids", "pane", "orchestration_of", "all"])]
+        units: Vec<String>,
+        /// Dispatched units to close, by the unit id `close --all` (or an
+        /// `ambiguous` refusal) printed. Repeat it, or give several ids.
+        #[arg(
+            long = "unit-id",
+            value_name = "ID",
+            num_args = 1..,
+            conflicts_with_all = ["pane", "orchestration_of", "all"]
+        )]
+        unit_ids: Vec<String>,
+        /// Close the one agent in this pane.
+        #[arg(long, value_name = "PANE_ID", conflicts_with_all = ["orchestration_of", "all"])]
+        pane: Option<String>,
+        /// Close every role of the orchestration this pane belongs to.
+        #[arg(
+            long = "orchestration-of",
+            value_name = "PANE_ID",
+            conflicts_with = "all"
+        )]
+        orchestration_of: Option<String>,
+        /// List every unit you may close. Closes nothing unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all: close the units it listed.
+        #[arg(long, requires = "all")]
+        yes: bool,
+        /// Show what would be closed, and what would be refused, without
+        /// closing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Close even a unit that has not reported, an agent that is mid-turn,
+        /// or one role of a live orchestration.
+        #[arg(long)]
+        force: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Acknowledge that a delegated task reached you, so the deck stops
     /// re-sending its pointer. Run it with the delivery id your task file names
     /// (`d-` plus 8 hex characters). Always exits 0: a failed acknowledgement
@@ -1627,6 +1685,30 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Close {
+            units,
+            unit_ids,
+            pane,
+            orchestration_of,
+            all,
+            yes,
+            dry_run,
+            force,
+            json,
+        }) => {
+            let args = dot_agent_deck::close_cli::CloseArgs {
+                units,
+                unit_ids,
+                pane,
+                orchestration_of,
+                all,
+                yes,
+                dry_run,
+                force,
+                json,
+            };
+            run_close_cli(args)
+        }
         Some(Commands::Docs { topic, all }) => {
             use dot_agent_deck::embedded_docs::{self, DocsOutput};
             match embedded_docs::run(embedded_docs::PAGES, topic.as_deref(), all) {
@@ -1981,15 +2063,28 @@ fn main() -> ExitCode {
                 // the TUI when an agent is added. The TUI still runs the same
                 // loop; every installer is idempotent, and Codex and Devin have
                 // run in both processes since they were added here.
-                {
+                //
+                // Issue #1637: each installer reports what it left the agent's
+                // hooks pinned to, so the daemon can tell the user when that is
+                // an older copy of the deck before any hook fires.
+                let hook_binaries = {
                     use dot_agent_deck::agent_registry::ALL;
+                    let mut pins = Vec::new();
                     for spec in ALL {
                         if let Some(install) = spec.startup_auto_install {
-                            install();
+                            pins.extend(install());
                         }
                     }
-                }
-                run_daemon_serve_cli()
+                    // The resolution the installers' takeover check already
+                    // made, not a fresh one per caller.
+                    let resolution = dot_agent_deck::hook_binary::process_resolution();
+                    dot_agent_deck::hook_binary::HookBinaryState::from_startup(
+                        dot_agent_deck::hook_binary::DeckIdentity::current(resolution),
+                        &pins,
+                        dot_agent_deck::hook_binary::refused_ephemeral_location(resolution),
+                    )
+                };
+                run_daemon_serve_cli(hook_binaries)
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
@@ -3339,6 +3434,27 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     }
 }
 
+/// `dot-agent-deck close` — PRD #1589. Connect-only: it never starts a daemon,
+/// because closing agents on a daemon it just started would close nothing. The
+/// request building and rendering live in [`dot_agent_deck::close_cli`].
+#[tokio::main]
+async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let output = dot_agent_deck::close_cli::identity_error_output(args.json, message);
+            print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
+            return ExitCode::from(output.code);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    let output = dot_agent_deck::close_cli::run_close(&client, &args, &identity).await;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
+}
+
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
 /// Documented, non-`kill -9` way to recycle the local daemon after a
 /// binary upgrade. Idempotent (no-op exit 0 when no daemon is running)
@@ -3438,7 +3554,9 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// to be (re)installed when the binary version changes — not every time
 /// the daemon starts.
 #[tokio::main]
-async fn run_daemon_serve_cli() -> ExitCode {
+async fn run_daemon_serve_cli(
+    hook_binaries: dot_agent_deck::hook_binary::HookBinaryState,
+) -> ExitCode {
     // NOTE: logging is initialized by the `DaemonCmd::Serve` dispatch arm in
     // `main`, before the login-shell PATH capture and before this runtime is
     // built — so it is intentionally NOT initialized again here (a second
@@ -3450,7 +3568,9 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // inherits the launching TUI's directory and the two agree on the file by
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
-    let state = Arc::new(RwLock::new(AppState::default()));
+    let mut initial = AppState::default();
+    initial.hook_binaries = hook_binaries;
+    let state = Arc::new(RwLock::new(initial));
     // Issue #1121: the BIND side, so these are deliberately the pure
     // resolvers and not `endpoint_resolve`'s client ones — the primary
     // endpoint is the new spelling, never one the compatibility read chose.
@@ -3491,13 +3611,25 @@ async fn run_daemon_serve_cli() -> ExitCode {
     let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
         dot_agent_deck::daemon_restart::InstallRecord::capture(),
     ));
+    let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_legacy_aliases(
             dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
             dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
         )
         .with_restart_control(restart_control.clone());
-    if let Err(e) = run_daemon_with(&path, daemon).await {
+    // Issue #1637: re-read the agents' hook configs periodically, so a notice
+    // about an older copy the hooks are still set up to call stays, and one
+    // the user has since fixed clears, without a restart. Here rather than in
+    // `run_daemon_with`, which in-process test daemons also run: only this
+    // daemon was started with the hook pins it reads.
+    let pin_refresh = tokio::spawn(dot_agent_deck::daemon::run_hook_pin_refresh(
+        refresh_state,
+        daemon.event_tx.clone(),
+    ));
+    let result = run_daemon_with(&path, daemon).await;
+    pin_refresh.abort();
+    if let Err(e) = result {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
     }

@@ -15012,6 +15012,18 @@ pub fn run_tui(
         } else {
             (full_frame_area, None)
         };
+        // Issue #1637: one row above that for the hook-binary notice, on the
+        // dashboard only and only while the daemon reports one, so every other
+        // frame keeps its layout.
+        let show_hook_notice = !snapshot.hook_binary_notices.is_empty()
+            && matches!(tab_view, ActiveTabView::Dashboard { zoomed: false, .. });
+        let (frame_area, hook_notice_area) = if show_hook_notice {
+            let chunks =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (frame_area, None)
+        };
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -15055,6 +15067,9 @@ pub fn run_tui(
             // the reservation above used.
             if let Some(footer_area) = experimental_footer_area {
                 render_experimental_footer(frame, &features_snap, footer_area);
+            }
+            if let Some(notice_area) = hook_notice_area {
+                render_hook_notice(frame, &snapshot.hook_binary_notices, notice_area);
             }
         })?;
         tick = tick.wrapping_add(1);
@@ -22136,6 +22151,263 @@ pub fn render_experimental_footer_to_buffer(
         // `frame.area()` for the same reason as `render_stats_bar_to_buffer`.
         let area = frame.area();
         render_experimental_footer(frame, features, area);
+    })
+}
+
+/// Issue #1637 — the dashboard footer row naming agents whose hooks run an
+/// older `dot-agent-deck` (or, issue #1157, a deck that could not install
+/// hooks at all), with the daemon's remedy. Draws nothing for an empty list;
+/// the live dashboard reserves the row only while there is a notice. One row,
+/// so a second notice is counted rather than drawn, and that count is never
+/// cut. A remedy is shown whole or not at all: when the row is narrow, the
+/// facts (agents, path, versions) are what get shorter, the path first.
+fn render_hook_notice(
+    frame: &mut Frame,
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    area: Rect,
+) {
+    let Some(line) = hook_notice_line(notices, area.width as usize) else {
+        return;
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The text [`render_hook_notice`] draws, fitted to `width` columns.
+///
+/// Reserved first, so never cut: the mark and the `(+N more)` count. Then,
+/// for a remedy that is a command or the generic upgrade-or-reinstall advice
+/// (Qodo on #1656), the first of these that fits:
+///
+/// 1. the facts with the binary's path (shortened from the middle if need
+///    be) and the command, both whole;
+/// 2. the facts without the path and the command;
+/// 3. the same two with the advice in place of the command;
+/// 4. whichever of command and advice is shorter, whole, beside the facts
+///    shortened: the later agents dropped from the list, then the compact
+///    `… hooks run 0.45.1; deck 0.46.0` form — never fewer than the first
+///    agent and both versions, so a long command cannot reduce the facts to
+///    `⚠ Cl…`;
+/// 5. the facts alone, as long as fits, with no remedy: a cut command could
+///    be pasted and run wrong, and cut advice reads as a broken sentence.
+///
+/// A remedy of the daemon's own (the move-the-app advice) is what the notice
+/// is about, so it keeps its place and the facts give way to it.
+fn hook_notice_line(
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    width: usize,
+) -> Option<Line<'static>> {
+    use crate::hook_binary::{HookBinaryReason, REMEDY_UPGRADE_OR_REINSTALL};
+    use unicode_width::UnicodeWidthStr;
+    // Sanitized again at the seam that writes to the terminal, whatever path
+    // the notice took to get here.
+    let notice = &notices.first()?.sanitized();
+    let version = notice.version.as_deref().unwrap_or("?");
+    let deck = &notice.daemon_version;
+    // `who` is the part of the facts that may be cut; `lead` and `tail`
+    // surround the path, and `compact` is the shortest form that still names
+    // both versions.
+    let mut who = notice.agents.join(", ");
+    let (lead, tail, compact) = match notice.reason {
+        HookBinaryReason::Older => (
+            format!(" hooks run dot-agent-deck {version} ("),
+            format!("); this deck is {deck}"),
+            Some(format!(" hooks run {version}; deck {deck}")),
+        ),
+        HookBinaryReason::Unreported => (
+            " hooks run an older dot-agent-deck (".to_string(),
+            format!(") that predates version reporting; this deck is {deck}"),
+            Some(format!(" hooks run an older version; deck {deck}")),
+        ),
+        HookBinaryReason::Unprobeable => (
+            " hooks run a dot-agent-deck that did not report its version (".to_string(),
+            format!("); this deck is {deck}"),
+            Some(format!(" hooks run an unreported version; deck {deck}")),
+        ),
+        HookBinaryReason::EphemeralLocation => {
+            who.clear();
+            (
+                "Agent hooks are off: this deck runs from a disk image or a temporary location ("
+                    .to_string(),
+                ")".to_string(),
+                None,
+            )
+        }
+        HookBinaryReason::Unknown => (" hooks run (".to_string(), ")".to_string(), None),
+    };
+    // `who` shortened to `room` columns by dropping whole agents from the end
+    // of the list, with `…` standing for them: never fewer than the first
+    // agent, and never an agent's name cut.
+    let agents = &notice.agents;
+    let shorten_who = |room: usize| -> Option<String> {
+        if who.is_empty() {
+            return None;
+        }
+        (1..agents.len())
+            .rev()
+            .map(|kept| format!("{}…", agents[..kept].join(", ")))
+            .find(|short| short.width() <= room)
+    };
+    let no_path = format!("{lead}…{tail}");
+
+    let mark = "⚠ ";
+    let more = match notices.len() {
+        1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    let more = truncate_end(&more, width.saturating_sub(mark.width()));
+    let budget = width.saturating_sub(mark.width() + more.width());
+
+    // The facts at their fullest that fit `room`, or `None`. Without
+    // `shorten`, only the path gives way; with it, `who` may too.
+    let fit_facts = |room: usize, shorten: bool| -> Option<Vec<Span<'static>>> {
+        let fixed = who.width() + lead.width() + tail.width();
+        if let Some(path_budget) = room.checked_sub(fixed) {
+            let path = if path_budget >= notice.binary.width() {
+                Some(notice.binary.clone())
+            } else if path_budget >= 5 {
+                Some(truncate_middle(&notice.binary, path_budget))
+            } else {
+                None
+            };
+            if let Some(path) = path {
+                return Some(vec![
+                    Span::styled(format!("{who}{lead}"), text_primary()),
+                    Span::styled(path, text_dim()),
+                    Span::styled(tail.clone(), text_primary()),
+                ]);
+            }
+        }
+        let compact = compact.iter().filter(|_| shorten);
+        std::iter::once(&no_path).chain(compact).find_map(|rest| {
+            let who_room = room.checked_sub(rest.width())?;
+            let who = if who.width() <= who_room {
+                who.clone()
+            } else if shorten {
+                shorten_who(who_room)?
+            } else {
+                return None;
+            };
+            Some(vec![Span::styled(format!("{who}{rest}"), text_primary())])
+        })
+    };
+    let line = |facts: Vec<Span<'static>>, remedy: Option<String>| {
+        let mut spans = vec![Span::styled(mark, Style::default().fg(Color::Yellow))];
+        spans.extend(facts);
+        if let Some(remedy) = remedy {
+            spans.push(Span::styled(
+                remedy,
+                text_primary().add_modifier(Modifier::BOLD),
+            ));
+        }
+        if !more.is_empty() {
+            spans.push(Span::styled(more.clone(), text_primary()));
+        }
+        Some(Line::from(spans))
+    };
+
+    let advice = format!(" — {REMEDY_UPGRADE_OR_REINSTALL}");
+    let remedies: Vec<String> = match &notice.command {
+        Some(command) => vec![format!(" — {} {command}", notice.remedy), advice],
+        None if notice.remedy == REMEDY_UPGRADE_OR_REINSTALL => vec![advice],
+        None => {
+            // The daemon's own advice: whole if the facts fit beside it at
+            // all, else it keeps what it can and the facts take the rest.
+            let remedy = format!(" — {}", notice.remedy);
+            if let Some(facts) = budget
+                .checked_sub(remedy.width())
+                .and_then(|room| fit_facts(room, false))
+            {
+                return line(facts, Some(remedy));
+            }
+            let remedy = truncate_end(&remedy, budget);
+            let facts = truncate_end(&format!("{who}{no_path}"), budget - remedy.width());
+            return line(vec![Span::styled(facts, text_primary())], Some(remedy));
+        }
+    };
+    // Steps 1–3: a remedy whole beside the facts whole.
+    for remedy in &remedies {
+        if let Some(facts) = budget
+            .checked_sub(remedy.width())
+            .and_then(|room| fit_facts(room, false))
+        {
+            return line(facts, Some(remedy.clone()));
+        }
+    }
+    // Step 4: the shorter remedy whole beside shortened facts.
+    let shorter = remedies.iter().min_by_key(|remedy| remedy.width())?;
+    if let Some(facts) = budget
+        .checked_sub(shorter.width())
+        .and_then(|room| fit_facts(room, true))
+    {
+        return line(facts, Some(shorter.clone()));
+    }
+    // Step 5: the facts alone.
+    let facts = fit_facts(budget, true).unwrap_or_else(|| {
+        vec![Span::styled(
+            truncate_end(&format!("{who}{no_path}"), budget),
+            text_primary(),
+        )]
+    });
+    line(facts, None)
+}
+
+/// The longest prefix of `chars` that fits in `max` columns.
+fn take_columns(chars: impl Iterator<Item = char>, max: usize) -> Vec<char> {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    chars
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= max
+        })
+        .collect()
+}
+
+/// `text` shortened to `max` columns by replacing its middle with `…`.
+fn truncate_middle(text: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep = max - 1;
+    let head = take_columns(text.chars(), keep / 2);
+    let mut tail = take_columns(text.chars().rev(), keep - keep / 2);
+    tail.reverse();
+    let mut out: String = head.into_iter().collect();
+    out.push('…');
+    out.extend(tail);
+    out
+}
+
+/// `text` cut to `max` columns, ending in `…` when it was cut.
+fn truncate_end(text: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = take_columns(text.chars(), max - 1).into_iter().collect();
+    out.push('…');
+    out
+}
+
+/// L1 test seam: render the hook-binary notice row into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale. Renders nothing for an
+/// empty list.
+#[doc(hidden)]
+pub fn render_hook_notice_to_buffer(
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        let area = frame.area();
+        render_hook_notice(frame, notices, area);
     })
 }
 
@@ -35321,12 +35593,21 @@ mod tests {
         // agent's `$PATH` cannot redirect, not by the bare name.
         let bin = crate::platform::paths::binary_name();
         let dispatch_verb = format!("{bin} dispatch <name>");
+        // PRD #1589: the seed teaches the `close` verb's mechanics, and leaves
+        // when to close to the user.
+        let close_verb = format!("{bin} close <name>");
+        let close_all = format!("{bin} close --all --yes");
+        let close_by_id = format!("{bin} close --unit-id <id>");
         assert!(
             !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
             "the dispatcher seed must not name the deck by its bare name"
         );
         for required in [
             dispatch_verb.as_str(),
+            close_verb.as_str(),
+            close_all.as_str(),
+            close_by_id.as_str(),
+            "When to close is the user's decision",
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
@@ -46136,6 +46417,136 @@ mod config_drift_tests {
         let (status, _) = ui.status_message.as_ref().expect("status line set");
         assert!(!status.contains(CONFIG_DRIFT_TAB_MARKER), "{status}");
         assert_eq!(ui.session_warnings, vec!["w".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod hook_notice_tests {
+    //! Issue #1637: the dashboard's hook-binary notice row.
+    use super::*;
+    use crate::hook_binary::{HookBinaryNotice, HookBinaryReason};
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn is_unsafe(c: char) -> bool {
+        c.is_control()
+            || crate::untrusted_text::is_bidi_format_char(c)
+            || matches!(c, '\u{2028}' | '\u{2029}')
+    }
+
+    #[test]
+    fn a_hostile_notice_renders_without_control_or_bidi_characters() {
+        let hostile = "\x1b[2J\r\n\u{202E}\u{2028}";
+        let notice = HookBinaryNotice {
+            binary: format!("/opt/old{hostile}/dot-agent-deck"),
+            agents: vec![format!("Codex{hostile}")],
+            version: Some(format!("0.45.0{hostile}")),
+            daemon_version: format!("0.46.0{hostile}"),
+            reason: HookBinaryReason::Older,
+            // Only characters that strip to nothing, so the lead-in is still
+            // `Run:` once cleaned and its dropped command is what is tested.
+            remedy: "Run:\r\n\u{202E}\u{2028}".to_string(),
+            command: Some(format!("brew upgrade dot-agent-deck{hostile}")),
+        };
+        for width in [40, 120, 400] {
+            let line = hook_notice_line(std::slice::from_ref(&notice), width).expect("a line");
+            let text = line_text(&line);
+            assert!(!text.chars().any(is_unsafe), "{width}: {text:?}");
+            let rendered = buffer_text(&render_hook_notice_to_buffer(
+                std::slice::from_ref(&notice),
+                width as u16,
+                1,
+            ));
+            assert!(!rendered.chars().any(is_unsafe), "{width}: {rendered:?}");
+        }
+        let text = line_text(&hook_notice_line(std::slice::from_ref(&notice), 400).unwrap());
+        assert!(text.contains("/opt/old[2J/dot-agent-deck"), "{text}");
+        // The altered command is dropped, not shown, and the remedy no longer
+        // leads in to it.
+        assert!(!text.contains("brew upgrade"), "{text}");
+        assert!(
+            text.contains(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL),
+            "{text}"
+        );
+    }
+
+    /// Scenario (Greptile and Qodo on #1656): at 80 columns, a notice whose
+    /// command is the two-agent `hooks install` for `~/.local/bin`, wider than
+    /// the row on its own. The row shows no part of the command, never a
+    /// cut-off one, but the agents and both versions; at 120 columns the
+    /// advice does not fit whole either, so none of it is shown; at 160 it is
+    /// shown whole, and at a width the command fits beside the facts, the row
+    /// shows the command whole.
+    #[test]
+    fn a_command_wider_than_the_row_falls_back_to_the_advice() {
+        use unicode_width::UnicodeWidthStr;
+        let command = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code && \
+                       /home/u/.local/bin/dot-agent-deck hooks install --agent codex";
+        assert!(command.width() > 80);
+        let notice = HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into(), "Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: crate::hook_binary::REMEDY_RUN.into(),
+            command: Some(command.into()),
+        };
+        let line = hook_notice_line(std::slice::from_ref(&notice), 80).unwrap();
+        let text = line_text(&line);
+        assert!(text.width() <= 80, "{text}");
+        assert!(!text.contains("hooks install --agent"), "{text}");
+        assert!(!text.contains("Run:"), "{text}");
+        for part in ["Claude Code, Codex", "0.45.0", "0.46.0"] {
+            assert!(text.contains(part), "missing {part:?}: {text}");
+        }
+        let roomier = line_text(&hook_notice_line(std::slice::from_ref(&notice), 120).unwrap());
+        assert!(!roomier.contains("Upgrade the"), "{roomier}");
+        assert!(!roomier.contains("hooks install --agent"), "{roomier}");
+        let advised = line_text(&hook_notice_line(std::slice::from_ref(&notice), 160).unwrap());
+        assert!(
+            advised.contains(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL),
+            "{advised}"
+        );
+        let rendered = buffer_text(&render_hook_notice_to_buffer(
+            std::slice::from_ref(&notice),
+            80,
+            1,
+        ));
+        assert!(!rendered.contains("hooks install --agent"), "{rendered}");
+
+        let wide = line_text(&hook_notice_line(std::slice::from_ref(&notice), 400).unwrap());
+        assert!(wide.contains(&format!("Run: {command}")), "{wide}");
+    }
+
+    #[test]
+    fn truncation_counts_display_columns() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "/home/用户/工作/目录/dot-agent-deck";
+        for max in 5..wide.width() {
+            let middle = truncate_middle(wide, max);
+            assert!(
+                middle.width() <= max,
+                "{max}: {middle} is {}",
+                middle.width()
+            );
+            assert!(middle.contains('…'), "{middle}");
+            let end = truncate_end(wide, max);
+            assert!(end.width() <= max, "{max}: {end} is {}", end.width());
+            assert!(end.ends_with('…'), "{end}");
+        }
+        assert_eq!(truncate_middle(wide, wide.width()), wide);
+        assert_eq!(truncate_end("abcdef", 4), "abc…");
+        assert_eq!(truncate_middle("abcdefgh", 5), "ab…gh");
     }
 }
 

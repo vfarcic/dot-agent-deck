@@ -542,9 +542,40 @@ pub fn binary_name() -> String {
 /// dashboard-startup path and add a new failure mode there, to catch a
 /// version-skew problem the PRD puts out of scope: an installed deck of a
 /// different version is still a *durable* path, which is all this function
-/// claims to find.
+/// claims to find. Issue #1637 does compare versions, but in the automatic
+/// installer and never here: it runs `<pinned> --version` on a binary an
+/// agent's config ALREADY names, bounded and cached
+/// ([`crate::hook_binary::probe_version`]), to decide whether this copy should
+/// take that pin over. No candidate this function returns is executed.
 pub fn durable_binary_path() -> Result<String, String> {
-    durable_binary_path_with(
+    durable_binary_resolution().map(|resolved| resolved.path)
+}
+
+/// Which arm of [`durable_binary_path_with`] produced a path (issue #1637), so
+/// the automatic installer can tell "this running binary IS an install" from
+/// "this binary resolved to another file".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolutionArm {
+    /// Steps 1 and 1b: the running binary itself, at an install location or
+    /// behind an installed name that resolves to it.
+    Running,
+    /// Steps 2a and 2b: another file, an install the running binary found.
+    Install,
+    /// Step 3: the running binary, pinned because nothing better exists.
+    LastResort,
+}
+
+/// A path [`durable_binary_path_with`] resolved, with the arm that produced
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: String,
+    pub arm: ResolutionArm,
+}
+
+/// [`durable_binary_path`] with the arm that produced the path.
+pub fn durable_binary_resolution() -> Result<Resolved, String> {
+    durable_binary_resolution_with(
         effective_current_exe(),
         &home_dir(),
         std::env::var_os("PATH").as_deref(),
@@ -574,6 +605,16 @@ pub fn durable_binary_path_with(
     home: &Path,
     path_value: Option<&std::ffi::OsStr>,
 ) -> Result<String, String> {
+    durable_binary_resolution_with(current_exe, home, path_value).map(|resolved| resolved.path)
+}
+
+/// [`durable_binary_path_with`] with the arm that produced the path.
+pub fn durable_binary_resolution_with(
+    current_exe: std::io::Result<PathBuf>,
+    home: &Path,
+    path_value: Option<&std::ffi::OsStr>,
+) -> Result<Resolved, String> {
+    let resolved = |path: String, arm: ResolutionArm| Ok(Resolved { path, arm });
     let name = durable_binary_file_name();
     let installed = home.join(".local").join("bin").join(&name);
 
@@ -607,7 +648,7 @@ pub fn durable_binary_path_with(
         && is_executable_file(&absolute)
         && let Some(path) = durable_path_string(&absolute)
     {
-        return Ok(path);
+        return resolved(path, ResolutionArm::Running);
     }
 
     // Step 1b (issue #1372): an installed NAME for the running binary — the
@@ -636,7 +677,7 @@ pub fn durable_binary_path_with(
                 && std::fs::canonicalize(&candidate).is_ok_and(|c| c == running)
                 && let Some(path) = durable_path_string(&candidate)
             {
-                return Ok(path);
+                return resolved(path, ResolutionArm::Running);
             }
         }
     }
@@ -648,14 +689,14 @@ pub fn durable_binary_path_with(
         && write_mode_is_owner_only(&installed)
         && let Some(path) = durable_path_string(&installed)
     {
-        return Ok(path);
+        return resolved(path, ResolutionArm::Install);
     }
 
     if let Some(path_value) = path_value
         && let Some(found) = first_durable_path_match(path_value, &name)
         && let Some(path) = durable_path_string(&found)
     {
-        return Ok(path);
+        return resolved(path, ResolutionArm::Install);
     }
 
     // Step 3 — the LAST RESORT, and the third arm of a three-way policy rather
@@ -674,6 +715,26 @@ pub fn durable_binary_path_with(
     // There, a refusal is not caution: it is no agent hooks at all, forever,
     // reported only as a `tracing::warn!` nobody reads. A pin the self-heal can
     // repair once something better exists is the better failure.
+    //
+    // Issue #1157: except a copy running from a mounted disk image or from
+    // macOS App Translocation. Such a pin dies when the image is ejected, and a
+    // translocated path changes between launches, so it would fail every hook
+    // with `not found` and be rewritten on every launch. Nothing is written,
+    // and the daemon tells the user to move the app (`EphemeralLocation`).
+    // Temporary directories are NOT refused here: a scratch copy that is the
+    // only deck on the machine is still pinned (`hooks/install/008`). Only this
+    // last resort refuses: an installed `~/.local/bin` or `$PATH` name is
+    // pinned by that name at the steps above even when it points into such a
+    // location, and a pin that dies with it is repaired when another copy
+    // next starts.
+    if is_mounted_or_translocated(&absolute) {
+        return Err(format!(
+            "refusing to write `{}` into agent hook config: it is running from a mounted disk \
+             image or a temporary App Translocation location, so the path stops working when \
+             the image is ejected or the app is relaunched. {MOVE_TO_APPLICATIONS_ADVICE}",
+            absolute.display()
+        ));
+    }
     if !is_build_artifact_path(&absolute)
         && is_executable_file(&absolute)
         && let Some(path) = durable_path_string(&absolute)
@@ -687,7 +748,7 @@ pub fn durable_binary_path_with(
             installed.display(),
             repair_advice(&installed)
         );
-        return Ok(path);
+        return resolved(path, ResolutionArm::LastResort);
     }
 
     Err(format!(
@@ -699,6 +760,64 @@ pub fn durable_binary_path_with(
         installed.display(),
         repair_advice(&installed)
     ))
+}
+
+/// The file the running binary canonically is (issue #1637): what takeover
+/// eligibility checks beside the installed name, so an installed link to a
+/// scratch copy is not mistaken for an install. Through
+/// `effective_current_exe`, so the e2e harness's binary copy answers for
+/// itself. `None` when it cannot be resolved.
+pub fn running_binary_target() -> Option<PathBuf> {
+    effective_current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok())
+}
+
+/// What a user whose deck runs from a disk image or a translocated location
+/// does about it (issue #1157). Shared by the resolver's refusal and the
+/// notice both clients show.
+pub const MOVE_TO_APPLICATIONS_ADVICE: &str =
+    "Move Agent Deck to /Applications and reopen it to turn agent hooks on.";
+
+/// Whether `path` runs from a macOS location that does not survive (issue
+/// #1157): a mounted volume (`/Volumes/<name>/…`, where a `.dmg` mounts) or an
+/// App Translocation copy (a path with an `AppTranslocation` component, where
+/// macOS runs a quarantined app it has not moved). Purely lexical, so it is
+/// decided the same way on every platform.
+pub fn is_mounted_or_translocated(path: &Path) -> bool {
+    let mut components = path.components();
+    let mounted = matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.next() == Some(std::path::Component::Normal("Volumes".as_ref()))
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_some();
+    mounted
+        || path
+            .components()
+            .any(|c| c == std::path::Component::Normal("AppTranslocation".as_ref()))
+}
+
+/// Whether `path` is somewhere a copy of the deck is known not to stay (issue
+/// #1637): under the temp directory, `/tmp` or `/var/tmp`, or
+/// [`is_mounted_or_translocated`]. Lexical, like
+/// [`is_installed_location`]. A copy there never takes over another install's
+/// hooks, because those hooks would stop working once the directory is
+/// cleaned, the image ejected or the app relaunched.
+pub fn is_known_ephemeral(path: &Path) -> bool {
+    if is_mounted_or_translocated(path) {
+        return true;
+    }
+    let temp = std::env::temp_dir();
+    let mut roots = vec![
+        temp.clone(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/private/var/tmp"),
+    ];
+    if let Ok(canonical) = std::fs::canonicalize(&temp) {
+        roots.push(canonical);
+    }
+    roots.iter().any(|root| path.starts_with(root))
 }
 
 /// Why `exe` was not usable as the written path, for the refusal message.
@@ -3937,6 +4056,181 @@ mod tests {
             "a CLI install must win over the desktop's bundled sidecar, or the two write two \
              sets of deck rules"
         );
+    }
+
+    /// Issue #1637: the resolver reports which arm produced its answer. Steps 1
+    /// and 1b are the running binary itself (`Running`), 2a and 2b another
+    /// file (`Install`), and step 3 the running binary with nothing better
+    /// (`LastResort`).
+    #[test]
+    fn durable_binary_resolution_reports_the_arm() {
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+
+        // Step 1: the running binary is the `~/.local/bin` install.
+        let home = dir.path().join("h1");
+        let installed = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&installed);
+        let resolved = durable_binary_resolution_with(Ok(installed.clone()), &home, None).unwrap();
+        assert_eq!(resolved.arm, ResolutionArm::Running);
+        assert_eq!(resolved.path, installed.to_str().unwrap());
+
+        // Step 2a: a scratch copy that finds the `~/.local/bin` install.
+        let scratch = dir.path().join("scratch").join(&name);
+        write_stub_executable(&scratch);
+        let resolved = durable_binary_resolution_with(Ok(scratch.clone()), &home, None).unwrap();
+        assert_eq!(resolved.arm, ResolutionArm::Install);
+        assert_eq!(resolved.path, installed.to_str().unwrap());
+
+        // Step 2b: a scratch copy that finds an install on `$PATH`.
+        let home2 = dir.path().join("h2");
+        std::fs::create_dir_all(&home2).unwrap();
+        let on_path = dir.path().join("prefix").join("bin");
+        write_stub_executable(&on_path.join(&name));
+        let resolved =
+            durable_binary_resolution_with(Ok(scratch.clone()), &home2, Some(on_path.as_os_str()))
+                .unwrap();
+        assert_eq!(resolved.arm, ResolutionArm::Install);
+        assert_eq!(resolved.path, on_path.join(&name).to_str().unwrap());
+
+        // Step 3: nothing better than the scratch copy itself.
+        let resolved = durable_binary_resolution_with(Ok(scratch.clone()), &home2, None).unwrap();
+        assert_eq!(resolved.arm, ResolutionArm::LastResort);
+        assert_eq!(resolved.path, scratch.to_str().unwrap());
+        assert_eq!(
+            durable_binary_path_with(Ok(scratch.clone()), &home2, None).unwrap(),
+            resolved.path,
+            "durable_binary_path_with is the same answer without the arm"
+        );
+    }
+
+    /// Issue #1637: step 1b — a Homebrew-style `<prefix>/bin` link on `$PATH`
+    /// into the running keg — is the running binary too.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_resolution_reports_running_for_an_installed_link() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let keg = dir
+            .path()
+            .join("Cellar")
+            .join("dot-agent-deck")
+            .join("0.46.0")
+            .join("bin")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&keg);
+        let prefix_bin = dir.path().join("prefix").join("bin");
+        std::fs::create_dir_all(&prefix_bin).unwrap();
+        std::os::unix::fs::symlink(&keg, prefix_bin.join(DEFAULT_BINARY_NAME)).unwrap();
+
+        let resolved =
+            durable_binary_resolution_with(Ok(keg.clone()), &home, Some(prefix_bin.as_os_str()))
+                .unwrap();
+
+        assert_eq!(resolved.arm, ResolutionArm::Running);
+        assert_eq!(
+            resolved.path,
+            prefix_bin.join(DEFAULT_BINARY_NAME).to_str().unwrap()
+        );
+    }
+
+    /// Issue #1157: with nothing installed, a copy running from a mounted disk
+    /// image (`/Volumes/<name>/…`) or from App Translocation is refused at step
+    /// 3 rather than pinned, and the refusal names `/Applications`. The shapes
+    /// are lexical. The translocated one is checked on every platform; the
+    /// `/Volumes` one on Unix, where it is an absolute path (on Windows it is
+    /// relative to the current drive, so no copy runs from it), and it need
+    /// not exist, because the refusal comes before step 3 looks at the file.
+    #[test]
+    fn step_3_refuses_a_mounted_or_translocated_copy() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        #[cfg(unix)]
+        {
+            let mounted =
+                PathBuf::from("/Volumes/Agent Deck/Agent Deck.app/Contents/MacOS").join(&name);
+            let err = durable_binary_path_with(Ok(mounted), &home, None).unwrap_err();
+            assert!(err.contains("/Applications"), "{err}");
+        }
+
+        let translocated = dir
+            .path()
+            .join("private")
+            .join("var")
+            .join("folders")
+            .join("AppTranslocation")
+            .join("3F2A")
+            .join("d")
+            .join("Agent Deck.app")
+            .join("Contents")
+            .join("MacOS")
+            .join(&name);
+        write_stub_executable(&translocated);
+        let err = durable_binary_path_with(Ok(translocated.clone()), &home, None).unwrap_err();
+        assert!(err.contains("/Applications"), "{err}");
+
+        // An install still wins over either, as it does over any sidecar.
+        let installed = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&installed);
+        let resolved = durable_binary_resolution_with(Ok(translocated), &home, None).unwrap();
+        assert_eq!(resolved.arm, ResolutionArm::Install);
+    }
+
+    /// Issue #1637 audit A4: a sandbox HOME under cargo's
+    /// `CARGO_TARGET_TMPDIR` (`<target-dir>/tmp/...`) is where an e2e test can
+    /// put an installed copy without any production exemption. Its
+    /// `~/.local/bin` is neither a cargo build artifact (`tmp` is not a
+    /// profile, and `.local/bin` holds no `.fingerprint/` + `deps/`) nor
+    /// lexically ephemeral when the checkout is on a disk-backed path.
+    #[test]
+    fn a_home_under_cargo_target_tmpdir_is_not_a_build_artifact_or_ephemeral() {
+        let installed = Path::new(
+            "/home/u/code/dot-agent-deck/target/tmp/dad-e2e-home/.local/bin/dot-agent-deck",
+        );
+        assert!(!is_build_artifact_path(installed));
+        assert!(!is_known_ephemeral(installed));
+    }
+
+    /// Issue #1637 / #1157: which locations are known not to stay.
+    #[test]
+    fn is_known_ephemeral_names_temporary_mounted_and_translocated_paths() {
+        let temp = std::env::temp_dir()
+            .join("dad-branch")
+            .join("dot-agent-deck");
+        assert!(is_known_ephemeral(&temp));
+        assert!(is_known_ephemeral(Path::new("/tmp/x/dot-agent-deck")));
+        assert!(is_known_ephemeral(Path::new(
+            "/var/tmp/dad-branch/bin/dot-agent-deck"
+        )));
+        assert!(is_known_ephemeral(Path::new(
+            "/Volumes/Agent Deck/Agent Deck.app/Contents/MacOS/dot-agent-deck"
+        )));
+        assert!(is_known_ephemeral(Path::new(
+            "/private/var/folders/xy/T/AppTranslocation/3F2A/d/Agent Deck.app/Contents/MacOS/dot-agent-deck"
+        )));
+
+        assert!(!is_known_ephemeral(Path::new(
+            "/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck"
+        )));
+        assert!(!is_known_ephemeral(Path::new(
+            "/home/u/.local/bin/dot-agent-deck"
+        )));
+        assert!(!is_known_ephemeral(Path::new(
+            "/opt/homebrew/bin/dot-agent-deck"
+        )));
+        assert!(!is_known_ephemeral(Path::new(
+            "/home/linuxbrew/.linuxbrew/bin/dot-agent-deck"
+        )));
+        // A mount point alone is not a file under it, and `Volumes` deeper in
+        // a path is not where macOS mounts images.
+        assert!(!is_mounted_or_translocated(Path::new("/Volumes/External")));
+        assert!(!is_mounted_or_translocated(Path::new(
+            "/home/u/Volumes/x/dot-agent-deck"
+        )));
     }
 
     /// The other direction of the same decision: a desktop-only machine — the

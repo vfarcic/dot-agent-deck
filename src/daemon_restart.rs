@@ -269,7 +269,7 @@ pub fn verify_restart_target(
 /// platform has them, plus size and modification time (PRD #1487 audit A5).
 /// Read through symlinks, so a repointed Homebrew link reads as a different
 /// file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     dev: u64,
     ino: u64,
@@ -432,7 +432,7 @@ fn strip_v(v: &str) -> &str {
 /// fails rather than reaching a thread nobody is waiting for. Elsewhere the read
 /// blocks, and a reader still running after the cancel's grace is abandoned, as
 /// [`crate::remote::run_local_bounded`] abandons one.
-fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, String> {
+pub(crate) fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, String> {
     use crate::remote::PipeReader;
     use std::process::{Command, Stdio};
     let deadline = Instant::now() + timeout;

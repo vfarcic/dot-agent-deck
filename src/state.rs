@@ -2055,6 +2055,16 @@ pub struct AppState {
     /// Issue #1635: the id of the check `upgrade_check` holds, so a check that
     /// started earlier never replaces it ([`crate::upgrade_dialog::publish`]).
     pub upgrade_check_id: u64,
+    /// Issue #1637, the daemon's side: which `dot-agent-deck` each agent's
+    /// hooks run, seeded by `daemon serve` from the startup installers and
+    /// updated from every hook line's stamp. Its
+    /// [`notices`](crate::hook_binary::HookBinaryState::notices) are what the
+    /// `Hello` reply and the `HookBinaryNotice` broadcast carry.
+    pub hook_binaries: crate::hook_binary::HookBinaryState,
+    /// Issue #1637, a client's side: the notices the daemon reported, seeded
+    /// from `Hello` and replaced by each `HookBinaryNotice` broadcast. Drawn as
+    /// one dashboard footer row while non-empty.
+    pub hook_binary_notices: Vec<crate::hook_binary::HookBinaryNotice>,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no
@@ -4769,6 +4779,26 @@ impl AppState {
             .map(|session| session.status.clone())
     }
 
+    /// PRD #1589: [`Self::pane_status`] for the `close` verb's busy check —
+    /// the status the card for `pane_id` shows. `None` when the pane has no
+    /// session, which the check treats as uncertainty rather than idle.
+    pub fn pane_status_of(&self, pane_id: &str) -> Option<SessionStatus> {
+        self.pane_status(pane_id)
+    }
+
+    /// PRD #1589 × issue #1678: the background work the card for `pane_id`
+    /// shows, as the daemon last published it — `None` when there is nothing to
+    /// show. An agent whose turn is over but whose commands or subagents still
+    /// run reads `Idle`, so the `close` verb's busy check reads this beside the
+    /// status.
+    pub fn pane_background_of(&self, pane_id: &str) -> Option<BackgroundWork> {
+        let session_id = self.pane_session_id(pane_id)?;
+        self.background_tracks
+            .get(&session_id)
+            .and_then(|track| track.published)
+            .filter(|work| !work.is_empty())
+    }
+
     /// Issue #447: [`Self::apply_event`], plus the one daemon-side consumer of
     /// a worker's `WaitingForInput`: open or close that worker's waiting
     /// episode, whose debounced notice tells the orchestrator that delegated to
@@ -5884,6 +5914,7 @@ async fn wait_for_worker_event(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -6637,6 +6668,7 @@ async fn run_delegate_late_readiness_recovery(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -7854,6 +7886,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -8087,6 +8120,7 @@ pub(crate) async fn hold_readiness_buffer(
                     BroadcastMsg::Event(_)
                     | BroadcastMsg::OrchestrationSurface(_)
                     | BroadcastMsg::WorktreeKept(_)
+                    | BroadcastMsg::HookBinaryNotice(_)
                     | BroadcastMsg::Unknown,
                 ) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -8321,6 +8355,7 @@ pub(crate) async fn wait_for_prompt_submission(
             Ok(Ok(
                 BroadcastMsg::OrchestrationSurface(_)
                 | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::HookBinaryNotice(_)
                 | BroadcastMsg::Unknown,
             )) => {
                 continue;
@@ -9380,25 +9415,30 @@ async fn dispatch_one_owned(
                     // permanent breakage issue #606 reports.
                     if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
                         let mut state = state.write().await;
-                        // Issue #962: a close that completed took this pane's
-                        // identity with it, and if it was the last pane mapping
-                        // to it the title went too. Put back the record read
-                        // when the delegate arrived, under ITS cwd.
-                        if let Some(held) = recorded_title.as_ref() {
-                            state.record_orchestration_title(
-                                &identity,
-                                held.display_title.as_deref(),
-                                &held.cwd,
+                        // PRD #1589 (auditor S1): not for a re-created agent a
+                        // close already took down — it unregistered the pane
+                        // after removing the record this reads.
+                        if registry.generation_registered(&new_agent_id) {
+                            // Issue #962: a close that completed took this pane's
+                            // identity with it, and if it was the last pane mapping
+                            // to it the title went too. Put back the record read
+                            // when the delegate arrived, under ITS cwd.
+                            if let Some(held) = recorded_title.as_ref() {
+                                state.record_orchestration_title(
+                                    &identity,
+                                    held.display_title.as_deref(),
+                                    &held.cwd,
+                                );
+                            }
+                            state.register_orchestration_role(
+                                &pane_id,
+                                &target_role,
+                                false,
+                                identity,
+                                cwd.as_deref(),
                             );
+                            state.announce_unproven_evictions(&event_tx);
                         }
-                        state.register_orchestration_role(
-                            &pane_id,
-                            &target_role,
-                            false,
-                            identity,
-                            cwd.as_deref(),
-                        );
-                        state.announce_unproven_evictions(&event_tx);
                     }
                 }
                 // Issue #962: the replacement holds the title from here on (a
@@ -14949,8 +14989,17 @@ pub async fn handle_restart_role_with_state(
                 let cwd = resolved.cwd.clone();
                 let title = resolved.title.clone();
                 let event_tx = event_tx.clone();
+                let registry = registry.clone();
+                let new_agent_id = new_agent_id.clone();
                 tokio::spawn(async move {
                     let mut state = state.write().await;
+                    // PRD #1589 (auditor S1): a close that took the re-created
+                    // agent down before this detached task got the guard has
+                    // already unregistered the pane; registering it again would
+                    // resurrect the role for a closed pane.
+                    if !registry.generation_registered(&new_agent_id) {
+                        return;
+                    }
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
                     // makes — a close that took the last pane mapping to this
                     // identity pruned its title too (Qodo, PR #1336).
@@ -15189,8 +15238,25 @@ pub async fn handle_spawn_role_with_state(
     // spawn of the same role won the race in the window between the
     // read-guard check above and here, close the just-spawned agent rather
     // than registering a second live pane for the role.
+    registry.before_role_registration().await;
     {
         let mut state_guard = state.write().await;
+        // PRD #1589 (auditor S1): a `close` of this instance that took the
+        // just-published generation down while this handler waited for the
+        // guard removed its record first, and unregisters the pane under this
+        // same guard after. Registering it now would re-create the role, and
+        // broadcasting it a card, for a pane already closed — so neither
+        // happens, and the spawn is reported as not having gone ahead.
+        if !registry.generation_registered(&agent_id) {
+            return SpawnRoleResponse {
+                spawned: false,
+                error: Some(format!(
+                    "role `{}` was closed before its spawn finished registering",
+                    signal.role
+                )),
+                ..Default::default()
+            };
+        }
         let still_live =
             state_guard.delegate_targets(&signal.pane_id, std::slice::from_ref(&signal.role));
         if !still_live.is_empty() {
@@ -15223,32 +15289,34 @@ pub async fn handle_spawn_role_with_state(
             resolved.cwd.as_deref(),
         );
         state_guard.announce_unproven_evictions(event_tx);
-    }
 
-    // Best-effort, like `surface_spawned_orchestration`'s own
-    // `let _ = event_tx.send(...)` (`src/spawn.rs`): a live TUI merging
-    // this into an already-open orchestration tab is issue #868's job,
-    // not this one's — this just needs to emit the broadcast correctly.
-    let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
-        name: orchestration_name,
-        cwd: resolved.cwd.clone().unwrap_or_default(),
-        display_title: resolved.display_title.clone(),
-        // Carry the calling orchestration's own instance token so the TUI's
-        // tab-growth match (`TabManager::orchestration_tab_index_for`) can
-        // tell two same-name, same-cwd orchestration instances apart instead
-        // of merging this role into whichever tab happens to match the bare
-        // `(cwd, name)` tuple first.
-        orchestration_id,
-        roles: vec![OrchestrationSurfaceRole {
-            pane_id: pane_id.clone(),
-            role_index: resolved.role_index,
-            role_name: signal.role.clone(),
-            is_start_role: false,
-        }],
-        // Issue #1395: a spawned role is never the start role, which alone
-        // carries the context path.
-        context_path: None,
-    }));
+        // Best-effort, like `surface_spawned_orchestration`'s own
+        // `let _ = event_tx.send(...)` (`src/spawn.rs`): a live TUI merging
+        // this into an already-open orchestration tab is issue #868's job,
+        // not this one's — this just needs to emit the broadcast correctly.
+        // Under the guard (PRD #1589, auditor S1), so it precedes the removal
+        // broadcast of any close that unregisters this pane after it.
+        let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
+            name: orchestration_name,
+            cwd: resolved.cwd.clone().unwrap_or_default(),
+            display_title: resolved.display_title.clone(),
+            // Carry the calling orchestration's own instance token so the TUI's
+            // tab-growth match (`TabManager::orchestration_tab_index_for`) can
+            // tell two same-name, same-cwd orchestration instances apart instead
+            // of merging this role into whichever tab happens to match the bare
+            // `(cwd, name)` tuple first.
+            orchestration_id,
+            roles: vec![OrchestrationSurfaceRole {
+                pane_id: pane_id.clone(),
+                role_index: resolved.role_index,
+                role_name: signal.role.clone(),
+                is_start_role: false,
+            }],
+            // Issue #1395: a spawned role is never the start role, which alone
+            // carries the context path.
+            context_path: None,
+        }));
+    }
 
     SpawnRoleResponse {
         spawned: true,
@@ -26283,6 +26351,35 @@ while True:
 
     const CLI_PANE: &str = "cli-pane-454";
     const CLI_AGENT_ID: &str = "agent-454";
+
+    /// PRD #1589 × issue #1678: an agent whose turn is over reads `Idle` while
+    /// its background work still runs, and `pane_background_of` is what tells
+    /// the `close` verb's busy check about that work.
+    #[test]
+    fn pane_background_of_reports_the_work_an_idle_card_shows() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        state.apply_event(frame("session_start"));
+        state.apply_event(frame("idle"));
+        assert_eq!(state.pane_background_of(CLI_PANE), None, "nothing running");
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &[12345].into_iter().collect());
+        state.apply_event(frame("idle"));
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(SessionStatus::Idle));
+        let work = state
+            .pane_background_of(CLI_PANE)
+            .expect("the idle card's background work");
+        assert_eq!((work.commands, work.subagents), (1, 0));
+        assert_eq!(state.pane_background_of("another-pane"), None);
+    }
 
     /// Scenario: End two conversations on one managed pane, leaving commands and a subagent running in the second conversation's placeholder card. Ending that conversation, removing its pane's sessions, or applying a daemon pane-close must leave a restored same-agent card with no background work.
     #[spec("status/background/012")]

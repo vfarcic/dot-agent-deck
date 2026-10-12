@@ -19,6 +19,7 @@ import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
   AgentBlocked,
+  HookBinaryNotice,
   AuthoringKind,
   AgentSession,
   AgentTarget,
@@ -115,6 +116,8 @@ export interface DesktopSnapshotDto {
     upgradeOffer?: UpgradeOffer;
     /** Issue #1490 — why the deck is not connected and which control to offer; present when `status` is `"disconnected"`. */
     disconnectedReason?: DisconnectedReason;
+    /** Issue #1637 — the daemon's hook-binary notices; omitted by the crate when there are none. */
+    hookBinaryNotices?: HookBinaryNotice[];
   };
   agents: DesktopAgentDto[];
   /*
@@ -2559,6 +2562,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       listingOptions: dto.connection.listingOptions === true,
       ...(dto.connection.upgradeOffer === undefined ? {} : { upgradeOffer: dto.connection.upgradeOffer }),
       ...(dto.connection.disconnectedReason === undefined ? {} : { disconnectedReason: dto.connection.disconnectedReason }),
+      // Issue #1637: without this the live app never shows a notice, whatever
+      // the daemon reported — only the fixture, which skips this mapping, did.
+      ...(dto.connection.hookBinaryNotices?.length ? { hookBinaryNotices: dto.connection.hookBinaryNotices } : {}),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.
@@ -2586,7 +2592,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;

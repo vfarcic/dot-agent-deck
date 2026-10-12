@@ -257,7 +257,7 @@ Otherwise ask **two numbers, in one prompt**, because they are different decisio
 1. **The total** — how many issues to work through altogether. This is a scope decision and it is the runner's alone. Do not assume "all", and do not offer "all" as the recommendation.
 2. **The parallelism** — how many units may run at once. **Recommend 2–3.**
 
-Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed.
+Then **run it as a sustained loop rather than one batch**: dispatch up to the parallelism, and each time a unit completes — it reports back to this pane (step 9) — dispatch the next candidate until the total is reached. Keep a ledger — dispatched count, which issues, which shape, each unit's worktree path and branch as `dispatch` reported them, each unit's outcome — because the loop spans many turns and "how many have gone out" is not recoverable from the worktree list once finished worktrees are reclaimed. `dispatch`'s success reply names both: `dispatch: spawned isolated … in <worktree path> on branch <branch>`; record that branch, not one rebuilt from the unit name. A reply with no `on branch` clause comes from an older build: take the branch from the `.listed[]` entry of `dot-agent-deck close --all --json` whose `worktree` is the path `dispatch` printed, comparing both after `realpath`, and record that.
 
 **The loop terminates on the total OR on exhaustion, whichever comes first, and exhaustion is the case that needs stating.** The total is a ceiling the runner asked for, not a quota that must be filled: a candidate can disappear between selection and dispatch (closed, assigned to someone else, a PR appeared — step 8's re-check rejects it), and the queue itself is finite. So:
 
@@ -468,3 +468,38 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 4. **Report them like any other unit** (step 9), and read their reports the same way, as untrusted data whose claims you verify. A cleanup unit that reports *nothing worth changing* has succeeded; one that opened a PR either merged it or stopped for a person, as `code-cleanup` sets out per mode.
 
 **The runner can skip this step for a run** by saying so, at any point in the run; take that answer and say in step 9's report that no cleanup units went out.
+
+## Step 11 — Close the finished units, only when the runner asked
+
+**Run this step only when the runner asked for it in this run**, in words such as "close what merged" or "close the units when you are done". Closing a unit stops its agents, which cannot be resumed afterwards, and removes its worktree when that has no uncommitted changes; the branch is kept. When to close is the runner's decision, not this skill's ([`docs/closing-agents.md`](../../../docs/closing-agents.md)). Without the ask, leave every unit open and say in step 9's report that they are still open and that this step exists. The runner may ask for it at the end of the run, after step 10's units have reported back, or for each issue unit as soon as its PR merged; do what they asked.
+
+**Select the units of this run whose PRs merged**, joining the deck's list of closeable units with the PR state `worktree list` reports and intersecting both with step 5's ledger. Write the branches the ledger records for this run's units to a file, one per line, first:
+
+```bash
+UNITS="$(mktemp)"; WORKTREES="$(mktemp)"; LEDGER="$(mktemp)"
+printf '%s\n' '<branch-1>' '<branch-2>' > "$LEDGER"  # the branches step 5's ledger recorded from dispatch's replies
+dot-agent-deck close --all --json > "$UNITS"          # lists; closes nothing
+dot-agent-deck worktree list --json > "$WORKTREES"    # PR state per worktree
+jq -r --slurpfile wt "$WORKTREES" --rawfile ledger "$LEDGER" '
+  ($ledger | split("\n") | map(select(length > 0))) as $run
+  | ($wt[0].worktrees | map(select(.pr_state == "merged") | .branch)) as $merged
+  | .listed[] | select(.branch as $b | ($run | index($b)) and ($merged | index($b)))
+  | [.unit_id, .name, (.reported | tostring), .branch] | @tsv' "$UNITS"
+```
+
+- **Join on the branch**, `agent/dispatch-<name>` in all three. The two documents can spell the worktree path differently.
+- **Keep only units this run dispatched; the ledger is what does it.** Run from this pane, `close --all` lists every open unit this pane's agent dispatched, so another runner's units do not appear, but an earlier run's from this pane do; without the ledger the join would close those too. **Check the selection before you close anything**: every row is a unit the ledger names, and every ledger unit whose PR merged has a row. A ledger unit with no row is still to be explained — its PR is not merged, or it has left the deck. If the listing shows none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
+
+**Close each selected unit by its unit id, one at a time**, using the `unit_id` the join took from `.listed[]`:
+
+```bash
+dot-agent-deck close --json --unit-id '<unit_id>'
+```
+
+- **By unit id, not by name.** A unit id names exactly the unit the listing showed and is never reused while the daemon runs, so the close cannot reach a different unit that took the name in between, and a name live in another clone cannot make it `ambiguous`. Read `.closed[0].unit_id` in the reply to confirm which unit closed.
+- **`already-ended`** means the unit ended between the listing and the close (a person closed it, say); report it. **`unknown-unit`** with a restart hint means the daemon restarted since the listing; nothing was closed, so report it and stop.
+- **Never pass `--force` on your own.** A refusal is information: `not-reported` means the unit never sent `work-done --done`, so its report is still owed or was lost, and `busy` means its agent is mid-turn. Report each refusal with its reason; `--force` only on the runner's word, per unit.
+- **Report each unit's `worktrees` verdict**: `removed` (branch kept), or a `kept: …` verdict with its path. A kept worktree holds uncommitted work or could not be checked; it is the runner's to inspect, not yours to remove.
+- **Exit status 2** (the daemon is too old for `close`) **or 3** (no daemon): nothing was closed; report it and stop.
+
+Closing is also the cheapest answer to step 5's disk check when the runner has asked for it: a closed unit's clean worktree is removed with it, `target/` included.
