@@ -4910,6 +4910,14 @@ async fn run_hook_loop_with_idle_timeout(
                                 }
                                 _ => None,
                             };
+                            // PRD #1666 S6: a prompt that is the deck's own
+                            // message is acknowledged and labelled here, for the
+                            // agent the token attests, before anything reads it.
+                            crate::inbox_prompt::stamp_deck_message_prompt(
+                                &mut event,
+                                attested_agent.as_deref(),
+                                pty_registry.inbox(),
+                            );
                             // The `#[serde(other)]` catch-all on `EventType`
                             // (PRD #386, precedent PRD #201's `AgentType`
                             // retrofit) is a deliberate forward-compat win —

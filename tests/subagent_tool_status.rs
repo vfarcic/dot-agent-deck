@@ -58,6 +58,10 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", PANE)
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        // No token: run from inside a deck pane, an inherited one would make
+        // the SessionStart hook also send its inbox announce (PRD #1666) on
+        // the connection this reads as one event.
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

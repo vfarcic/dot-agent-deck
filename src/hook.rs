@@ -161,10 +161,20 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         }
     };
 
-    let event = match event {
+    let mut event = match event {
         Some(e) => e,
         None => return ExitCode::SUCCESS,
     };
+
+    // PRD #1666 S6: what Claude Code's own hooks do for the deck's inbox, in a
+    // deck pane only — every Claude session runs these global hooks.
+    let mut announce = None;
+    if matches!(agent, "claude-code" | "claude_code" | "claude")
+        && crate::inbox_prompt::in_deck_pane()
+        && let Some(stdout) = claude_inbox_hooks(&input, &mut event, &mut announce)
+    {
+        println!("{stdout}");
+    }
 
     // PRD #1497: the turn's final reply, for the daemon's reading
     // subscribers. Read from the raw payload, so a reply of a strange shape
@@ -187,8 +197,123 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    let _ = send_to_socket(&json);
+    // The announce goes FIRST on the same connection (design §6.5): the daemon
+    // reads one connection's lines in order, so it knows a native waiter is
+    // coming before the Idle this SessionStart reports could ring the doorbell.
+    let _ = match announce {
+        Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
+        None => send_to_socket(&json),
+    };
     ExitCode::SUCCESS
+}
+
+/// PRD #1666 S6: send `lines` on one connection, half-close it, and read
+/// whatever the daemon answers until it closes — the announce's `SignalAck` —
+/// so the connection never ends under a reply still being written. An older
+/// daemon that answers nothing closes at the half-close, so this waits on no
+/// reply; the whole exchange is bounded by [`SIGNAL_ACK_TIMEOUT`].
+fn send_lines_and_drain(lines: &str) -> Option<()> {
+    let mut stream =
+        crate::platform::ipc::IpcClient::connect_timeout(&client_socket_path(), SIGNAL_ACK_TIMEOUT)
+            .ok()?;
+    let _ = stream.set_timeouts(SIGNAL_ACK_TIMEOUT);
+    stream.write_all(format!("{lines}\n").as_bytes()).ok()?;
+    stream.flush().ok()?;
+    stream.shutdown_write().ok()?;
+    let deadline = std::time::Instant::now() + SIGNAL_ACK_TIMEOUT;
+    let mut buf = [0u8; 1024];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    Some(())
+}
+
+/// PRD #1666 S6: Claude Code's side of the inbox, for one hook payload in a
+/// deck pane. Returns what the hook prints on stdout, if anything.
+///
+/// - `SessionStart` prints the session framing as `additionalContext` (a
+///   static text, so no daemon round trip) and queues an `inbox_announce`
+///   `Native` line for the caller to send ahead of the status event. Native
+///   wake-up is enabled by this announcement, never by the launch command.
+/// - `UserPromptSubmit` recognises the deck's own prompts
+///   ([`crate::inbox_prompt`]): a doorbell line is answered by fetching the
+///   waiting content and handing it to the model, and the event is marked so
+///   the daemon acknowledges what the prompt carried and labels the card.
+fn claude_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> Option<String> {
+    let payload: Value = serde_json::from_str(input).ok()?;
+    let hook_event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
+    match hook_event_name {
+        "SessionStart" => {
+            *announce = claude_native_announce();
+            Some(crate::inbox_prompt::hook_output(
+                "SessionStart",
+                crate::inbox_hub::SESSION_FRAMING,
+            ))
+        }
+        "UserPromptSubmit" => {
+            let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            deck_prompt_submit(
+                prompt,
+                crate::event::InboxComponent::ClaudeHooks.inline_budget(),
+                event,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
+/// every agent whose hook accepts `hookSpecificOutput.additionalContext`
+/// shares it (Claude Code now, Codex in S7), each with its own `budget`. An
+/// ordinary prompt costs a local scan and no daemon call.
+pub fn deck_prompt_submit(prompt: &str, budget: usize, event: &mut AgentEvent) -> Option<String> {
+    let ids = crate::inbox_prompt::scan(prompt);
+    if ids.is_empty() {
+        return None;
+    }
+    let injection = if ids.rung.is_empty() {
+        None
+    } else {
+        crate::inbox_prompt::doorbell_injection(budget)
+    };
+    let fetched = injection
+        .as_ref()
+        .map(|injection| injection.fetched.clone())
+        .unwrap_or_default();
+    crate::inbox_prompt::mark_event(event, &ids, &fetched);
+    injection
+        .map(|injection| crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context))
+}
+
+/// The `inbox_announce` line Claude Code's `SessionStart` hook sends, or `None`
+/// without the pane's token (the daemon would refuse it).
+fn claude_native_announce() -> Option<String> {
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())?;
+    let token = crate::hook_provenance::token_from_env()?;
+    let request = crate::event::DaemonMessage::InboxAnnounce(crate::event::InboxAnnounceRequest {
+        pane_id,
+        agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID)
+            .ok()
+            .filter(|agent| !agent.is_empty()),
+        token: Some(token),
+        component: crate::event::InboxComponent::ClaudeHooks,
+        component_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        wake: crate::event::InboxWake::Native,
+        #[cfg(unix)]
+        pid: Some(std::os::unix::process::parent_id()),
+        #[cfg(not(unix))]
+        pid: None,
+    });
+    serde_json::to_string(&request).ok()
 }
 
 /// PRD #1497: `line` with `reply` added under

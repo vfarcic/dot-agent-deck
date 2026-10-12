@@ -137,7 +137,53 @@ pub fn wait(agent: &str, stream: bool) -> ExitCode {
     }
 }
 
+/// How often a Once waiter checks that the agent that ran it is still there.
+#[cfg(unix)]
+const ORPHAN_POLL: Duration = Duration::from_secs(1);
+
+/// PRD #1666 S6 (design §6.5): a Once waiter exits when the agent that ran it
+/// is gone. Its stdin is the hook JSON, closed as soon as it is read, so EOF
+/// cannot say so; an orphaned waiter would otherwise keep the dead generation
+/// "armed" and hold off the doorbell. The waiter watches its parent and, on
+/// Linux, its parent's parent — Claude Code runs a hook through `sh -c`, which
+/// may or may not `exec` it — and exits 0, unwoken, when either changes.
+#[cfg(unix)]
+fn exit_when_orphaned() {
+    let ancestry = || {
+        let parent = std::os::unix::process::parent_id();
+        (parent, parent_of(parent))
+    };
+    let started = ancestry();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(ORPHAN_POLL);
+            if ancestry() != started {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn exit_when_orphaned() {}
+
+/// The parent of process `pid`, from `/proc/<pid>/stat`; `None` once it is
+/// gone or where there is no `/proc`.
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid …`; `comm` may itself hold spaces or parentheses.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 fn wait_once(json: &str) -> ExitCode {
+    exit_when_orphaned();
     let path = crate::endpoint_resolve::client_socket_path();
     let Ok(mut socket) = crate::platform::ipc::IpcClient::connect(&path) else {
         return ExitCode::SUCCESS;

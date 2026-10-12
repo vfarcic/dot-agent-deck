@@ -53,6 +53,67 @@ pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 pub(crate) const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
 
+/// PRD #1666 S6: the first Claude Code release the deck writes its native
+/// inbox waiter for — an `asyncRewake` command handler on `SessionStart` and
+/// `Stop` ([`WAITER_COMMAND_SUFFIX`]).
+///
+/// **This is the release the behaviour was MEASURED on, not a known minimum.**
+/// The PRD #1666 spike (2026-10-10, Haiku) and the S6 live check ran 2.1.296: a
+/// waiter that exits 2 wakes an idle session, a `timeout` of 86,400 s keeps an
+/// idle waiter alive past the 600 s default, and pre-`/clear` waiters still
+/// deliver. Earlier releases (2.1.294 and 2.1.295 sit beside it on the dev box)
+/// carry the `asyncRewake` key in their binaries, but no run checked how they
+/// treat it, and the `StopFailure` precedent above shows an unknown hook key
+/// can switch off every deck hook. So an older or unknown version gets no
+/// waiter, and the doorbell delivers to it instead. Lower this only with a
+/// measurement.
+pub const CLAUDE_ASYNC_REWAKE_MIN: (u64, u64, u64) = (2, 1, 296);
+
+/// PRD #1666 S6: the deck's second Claude handler kind, the native inbox
+/// waiter, identified by this suffix the way the status handler is identified
+/// by [`HOOK_COMMAND_SUFFIX`].
+const WAITER_COMMAND_SUFFIX: &str = "inbox wait --agent claude-code";
+
+/// The hook types that carry a waiter beside their status handler.
+const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop"];
+
+/// The waiter's hook `timeout`, in seconds: one day. Claude Code's 600 s
+/// default kills an idle waiter silently (spike §e); 86,400 s was observed
+/// alive past it and is far below 2^31 ms.
+pub const WAITER_TIMEOUT_SECS: u64 = 86_400;
+
+/// Which version-gated Claude Code hook entries an install writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClaudeGates {
+    /// The `StopFailure` key (issue #714, [`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
+    pub stop_failure: bool,
+    /// The native inbox waiter (PRD #1666, [`CLAUDE_ASYNC_REWAKE_MIN`]).
+    pub async_rewake: bool,
+}
+
+impl ClaudeGates {
+    /// The gates a Claude Code reporting `output` for `--version` passes; an
+    /// unknown version passes none.
+    pub fn from_version(output: Option<&str>) -> Self {
+        Self {
+            stop_failure: output.is_some_and(claude_version_accepts_stop_failure),
+            async_rewake: output.is_some_and(claude_version_accepts_async_rewake),
+        }
+    }
+}
+
+/// Whether a Claude Code reporting `output` for `--version` gets the native
+/// inbox waiter ([`CLAUDE_ASYNC_REWAKE_MIN`]).
+pub fn claude_version_accepts_async_rewake(output: &str) -> bool {
+    parse_claude_version(output).is_some_and(|v| v >= CLAUDE_ASYNC_REWAKE_MIN)
+}
+
+/// [`installed_claude_accepts_stop_failure`]'s probe, answered as every gate.
+pub fn installed_claude_gates() -> (ClaudeGates, Option<String>) {
+    let (_, line) = installed_claude_accepts_stop_failure();
+    (ClaudeGates::from_version(line.as_deref()), line)
+}
+
 /// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
 /// output (`2.1.283 (Claude Code)`). `None` for anything else.
 pub fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
@@ -610,24 +671,70 @@ fn hook_command(binary_path: &str) -> String {
 
 /// Build a rule object in the new hooks format:
 /// `{ "hooks": [{"type": "command", "command": "..."}] }`
-/// For Notification, adds a matcher for permission_prompt.
-fn make_rule(binary_path: &str, hook_type: &str) -> Value {
+/// For Notification, adds a matcher for permission_prompt. With `waiter`, the
+/// native inbox waiter follows the status handler in the same rule.
+fn make_rule(binary_path: &str, hook_type: &str, waiter: bool) -> Value {
     let command = hook_command(binary_path);
-    let command_obj = json!({
+    let mut handlers = vec![json!({
         "type": "command",
         "command": command
-    });
+    })];
+    if waiter {
+        handlers.push(waiter_handler(&waiter_command_for(&command)));
+    }
 
     if hook_type == "Notification" {
         json!({
             "matcher": "permission_prompt",
-            "hooks": [command_obj]
+            "hooks": handlers
         })
     } else {
         json!({
-            "hooks": [command_obj]
+            "hooks": handlers
         })
     }
+}
+
+/// PRD #1666 S6: the waiter command naming the same executable, override
+/// wrapper included, as the status command `status_command`.
+fn waiter_command_for(status_command: &str) -> String {
+    let word = status_command
+        .strip_suffix(HOOK_COMMAND_SUFFIX)
+        .unwrap_or(status_command);
+    format!("{word}{WAITER_COMMAND_SUFFIX}")
+}
+
+/// PRD #1666 S6: the native waiter's handler object. `asyncRewake` makes an
+/// exit 2 wake the session; the day-long `timeout` keeps an idle waiter alive
+/// ([`WAITER_TIMEOUT_SECS`]).
+fn waiter_handler(command: &str) -> Value {
+    json!({
+        "type": "command",
+        "command": command,
+        "asyncRewake": true,
+        "timeout": WAITER_TIMEOUT_SECS
+    })
+}
+
+/// PRD #1666 S6: the executable of a deck waiter command, still quoted as
+/// written; `None` for anything that is not one.
+fn waiter_format_executable(command: &str) -> Option<&str> {
+    crate::agent_hook_config::command_executable(command, WAITER_COMMAND_SUFFIX)
+}
+
+/// Whether `command` is a deck waiter, of any install.
+fn waiter_is_ours(command: &str) -> bool {
+    waiter_format_executable(command).is_some()
+}
+
+/// Whether an install by `binary_path` owns the waiter `command`, by the same
+/// rule [`command_is_deck_install`] applies to the status handler.
+fn waiter_is_deck_install(command: &str, binary_path: &str) -> bool {
+    waiter_format_executable(command).is_some_and(|exe| {
+        let exe = unquote_if_needed(exe);
+        executables_match(&exe, binary_path)
+            || crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path)
+    })
 }
 
 /// Single-quote `path` for a POSIX shell only when it contains a character
@@ -736,15 +843,32 @@ struct InstallOutcome {
     named: String,
 }
 
+#[cfg(test)]
 fn install_impl(
     settings: &mut Value,
     binary_path: &str,
     with_stop_failure: bool,
 ) -> InstallOutcome {
+    install_impl_gated(
+        settings,
+        binary_path,
+        ClaudeGates {
+            stop_failure: with_stop_failure,
+            async_rewake: false,
+        },
+    )
+}
+
+/// [`install_impl`] with every version gate spelled out.
+fn install_impl_gated(
+    settings: &mut Value,
+    binary_path: &str,
+    gates: ClaudeGates,
+) -> InstallOutcome {
     install_impl_in(
         settings,
         binary_path,
-        with_stop_failure,
+        gates,
         crate::agent_hook_config::InstallMode::Explicit,
     )
 }
@@ -757,12 +881,15 @@ fn install_impl(
 fn install_impl_in(
     settings: &mut Value,
     binary_path: &str,
-    with_stop_failure: bool,
+    gates: ClaudeGates,
     mode: crate::agent_hook_config::InstallMode,
 ) -> InstallOutcome {
     use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
 
-    let hook_types = hook_types(with_stop_failure);
+    let hook_types = hook_types(gates.stop_failure);
+    let deck_owned = |cmd: &str| {
+        command_is_deck_install(cmd, binary_path) || waiter_is_deck_install(cmd, binary_path)
+    };
     let hooks_obj = ensure_hooks_object(settings);
 
     // Clean up deck entries for hook types no longer installed. These are
@@ -816,23 +943,28 @@ fn install_impl_in(
     for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
         let before = rules.clone();
+        let waiter_here = gates.async_rewake && WAITER_HOOK_TYPES.contains(&hook_type);
         let deck_commands_before = rule_command_strs(rules)
             .into_iter()
-            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .filter(|cmd| deck_owned(cmd))
             .count();
 
         let kept_here = match mode {
             InstallMode::Explicit => None,
             InstallMode::Automatic => kept(rules),
         };
-        let mut expected = make_rule(binary_path, hook_type);
+        let mut expected = make_rule(binary_path, hook_type, waiter_here);
         let own_command = expected["hooks"][0]["command"]
             .as_str()
             .expect("make_rule writes a command")
             .to_string();
         let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), &own_command)
             .to_string();
+        let waiter_command = waiter_command_for(&command);
         expected["hooks"][0]["command"] = Value::String(command.clone());
+        if waiter_here {
+            expected["hooks"][1]["command"] = Value::String(waiter_command.clone());
+        }
         // Another install's rule keeps its `matcher` and its place (PRD #1487);
         // only its command is rebuilt, around the same executable (PRD #1497).
         let keeps_other = matches!(kept_here, Some(KeptDeckEntry::Other { .. }));
@@ -848,15 +980,23 @@ fn install_impl_in(
             command_is_deck_install(cmd, binary_path)
         }) {
             Some((rule_idx, _)) => {
-                // A rule holding only the deck's command is the deck's own:
-                // rewrite it whole so its `matcher` is the current one (the
+                // A rule holding only the deck's commands — its status handler
+                // and, since PRD #1666, its waiter — is the deck's own: rewrite
+                // it whole so its `matcher` is the current one (the
                 // `Notification` rule carries one). A rule the user shares is
-                // left alone apart from the command.
+                // left alone apart from the commands.
                 let deck_only = !keeps_other
                     && rules[rule_idx]
                         .get("hooks")
                         .and_then(Value::as_array)
-                        .is_some_and(|handlers| handlers.len() == 1)
+                        .is_some_and(|handlers| {
+                            handlers.iter().all(|handler| {
+                                handler
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(deck_owned)
+                            })
+                        })
                     && rules[rule_idx].get("command").is_none();
                 if deck_only {
                     rules[rule_idx] = expected;
@@ -864,13 +1004,60 @@ fn install_impl_in(
             }
             None => {
                 strip_deck_commands(rules, |cmd| command_is_deck_install(cmd, binary_path));
+                strip_deck_commands(rules, |cmd| waiter_is_deck_install(cmd, binary_path));
                 rules.push(expected);
             }
         }
 
+        // PRD #1666 S6: the second deck handler kind. Exactly one waiter where
+        // the gate allows it, consolidated the same way as the status handler;
+        // none anywhere else, of any install — a waiter left for a Claude Code
+        // that no longer passes the gate is the risk the gate exists for.
+        if waiter_here {
+            match crate::agent_hook_config::consolidate_deck_handlers_in_place(
+                rules,
+                &waiter_command,
+                |cmd| waiter_is_deck_install(cmd, binary_path),
+            ) {
+                Some((rule_idx, handler_idx)) => {
+                    if let Some(handler) = rules[rule_idx]
+                        .get_mut("hooks")
+                        .and_then(Value::as_array_mut)
+                        .and_then(|handlers| handlers.get_mut(handler_idx))
+                        .and_then(Value::as_object_mut)
+                    {
+                        handler.insert("asyncRewake".into(), Value::Bool(true));
+                        handler.insert("timeout".into(), json!(WAITER_TIMEOUT_SECS));
+                    }
+                }
+                None => {
+                    strip_deck_commands(rules, |cmd| waiter_is_deck_install(cmd, binary_path));
+                    let status_rule = rules.iter_mut().find(|rule| {
+                        rule.get("hooks")
+                            .and_then(Value::as_array)
+                            .is_some_and(|handlers| {
+                                handlers.iter().any(|handler| {
+                                    handler.get("command").and_then(Value::as_str)
+                                        == Some(command.as_str())
+                                })
+                            })
+                    });
+                    match status_rule
+                        .and_then(|rule| rule.get_mut("hooks"))
+                        .and_then(Value::as_array_mut)
+                    {
+                        Some(handlers) => handlers.push(waiter_handler(&waiter_command)),
+                        None => rules.push(json!({ "hooks": [waiter_handler(&waiter_command)] })),
+                    }
+                }
+            }
+        } else {
+            strip_deck_commands(rules, waiter_is_ours);
+        }
+
         let deck_commands_after = rule_command_strs(rules)
             .into_iter()
-            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .filter(|cmd| deck_owned(cmd))
             .count();
         repaired += deck_commands_before.saturating_sub(deck_commands_after);
         if *rules == before {
@@ -1016,7 +1203,9 @@ fn is_legacy_deck_rule(command: &str) -> bool {
 /// (any executable, by the suffix alone) or any LEGACY-format command whose
 /// executable is exactly [`DEFAULT_BINARY_NAME`].
 fn command_is_ours(command: &str) -> bool {
-    current_format_executable(command).is_some() || is_legacy_deck_rule(command)
+    current_format_executable(command).is_some()
+        || is_legacy_deck_rule(command)
+        || waiter_is_ours(command)
 }
 
 /// Whether `command` is a deck-owned hook command that should be treated as
@@ -1145,10 +1334,10 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
 pub fn auto_install() {
-    auto_install_to_gated(
+    auto_install_to_with_gates(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
-        || installed_claude_accepts_stop_failure().0,
+        || installed_claude_gates().0,
     );
 }
 
@@ -1186,6 +1375,20 @@ pub fn auto_install_to_gated(
     resolve: impl FnOnce() -> Result<String, String>,
     stop_failure: impl FnOnce() -> bool,
 ) {
+    auto_install_to_with_gates(path, resolve, || ClaudeGates {
+        stop_failure: stop_failure(),
+        async_rewake: false,
+    });
+}
+
+/// [`auto_install_to_gated`] with every version gate injected
+/// ([`installed_claude_gates`] in production). Asked at the same point, so a
+/// machine without Claude Code still never runs the probe.
+pub fn auto_install_to_with_gates(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+    gates: impl FnOnce() -> ClaudeGates,
+) {
     if path.parent().is_none_or(|p| !p.exists()) {
         return;
     }
@@ -1222,7 +1425,7 @@ pub fn auto_install_to_gated(
     let outcome = install_impl_in(
         &mut settings,
         &binary_path,
-        stop_failure(),
+        gates(),
         crate::agent_hook_config::InstallMode::Automatic,
     );
 
@@ -1288,7 +1491,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     // Before the settings are read, so a refusal leaves them as they were.
     crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path)
         .map_err(|e| e.to_string())?;
-    let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
+    let (gates, claude_version) = installed_claude_gates();
 
     let path = settings_path();
     let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
@@ -1297,7 +1500,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let before = settings.clone();
     let InstallOutcome {
         installed, skipped, ..
-    } = install_impl(&mut settings, &binary_path, stop_failure);
+    } = install_impl_gated(&mut settings, &binary_path, gates);
 
     // Equal settings are not rewritten (PRD #1487).
     if settings != before {
@@ -1310,7 +1513,18 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     if !skipped.is_empty() {
         println!("Already installed (skipped): {}", skipped.join(", "));
     }
-    if !stop_failure {
+    if !gates.async_rewake {
+        let (major, minor, patch) = CLAUDE_ASYNC_REWAKE_MIN;
+        println!(
+            "Note: dot-agent-deck's message waiter was not installed: `claude --version` \
+             reported {}, and it is installed only for Claude Code {major}.{minor}.{patch} or \
+             newer. Without it, deck messages reach a Claude Code agent through a one-line \
+             notice typed into its pane instead of waking it directly. Run this again after \
+             updating Claude Code.",
+            claude_version.as_deref().unwrap_or("nothing usable")
+        );
+    }
+    if !gates.stop_failure {
         let (major, minor, patch) = STOP_FAILURE_MIN_CLAUDE_VERSION;
         println!(
             "Note: the {STOP_FAILURE_HOOK} hook was not installed: `claude --version` reported \
@@ -1377,11 +1591,23 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
+    install_to_with_gates(
+        path,
+        binary_path,
+        ClaudeGates {
+            stop_failure,
+            async_rewake: false,
+        },
+    )
+}
+
+/// [`install_to`] with every version gate given.
+pub fn install_to_with_gates(path: &Path, binary_path: &str, gates: ClaudeGates) -> io::Result<()> {
     crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     let before = settings.clone();
-    install_impl(&mut settings, binary_path, stop_failure);
+    install_impl_gated(&mut settings, binary_path, gates);
     if settings == before {
         return Ok(());
     }

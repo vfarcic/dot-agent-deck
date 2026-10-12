@@ -70,6 +70,7 @@ pub mod hyperlink;
 pub mod inbox;
 pub mod inbox_cli;
 pub mod inbox_hub;
+pub mod inbox_prompt;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;

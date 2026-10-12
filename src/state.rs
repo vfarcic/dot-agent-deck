@@ -17044,7 +17044,11 @@ impl AppState {
             session.cwd.clone_from(&event.cwd);
         }
 
-        if let Some(ref prompt) = event.user_prompt {
+        // PRD #1666 S6: a deck message's label shows on the card through the
+        // event's own prompt, but it is not something the user typed.
+        if let Some(ref prompt) = event.user_prompt
+            && !crate::inbox_prompt::is_deck_message(&event)
+        {
             session.last_user_prompt = Some(prompt.clone());
             if session.first_prompts.len() < MAX_FIRST_PROMPTS {
                 session.first_prompts.push(prompt.clone());
