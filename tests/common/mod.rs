@@ -5677,7 +5677,8 @@ const OPENCODE_PROBE_ANSWER: &str = "4444";
 /// there without being slow to fail on a quiet box, which is what scaling it
 /// avoids.
 ///
-/// FINITE, which the sibling [`check_codex_available`] probe is not. An
+/// FINITE, as the sibling [`check_codex_available`] preflight has also been
+/// since PRD #1631 ([`CODEX_PREFLIGHT_BASE`]). An
 /// unbounded probe that wedges spends the test's entire nextest kill window
 /// (3 x 60 s by default here; some callers widen theirs in
 /// `.config/nextest.toml`), after which the process is SIGKILLed — producing
@@ -5962,10 +5963,66 @@ pub fn opencode_test_model() -> &'static str {
     })
 }
 
+/// Upper bound on [`check_codex_available`]'s two `codex` calls together — the
+/// `login status` check and the model probe — on a quiet box. They share one
+/// deadline of [`load_scaled`] of this, as [`OPENCODE_PROBE_BASE`] bounds the
+/// OpenCode probe, so a starved box waits up to [`MAX_LOAD_FACTOR`] times as
+/// long.
+///
+/// Unbounded until PRD #1631's lane-2 run, where `codex_hooks_001`'s isolated
+/// retry spent more than 120 s here (its deck was built only after the +120 s
+/// load sample) on a box with `io full` near 70%, ran its scenario green in
+/// about 40 s, and was SIGKILLed at nextest's 180 s with no skip, no failure
+/// message and no grid. A wedged `codex` now reports here instead, naming the
+/// call and the ceiling. Scaled to the maximum the ceiling is 360 s, which is
+/// why `codex_hooks_001`'s kill window in `.config/nextest.toml` sits above it.
+const CODEX_PREFLIGHT_BASE: Duration = Duration::from_secs(60);
+
+/// Run one preflight `codex` call to completion or to `deadline`, killing it
+/// there. Output goes to a FILE rather than pipes for the reason
+/// [`opencode_model_probe`] gives. Returns the exit status, or `None` when the
+/// deadline killed it, with stdout and stderr together.
+fn run_codex_preflight(
+    command: &mut std::process::Command,
+    deadline: Instant,
+) -> Result<(Option<std::process::ExitStatus>, String), String> {
+    let sink = harness_tempfile()
+        .map_err(|e| format!("could not create the Codex preflight output file: {e}"))?;
+    let open = || {
+        sink.as_file()
+            .try_clone()
+            .map_err(|e| format!("could not open the Codex preflight output file: {e}"))
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(open()?))
+        .stderr(std::process::Stdio::from(open()?))
+        .spawn()
+        .map_err(|e| format!("could not run the Codex preflight: {e}"))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not wait on the Codex preflight: {e}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok((
+        status,
+        std::fs::read_to_string(sink.path()).unwrap_or_default(),
+    ))
+}
+
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
 /// so expired credentials, 401 responses, and unreachable accounts skip cleanly
-/// before the PTY scenario starts.
+/// before the PTY scenario starts. Both `codex` calls share one load-scaled
+/// deadline ([`CODEX_PREFLIGHT_BASE`]).
 pub fn check_codex_available() -> Result<(), String> {
     install_credential_redaction();
     if !cli_invocable("codex") {
@@ -5982,23 +6039,30 @@ pub fn check_codex_available() -> Result<(), String> {
         );
     }
 
-    let login = std::process::Command::new("codex")
-        .args(["login", "status"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not check Codex login status: {e}"))?;
-    let login_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&login.stdout),
-        String::from_utf8_lossy(&login.stderr)
-    );
-    if !login.status.success() || login_text.to_ascii_lowercase().contains("not logged") {
+    let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
+    let deadline = Instant::now() + ceiling;
+    let timed_out = |call: &str| {
+        format!(
+            "Codex preflight `{call}` did not finish within {ceiling:?} (the shared ceiling \
+             for `codex login status` and the model probe, scaled with contention)"
+        )
+    };
+
+    let (login_status, login_text) = run_codex_preflight(
+        std::process::Command::new("codex").args(["login", "status"]),
+        deadline,
+    )?;
+    let Some(login_status) = login_status else {
+        return Err(timed_out("codex login status"));
+    };
+    if !login_status.success() || login_text.to_ascii_lowercase().contains("not logged") {
         return Err("Codex is not authenticated — log in with `codex login`".into());
     }
 
     let final_message =
         harness_tempfile().map_err(|e| format!("could not create Codex probe output file: {e}"))?;
-    let probe = std::process::Command::new("codex")
+    let mut probe = std::process::Command::new("codex");
+    probe
         .args([
             "exec",
             "--ephemeral",
@@ -6015,18 +6079,14 @@ pub fn check_codex_available() -> Result<(), String> {
         ])
         .arg("--output-last-message")
         .arg(final_message.path())
-        .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run Codex model probe: {e}"))?;
-    let probe_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
+        .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.");
+    let (probe_status, probe_text) = run_codex_preflight(&mut probe, deadline)?;
+    let Some(probe_status) = probe_status else {
+        return Err(timed_out("codex exec"));
+    };
     let lower = probe_text.to_ascii_lowercase();
     let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
-    if !probe.status.success()
+    if !probe_status.success()
         || !model_reply.contains("CODEX_AUTH_OK")
         || [
             "401",
