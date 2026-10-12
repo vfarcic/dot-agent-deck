@@ -7986,6 +7986,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** that any agent sends a question of more than sixteen options; the desktop's keyboard-only row (`question/desktop/*`).
 - **Platform coverage:** mac+linux.
 
+##### question/model/007 — A form with an option the deck cannot read is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Codex `request_user_input`, a Claude Code `AskUserQuestion` and an OpenCode `question.asked` built by the deck's own parsers).
+- **Asserts:** a form whose second question lists an option with no label between two labelled ones is shown with the channel `unsupported`, the option after it keeping index 3, offers no option, and refuses an answer picking option 1, 2 or 3, for all three agents; a reply forged past the daemon is not turned into Claude Code's decision or OpenCode's reply; `sanitized` makes a held question whose option indices have a gap keyboard-only.
+- **Does not assert:** that any agent sends an option without a label; the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/detect
 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.

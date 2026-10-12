@@ -488,10 +488,10 @@ impl PendingQuestion {
         // deck appends, so a cut here only ever comes from a producer that
         // did not.
         let shown_options = MAX_OPTIONS + MAX_APPENDED_OPTIONS;
-        let mut oversized = self.questions.len() > MAX_QUESTIONS;
+        let mut keyboard_only = self.questions.len() > MAX_QUESTIONS;
         let mut questions = Vec::new();
         for question in self.questions.into_iter().take(MAX_QUESTIONS) {
-            oversized |= question.options.len() > shown_options;
+            keyboard_only |= question.options.len() > shown_options;
             let options: Vec<QuestionOption> = question
                 .options
                 .into_iter()
@@ -514,6 +514,15 @@ impl PendingQuestion {
             if !options.iter().all(|o| o.index >= 1 && seen.insert(o.index)) {
                 return None;
             }
+            // An option numbered out of turn leaves a number the deck knows no
+            // option for — a producer left one out, as [`PayloadOptions`] does
+            // for an entry it could not read — so the whole form is
+            // keyboard-only (PR #1698 review), whether or not the producer
+            // already said so.
+            keyboard_only |= options
+                .iter()
+                .enumerate()
+                .any(|(i, o)| o.index != i as u32 + 1);
             questions.push(Question {
                 prompt: clean(&question.prompt, MAX_PROMPT_BYTES, true),
                 header: clean_opt(question.header, MAX_LABEL_BYTES),
@@ -535,7 +544,7 @@ impl PendingQuestion {
             questions,
             raised_at_ms: self.raised_at_ms,
             tool,
-            channel: if oversized {
+            channel: if keyboard_only {
                 AnswerChannel::Unsupported
             } else {
                 self.channel
@@ -728,36 +737,65 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+/// The options a payload lists for one question.
+struct PayloadOptions {
+    /// Every entry the deck could read, numbered by its place in the list
+    /// from 1 — so an entry it could not read leaves a gap rather than moving
+    /// the number of every option after it.
+    options: Vec<QuestionOption>,
+    /// How many entries the payload lists, read or not.
+    listed: usize,
+}
+
+impl PayloadOptions {
+    /// Whether every entry was read. A question with one the deck could not
+    /// read makes its whole form keyboard-only (PR #1698 review): the agent
+    /// draws an option the deck does not know, so an answer could name the
+    /// wrong one — Codex's digit, or the label a reply maps an index to.
+    fn all_read(&self) -> bool {
+        self.options.len() == self.listed
+    }
+
+    /// The labels by index from 1, or `None` when an entry was not read.
+    fn labels(self) -> Option<Vec<String>> {
+        self.all_read()
+            .then(|| self.options.into_iter().map(|o| o.label).collect())
+    }
+}
+
 /// The options a payload lists for one question: `options[] = {label,
-/// description}`, numbered from 1.
-fn payload_options(question: &Value) -> Vec<QuestionOption> {
-    question
+/// description}`. An entry that is neither a string nor carries a string
+/// `label` is not read ([`PayloadOptions::all_read`]).
+fn payload_options(question: &Value) -> PayloadOptions {
+    let listed = question
         .get("options")
         .and_then(Value::as_array)
-        .map(|options| {
-            options
-                .iter()
-                .filter_map(|option| {
-                    // OpenCode, Claude and Codex all send objects; a bare
-                    // string is accepted too, for Pi-shaped lists.
-                    let label = option
-                        .as_str()
-                        .or_else(|| str_field(option, "label"))?
-                        .to_string();
-                    Some((label, str_field(option, "description").map(str::to_string)))
-                })
-                .enumerate()
-                .map(|(i, (label, description))| QuestionOption {
-                    index: i as u32 + 1,
-                    label,
-                    description,
-                    role: OptionRole::Choice,
-                    keyboard_only: false,
-                    scope: None,
-                })
-                .collect()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let options = listed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, option)| {
+            // OpenCode, Claude and Codex all send objects; a bare string is
+            // accepted too, for Pi-shaped lists.
+            let label = option
+                .as_str()
+                .or_else(|| str_field(option, "label"))?
+                .to_string();
+            Some(QuestionOption {
+                index: i as u32 + 1,
+                label,
+                description: str_field(option, "description").map(str::to_string),
+                role: OptionRole::Choice,
+                keyboard_only: false,
+                scope: None,
+            })
         })
-        .unwrap_or_default()
+        .collect();
+    PayloadOptions {
+        options,
+        listed: listed.len(),
+    }
 }
 
 fn agent_tables(agent: &AgentType) -> Option<&'static QuestionTables> {
@@ -977,7 +1015,8 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
 /// - `AskUserQuestion` → a [`QuestionKind::Choice`] form, one question per
 ///   `tool_input.questions[]`, the payload's options followed by the options
 ///   Claude Code appends on screen; held, and keyboard-only when a question
-///   has more than [`MAX_OPTIONS`] of its own ([`own_options_fit`]).
+///   has more than [`MAX_OPTIONS`] of its own ([`own_options_fit`]) or one
+///   the deck cannot read ([`PayloadOptions::all_read`]).
 /// - `ExitPlanMode` → [`QuestionKind::Plan`], options from the table; answered
 ///   by keys, NOT held — a hook decision does not dismiss the plan dialog
 ///   [observed on 2.1.289].
@@ -1001,7 +1040,7 @@ pub fn claude_permission_request(
     let no_fill = |s: &str| s.to_string();
     match tool_name {
         "AskUserQuestion" => {
-            let mut too_many = false;
+            let mut keyboard_only = false;
             let questions = tool_input
                 .and_then(|input| input.get("questions"))
                 .and_then(Value::as_array)
@@ -1009,9 +1048,11 @@ pub fn claude_permission_request(
                     questions
                         .iter()
                         .map(|question| {
-                            let mut options = payload_options(question);
-                            too_many |= !own_options_fit(options.len());
-                            let next = options.len() as u32 + 1;
+                            let payload = payload_options(question);
+                            keyboard_only |=
+                                !own_options_fit(payload.listed) || !payload.all_read();
+                            let next = payload.listed as u32 + 1;
+                            let mut options = payload.options;
                             options.extend(table_options(
                                 tables,
                                 MenuKind::ChoiceAppended,
@@ -1046,7 +1087,7 @@ pub fn claude_permission_request(
                         detail: None,
                         use_id: None,
                     }),
-                    channel: if too_many {
+                    channel: if keyboard_only {
                         AnswerChannel::Unsupported
                     } else {
                         AnswerChannel::Held
@@ -1180,10 +1221,7 @@ pub fn claude_decision(
             for answer in answers {
                 let payload_question = payload_questions.get(answer.question_index as usize)?;
                 let key = str_field(payload_question, "question")?.to_string();
-                let payload_labels: Vec<String> = payload_options(payload_question)
-                    .into_iter()
-                    .map(|o| o.label)
-                    .collect();
+                let payload_labels = payload_options(payload_question).labels()?;
                 let value = if let Some(text) = &answer.text {
                     Value::String(text.clone())
                 } else {
@@ -1298,7 +1336,9 @@ pub fn codex_prefix_scope(command: &str) -> Option<String> {
 /// the whole form keyboard-only (PR #1698 review): Codex takes an option by
 /// digit only for `1`-`9`, and past that only by moving its highlight, which
 /// the deck cannot see. Offering the first nine alone would let a user who
-/// heard a partial list ask for an option that was never offered.
+/// heard a partial list ask for an option that was never offered. So does a
+/// question with an option the deck cannot read ([`PayloadOptions::all_read`]):
+/// Codex draws an option there that the deck does not know.
 pub fn codex_request_user_input(
     tool_use_id: Option<&str>,
     tool_input: Option<&Value>,
@@ -1306,17 +1346,18 @@ pub fn codex_request_user_input(
     version: Option<(u64, u64, u64)>,
 ) -> Option<PendingQuestion> {
     let tables = agent_tables(&AgentType::Codex);
-    let mut beyond_digits = false;
+    let mut keyboard_only = false;
     let questions = tool_input?
         .get("questions")?
         .as_array()?
         .iter()
         .map(|question| {
-            let mut options = payload_options(question);
+            let payload = payload_options(question);
             // Past nine options of its own the form is keyboard-only, which
             // also covers past MAX_OPTIONS ([`own_options_fit`]).
-            beyond_digits |= options.len() > CODEX_DIGIT_OPTIONS as usize;
-            let next = options.len() as u32 + 1;
+            keyboard_only |= payload.listed > CODEX_DIGIT_OPTIONS as usize || !payload.all_read();
+            let next = payload.listed as u32 + 1;
+            let mut options = payload.options;
             options.extend(table_options(
                 tables,
                 MenuKind::ChoiceAppended,
@@ -1347,7 +1388,7 @@ pub fn codex_request_user_input(
             detail: None,
             use_id: tool_use_id.map(str::to_string),
         }),
-        channel: if beyond_digits {
+        channel: if keyboard_only {
             AnswerChannel::Unsupported
         } else {
             channel_for(tables, version, AnswerChannel::Keys)
@@ -1490,21 +1531,23 @@ pub fn opencode_always_scope(props: &Value) -> Option<String> {
 /// PRD #1631: OpenCode's `question.asked` properties → a held
 /// [`QuestionKind::Choice`] form. Each question gets OpenCode's own
 /// "Type your own answer" option unless it says `custom: false`. A question
-/// with more than [`MAX_OPTIONS`] of its own makes the form keyboard-only
+/// with more than [`MAX_OPTIONS`] of its own, or one the deck cannot read
+/// ([`PayloadOptions::all_read`]), makes the form keyboard-only
 /// ([`own_options_fit`]).
 pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
     let id = str_field(props, "id")?.to_string();
     let tables = agent_tables(&AgentType::OpenCode);
-    let mut too_many = false;
+    let mut keyboard_only = false;
     let questions = props
         .get("questions")?
         .as_array()?
         .iter()
         .map(|question| {
-            let mut options = payload_options(question);
-            too_many |= !own_options_fit(options.len());
+            let payload = payload_options(question);
+            keyboard_only |= !own_options_fit(payload.listed) || !payload.all_read();
+            let next = payload.listed as u32 + 1;
+            let mut options = payload.options;
             if question.get("custom").and_then(Value::as_bool) != Some(false) {
-                let next = options.len() as u32 + 1;
                 options.extend(table_options(
                     tables,
                     MenuKind::ChoiceAppended,
@@ -1531,7 +1574,7 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
         questions,
         raised_at_ms,
         tool: None,
-        channel: if too_many {
+        channel: if keyboard_only {
             AnswerChannel::Unsupported
         } else {
             AnswerChannel::Held
@@ -1585,10 +1628,7 @@ pub fn opencode_reply(
                 let value = if let Some(text) = &answer.text {
                     vec![Value::String(text.clone())]
                 } else {
-                    let labels: Vec<String> = payload_options(payload_questions.get(index)?)
-                        .into_iter()
-                        .map(|o| o.label)
-                        .collect();
+                    let labels = payload_options(payload_questions.get(index)?).labels()?;
                     answer
                         .option_indices
                         .iter()
@@ -2720,6 +2760,125 @@ mod tests {
                 agent_tables(&agent).map_or(0, |t| t.menu(MenuKind::ChoiceAppended).len());
             assert!(appended <= MAX_APPENDED_OPTIONS, "{agent:?}: {appended}");
         }
+    }
+
+    /// Scenario: Codex, Claude Code and OpenCode each ask a form whose second
+    /// question has an option the deck cannot read — no label — between two
+    /// it can. Each whole form is keyboard-only: the options after the
+    /// unreadable one keep the number the agent draws beside them, nothing is
+    /// offered, every answer is refused, and a reply forged past the daemon is
+    /// never turned into the agent's answer.
+    #[spec("question/model/007")]
+    #[test]
+    fn question_model_007_a_form_with_an_option_the_deck_cannot_read_is_keyboard_only() {
+        let options = serde_json::json!([
+            {"label": "Alpha"},
+            {"description": "an option with no label"},
+            {"label": "Gamma"},
+        ]);
+        let codex_input = serde_json::json!({"questions": [
+            {"id": "first", "question": "First?", "options": [{"label": "Yes"}, {"label": "No"}]},
+            {"id": "second", "question": "Second?", "options": options},
+        ]});
+        let codex = codex_request_user_input(Some("call_unlabeled"), Some(&codex_input), 1, None)
+            .expect("a form")
+            .sanitized()
+            .expect("still shown");
+        let claude_input = serde_json::json!({"questions": [
+            {"question": "First?", "header": "First", "options": [{"label": "Yes"}, {"label": "No"}], "multiSelect": false},
+            {"question": "Second?", "header": "Second", "options": options, "multiSelect": false},
+        ]});
+        let claude = claude_permission_request(
+            "toolu_unlabeled".into(),
+            "AskUserQuestion",
+            Some(&claude_input),
+            None,
+            None,
+            1,
+            None,
+        )
+        .question
+        .sanitized()
+        .expect("still shown");
+        let opencode_props = serde_json::json!({"id": "que_unlabeled", "questions": [
+            {"question": "First?", "header": "First", "options": [{"label": "Yes"}, {"label": "No"}]},
+            {"question": "Second?", "header": "Second", "options": options},
+        ]});
+        let opencode = opencode_question_asked(&opencode_props, 1)
+            .expect("a form")
+            .sanitized()
+            .expect("still shown");
+
+        for (agent, form) in [
+            ("codex", &codex),
+            ("claude", &claude),
+            ("opencode", &opencode),
+        ] {
+            let gamma = form.questions[1]
+                .options
+                .iter()
+                .find(|o| o.label == "Gamma")
+                .expect("Gamma is shown");
+            assert_eq!(gamma.index, 3, "{agent}: Gamma keeps the agent's number");
+            assert_eq!(
+                form.channel,
+                AnswerChannel::Unsupported,
+                "{agent}: keyboard-only"
+            );
+            assert!(!form.has_answerable_option(), "{agent}: nothing is offered");
+            for second in [1, 3] {
+                assert!(
+                    form.validate(&[answer(0, &[1], None), answer(1, &[second], None)], false)
+                        .is_err(),
+                    "{agent}: option {second} is refused"
+                );
+            }
+            assert!(
+                form.validate(&[answer(0, &[1], None), answer(1, &[2], None)], false)
+                    .is_err(),
+                "{agent}: the unreadable option is refused"
+            );
+        }
+
+        let forged = |form: &PendingQuestion| {
+            QuestionReply::answered(
+                &form.id,
+                vec![
+                    ResolvedAnswer {
+                        question_index: 0,
+                        option_indices: vec![1],
+                        labels: vec!["Yes".into()],
+                        roles: vec![OptionRole::Choice],
+                        text: None,
+                    },
+                    ResolvedAnswer {
+                        question_index: 1,
+                        option_indices: vec![2],
+                        labels: vec!["Gamma".into()],
+                        roles: vec![OptionRole::Choice],
+                        text: None,
+                    },
+                ],
+            )
+        };
+        assert_eq!(
+            claude_decision(&claude, Some(&claude_input), None, &forged(&claude)),
+            None,
+            "claude: no answer is mapped onto a payload with an unreadable option"
+        );
+        assert_eq!(
+            opencode_reply(&opencode, &opencode_props, &forged(&opencode)),
+            None,
+            "opencode: no answer is mapped onto a payload with an unreadable option"
+        );
+
+        // Sanitizing is the backstop: options numbered with a gap, from a
+        // producer that dropped one without saying so, are keyboard-only.
+        let mut gap = permission(AnswerChannel::Held);
+        gap.questions[0].options[1].index = 4;
+        let gap = gap.sanitized().expect("still shown");
+        assert_eq!(gap.channel, AnswerChannel::Unsupported);
+        assert!(!gap.has_answerable_option());
     }
 
     /// Scenario: Every shape an answer can be wrong in is refused with the
