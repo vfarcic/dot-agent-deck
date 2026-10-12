@@ -3996,10 +3996,10 @@ async fn desktop_voice_answer_question(
     }
     // Audit A4: the registration the webview resolved the answer against must
     // still be the pending one, and the daemon is told which one it is.
-    if revision.is_some() && revision != question.revision {
-        return Ok(voice::question::stale_outcome());
-    }
-    let revision = question.revision;
+    let revision = match voice::question::check_revision(revision, question.revision) {
+        Ok(revision) => revision,
+        Err(stale) => return Ok(stale),
+    };
     let answers = voice::question::answers_of(&form);
     let leased = voice::lease::send_leased(&lease, |still_wanted| async {
         if !still_wanted() {
@@ -4008,7 +4008,7 @@ async fn desktop_voice_answer_question(
         let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
         let daemon = state.daemon.trusted(scope.endpoint()).await?;
         daemon.require_compatible()?;
-        let sent = daemon.client.answer_question_at_while(
+        let sent = daemon.client.answer_question_while(
             still_wanted,
             &agent_id,
             &question_id,

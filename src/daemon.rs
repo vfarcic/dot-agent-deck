@@ -2633,7 +2633,8 @@ where
 /// `delivery`. A producer that asked to acknowledge (`ack`, the OpenCode
 /// plugin's child) then writes one [`crate::question::ReplyAck`] line, read
 /// within `ack_wait`; any other producer acts on the line itself, so a written
-/// line is a delivered answer, as it always was.
+/// line is a delivered answer, as it always was. A line whose write or flush
+/// failed is unconfirmed for every producer.
 async fn write_held_reply<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -2657,10 +2658,12 @@ async fn write_held_reply<R, W>(
     let Some(delivery) = held.delivery else {
         return;
     };
-    let outcome = if !ack {
-        ReplyDelivery::Delivered
-    } else if !written {
+    // A line that could not be written may or may not have reached the
+    // producer, whether or not it acknowledges (PR #1698 review).
+    let outcome = if !written {
         ReplyDelivery::Unconfirmed
+    } else if !ack {
+        ReplyDelivery::Delivered
     } else {
         match tokio::time::timeout(
             ack_wait,
@@ -16055,6 +16058,55 @@ mod question_hold_tests {
         })
         .await;
         assert_eq!(deck.pending(&a).await, None);
+    }
+
+    /// Scenario: A held producer that does not acknowledge — Claude Code's
+    /// hook, Pi's extension — closes its connection just as the deck answers,
+    /// so writing the answer fails. The deck reports the answer unconfirmed,
+    /// never delivered; a write that succeeds is still reported delivered.
+    #[spec("question/hold/020")]
+    #[tokio::test]
+    async fn question_hold_020_an_answer_the_producer_never_received_is_not_reported_delivered() {
+        use crate::agent_pty::{HeldReply, ReplyDelivery};
+        let deliver = |closed: bool| async move {
+            let (ours, theirs) = tokio::io::duplex(64);
+            if closed {
+                drop(theirs);
+            } else {
+                // Kept open (and drained) so the write lands.
+                tokio::spawn(async move {
+                    let mut theirs = tokio::io::BufReader::new(theirs);
+                    let mut line = String::new();
+                    let _ = theirs.read_line(&mut line).await;
+                });
+            }
+            let (read_half, mut write_half) = tokio::io::split(ours);
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let held = HeldReply {
+                reply: QuestionReply::answered("q-noack", Vec::new()),
+                delivery: Some(tx),
+            };
+            write_held_reply(
+                &mut reader,
+                &mut write_half,
+                held,
+                false,
+                Duration::from_millis(100),
+            )
+            .await;
+            rx.await.expect("an outcome is always reported")
+        };
+        assert_eq!(
+            deliver(true).await,
+            ReplyDelivery::Unconfirmed,
+            "a reply that could not be written is not delivered"
+        );
+        assert_eq!(
+            deliver(false).await,
+            ReplyDelivery::Delivered,
+            "a written reply to a producer that does not acknowledge is delivered"
+        );
     }
 }
 

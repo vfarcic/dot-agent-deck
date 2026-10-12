@@ -941,6 +941,25 @@ async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
     assert_eq!(resolver.question_calls(), 0);
 }
 
+/// An answer is bound to the revision of the question it was worked out
+/// against (audit A4, PR #1698 review): that revision is what the daemon is
+/// sent, and an answer whose revision is not the pending one — including one
+/// that names none — is refused as stale rather than sent to whatever
+/// registration of the id is pending now.
+#[test]
+fn question_desktop_an_answer_is_bound_to_the_revision_it_was_resolved_against() {
+    assert_eq!(check_revision(Some(7), Some(7)), Ok(Some(7)));
+    for (resolved_against, pending) in [(Some(6), Some(7)), (None, Some(7)), (Some(7), None)] {
+        let refused = check_revision(resolved_against, pending)
+            .expect_err("an answer for another registration is not sent");
+        assert_eq!(
+            refused.code,
+            Some("stale"),
+            "{resolved_against:?} vs {pending:?}"
+        );
+    }
+}
+
 /// Every refusal the daemon can send has its own plain sentence and code, and
 /// a form for a question that has since changed is refused before sending.
 #[test]

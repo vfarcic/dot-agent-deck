@@ -95,7 +95,7 @@ pub fn answer(
         .block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(30),
-                client.answer_question_while(|| true, id, &q.id, answers, false),
+                client.answer_question_while(|| true, id, &q.id, q.revision, answers, false),
             )
             .await
         })

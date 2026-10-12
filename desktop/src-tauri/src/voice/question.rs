@@ -1105,6 +1105,22 @@ pub fn stale_outcome() -> AnswerOutcome {
     }
 }
 
+/// Audit A4 (PR #1698 review): the answer was resolved against the question's
+/// `resolved_against` revision, and is sent only while that is still the
+/// `pending` one — the revision the daemon is then told is that same one, never
+/// a freshly read one, so the daemon's own check sees any replacement too. An
+/// answer naming no revision is stale against a question that has one.
+pub fn check_revision(
+    resolved_against: Option<u64>,
+    pending: Option<u64>,
+) -> Result<Option<u64>, AnswerOutcome> {
+    if resolved_against == pending {
+        Ok(resolved_against)
+    } else {
+        Err(stale_outcome())
+    }
+}
+
 /// Check a whole form against the question as the snapshot has it now, the
 /// last step before it is sent: the same question, every selection still
 /// valid, every question answered, and the confirmation an always option needs.

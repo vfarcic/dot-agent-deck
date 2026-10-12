@@ -2672,7 +2672,11 @@ impl DaemonClient {
         Ok(FocusReport::Recorded)
     }
 
-    /// PRD #1631 — answer the question `agent_id` is waiting on.
+    /// PRD #1631 — answer the question `agent_id` is waiting on, naming the
+    /// `revision` of it the answer was worked out against, as the snapshot
+    /// carried it ([`crate::question::PendingQuestion::revision`], audit A4):
+    /// the daemon refuses the answer as stale unless that revision — `None`
+    /// included — is still the pending one.
     ///
     /// **Withholds unless the daemon advertises
     /// [`crate::daemon_protocol::CAP_ANSWER_QUESTION`]**, answering
@@ -2685,30 +2689,6 @@ impl DaemonClient {
     /// ([`AnswerReport::Refused`]), not an error; `Err` is a transport failure
     /// or an error the daemon did not classify.
     pub async fn answer_question_while(
-        &self,
-        still_wanted: impl Fn() -> bool,
-        agent_id: &str,
-        question_id: &str,
-        answers: Vec<crate::question::QuestionAnswer>,
-        confirmed_always: bool,
-    ) -> Result<AnswerReport, ClientError> {
-        self.answer_question_at_while(
-            still_wanted,
-            agent_id,
-            question_id,
-            None,
-            answers,
-            confirmed_always,
-        )
-        .await
-    }
-
-    /// [`Self::answer_question_while`], naming the question's `revision` as
-    /// the snapshot carried it ([`crate::question::PendingQuestion::revision`],
-    /// audit A4): the daemon refuses the answer as stale unless that revision
-    /// is still the pending one. `None` sends no revision, as an older client
-    /// does.
-    pub async fn answer_question_at_while(
         &self,
         still_wanted: impl Fn() -> bool,
         agent_id: &str,
@@ -7744,7 +7724,7 @@ start = true
                 });
                 let client = DaemonClient::new(path);
                 let report = client
-                    .answer_question_while(|| true, "1", "q-1", Vec::new(), false)
+                    .answer_question_while(|| true, "1", "q-1", None, Vec::new(), false)
                     .await
                     .expect("a withhold is not an error");
                 assert_eq!(report, AnswerReport::Withheld, "advertised {advertised:?}");
@@ -7758,14 +7738,14 @@ start = true
             let client = DaemonClient::new(path);
             assert_eq!(
                 client
-                    .answer_question_while(|| false, "1", "q-1", Vec::new(), false)
+                    .answer_question_while(|| false, "1", "q-1", None, Vec::new(), false)
                     .await
                     .unwrap(),
                 AnswerReport::Superseded
             );
             assert_eq!(
                 client
-                    .answer_question_while(|| true, "no-such-agent", "q-1", Vec::new(), false)
+                    .answer_question_while(|| true, "no-such-agent", "q-1", None, Vec::new(), false)
                     .await
                     .unwrap(),
                 AnswerReport::Refused(crate::question::AnswerRefusal::AgentNotFound)

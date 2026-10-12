@@ -2417,8 +2417,8 @@ pub enum AttachRequest {
     /// validates the whole answer against it
     /// ([`crate::question::PendingQuestion::validate`]), and answers through
     /// the agent's own channel: the held hook, plugin or extension decision, or
-    /// the keys the agent's option table names. A refusal says why on
-    /// [`AttachResponse::answer_refusal`].
+    /// the keys the agent's option table names. A refusal is answered
+    /// `ok: false` and says why on [`AttachResponse::answer_refusal`].
     ///
     /// **Withheld unless the daemon advertises [`CAP_ANSWER_QUESTION`]** —
     /// [`crate::daemon_client::DaemonClient::answer_question_while`] holds that
@@ -2438,15 +2438,16 @@ pub enum AttachRequest {
         /// otherwise explicitly rather than by omission.
         #[serde(default)]
         confirmed_always: bool,
-        /// PRD #1631 (audit A4): the question's revision as the client saw it
-        /// ([`crate::question::PendingQuestion::revision`] on the snapshot).
-        /// When given, the daemon refuses the answer as stale unless it is the
-        /// revision pending now, so a question replaced under the same id
-        /// between the client's read and the request is never answered with a
-        /// choice made for the old one. Additive optional: a client that omits
-        /// it gets the id check alone at the request, and the daemon still
-        /// binds its own delivery to the revision it validated against, within
-        /// the limits `answer_question_at`'s doc states for keys.
+        /// PRD #1631 (audit A4): the revision of the question the answer was
+        /// worked out against ([`crate::question::PendingQuestion::revision`]
+        /// on the snapshot). The daemon refuses the answer as stale unless it
+        /// is the revision pending now, so a question replaced under the same
+        /// id between the client's read and the request is never answered with
+        /// a choice made for the old one. A request that omits it is refused
+        /// the same way whenever the pending question has a revision (PR #1698
+        /// review); no released client sends this request, so none relied on
+        /// the id check alone. Optional on the wire only so that a pending
+        /// question the daemon stamped no revision on can still be named.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
     },
@@ -3595,7 +3596,11 @@ pub struct AttachResponse {
     pub instance_id: Option<String>,
     /// PRD #1631: why an [`AttachRequest::AnswerQuestion`] was refused, so a
     /// client never branches on `error` text. `None` on success and on every
-    /// other response. Additive + optional, and the request it answers is
+    /// other response. Unlike [`Self::close_agents`], an answer refusal is
+    /// answered `ok: false` with this field set: `ok: true` means the answer
+    /// was delivered, and that is what
+    /// [`crate::daemon_client::DaemonClient::answer_question_while`] reads
+    /// first. Additive + optional, and the request it answers is
     /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_refusal: Option<crate::question::AnswerRefusal>,
@@ -7607,8 +7612,9 @@ fn validate_task(task: &str) -> Result<(), String> {
 /// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
 const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
 
-/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler, for a request that
-/// names no revision — [`answer_question_at`] with `None`.
+/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler, for a client that
+/// read `agent_id`'s pending question just now — [`answer_question_at`] naming
+/// the revision pending at the call (`None` when nothing is pending).
 #[cfg(test)]
 pub(crate) async fn answer_question(
     registry: &Arc<AgentPtyRegistry>,
@@ -7619,13 +7625,23 @@ pub(crate) async fn answer_question(
     answers: &[crate::question::QuestionAnswer],
     confirmed_always: bool,
 ) -> Result<(), crate::question::AnswerRefusal> {
+    let pane_id = registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.id == agent_id)
+        .and_then(|r| r.pane_id_env);
+    let revision = state
+        .read()
+        .await
+        .pending_question_for(agent_id, pane_id.as_deref())
+        .and_then(|(_, question)| question.revision);
     answer_question_at(
         registry,
         state,
         event_tx,
         agent_id,
         question_id,
-        None,
+        revision,
         answers,
         confirmed_always,
     )
@@ -7729,9 +7745,10 @@ pub(crate) async fn answer_question_at(
             .unwrap_or(crate::event::AgentType::None);
         (session_id, agent_type, question)
     };
-    if question.id != question_id
-        || requested_revision.is_some_and(|wanted| Some(wanted) != question.revision)
-    {
+    // PR #1698 review: a request naming no revision is refused like one naming
+    // another — it cannot say which registration of a reused id it was worked
+    // out against. No released client sends `AnswerQuestion`.
+    if question.id != question_id || requested_revision != question.revision {
         return Err(AnswerRefusal::Stale {
             current_id: Some(question.id),
         });
@@ -14297,9 +14314,9 @@ mod question_answer_tests {
     /// registered again — a new hold for a held question, new content for one
     /// answered by keys. The answer is refused as stale and reaches nothing: the
     /// replacement stays pending and held, and its own answer later reaches it.
-    /// An answer naming a revision that is no longer pending is refused before
-    /// anything is checked, and a repeat of the pending question keeps its
-    /// revision.
+    /// An answer naming a revision that is no longer pending, or naming none,
+    /// is refused before anything is checked, and a repeat of the pending
+    /// question keeps its revision.
     #[spec("question/answer/010")]
     #[tokio::test]
     async fn question_answer_010_an_answer_is_bound_to_the_revision_it_was_checked_against() {
@@ -14336,6 +14353,24 @@ mod question_answer_tests {
             fx.pending_question().await.unwrap().revision,
             second_revision,
             "the replacement is still pending"
+        );
+        // A request naming no revision cannot say which registration it was
+        // worked out against, so it is refused too (PR #1698 review).
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "q-bash",
+                None,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
         );
         // A client that read the old revision is refused at the request.
         assert_eq!(

@@ -8406,6 +8406,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** that the plugin routes the child's ask through `await-answer` (`question/detect/007` and `opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent`), or the reply posted to OpenCode.
 - **Platform coverage:** mac+linux.
 
+##### question/hold/020 — An answer a non-acknowledging producer never received is not reported delivered.
+- **Layer:** L1/fast unit (`src/daemon.rs`, `write_held_reply` over an in-memory duplex).
+- **Agent:** none.
+- **Asserts:** for a producer that does not acknowledge (Claude Code's hook, Pi's child), a reply whose write fails because the producer closed its end is reported `Unconfirmed`, and a reply written to an open producer is reported `Delivered`.
+- **Does not assert:** the desktop's sentence for an unconfirmed answer (`question_desktop_every_refusal_has_its_sentence`).
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
