@@ -6794,7 +6794,7 @@ fn post_message(
              nothing was posted"
         ));
     }
-    let content = crate::inbox::Content {
+    let mut content = crate::inbox::Content {
         from: crate::inbox::Sender::Deck {
             reason: origin.reason().to_string(),
         },
@@ -6805,6 +6805,14 @@ fn post_message(
         id: None,
         preface: None,
     };
+    // PRD #1666 hardening H4: a body too long to hand over whole is saved to
+    // a file the block names, or the post is refused.
+    let dirs = crate::inbox_hub::spill_dirs(registry, pane_id, Some(live.as_str()));
+    if let Err(error) =
+        crate::inbox_hub::retain_full_body(&registry.inbox().deck(), pane_id, &mut content, &dirs)
+    {
+        return AttachResponse::err(format!("post-message: {error}"));
+    }
     match registry
         .inbox()
         .post_direct(crate::inbox::Recipient::bound(pane_id, live), content)

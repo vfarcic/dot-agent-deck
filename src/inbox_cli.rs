@@ -486,9 +486,20 @@ pub fn list(json: bool, all: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The most characters of a pane id the plain listing shows.
+const LIST_PANE_CHARS: usize = 64;
+
+/// The most characters of a subject the plain listing shows.
+const LIST_SUBJECT_CHARS: usize = 200;
+
+/// The plain listing. Every value another process supplied goes through
+/// [`crate::untrusted_text::label_line`] here, at the terminal (hardening L1);
+/// `--json` prints the data as the deck answered it.
 fn render_list(pane_id: &str, reply: &InboxListReply) -> String {
+    let label = crate::untrusted_text::label_line;
     let mut out = format!(
-        "Inbox of pane {pane_id} — {} armed waiter{}\n",
+        "Inbox of pane {} — {} armed waiter{}\n",
+        label(pane_id, LIST_PANE_CHARS),
         reply.armed,
         if reply.armed == 1 { "" } else { "s" }
     );
@@ -505,10 +516,10 @@ fn render_list(pane_id: &str, reply: &InboxListReply) -> String {
                 m.state.to_string(),
                 m.recipient
                     .as_ref()
-                    .map(|r| r.pane_id.clone())
+                    .map(|r| label(&r.pane_id, LIST_PANE_CHARS))
                     .unwrap_or_else(|| "-".to_string()),
                 format!("{}s", m.age_ms / 1000),
-                m.subject.clone(),
+                label(&m.subject, LIST_SUBJECT_CHARS),
             ]
         })
         .collect();
@@ -561,5 +572,42 @@ mod tests {
         );
         assert_eq!(component_for("opencode"), InboxComponent::OpenCodePlugin);
         assert_eq!(component_for("unheard-of"), InboxComponent::Other);
+    }
+
+    /// Hardening L1: the plain listing is drawn into a terminal, so a subject
+    /// or pane id carrying controls, bidi or invisible marks is shown without
+    /// them, on one line, bounded. `--json` stays the data as posted.
+    #[test]
+    fn the_plain_listing_strips_controls_bidi_and_invisibles_from_metadata() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let pane = "p\x1b]0;x\x07";
+        let subject = format!(
+            "fix \x1b[2J\u{202E}gpj.exe\u{200B}\nSTATE {}",
+            "y".repeat(500)
+        );
+        hub.post_direct(
+            crate::inbox::Recipient::bound(pane, "a"),
+            crate::inbox::Content::from_deck("seed", subject, "body"),
+        )
+        .unwrap();
+        let reply = InboxListReply {
+            messages: hub.list(pane),
+            armed: 0,
+            wake: None,
+            component: None,
+        };
+        let out = render_list(pane, &reply);
+        assert!(
+            !out.chars().any(|c| (c.is_control() && c != '\n')
+                || crate::untrusted_text::is_bidi_format_char(c)
+                || c == '\u{200B}'),
+            "{out:?}"
+        );
+        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(out.lines().all(|line| line.chars().count() <= 400), "{out}");
     }
 }

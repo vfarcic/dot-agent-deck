@@ -44,7 +44,7 @@ fn pending(daemon: &impl Endpoint, pane: &Pane, queued: u64, fetched: u64, wake:
 #[spec("inbox/status/003")]
 #[test]
 fn status_003_list_agents_reports_counts_and_armed_wake() {
-    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1")]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1")]);
     let worker = pane(&daemon, "status-worker");
     let control = pane(&daemon, "status-control");
     status(&daemon, &worker, "idle", "codex");
@@ -156,7 +156,7 @@ fn transition(socket: &mut UnixStream, pane: &Pane, id: &str, expected: &str) {
 #[spec("inbox/status/004")]
 #[test]
 fn status_004_attached_client_receives_each_inbox_state_change() {
-    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "60000")]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "60000")]);
     let worker = pane(&daemon, "broadcast-worker");
     let mut events = subscribe(&daemon);
     let mut stream = waiter(&daemon, &worker);
@@ -186,7 +186,7 @@ fn status_004_attached_client_receives_each_inbox_state_change() {
 #[spec("inbox/status/005")]
 #[test]
 fn status_005_hello_names_the_inbox_deck() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let worker = pane(&daemon, "hello-worker");
     let hello = || {
         attach(

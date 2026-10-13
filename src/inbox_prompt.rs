@@ -271,13 +271,10 @@ pub fn stamp_deck_message_prompt(
             .find(|summary| summary.id.as_str() == id)
             .map(|summary| summary.subject.clone())
     });
-    let subject: String = subject
-        .as_deref()
-        .unwrap_or(UNKNOWN_SUBJECT)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_SUBJECT_CHARS)
-        .collect();
+    let subject = crate::untrusted_text::label_line(
+        subject.as_deref().unwrap_or(UNKNOWN_SUBJECT),
+        MAX_SUBJECT_CHARS,
+    );
     event.user_prompt = Some(format!("✉ {subject}"));
     event
         .metadata
@@ -324,6 +321,59 @@ mod tests {
     #[test]
     fn a_malformed_id_is_ignored() {
         assert!(scan("[dot-agent-deck message m-k3x9q2ab-0f3c9a71d2e4b850 from x]").is_empty());
+    }
+
+    fn event_with(metadata: &[(&str, &str)], pane: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".into(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type: crate::event::EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: Some("raw".into()),
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            pane_id: Some(pane.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Hardening L1: the card label `✉ <subject>` carries no control, bidi or
+    /// invisible character from the subject.
+    #[test]
+    fn the_card_label_strips_bidi_and_invisibles_from_the_subject() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound("p", "a"),
+                crate::inbox::Content::from_deck(
+                    "seed",
+                    "task \u{202E}gpj.exe\u{200B}\u{2066}\x1b[2J",
+                    "body",
+                ),
+            )
+            .unwrap();
+        let mut event = event_with(&[(DECK_MESSAGE_IDS_METADATA_KEY, id.as_str())], "p");
+        stamp_deck_message_prompt(&mut event, Some("a"), &hub);
+        let label = event.user_prompt.unwrap();
+        assert!(label.starts_with("✉ task "), "{label:?}");
+        assert!(
+            !label.chars().any(|c| c.is_control()
+                || crate::untrusted_text::is_bidi_format_char(c)
+                || matches!(c, '\u{200B}' | '\u{FEFF}')),
+            "{label:?}"
+        );
     }
 
     #[test]

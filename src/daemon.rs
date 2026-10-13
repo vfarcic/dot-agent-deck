@@ -3868,6 +3868,103 @@ fn handle_inbox_ack(
 }
 
 /// PRD #1666: `inbox_fetch` — hand the attested agent its queued messages.
+/// PRD #1666 hardening M2: the refusal code for an inbox component whose
+/// process is not the pane's agent or one of its descendants.
+const INBOX_NOT_AGENT_PROCESS: &str = "inbox_not_agent_process";
+
+/// [`INBOX_NOT_AGENT_PROCESS`]'s message.
+const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's agent or one of its processes, so it may not receive \
+     the agent's inbox";
+
+/// TEST knob, honoured only in a build with the `e2e` feature: inbox
+/// components may connect from outside the pane's agent process tree, as the
+/// synthetic lane-1 tests that drive the inbox wire from the test process do.
+const ENV_TEST_UNBOUND_COMPONENTS: &str = "DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS";
+
+/// [`admit_component_process`] on this platform's process table, unless the
+/// `e2e`-only [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
+fn admit_inbox_component(
+    peer: Option<u32>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+) -> Result<Option<u32>, &'static str> {
+    #[cfg(feature = "e2e")]
+    if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    {
+        return Ok(claimed);
+    }
+    #[cfg(not(feature = "e2e"))]
+    let _ = ENV_TEST_UNBOUND_COMPONENTS;
+    admit_component_process(peer, claimed, root, crate::platform::proc::descends_from)
+}
+
+/// PRD #1666 hardening M2: bind an inbox component to the pane's managed
+/// agent. `peer` is the connecting process as the kernel reports it, `claimed`
+/// the component instance it names (the process that runs its watcher, which
+/// the stream is keyed by), and `root` the agent process the deck spawned.
+/// Each must be `root` or descend from it, and the claimed instance must be an
+/// ancestor of the caller (or the caller itself). Where `descends` cannot say —
+/// Windows, a Unix other than Linux or macOS, or a process that exited during
+/// the walk — the check is skipped, as before this hardening. Answers the
+/// instance to arm the stream under.
+fn admit_component_process(
+    peer: Option<u32>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    descends: impl Fn(u32, u32) -> Option<bool>,
+) -> Result<Option<u32>, &'static str> {
+    let Some(root) = root else {
+        return Ok(claimed);
+    };
+    if let Some(peer) = peer
+        && descends(peer, root) == Some(false)
+    {
+        return Err("the connecting process is not the agent's");
+    }
+    if let Some(claimed) = claimed {
+        if descends(claimed, root) == Some(false) {
+            return Err("the named component process is not the agent's");
+        }
+        if let Some(peer) = peer
+            && descends(peer, claimed) == Some(false)
+        {
+            return Err("the named component process is not the caller's");
+        }
+    }
+    Ok(claimed)
+}
+
+/// PRD #1666 hardening H2: the inbox half of `get-seed` — the oldest message
+/// queued for the agent, rendered and acknowledged, which an extension that
+/// predates the inbox reads as its seed. It acts only for `attested`, the
+/// agent the request's token attests, and only while that agent is the pane's
+/// `live` one: an unattested request (admitted under the `warn` provenance
+/// policy) gets nothing, and so does one naming any other agent (`requested`),
+/// so no generation can take another's work.
+fn get_seed_inbox_alias(
+    hub: &crate::inbox_hub::InboxHub,
+    pane_id: &str,
+    requested: Option<&str>,
+    attested: Option<&str>,
+    live: Option<&str>,
+) -> Option<String> {
+    let agent = attested?;
+    if requested.is_some_and(|requested| !requested.is_empty() && requested != agent) {
+        warn!(
+            pane_id = %escape_id_for_log(pane_id),
+            "get-seed named an agent other than the one its token attests; no inbox message \
+             was handed over"
+        );
+        return None;
+    }
+    if live != Some(agent) {
+        return None;
+    }
+    hub.fetch_first_acked(pane_id, agent, crate::inbox::AckHow::ExtensionConfirmed)
+        .map(|delivery| delivery.text)
+}
+
 fn handle_inbox_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
@@ -4066,6 +4163,10 @@ async fn run_hook_loop_with_idle_timeout(
                     // since issue #1129, whose line comes from the provenance
                     // gate above rather than from an arm. Raw `AgentEvent`
                     // traffic is still answered by nothing.
+                    // PRD #1666 hardening M2: the process on the other end,
+                    // as the kernel reports it, for the inbox verbs that bind
+                    // a component to the pane's agent.
+                    let peer_pid = crate::platform::peercred::peer_pid(&stream).ok();
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -4326,6 +4427,32 @@ async fn run_hook_loop_with_idle_timeout(
                                         }
                                         continue;
                                     }
+                                    let instance = match admit_inbox_component(
+                                        peer_pid,
+                                        req.pid,
+                                        pty_registry.child_pid(&agent_id),
+                                    ) {
+                                        Ok(instance) => instance,
+                                        Err(why) => {
+                                            warn!(
+                                                pane_id = %escape_id_for_log(&req.pane_id),
+                                                component = ?req.component,
+                                                why,
+                                                "hook socket: refused an inbox wait from outside \
+                                                 the pane's agent"
+                                            );
+                                            let reply = crate::event::InboxWaitReply::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&reply) {
+                                                let line = format!("{json}\n");
+                                                let _ = write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         mode = ?req.mode,
@@ -4344,6 +4471,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         agent_id,
                                         req.mode,
                                         req.component,
+                                        instance,
                                         reader,
                                         write_half,
                                         |agent: &str| pty_registry.nudge_repaint(agent),
@@ -4355,6 +4483,30 @@ async fn run_hook_loop_with_idle_timeout(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    if let Err(why) = admit_inbox_component(
+                                        peer_pid,
+                                        req.pid,
+                                        pty_registry.child_pid(&agent_id),
+                                    ) {
+                                        warn!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            component = ?req.component,
+                                            why,
+                                            "hook socket: refused an inbox announce from outside \
+                                             the pane's agent"
+                                        );
+                                        if let Ok(json) =
+                                            serde_json::to_string(&crate::event::SignalAck::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            ))
+                                        {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
                                     pty_registry
                                         .inbox()
                                         .announce(&req.pane_id, &agent_id, req.wake, req.component);
@@ -4745,23 +4897,26 @@ async fn run_hook_loop_with_idle_timeout(
                                     // predates the inbox needs to keep receiving
                                     // its seed. A seed stashed the old way is
                                     // still taken first.
+                                    //
+                                    // Hardening H2: the inbox half acts only
+                                    // for the agent the token attests, never
+                                    // for an id the caller names or the pane's
+                                    // occupant ([`get_seed_inbox_alias`]).
                                     let seed = pty_registry
                                         .take_pending_seed_native_for(
                                             &req.pane_id,
                                             req.agent_id.as_deref(),
                                         )
                                         .or_else(|| {
-                                            let agent = req.agent_id.clone().or_else(|| {
-                                                pty_registry.pane_current_agent_id(&req.pane_id)
-                                            })?;
-                                            pty_registry
-                                                .inbox()
-                                                .fetch_first_acked(
-                                                    &req.pane_id,
-                                                    &agent,
-                                                    crate::inbox::AckHow::ExtensionConfirmed,
-                                                )
-                                                .map(|delivery| delivery.text)
+                                            get_seed_inbox_alias(
+                                                pty_registry.inbox(),
+                                                &req.pane_id,
+                                                req.agent_id.as_deref(),
+                                                attested_agent.as_deref(),
+                                                pty_registry
+                                                    .pane_current_agent_id(&req.pane_id)
+                                                    .as_deref(),
+                                            )
                                         });
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
@@ -8642,6 +8797,84 @@ mod hook_ingestion_tests {
              table cannot be known to be B's — which under pid reuse is exactly how a \
              replacement pane inherits a departed one's descendants"
         );
+    }
+
+    /// PRD #1666 hardening M2: a component is admitted only from the pane's
+    /// agent process tree, and only under an instance that is the caller's own
+    /// ancestry; where the platform cannot say, it is not checked.
+    #[test]
+    fn admit_component_process_binds_to_the_agent_process_tree() {
+        // 1 ── 10 (agent) ── 11 (plugin host) ── 12 (watcher CLI)
+        //  └── 20 (unrelated) ── 21
+        let parents = |pid: u32| match pid {
+            10 | 20 => Some(1),
+            11 => Some(10),
+            12 => Some(11),
+            21 => Some(20),
+            _ => None,
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        assert_eq!(
+            admit_component_process(Some(12), Some(11), Some(10), descends),
+            Ok(Some(11))
+        );
+        assert_eq!(
+            admit_component_process(Some(12), None, Some(10), descends),
+            Ok(None)
+        );
+        assert!(admit_component_process(Some(21), Some(20), Some(10), descends).is_err());
+        assert!(admit_component_process(Some(12), Some(20), Some(10), descends).is_err());
+        assert!(admit_component_process(Some(11), Some(12), Some(10), descends).is_err());
+        assert!(admit_component_process(Some(12), Some(10), Some(10), descends).is_ok());
+        // Cannot say: unknown pids, or no agent process to check against.
+        assert_eq!(
+            admit_component_process(Some(99), Some(98), Some(10), descends),
+            Ok(Some(98))
+        );
+        assert_eq!(
+            admit_component_process(Some(21), Some(20), None, descends),
+            Ok(Some(20))
+        );
+    }
+
+    /// PRD #1666 hardening H2: the inbox half of get-seed hands over only the
+    /// attested agent's own message, and only while it is the pane's live one.
+    #[test]
+    fn get_seed_inbox_alias_acts_only_for_the_attested_live_agent() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound("p", "new"),
+                crate::inbox::Content::from_deck("seed", "task", "the successor's task"),
+            )
+            .unwrap();
+        let queued = || {
+            hub.list("p")
+                .iter()
+                .any(|m| m.id == id && m.state == crate::inbox::StateName::Queued)
+        };
+        for (requested, attested, live) in [
+            (Some("new"), Some("old"), Some("new")),
+            (None, Some("old"), Some("new")),
+            (Some("new"), None, Some("new")),
+            (None, None, Some("new")),
+            (Some("old"), Some("new"), Some("new")),
+            (None, Some("new"), Some("newer")),
+        ] {
+            assert_eq!(
+                get_seed_inbox_alias(&hub, "p", requested, attested, live),
+                None,
+                "{requested:?} {attested:?} {live:?}"
+            );
+            assert!(queued(), "{requested:?} {attested:?} {live:?}");
+        }
+        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"))
+            .expect("its own agent gets it");
+        assert!(seed.contains("the successor's task"));
     }
 
     /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a

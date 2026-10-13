@@ -88,6 +88,16 @@ pub fn daemon(extra: &[(&str, &str)]) -> DaemonProc {
     common::spawn_daemon_serve_with_env(None, "0", &env)
 }
 
+/// [`daemon`] for a synthetic test whose inbox components connect from the
+/// test process, outside the pane's agent (PRD #1666 hardening M2). The
+/// binding itself has its own test (inbox/protocol/014); real-agent tests
+/// use [`daemon`], which keeps it.
+pub fn daemon_unbound(extra: &[(&str, &str)]) -> DaemonProc {
+    let mut env = vec![("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")];
+    env.extend_from_slice(extra);
+    daemon(&env)
+}
+
 pub fn attach(daemon: &impl Endpoint, req: Value) -> Value {
     let mut socket = UnixStream::connect(daemon.attach_socket()).unwrap();
     socket.set_read_timeout(Some(WAIT)).unwrap();

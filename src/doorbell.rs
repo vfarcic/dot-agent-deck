@@ -327,20 +327,17 @@ async fn run_tick(
     // PRD #1666 S5: a pane whose session declared it cannot take input
     // (history-only or view-only) is never rung, whatever its status says —
     // the line would land in no live conversation.
-    let idles: Vec<bool> = {
+    let admissions: Vec<Option<crate::state::DoorbellAdmission>> = {
         let state = state.read().await;
         keys.iter()
-            .map(|(pane, agent)| {
-                state.agent_doorbell_idle(agent, pane)
-                    && state.pane_writable(pane) == crate::event::Writable::Live
-            })
+            .map(|(pane, agent)| state.doorbell_admission(agent, pane))
             .collect()
     };
     let now = Instant::now();
-    for ((pane, agent), idle) in keys.into_iter().zip(idles) {
+    for ((pane, agent), admission) in keys.into_iter().zip(admissions) {
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
-            idle,
+            idle: admission.is_some(),
             draft: registry.draft_pending(&pane),
         };
         let action = {
@@ -362,14 +359,29 @@ async fn run_tick(
         };
         let registry = Arc::clone(registry);
         let slots = Arc::clone(slots);
+        let state = Arc::clone(state);
         let queued = facts.inbox.queued;
         tokio::spawn(async move {
             let (pre_cr, line) = match &action {
                 Action::Ring { id, pre_cr } => (*pre_cr, Some(doorbell_line(id))),
                 _ => (true, None),
             };
+            // PRD #1666 hardening H3: re-asked under the writer before every
+            // byte. The same admission (nothing happened to the pane since
+            // this tick) and, for a ring, still no native component armed.
+            let ring = matches!(action, Action::Ring { .. });
+            let still_admitted = || {
+                let state = Arc::clone(&state);
+                let registry = Arc::clone(&registry);
+                let (pane, agent) = (pane.clone(), agent.clone());
+                async move {
+                    admission.is_some()
+                        && state.read().await.doorbell_admission(&agent, &pane) == admission
+                        && (!ring || registry.inbox().doorbell_facts(&pane, &agent).armed == 0)
+                }
+            };
             let outcome = registry
-                .write_doorbell(&pane, &agent, pre_cr, line.as_deref())
+                .write_doorbell(&pane, &agent, pre_cr, line.as_deref(), still_admitted)
                 .await;
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) else {

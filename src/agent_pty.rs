@@ -2600,6 +2600,10 @@ pub enum DoorbellWrite {
     /// its composer is not on screen, so whatever is there — a start dialog,
     /// known or not — gets no byte; nothing was written.
     NoComposer,
+    /// PRD #1666 hardening H3: between the doorbell's decision and the write
+    /// the pane stopped being fit for it — a status changed, a dialog opened,
+    /// or a native component armed; nothing was written.
+    NotAdmitted,
     /// A write failed part-way or could not be encoded.
     Failed,
 }
@@ -11884,13 +11888,18 @@ impl AgentPtyRegistry {
     /// No echo wait and no retry: whether the message arrived is the inbox's
     /// to say, not the screen's. The screen is read only for the composer gate,
     /// which can only withhold bytes.
-    pub async fn write_doorbell(
+    pub async fn write_doorbell<F, Fut>(
         &self,
         pane_id: &str,
         expected_agent_id: &str,
         pre_cr: bool,
         line: Option<&str>,
-    ) -> DoorbellWrite {
+        still_admitted: F,
+    ) -> DoorbellWrite
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         let owner = |target: &PaneWriterTarget| {
             target.agent_id == expected_agent_id && !target.exited.load(Ordering::SeqCst)
         };
@@ -11951,6 +11960,17 @@ impl AgentPtyRegistry {
         for (n, bytes) in steps.into_iter().enumerate() {
             if n > 0 {
                 tokio::time::sleep(SUBMIT_DELAY).await;
+            }
+            // PRD #1666 hardening H3: the admission the doorbell decided on
+            // is asked for again under the writer before EVERY byte — the
+            // pre-ring CR, the line, its submit and a cleanup CR — so a dialog
+            // or a turn that started while this write waited gets nothing.
+            if !still_admitted().await {
+                return if n == 0 {
+                    DoorbellWrite::NotAdmitted
+                } else {
+                    DoorbellWrite::Failed
+                };
             }
             match sink.write_tracked(bytes).await {
                 WriteProgress::Complete => {}
@@ -12739,6 +12759,7 @@ impl AgentPtyRegistry {
     /// a reservation that then failed would leave them with nothing to prune
     /// them.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
+        let mut closed_pane = None;
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
             let agent = inner
@@ -12769,10 +12790,16 @@ impl AgentPtyRegistry {
                         .get(pane)
                         .is_none_or(|mutex| mutex.try_lock().is_ok());
                     self.pending_deliveries.forget_pane(pane, id, dispatch_idle);
+                    closed_pane = Some(pane.to_string());
                 }
             }
             agent
         };
+        // PRD #1666 hardening M3: a closed pane's inbox history goes with it.
+        // Outside the registry lock: the hub takes its own.
+        if let Some(pane) = closed_pane {
+            self.inbox().forget_pane_history(&pane);
+        }
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
@@ -24173,6 +24200,74 @@ mod spawn_tests {
         );
         assert_eq!(log.lock().unwrap().as_slice(), b"typed while stuck");
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// PRD #1666 hardening H3: the doorbell decides on an Idle pane, but its
+    /// write waits behind a busy writer; a dialog (WaitingForInput) arrives in
+    /// the meantime. When the writer frees up, not one automatic byte may reach
+    /// the pane — the admission is re-checked under the writer, not reused from
+    /// the tick.
+    #[tokio::test]
+    async fn a_doorbell_waiting_for_the_writer_writes_nothing_after_a_dialog_arrives() {
+        const PANE: &str = "hardening-h3-pane";
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, false).await;
+        registry.set_pty_write_stall_bound_for_test(Duration::from_secs(30));
+        gate.release();
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let event = |event_type| crate::event::AgentEvent {
+            session_id: "h3-session".into(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE.into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        for kind in [
+            crate::event::EventType::SessionStart,
+            crate::event::EventType::Idle,
+        ] {
+            state.write().await.apply_event(event(kind));
+        }
+        assert!(state.read().await.agent_doorbell_idle(&agent, PANE));
+        let writer = registry.agent_writer(&agent).unwrap();
+        let held = writer.lock().await;
+        registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound(PANE, &agent),
+                crate::inbox::Content::from_deck("seed", "task", "do it"),
+            )
+            .unwrap();
+        let config = crate::doorbell::DoorbellConfig {
+            tick: Duration::from_millis(20),
+            schedule: vec![Duration::from_secs(60)],
+            arm_grace: Duration::from_millis(1),
+        };
+        let bell = crate::doorbell::spawn(registry.clone(), state.clone(), config);
+        // Several ticks: the ring is decided on the Idle pane and its write is
+        // queued behind the held writer.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::WaitingForInput));
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        bell.abort();
+        assert_eq!(
+            String::from_utf8_lossy(&log.lock().unwrap()),
+            "",
+            "no automatic byte may reach a pane showing a dialog"
+        );
     }
 
     /// Issue #525: a guarded write with no deadline waits for a pane's writer

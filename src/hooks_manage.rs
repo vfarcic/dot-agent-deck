@@ -98,6 +98,47 @@ pub const WAITER_REWAKE_SUMMARY: &str = "✉ dot-agent-deck message";
 /// by [`HOOK_COMMAND_SUFFIX`].
 const WAITER_COMMAND_SUFFIX: &str = "inbox wait --agent claude-code";
 
+/// PRD #1666 review SF-2: whether Claude Code's settings — the file the
+/// installer writes ([`settings_path`]) — carry the deck's native waiter on
+/// `SessionStart`. Only then does a waiter arm, so only then does the
+/// `SessionStart` hook announce Native: below [`CLAUDE_ASYNC_REWAKE_MIN`] the
+/// installer writes no waiter, and an announcement would only hold the first
+/// doorbell for the arm grace. A missing, unreadable, oversized or malformed
+/// file reads as no waiter.
+pub fn claude_waiter_installed() -> bool {
+    /// Claude Code's settings are small; anything larger is not read.
+    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    let Ok(file) = std::fs::File::open(settings_path()) else {
+        return false;
+    };
+    let mut text = String::new();
+    if std::io::Read::read_to_string(
+        &mut std::io::Read::take(file, MAX_SETTINGS_BYTES + 1),
+        &mut text,
+    )
+    .is_err()
+        || text.len() as u64 > MAX_SETTINGS_BYTES
+    {
+        return false;
+    }
+    settings_have_waiter(&text)
+}
+
+/// [`claude_waiter_installed`] for the settings text `text`.
+fn settings_have_waiter(text: &str) -> bool {
+    let Ok(settings) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    settings["hooks"]["SessionStart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["hooks"].as_array())
+        .flatten()
+        .filter_map(|handler| handler["command"].as_str())
+        .any(|command| command.trim_end().ends_with(WAITER_COMMAND_SUFFIX))
+}
+
 /// The hook types that carry a waiter beside their status handler.
 const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop"];
 
@@ -2241,5 +2282,28 @@ mod tests {
             ),
             (false, None)
         );
+    }
+
+    /// PRD #1666 review SF-2: the waiter is found on SessionStart by its
+    /// command suffix, whatever executable spelling precedes it.
+    #[test]
+    fn settings_have_waiter_reads_only_a_session_start_waiter() {
+        let with = |event: &str, command: &str| {
+            json!({"hooks":{event:[{"hooks":[{"type":"command","command":command}]}]}}).to_string()
+        };
+        assert!(settings_have_waiter(&with(
+            "SessionStart",
+            "'/opt/my deck/dot-agent-deck' inbox wait --agent claude-code"
+        )));
+        assert!(!settings_have_waiter(&with(
+            "SessionStart",
+            "/opt/dot-agent-deck hook --agent claude-code"
+        )));
+        assert!(!settings_have_waiter(&with(
+            "Stop",
+            "/opt/dot-agent-deck inbox wait --agent claude-code"
+        )));
+        assert!(!settings_have_waiter("not json"));
+        assert!(!settings_have_waiter("{}"));
     }
 }

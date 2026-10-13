@@ -13,7 +13,7 @@ use std::time::Duration;
 #[spec("inbox/doorbell/001")]
 #[test]
 fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let pane = pane(&daemon, "idle");
     status(&daemon, &pane, "idle", "codex");
     unchanged(&pane, Duration::from_millis(300));
@@ -34,7 +34,7 @@ fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
 #[spec("inbox/doorbell/002")]
 #[test]
 fn doorbell_002_unknown_dialogs_and_busy_states_never_ring() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
         let pane = pane(&daemon, agent_type);
         let id = enqueue(&daemon, &pane, BODY);
@@ -75,7 +75,7 @@ fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
     // claim/deliver Queued work through waiters. Without it a live waiter
     // immediately makes the message Fetched, which cannot prove the armed
     // guard independently of the Queued guard.
-    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1")]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1")]);
     let pane = pane(&daemon, "armed");
     status(&daemon, &pane, "idle", "pi");
     let wait = waiter(&daemon, &pane);
@@ -101,7 +101,7 @@ fn doorbell_004_native_announce_gets_arm_grace() {
     // when the harness widens process-scheduling budgets under host load.
     let grace = common::load_scaled(Duration::from_millis(1200));
     let grace_ms = grace.as_millis().to_string();
-    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", &grace_ms)]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", &grace_ms)]);
     let pane = pane(&daemon, "native-grace");
     status(&daemon, &pane, "idle", "claude_code");
     announce(&daemon, &pane, "native");
@@ -137,7 +137,7 @@ fn doorbell_004_native_announce_gets_arm_grace() {
 fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
     let scratch = common::harness_tempdir().unwrap();
     let log = scratch.path().join("doorbell.log");
-    let daemon = daemon(&[
+    let daemon = daemon_unbound(&[
         ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
         ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "300,500,700,900"),
         ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "30000"),
@@ -203,7 +203,7 @@ fn ring_times(path: &std::path::Path, pane: &inbox::Pane) -> Vec<chrono::DateTim
 #[spec("inbox/doorbell/006")]
 #[test]
 fn doorbell_006_one_ring_coalesces_all_queued_messages() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let pane = pane(&daemon, "coalesced");
     status(&daemon, &pane, "thinking", "codex");
     let ids: Vec<_> = (0..3)
@@ -243,7 +243,7 @@ fn doorbell_006_one_ring_coalesces_all_queued_messages() {
 #[spec("inbox/doorbell/007")]
 #[test]
 fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
-    let daemon = daemon(&[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "1500")]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "1500")]);
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
         let pane = pane(&daemon, agent_type);
         status(&daemon, &pane, "idle", agent_type);
@@ -284,7 +284,7 @@ fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_respawn_never_rings_old_agents_message() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let old = pane(&daemon, "respawn");
     status(&daemon, &old, "idle", "codex");
     let user = input(&daemon, &old, DRAFT);
@@ -320,7 +320,7 @@ fn doorbell_008_respawn_never_rings_old_agents_message() {
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let pane = pane(&daemon, "worker-draft");
     status(&daemon, &pane, "idle", "codex");
     let mut user = input(&daemon, &pane, DRAFT);
@@ -347,7 +347,7 @@ fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let pane = pane(&daemon, "terminal-reports");
     status(&daemon, &pane, "idle", "codex");
     let reports =

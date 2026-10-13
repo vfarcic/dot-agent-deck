@@ -591,6 +591,45 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 // Orphan watchdog (lifted from daemon.rs; test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
+/// PRD #1666 hardening M2: the parent of process `pid`, or `None` when the
+/// process is gone or this platform cannot say. Linux reads
+/// `/proc/<pid>/stat`; macOS asks `proc_pidinfo(PROC_PIDTBSDINFO)`. Other Unix
+/// platforms answer `None`, and the caller falls back to not checking.
+#[cfg(target_os = "linux")]
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid …`; `comm` may itself hold spaces or parentheses.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdinfo` that outlives
+    // the call, and `size` is exactly its size, so the kernel writes at most
+    // that many bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then_some(info.pbi_ppid)
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn parent_pid_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
 /// infallible) so the single `unsafe` lives in one place.
 pub fn current_ppid() -> i32 {

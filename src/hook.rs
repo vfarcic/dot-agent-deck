@@ -248,9 +248,11 @@ fn send_lines_and_drain(lines: &str) -> Option<()> {
 /// deck pane. Returns what the hook prints on stdout, if anything.
 ///
 /// - `SessionStart` prints the session framing as `additionalContext` (a
-///   static text, so no daemon round trip) and queues an `inbox_announce`
-///   `Native` line for the caller to send ahead of the status event. Native
-///   wake-up is enabled by this announcement, never by the launch command.
+///   static text, so no daemon round trip) and, when Claude's settings carry
+///   the deck's waiter ([`crate::hooks_manage::claude_waiter_installed`]),
+///   queues an `inbox_announce` `Native` line for the caller to send ahead of
+///   the status event. Native wake-up is enabled by this announcement, never
+///   by the launch command.
 /// - `UserPromptSubmit` recognises the deck's own prompts
 ///   ([`crate::inbox_prompt`]): a doorbell line is answered by fetching the
 ///   waiting content and handing it to the model, and the event is marked so
@@ -264,10 +266,14 @@ fn claude_inbox_hooks(
     let hook_event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
     match hook_event_name {
         "SessionStart" => {
-            *announce = inbox_announce(
-                crate::event::InboxComponent::ClaudeHooks,
-                crate::event::InboxWake::Native,
-            );
+            // Review SF-2: only a Claude whose settings carry the deck's
+            // waiter will arm one, so only it announces Native.
+            if crate::hooks_manage::claude_waiter_installed() {
+                *announce = inbox_announce(
+                    crate::event::InboxComponent::ClaudeHooks,
+                    crate::event::InboxWake::Native,
+                );
+            }
             Some(crate::inbox_prompt::hook_output(
                 "SessionStart",
                 crate::inbox_hub::SESSION_FRAMING,
@@ -1232,7 +1238,8 @@ pub fn build_agent_event_cli(
             crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
         );
     }
-    AgentEvent {
+    let prompt = non_blank(detail.prompt);
+    let mut event = AgentEvent {
         session_id: format!("{pane_id}-session"),
         agent_type: AgentType::Pi,
         event_type,
@@ -1240,14 +1247,28 @@ pub fn build_agent_event_cli(
         tool_detail,
         cwd: non_blank(detail.cwd),
         timestamp: Utc::now(),
-        user_prompt: non_blank(detail.prompt).map(|p| record_submitted_prompt(&p)),
+        user_prompt: prompt.as_deref().map(record_submitted_prompt),
         metadata,
         pane_id: Some(pane_id),
         agent_id,
         agent_version: None,
         schema_version: None,
         live_target: None,
+    };
+    // PRD #1666 (pi_001): the Pi extension hands a deck message over as a
+    // prompt of its own — the framing, then the blocks. It is the deck's, not
+    // the user's: the daemon labels the card `✉ <subject>` from the ids named
+    // here and keeps the text out of the prompt history. The extension
+    // acknowledges the message itself when Pi commits it, so every id counts as
+    // handed over and none is acknowledged again here.
+    if let Some(prompt) = prompt.as_deref() {
+        let ids = crate::inbox_prompt::scan(prompt);
+        if !ids.is_empty() {
+            let handed_over: Vec<String> = ids.opened.clone();
+            crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
+        }
     }
+    event
 }
 
 /// How long `dot-agent-deck agent-event --turn-reply-stdin` waits for its
@@ -2293,6 +2314,62 @@ mod tests {
         assert_eq!(event.tool_name.as_deref(), Some("bash"));
         assert_eq!(event.tool_detail.as_deref(), Some("touch a.txt"));
         assert!(event.user_prompt.is_none());
+    }
+
+    /// PRD #1666 (pi_001): the Pi extension hands a deck message over as
+    /// the framing followed by the block, and reports that prompt. It is the
+    /// deck's prompt, not the user's: the raw text is dropped and its ids are
+    /// named for the daemon to label the card `✉ <subject>` and keep it out
+    /// of the user's prompt history.
+    #[test]
+    fn a_pi_prompt_carrying_a_deck_message_is_marked_as_the_decks() {
+        let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+        let prompt = format!(
+            "{}\n\n[dot-agent-deck message {id} from dot-agent-deck (the prompt this session \
+             was started with)]\nSent by: the user.\ndo the task\n[end of dot-agent-deck \
+             message {id}]",
+            crate::inbox_hub::AGENT_FRAMING
+        );
+        for event_type in [EventType::Thinking, EventType::Idle] {
+            let event = build_agent_event_cli(
+                "pane-7".into(),
+                Some("agent-7".into()),
+                event_type,
+                AgentEventDetail {
+                    cwd: None,
+                    prompt: Some(prompt.clone()),
+                    tool_name: None,
+                    tool_detail: None,
+                    reports_prompts: true,
+                },
+            );
+            assert_eq!(event.user_prompt, None, "{event:?}");
+            assert_eq!(
+                event.metadata[crate::inbox_prompt::DECK_MESSAGE_IDS_METADATA_KEY],
+                id
+            );
+        }
+        let ordinary = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-7".into()),
+            EventType::Thinking,
+            AgentEventDetail {
+                cwd: None,
+                prompt: Some("please fix the build".into()),
+                tool_name: None,
+                tool_detail: None,
+                reports_prompts: true,
+            },
+        );
+        assert_eq!(
+            ordinary.user_prompt.as_deref(),
+            Some("please fix the build")
+        );
+        assert!(
+            !ordinary
+                .metadata
+                .contains_key(crate::inbox_prompt::DECK_MESSAGE_IDS_METADATA_KEY)
+        );
     }
 
     #[test]

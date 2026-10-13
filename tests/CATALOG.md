@@ -7812,6 +7812,30 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Asserts:** rendered task is Fetched, nack returns it to the stream, ack changes it to Acknowledged, and EOF removes the stream's armed registration.
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/011 — An oversized post is saved whole and named.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted hook-socket fetch.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** the fetched block fits 4,800 bytes, names a file instead of carrying the tail, and that owner-only file holds the whole task including the directive at its end.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/012 — get-seed never fetches for another agent generation.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), stop-agent and a replacement in the same pane, raw get_seed on the hook socket.
+- **Agent:** none (two `cat` stand-ins).
+- **Asserts:** the predecessor's token naming the replacement, or naming nobody, gets no seed and leaves the replacement's task Queued; the replacement still fetches it.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/013 — An unattested get-seed hands over no inbox message.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon under the legacy warn provenance policy.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** get_seed without a token, with or without an agent id, gets no seed and the task stays Queued.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/014 — A process outside the agent cannot arm its inbox.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket wait and announce from the test process.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree are each refused as `inbox_not_agent_process`; nothing arms and the task stays Queued.
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -8100,8 +8124,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/010 — SessionStart sends Native announce before status on one hook connection.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI and recording Unix socket.
 - **Agent:** none.
-- **Asserts:** The recording endpoint receives exactly one connection containing InboxAnnounce with Native wake first, then SessionStart status.
+- **Asserts:** With the deck's waiter in Claude's settings, the recording endpoint receives exactly one connection containing InboxAnnounce with Native wake first, then SessionStart status.
 - **Does not assert:** Daemon grace policy, covered by /005 and inbox/doorbell/004.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/015 — SessionStart without an installed waiter announces nothing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI and recording Unix socket.
+- **Agent:** none.
+- **Asserts:** With no Claude settings, and with settings whose SessionStart carries only the status handler (a Claude below the waiter gate), the hook sends its SessionStart status and no InboxAnnounce.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
@@ -8372,7 +8402,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/opencode/011 — Submitted doorbell is replaced in place and acknowledged when its assistant starts.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
-- **Agent:** generated server plugin's real chat.message hook under a fake OpenCode host.
+- **Agent:** generated server plugin's real chat.message hook, loaded in a worker thread as the full TUI loads it, under a fake OpenCode host.
 - **Asserts:** original text-parts array receives framed fetched content; fetch does not ack; abort before assistant start permits redelivery; only the matching assistant parent acknowledges the retry; recalling a handled id leaves newer pending work untouched.
 - **Does not assert:** real OpenCode rendering or cancellation; the interception channel was measured separately in full TUI and mini.
 - **Cost:** none.

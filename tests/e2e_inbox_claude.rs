@@ -190,11 +190,14 @@ fn record(endpoint: &impl Endpoint, pane: &Pane) -> Value {
         .clone()
 }
 
-/// Scenario: Queue a spawn-time seed before scripted Claude reports SessionStart. Its real status hook must provide deck framing and native arm grace before Idle can ring; a subsequently armed waiter receives that seed on stderr with exit 2 and no automatic PTY bytes.
+/// Scenario: Install the deck's waiter in Claude's settings and queue a spawn-time seed before scripted Claude reports SessionStart. Its real status hook must provide deck framing and native arm grace before Idle can ring; a subsequently armed waiter receives that seed on stderr with exit 2 and no automatic PTY bytes.
 #[spec("inbox/claude/005")]
 #[test]
 fn claude_005_session_start_frames_and_announces_before_idle() {
     let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "30000")]);
+    // A Claude that announces Native is one whose settings carry the deck's
+    // waiter (review SF-2).
+    seed_waiter_settings(daemon.home());
     let pane = parent(&daemon, "claude-boot");
     let id = post(&daemon, &pane, NATIVE_BODY);
     let out = run_hook(&pane, "start", payload(&pane, "SessionStart"));
@@ -369,15 +372,15 @@ fn claude_009_native_notification_acks_and_shows_subject_without_polluting_user_
     assert!(!deck.snapshot_grid().contains("<task-notification>"));
 }
 
-/// Scenario: Run the real Claude SessionStart hook against an isolated recording hook socket. Its Native announcement and status event must arrive in that order on one connection, so a queued seed cannot become eligible to ring between them.
-#[spec("inbox/claude/010")]
-#[test]
-fn claude_010_session_start_announces_before_status_on_one_connection() {
+/// Run the real Claude SessionStart hook in `home` against an isolated
+/// recording hook socket; the hook's output and every line each connection
+/// carried.
+fn record_session_start(home: &std::path::Path) -> (std::process::Output, Vec<Vec<Value>>) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Command, Stdio};
-    let scratch = common::harness_tempdir().unwrap();
-    let socket = scratch.path().join("hook.sock");
+    let socket = home.join("hook.sock");
+    let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).unwrap();
     let reader = std::thread::spawn(move || {
         let mut connections = Vec::new();
@@ -414,8 +417,8 @@ fn claude_010_session_start_announces_before_status_on_one_connection() {
     let mut hook = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["hook", "--agent", "claude-code"])
         .env_clear()
-        .env("HOME", scratch.path())
-        .env("PATH", claude_path(scratch.path()))
+        .env("HOME", home)
+        .env("PATH", claude_path(home))
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", "recorded-claude")
         .env("DOT_AGENT_DECK_AGENT_ID", "recorded-agent")
@@ -432,6 +435,29 @@ fn claude_010_session_start_announces_before_status_on_one_connection() {
     let mut complete = UnixStream::connect(&socket).unwrap();
     writeln!(complete, "{{\"recording_complete\":true}}").unwrap();
     let connections = reader.join().unwrap();
+    (output, connections)
+}
+
+/// The Claude settings a supported install leaves: SessionStart's status
+/// handler and the deck's native waiter.
+fn seed_waiter_settings(home: &std::path::Path) {
+    let dir = home.join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = json!({"hooks":{"SessionStart":[{"hooks":[
+        {"type":"command","command":"/opt/dot-agent-deck hook --agent claude-code"},
+        {"type":"command","command":"/opt/dot-agent-deck inbox wait --agent claude-code",
+         "asyncRewake":true,"timeout":86400}
+    ]}]}});
+    std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+}
+
+/// Scenario: Run the real Claude SessionStart hook, with the deck's native waiter installed in Claude's settings, against an isolated recording hook socket. Its Native announcement and status event must arrive in that order on one connection, so a queued seed cannot become eligible to ring between them.
+#[spec("inbox/claude/010")]
+#[test]
+fn claude_010_session_start_announces_before_status_on_one_connection() {
+    let scratch = common::harness_tempdir().unwrap();
+    seed_waiter_settings(scratch.path());
+    let (output, connections) = record_session_start(scratch.path());
     assert!(output.status.success(), "status hook: {output:?}");
     assert_eq!(
         connections.len(),
@@ -446,4 +472,36 @@ fn claude_010_session_start_announces_before_status_on_one_connection() {
     assert_eq!(connections[0][0]["message_type"], "inbox_announce");
     assert_eq!(connections[0][0]["wake"], "native");
     assert_eq!(connections[0][1]["event_type"], "session_start");
+}
+
+/// Scenario: Run the real Claude SessionStart hook in a HOME whose Claude settings carry no deck waiter, as a Claude below the native-wake version gate is installed, and again with no settings at all. The hook must send its status event and no Native announcement, so the doorbell rings without waiting out the arm grace for a waiter that will never arm.
+#[spec("inbox/claude/015")]
+#[test]
+fn claude_015_session_start_without_a_waiter_announces_nothing() {
+    let scratch = common::harness_tempdir().unwrap();
+    let (output, connections) = record_session_start(scratch.path());
+    assert!(output.status.success(), "status hook: {output:?}");
+    let dir = scratch.path().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let below_gate = json!({"hooks":{"SessionStart":[{"hooks":[
+        {"type":"command","command":"/opt/dot-agent-deck hook --agent claude-code"}
+    ]}]}});
+    std::fs::write(dir.join("settings.json"), below_gate.to_string()).unwrap();
+    let (again, more) = record_session_start(scratch.path());
+    assert!(again.status.success(), "status hook: {again:?}");
+    for lines in connections.iter().chain(&more) {
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["message_type"] != "inbox_announce"),
+            "no waiter, no Native announcement: {lines:?}"
+        );
+    }
+    let statuses = connections
+        .iter()
+        .chain(&more)
+        .flatten()
+        .filter(|line| line["event_type"] == "session_start")
+        .count();
+    assert_eq!(statuses, 2, "{connections:?} {more:?}");
 }

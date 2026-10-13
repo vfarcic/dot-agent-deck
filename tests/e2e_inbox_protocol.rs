@@ -30,6 +30,22 @@ struct Pane {
     pid: u32,
 }
 
+/// The knob that lets this file's synthetic components connect from the test
+/// process rather than from inside the pane's agent: these tests drive the
+/// inbox wire directly. The binding itself is pinned by inbox/protocol/014,
+/// with the knob off.
+const UNBOUND_COMPONENTS: (&str, &str) = ("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1");
+
+fn daemon() -> DaemonProc {
+    daemon_with(&[])
+}
+
+fn daemon_with(extra: &[(&str, &str)]) -> DaemonProc {
+    let mut env = vec![UNBOUND_COMPONENTS];
+    env.extend_from_slice(extra);
+    common::spawn_daemon_serve_with_env(None, "0", &env)
+}
+
 fn attach(daemon: &DaemonProc, request: Value) -> Value {
     let mut socket = UnixStream::connect(&daemon.attach_socket).expect("attach socket");
     socket.set_read_timeout(Some(WAIT)).unwrap();
@@ -267,7 +283,7 @@ fn success(result: &Output) {
 #[spec("inbox/protocol/001")]
 #[test]
 fn inbox_protocol_001_attested_only_verbs() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "attested", "exec /bin/cat");
     let mut announce = request(&pane, "inbox_announce");
     announce["component"] = json!("claude_waiter");
@@ -306,7 +322,7 @@ fn inbox_protocol_001_attested_only_verbs() {
 #[spec("inbox/protocol/002")]
 #[test]
 fn inbox_protocol_002_wrong_agent_cannot_ack() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let owner = pane(&daemon, "owner", "exec /bin/cat");
     let other = pane(&daemon, "other", "exec /bin/cat");
     let id = enqueue(&daemon, &owner);
@@ -330,7 +346,7 @@ fn inbox_protocol_002_wrong_agent_cannot_ack() {
 #[spec("inbox/protocol/003")]
 #[test]
 fn inbox_protocol_003_legacy_delivery_id_is_unknown() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "legacy", "exec /bin/cat");
     assert_eq!(listing(&daemon, &pane)["messages"], json!([]));
     let mut req = request(&pane, "ack");
@@ -353,7 +369,7 @@ fn inbox_protocol_003_legacy_delivery_id_is_unknown() {
 #[spec("inbox/protocol/004")]
 #[test]
 fn inbox_protocol_004_once_claims_newest_and_explicit_ack() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "once", "exec /bin/cat");
     let mut older = waiter(&daemon, &pane);
     armed(&daemon, &pane, 1);
@@ -386,7 +402,7 @@ fn inbox_protocol_004_once_claims_newest_and_explicit_ack() {
 #[spec("inbox/protocol/005")]
 #[test]
 fn inbox_protocol_005_waiter_cap_supersedes_oldest() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "cap", "exec /bin/cat");
     let mut oldest = waiter(&daemon, &pane);
     armed(&daemon, &pane, 1);
@@ -408,14 +424,10 @@ fn inbox_protocol_005_waiter_cap_supersedes_oldest() {
 #[spec("inbox/protocol/006")]
 #[test]
 fn inbox_protocol_006_waiter_outlives_hook_idle_timeout() {
-    let daemon = common::spawn_daemon_serve_with_env(
-        None,
-        "0",
-        &[
-            ("DOT_AGENT_DECK_HOOK_IDLE_TIMEOUT_MS", "75"),
-            ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "100"),
-        ],
-    );
+    let daemon = daemon_with(&[
+        ("DOT_AGENT_DECK_HOOK_IDLE_TIMEOUT_MS", "75"),
+        ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "100"),
+    ]);
     let pane = pane(&daemon, "idle", "exec /bin/cat");
     let mut wait = waiter(&daemon, &pane);
     armed(&daemon, &pane, 1);
@@ -456,7 +468,7 @@ fn inbox_protocol_006_waiter_outlives_hook_idle_timeout() {
 #[spec("inbox/protocol/007")]
 #[test]
 fn inbox_protocol_007_waiter_eof_deregisters() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "eof", "exec /bin/cat");
     let first = waiter(&daemon, &pane);
     armed(&daemon, &pane, 1);
@@ -474,7 +486,7 @@ fn inbox_protocol_007_waiter_eof_deregisters() {
 #[spec("inbox/protocol/008")]
 #[test]
 fn inbox_protocol_008_legacy_unattested_pane_cannot_fetch_or_ack() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let event = json!({"session_id":"legacy-unattested-s2", "pane_id":"legacy-unattested",
         "agent_id":"legacy-agent", "agent_type":"claude_code", "event_type":"session_start",
         "timestamp":chrono::Utc::now(), "cwd":daemon.home});
@@ -505,7 +517,7 @@ fn inbox_protocol_008_legacy_unattested_pane_cannot_fetch_or_ack() {
 #[spec("inbox/protocol/009")]
 #[test]
 fn inbox_protocol_009_waiters_do_not_exhaust_hook_ingest_pool() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let mut waiters = Vec::new();
     let mut panes = Vec::new();
     for index in 0..5 {
@@ -536,7 +548,7 @@ fn inbox_protocol_009_waiters_do_not_exhaust_hook_ingest_pool() {
 #[spec("inbox/protocol/010")]
 #[test]
 fn inbox_protocol_010_stream_nack_redelivers_and_ack_confirms() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "stream", "exec /bin/cat");
     let mut req = request(&pane, "inbox_wait");
     req["component"] = json!("pi_extension");
@@ -572,11 +584,151 @@ fn inbox_protocol_010_stream_nack_redelivers_and_ack_confirms() {
     armed(&daemon, &pane, 0);
 }
 
+fn post(daemon: &DaemonProc, pane: &Pane, body: &str) -> String {
+    let reply = attach(
+        daemon,
+        json!({"op":"post-message", "pane_id":pane.id,
+        "expected_agent_id":pane.agent, "subject":"long task", "body":body,
+        "origin":"seed"}),
+    );
+    assert_eq!(reply["ok"], true, "post-message: {reply}");
+    reply["id"].as_str().expect("message id").to_string()
+}
+
+/// Scenario: Post a task far longer than the tightest agent budget, with its one directive at the very end, then fetch it within Codex's byte budget. The block must name a file the deck saved, owner-only, holding the whole task including the directive, so the part past the inline head is still reachable.
+#[spec("inbox/protocol/011")]
+#[test]
+fn inbox_protocol_011_oversized_post_is_saved_whole_and_named() {
+    let daemon = daemon();
+    let pane = pane(&daemon, "oversized", "exec /bin/cat");
+    let directive = "FINAL-DIRECTIVE-9d41: create the file oversized-sentinel.txt";
+    let body = format!(
+        "{}\n{directive}\n",
+        "background detail line\n".repeat(1_500)
+    );
+    let id = post(&daemon, &pane, &body);
+    let mut fetch = request(&pane, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    fetch["max_chars"] = json!(4_800);
+    fetch["max_bytes"] = json!(4_800);
+    fetch["ack"] = json!(false);
+    let reply = hook(&daemon, fetch);
+    let text = reply["messages"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("one block: {reply}"));
+    assert!(text.len() <= 4_800, "{} bytes", text.len());
+    assert!(
+        !text.contains(directive),
+        "the directive is past the inline head"
+    );
+    let named = text
+        .lines()
+        .find_map(|line| line.strip_prefix("The full message is in "))
+        .unwrap_or_else(|| panic!("the block must name where the rest is:\n{text}"));
+    let path = std::path::PathBuf::from(named.trim_end_matches('.'));
+    let saved = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the named file {path:?} must be readable: {e}"));
+    assert!(
+        saved.contains(directive),
+        "the saved file holds the whole task"
+    );
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+        0,
+        "owner-only"
+    );
+    state(&daemon, &pane, &id, "fetched");
+}
+
+/// Scenario: Stop a stand-in, start its replacement in the same pane and queue a task for the replacement. The predecessor's still-resolvable token then calls get-seed naming the replacement, and naming nobody; neither call may hand over or acknowledge the replacement's task, which its own token can still fetch.
+#[spec("inbox/protocol/012")]
+#[test]
+fn inbox_protocol_012_get_seed_never_fetches_for_another_generation() {
+    let daemon = daemon();
+    let old = pane(&daemon, "generations", "exec /bin/cat");
+    let reply = attach(&daemon, json!({"op":"stop-agent","id":old.agent}));
+    assert_eq!(reply["ok"], true, "stop old agent: {reply}");
+    let new = pane(&daemon, "generations", "exec /bin/cat");
+    assert_ne!(old.agent, new.agent);
+    let id = post(&daemon, &new, BODY);
+    for agent in [Some(new.agent.as_str()), None] {
+        let mut seed = json!({"message_type":"get_seed", "pane_id":old.id, "token":old.token});
+        if let Some(agent) = agent {
+            seed["agent_id"] = json!(agent);
+        }
+        let reply = hook(&daemon, seed);
+        assert!(
+            reply.get("seed").is_none_or(Value::is_null),
+            "a predecessor's get-seed took the replacement's task: {reply}"
+        );
+        state(&daemon, &new, &id, "queued");
+    }
+    let mut fetch = request(&new, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    fetch["max_chars"] = json!(9000);
+    fetch["ack"] = json!(true);
+    blocks(&hook(&daemon, fetch), &id);
+}
+
+/// Scenario: Run the daemon with the legacy warn provenance policy, queue a task for a token-bearing stand-in and call get-seed for its pane with no token. The unattested call must get no seed, and the task must stay Queued for its own agent.
+#[spec("inbox/protocol/013")]
+#[test]
+fn inbox_protocol_013_unattested_get_seed_hands_over_no_inbox_message() {
+    let daemon = daemon_with(&[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
+    let pane = pane(&daemon, "warned", "exec /bin/cat");
+    let id = post(&daemon, &pane, BODY);
+    for agent in [Some(pane.agent.as_str()), None] {
+        let mut seed = json!({"message_type":"get_seed", "pane_id":pane.id});
+        if let Some(agent) = agent {
+            seed["agent_id"] = json!(agent);
+        }
+        let reply = hook(&daemon, seed);
+        assert!(
+            reply.get("seed").is_none_or(Value::is_null),
+            "an unattested get-seed took a task: {reply}"
+        );
+        state(&daemon, &pane, &id, "queued");
+    }
+}
+
+/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane presents the pane's own token and agent id and tries to arm a stream, a once waiter and a Native announcement for it. Each must be refused as not the agent's process, nothing may arm, and the queued task stays Queued.
+#[spec("inbox/protocol/014")]
+#[test]
+fn inbox_protocol_014_a_process_outside_the_agent_cannot_arm_its_inbox() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let pane = pane(&daemon, "bound", "exec /bin/cat");
+    let id = post(&daemon, &pane, BODY);
+    for mode in ["stream", "once"] {
+        let mut req = request(&pane, "inbox_wait");
+        req["component"] = json!("pi_extension");
+        req["component_version"] = json!("synthetic");
+        req["mode"] = json!(mode);
+        req["pid"] = json!(pane.pid);
+        let reply = line(&mut connect(&daemon, &req));
+        assert_eq!(
+            reply["refused"], "inbox_not_agent_process",
+            "{mode}: {reply}"
+        );
+        assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
+    }
+    let mut announce = request(&pane, "inbox_announce");
+    announce["component"] = json!("claude_hooks");
+    announce["component_version"] = json!("synthetic");
+    announce["wake"] = json!("native");
+    announce["pid"] = json!(pane.pid);
+    let reply = hook(&daemon, announce);
+    assert_eq!(reply["accepted"], false, "{reply}");
+    assert_eq!(reply["reason"], "inbox_not_agent_process", "{reply}");
+    armed(&daemon, &pane, 0);
+    state(&daemon, &pane, &id, "queued");
+}
+
 /// Scenario: Enqueue a task for a scripted agent pane and release it to run the real inbox fetch command using its injected identity. Its captured output must contain the session framing and complete message block; both the wire listing and inbox list CLI must show Acknowledged.
 #[spec("inbox/cli/001")]
 #[test]
 fn inbox_cli_001_in_pane_fetch_frames_and_acknowledges() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let script = daemon.home.join("fetch.sh");
     std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f fetch-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox fetch > fetch.stdout 2> fetch.stderr\nprintf '%s' \"$?\" > fetch.exit\nexec /bin/cat\n").unwrap();
     // Quote only fixture-owned paths; the binary path contains no shell code.
@@ -631,7 +783,7 @@ fn inbox_cli_001_in_pane_fetch_frames_and_acknowledges() {
 #[spec("inbox/cli/002")]
 #[test]
 fn inbox_cli_002_claude_waiter_exits_two_with_stderr() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "claude-wait", "exec /bin/cat");
     let child = BoundedChild::start(
         &mut cli(
@@ -671,7 +823,7 @@ fn inbox_cli_002_claude_waiter_exits_two_with_stderr() {
 #[spec("inbox/cli/003")]
 #[test]
 fn inbox_cli_003_waiter_without_deck_or_daemon_is_quiet() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let hook_json =
         br#"{"session_id":"outside-s2", "source":"startup", "hook_event_name":"SessionStart"}"#;
     let result = BoundedChild::start(
@@ -735,7 +887,7 @@ fn mock_waiter_reply(daemon: &DaemonProc, pane: &Pane, path: &Path, reply: Optio
 #[spec("inbox/cli/004")]
 #[test]
 fn inbox_cli_004_non_delivery_replies_never_wake() {
-    let daemon = common::spawn_daemon_serve(None, "0");
+    let daemon = daemon();
     let pane = pane(&daemon, "quiet", "exec /bin/cat");
     for (index, reply) in [
         Some(r#"{"superseded":true}"#),

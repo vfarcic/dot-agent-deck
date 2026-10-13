@@ -1652,6 +1652,12 @@ impl std::fmt::Debug for AgentOwnershipOracle {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// PRD #1666 hardening H3: per pane, how many events have changed what the
+    /// doorbell reads of it ([`Self::doorbell_view`]). A doorbell admission is
+    /// bound to this count ([`Self::doorbell_admission`]), so any status change
+    /// between the doorbell's decision and its write — a dialog, a turn — voids
+    /// it.
+    pane_event_epochs: HashMap<String, u64>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Issue #1507: per pane, the daemon registry id its card-surfacing
@@ -2069,6 +2075,13 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
+
+/// PRD #1666 hardening H3: what [`AppState::doorbell_admission`] grants — a
+/// pane fit for the doorbell, as of one event count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoorbellAdmission {
+    epoch: u64,
+}
 
 /// Bytes of the human-readable half of a role slug that survive into the
 /// suggested report path. #303 round-3 (auditor finding 5): nothing bounds a
@@ -2849,16 +2862,16 @@ pub(crate) fn inline_report_text(summary: &str) -> (String, bool) {
 /// * control characters other than newline and tab, and the bidi and invisible
 ///   marks [`rewrites_how_text_reads`] names, are dropped, since they can hide
 ///   or reorder text without changing what it says. CRLF is normalised to LF
-///   first so the dropped CR does not fuse two lines.
+///   first so the dropped CR does not fuse two lines;
+/// * the deck's own message opener, closer and `Sent by:` label are then
+///   neutralised in every case and spacing ([`neutralise_message_markers`],
+///   PRD #1666 hardening M1), so a report saved to a file cannot carry one any
+///   more than an inline report can.
 ///
 /// Advisory, like every frame here: the recipient is an LLM following a
 /// pointer, so this is defence in depth rather than a parser boundary.
 pub(crate) fn frame_untrusted_report_for_file(summary: &str) -> String {
-    let kept: String = summary
-        .replace("\r\n", "\n")
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !rewrites_how_text_reads(*c))
-        .collect();
+    let kept = neutralise_message_markers(&normalise_untrusted_text(summary));
     // `to_ascii_uppercase` changes no byte length, so an offset found in the
     // uppercased copy is the same offset in the original — and the match is
     // ASCII, so its span is a char boundary in both.
@@ -2882,6 +2895,46 @@ pub(crate) fn frame_untrusted_report_for_file(summary: &str) -> String {
         "\n"
     };
     format!("{REPORT_FRAME_OPEN}\n{body}{separator}{REPORT_FRAME_CLOSE}\n")
+}
+
+/// Text another agent wrote, made safe to read as written: CRLF becomes LF,
+/// and every control character other than newline and tab, plus the
+/// bidi and invisible marks [`rewrites_how_text_reads`] names, is dropped.
+/// A lone CR is dropped with the other controls. Run BEFORE anything looks for
+/// a marker in the text (hardening M1): a marker split by an invisible
+/// character would otherwise pass a check and then be reassembled by this very
+/// step.
+pub(crate) fn normalise_untrusted_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !rewrites_how_text_reads(*c))
+        .collect()
+}
+
+/// PRD #1666 hardening M1: neutralise every spelling of the deck's message
+/// opener, closer and provenance label (`Sent by:`) in `text` — ASCII case and
+/// the whitespace between words ignored — so a body or report cannot close its
+/// block, open one that reads as the deck's, or forge the line that says who
+/// sent it. Call it on [`normalise_untrusted_text`]'s output; the one helper
+/// serves the inline renderer ([`crate::inbox_hub::render`]) and every saved
+/// report file ([`frame_untrusted_report_for_file`]). Idempotent.
+pub(crate) fn neutralise_message_markers(text: &str) -> String {
+    static CLOSER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\[\s*end\s+of\s+dot-agent-deck\s+message\b")
+            .expect("the closer pattern is valid")
+    });
+    static OPENER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\[\s*dot-agent-deck\s+message\b")
+            .expect("the opener pattern is valid")
+    });
+    static PROVENANCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bsent\s+by\s*:").expect("the provenance pattern is valid")
+    });
+    let text = CLOSER.replace_all(text, "[end of dot-agent-deck quoted-message");
+    let text = OPENER.replace_all(&text, "[dot-agent-deck quoted-message");
+    PROVENANCE
+        .replace_all(&text, "Quoted sent-by:")
+        .into_owned()
 }
 
 /// [`save_full_report`] on tokio's blocking pool, for the two async delivery
@@ -3560,19 +3613,29 @@ pub(crate) fn truncation_notice(
 /// plus which directory's `.dot-agent-deck/` holds it (PR #1341 review — see
 /// [`truncation_notice`]). Shared with the #331 diverted-report pointer so the
 /// two cannot drift apart.
-fn describe_saved_report_location(path: &std::path::Path, saved_in: &str) -> String {
+///
+/// PRD #1666 hardening H1: the file name is held to the same test. The deck
+/// mints the names it saves under, but an attach client may name its own file
+/// for a posted message, so a name that is not inert is not spelled out either.
+pub(crate) fn describe_saved_report_location(path: &std::path::Path, saved_in: &str) -> String {
+    let inert = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| !c.is_whitespace() && !is_frame_breaking(c))
+    };
     let shown = path.display().to_string();
-    if shown
-        .chars()
-        .all(|c| !c.is_whitespace() && !is_frame_breaking(c))
-    {
+    if inert(&shown) {
         return shown;
     }
-    let name = path
+    match path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    format!("{name} in the .dot-agent-deck directory of {saved_in}")
+        .filter(|name| inert(name))
+    {
+        Some(name) => format!("{name} in the .dot-agent-deck directory of {saved_in}"),
+        None => format!("a file in the .dot-agent-deck directory of {saved_in}"),
+    }
 }
 
 /// PRD #126: the single-line prompt the daemon submits into the orchestrator's
@@ -11891,6 +11954,50 @@ impl AppState {
             })
     }
 
+    /// PRD #1666 hardening H3: everything about `pane_id`'s sessions that
+    /// [`Self::doorbell_admission`] reads — each session's agent, status,
+    /// writability and whether a wrapper fork is starting. An event that
+    /// changes none of it (a wrapper's output frame, a repeated Idle) leaves an
+    /// admission standing; any other voids it.
+    fn doorbell_view(
+        &self,
+        pane_id: &str,
+    ) -> Vec<(String, Option<String>, SessionStatus, Writable, bool)> {
+        let mut view: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.agent_id.clone(),
+                    s.status.clone(),
+                    s.writable(),
+                    s.recent_events
+                        .back()
+                        .is_some_and(|event| event.is_wrapper_fork_session_start()),
+                )
+            })
+            .collect();
+        view.sort_by(|a, b| a.0.cmp(&b.0));
+        view
+    }
+
+    /// PRD #1666 hardening H3: whether the doorbell may write to `agent_id` in
+    /// `pane_id` now — Idle by its own hooks ([`Self::agent_doorbell_idle`])
+    /// and taking live input — and, when it may, the admission that says so.
+    /// The admission is bound to the pane's change count, so the writer can ask
+    /// again right before each byte and get the SAME admission back only when
+    /// nothing the doorbell reads has changed since the decision — not even a
+    /// turn that started and ended in between.
+    pub fn doorbell_admission(&self, agent_id: &str, pane_id: &str) -> Option<DoorbellAdmission> {
+        (self.agent_doorbell_idle(agent_id, pane_id)
+            && self.pane_writable(pane_id) == Writable::Live)
+            .then(|| DoorbellAdmission {
+                epoch: self.pane_event_epochs.get(pane_id).copied().unwrap_or(0),
+            })
+    }
+
     pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
         self.sessions
             .values()
@@ -16017,7 +16124,13 @@ impl AppState {
     ) -> AppliedEvent {
         self.applied_unproven = false;
         let pane_id = event.pane_id.clone();
+        let doorbell_view_before = pane_id.as_deref().map(|pane| self.doorbell_view(pane));
         let applied = self.apply_event_unsettled(event, attested_agent);
+        if let (Some(pane_id), Some(before)) = (&pane_id, doorbell_view_before)
+            && self.doorbell_view(pane_id) != before
+        {
+            *self.pane_event_epochs.entry(pane_id.clone()).or_default() += 1;
+        }
         if let Some(pane_id) = pane_id {
             self.carry_card_inbox(&pane_id);
         }

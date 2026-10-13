@@ -484,7 +484,7 @@ fn opencode_009_only_mini_stream_nudges_without_losing_scrollback_or_geometry() 
         "claude_waiter",
         "opencode_mini",
     ] {
-        let daemon = daemon(&[("DOT_AGENT_DECK_REPAINT_NUDGE_GAP_MS", "300")]);
+        let daemon = daemon_unbound(&[("DOT_AGENT_DECK_REPAINT_NUDGE_GAP_MS", "300")]);
         let script = daemon.home.join("size-probe.py");
         let base = daemon.home.join("probe");
         std::fs::write(&script,r#"import os,sys,tty,termios,signal,json,time
@@ -617,7 +617,7 @@ while os.read(0,4096):pass
 #[test]
 fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
     for component in ["opencode_plugin", "opencode_mini"] {
-        let daemon = daemon(&[]);
+        let daemon = daemon_unbound(&[]);
         let pane = pane(&daemon, "unarmed-opencode");
         status(&daemon, &pane, "idle", "opencode");
         let mut req = request(&pane, "inbox_announce");
@@ -634,11 +634,13 @@ fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
     }
 }
 
-/// Scenario: Submit the fixed doorbell through the generated server plugin and inspect the original text-parts array that OpenCode saves for the model. Fetch without acknowledgement, abort before any assistant starts and require redelivery, then acknowledge only the matching assistant child; recalling a handled doorbell must leave a newer task untouched.
+/// Scenario: Submit the fixed doorbell through the generated server plugin, loaded in a worker thread as the full TUI loads it, and inspect the original text-parts array that OpenCode saves for the model. Fetch without acknowledgement, abort before any assistant starts and require redelivery, then acknowledge only the matching assistant child; recalling a handled doorbell must leave a newer task untouched.
 #[spec("inbox/opencode/011")]
 #[test]
 fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
-    let op = OpenCode::new("session", json!({"server":true,"argv":["run"]}));
+    // Hardening M2: interception runs only in the managed interactive
+    // OpenCode — the full TUI's worker or `--mini` — never under `run`.
+    let op = OpenCode::new("session", json!({"server":true,"worker":true}));
     let id = op.post();
     op.control(json!({"doorbell":fixed_line(&id)}));
     op.wait_kind("intercepted");

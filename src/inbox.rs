@@ -50,6 +50,12 @@ pub const DEFAULT_MAX_MESSAGES: usize = 4096;
 pub const DEFAULT_MAX_BODY_BYTES: usize = crate::bounded_read::MAX_TASK_BYTES as usize;
 /// Acknowledged or undeliverable messages kept per pane for listing.
 pub const DEFAULT_HISTORY_PER_PANE: usize = 64;
+/// Hardening M3: see [`InboxLimits::max_history_messages`].
+pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 1024;
+/// Hardening M3: see [`InboxLimits::max_history_bytes`].
+pub const DEFAULT_MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+/// Hardening M3: see [`InboxLimits::history_body_ttl`].
+pub const DEFAULT_HISTORY_BODY_TTL: Duration = Duration::from_secs(60 * 60);
 /// How long a message id is remembered for dedup.
 pub const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// How many message ids are remembered for dedup.
@@ -639,6 +645,13 @@ pub struct InboxLimits {
     pub default_claim_ttl: Duration,
     pub min_claim_ttl: Duration,
     pub max_claim_ttl: Duration,
+    /// Hardening M3: acknowledged and undeliverable messages kept deck-wide.
+    pub max_history_messages: usize,
+    /// Hardening M3: body bytes of those messages kept deck-wide.
+    pub max_history_bytes: usize,
+    /// Hardening M3: how long a terminal message keeps its body for
+    /// diagnostics; its summary stays until it leaves the history.
+    pub history_body_ttl: Duration,
 }
 
 impl Default for InboxLimits {
@@ -657,6 +670,9 @@ impl Default for InboxLimits {
             default_claim_ttl: DEFAULT_CLAIM_TTL,
             min_claim_ttl: DEFAULT_MIN_CLAIM_TTL,
             max_claim_ttl: MAX_CLAIM_TTL,
+            max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
+            history_body_ttl: DEFAULT_HISTORY_BODY_TTL,
         }
     }
 }
@@ -700,6 +716,9 @@ impl InboxLimits {
             default_claim_ttl: d.default_claim_ttl.max(min_claim_ttl),
             min_claim_ttl,
             max_claim_ttl: d.max_claim_ttl.max(min_claim_ttl),
+            max_history_messages: d.max_history_messages,
+            max_history_bytes: d.max_history_bytes,
+            history_body_ttl: d.history_body_ttl,
         }
     }
 }
@@ -894,6 +913,7 @@ impl Inbox {
             &content,
             body,
         );
+        self.trim_history(now);
         Ok(id)
     }
 
@@ -936,6 +956,7 @@ impl Inbox {
                 body.clone(),
             );
         }
+        self.trim_history(now);
         Ok(Published {
             id,
             delivered_to: room.len(),
@@ -1145,7 +1166,7 @@ impl Inbox {
                     }
                 } else {
                     self.transition(index, now, MessageState::Acknowledged { at: now, how });
-                    self.trim_history();
+                    self.trim_history(now);
                     AckOutcome::Acknowledged
                 }
             }
@@ -1163,7 +1184,7 @@ impl Inbox {
             return false;
         }
         self.redeliver(index, now);
-        self.trim_history();
+        self.trim_history(now);
         true
     }
 
@@ -1180,7 +1201,7 @@ impl Inbox {
         for &index in &indices {
             self.redeliver(index, now);
         }
-        self.trim_history();
+        self.trim_history(now);
         indices.len()
     }
 
@@ -1202,7 +1223,7 @@ impl Inbox {
                         how: AckHow::OfferCompleted,
                     },
                 );
-                self.trim_history();
+                self.trim_history(now);
                 ClaimOutcome::Completed
             }
             Err(outcome) => outcome,
@@ -1221,7 +1242,7 @@ impl Inbox {
         match self.claimed_by(id, pane_id, agent_id) {
             Ok(index) => {
                 self.return_offer(index, now);
-                self.trim_history();
+                self.trim_history(now);
                 ClaimOutcome::Released
             }
             Err(outcome) => outcome,
@@ -1259,7 +1280,7 @@ impl Inbox {
                 );
             }
         }
-        self.trim_history();
+        self.trim_history(now);
     }
 
     /// Retire a message that is not yet acknowledged, for `reason`. Returns
@@ -1279,7 +1300,7 @@ impl Inbox {
             return false;
         };
         self.transition(index, now, MessageState::Undeliverable { at: now, reason });
-        self.trim_history();
+        self.trim_history(now);
         true
     }
 
@@ -1301,7 +1322,7 @@ impl Inbox {
                 _ => {}
             }
         }
-        self.trim_history();
+        self.trim_history(now);
         self.expire_dedup(now);
         self.rate.retain(|_, times| {
             while times
@@ -1371,6 +1392,14 @@ impl Inbox {
             .iter()
             .filter(|m| !m.state.is_terminal())
             .count()
+    }
+
+    /// Hardening M3: drop `pane_id`'s acknowledged and undeliverable history,
+    /// once the pane is closed. Live messages are untouched.
+    pub fn forget_pane_history(&mut self, pane_id: &str) {
+        self.messages.retain(|m| {
+            !m.state.is_terminal() || m.recipient.as_ref().is_none_or(|r| r.pane_id != pane_id)
+        });
     }
 
     pub fn drain_events(&mut self) -> Vec<InboxEvent> {
@@ -1490,17 +1519,25 @@ impl Inbox {
         content: &Content,
         body: Arc<str>,
     ) {
+        // Hardening M3: what travels beside the body is bounded here, where
+        // it is stored, so the deck's memory bound is not a body-only one.
         let message = Message {
             id,
             kind,
             to,
             recipient,
-            from: content.from.clone(),
-            subject: content.subject.clone(),
+            from: capped_sender(&content.from),
+            subject: capped_subject(&content.subject),
             body,
             body_trust: content.body_trust,
-            spill_path: content.spill_path.clone(),
-            preface: content.preface.clone(),
+            spill_path: content
+                .spill_path
+                .clone()
+                .filter(|path| path.as_os_str().len() <= MAX_STORED_PATH_BYTES),
+            preface: content
+                .preface
+                .as_deref()
+                .map(|preface| cut_bytes(preface, MAX_STORED_PREFACE_BYTES).to_string()),
             created_at: now,
             state: MessageState::Queued,
             deliveries: 0,
@@ -1616,31 +1653,117 @@ impl Inbox {
     /// per pane (offers that ended in their pool count as one more "pane"),
     /// dropping the oldest. Run at the end of every operation that can end a
     /// message, never inside one, so no index an operation holds moves.
-    fn trim_history(&mut self) {
+    ///
+    /// PRD #1666 hardening M3: and bound the history deck-wide too — at most
+    /// [`InboxLimits::max_history_messages`] messages and
+    /// [`InboxLimits::max_history_bytes`] of their bodies, oldest dropped
+    /// first — and drop the body of a message that ended longer than
+    /// [`InboxLimits::history_body_ttl`] ago, keeping its summary. Live
+    /// messages are never touched.
+    fn trim_history(&mut self, now: Instant) {
+        let ttl = self.limits.history_body_ttl;
+        for m in self.messages.iter_mut().filter(|m| m.state.is_terminal()) {
+            let ended = m.history.last().map_or(m.created_at, |(at, _)| *at);
+            if !m.body.is_empty() && now.saturating_duration_since(ended) >= ttl {
+                m.body = Arc::from("");
+            }
+        }
         let limit = self.limits.history_per_pane;
         let holder = |m: &Message| m.recipient.as_ref().map(|r| r.pane_id.clone());
         let mut excess: HashMap<Option<String>, usize> = HashMap::new();
         for m in self.messages.iter().filter(|m| m.state.is_terminal()) {
             *excess.entry(holder(m)).or_default() += 1;
         }
-        if excess.values().all(|n| *n <= limit) {
+        if excess.values().any(|n| *n > limit) {
+            for n in excess.values_mut() {
+                *n = n.saturating_sub(limit);
+            }
+            self.messages.retain(|m| {
+                if !m.state.is_terminal() {
+                    return true;
+                }
+                match excess.get_mut(&holder(m)) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        }
+        let (mut count, mut bytes) = self
+            .messages
+            .iter()
+            .filter(|m| m.state.is_terminal())
+            .fold((0usize, 0usize), |(n, b), m| (n + 1, b + m.body.len()));
+        if count <= self.limits.max_history_messages && bytes <= self.limits.max_history_bytes {
             return;
         }
-        for n in excess.values_mut() {
-            *n = n.saturating_sub(limit);
-        }
+        let (max_count, max_bytes) = (
+            self.limits.max_history_messages,
+            self.limits.max_history_bytes,
+        );
         self.messages.retain(|m| {
-            if !m.state.is_terminal() {
+            if !m.state.is_terminal() || (count <= max_count && bytes <= max_bytes) {
                 return true;
             }
-            match excess.get_mut(&holder(m)) {
-                Some(n) if *n > 0 => {
-                    *n -= 1;
-                    false
-                }
-                _ => true,
-            }
+            count -= 1;
+            bytes -= m.body.len();
+            false
         });
+    }
+}
+
+/// Hardening M3: the most of a subject the inbox stores, in characters.
+const MAX_STORED_SUBJECT_CHARS: usize = 200;
+
+/// Hardening M3: the most of a preface the inbox stores, in bytes.
+const MAX_STORED_PREFACE_BYTES: usize = 8 * 1024;
+
+/// Hardening M3: the most of a sender's reason, role or orchestration name
+/// the inbox stores, in bytes.
+const MAX_STORED_LABEL_BYTES: usize = 256;
+
+/// Hardening M3: a spill path longer than this is not a path any agent could
+/// open, and is not stored.
+const MAX_STORED_PATH_BYTES: usize = 4096;
+
+/// The longest prefix of `text` within `max` bytes, cut at a char boundary.
+fn cut_bytes(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// A subject as stored: one line, at most [`MAX_STORED_SUBJECT_CHARS`].
+fn capped_subject(subject: &str) -> String {
+    let one_line: String = subject
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::untrusted_text::label_line(one_line.trim(), MAX_STORED_SUBJECT_CHARS)
+}
+
+/// A sender as stored, its free-text names bounded.
+fn capped_sender(from: &Sender) -> Sender {
+    let cap = |text: &str| cut_bytes(text, MAX_STORED_LABEL_BYTES).to_string();
+    match from {
+        Sender::Deck { reason } => Sender::Deck {
+            reason: cap(reason),
+        },
+        Sender::Agent {
+            pane_id,
+            agent_id,
+            role,
+            orchestration,
+        } => Sender::Agent {
+            pane_id: pane_id.clone(),
+            agent_id: agent_id.clone(),
+            role: role.as_deref().map(cap),
+            orchestration: orchestration.as_deref().map(cap),
+        },
     }
 }
 
@@ -2824,6 +2947,102 @@ mod tests {
                 &to,
             )
             .unwrap();
+    }
+
+    /// Hardening M3: terminal history is bounded deck-wide, not only per
+    /// pane: acknowledged messages left behind by many short-lived panes stay
+    /// within the deck's history bound, newest kept, and no live message is
+    /// ever trimmed.
+    #[test]
+    fn history_is_bounded_across_panes() {
+        let t0 = Instant::now();
+        let mut inbox = inbox_with(InboxLimits::default());
+        let live = inbox
+            .post_direct(t0, Recipient::bound("live", "agent-live"), from_deck())
+            .unwrap();
+        let mut newest = None;
+        for pane in 0..40 {
+            let pane = format!("short-lived-{pane}");
+            for _ in 0..64 {
+                let id = inbox
+                    .post_direct(t0, Recipient::bound(&pane, "agent"), from_deck())
+                    .unwrap();
+                inbox.ack(t0, id.as_str(), &pane, "agent", AckHow::Explicit);
+                newest = Some(id);
+            }
+        }
+        let terminal = inbox.all().iter().filter(|m| m.state.is_terminal()).count();
+        assert!(terminal <= 1_024, "{terminal} terminal messages kept");
+        assert!(inbox.all().iter().any(|m| m.id == live));
+        assert!(inbox.all().iter().any(|m| Some(&m.id) == newest.as_ref()));
+    }
+
+    /// Hardening M3: retained history is bounded in bytes, a terminal
+    /// message's body is dropped once its diagnostic lifetime ends, and a
+    /// closed pane's history goes with it.
+    #[test]
+    fn history_bytes_body_lifetime_and_closed_panes_are_bounded() {
+        let t0 = Instant::now();
+        let mut inbox = inbox_with(InboxLimits {
+            max_history_bytes: 1_000,
+            history_body_ttl: Duration::from_secs(60),
+            ..InboxLimits::default()
+        });
+        let body = |n: usize| Content {
+            body: "b".repeat(n),
+            ..from_deck()
+        };
+        for _ in 0..5 {
+            let id = inbox.post_direct(t0, worker(), body(400)).unwrap();
+            inbox.ack(t0, id.as_str(), "2", "agent-w1", AckHow::Explicit);
+        }
+        let kept: usize = inbox
+            .all()
+            .iter()
+            .filter(|m| m.state.is_terminal())
+            .map(|m| m.body.len())
+            .sum();
+        assert!(kept <= 1_000, "{kept} bytes of history kept");
+        let later = t0 + Duration::from_secs(61);
+        let live = inbox.post_direct(later, worker(), body(10)).unwrap();
+        assert!(
+            inbox
+                .all()
+                .iter()
+                .filter(|m| m.state.is_terminal())
+                .all(|m| m.body.is_empty()),
+            "terminal bodies past their lifetime are dropped"
+        );
+        inbox.forget_pane_history("2");
+        let left: Vec<_> = inbox.list("2").iter().map(|m| m.id.clone()).collect();
+        assert_eq!(left, vec![live], "only the live message is left");
+    }
+
+    /// Hardening M3: what a producer supplies beside the body is bounded and
+    /// made one line when it is stored.
+    #[test]
+    fn message_metadata_is_capped_when_stored() {
+        let t0 = Instant::now();
+        let mut inbox = inbox_with(InboxLimits::default());
+        let content = Content {
+            subject: format!("line one\nline two {}", "s".repeat(10_000)),
+            preface: Some("p".repeat(100_000)),
+            from: Sender::Deck {
+                reason: format!("schedule:{}", "r".repeat(10_000)),
+            },
+            spill_path: Some(PathBuf::from("/".to_string() + &"d".repeat(10_000))),
+            ..from_deck()
+        };
+        let id = inbox.post_direct(t0, worker(), content).unwrap();
+        let stored = inbox.get(id.as_str(), "2").unwrap();
+        assert!(!stored.subject.contains('\n'), "{:?}", stored.subject);
+        assert!(stored.subject.chars().count() <= 200);
+        assert!(stored.preface.as_ref().unwrap().len() <= 8 * 1024);
+        match &stored.from {
+            Sender::Deck { reason } => assert!(reason.len() <= 256),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(stored.spill_path, None, "an oversized path is not kept");
     }
 
     /// Scenario: Acknowledge more messages for one pane than its history ring
