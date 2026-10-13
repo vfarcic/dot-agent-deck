@@ -362,7 +362,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 # dependencies: wry and tauri build on these on Windows and the lockfile
 # carries one of each.
 webview2-com = "0.39"
-windows-core = "0.62"
+windows-core = "0.100"
 
 # PRD #1401's sign-out on macOS: `removeDataOfTypes:modifiedSince:completionHandler:`
 # on the webview's `WKWebsiteDataStore` with a handler of our own (wry's is
