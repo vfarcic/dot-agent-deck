@@ -60,7 +60,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
 
       - name: Build site
         run: cargo xtask site site/build/public

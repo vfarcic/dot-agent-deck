@@ -2304,11 +2304,15 @@ mod tests {
     /// with 600 ms before it and 900 ms after — what a finished segment holds.
     fn spoken(fixture: &[u8], peak: f64, room: f64, seed: u32) -> Pcm16 {
         let speech: Vec<f64> = fixture
-            .chunks_exact(2)
-            .map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f64::from(i16::from_le_bytes(*pair)))
             .collect();
         let loudest = speech
-            .chunks_exact(320)
+            .as_chunks::<320>()
+            .0
+            .iter()
             .map(|frame| (frame.iter().map(|s| s * s).sum::<f64>() / 320.0).sqrt())
             .fold(0.0, f64::max);
         let gain = peak / loudest.max(1.0);
@@ -2605,8 +2609,10 @@ mod tests {
         );
         let raw = std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
         let samples: Vec<i16> = raw
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair))
             .collect();
         let audio = Pcm16::new(samples);
         assert!(

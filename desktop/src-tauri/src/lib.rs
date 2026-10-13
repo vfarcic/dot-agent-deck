@@ -2656,12 +2656,12 @@ async fn desktop_set_settings(
             apply_selection(&app, &state),
         )
         .await;
-    Err(crate::dto::DesktopSettingsSaveError::Partial(
+    Err(crate::dto::DesktopSettingsSaveError::Partial(Box::new(
         crate::dto::DesktopPartialSettingsSave {
             message,
             written: disk,
         },
-    ))
+    )))
 }
 
 /// Rename a remote deck (issue #1426) and return the settings as they are now
@@ -2734,12 +2734,12 @@ async fn desktop_rename_deck(
             state.saved_selections.publish(&disk);
             drop(order);
             apply_selection(&app, &state).await;
-            return Err(crate::dto::DesktopSettingsSaveError::Partial(
+            return Err(crate::dto::DesktopSettingsSaveError::Partial(Box::new(
                 crate::dto::DesktopPartialSettingsSave {
                     message,
                     written: disk,
                 },
-            ));
+            )));
         }
         Err(error) => return Err(rename_error_message(error).into()),
     };

@@ -8,12 +8,12 @@
     "openstackclient":              "10.3.0",
     "gh":                           "2.102.0",
     "asciinema":                    "3.2.1",
-    "cargo-nextest":                "0.9.143",
-    "rustc":                        "1.97.1",
-    "cargo":                        "1.97.1",
-    "clippy":                       "1.97.1",
+    "cargo-nextest":                "0.9.146",
+    "rustc":                        "1.98.1",
+    "cargo":                        "1.98.1",
+    "clippy":                       "1.98.1",
     "mold":                         "2.42.1",
-    "rustfmt":                      "1.97.1",
+    "rustfmt":                      "1.98.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",
     "ffmpeg":                       "9.0.1",
@@ -24,7 +24,7 @@
     "github:NixOS/nixpkgs/nixos-26.05#nodejs_24": {
       "disable_plugin": true
     },
-    "pnpm":                       "11.22.0",
+    "pnpm":                       "11.25.0",
     "netlify-cli":                "23.15.0",
     "pkg-config":                 "0.29.2",
     "path:tauri-deps#tauri-deps": ""
