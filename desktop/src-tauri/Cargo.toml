@@ -336,6 +336,8 @@ zbus = "5"
 # webview is moved into a `GtkOverlay` over the main one. NOT a new dependency:
 # `tauri`, `tao` and `wry` all build on this `gtk` on Linux and the lockfile
 # carries one 0.18. Declared for the discipline the `zbus` entry states.
+# renovate.json holds this, `webkit2gtk`, `webview2-com` and `windows-core` to
+# patch updates: they move by hand, in the Tauri upgrade that moves them.
 gtk = "0.18"
 # PRD #1401's sign-out: `webkit_website_data_manager_clear` with its completion
 # callback, which wry's `clear_all_browsing_data` calls but discards, so the
@@ -360,7 +362,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 # PRD #1401's sign-out: `ICoreWebView2Profile2::ClearBrowsingDataAll` with a
 # completion handler that reports its status (wry's discards it). NOT new
 # dependencies: wry and tauri build on these on Windows and the lockfile
-# carries one of each.
+# carries one of each. Held to patch updates by renovate.json, as `gtk` is.
 webview2-com = "0.39"
 windows-core = "0.62"
 

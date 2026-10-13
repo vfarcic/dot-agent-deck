@@ -9,6 +9,7 @@
 //! cover.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -84,7 +85,17 @@ pub fn verify_checksum(
 pub fn file_sha256(path: &Path) -> std::io::Result<String> {
     let mut file = super::execute::open_no_follow(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    // sha2 0.11's hashers no longer implement `io::Write`, so `io::copy` into
+    // one does not compile: feed it a bounded buffer at a time instead.
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(hasher
         .finalize()
         .iter()
@@ -685,6 +696,32 @@ mod tests {
         let err = rehash(&staged, &digest).unwrap_err();
         assert!(matches!(err, UpgradeError::StagedChanged { .. }), "{err:?}");
         assert!(err.to_string().contains("was not installed"), "{err}");
+    }
+
+    /// Pinned digests, so a change of hashing crate or of how a file is read
+    /// cannot change what a manifest is compared against. One file is larger
+    /// than [`file_sha256`]'s read buffer and not a multiple of it, so its
+    /// digest covers several reads and a short last one.
+    #[test]
+    fn verify_015_digests_match_known_sha256_values() {
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        const MILLION_A: &str = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+        assert_eq!(sha256_hex(b""), EMPTY);
+        assert_eq!(sha256_hex(b"abc"), ABC);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, Vec<u8>, &str); 3] = [
+            ("empty", Vec::new(), EMPTY),
+            ("abc", b"abc".to_vec(), ABC),
+            ("million-a", vec![b'a'; 1_000_000], MILLION_A),
+        ];
+        for (name, bytes, expected) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(file_sha256(&path).unwrap(), expected, "{name}");
+            assert_eq!(sha256_hex(&bytes), expected, "{name}");
+        }
     }
 
     #[cfg(unix)]

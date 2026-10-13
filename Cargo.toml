@@ -107,7 +107,7 @@ getrandom = "0.4"
 # release's checksum manifest before `dot-agent-deck upgrade` replaces
 # anything. Already in this workspace's lockfile (the desktop crate's graph
 # carries 0.10.9), so the version resolves to code the workspace builds today.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
