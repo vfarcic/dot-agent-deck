@@ -8521,7 +8521,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
-- **Asserts:** Needs Input and a pending held Permission question; permission labels match the visible menu; no sentinel before approval; one client-library `AnswerQuestion` creates the unique sentinel and the agent finishes Idle.
+- **Asserts:** Needs Input and a pending held Permission question; permission labels match the visible menu, and No's number matches the screen's, one higher where the screen leaves out "Yes, and switch to auto mode" (PR #1698: the payload does not say whether Claude draws it); no sentinel before approval; one client-library `AnswerQuestion` creates the unique sentinel and the agent finishes Idle.
 - **Does not assert:** desktop voice recognition or the always-allow confirmation.
 - **Platform coverage:** mac+linux.
 
@@ -8535,7 +8535,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 ##### question/live/003 — Keyboard denial clears a held Claude question and rejects a late answer.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Haiku Claude Code.
-- **Asserts:** keyboard `3` denies the visible permission, the snapshot clears, a late client answer is refused `NoPendingQuestion`, and the sentinel stays absent.
+- **Asserts:** typing the number Claude draws beside No (3, or one less than the deck's when the screen leaves out the auto-mode option the deck lists) denies the visible permission, the snapshot clears, a late client answer is refused `NoPendingQuestion`, and the sentinel stays absent.
 - **Does not assert:** a keyboard allow or another client's simultaneous answer.
 - **Platform coverage:** mac+linux.
 

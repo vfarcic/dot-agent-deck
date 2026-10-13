@@ -33,6 +33,27 @@ fn submit_claude(deck: &TuiDeck, id: &str, prompt: &str, probe: &str) {
     deck.submit_claude_prompt(&events, id, prompt, probe);
 }
 
+/// The number Claude Code draws beside No. The deck lists Claude's "Yes, and
+/// switch to auto mode", keyboard-only, wherever the payload says a Bash prompt
+/// may draw it (PR #1698); Claude draws it only where auto mode is available
+/// to the account, which the payload does not say. Where the screen has none,
+/// No sits one number lower than the deck's — the side on which the screen's
+/// number for No names the keyboard-only entry and is refused, rather than
+/// naming another option.
+fn screen_no(deck: &TuiDeck, q: &dot_agent_deck::question::PendingQuestion) -> u32 {
+    let options = &q.questions[0].options;
+    let no = options.last().unwrap().index;
+    visible(deck, "Esc to cancel");
+    let listed = options
+        .iter()
+        .any(|o| o.label == "Yes, and switch to auto mode" && o.keyboard_only);
+    if listed && !deck.snapshot_grid().contains("switch to auto mode") {
+        no - 1
+    } else {
+        no
+    }
+}
+
 fn assert_claude_permission(deck: &TuiDeck, q: &dot_agent_deck::question::PendingQuestion) {
     assert_eq!(q.channel, AnswerChannel::Held);
     let options = &q.questions[0].options;
@@ -41,7 +62,7 @@ fn assert_claude_permission(deck: &TuiDeck, q: &dot_agent_deck::question::Pendin
     assert_eq!(options.last().unwrap().label, "No");
     assert_eq!(options.last().unwrap().role, OptionRole::Deny);
     visible(deck, "1. Yes");
-    visible(deck, &format!("{}. No", options.last().unwrap().index));
+    visible(deck, &format!("{}. No", screen_no(deck, q)));
     if let Some(always) = options.iter().find(|o| o.role == OptionRole::AllowAlways) {
         assert!(
             always.scope.is_some(),
@@ -127,7 +148,7 @@ fn question_live_002_claude_whole_multiselect_form() {
     visible(&deck, "Green|Small|Large");
 }
 
-/// Scenario: Deny a genuine held Haiku permission prompt with keyboard 3.
+/// Scenario: Deny a genuine held Haiku permission prompt by typing the number Claude draws beside No.
 /// The snapshot clears the prompt, a late client answer is refused, and the
 /// denied command never creates its sentinel file.
 #[spec("question/live/003")]
@@ -145,8 +166,8 @@ fn question_live_003_claude_keyboard_deny_refuses_late_answer() {
     submit_claude(&deck, &id, &prompt, "question_deny_bf1377d2");
     let q = pending(&deck, &id, QuestionKind::Permission);
     assert_claude_permission(&deck, &q);
-    assert_eq!(q.questions[0].options.last().unwrap().index, 3);
-    deck.send_keys(b"3");
+    let no = screen_no(&deck, &q);
+    deck.send_keys(no.to_string().as_bytes());
     cleared(&deck, &id);
     assert_eq!(
         answer(&deck, &id, &q, vec![selection(0, &[1])]),
