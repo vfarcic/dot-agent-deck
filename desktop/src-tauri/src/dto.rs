@@ -3420,6 +3420,28 @@ mod tests {
         assert_eq!(value["tab"]["kind"], "mode");
     }
 
+    /// Scenario: Map a daemon record with queued and fetched messages into the desktop DTO; its inbox counts must survive for the card badge.
+    #[test]
+    fn agent_mapping_preserves_the_inbox_summary_for_cards() {
+        let mut record = fixture_record();
+        record.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
+            queued: 2,
+            fetched: 1,
+            undeliverable: 1,
+            last_acked_at: None,
+            wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
+            component: None,
+        });
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["inbox"]["queued"], 2,
+            "desktop DTO lost queued inbox messages: {value}"
+        );
+        assert_eq!(value["inbox"]["fetched"], 1);
+        assert_eq!(value["inbox"]["undeliverable"], 1);
+        assert_eq!(value["inbox"]["wake"], "doorbell");
+    }
+
     /// Issue #856: the CLI column is the DAEMON's answer, copied through
     /// verbatim — and a daemon this build disagrees with about the registry
     /// still gets its own answer rendered.

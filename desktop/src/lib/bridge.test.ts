@@ -4251,19 +4251,19 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * A stamp left on `describe()` would have gone on answering "yes, this is the
    * deck you are on" for a second daemon on the same host.
    */
+  /// Scenario: Inbox broadcasts reach only their selected deck's rail; unstamped local broadcasts remain accepted.
   it("drops a daemon event stamped with a daemon the screen is not on, and keeps an unstamped one", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
     await bridge.subscribe(onFleet, vi.fn());
-    await bridge.connect();
+    onFleet(await bridge.connect());
 
     const event = (deck?: string) => ({
       ...(deck === undefined ? {} : { deck }),
-      kind: "event",
-      event_type: "delegation_dispatched",
-      session_id: `dlg-${deck ?? "none"}`,
-      metadata: { to_role: "Reviewer", orchestration: "dot-agent-deck" },
+      kind: "inbox", state: "queued", pane_id: "reviewer",
+      message_id: deck === localId ? "m-k3xzq2ab-0000000000000001" : deck === undefined ? "m-k3xzq2ab-0000000000000002" : "m-k3xzq2ab-0000000000000003",
+      subject: "Review fixture", from_label: "the orchestrator",
     });
 
     const calls = () => onFleet.mock.calls.length;
@@ -4275,18 +4275,16 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     listeners.get("desktop://daemon-event")?.({ payload: event() });
     const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     // Newest first, and the foreign deck's is absent from both ends of it.
-    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-none", `dlg-${localId}`]);
+    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["m-k3xzq2ab-0000000000000002", "m-k3xzq2ab-0000000000000001"]);
     await bridge.dispose();
   });
 
-  /** A hook event as the crate stamps it, PRD 742 M3. */
+  /** An inbox event as the crate stamps it, PRD 742 M3 / inbox S13. */
   function hookEvent(deck: string, session: string) {
     return {
       deck,
-      kind: "event",
-      event_type: "delegation_dispatched",
-      session_id: session,
-      metadata: { to_role: "Reviewer", orchestration: "dot-agent-deck" },
+      kind: "inbox", state: "queued", pane_id: "reviewer",
+      message_id: session, subject: "Review fixture", from_label: "the orchestrator",
     };
   }
 
@@ -4318,17 +4316,18 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * **What it does not prove:** that the drawer's React component renders what
    * it is handed; that is `AgentOverview`/`App`'s business and is not what moved.
    */
+  /// Scenario: Inbox rail history stays with its deck when the selected deck changes and is restored when the user switches back.
   it("does not carry one deck's hook history onto another deck's screen", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
     await bridge.subscribe(onFleet, vi.fn());
-    await bridge.connect();
+    onFleet(await bridge.connect());
     listeners.get("desktop://snapshot")?.({ payload: remote });
 
     // Two hook events while the local deck is the one on screen.
-    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-1") });
-    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-2") });
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "m-k3xzq2ab-0000000000000001") });
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "m-k3xzq2ab-0000000000000002") });
     let fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     expect(fleet[0].connection.deckId).toBe(localId);
     expect(fleet[0].handoffs).toHaveLength(2);
@@ -4346,19 +4345,19 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     expect(fleet.find((deck) => deck.connection.deckId === localId)?.handoffs).toHaveLength(2);
 
     // A hook event from the daemon now on screen belongs to it alone.
-    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(remoteId, "dlg-remote-1") });
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(remoteId, "m-k3xzq2ab-0000000000000003") });
     fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     expect(fleet.find((deck) => deck.connection.deckId === remoteId)?.handoffs.map((edge) => edge.id))
-      .toEqual(["dlg-remote-1"]);
+      .toEqual(["m-k3xzq2ab-0000000000000003"]);
     expect(fleet.find((deck) => deck.connection.deckId === localId)?.handoffs.map((edge) => edge.id))
-      .toEqual(["dlg-local-2", "dlg-local-1"]);
+      .toEqual(["m-k3xzq2ab-0000000000000002", "m-k3xzq2ab-0000000000000001"]);
 
     // Switching back restores the local deck's drawer rather than showing the
     // remote deck's, and rather than showing nothing.
     listeners.get("desktop://snapshot")?.({ payload: local });
     fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     expect(fleet[0].connection.deckId).toBe(localId);
-    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-local-2", "dlg-local-1"]);
+    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["m-k3xzq2ab-0000000000000002", "m-k3xzq2ab-0000000000000001"]);
     await bridge.dispose();
   });
 
@@ -4372,13 +4371,14 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * **What this proves:** that `connect()` points the ring at the daemon it is
    * bootstrapping before it maps that daemon's snapshot.
    */
+  /// Scenario: Reconnecting to another deck starts with that deck's history instead of copying the previous deck's inbox rail.
   it("does not hand a reconnect's deck the previous deck's hook history", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
     await bridge.subscribe(onFleet, vi.fn());
-    await bridge.connect();
-    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-1") });
+    onFleet(await bridge.connect());
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "m-k3xzq2ab-0000000000000001") });
     expect((onFleet.mock.calls.at(-1)?.[0] as DeckFleet)[0].handoffs).toHaveLength(1);
 
     const remoteSelected = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"], [remoteId]);
