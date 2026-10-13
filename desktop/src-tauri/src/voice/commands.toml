@@ -186,7 +186,8 @@
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
 agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see, look at,
-select, go to or switch to ONE agent, or to see only that one ("everything except the tester") —
+select, go to or switch to ONE agent, or to see only that one ("see only the tester", "everything
+except the tester") —
 including "open tester agent", the accessible name of a dashboard row's open control, and "select
 dispatcher agent". The agent may be named as the screen shows it (a role like "tester", or a name
 the user gave it), by anything `agents_on_screen` says about it — its mode, agent type,
@@ -244,18 +245,34 @@ heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running",
 # (`outcome::FILTER_DASHBOARD_ROW`). A filter replaces the one before it, so
 # what was said is what is shown. Not over the New agent dialog, whose
 # directory browser has its own "filter" and "clear the filter" rows.
+#
+# The singular rule leads the description rather than trailing it: with "see
+# only the tester" named as `open_agent` only in the last sentence, after "or
+# filter by a name", `gpt-5-mini` answered it with this row and `text` =
+# "tester" in 8 of 10 runs of fixture
+# `dashboard-filter-control-see-only-the-tester`. With "the number decides"
+# stated first and `text` described as words the user asked to filter by, 20
+# of 20, and every `dashboard-*` and `open-agent*` fixture 3 of 3 — but
+# `dashboard-filter-agents-on-build-box` ("show the agents on build box", said
+# on the Daemons screen) then picked `switch_deck` in 2 of 34 runs, against 0
+# of 20 before. Naming its example as the `daemon` facet and not `switch_deck`
+# took it back to 20 of 20, and the full manifest to 289 of 289 (2026-10-13).
 [[commands]]
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
 status (working, thinking, needs input, idle, blocked, error), of an agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
-contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
-all working agents, show Codex agents, show the agents on build box, show only agents waiting for
-input, or filter by a name. Set only the facets the user named and leave the rest out; `kind`
-is the kind, `status` the status, `agent_type` the type, `daemon` the daemon, and `text` a name
-or words to match. Opening ONE agent — "open tester", "see only the tester", or one named by what
-it is doing, "show me the one that's stuck" — is `open_agent`, not this one; "show everything" or "clear the filter" is `clear_dashboard_filter`.
+contains some text. The number decides: a request naming ONE agent by its name or role alone —
+"see only the tester", "show only the coder", "open tester" — or by what it is doing, "show me
+the one that's stuck", is `open_agent`, never this one, even with "only" in it. Use this one for
+a plural or a category: show only the dispatchers, show me all orchestration agents, show me all
+working agents, show Codex agents, show the agents on build box (the `daemon` facet: it filters,
+and is not `switch_deck`), show only agents waiting for input, or when the user says to filter by
+some text. Set only the facets the user named and leave
+the rest out; `kind` is the kind, `status` the status, `agent_type` the type, `daemon` the
+daemon, and `text` the words the user asked to filter by. "show everything" or "clear the filter"
+is `clear_dashboard_filter`.
 While the New agent dialog shows a directory listing, "filter" is about its directories:
 `filter_directories`, not this one."""
 invoke      = "filterDashboard"
