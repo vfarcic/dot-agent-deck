@@ -709,7 +709,7 @@ pub static CODEX: AgentSpec = AgentSpec {
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
-/// row each — show Codex's empty composer, as measured on Codex 0.160.0:
+/// row each — show Codex's composer **empty**, as measured on Codex 0.160.0:
 ///
 /// ```text
 /// › Ask Codex to do anything
@@ -718,35 +718,56 @@ pub static CODEX: AgentSpec = AgentSpec {
 ///   ? for shortcuts                                  ⚠ 1 warning · f2 to view
 /// ```
 ///
-/// The footer `? for shortcuts` must be the last row with text, and a `›`
-/// prompt row that is not a numbered choice must sit at most
-/// [`CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER`] rows above it. Codex's start
-/// dialogs (update, folder trust, hooks review) put `›` on a numbered choice
-/// and end in a key-hint footer instead, so none of them matches; nor does any
-/// screen this does not know.
+/// The footer must be the last row with text and hold `? for shortcuts`,
+/// either at its start or after a `· ` separator (measured on a real 0.160.0
+/// after a turn: `← for agents · ? for shortcuts`). A `›` prompt row that is
+/// not a numbered choice must sit at most
+/// [`CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER`] rows above it, holding nothing or
+/// one of Codex's placeholders ([`CODEX_COMPOSER_PLACEHOLDERS`]), with a
+/// blank row right below it. Codex's start dialogs (update, folder trust,
+/// hooks review) put `›` on a numbered choice and end in a key-hint footer
+/// instead, so none of them matches; nor does any screen this does not know.
+///
+/// **Empty, not merely present** (decision 2): Codex can keep a human's text
+/// in the composer after an Enter it took as a newline (a paste burst), so
+/// the input tracker can believe a draft was submitted while it is still on
+/// screen. Any text on the prompt row other than a placeholder, or a second
+/// composer row below it, is a draft the doorbell must not join.
 ///
 /// **This is the one place that knows what Codex's composer looks like.** A
 /// Codex release that redraws it makes this return `false`, and the effect is
-/// the safe one: a Codex generation is not rung until its own first hook event
-/// (its first prompt), never typed into a screen the deck does not recognise.
-/// Re-measure and update this function, and the fixture
-/// `tests/fixtures/codex-inbox/composer.txt`, together.
+/// the safe one: the doorbell holds, and queued messages wait for the `Stop`
+/// hand-over or for a recognised empty composer, never typed into a screen
+/// the deck does not recognise. Re-measure and update this function, and the
+/// fixture `tests/fixtures/codex-inbox/composer.txt`, together.
 pub fn codex_composer_on_screen(rows: &[String]) -> bool {
     let Some(footer) = rows.iter().rposition(|row| !row.is_empty()) else {
         return false;
     };
-    if !rows[footer].starts_with("? for shortcuts") {
+    let footer_row = &rows[footer];
+    if !(footer_row.starts_with("? for shortcuts") || footer_row.contains("· ? for shortcuts")) {
         return false;
     }
     let first = footer.saturating_sub(CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER);
-    rows[first..footer].iter().rev().any(|row| {
-        row.strip_prefix('›').is_some_and(|rest| {
+    let Some(prompt) = (first..footer).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
             let rest = rest.trim_start();
             let digits = rest.chars().take_while(char::is_ascii_digit).count();
             !(digits > 0 && rest[digits..].starts_with('.'))
         })
-    })
+    }) else {
+        return false;
+    };
+    let content = rows[prompt].strip_prefix('›').unwrap_or_default().trim();
+    let empty = content.is_empty() || CODEX_COMPOSER_PLACEHOLDERS.contains(&content);
+    empty && rows.get(prompt + 1).is_some_and(String::is_empty)
 }
+
+/// The texts Codex 0.160.0 shows in an empty composer: the first at start
+/// and after a turn (measured), the second from the binary's strings
+/// (unmeasured on screen). Anything else on the prompt row is a draft.
+const CODEX_COMPOSER_PLACEHOLDERS: [&str; 2] =
+    ["Ask Codex to do anything", "Ask a follow-up question"];
 
 /// How far above [`codex_composer_on_screen`]'s footer the prompt row may be:
 /// the prompt, a blank row, the model line, plus room for a wrapped prompt.
@@ -942,6 +963,12 @@ mod tests {
             "? for shortcuts                       ⚠ 1 warning · f2 to view",
         );
         assert!(codex_composer_on_screen(&rows(&warned)));
+        // Measured on a real 0.160.0 after a turn.
+        let agents = composer.replace("? for shortcuts", "← for agents · ? for shortcuts");
+        assert!(codex_composer_on_screen(&rows(&agents)));
+        let empty_line_draft =
+            composer.replace("› Ask Codex to do anything\n", "›\n  typed below\n");
+        assert!(!codex_composer_on_screen(&rows(&empty_line_draft)));
         for dialog in [
             include_str!("../tests/fixtures/codex-inbox/update.txt"),
             include_str!("../tests/fixtures/codex-inbox/folder.txt"),
