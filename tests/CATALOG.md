@@ -8202,10 +8202,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/004 — Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; after Idle, the pane fetches it without the seed being typed.
+##### inbox/route/004 — Each supported agent starts with one inbox seed, without typed task content.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; after Idle, the pane fetches it without the seed being typed.
+- **Asserts:** One queued seed bound to each generation before SessionStart; the Codex stand-in paints the measured empty composer before a fixed doorbell fetch. Pi's legacy GetSeed alias consumes and acknowledges each oldest queued message once, including a message posted after startup, without typed task content.
 - **Test:** `route_004_start_agent_seed_is_first_message_for_every_agent_type` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.

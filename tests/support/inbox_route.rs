@@ -37,6 +37,10 @@ base = os.path.join(os.getcwd(), '.route-' + os.environ['DOT_AGENT_DECK_AGENT_ID
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 os.write(1, b'ROUTE-AGENT-READY\r\n')
+composer = os.environ.get('INBOX_ROUTE_CODEX_COMPOSER')
+if composer:
+    with open(composer) as f:
+        os.write(1, f.read().replace('\n', '\r\n').encode())
 line = bytearray()
 while True:
     chunk = os.read(0, 4096)

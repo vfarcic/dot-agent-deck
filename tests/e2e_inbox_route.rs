@@ -156,17 +156,22 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
     );
 }
 
-/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart. The seed must already be queued once and bound to that generation; Codex interface readiness may allow a fixed doorbell, and after Idle the pane fetches the seed without its content being typed.
+/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart, showing Codex's recognised empty composer in its stand-in. The seed must already be queued once and bound to that generation; Pi's legacy GetSeed alias consumes the oldest inbox item once, while the other panes fetch after their fixed doorbell without receiving typed content.
 #[spec("inbox/route/004")]
 #[test]
 fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
     let daemon = daemon(&[]);
+    let composer = daemon.home.join("codex-composer.txt");
+    std::fs::write(&composer, include_str!("fixtures/codex-inbox/composer.txt")).unwrap();
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
-        let pane = route::start(
-            &daemon,
-            agent_type,
-            json!({"seed":route::TASK, "agent_type":agent_type}),
-        );
+        let mut extra = json!({"seed":route::TASK,"agent_type":agent_type});
+        if agent_type == "codex" {
+            extra["env"] = json!([
+                ["DOT_AGENT_DECK_PANE_ID", agent_type],
+                ["INBOX_ROUTE_CODEX_COMPOSER", composer]
+            ]);
+        }
+        let pane = route::start(&daemon, agent_type, extra);
         let messages = route::count(&daemon, &pane, 1);
         assert!(
             messages[0]["state"]
@@ -175,6 +180,31 @@ fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
                 .contains("queued")
         );
         route::only_doorbells(&pane, &messages);
+        if agent_type == "pi" {
+            let first = hook(&daemon, request(&pane, "get_seed"));
+            let text = first["seed"]
+                .as_str()
+                .expect("Pi GetSeed must serve the inbox seed");
+            let id = messages[0]["id"].as_str().unwrap();
+            assert!(
+                text.contains(route::TASK) && text.contains(id),
+                "framed seed: {first}"
+            );
+            state(&daemon, &pane, id, "acknowledged");
+            assert!(hook(&daemon, request(&pane, "get_seed"))["seed"].is_null());
+            let next = enqueue(&daemon, &pane, "PI-GET-SEED-NEXT-79a2");
+            let second = hook(&daemon, request(&pane, "get_seed"));
+            assert!(
+                second["seed"].as_str().is_some_and(
+                    |text| text.contains(&next) && text.contains("PI-GET-SEED-NEXT-79a2")
+                ),
+                "alias must consume inbox messages after the startup seed too: {second}"
+            );
+            state(&daemon, &pane, &next, "acknowledged");
+            assert!(!String::from_utf8_lossy(&bytes(&pane)).contains(route::TASK));
+            continue;
+        }
+        eprintln!("route_004: fetching the seed for {agent_type}");
         route::fetched(
             &daemon,
             &pane,

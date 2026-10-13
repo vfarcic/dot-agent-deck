@@ -256,7 +256,7 @@ fn codex_005_recognised_composer_rings_before_first_hook() {
     );
 }
 
-/// Scenario: Type into synthetic Codex and press Enter during its paste burst, which leaves the draft visible. A queued message must send zero bytes while that text remains, even after a native hook; clearing the composer must let the fixed doorbell ring separately.
+/// Scenario: Type into synthetic Codex and press Enter during its paste burst, which leaves the draft visible. A queued message must send zero bytes while that text remains, even after a native hook; clearing the composer must let the fixed doorbell ring separately, including when the screen poll starts after the placeholder has been replaced by the doorbell.
 #[spec("inbox/codex/012")]
 #[test]
 fn codex_012_retained_paste_burst_draft_holds_doorbell() {
@@ -285,10 +285,18 @@ fn codex_012_retained_paste_burst_draft_holds_doorbell() {
         );
         state(&codex.daemon, &codex.pane, &id, "queued");
         input.write("\x15");
+        if own_hook {
+            // Reproduce a slow screen poll deterministically: the doorbell
+            // may finish before the poll observes the empty placeholder.
+            assert!(common::wait_until(WAIT, || bytes(&codex.pane)
+                .ends_with(format!("{}\r", fixed_line(&id)).as_bytes())));
+        }
         assert!(
-            common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-                .contains("Ask Codex to do anything")),
-            "Ctrl+U must empty composer"
+            common::wait_until(WAIT, || {
+                let shown = screen(&codex.daemon, &codex.pane);
+                shown.contains("Ask Codex to do anything") || shown.contains(&fixed_line(&id))
+            }),
+            "Ctrl+U must show an empty composer or its subsequently delivered doorbell"
         );
         assert!(
             common::wait_until(WAIT, || bytes(&codex.pane)
