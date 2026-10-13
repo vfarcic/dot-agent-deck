@@ -3521,13 +3521,12 @@ without depending on the config struct API.
 - **Does not assert:** a concrete Gemini registry entry or wrapper classifier; those do not exist yet.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/009 — A `clear = true` delegate to a REAL wrapped Codex worker delivers the prompt and the worker acts on it — the user-visible end of PRD #225 (M5). [reel]
-- **Layer:** L2 PTY-attached REAL-agent (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`; lane-2 e2e tier per CLAUDE.md rule 5 — the credentialed half, flaky-tolerant).
-- **Agent:** a REAL interactive cheap-model Codex (`common::codex_test_model()`, no `-p`, no stand-in) as the `clear = true` `coder` role, wrapped from its first spawn because the role command's basename resolves to Codex; the `orchestrator` role is a deterministic script that invokes the genuine `dot-agent-deck delegate --to coder` CLI over the same hook socket a real orchestrator agent uses (the defect is entirely on the worker side, so a second LLM would add a flaky link without covering another line of the fix).
-- **Asserts:** opening the orchestration through the normal Ctrl+N new-pane form surfaces the `coder` role card live; jumping into the worker's role pane shows the REAL Codex TUI up (its header names the pinned model) BEFORE anything is delegated — the readiness precondition, taken on the user-visible surface because codex-cli 0.145.0 posts its native `SessionStart` only when the first turn starts, so gating on that event would deadlock on the delegate that causes it; after the delegate the worker's card visibly enters `Thinking`, the daemon broadcasts the worker's GENUINE native Codex `SessionStart` (no wrapper-fork origin marker, so it is Codex itself and not the wrapper's fork-time card-surfacing event) plus a `Thinking` whose `user_prompt` is the injected `worker-task-coder.md` pointer — a field only Codex's native `UserPromptSubmit` hook sets, the wrapper's line classifier always leaves it `None` — so the pointer was submitted INSIDE the agent rather than echoed away by the launcher's line discipline; and the respawned worker creates the uniquely named sentinel `prd225-codex-delegate-6f21ba.txt` with the requested contents. Pre-fix the wrapper's fork-time event released the readiness gate seconds before the Codex TUI existed, the prompt was lost, and no sentinel ever appeared.
-- **Also asserts, since issue #243:** that the delegate is PROMPT, not merely eventual. The wrapper's interface-ready `SessionStart` for the REPLACEMENT worker is captured as the anchor — an event that did not exist before #243 — and no more than 15 s may pass between it and the pointer's submission. This is load-bearing rather than decorative: every other assertion in this test was satisfied by the BROKEN path too, because the 30 s timeout fallback delivered the pointer eventually and Codex then acted on it, so the test passed for months through the defect and would keep passing through a regression to it. The budget is justified from both ends in `READY_TO_SUBMIT_BUDGET`, and round 3 moved one term rather than re-guessing it: it was 10 s while the harness's `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=0` left no buffer inside the interval at all; this test now pins that variable at the production 5000 ms, so the budget is 5 s wider and the uncontrolled share is unchanged. Half of the ~30.6 s a run still paying the dead wait would measure (the production delegates in the issue burned 31.2–32.3 s), and ~10 s of headroom over the deck's own share, leaving the remainder for codex-cli's `UserPromptSubmit` hook. **Measured 2026-08-26 against real codex-cli 0.149.0 on `gpt-5.6-luna`: 5.758 s** — the 5000 ms buffer plus 758 ms of codex taking the keystrokes and its hook reaching the daemon, landing where the constant's derivation predicted a warm Codex would (~5.6 s).
-- **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the launch-shape half of PRD #225 (`codex/spawn/007` for the hook-learned badge, `codex/spawn/008` for the respawn wrap decision); the hookless-wrapper guard (`orchestration/delegate/008`); WHICH of the wrapper's two interface facts released the gate — the anchor accepts either, since the point is to measure from whatever did (the synthetic `codex/wrap/006` covers the emit, and only a real Codex TUI exercises the strong `ICANON`/`ECHO` fact at all).
-- **Platform coverage:** mac+linux (unix-only — writes an executable role script).
+##### orchestration/delegate/009 — A clear=true real Codex replacement acts on an inbox delegate. [reel]
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_codex_delegate.rs`).
+- **Agent:** interactive cheap-model Codex through the deck wrapper; a scripted orchestrator invokes the genuine delegate CLI.
+- **Asserts:** normal new-pane orchestration flow, visible real Codex before delegation, replacement generation, submit-hook inbox injection, acknowledgement, exact sentinel and envelope card.
+- **Does not assert:** the retired typing readiness/submit latency machinery or the worker's work-done leg.
+- **Platform coverage:** Unix.
 
 ##### orchestration/delegate/010 — An observed replacement `SessionStart` starts, but does not bypass, the delegate readiness buffer (PRD #249 M1).
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket; no LLM and no `e2e` feature gate).
@@ -8236,6 +8235,27 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** mac+linux.
 
 #### inbox/codex
+
+##### inbox/codex/009 — Real idle Codex receives a fixed doorbell and acts on submit-hook inbox context. [reel]
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY.
+- **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, scratch HOME/CODEX_HOME and cwd outside the repository.
+- **Asserts:** visible interactive composer, doorbell and UserPromptSubmit injection, exact sentinel contents, acknowledgement and envelope card.
+- **Does not assert:** busy hand-over or startup dialogs, covered below.
+- **Cost:** one cheap model turn.
+
+##### inbox/codex/010 — Real folder trust holds an inbox message until the user answers.
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`).
+- **Agent:** interactive cheap-model Codex in a fresh untrusted scratch git directory.
+- **Asserts:** the folder selection stays unchanged while the task is queued, no doorbell is rung, and accepting trust permits action and acknowledgement.
+- **Does not assert:** raw byte counts in a real agent (the synthetic dialog tests pin those).
+- **Cost:** one cheap model turn.
+
+##### inbox/codex/011 — Real busy Codex takes a queued task through its Stop block.
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`).
+- **Agent:** interactive cheap-model Codex performing a slow shell directive.
+- **Asserts:** busy precondition, no doorbell, TurnEndHook hand-over, visible Blocked by hook text, exact sentinel and acknowledgement.
+- **Does not assert:** multiple-message byte budgets (synthetic /007 and /008).
+- **Cost:** two cheap model turns.
 
 ##### inbox/codex/012 — A draft retained after paste-burst Enter prevents all doorbell input.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).

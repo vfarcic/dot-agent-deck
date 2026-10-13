@@ -345,7 +345,7 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
         format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
     let directive = format!(
         "Use the Bash tool to run exactly this one command: dot-agent-deck delegate --to \
-         {REAL_WORKER_ROLE} --task 'Remain silent and do not send work-done.' After the command \
+         {REAL_WORKER_ROLE} --task 'Wait for further instructions.' After the command \
          succeeds, respond with exactly {INITIAL_WAIT_RESPONSE}, then end your turn. Later, a \
          dot-agent-deck message may say that the task has not reached the worker. When it \
          arrives, keep waiting: use the Bash tool to run exactly `printf '%s\\n' \
