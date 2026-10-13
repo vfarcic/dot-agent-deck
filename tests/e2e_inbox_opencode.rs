@@ -42,7 +42,10 @@ impl OpenCode {
         let path = std::env::var("PATH").unwrap();
         let daemon = daemon(&[
             ("PATH", &path),
-            ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
+            (
+                "DOT_AGENT_DECK_INBOX_ACK_WAIT_MS",
+                config["ackWaitMs"].as_str().unwrap_or("1500"),
+            ),
             ("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "3500"),
         ]);
         let installed = daemon.home.join(".local/bin/dot-agent-deck");
@@ -258,6 +261,118 @@ fn opencode_001_home_creates_navigates_delivers_serially_and_acks() {
     }
     state(&op.daemon, &op.pane, &first, "acknowledged");
     state(&op.daemon, &op.pane, &second, "acknowledged");
+}
+
+/// Scenario: Deliver a task in another session, then three tasks in the shown session with a human message between them. One assistant naming the third task must acknowledge the three tasks once without acknowledging the human or the other session's task, and the acknowledged tasks must not redeliver.
+#[spec("inbox/opencode/023")]
+#[test]
+fn opencode_023_coalesced_turn_acks_prior_deck_messages_in_its_session_once() {
+    let op = OpenCode::new("session", json!({"ackWaitMs":"10000"}));
+    armed(&op.daemon, &op.pane, 1);
+    let other = op.post();
+    assert!(common::wait_until(WAIT, || op.events().iter().any(
+        |e| e["kind"] == "user-message" && e["sessionID"] == "shown"
+    )));
+    op.control(json!({"route":{"name":"session","params":{"sessionID":"root"}}}));
+    op.wait_kind("navigate");
+
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        ids.push(op.post());
+        assert!(
+            common::wait_until(WAIT, || op
+                .events()
+                .iter()
+                .filter(|e| e["kind"] == "user-message" && e["sessionID"] == "root")
+                .count()
+                == n + 1),
+            "three delivered prompts in root: {:?}",
+            op.events()
+        );
+        if n == 0 {
+            op.control(json!({"event":"message.updated","properties":{"info":{
+                "id":"human-between-deck-messages","role":"user","sessionID":"root"
+            }}}));
+            assert!(common::wait_until(WAIT, || op
+                .events()
+                .iter()
+                .any(|e| e["kind"] == "emitted"
+                    && e["properties"]["info"]["id"]
+                        == "human-between-deck-messages")));
+        }
+    }
+    let parents: Vec<_> = op
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "user-message" && e["sessionID"] == "root")
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect();
+    let parent = parents.last().unwrap();
+    op.assistant(parent);
+    // The directly named parent is the control: the assistant event reached the plugin.
+    state(&op.daemon, &op.pane, &ids[2], "acknowledged");
+    assert!(
+        common::wait_until(Duration::from_secs(2), || {
+            let listed = listing(&op.daemon, &op.pane);
+            ids.iter().all(|id| {
+                listed["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["id"] == *id && m["state"] == "acknowledged")
+            })
+        }),
+        "coalesced assistant must acknowledge all three deck messages in its session; ids={ids:?}, inbox={}, events={:?}",
+        listing(&op.daemon, &op.pane),
+        op.events()
+    );
+    // OpenCode can update an assistant repeatedly; each deck id must still ack once.
+    op.assistant(parent);
+    assert!(
+        !common::wait_until(Duration::from_secs(11), || ids.iter().any(|id| op
+            .prompts()
+            .iter()
+            .filter(|p| p["parts"][0]["text"].as_str().unwrap().contains(id))
+            .count()
+            > 1)),
+        "acknowledged siblings must not redeliver: {:?}",
+        op.events()
+    );
+    let listed = listing(&op.daemon, &op.pane);
+    let messages = listed["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "human must not become a deck message");
+    let other_message = messages.iter().find(|m| m["id"] == other).unwrap();
+    assert_ne!(
+        other_message["state"], "acknowledged",
+        "other session must remain pending: {listed}"
+    );
+    for id in &ids {
+        let message = messages.iter().find(|m| m["id"] == *id).unwrap();
+        assert_eq!(message["ack_how"], "plugin_confirmed");
+        assert_eq!(message["deliveries"], 1, "no redelivery: {message}");
+    }
+    let acks: Vec<Value> = op
+        .events()
+        .iter()
+        .filter(|e| e["kind"] == "stdin")
+        .filter_map(|e| e["text"].as_str())
+        .flat_map(str::lines)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|v| v["ack"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert_eq!(
+        acks.len(),
+        3,
+        "exactly three deck acknowledgements: {acks:?}"
+    );
+    for id in &ids {
+        assert_eq!(
+            acks.iter().filter(|v| **v == *id).count(),
+            1,
+            "each sibling must ack once: {acks:?}"
+        );
+    }
 }
 
 /// Scenario: Deliver while the fake TUI shows an existing session or a nested child view. Stay in the shown root session or navigate from the child to its root, copying that target's last user model and agent; navigation must wait while a dialog is open.

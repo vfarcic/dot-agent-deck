@@ -8344,6 +8344,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** OpenCode rendering or real event ordering.
 - **Cost:** none.
 
+##### inbox/opencode/023 — One coalesced assistant turn acknowledges its earlier deck messages.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake OpenCode API executing the real generated TUI plugin and inbox watcher CLI.
+- **Asserts:** one assistant parent naming the third delivered prompt acknowledges the three deck ids in that session exactly once; an interleaved human does not interrupt acknowledgement; another session stays pending; acknowledged tasks do not redeliver after the deadline or a repeated assistant update.
+- **Does not assert:** real OpenCode model execution or rendering (covered by the live and load tests).
+- **Cost:** none.
+
 ##### inbox/opencode/002 — Existing root stays in place and a child view routes to its root.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
 - **Agent:** fake OpenCode API with a nested session tree and last-user selections.

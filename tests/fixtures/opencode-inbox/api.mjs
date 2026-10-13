@@ -116,6 +116,7 @@ const timer=setInterval(async ()=>{
   for(const line of lines) {
     offset+=line.length+1;const control=JSON.parse(line);
     if('dialogOpen' in control){state.dialogOpen=control.dialogOpen;log('dialog',{open:state.dialogOpen});}
+    if(control.route) api.route.navigate(control.route.name,control.route.params);
     if(control.event)await event(control.event,control.properties);
     if(control.dispose) {for(const fn of disposers)await fn(); log('disposed');}
     if(control.eof) {for(const child of spawned)child.stdin?.end();}
