@@ -33,8 +33,8 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
-| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [open its pull request, or another agent's](#pull-requests) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
@@ -149,6 +149,16 @@ While the pull request page is open:
 - **"close"**, **"close the PR"** or **"close the pull request"** closes the page and returns to the screen under it. It only closes the page in the app; nothing happens to the pull request on GitHub.
 
 Typing into the agent does not work while the page is open over its pane: close the page first.
+
+## Checking a daemon's machine
+
+On the dashboard, say **"show host"**, **"open host info"** or **"show resource usage"** to open a daemon's **Host** figures: the same free disk space, load and memory its **Host** button beside the daemon's name shows ([Session Management → Check the machine a deck runs on](../session-management.md#check-the-machine-a-deck-runs-on)). Reading the button aloud works too: "Host", "Host warning" or "Host critical". So do "disk space" and "how is the machine doing?".
+
+- With one daemon on the dashboard, its figures open.
+- With several, name the one you mean, for example "show host for build box". If you do not, nothing opens and the app asks which one.
+- A daemon that is not connected has no figures, and the app says so instead.
+
+To close the figures, say **"close"**, **"close it"**, **"close host"** (the name of the figures' **X** button), **"close resource usage"** or **"hide resource usage"**. If something else is open over the dashboard, such as Settings, an agent's pane or the list of commands, "close" closes that first, and the figures on the next "close". While a confirmation is open, such as the one for stopping an agent, "close" leaves the figures open behind it. Their **X**, `Esc` or a click elsewhere also closes them. The app does not read the figures aloud.
 
 ## Long lists are shown in pages
 

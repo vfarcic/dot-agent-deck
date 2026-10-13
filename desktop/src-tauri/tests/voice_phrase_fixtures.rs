@@ -914,7 +914,10 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // switches to a deck the dialog disables, and its report is
                 // "Showing <deck>." rather than a preselection. Nor to the
                 // dashboard filter (issue #1496), whose daemon is one to filter
-                // by and is reported as "Daemon: <deck>.". The first is
+                // by and is reported as "Daemon: <deck>.", nor to the Host
+                // figures (PR #1672), whose daemon is the one whose popover
+                // opens, reported the same way and open whether or not a new
+                // agent can start there. The first is
                 // scoped to the rows that append "Preselected daemon:" at all —
                 // an OPTIONAL `deck_ref` — which also stops it failing every
                 // `choose_deck` fixture, whose report is "Daemon: <deck>.".
@@ -925,6 +928,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 let for_new_agent = dispatched.is_none_or(|row| {
                     row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW
                         && row.id != dot_agent_deck_desktop::voice::FILTER_DASHBOARD_ROW
+                        && row.id != dot_agent_deck_desktop::voice::SHOW_HOST_METRICS_ROW
                 });
                 let preselects = for_new_agent
                     && dispatched.is_some_and(|row| {

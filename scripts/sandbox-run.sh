@@ -14,7 +14,9 @@
 #                      against the sandbox daemon (`task run-stop`)
 #   CHECKOUT  the Taskfile's own checkout; the desktop always runs from its desktop/
 #   DIR       the config dir the TUI starts in
-#   SANDBOX   the isolation state dir; empty means DIR/.dad-sandbox
+#   SANDBOX   the isolation state dir; empty means the checkout's branch's own,
+#             DIR/.dad-sandbox/branch-<slug>, or commit-<sha> on a detached
+#             HEAD (see "which sandbox" below)
 #   PROFILE   release | debug; empty (stop only) means "the build that started it"
 #
 # A fifth mode, keep-desktop, is internal: `all` re-invokes this script with it
@@ -35,20 +37,162 @@ sandbox=$4
 profile=$5
 shift 5
 
-[ -n "$sandbox" ] || sandbox="$dir/.dad-sandbox"
+case $mode in
+  tui | desktop | all | stop | keep-desktop) ;;
+  *) die "unknown mode '$mode'" ;;
+esac
+
+# --- which sandbox -----------------------------------------------------------
+#
+# Every branch built from a checkout gets a sandbox, and so a daemon, of its
+# own: DIR/.dad-sandbox/branch-<slug>, or DIR/.dad-sandbox/commit-<sha> on a
+# detached HEAD. A run of another branch of this checkout therefore does not
+# meet this one's daemon, nor the build-mismatch prompt that offers to restart
+# it — with whatever agents are running under it. Two checkouts on branches of
+# one name still share a sandbox under one DIR. A new commit on the SAME
+# branch keeps the same sandbox on purpose: that is the build-stamp case
+# (CLAUDE.md rule 15), whose documented recovery is `task run-stop` and run
+# again against this same sandbox. An explicit SANDBOX is used as given.
+#
+# Socket paths are bounded. A Unix socket's path lives in sockaddr_un's
+# sun_path, a fixed array of 104 bytes on macOS and the BSDs and 108 on Linux,
+# one of which is the terminating NUL, so a path is at most 103 or 107 bytes;
+# a longer one fails only when the daemon binds it, with an error that does not
+# say why. The longest path the sandbox exports is SANDBOX/attach.sock, 12
+# bytes past SANDBOX ("/attach.sock"). With ROOT = DIR/.dad-sandbox the default
+# sandbox is ROOT/<slug>, so
+#
+#   len(ROOT) + 1 + len(slug) + 12 <= max   →   len(slug) <= max - len(ROOT) - 13
+#
+# e.g. ROOT = /Users/vfarcic/code/dot-agent-deck/.dad-sandbox is 47 bytes,
+# which leaves 103 - 47 - 13 = 43 bytes of slug on macOS. A slug that does not
+# fit is cut and given a hash of the full branch name (below), and when even
+# the shortest slug cannot fit this refuses to start rather than let the daemon
+# fail to bind.
+case $(uname -s) in
+  Darwin | *BSD | DragonFly) socket_path_max=103 ;;
+  *) socket_path_max=107 ;;
+esac
+socket_path_tail="/attach.sock"
+
+# The length of $1 in BYTES, which is what sun_path bounds. `${#var}` counts
+# characters under a UTF-8 locale, so a DIR holding multibyte characters would
+# pass a bound it does not fit. `wc -c` counts bytes on Linux and macOS alike,
+# and LC_ALL=C stays on it rather than reaching the TUI.
+byte_len() {
+  printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
+}
+
+# The slug for the branch CHECKOUT is on, at most $1 bytes long, or a refusal
+# when even its shortest form is longer. Every slug starts with `branch-` or
+# `commit-`, which no file of the sandbox layout from before per-branch
+# sandboxes did (attach.sock, state, deck.log, …), so a branch can never be
+# named onto one of that layout's files in the same ROOT.
+sandbox_slug() {
+  local budget=$1 kind raw clean slug hash keep
+  # The full ref, stripped by hand: `--short` abbreviates to `heads/main` when
+  # a tag `main` also exists, which would move the sandbox.
+  if raw=$(git -C "$checkout" symbolic-ref --quiet HEAD 2>/dev/null); then
+    raw=${raw#refs/heads/}
+    kind=branch
+  elif raw=$(git -C "$checkout" rev-parse --short=12 HEAD 2>/dev/null); then
+    kind=commit
+  else
+    die "cannot tell which branch $checkout is on (is it a git checkout?) — pass SANDBOX=<dir> to name a sandbox"
+  fi
+  # A slug comes in two forms: KIND-NAME, the name as it is, and
+  # KIND-PREFIX-HASH, a prefix of the name with anything outside
+  # [A-Za-z0-9._-] turned into `-`, then `-` and eight hex digits of a CRC of
+  # the full name (POSIX cksum, the same on Linux and macOS).
+  #
+  # The plain form is kept to names it cannot confuse, and the rest are hashed:
+  #
+  # - a name with a byte outside [A-Za-z0-9._-]: `a/b` and `a-b` would read
+  #   the same once `/` is replaced;
+  # - a name with an uppercase letter: macOS's default APFS is
+  #   case-insensitive, so `Main` and `main` would be one directory;
+  # - a name that already ENDS the way a hashed slug does, in `-` and eight
+  #   lowercase hex digits: the plain form of `a-b-<hash of a/b>` would be the
+  #   hashed form of `a/b` (PR #1672 review);
+  # - a name whose plain form is longer than the budget.
+  #
+  # So a plain slug never ends in `-<8 hex>` and a hashed one always does: the
+  # two forms cannot meet. Two plain slugs are equal only for one name, and two
+  # hashed ones only when the names share both the kept prefix and the CRC.
+  # `clean` is ASCII, so its length in characters is its length in bytes.
+  clean=$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
+  slug="$kind-$clean"
+  if [ "$clean" != "$raw" ] ||
+    [ "$(printf '%s' "$clean" | LC_ALL=C tr -d 'A-Z')" != "$clean" ] ||
+    printf '%s' "$clean" | LC_ALL=C grep -Eq -- '-[0-9a-f]{8}$' ||
+    [ "${#slug}" -gt "$budget" ]; then
+    # The shortest hashed slug keeps one byte of the name: KIND, `-`, one
+    # byte, `-` and the eight-digit hash.
+    [ "$budget" -ge $((${#kind} + 11)) ] ||
+      die "$sandbox_root is too long to hold this ${kind}'s sandbox ($kind-$clean needs at least $((${#kind} + 11)) bytes of its name, and $budget fit) with socket paths inside the $socket_path_max bytes a Unix socket path can hold here — pass SANDBOX=<a shorter dir>"
+    hash=$(printf '%s' "$raw" | cksum)
+    # bash's printf, not awk's: some awks clamp %x at 2^31 - 1.
+    hash=$(printf '%08x' "${hash%% *}")
+    keep=$((budget - ${#kind} - 1 - 9))
+    [ "$keep" -le "${#clean}" ] || keep=${#clean}
+    slug="$kind-${clean:0:keep}-$hash"
+  fi
+  echo "$slug"
+}
+
+check_socket_path_fits() {
+  local longest="$1$socket_path_tail" bytes
+  bytes=$(byte_len "$longest")
+  [ "$bytes" -le "$socket_path_max" ] ||
+    die "the sandbox's socket path $longest is $bytes bytes, past the $socket_path_max a Unix socket path can hold here — pass SANDBOX=<a shorter dir>"
+}
+
+dir_abs=$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd) || die "DIR $dir is not a directory"
+sandbox_root="$dir_abs/.dad-sandbox"
+if [ -z "$sandbox" ]; then
+  # The refusal, when even this checkout's shortest slug cannot fit, is
+  # sandbox_slug's: it depends on the name, so a short branch still runs from a
+  # DIR too deep for a long one. The assignment carries its exit status, so
+  # `set -e` stops here on it.
+  slug=$(sandbox_slug $((socket_path_max - $(byte_len "$sandbox_root") - 13)))
+  sandbox="$sandbox_root/$slug"
+fi
+
+# Before per-branch sandboxes every branch shared ROOT itself as its sandbox,
+# and a daemon started that way may still be running there with agents under
+# it. Nothing here touches it unless SANDBOX names it; say how to reach it.
+old_sandbox_note() {
+  if [ "$mode" != keep-desktop ] && [ "$sandbox" != "$sandbox_root" ] && [ -S "$sandbox_root/attach.sock" ]; then
+    echo "note: $sandbox_root holds a sandbox from before each branch got its own;" >&2
+    echo "      its daemon may still be running. \`task run-stop SANDBOX=$sandbox_root\` stops it." >&2
+  fi
+}
+
+# An explicit SANDBOX is checked before anything creates it, against its path
+# as written made absolute, and again below against the exact string the socket
+# paths are built from. Neither resolves a symlink, and neither needs to: the
+# bound applies to the path a socket is bound at, not to where a symlink in it
+# leads (PR #1672 review).
+case $sandbox in
+  /*) check_socket_path_fits "$sandbox" ;;
+  *) check_socket_path_fits "$PWD/$sandbox" ;;
+esac
+
 case $mode in
   stop)
     if [ ! -d "$sandbox" ]; then
+      old_sandbox_note
       echo "no sandbox at $sandbox — nothing to stop"
       exit 0
     fi
     ;;
-  tui | desktop | all | keep-desktop) mkdir -p "$sandbox" ;;
-  *) die "unknown mode '$mode'" ;;
+  *) mkdir -p "$sandbox" ;;
 esac
 # Absolute, because the desktop refuses a relative settings path outright, and
 # a relative socket path would resolve against whatever cwd each child has.
 sandbox=$(CDPATH='' cd -- "$sandbox" && pwd)
+check_socket_path_fits "$sandbox"
+old_sandbox_note
 
 desktop_dir="$checkout/desktop"
 desktop_log="$sandbox/desktop.log"
@@ -162,6 +306,31 @@ export DAD_DEV_BIN
 # argv. The keeper stays alive until the group is killed, so the group id cannot
 # be recycled while anything in it still runs, and `ps -o args=` on the leader
 # is a portable identity check before any signal is sent to the group.
+#
+# The keeper also leads a SESSION of its own, with no controlling terminal, so
+# nothing in the desktop's tree can make another process group the foreground
+# of the terminal the TUI owns: tcsetpgrp works only on the caller's own
+# controlling terminal, and opening /dev/tty there fails. While the desktop
+# shared the TUI's session, a process in its tree that took the foreground
+# would leave the TUI in a background group, and the TUI's next read of a key
+# would stop its whole group — `task` included — with SIGTTIN, which zsh
+# reports as `suspended (tty input)`: the report this guards against, from
+# macOS. It did not reproduce on Linux, so which process did it there is not
+# known; this rules out every one in the desktop's tree
+# (docs/develop/local-run.md, "Why the desktop runs in a session of its own").
+# The keeper's session id is also its pid, so `desktop_pgid` still names its
+# group.
+#
+# The session is made by perl's POSIX::setsid, because macOS ships perl and
+# has no setsid(1), so Linux runs the same path macOS does. perl runs in place
+# and then execs the keeper — the backgrounded child that calls setsid is not a
+# process-group leader, so setsid needs no fork — which is what makes `$!` the
+# keeper's pid. Until perl has called setsid that pid is not a group leader,
+# which is why finish_all waits for it to become one.
+keeper_session_preflight() {
+  command -v perl >/dev/null 2>&1 ||
+    die "\`task run-all\` needs perl to start the desktop in a session of its own, and perl is not on PATH"
+}
 
 # Is $1 the live leader of a desktop group for THIS sandbox?
 desktop_group_is_ours() {
@@ -170,6 +339,18 @@ desktop_group_is_ours() {
   leader_pgid=$(ps -o pgid= -p "$pgid" 2>/dev/null | tr -d ' ') || return 1
   [ "$leader_pgid" = "$pgid" ] || return 1
   args=$(ps -ww -o args= -p "$pgid" 2>/dev/null) || return 1
+  case $args in
+    *"sandbox-run.sh keep-desktop "*" $sandbox "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Is $1 a live process that is about to be this sandbox's keeper — perl, or
+# whatever runs it, with the keeper's command line in its argv?
+desktop_keeper_starting() {
+  local pid=$1 args
+  case $pid in '' | *[!0-9]*) return 1 ;; esac
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null) || return 1
   case $args in
     *"sandbox-run.sh keep-desktop "*" $sandbox "*) return 0 ;;
     *) return 1 ;;
@@ -214,6 +395,30 @@ stop_recorded_desktop() {
 
 # --- desktop preflight -------------------------------------------------------
 
+# Does something listen on loopback address $1, port $2? On loopback a listener
+# answers a connect at once, and a port with nothing on it is refused at once.
+# A port a socket holds BOUND but not listening is refused at once on Linux, but
+# macOS drops the SYN, and the connect waits out the TCP connect timeout, about
+# 75 seconds: two probes of such a port took a test's run-all 151 seconds on
+# build-macos (PR #1672). Nothing listens there, which is all this asks, so a
+# probe still waiting after a second is a no; vite reports any other reason it
+# cannot bind in its own log.
+port_answers() {
+  local probe i=0
+  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null &
+  probe=$!
+  while kill -0 "$probe" 2>/dev/null; do
+    if [ "$i" -ge 10 ]; then
+      # wait's status: a killed probe is a no, one that connected just now a yes.
+      { kill "$probe"; wait "$probe"; } 2>/dev/null
+      return
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$probe"
+}
+
 desktop_preflight() {
   command -v pnpm >/dev/null 2>&1 ||
     die "pnpm is not on PATH — run this from a \`devbox shell\` (docs/develop/desktop-gui.md#prerequisites)"
@@ -226,8 +431,12 @@ desktop_preflight() {
   # vite binds 1420 with strictPort (desktop/vite.config.ts), so a second `pnpm
   # dev` or `tauri dev` anywhere on this machine would fail the desktop — and
   # under `all` that failure would land in a log file behind the TUI.
-  if (exec 3<>/dev/tcp/127.0.0.1/1420) 2>/dev/null || (exec 3<>/dev/tcp/::1/1420) 2>/dev/null; then
-    die "port 1420 is in use, probably by another \`pnpm dev\` or \`tauri dev\` — the desktop's vite server needs it"
+  # DAD_SANDBOX_RUN_VITE_PORT moves only this probe, not vite, and exists for
+  # xtask/linkage-check/src/sandbox_run.rs, whose stand-in desktop binds
+  # nothing: 1420 is in use whenever a `tauri dev` runs on the machine.
+  local port=${DAD_SANDBOX_RUN_VITE_PORT:-1420}
+  if port_answers 127.0.0.1 "$port" || port_answers ::1 "$port"; then
+    die "port $port is in use, probably by another \`pnpm dev\` or \`tauri dev\` — the desktop's vite server needs it"
   fi
   if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     echo "note: neither DISPLAY nor WAYLAND_DISPLAY is set, so the desktop window may fail to open" >&2
@@ -266,18 +475,21 @@ run_desktop() {
 run_all() {
   desktop_preflight
   config_note
+  keeper_session_preflight
   echo "$bin" >"$binary_record"
   rm -f "$desktop_exit_record"
   : >"$desktop_log"
 
-  # `set -m` for this one command only: it is what puts the keeper in a process
-  # group of its own. The TUI below stays in this shell's group and keeps the
-  # terminal.
-  set -m
-  bash "$checkout/scripts/sandbox-run.sh" keep-desktop "$checkout" "$dir" "$sandbox" "$profile" "$$" \
+  # The keeper in a session, and so a process group, of its own (see "the
+  # background desktop's process group" above). This shell never turns job
+  # control on, so the TUI below stays in this shell's process group — the one
+  # the terminal's shell made its foreground — as it does under `task run`.
+  perl -MPOSIX -e '
+    POSIX::setsid() > 0 or die "setsid: $!\n";
+    exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";
+  ' bash "$checkout/scripts/sandbox-run.sh" keep-desktop "$checkout" "$dir" "$sandbox" "$profile" "$$" \
     </dev/null >>"$desktop_log" 2>&1 &
   local desktop_pgid=$!
-  set +m
   echo "$desktop_pgid" >"$desktop_record"
 
   # Expanded now: the trap can fire after this function's locals are gone.
@@ -303,8 +515,21 @@ finish_all() {
   # abort this trap before the desktop was stopped.
   set +e
   [ -f "$desktop_exit_record" ] && exited_on_its_own=$(cat "$desktop_exit_record")
+  # The TUI can exit before perl has made the keeper's session, while the pid
+  # still sits in THIS shell's process group, so it is not yet the leader
+  # desktop_group_is_ours looks for. Give it two seconds to become one rather
+  # than leave it to start the desktop after we are gone. Until then it is
+  # signalled only by its own pid: its group is still ours and the TUI's.
+  local i=0
+  while [ "$i" -lt 20 ] && ! desktop_group_is_ours "$desktop_pgid" &&
+    desktop_keeper_starting "$desktop_pgid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
   if desktop_group_is_ours "$desktop_pgid"; then
     stop_desktop_group "$desktop_pgid"
+  elif desktop_keeper_starting "$desktop_pgid"; then
+    kill -TERM "$desktop_pgid" 2>/dev/null
   fi
   rm -f "$desktop_record"
   if [ -n "$exited_on_its_own" ]; then
@@ -323,6 +548,11 @@ controlling_tty() {
   case $tty in '' | '?' | '??') ;; *) echo "$tty" ;; esac
 }
 
+# Has this keeper lost the shell that started it ($1)?
+parent_is_gone() {
+  [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')" != "$1" ]
+}
+
 keep_desktop() {
   local parent=$1 child status
 
@@ -330,14 +560,25 @@ keep_desktop() {
   # connect-only probe at launch. So wait until the daemon answers before
   # starting it, or a warm desktop can beat the daemon up and open on an error
   # that only a manual Reconnect clears. Bounded: after 30s it starts anyway.
+  # And never start it once the shell that started us is gone: its teardown
+  # may already have run and found nothing to stop.
   local i=0
   until "$bin" daemon status >/dev/null 2>&1; do
+    parent_is_gone "$parent" && exit 0
     i=$((i + 1))
     [ "$i" -ge 150 ] && break
     sleep 0.2
   done
+  parent_is_gone "$parent" && exit 0
 
-  (cd "$desktop_dir" && exec pnpm tauri dev) &
+  # Through perl, which puts SIGINT and SIGQUIT back to their defaults: this
+  # keeper is a shell without job control, which starts a `&` command with both
+  # ignored, an ignored signal stays ignored across exec, and the desktop's tree
+  # had them at their defaults when `set -m` started it.
+  (cd "$desktop_dir" && exec perl -e '
+    $SIG{INT} = $SIG{QUIT} = "DEFAULT";
+    exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";
+  ' pnpm tauri dev) &
   child=$!
 
   # Hold the group until `all` (or `task run-stop`) kills it, and take it down
@@ -350,14 +591,15 @@ keep_desktop() {
   #   interactive shell that forwards SIGHUP to its jobs (`ssh -t host task
   #   run-all`, a tmux pane whose command is `task`), neither the TUI nor that
   #   shell hears about it and the TUI keeps running with no terminal. What the
-  #   hangup does do is detach the whole session from the tty, so we watch that.
+  #   hangup does do is detach that shell's session from the tty, so we watch
+  #   the shell's terminal — this keeper's own session never has one.
   local started_on_tty
-  started_on_tty=$(controlling_tty "$$")
+  started_on_tty=$(controlling_tty "$parent")
   local reason=""
   while [ -z "$reason" ]; do
-    if [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')" != "$parent" ]; then
+    if parent_is_gone "$parent"; then
       reason="the shell that started this desktop is gone"
-    elif [ -n "$started_on_tty" ] && [ -z "$(controlling_tty "$$")" ]; then
+    elif [ -n "$started_on_tty" ] && [ -z "$(controlling_tty "$parent")" ]; then
       reason="the terminal this desktop was started from has hung up"
     else
       if [ -n "$child" ] && ! kill -0 "$child" 2>/dev/null; then

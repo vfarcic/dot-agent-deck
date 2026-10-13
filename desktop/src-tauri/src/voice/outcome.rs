@@ -152,6 +152,23 @@ pub const FILTER_DASHBOARD_ROW: &str = "filter_dashboard";
 /// A resolved agent is named in a note of its own ("Agent: tester."), the way
 /// an optional param's value is, so a wrong one is audible.
 pub const OPEN_PR_ROW: &str = "open_pr";
+/// PR #1672 — the Host button's row: a daemon's Host figures, a read-only
+/// popover on the agent dashboard (PRD #1258).
+///
+/// Named for what no column carries about its optional `deck_ref`. It is
+/// resolved against every observed daemon, not the New agent dialog's eligible
+/// set, since a daemon that cannot take a new agent still has a Host button;
+/// none is ever implied ([`implied_param`] is the dialog's), because with no
+/// daemon named the dashboard opens the one showing a Host button or asks which
+/// (`chooseHostDeck` in `desktop/src/lib/hostMetrics.ts`); one that resolves is
+/// named in the report the way a dashboard filter names its daemon
+/// ([`facet_note`]); and one the user SAID that matches nothing or several
+/// refuses the row as a required param would — a popover for a daemon the user
+/// did not ask about is no answer to the one they did — while one only the
+/// model supplied is set aside before it is resolved, as if none was named.
+/// All daemons, the Daemon selector's entry for every daemon at once, is
+/// refused: the figures are per daemon, so the user is asked which.
+pub const SHOW_HOST_METRICS_ROW: &str = "show_host_metrics";
 /// One reading of a pick in [`UNGROUNDED_READS_AS`]: the row it is answered
 /// as, and the requirement that has to hold for it to be read that way.
 type Reading = (&'static str, Option<Requirement>);
@@ -1191,7 +1208,7 @@ pub async fn handle_utterance_with_modes(
                 }
             }
             if spec.optional {
-                if row.id != FILTER_DASHBOARD_ROW {
+                if row.id != FILTER_DASHBOARD_ROW && row.id != SHOW_HOST_METRICS_ROW {
                     resolved.extend(implied_param(spec, decks));
                 }
                 continue;
@@ -1203,6 +1220,18 @@ pub async fn handle_utterance_with_modes(
                 param: spec.name.clone(),
             });
         };
+        // PR #1672 — a daemon the user did not SAY is set aside before it is
+        // resolved, and the dashboard decides as if none was named
+        // ([`SHOW_HOST_METRICS_ROW`]): with several daemons showing a Host
+        // button, a name only the model supplied would otherwise open one the
+        // user never asked about instead of asking which. The daemon's words
+        // must be heard beside the ones that asked for the row: a daemon
+        // called "host" is not named by "show host" (Qodo on PR #1672).
+        if row.id == SHOW_HOST_METRICS_ROW
+            && !said_beyond_the_ask(spoken, transcript.text(), row, decks)
+        {
+            continue;
+        }
         // An observed-name param the model supplied while labels are withheld:
         // this request could not show the model the name, so it is never
         // resolved. (A REQUIRED one never gets here — `needs_labels` refused
@@ -1218,7 +1247,9 @@ pub async fn handle_utterance_with_modes(
                 decks,
                 directories,
                 new_agent,
-                row.id != SWITCH_DECK_ROW && row.id != FILTER_DASHBOARD_ROW,
+                row.id != SWITCH_DECK_ROW
+                    && row.id != FILTER_DASHBOARD_ROW
+                    && row.id != SHOW_HOST_METRICS_ROW,
                 row,
             )
         };
@@ -1237,6 +1268,26 @@ pub async fn handle_utterance_with_modes(
                     safe_message(&param.label)
                 ));
             }
+            // PR #1672 — All daemons is a selection, not a daemon with a Host
+            // button: the figures are per daemon, so the user is asked to name
+            // one rather than told the figures are showing when nothing opens.
+            Ok(param)
+                if row.id == SHOW_HOST_METRICS_ROW
+                    && param.kind == ParamKind::DeckRef
+                    && param.value == super::ALL_DECKS_ID =>
+            {
+                return finish(VoiceOutcome::ParamUnresolved {
+                    sentence: heard(
+                        &transcript,
+                        "the Host figures are shown one daemon at a time, so say which daemon",
+                    ),
+                    action: row.id.clone(),
+                    param: spec.name.clone(),
+                    spoken: spoken.to_string(),
+                    transcript,
+                    nothing_matched: false,
+                });
+            }
             // **An optional param that resolves is named in the report**
             // (PRD #1223), whether or not the user said it. A row's report may
             // not interpolate an optional param — it may have nothing to say —
@@ -1247,7 +1298,10 @@ pub async fn handle_utterance_with_modes(
             // silent, which matters because a voice-only user cannot change
             // the deck once the dialog is open (#1263).
             Ok(param) => {
-                if row.id == FILTER_DASHBOARD_ROW || row.id == OPEN_PR_ROW {
+                if row.id == FILTER_DASHBOARD_ROW
+                    || row.id == OPEN_PR_ROW
+                    || row.id == SHOW_HOST_METRICS_ROW
+                {
                     notes.push(facet_note(&param));
                 } else if spec.optional {
                     notes.push(preselected_note(&param));
@@ -1290,7 +1344,9 @@ pub async fn handle_utterance_with_modes(
             // deck can take a new agent the dialog preselects it whatever it
             // was asked for, so that deck is dispatched and named instead
             // ([`implied_param`]) — the report says what the dialog shows.
-            Err(unmet) if spec.optional && row.id != OPEN_PR_ROW => {
+            Err(unmet)
+                if spec.optional && row.id != OPEN_PR_ROW && row.id != SHOW_HOST_METRICS_ROW =>
+            {
                 let implied = implied_param(spec, decks);
                 notes.push(unmet.dropped_note(
                     spec.kind,
@@ -1702,6 +1758,44 @@ fn said(spoken: &str, transcript: &str) -> bool {
     let words = content_words(spoken);
     let heard = Heard::new(transcript);
     !words.is_empty() && words.iter().all(|word| heard.word(word))
+}
+
+/// Whether the user SAID `spoken` ([`said`]) in the words left once one
+/// occurrence of each of `row`'s `heard_as` entries is taken out — the words
+/// that asked for the row. "host for host" names a daemon called "host";
+/// "show host" does not, though its one "host" is that daemon's whole name.
+///
+/// When `spoken` is a deck's label as listed — which the row's description
+/// asks the model for — a word of it that no other deck's names hold counts
+/// as said ([`mentioned`]): "show host for the build box" names
+/// `deploy@build-box`, though nobody says its user part (PR #1672 round 10,
+/// the `show-host-named-daemon` fixture).
+fn said_beyond_the_ask(
+    spoken: &str,
+    transcript: &str,
+    row: &CommandRow,
+    decks: &[VoiceDeck],
+) -> bool {
+    let mut rest = spoken_words(transcript);
+    if let ActionGrounding::HeardAs(entries) = &row.grounding {
+        for entry in entries.iter().chain(&row.grounding_also) {
+            let wanted = spoken_words(entry);
+            if wanted.is_empty() {
+                continue;
+            }
+            if let Some(at) = rest.windows(wanted.len()).position(|window| {
+                window
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(heard, wanted)| same_word(heard, wanted))
+            }) {
+                rest.drain(at..at + wanted.len());
+            }
+        }
+    }
+    let rest = rest.join(" ");
+    said(spoken, &rest)
+        || (decks.iter().any(|deck| deck.label == spoken) && mentioned(spoken, &rest, decks))
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -8126,6 +8220,312 @@ mod tests {
         assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
     }
 
+    /// Scenario (PR #1672): on the dashboard the user says "show host" and the
+    /// model names no daemon. The row dispatches with no daemon and no note —
+    /// the dashboard opens the one daemon showing a Host button, or asks which
+    /// — and no deck is implied the way the New agent dialog implies one.
+    #[tokio::test]
+    async fn voice_outcome_show_host_with_no_daemon_dispatches_none() {
+        for said in [
+            "show host",
+            "open host info",
+            "show resource usage",
+            "Host warning",
+        ] {
+            let resolver =
+                StubResolver::new().answering(said, IntentAnswer::new(SHOW_HOST_METRICS_ROW));
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new(said),
+                    action: SHOW_HOST_METRICS_ROW.to_string(),
+                    invoke: "showHostMetrics".to_string(),
+                    params: Vec::new(),
+                    sentence: "Showing the Host figures.".to_string(),
+                    then_submit: false,
+                },
+                "{said:?}"
+            );
+        }
+        // One daemon a new agent could start on is still not implied here.
+        let (outcome, _) = open_new_agent_over(
+            &[deck("deck-local", "Local deck", true)],
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW),
+            "show host",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario (PR #1672): "show host for the build box" opens that daemon's
+    /// Host figures and names it; a daemon that cannot take a new agent — not
+    /// connected, here — is still resolved, since the dashboard says why it
+    /// has no figures rather than voice refusing it as the New agent dialog
+    /// would.
+    #[tokio::test]
+    async fn voice_outcome_show_host_for_a_named_daemon_dispatches_it() {
+        let resolver = StubResolver::new().answering(
+            "show host for the build box",
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "the build box"),
+        );
+        let outcome = run(
+            &resolver,
+            Screen::Overview,
+            &fleet(),
+            "show host for the build box",
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].value, "deck-build");
+        assert_eq!(params[0].kind, ParamKind::DeckRef);
+        assert_eq!(
+            sentence,
+            "Showing the Host figures. Daemon: deploy@build-box.example.com:2222."
+        );
+
+        let (outcome, _) = open_new_agent_over(
+            &[
+                deck("deck-local", "Local deck", true),
+                unavailable_deck("deck-stale", "ci@stale-box", false, NOT_CONNECTED),
+            ],
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "stale box"),
+            "host stale box",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-stale"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario (PR #1672): a daemon the user SAID that matches nothing is
+    /// refused rather than set aside, and one that matches several is the
+    /// numbered choice — a popover for another daemon would not answer what
+    /// they asked. A daemon only the model supplied is set aside silently, and
+    /// the row dispatches as if none was named.
+    #[tokio::test]
+    async fn voice_outcome_show_host_refuses_a_said_daemon_it_cannot_find() {
+        let resolver = StubResolver::new().answering(
+            "show host for the ghost box",
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "ghost box"),
+        );
+        let outcome = run(
+            &resolver,
+            Screen::Overview,
+            &fleet(),
+            "show host for the ghost box",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { action, .. }
+                if action == SHOW_HOST_METRICS_ROW),
+            "{outcome:?}"
+        );
+
+        let resolver = StubResolver::new().answering(
+            "host build",
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "build"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "host build").await;
+        let VoiceOutcome::ParamAmbiguous { candidates, .. } = &outcome else {
+            panic!("expected the numbered choice, got {outcome:?}");
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["deck-build", "deck-build-two"]
+        );
+
+        let resolver = StubResolver::new().answering(
+            "show host",
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "ghost box"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "show host").await;
+        assert_eq!(outcome.sentence(), "Showing the Host figures.");
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario (PR #1672): with several daemons on the dashboard the user
+    /// says only "show host", and the model fills in a daemon that does exist.
+    /// The user named none, so it is set aside before it is resolved and the
+    /// row dispatches with no daemon: the dashboard then asks which daemon
+    /// (`chooseHostDeck`) rather than opening that one's popover.
+    #[tokio::test]
+    async fn voice_outcome_show_host_sets_aside_an_unspoken_daemon_that_resolves() {
+        for supplied in ["build box", "deploy@build-box.example.com:2222", "local"] {
+            let resolver = StubResolver::new().answering(
+                "show host",
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", supplied),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), "show host").await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new("show host"),
+                    action: SHOW_HOST_METRICS_ROW.to_string(),
+                    invoke: "showHostMetrics".to_string(),
+                    params: Vec::new(),
+                    sentence: "Showing the Host figures.".to_string(),
+                    then_submit: false,
+                },
+                "{supplied:?}"
+            );
+        }
+    }
+
+    /// Scenario (PR #1672, Qodo): a daemon is named "host", the row's own word.
+    /// "show host" with the model supplying `deck = "host"` dispatches with no
+    /// daemon, since the one "host" asked for the figures; "host for host" and
+    /// "show host on host" say it a second time, and open that daemon.
+    #[tokio::test]
+    async fn voice_outcome_show_host_needs_a_daemon_said_beside_the_row_words() {
+        let decks = [
+            deck("deck-host", "host", true),
+            deck("deck-local", "Local deck", true),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &decks,
+            IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "host"),
+            "show host",
+        )
+        .await;
+        assert_eq!(outcome.sentence(), "Showing the Host figures.");
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+
+        for said in ["host for host", "show host on host"] {
+            let (outcome, _) = open_new_agent_over(
+                &decks,
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "host"),
+                said,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params.len() == 1 && params[0].value == "deck-host"),
+                "{said:?}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario (PR #1672 round 10): two remote daemons are labelled
+    /// `deploy@build-box` and `ci@stale-box`, and the model answers the one
+    /// the user meant by its label as listed. "show host for the build box"
+    /// opens the build box, though the user never said "deploy"; "show host
+    /// for the box" names a word both labels share, so it names neither and
+    /// the dashboard decides.
+    #[tokio::test]
+    async fn voice_outcome_show_host_names_a_daemon_by_a_word_of_its_label() {
+        let decks = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build-box", "deploy@build-box", false),
+            deck("deck-stale-box", "ci@stale-box", false),
+        ];
+        let answer =
+            || IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "deploy@build-box");
+        let (outcome, _) =
+            open_new_agent_over(&decks, answer(), "show host for the build box").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-build-box"),
+            "{outcome:?}"
+        );
+        let (outcome, _) = open_new_agent_over(&decks, answer(), "show host for the box").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario (PR #1672): "show host for all daemons" resolves to the Daemon
+    /// selector's All daemons entry, which has no Host button of its own. The
+    /// row is refused in words asking which daemon, rather than reporting the
+    /// figures as shown while no popover opens.
+    #[tokio::test]
+    async fn voice_outcome_show_host_for_all_daemons_asks_which_daemon() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
+        });
+        for (said, supplied) in [
+            ("show host for all daemons", "all daemons"),
+            ("host for all demons", "all demons"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", supplied),
+            );
+            let outcome = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks,
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            let VoiceOutcome::ParamUnresolved {
+                action, sentence, ..
+            } = &outcome
+            else {
+                panic!("{said:?}: expected a refusal, got {outcome:?}");
+            };
+            assert_eq!(action, SHOW_HOST_METRICS_ROW);
+            assert_eq!(
+                sentence,
+                &format!(
+                    "Heard: \u{201c}{said}\u{201d} — the Host figures are shown one daemon \
+                     at a time, so say which daemon."
+                ),
+            );
+            assert!(!sentence.contains("Showing"), "{sentence}");
+        }
+    }
+
+    /// Scenario (PR #1672): "show host" over an agent's pane, or with the New
+    /// agent dialog open, is not run: the Host buttons are on the dashboard,
+    /// under neither.
+    #[tokio::test]
+    async fn voice_outcome_show_host_is_unavailable_off_the_dashboard() {
+        let resolver =
+            StubResolver::new().answering("show host", IntentAnswer::new(SHOW_HOST_METRICS_ROW));
+        for screen in [Screen::Agent, Screen::Deck] {
+            let outcome = run(&resolver, screen, &fleet(), "show host").await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { .. }),
+                "{screen:?}: {outcome:?}"
+            );
+        }
+        let row = table().row(SHOW_HOST_METRICS_ROW).expect("present");
+        assert!(row.requires.contains(&Requirement::NewAgentDialogClosed));
+    }
+
     /// `open_new_agent` said as `said` over `decks`, answered with `answer` —
     /// the outcome, and the data turn the model was sent.
     async fn open_new_agent_over(
@@ -12568,6 +12968,7 @@ mod tests {
             ("open_settings", Screen::Deck),
             ("start_new_agent", Screen::Overview),
             ("open_new_agent", Screen::Overview),
+            (SHOW_HOST_METRICS_ROW, Screen::Overview),
         ] {
             let resolver = StubResolver::new().answering("open docs", IntentAnswer::new(action));
             let outcome = run_everything(&resolver, screen, "open docs").await;
@@ -12750,13 +13151,19 @@ mod tests {
                 "just launch the agent immediately",
             ),
             ("open_new_agent", Screen::Overview, "spin up an agent"),
+            (
+                SHOW_HOST_METRICS_ROW,
+                Screen::Overview,
+                "how is the machine doing?",
+            ),
         ] {
             let resolver = StubResolver::new().answering(said, IntentAnswer::new(action));
             // `close` and `open_deck` are token-grounded only while the New
             // agent dialog is NOT declared (H1), and `run_everything` declares
             // it — so their ordinary phrasings are asked with nothing declared.
-            // Over the dialog they are the H1 tests below.
-            let outcome = if over_the_dialog(action).is_some() {
+            // Over the dialog they are the H1 tests below. The Host row needs
+            // the dialog closed, so it is asked with nothing declared too.
+            let outcome = if over_the_dialog(action).is_some() || action == SHOW_HOST_METRICS_ROW {
                 run(&resolver, screen, &fleet(), said).await
             } else {
                 run_everything(&resolver, screen, said).await
@@ -14994,6 +15401,10 @@ mod tests {
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
     const AGENT_TILE_TSX: &str = include_str!("../../../src/components/AgentTile.tsx");
+    /// PR #1672 — the Host button beside each daemon's name, and its words.
+    const HOST_METRICS_PANEL_TSX: &str =
+        include_str!("../../../src/components/HostMetricsPanel.tsx");
+    const HOST_METRICS_TS: &str = include_str!("../../../src/lib/hostMetrics.ts");
 
     /// Where a label lives, as the literal the source renders it from.
     struct ControlLabel {
@@ -15014,7 +15425,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 21] = [
+    const CONTROL_LABELS: [ControlLabel; 26] = [
         ControlLabel {
             source: "\"Activate orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,
@@ -15167,6 +15578,45 @@ mod tests {
             row: "close_orchestration",
             over_the_form: false,
         },
+        // PR #1672 — the Host button: "Host", "Host: warning" or "Host:
+        // critical" (its text), and "Host of this deck, <daemon>" (its
+        // accessible name).
+        ControlLabel {
+            source: "export const HOST_BUTTON_TEXT = \"Host\";",
+            file: HOST_METRICS_TS,
+            said: "Host",
+            row: SHOW_HOST_METRICS_ROW,
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "`${HOST_BUTTON_TEXT}: ${word}`",
+            file: HOST_METRICS_PANEL_TSX,
+            said: "Host warning",
+            row: SHOW_HOST_METRICS_ROW,
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "case \"critical\": return \"critical\";",
+            file: HOST_METRICS_TS,
+            said: "Host critical",
+            row: SHOW_HOST_METRICS_ROW,
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "export const HOST_TITLE = \"Host of this deck\";",
+            file: HOST_METRICS_TS,
+            said: "Host of this deck Local daemon",
+            row: SHOW_HOST_METRICS_ROW,
+            over_the_form: false,
+        },
+        // PR #1672 round 10 — the open popover's X, which `close` closes.
+        ControlLabel {
+            source: "export const HOST_CLOSE_LABEL = \"Close host\";",
+            file: HOST_METRICS_TS,
+            said: "Close host",
+            row: "close",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label, said as it reads,
@@ -15229,6 +15679,16 @@ mod tests {
             ("open_deck", "open deck"),
             ("open_agent", "open tester agent"),
             ("stop_agent", "stop tester agent"),
+            ("show_host_metrics", "host warning"),
+            ("show_host_metrics", "host critical"),
+            ("show_host_metrics", "host of this deck"),
+            ("show_host_metrics", "open host info"),
+            ("show_host_metrics", "show resource usage"),
+            ("close", "close host"),
+            ("close", "close host info"),
+            ("close", "close resource usage"),
+            ("close", "hide resource usage"),
+            ("close", "close the host figures"),
         ] {
             // A description wraps across lines, so compare word runs.
             let description = spoken_words(&table().row(row).expect("present").description);
@@ -15271,6 +15731,58 @@ mod tests {
         }
         let close = table().row("close").expect("present");
         assert!(action_grounded(close, "Close", None, None));
+    }
+
+    /// Scenario: with a daemon's Host popover open, the user says "close
+    /// host" (its X's accessible name), "close resource usage" or the other
+    /// words for closing it. Each grounds `close`, which closes the popover,
+    /// and none grounds a row that stops something; `show_host_metrics`'s
+    /// description says it only opens and sends a close to `close`.
+    #[test]
+    fn voice_outcome_closing_the_host_popover_is_the_close_row() {
+        let close = table().row("close").expect("present");
+        let stops =
+            ["stop_agent", "close_orchestration"].map(|id| table().row(id).expect("present"));
+        for said in [
+            "close host",
+            "Close host",
+            "close host info",
+            "close resource usage",
+            "hide resource usage",
+            "close the host figures",
+            "close",
+            "close it",
+            "close this",
+        ] {
+            assert!(
+                action_grounded(close, said, None, None),
+                "{said:?} does not ground `close`"
+            );
+            for stop in &stops {
+                assert!(
+                    !action_grounded(stop, said, None, None),
+                    "{said:?} grounds `{}`",
+                    stop.id
+                );
+            }
+        }
+        let host = table()
+            .row(SHOW_HOST_METRICS_ROW)
+            .expect("present")
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(host.contains("This only OPENS the figures"));
+        assert!(
+            host.contains("close host, close resource usage, hide resource usage — is `close`")
+        );
+        let close_description = close
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(close_description.contains("otherwise a daemon's Host popover if it is open"));
     }
 
     /// Scenario: the user reads the X button's accessible name, "Close new

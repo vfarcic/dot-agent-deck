@@ -565,6 +565,130 @@ screen = "overview"
 action = "open_settings"
 outcome = "dispatch"
 
+# PR #1672 — a daemon's Host figures (`show_host_metrics`). The first two are
+# the phrasings the user tried on a Mac and expects to work; the next three are
+# the Host button's own labels (the label rule); the rest are natural ones. The
+# collision fixtures pin that Settings and switching daemon keep their words.
+# Not yet measured against a live backend.
+[[fixtures]]
+name = "show-host-open-host-info"
+utterance = "open host info"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-resource-usage"
+utterance = "show resource usage"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-host"
+utterance = "Host"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-warning"
+utterance = "Host warning"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-critical"
+utterance = "Host critical"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-disk-space"
+utterance = "how much disk space is left?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-machine-doing"
+utterance = "how is the machine doing?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-named-daemon"
+utterance = "show host for the build box"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-not-switch-deck"
+utterance = "switch daemon to the build box"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-unavailable"
+utterance = "open host info"
+screen = "agent"
+action = "show_host_metrics"
+outcome = "unavailable"
+
+# PR #1672 round 10 — closing the Host popover. Its words carry `host`,
+# `resource` and `usage`, which are `show_host_metrics`'s, so these are the
+# guard that a close is `close` and not a second open. The popover's open state
+# is not declared to the model, so a bare "close it" said over it is the
+# dashboard's bare close, which the app then sends to the popover.
+[[fixtures]]
+name = "close-host-button-label"
+utterance = "close host"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-info"
+utterance = "close host info"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage"
+utterance = "close resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage-hide"
+utterance = "hide resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-figures"
+utterance = "close the host figures"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-it-host-open"
+utterance = "close it"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-settings-unavailable"
 utterance = "open settings"

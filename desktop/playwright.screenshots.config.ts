@@ -69,6 +69,9 @@ const PREVIEW = `vite preview ${OUT_DIR_ARG} --port ${PORT} --strictPort --host 
 export default defineConfig({
   testDir: "./screenshots",
   testMatch: "*.shot.ts",
+  // Pays Chromium's first-use font cost before the first shot's budget runs;
+  // the file says what it absorbs and why it is not a setup project.
+  globalSetup: "./screenshots/warm-up.global.ts",
   // One worker: the images do not depend on ordering, but two Chromium
   // processes rasterizing at once is the one variable left that this run can
   // simply not introduce.

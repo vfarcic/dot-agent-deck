@@ -10,8 +10,8 @@ set -euo pipefail
 #
 # READ docs/develop/governance.md BEFORE RUNNING `apply`. In particular:
 #
-#   1. `main` currently takes two direct pushes from CI — the changelog commit
-#      in release.yml and the docs chart bump in docs-publish.yml. Both are
+#   1. `main` currently takes two direct pushes from CI — the flake version pin
+#      in tag-release.yml and the changelog commit in release.yml. Both are
 #      rejected with `GH006` under this ruleset unless the RELEASE_TOKEN secret
 #      is set to an admin PAT. Applying this without that secret breaks the very
 #      next release, exactly as it did for v0.35.6 (CLAUDE.md rule 8).
@@ -389,7 +389,7 @@ cmd_status() {
   if [ "$token_state" = set ]; then
     echo "set — CI can bypass"
   else
-    echo "NOT SET — applying this ruleset will break the next release and /publish-docs"
+    echo "NOT SET — applying this ruleset will break the next release"
   fi
 }
 
@@ -403,7 +403,7 @@ cmd_apply() {
   fi
   if [ "$token_state" != set ]; then
     echo "refusing to apply: RELEASE_TOKEN is not set on $REPO." >&2
-    echo "release.yml and docs-publish.yml push directly to main; without an" >&2
+    echo "tag-release.yml and release.yml push directly to main; without an" >&2
     echo "admin PAT they will fail with GH006. See docs/develop/governance.md." >&2
     exit 1
   fi

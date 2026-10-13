@@ -88,12 +88,20 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
     }
 }
 
-/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane.
+/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, and the dashboard shortcuts must advertise the `m` host-metrics overlay.
 #[spec("dashboard/help/002")]
 #[test]
 fn help_002_overlay_documents_ctrl_d_toggle() {
     let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
 
+    let host_row = buf
+        .lines()
+        .find(|line| line.contains("host"))
+        .unwrap_or_else(|| panic!("help must document the host-metrics overlay\n{buf}"));
+    assert!(
+        host_row.split_whitespace().any(|word| word == "m"),
+        "help must show the default m host-metrics key\n{buf}"
+    );
     insta::assert_snapshot!(buf);
     assert!(
         buf.contains("toggle command / pane"),

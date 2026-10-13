@@ -61,6 +61,10 @@ pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
+// PRD #1258: measurements of the host the process runs on. Its load-per-CPU is
+// the one implementation the lib tests' `test_budget` and the test harness both
+// call (M2).
+pub mod host_metrics;
 // Issue #1181: the ambient git location environment, and the one place this
 // crate switches it off. Every `git` the crate spawns is built here.
 pub(crate) mod git_env;
@@ -83,6 +87,7 @@ pub mod new_agent_options;
 pub mod opencode_manage;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
+pub mod osc52;
 pub mod palette;
 pub mod pane;
 pub mod pane_delivery_queue;

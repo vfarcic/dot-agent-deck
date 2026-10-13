@@ -42,9 +42,13 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     /** Every `keydown` that reached xterm's own listener, by key. */
     keysSeen: string[] = [];
     getSelection(): string { return this.selection; }
+    hasSelection(): boolean { return this.selection !== ""; }
+    clearSelection(): void { this.selection = ""; }
+    /* Issue #1705's OSC 52 handler; `TerminalViewport.clipboard.test.tsx` drives it through the real xterm. */
+    readonly parser = { registerOscHandler: (): { dispose: () => void } => ({ dispose: () => {} }) };
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { this.host = host; host.appendChild(this.textarea); }
-    write(): void {}
+    write(_data?: unknown, callback?: () => void): void { callback?.(); }
     reset(): void {}
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
@@ -317,12 +321,19 @@ describe("TerminalViewport copy", () => {
   });
 
   /**
+   * Issue #1705 — clipboard writes are queued in order, so one starts a
+   * microtask after the key. Let the queue run before asserting, so a "not
+   * called" means nothing was queued, not that it had not started yet.
+   */
+  const settled = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  /**
    * Scenario: the operator highlights part of an agent's output and presses
    * Ctrl+Shift+C (Cmd+C on macOS). The highlighted text goes to the clipboard,
    * and the keystroke never reaches xterm — so nothing at all, and certainly
    * not an interrupt, is sent to the agent. Issue #1403.
    */
-  it("copies the selection on Ctrl+Shift+C and Cmd+C without the agent seeing the keystroke", () => {
+  it("copies the selection on Ctrl+Shift+C and Cmd+C without the agent seeing the keystroke", async () => {
     const onInput = vi.fn();
     renderViewport(false, onInput);
     const terminal = terminals[0];
@@ -331,6 +342,7 @@ describe("TerminalViewport copy", () => {
     const shiftChord = fireEvent.keyDown(terminal.textarea, { key: "C", ctrlKey: true, shiftKey: true });
     const macChord = fireEvent.keyDown(terminal.textarea, { key: "c", metaKey: true });
 
+    await settled();
     expect(writeClipboardText.mock.calls).toEqual([["cargo test passed"], ["cargo test passed"]]);
     // `fireEvent` returns false when the event was default-prevented: the
     // webview's own reaction to either chord is claimed too.
@@ -344,12 +356,13 @@ describe("TerminalViewport copy", () => {
    * Scenario: the chord with nothing highlighted. The clipboard keeps what it
    * had, and the chord still goes nowhere near the agent.
    */
-  it("leaves the clipboard alone when nothing is selected", () => {
+  it("leaves the clipboard alone when nothing is selected", async () => {
     const onInput = vi.fn();
     renderViewport(false, onInput);
     const terminal = terminals[0];
 
     fireEvent.keyDown(terminal.textarea, { key: "C", ctrlKey: true, shiftKey: true });
+    await settled();
 
     expect(writeClipboardText).not.toHaveBeenCalled();
     expect(terminal.keysSeen).toEqual([]);
@@ -360,13 +373,14 @@ describe("TerminalViewport copy", () => {
    * Scenario: plain Ctrl+C while text is highlighted. It is the agent's
    * interrupt, exactly as before, and copies nothing.
    */
-  it("hands plain Ctrl+C to the agent as an interrupt even over a selection", () => {
+  it("hands plain Ctrl+C to the agent as an interrupt even over a selection", async () => {
     const onInput = vi.fn();
     renderViewport(false, onInput);
     const terminal = terminals[0];
     terminal.selection = "cargo test passed";
 
     fireEvent.keyDown(terminal.textarea, { key: "c", ctrlKey: true });
+    await settled();
 
     expect(onInput).toHaveBeenCalledWith("\x03");
     expect(writeClipboardText).not.toHaveBeenCalled();
@@ -377,12 +391,13 @@ describe("TerminalViewport copy", () => {
    * client holds the write lease. Its output can still be copied, which is most
    * of what such a pane is for.
    */
-  it("copies from a read-only pane", () => {
+  it("copies from a read-only pane", async () => {
     renderViewport(true, vi.fn());
     const terminal = terminals[0];
     terminal.selection = "exit status 0";
 
     fireEvent.keyDown(screen.getByTestId("terminal-planner"), { key: "C", ctrlKey: true, shiftKey: true });
+    await settled();
 
     expect(writeClipboardText).toHaveBeenCalledWith("exit status 0");
   });

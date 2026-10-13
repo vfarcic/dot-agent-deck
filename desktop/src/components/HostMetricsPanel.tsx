@@ -1,0 +1,216 @@
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { Gauge, X } from "lucide-react";
+import type { HostMetricsReport } from "../types";
+import { formatDisk, formatGib, formatLoad, HOST_BUTTON_TEXT, HOST_CLOSE_LABEL, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
+import { displayText, DISPLAY_LIMITS, domIdentity } from "../lib/displayText";
+
+/**
+ * PRD #1258 — one value as the daemon judged it: coloured by its level, and
+ * followed by the level's word when it is not `ok`, so the colour is never the
+ * only signal. A value with no level (an older daemon, or an absent number) is
+ * written plain.
+ */
+function JudgedValue({ value, level }: { value: string; level: unknown }) {
+  const known = hostLevel(level);
+  const word = hostLevelWord(known);
+  return (
+    <dd className={known ? `host-level-${known}` : undefined} data-level={known ?? ""}>
+      {word ? `${value} ${word}` : value}
+    </dd>
+  );
+}
+
+/**
+ * PRD #1258 — one deck's host: disk per watched role, load per core and memory,
+ * as that deck's daemon reports them, each coloured by the
+ * level the daemon gave it. The same rows and words as the TUI's host overlay.
+ * Shown in the popover that the deck header's host button opens.
+ */
+export function HostMetricsPanel({ report }: { report: HostMetricsReport }) {
+  return (
+    <section className="host-metrics" data-testid="host-metrics" aria-label={HOST_TITLE}>
+      <header className="host-metrics-header">
+        <strong>{HOST_TITLE}</strong>
+        <span className="host-metrics-subtitle">{HOST_SUBTITLE}</span>
+      </header>
+      {report.status === "not-available" ? (
+        <p className="host-metrics-unavailable">{HOST_NOT_AVAILABLE} {HOST_NOT_AVAILABLE_WHY}</p>
+      ) : (
+        <dl className="host-metrics-rows">
+          {report.metrics.disks.map((disk, index) => (
+            // The role is the daemon's text: the key gets its bounded copy, and
+            // the index keeps two equal roles from sharing one.
+            <div className="host-metrics-row" key={`${index}:${domIdentity(disk.role)}`}>
+              <dt>{displayText(hostRoleLabel(disk.role), DISPLAY_LIMITS.message)}</dt>
+              <JudgedValue value={formatDisk(disk.freeBytes, disk.totalBytes)} level={disk.level} />
+            </div>
+          ))}
+          <div className="host-metrics-row">
+            <dt>Load per core</dt>
+            <JudgedValue value={formatLoad(report.metrics.loadPerCpu, report.metrics.cpuCount)} level={report.metrics.loadLevel} />
+          </div>
+          <div className="host-metrics-row">
+            <dt>Memory used</dt>
+            <dd>{formatGib(report.metrics.memoryUsedBytes)}</dd>
+          </div>
+          <div className="host-metrics-row">
+            <dt>Memory available</dt>
+            <JudgedValue value={formatGib(report.metrics.memoryAvailableBytes)} level={report.metrics.memoryLevel} />
+          </div>
+        </dl>
+      )}
+    </section>
+  );
+}
+
+/** The gap the host popover keeps from each side of the window. */
+const POPOVER_VIEWPORT_MARGIN = 12;
+
+/**
+ * PRD #1258 — the deck header's host button, beside the deck's name. It is
+ * coloured by the worst level among the deck's readings (neutral when none
+ * carries one), names that state in words in its accessible name and tooltip,
+ * and discloses {@link HostMetricsPanel} in a popover that its X button
+ * (`Close host`, PR #1672), Escape and a press anywhere else close. A deck
+ * whose daemon does not report its host opens the same popover saying so.
+ *
+ * Whether it is open is the overview's (PR #1672): a click asks to open it
+ * through `onOpen`, which the overview routes through the voice action
+ * registry, so the button and the spoken "show host" are one action.
+ * Every close is `onClose`, including the spoken `close`, which the overview
+ * routes through `closeTopmost`.
+ */
+export function HostMetricsButton({ report, deckLabel, open, onOpen, onClose }: { report: HostMetricsReport; deckLabel: string; open: boolean; onOpen: () => void; onClose: () => void }) {
+  const root = useRef<HTMLDivElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const popoverId = useId();
+  const level = worstHostLevel(report);
+  const state = hostStateWords(report);
+  const word = level === "warn" || level === "critical" ? state : undefined;
+
+  /*
+    Dismissed the way the dashboard's Columns picker is: a press, or an Escape,
+    raised anywhere OUTSIDE this root closes it, bound only while open and in
+    the capture phase so a sibling that stops Escape cannot keep it open. That
+    outside Escape is deliberately NOT stopped and focus is NOT moved: focus is
+    somewhere else — the command palette, an agent's terminal — and that press
+    is theirs. An Escape raised INSIDE the root is the root's own `onKeyDown`
+    below, which closes, stops the key so the app-wide Escape does not act on
+    it too, and hands focus back to the button.
+  */
+  /* The latest close, so the listeners below are bound once per opening
+     rather than again on every render that hands down a new callback. */
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: Event) => {
+      if (event.target instanceof Node && root.current?.contains(event.target)) return;
+      close.current();
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      dismiss(event);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismissOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismissOnEscape, true);
+    };
+  }, [open]);
+
+  /*
+    Kept inside the window: the popover hangs from the button's left edge, and
+    a button far to the right — a narrow window, a long deck name — would push
+    it past the right edge and give the page a horizontal scrollbar. Measured
+    after layout and shifted left by exactly the overflow, never past the left
+    margin; its CSS width already never exceeds the viewport less both margins.
+    Measured again whenever the window is resized while it is open, so the
+    shift follows the window both ways (PR #1672 review); measured from the
+    anchor, not from the popover's already-shifted box.
+  */
+  const popover = useRef<HTMLDivElement>(null);
+  const [shift, setShift] = useState(0);
+  /* Opened by voice, the button may be scrolled out of the dashboard's view:
+     bring the popover into it, as a spoken agent row is (issue #1492). */
+  useEffect(() => {
+    if (open) popover.current?.scrollIntoView?.({ block: "nearest" });
+  }, [open]);
+  useLayoutEffect(() => {
+    if (!open) {
+      setShift(0);
+      return;
+    }
+    const measure = () => {
+      const element = popover.current;
+      const anchor = root.current;
+      if (!element || !anchor) return;
+      const margin = POPOVER_VIEWPORT_MARGIN;
+      const anchorLeft = anchor.getBoundingClientRect().left;
+      const width = element.getBoundingClientRect().width;
+      const overflow = anchorLeft + width - (window.innerWidth - margin);
+      setShift(overflow > 0 ? Math.min(overflow, Math.max(0, anchorLeft - margin)) : 0);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [open]);
+
+  return (
+    <div
+      className="host-metrics-anchor"
+      ref={root}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !open) return;
+        event.stopPropagation();
+        onClose();
+        button.current?.focus();
+      }}
+    >
+      <button
+        ref={button}
+        type="button"
+        className={`button secondary compact host-metrics-button host-button-${level ?? "none"}`}
+        data-testid="host-metrics-button"
+        data-level={level ?? ""}
+        aria-expanded={open}
+        aria-controls={open ? popoverId : undefined}
+        aria-label={`${HOST_TITLE}, ${deckLabel}${state ? `: ${state}` : ""}`}
+        title={`${HOST_TITLE}${state ? `: ${state}` : ""}`}
+        onClick={() => (open ? onClose() : onOpen())}
+      >
+        <Gauge size={13} aria-hidden="true" />
+        <span>{word ? `${HOST_BUTTON_TEXT}: ${word}` : HOST_BUTTON_TEXT}</span>
+      </button>
+      {open && (
+        <div
+          ref={popover}
+          className="host-metrics-popover"
+          id={popoverId}
+          aria-label={`${HOST_TITLE}, ${deckLabel}`}
+          data-testid="host-metrics-popover"
+          style={shift > 0 ? { left: -shift } : undefined}
+        >
+          <HostMetricsPanel report={report} />
+          {/* PR #1672 — the X every other overlay has, named for what it
+              closes so the user can say what they see ("close host"). It is
+              inside the root, so the outside-press dismissal does not also
+              fire; focus goes back to the button, as Escape's does. */}
+          <button
+            type="button"
+            className="icon-button host-metrics-close"
+            aria-label={HOST_CLOSE_LABEL}
+            title={HOST_CLOSE_LABEL}
+            onClick={() => {
+              onClose();
+              button.current?.focus();
+            }}
+          >
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

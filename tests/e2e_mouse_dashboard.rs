@@ -56,7 +56,7 @@ fn dashboard_001_click_selects_double_click_focuses() {
     // pane (no agent credentials needed) so the double-click→focus enters
     // PaneInput.
     // PRD #127: 200 cols so the Normal-mode bar renders the FULL labeled set
-    // (`[New Agent Ctrl+N]`); at the default 120 it collapses to chips once the
+    // (`[New Agent n/Ctrl+N]`); at the default 120 it collapses to chips once the
     // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
@@ -64,10 +64,10 @@ fn dashboard_001_click_selects_double_click_focuses() {
         .launch_with_fixture("minimal");
     // --continue auto-focuses the single restored pane (PaneInput → the bottom
     // bar shows [Command Mode Ctrl+D]). Detach to the dashboard Normal mode (bar
-    // shows [New Agent Ctrl+N]) so the card is clickable.
+    // shows [New Agent n/Ctrl+N]) so the card is clickable.
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // The realpane card's body shows "Launch an agent..." (a No-agent pane).
     // Locate the card by that text — find_in_grid("realpane") would hit the
     // focused-pane preview's title bar on the right, not the card.
@@ -98,7 +98,7 @@ fn dashboard_001_click_selects_double_click_focuses() {
 fn dashboard_002_filter_rename_generate_buttons() {
     // PRD #127: 200 cols so the dashboard bar renders the FULL labeled context
     // buttons (`[Filter /]`, `[Rename r]`, `[Generate g]`) and the labeled
-    // global `[New Agent Ctrl+N]`; at the default 120 the bar collapses to
+    // global `[New Agent n/Ctrl+N]`; at the default 120 the bar collapses to
     // shortcut-only chips once the always-shown Schedules button is added.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
@@ -116,14 +116,14 @@ fn dashboard_002_filter_rename_generate_buttons() {
     deck.send_bytes(b"\x1b"); // Esc → back to Normal mode
     // Wait for the Normal-mode button bar to return before locating the next
     // button (Esc is async — finding it immediately races the redraw).
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // Rename button (acts on the selected card) → rename mode.
     let (c, r) = deck.wait_for_in_grid("Rename");
     deck.click(c, r);
     deck.wait_for_string("Rename:");
     deck.send_bytes(b"\x1b"); // Esc → back to Normal mode
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // Generate-config button → config-generation prompt.
     let (c, r) = deck.wait_for_in_grid("Generate");

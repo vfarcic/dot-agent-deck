@@ -249,6 +249,27 @@ pub fn highest_priority_status(statuses: &[SessionStatus]) -> SessionStatus {
         .unwrap_or(SessionStatus::Idle)
 }
 
+/// PRD #1258: a host reading the daemon judged healthy. The working role's
+/// green, so "fine" reads the same on a host reading as on an agent.
+pub const HEALTH_OK: Color = STATUS_WORKING;
+/// PRD #1258: a host reading past its warn threshold. Yellow, the colour the
+/// TUI already gives a caution in its status line.
+pub const HEALTH_WARN: Color = Color::Yellow;
+/// PRD #1258: a host reading past its critical threshold — the error role's red.
+pub const HEALTH_CRITICAL: Color = STATUS_ERROR;
+
+/// PRD #1258: the colour of a host reading at `level`. Named ANSI colours, so a
+/// terminal theme remaps them like every other status colour. Never the only
+/// signal: the overlay writes the level's word beside every non-ok value.
+pub fn health_color(level: crate::daemon_protocol::HealthLevel) -> Color {
+    use crate::daemon_protocol::HealthLevel;
+    match level {
+        HealthLevel::Ok => HEALTH_OK,
+        HealthLevel::Warn => HEALTH_WARN,
+        HealthLevel::Critical => HEALTH_CRITICAL,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,9 +9,9 @@
 //!
 //! The bar exposes the five global commands, each carrying its keyboard
 //! shortcut inline so the bar doubles as a legend:
-//!   New Agent        → Ctrl+N   `[New Agent Ctrl+N]`
-//!   Close           → Ctrl+W   `[Close Ctrl+W]`
-//!   Toggle Layout   → Ctrl+T   `[Toggle Layout Ctrl+T]`
+//!   New Agent        → Ctrl+N   `[New Agent n/Ctrl+N]`
+//!   Close           → Ctrl+W   `[Close w/Ctrl+W]`
+//!   Toggle Layout   → Ctrl+T   `[Toggle Layout t/Ctrl+T]`
 //!   Help            → ?        `[Help ?]`
 //!   Quit            → Ctrl+C   `[Quit Ctrl+C]`
 //! The shortcut strings are derived from the keyboard handlers in
@@ -37,7 +37,7 @@ fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// Scenario: Render the global button bar into a 120-column (comfortable
 /// width) `TestBackend` buffer. The single bottom row must contain a
 /// clickable button for every global command WITH its inline shortcut —
-/// `[New Agent Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`,
+/// `[New Agent n/Ctrl+N]`, `[Close w/Ctrl+W]`, `[Toggle Layout t/Ctrl+T]`,
 /// `[Help ?]`, and `[Quit Ctrl+C]` — so click and keyboard expose the same
 /// five actions and the bar doubles as a legend. PRD #144 no-wrap guard:
 /// rendering the FULL dashboard bar (global + context, ~133 cells) at a
@@ -51,9 +51,9 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
     let bar = row_text(&buffer);
 
     for expected in [
-        "[New Agent Ctrl+N]",
-        "[Close Ctrl+W]",
-        "[Toggle Layout Ctrl+T]",
+        "[New Agent n/Ctrl+N]",
+        "[Close w/Ctrl+W]",
+        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
     ] {
@@ -76,9 +76,9 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
     );
     // … and that single row still carries the full inline-shortcut labels.
     assert!(
-        joined_rows(&wide).contains("[New Agent Ctrl+N]"),
+        joined_rows(&wide).contains("[New Agent n/Ctrl+N]"),
         "the comfortable-width single-row bar must still render the full \
-         `[New Agent Ctrl+N]` label, got:\n{}",
+         `[New Agent n/Ctrl+N]` label, got:\n{}",
         joined_rows(&wide)
     );
 }
@@ -87,9 +87,9 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
 /// ~133 cells) at a narrow/windowed 80 columns into a multi-row area. PRD #144:
 /// rather than collapsing to shortcut-only chips, the bar must WRAP to multiple
 /// rows while keeping the FULL `[Label Shortcut]` form of every button — so
-/// `[New Agent Ctrl+N]`, `[Toggle Layout Ctrl+T]`, `[Quit Ctrl+C]` and the
+/// `[New Agent n/Ctrl+N]`, `[Toggle Layout t/Ctrl+T]`, `[Quit Ctrl+C]` and the
 /// always-shown `[Schedules s]` all stay spelled out somewhere across the
-/// rows, the shortcut-only chip `[Ctrl+N]` never appears, and the bar occupies
+/// rows, the shortcut-only chip `[n/Ctrl+N]` never appears, and the bar occupies
 /// more than one row. This inverts the pre-#144 shortcut-only degradation.
 #[spec("mouse/buttonbar/002")]
 #[test]
@@ -99,9 +99,9 @@ fn buttonbar_002_narrow_terminal_wraps_keeping_full_labels() {
 
     // Every command keeps its FULL inline-shortcut label — wrapped, not chipped.
     for expected in [
-        "[New Agent Ctrl+N]",
-        "[Close Ctrl+W]",
-        "[Toggle Layout Ctrl+T]",
+        "[New Agent n/Ctrl+N]",
+        "[Close w/Ctrl+W]",
+        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
         "[Schedules s]",
@@ -116,8 +116,8 @@ fn buttonbar_002_narrow_terminal_wraps_keeping_full_labels() {
     // The shortcut-only chip must NOT appear — proving the bar wrapped rather
     // than degrading to chips.
     assert!(
-        !bar.contains("[Ctrl+N]"),
-        "narrow bar must wrap with full labels, not degrade to the `[Ctrl+N]` \
+        !bar.contains("[n/Ctrl+N]"),
+        "narrow bar must wrap with full labels, not degrade to the `[n/Ctrl+N]` \
          shortcut-only chip, got rows:\n{bar}"
     );
 
@@ -151,8 +151,8 @@ fn buttonbar_005_schedules_button_present_with_zero_schedules() {
 /// default PTY width (`DEFAULT_COLS`), into a multi-row area. The full
 /// `[Label Shortcut]` set is ~133 cells, so it overflows 120 and PRD #144 has it
 /// WRAP to a second row keeping EVERY button's full label rather than collapsing
-/// to shortcut-only chips: the full `[New Agent Ctrl+N]` label is present and the
-/// shortcut-only `[Ctrl+N]` chip is absent. Degradation is uniform — the
+/// to shortcut-only chips: the full `[New Agent n/Ctrl+N]` label is present and the
+/// shortcut-only `[n/Ctrl+N]` chip is absent. Degradation is uniform — the
 /// `[Schedules s]` button is full-labelled like the rest, NOT special-
 /// cased to keep its label while others chip. This inverts the pre-#144
 /// collapse-to-chips behavior at the 120-col reference width.
@@ -164,9 +164,9 @@ fn buttonbar_006_full_dashboard_set_wraps_at_default_width() {
 
     // Every button keeps its full label — wrapped to a second row, not chipped.
     for expected in [
-        "[New Agent Ctrl+N]",
-        "[Close Ctrl+W]",
-        "[Toggle Layout Ctrl+T]",
+        "[New Agent n/Ctrl+N]",
+        "[Close w/Ctrl+W]",
+        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
         "[Schedules s]",
@@ -181,9 +181,9 @@ fn buttonbar_006_full_dashboard_set_wraps_at_default_width() {
 
     // The shortcut-only chip must be absent — the bar wrapped, it did not chip.
     assert!(
-        !bar.contains("[Ctrl+N]"),
+        !bar.contains("[n/Ctrl+N]"),
         "at 120 cols the full dashboard bar must wrap with full labels, NOT \
-         collapse to the `[Ctrl+N]` shortcut-only chip, got rows:\n{bar}"
+         collapse to the `[n/Ctrl+N]` shortcut-only chip, got rows:\n{bar}"
     );
 
     // It wrapped to a second row (the full set does not fit one row at 120).

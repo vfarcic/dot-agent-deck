@@ -667,7 +667,7 @@ fn pr_004_dashboard_badge_and_browser_shortcut() {
         deck.wait_for_string("pr-fixture-agent");
         select_dashboard_card(&deck);
         deck.send_keys(b"o?");
-        deck.wait_for_string("Global (works from any pane)");
+        deck.wait_for_string("Global (chords work from any pane)");
         assert!(
             !fixture.scratch.path().join("browser-urls").exists(),
             "o on a card without a PR must not spawn an opener"

@@ -58,6 +58,11 @@ libc = "0.2"
 # `label-policy.json` the labeler's setup step writes.
 serde_json = "1"
 tempfile = "3"
+# Already a root-package dependency at the same pinned version, so this pulls
+# no new crate into Cargo.lock. `sandbox_run` drives `task run-all`'s script on
+# a real terminal, because what it guards — which process group owns the
+# terminal's foreground — exists only on one.
+portable-pty = "=0.8.1"
 # Issue #1061: `skill_frontmatter` has to decide whether a `SKILL.md`
 # frontmatter block is really valid YAML, and the whole defect it guards is
 # that a LENIENT reader accepted what a spec-correct one rejected — so

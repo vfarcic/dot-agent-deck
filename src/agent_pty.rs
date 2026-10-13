@@ -1844,18 +1844,24 @@ fn spawn_with_dir(
         .clone()
         .or_else(|| AgentType::from_command(opts.command))
         .unwrap_or(AgentType::None);
-    let launch_command: Option<String> = opts
+    // Issue #1685: a wrapped command the shell has to run itself (a leading
+    // assignment, a compound) comes back as an argv that hands it to
+    // `default_shell` inside the wrapper, so it is exec'd as it stands.
+    let launch_command = opts
         .command
-        .map(|c| crate::wrap::wrap_launch_command(c, &resolved_agent));
+        .map(|c| crate::wrap::wrap_launch_command(c, &resolved_agent, &default_shell));
 
-    let mut cmd = match launch_command.as_deref() {
-        Some(c) if command_needs_shell_wrap(c) => {
+    let mut cmd = match launch_command {
+        Some(crate::wrap::LaunchCommand::Argv(argv)) => {
+            CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect())
+        }
+        Some(crate::wrap::LaunchCommand::Line(c)) if command_needs_shell_wrap(&c) => {
             let mut cb = CommandBuilder::new(&default_shell);
             cb.arg(crate::platform::shell::shell_command_flag());
             cb.arg(c);
             cb
         }
-        Some(c) => CommandBuilder::new(c),
+        Some(crate::wrap::LaunchCommand::Line(c)) => CommandBuilder::new(c),
         None => CommandBuilder::new(&default_shell),
     };
 
@@ -24267,12 +24273,12 @@ mod spawn_tests {
     /// OUTSIDE the one-worker runtime it ran on.
     #[cfg(unix)]
     struct WedgeObservation {
-        /// The write's outcome and how long it took, if it came back before
-        /// the observer stopped waiting.
+        /// The write's outcome and time since entry into the PTY writer, if it
+        /// came back before the observer stopped waiting.
         returned: Option<(Result<FirstWriteSend, AgentPtyError>, Duration)>,
-        /// Heartbeats the runtime's only worker managed in the second after the
-        /// write's deadline. A worker parked inside a `write(2)` manages none.
-        beats_after_deadline: u64,
+        /// Heartbeats the runtime's only worker managed in the second after
+        /// entry into the writer. A worker parked inside `write(2)` manages none.
+        beats_after_entry: u64,
         /// Panes the daemon reported a stranded write on.
         notices: Vec<String>,
     }
@@ -24296,8 +24302,26 @@ mod spawn_tests {
 
         const PANE: &str = "issue-525-pane";
         const TEXT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
-        const DEADLINE: Duration = Duration::from_millis(500);
+        const ADMISSION_BUDGET: Duration = Duration::from_secs(5);
         const STALL_BOUND: Duration = Duration::from_millis(1500);
+
+        struct ObservedWriter {
+            inner: Box<dyn std::io::Write + Send>,
+            entered: Option<std::sync::mpsc::Sender<Instant>>,
+        }
+
+        impl std::io::Write for ObservedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(Instant::now());
+                }
+                self.inner.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -24372,6 +24396,20 @@ mod spawn_tests {
             }
         }
 
+        // Observe the real writer, after admission and echo-watch preparation.
+        // A 500 ms admission deadline previously expired under I/O contention,
+        // so neither case reached the kernel behavior it intended to measure.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let original =
+            rt.block_on(registry.replace_agent_writer_for_test(&agent, Box::new(std::io::sink())));
+        let _placeholder = rt.block_on(registry.replace_agent_writer_for_test(
+            &agent,
+            Box::new(ObservedWriter {
+                inner: original,
+                entered: Some(entered_tx),
+            }),
+        ));
+
         let beats = Arc::new(AtomicU64::new(0));
         let beats_task = beats.clone();
         rt.spawn(async move {
@@ -24392,16 +24430,18 @@ mod spawn_tests {
                     &write_agent,
                     || async { true },
                     started,
-                    started + DEADLINE,
+                    started + ADMISSION_BUDGET,
                 )
                 .await;
-            let _ = tx.send((sent, started.elapsed()));
+            let _ = tx.send((sent, Instant::now()));
         });
 
-        std::thread::sleep(DEADLINE);
-        let at_deadline = beats.load(Ordering::SeqCst);
+        let entered = entered_rx
+            .recv_timeout(ADMISSION_BUDGET + Duration::from_secs(5))
+            .ok();
+        let at_entry = beats.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_secs(1));
-        let beats_after_deadline = beats.load(Ordering::SeqCst) - at_deadline;
+        let beats_after_entry = beats.load(Ordering::SeqCst) - at_entry;
         // Generous: the control's CR waits out the echo bound (echo is off).
         let returned = rx
             .recv_timeout(
@@ -24421,9 +24461,13 @@ mod spawn_tests {
         unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
         drop(_entered);
         rt.shutdown_timeout(Duration::from_secs(5));
+        let entered = entered.unwrap_or_else(|| {
+            panic!("the guarded write never entered the PTY writer: {returned:?}")
+        });
         WedgeObservation {
-            returned,
-            beats_after_deadline,
+            returned: returned
+                .map(|(sent, finished)| (sent, finished.saturating_duration_since(entered))),
+            beats_after_entry,
             notices,
         }
     }
@@ -24451,10 +24495,10 @@ mod spawn_tests {
     fn a_guarded_write_into_a_pty_that_never_reads_leaves_the_runtime_worker_free() {
         let seen = guarded_write_into_a_raw_pty(true);
         assert!(
-            seen.beats_after_deadline > 10,
-            "the runtime's only worker stopped for a whole second past the write's deadline \
+            seen.beats_after_entry > 10,
+            "the runtime's only worker stopped for a whole second after entry into the writer \
              ({} heartbeats): the PTY write parked it in the kernel",
-            seen.beats_after_deadline
+            seen.beats_after_entry
         );
         let (sent, took) = seen
             .returned
@@ -24485,7 +24529,7 @@ mod spawn_tests {
     #[test]
     fn a_guarded_write_into_a_pty_with_room_is_still_applied() {
         let seen = guarded_write_into_a_raw_pty(false);
-        assert!(seen.beats_after_deadline > 10);
+        assert!(seen.beats_after_entry > 10);
         let (sent, _) = seen.returned.expect("the write came back");
         assert_eq!(
             sent.expect("delivered").detail,
@@ -26165,8 +26209,17 @@ mod spawn_tests {
             sent.detail,
             GuardedSendDetail::Outcome(GuardedSend::Applied)
         );
+        // The reported wait is the sum of the draft-poll sleeps, so it is at
+        // least one poll and never more than the time since the write was
+        // spawned. Not a fixed 400 ms floor: at load ~37 on 16 cores this test
+        // measured a single poll (200.9 ms, 215 ms) in two of three isolated
+        // runs (PR #1672) while still passing the "must wait" check above —
+        // consistent with the spawned write reaching its first draft check
+        // late on a starved runtime, which a floor tied to the test's own
+        // sleep cannot allow for.
         assert!(
-            sent.deferred >= Duration::from_millis(400) && sent.deferred <= started.elapsed(),
+            sent.deferred >= crate::draft_deferral::DRAFT_POLL_INTERVAL
+                && sent.deferred <= started.elapsed(),
             "the reported wait is the time spent waiting: {:?}",
             sent.deferred
         );
