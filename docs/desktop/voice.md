@@ -33,7 +33,7 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
 | Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that) |
@@ -140,7 +140,7 @@ On the dashboard, say **"show host"**, **"open host info"** or **"show resource 
 - With several, name the one you mean, for example "show host for build box". If you do not, nothing opens and the app asks which one.
 - A daemon that is not connected has no figures, and the app says so instead.
 
-`Esc` or a click elsewhere closes the figures, as it does when you open them with the button. The app does not read the figures aloud.
+To close the figures, say **"close"**, **"close it"**, **"close host"** (the name of the figures' **X** button), **"close resource usage"** or **"hide resource usage"**. If something else is open over the dashboard, such as Settings, an agent's pane or the list of commands, "close" closes that first, and the figures on the next "close". While a confirmation is open, such as the one for stopping an agent, "close" leaves the figures open behind it. Their **X**, `Esc` or a click elsewhere also closes them. The app does not read the figures aloud.
 
 ## Long lists are shown in pages
 

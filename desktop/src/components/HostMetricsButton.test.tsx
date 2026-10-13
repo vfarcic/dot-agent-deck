@@ -78,6 +78,26 @@ describe("HostMetricsButton", () => {
     expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
   });
 
+  /** Scenario: the open popover has an X named "Close host", like every other overlay's; pressing it closes the popover, returns focus to the Host button, and a press on the X does not count as a press outside. */
+  it("closes from its X button", () => {
+    const onClose = vi.fn();
+    const { rerender } = render(<HostMetricsButton report={report({ disk: "warn" })} deckLabel="Local daemon" open={true} onOpen={vi.fn()} onClose={onClose} />);
+    const close = screen.getByRole("button", { name: "Close host" });
+    expect(screen.getByTestId("host-metrics-popover").contains(close)).toBe(true);
+    expect(close.className).toContain("icon-button");
+    fireEvent.pointerDown(close);
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("host-metrics-button"));
+
+    rerender(<Stateful report={report({ disk: "warn" })} deckLabel="Local daemon" />);
+    fireEvent.click(screen.getByTestId("host-metrics-button"));
+    fireEvent.click(screen.getByRole("button", { name: "Close host" }));
+    expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close host" })).toBeNull();
+  });
+
   /** Scenario: with the popover open and focus elsewhere — the palette, a terminal — an Escape raised there closes the popover but still reaches a window listener and leaves focus where it was. */
   it("lets an Escape raised outside the popover through", () => {
     render(<div><Stateful report={report({ disk: "warn" })} deckLabel="Local daemon" /><input data-testid="outside" /></div>);

@@ -1159,6 +1159,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* PR #1672 — a daemon's Host figures, served always: Rust offers the
          row only while the New agent dialog is closed. */
       showHostMetrics,
+      /* And its close, published only while a popover is open, so
+         `closeTopmost` reads its presence the way it reads `closeNewAgent`'s. */
+      ...(hostOpen !== undefined ? { closeHostMetrics: () => setHostOpen(undefined) } : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }

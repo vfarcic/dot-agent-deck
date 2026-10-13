@@ -1346,7 +1346,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .host-metrics-button.host-button-critical { color: var(--red-ink); background: var(--red-soft); border-color: var(--red-rim-strong); }
 .host-metrics-popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(380px, calc(100vw - 24px)); border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
 .host-metrics { padding: 9px 12px 10px; }
-.host-metrics-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+/* PR #1672 — the popover's X, the other overlays' icon button, in the top-right
+   corner; the header keeps clear of it and is tall enough that the first row
+   starts below it. */
+.host-metrics-close { position: absolute; top: 4px; right: 4px; }
+.host-metrics-header { min-height: 26px; padding-right: 32px; display: flex; flex-wrap: wrap; align-items: baseline; align-content: center; gap: 8px; margin-bottom: 6px; }
 .host-metrics-header strong { font-size: 11px; font-weight: 720; }
 .host-metrics-subtitle { color: var(--faint); font-size: 9.5px; }
 .host-metrics-rows { margin: 0; display: grid; gap: 3px; }

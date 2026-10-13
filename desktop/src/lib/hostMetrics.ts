@@ -14,6 +14,8 @@ export const HOST_NOT_AVAILABLE = "Host metrics are not available from this deck
 export const HOST_NOT_AVAILABLE_WHY = "Its daemon is an older version, or runs on Windows.";
 /** The deck header's host button text. */
 export const HOST_BUTTON_TEXT = "Host";
+/** PR #1672 — the popover's X: its accessible name and tooltip, which voice's `close` row hears ("close host"). */
+export const HOST_CLOSE_LABEL = "Close host";
 
 const GIB = 1024 ** 3;
 

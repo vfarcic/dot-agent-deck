@@ -642,6 +642,53 @@ screen = "agent"
 action = "show_host_metrics"
 outcome = "unavailable"
 
+# PR #1672 round 10 — closing the Host popover. Its words carry `host`,
+# `resource` and `usage`, which are `show_host_metrics`'s, so these are the
+# guard that a close is `close` and not a second open. The popover's open state
+# is not declared to the model, so a bare "close it" said over it is the
+# dashboard's bare close, which the app then sends to the popover.
+[[fixtures]]
+name = "close-host-button-label"
+utterance = "close host"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-info"
+utterance = "close host info"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage"
+utterance = "close resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage-hide"
+utterance = "hide resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-figures"
+utterance = "close the host figures"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-it-host-open"
+utterance = "close it"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-settings-unavailable"
 utterance = "open settings"

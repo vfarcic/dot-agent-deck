@@ -366,8 +366,10 @@ heard_as_whole_while.new_agent_dialog = [
 # decided at DISPATCH, in `closeTopmost` (`desktop/src/lib/voiceActions.ts`):
 # the list of commands if it is showing, then the New agent dialog, then the
 # agent's pane, then Settings (a shell overlay since issue #1197, so it can sit
-# under a pane opened over it), otherwise nothing — and when there is nothing,
-# the surface says so rather than reporting a close that did not happen.
+# under a pane opened over it), then a daemon's Host popover (PR #1672: it hangs
+# from a button IN the dashboard, so every other layer can open over it),
+# otherwise nothing — and when there is nothing, the surface says so rather
+# than reporting a close that did not happen.
 #
 # **`close_agent_view` folded into this one instead of staying.** Two rows both
 # claiming *"close this"* is exactly the tie `schema::TOOL_INSTRUCTIONS`
@@ -441,16 +443,30 @@ heard_as_whole_while.new_agent_dialog = [
 # `close_orchestration`), and `stop_agent`'s that "close" stops nothing on any screen although
 # its button is labelled Close: 30 of 30 after, with every `stop-*` fixture 5 of
 # 5 and `start-new-agent-dialog-closed` 15 of 20 against 9 of 20 (2026-10-09).
+#
+# **The Host popover's words are this row's** (PR #1672 round 10). The user
+# said "close it", "close" and "close resource usage" with the popover open and
+# none of them closed it: it was not in `closeTopmost`'s chain. Its X is named
+# "Close host", so "close host" is the label rule's phrasing; "close resource
+# usage", "hide resource usage", "close host info" and "close the host
+# figures" are the user's own words for it. Every one of them is grounded by
+# `close` or `hide` already, and every one also carries a `show_host_metrics`
+# word (`host`, `resource`, `usage`), so the two descriptions settle it: this
+# one names them, and `show_host_metrics` says it only opens and that a close
+# is this row. None of them grounds `stop_agent` or `close_orchestration`.
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
 underneath. That is the list of spoken commands if it is showing, then the New agent dialog if it
-is open, then one agent's open pane, and otherwise the Settings sheet if it is open. Use for close, close this, close it, close the
+is open, then one agent's open pane, then the Settings sheet if it is open, and otherwise a
+daemon's Host popover if it is open. Use for close, close this, close it, close the
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
 agent, back to dashboard (the label of an open agent pane's button), or back to the dashboard or
-overview. "Close the agent", "close the agent screen", "close the agent
+overview. Closing the Host popover is THIS one too: close host (the accessible name of the popover's
+X button), close host info, close resource usage, hide resource usage, close the host figures — a
+request to CLOSE or HIDE the Host figures is never `show_host_metrics`. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
 keeps running — on the agent dashboard too, where nothing may be open over the screen and the app
 then says there is nothing to close. A request to close an agent or its view is THIS one even when
@@ -539,8 +555,9 @@ info, host warning, host critical, host of this deck, show resource usage, resou
 how much disk is left, memory, CPU, load, metrics, or how is the machine doing. When the user names
 the daemon (which a user may also call a deck) — "host for the build box", "show the build box
 resource usage" — set `deck` to the daemon they meant, exactly as listed in `decks`; otherwise
-leave `deck` out. This only shows figures: it starts, stops and changes nothing. It is not
-`switch_deck`, which changes which daemon is shown, and not `open_settings`."""
+leave `deck` out. This only OPENS the figures: it starts, stops and changes nothing. A request to
+close or hide them — close host, close resource usage, hide resource usage — is `close`, not this
+one. It is not `switch_deck`, which changes which daemon is shown, and not `open_settings`."""
 invoke      = "showHostMetrics"
 screens     = ["overview"]
 requires    = ["new_agent_dialog_closed"]

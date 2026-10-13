@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DeckShell } from "../App";
-import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, fixtureHostMetrics, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
 import { chooseHostDeck, HOST_VOICE_NONE, HOST_VOICE_NOT_SHOWN } from "../lib/hostMetrics";
+import { VOICE_ACTIONS, type VoiceDispatchTarget } from "../lib/voiceActions";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
-import { VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
+import { VOICE_NOTHING_TO_CLOSE, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 
 /*
  * PR #1672 — the Host popover by voice: the `show_host_metrics` row dispatches
@@ -49,6 +50,16 @@ const SAID: Record<string, VoiceResolvedParamDto[]> = {
   "host for the runner": [deck(FIXTURE_UNREACHABLE_DAEMON_ID, "ci@runner-7")],
 };
 
+/** What resolves to the `close` row: the popover's own words, and the bare forms. */
+const CLOSE = ["close", "close it", "close host", "close resource usage", "hide resource usage"];
+
+/** The other rows the precedence cases open things with. */
+const OTHER: Record<string, { action: string; invoke: string; sentence: string; params?: VoiceResolvedParamDto[] }> = {
+  "open settings": { action: "open_settings", invoke: "openSettings", sentence: "Opening settings." },
+  "what can I say?": { action: "list_commands", invoke: "showVoiceCommands", sentence: "Here is what you can say." },
+  "open the planner": { action: "open_agent", invoke: "openAgent", sentence: "Opening Planner.", params: [{ name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" }] },
+};
+
 function runtime(voice: ReturnType<typeof microphone>, fleet: DeckSnapshot[]) {
   const resolveVoice = vi.fn(async (transcript: string): Promise<VoiceResultDto> => {
     const params = SAID[transcript];
@@ -57,6 +68,13 @@ function runtime(voice: ReturnType<typeof microphone>, fleet: DeckSnapshot[]) {
         kind: "dispatch", transcript, action: "show_host_metrics", invoke: "showHostMetrics", params,
         sentence: "Showing the Host figures.",
       } };
+    }
+    if (CLOSE.includes(transcript)) {
+      return { backend: "stub", resolveMs: 21, outcome: { kind: "dispatch", transcript, action: "close", invoke: "closeTopmost", params: [], sentence: "Closed." } };
+    }
+    const other = OTHER[transcript];
+    if (other) {
+      return { backend: "stub", resolveMs: 21, outcome: { kind: "dispatch", transcript, action: other.action, invoke: other.invoke, params: other.params ?? [], sentence: other.sentence } };
     }
     return { backend: "stub", resolveMs: 21, outcome: { kind: "no_match", transcript, sentence: `Heard: “${transcript}” — no matching action.` } };
   });
@@ -70,6 +88,9 @@ function runtime(voice: ReturnType<typeof microphone>, fleet: DeckSnapshot[]) {
     getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: undefined })),
     saveSettings: vi.fn(async () => structuredClone(DEFAULT_DESKTOP_SETTINGS)),
     setZoom: vi.fn(async (level: number) => level),
+    voiceCommands: vi.fn(async () => []),
+    listDirectories: vi.fn(async () => ({ kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false })),
+    newAgentOptions: vi.fn(async () => ({ kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" })),
     resolveVoice, ...voice,
   } as unknown as DeckRuntimeState;
 }
@@ -166,6 +187,120 @@ describe("the Host popover by voice (PR #1672)", () => {
       expect(within(section(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("host-metrics-button")).toHaveAttribute("aria-expanded", "false");
       expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
     }
+  });
+});
+
+/** The fixture daemon with its agents (Planner among them) and its Host figures. */
+const withPlanner = () => [{ ...createFixtureSnapshot("connected"), hostMetrics: fixtureHostMetrics("local") }];
+
+describe("closing the Host popover by voice (PR #1672 round 10)", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  /** Scenario: with the Host popover open on the dashboard, each of "close", "close it", "close host", "close resource usage" and "hide resource usage" closes it and says "Closed."; the dashboard stays, and a "close" with nothing open then says there is nothing to close. */
+  it("closes the open popover and leaves the dashboard", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtime(voice, [createFixtureSnapshot("docs")])} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    for (const words of CLOSE) {
+      await speak(voice, "show host");
+      expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+      await speak(voice, words);
+      expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+      expect(screen.getByTestId("host-metrics-button")).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getByTestId("voice-report")).toHaveTextContent("Closed.");
+      expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    }
+    await speak(voice, "close");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /** Scenario: open the Host popover by voice, then — each by voice, so nothing presses outside it — Settings, an agent's pane and the list of spoken commands over it. Each "close" takes the top one: the list, the pane, Settings, and only then the popover. */
+  it("closes what is over the popover first", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtime(voice, withPlanner())} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    await speak(voice, "show host");
+    await speak(voice, "open settings");
+    await speak(voice, "open the planner");
+    await speak(voice, "what can I say?");
+    const settings = () => screen.queryByRole("dialog", { name: "Settings" });
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(settings()).not.toBeNull();
+    expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+
+    await speak(voice, "close");
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    await speak(voice, "close it");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(settings()).not.toBeNull();
+    await speak(voice, "close");
+    expect(settings()).toBeNull();
+    expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+    await speak(voice, "close host");
+    expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Closed.");
+  });
+
+  /** Scenario: with the Host popover open, the New agent dialog opens over it from its button; "close" closes the dialog and leaves the popover, and the next "close" closes the popover. */
+  it("closes the New agent dialog before the popover", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtime(voice, withPlanner())} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    await speak(voice, "show host");
+    fireEvent.click(screen.getByTestId("daemon-new-agent"));
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+    await speak(voice, "close");
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+    expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+    await speak(voice, "close");
+    expect(screen.queryByTestId("host-metrics-popover")).toBeNull();
+  });
+
+  /** Scenario: with the Host popover open, an agent's Close button asks for confirmation over the dashboard; "close" then leaves the popover open behind that confirmation rather than closing something the user cannot see. */
+  it("does not reach behind a stop confirmation", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtime(voice, withPlanner())} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    await speak(voice, "show host");
+    fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]);
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await speak(voice, "close");
+    expect(screen.getByTestId("host-metrics-popover")).toBeInTheDocument();
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+  });
+});
+
+describe("closeTopmost's precedence with the Host popover (PR #1672 round 10)", () => {
+  /** A context with the always-present members recorded, plus whatever layers are open. */
+  function context(open: Partial<Record<"dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeHostMetrics", true>>) {
+    const calls: string[] = [];
+    const record = (name: string) => () => { calls.push(name); return undefined; };
+    const built = {
+      closeAgentView: record("closeAgentView"),
+      reportNothingToClose: record("reportNothingToClose"),
+      reportRefused: record("reportRefused"),
+      ...Object.fromEntries(Object.keys(open).map((name) => [name, record(name)])),
+    };
+    return { calls, built };
+  }
+  const run = (open: Parameters<typeof context>[0], agentViewOpen = false) => {
+    const { calls, built } = context(open);
+    VOICE_ACTIONS.closeTopmost.run(built as never, { agentViewOpen } as VoiceDispatchTarget);
+    return calls;
+  };
+
+  /** Scenario: the popover alone is closed; under every other layer it waits, closing only once each of them has gone. */
+  it("closes the popover only when nothing else is open", () => {
+    expect(run({ closeHostMetrics: true })).toEqual(["closeHostMetrics"]);
+    expect(run({ closeHostMetrics: true, closeSettings: true })).toEqual(["closeSettings"]);
+    expect(run({ closeHostMetrics: true }, true)).toEqual(["closeAgentView"]);
+    expect(run({ closeHostMetrics: true, closeNewAgent: true })).toEqual(["closeNewAgent"]);
+    expect(run({ closeHostMetrics: true, dismissVoiceOverlay: true })).toEqual(["dismissVoiceOverlay"]);
+    expect(run({})).toEqual(["reportNothingToClose"]);
   });
 });
 

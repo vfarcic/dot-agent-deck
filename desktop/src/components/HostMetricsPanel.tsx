@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { Gauge } from "lucide-react";
+import { Gauge, X } from "lucide-react";
 import type { HostMetricsReport } from "../types";
-import { formatDisk, formatGib, formatLoad, HOST_BUTTON_TEXT, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
+import { formatDisk, formatGib, formatLoad, HOST_BUTTON_TEXT, HOST_CLOSE_LABEL, HOST_NOT_AVAILABLE, HOST_NOT_AVAILABLE_WHY, HOST_SUBTITLE, HOST_TITLE, hostLevel, hostLevelWord, hostRoleLabel, hostStateWords, worstHostLevel } from "../lib/hostMetrics";
 import { displayText, DISPLAY_LIMITS, domIdentity } from "../lib/displayText";
 
 /**
@@ -70,14 +70,15 @@ const POPOVER_VIEWPORT_MARGIN = 12;
  * PRD #1258 — the deck header's host button, beside the deck's name. It is
  * coloured by the worst level among the deck's readings (neutral when none
  * carries one), names that state in words in its accessible name and tooltip,
- * and discloses {@link HostMetricsPanel} in a popover that Escape and a press
- * anywhere else close. A deck whose daemon does not report its host opens the
- * same popover saying so.
+ * and discloses {@link HostMetricsPanel} in a popover that its X button
+ * (`Close host`, PR #1672), Escape and a press anywhere else close. A deck
+ * whose daemon does not report its host opens the same popover saying so.
  *
  * Whether it is open is the overview's (PR #1672): a click asks to open it
  * through `onOpen`, which the overview routes through the voice action
  * registry, so the button and the spoken "show host" are one action.
- * Every close is `onClose`.
+ * Every close is `onClose`, including the spoken `close`, which the overview
+ * routes through `closeTopmost`.
  */
 export function HostMetricsButton({ report, deckLabel, open, onOpen, onClose }: { report: HostMetricsReport; deckLabel: string; open: boolean; onOpen: () => void; onClose: () => void }) {
   const root = useRef<HTMLDivElement>(null);
@@ -192,6 +193,22 @@ export function HostMetricsButton({ report, deckLabel, open, onOpen, onClose }: 
           style={shift > 0 ? { left: -shift } : undefined}
         >
           <HostMetricsPanel report={report} />
+          {/* PR #1672 — the X every other overlay has, named for what it
+              closes so the user can say what they see ("close host"). It is
+              inside the root, so the outside-press dismissal does not also
+              fire; focus goes back to the button, as Escape's does. */}
+          <button
+            type="button"
+            className="icon-button host-metrics-close"
+            aria-label={HOST_CLOSE_LABEL}
+            title={HOST_CLOSE_LABEL}
+            onClick={() => {
+              onClose();
+              button.current?.focus();
+            }}
+          >
+            <X size={15} aria-hidden="true" />
+          </button>
         </div>
       )}
     </div>

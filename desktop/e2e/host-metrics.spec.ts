@@ -269,6 +269,28 @@ test("the host popover opens from the keyboard and closes on Escape and on an ou
   await expect(localCard.getByTestId("host-metrics-popover")).toHaveCount(0);
 });
 
+/** Scenario: Open a deck's host popover and press its X, named "Close host", in the popover's top-right corner; the popover closes and focus returns to the Host button. */
+test("the host popover closes from its X button", async ({ page }) => {
+  const { localCard } = await overview(page, judged(), available(true));
+  const button = localCard.getByTestId("host-metrics-button");
+  await button.click();
+  const popover = localCard.getByTestId("host-metrics-popover");
+  const close = popover.getByRole("button", { name: "Close host" });
+  await expect(close).toBeVisible();
+  const [closeBox, popoverBox] = [await close.boundingBox(), await popover.boundingBox()];
+  if (!closeBox || !popoverBox) throw new Error("the popover or its X has no box");
+  // In the top-right corner, and clear of the first row of figures.
+  expect(closeBox.x + closeBox.width).toBeGreaterThan(popoverBox.x + popoverBox.width - 12);
+  expect(closeBox.y).toBeLessThan(popoverBox.y + 12);
+  const firstRow = await popover.locator(".host-metrics-row").first().boundingBox();
+  if (!firstRow) throw new Error("the first row has no box");
+  expect(closeBox.y + closeBox.height).toBeLessThanOrEqual(firstRow.y);
+  await close.click();
+  await expect(popover).toHaveCount(0);
+  await expect(button).toBeFocused();
+  await expect(button).toHaveAttribute("aria-expanded", "false");
+});
+
 /** Scenario: In a narrow window, open each deck's host popover; it stays inside the window on both sides and opening it adds no horizontal scrolling to the page. */
 test("the host popover stays inside a narrow window", async ({ page }) => {
   const { localCard, remoteCard } = await overview(page, judged(), available(true));
