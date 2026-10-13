@@ -575,7 +575,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       # The desktop crate's Linux build deps, needed because clippy/nextest below
       # run with --workspace, which includes desktop/src-tauri
       # (dot-agent-deck-desktop). Without them that crate fails to build on this
@@ -823,7 +823,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       # The same Linux deps the `build` job installs, for the same reason: the
       # alias carries `--workspace`, which includes desktop/src-tauri
       # (dot-agent-deck-desktop), and without them that crate does not build on
@@ -1162,7 +1162,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail Windows-only and be unreproducible on the
@@ -1224,7 +1224,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
