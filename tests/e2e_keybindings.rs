@@ -302,3 +302,102 @@ fn scheduler_001_lowercase_s_opens_manager() {
     deck.wait_for_string("kbsopen");
     drop(dir);
 }
+
+/// Scenario: Launch the deck with a restored pane running `cat`, which opens
+/// focused, and type `tz` and Enter into it: `cat` echoes `tz` back and the
+/// layout does not change. Press `Ctrl+D` for command mode, then a plain `t`:
+/// the layout toggles and the bar says `Layout:`, as `Ctrl+t` would.
+#[spec("keybindings/letters/004")]
+#[test]
+fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("lp", "cat")
+        .launch_with_fixture("minimal");
+    // The restored pane opens focused: keys go to `cat`.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // In the pane, `t` and `z` are the program's: the tty echoes the line as
+    // typed and `cat` prints it back, so it shows twice, and neither letter
+    // toggles the layout or zooms.
+    deck.send_bytes(b"tz\r");
+    deck.wait_until_grid("cat echoed the typed letters", |g| {
+        // A row of the pane is its text between the pane's `│` borders.
+        g.lines()
+            .filter(|line| line.split('│').any(|cell| cell.trim() == "tz"))
+            .count()
+            >= 2
+    });
+    assert!(
+        !deck.snapshot_grid().contains("Layout:"),
+        "a `t` typed into the pane toggled the layout\n{}",
+        deck.snapshot_grid()
+    );
+
+    // In command mode the same plain `t` is the layout toggle.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+    deck.send_bytes(b"t");
+    deck.wait_for_string("Layout:");
+}
+
+/// Scenario: Launch the deck with a restored pane running `cat`, which opens
+/// focused, and a seeded schedule. In the pane, type `ab` and press `Ctrl+R`:
+/// the pane's terminal reprints the line (`^R`), so the chord reached the
+/// program, and no rename opens. Press `Ctrl+D` for command mode, then
+/// `Ctrl+S`: the Schedules manager opens, as a plain `s` does.
+#[spec("keybindings/letters/007")]
+#[test]
+fn letters_007_ctrl_form_acts_in_command_mode_and_reaches_the_pane_program() {
+    let dir = common::harness_tempdir().expect("scratch tempdir");
+    let sched_path = dir.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        "[[scheduled_tasks]]\n\
+         name = \"ctrlsopen\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"ctrlsopen prompt\"\n\
+         enabled = true\n",
+    )
+    .expect("write fixture schedules.toml");
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_continue_session("lp", "cat")
+        .launch_with_fixture("minimal");
+    // The restored pane opens focused: keys go to `cat`.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // `Ctrl+R` in the pane is the program's: the pane's line discipline
+    // answers it by reprinting the line, which it shows as `^R`.
+    deck.send_bytes(b"ab\x12");
+    deck.wait_until_grid("the pane's terminal reprinted the line on Ctrl+R", |g| {
+        g.contains("ab^R")
+    });
+    assert!(
+        !deck.snapshot_grid().contains("Rename: "),
+        "Ctrl+R in the pane opened a rename\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\r");
+    deck.wait_until_grid("cat echoed the line", |g| {
+        g.lines()
+            .filter(|line| line.split('│').any(|cell| cell.trim() == "ab"))
+            .count()
+            >= 2
+    });
+    assert!(
+        !deck.snapshot_grid().contains("ctrlsopen"),
+        "the Schedules manager opened from the pane\n{}",
+        deck.snapshot_grid()
+    );
+
+    // In command mode the same kind of chord is the command.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+    deck.send_bytes(b"\x13"); // Ctrl+S
+    deck.wait_for_string("ctrlsopen");
+    drop(dir);
+}

@@ -178,7 +178,7 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
 
     let launched = wait_for_declared_launcher(&record);
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
@@ -249,7 +249,7 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .unwrap_or_else(|state| panic!("the bespoke real-Codex launcher never executed: {state}"));
 
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
     let real_launch =

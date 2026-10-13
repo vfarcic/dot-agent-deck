@@ -62,6 +62,54 @@ use crate::daemon_client::LocalEndpoint;
 pub const DAEMON_START_POLL_TIMEOUT: Duration =
     crate::login_shell::CAPTURE_TIMEOUT.saturating_add(Duration::from_secs(5));
 
+/// e2e seam (PRD #1258): the variable an `e2e` build reads to widen
+/// [`DAEMON_START_POLL_TIMEOUT`] for [`ensure_external_daemon_or_die`], in
+/// milliseconds. The TUI harness (`tests/common/mod.rs`) sets it to the default
+/// load-scaled, because on a starved box (io stalled ~70% of the window, load
+/// 17 on 16 cores) a debug daemon measurably bound after the fixed 15 s and the
+/// deck gave up while its daemon was still healthy.
+///
+/// The name is compiled into every build so the harness, which is also built
+/// without the feature, can spell it; only an `e2e` build reads it (see
+/// [`daemon_start_poll_timeout`]), for the reason `effective_current_exe` in
+/// `src/platform/paths.rs` is gated: a shipped binary has no switch that moves
+/// its start bound.
+pub const DAEMON_START_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS";
+
+/// The most [`DAEMON_START_TIMEOUT_ENV`] can widen the start bound to: past
+/// this, a start that has not bound is hung rather than slow, and waiting
+/// longer only delays the error that says so.
+#[cfg(feature = "e2e")]
+pub const DAEMON_START_POLL_TIMEOUT_MAX: Duration = Duration::from_secs(120);
+
+/// Parse a [`DAEMON_START_TIMEOUT_ENV`] value. Unset, empty or unparseable
+/// yields [`DAEMON_START_POLL_TIMEOUT`]; a number is clamped into
+/// `[DAEMON_START_POLL_TIMEOUT, DAEMON_START_POLL_TIMEOUT_MAX]`, so the seam
+/// can only widen the bound, never shorten it below the daemon's own pre-bind
+/// budget (see [`DAEMON_START_POLL_TIMEOUT`]'s doc for why that would fail).
+#[cfg(feature = "e2e")]
+pub fn parse_daemon_start_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DAEMON_START_POLL_TIMEOUT, |ms| {
+            Duration::from_millis(ms)
+                .clamp(DAEMON_START_POLL_TIMEOUT, DAEMON_START_POLL_TIMEOUT_MAX)
+        })
+}
+
+/// The bound [`ensure_external_daemon_or_die`] polls with:
+/// [`DAEMON_START_POLL_TIMEOUT`], widened by [`DAEMON_START_TIMEOUT_ENV`] in an
+/// `e2e` build only.
+#[cfg(feature = "e2e")]
+fn daemon_start_poll_timeout() -> Duration {
+    parse_daemon_start_timeout(std::env::var(DAEMON_START_TIMEOUT_ENV).ok().as_deref())
+}
+
+#[cfg(not(feature = "e2e"))]
+fn daemon_start_poll_timeout() -> Duration {
+    DAEMON_START_POLL_TIMEOUT
+}
+
 /// How often [`ensure_external_daemon_or_die`] re-checks for the endpoint.
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -410,7 +458,8 @@ pub fn via_daemon_enabled() -> bool {
 /// stderr and exits nonzero — there is no in-process fallback). Polling uses
 /// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
 /// former's docs for why the budget is derived from the daemon's own pre-bind
-/// work rather than hardcoded.
+/// work rather than hardcoded. An `e2e` build lets the test harness widen it
+/// through [`DAEMON_START_TIMEOUT_ENV`].
 pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
@@ -419,7 +468,7 @@ pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
         DAEMON_START_POLL_INTERVAL,
-        DAEMON_START_POLL_TIMEOUT,
+        daemon_start_poll_timeout(),
     )
     .await
 }
@@ -453,6 +502,41 @@ mod tests {
             crate::login_shell::CAPTURE_TIMEOUT,
             crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
         );
+    }
+
+    /// PRD #1258: the e2e start-bound seam only ever widens the bound, and
+    /// within a ceiling. Unset, empty and junk fall back to the default; a value
+    /// below the daemon's pre-bind budget is raised to it rather than honoured,
+    /// because shortening it would reintroduce the healthy-but-slow failure
+    /// [`attach_poll_timeout_exceeds_daemon_pre_bind_budget`] guards.
+    #[cfg(feature = "e2e")]
+    #[test]
+    fn daemon_start_timeout_override_parses_and_clamps() {
+        let ms = |d: Duration| d.as_millis();
+        let default = ms(DAEMON_START_POLL_TIMEOUT);
+        let max = ms(DAEMON_START_POLL_TIMEOUT_MAX);
+        for (input, expected) in [
+            (None, default),
+            (Some(""), default),
+            (Some("   "), default),
+            (Some("soon"), default),
+            (Some("-5"), default),
+            (Some("12.5"), default),
+            (Some("99999999999999999999999"), default),
+            (Some("0"), default),
+            (Some("1000"), default),
+            (Some(" 40000 "), 40_000),
+            (Some("90000"), 90_000),
+            (Some("600000"), max),
+            (Some(&*u64::MAX.to_string()), max),
+        ] {
+            assert_eq!(
+                ms(parse_daemon_start_timeout(input)),
+                expected,
+                "input {input:?}"
+            );
+        }
+        assert!(DAEMON_START_POLL_TIMEOUT_MAX > DAEMON_START_POLL_TIMEOUT);
     }
 
     /// Issue #1121 round two, B6: a non-primary endpoint — the pre-#1121

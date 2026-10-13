@@ -417,7 +417,7 @@ fn open_pane(deck: &TuiDeck, agent: &Agent, command: &str, last_command: &str) {
     // The transcript's first line is its prompt, which no card shows yet.
     deck.wait_for_string(&format!("> {}", agent.prompt));
     deck.send_keys(b"\x04"); // Ctrl+D -> back to the dashboard
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 }
 
 /// The daemon's record of the pane named `name`, once it has one that
@@ -566,7 +566,7 @@ fn stage_dashboard() -> DashboardScene {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // The cards' `Last:` ages. A card's last activity is a high-water mark
     // that starts at its pane's spawn, so every status event is stamped after
@@ -678,7 +678,7 @@ fn docs_screenshot_dashboard_empty() {
     html_dir();
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
-        grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
+        grid.contains("No active agents") && grid.contains("[New Agent n/Ctrl+N]")
     });
 }
 
@@ -865,6 +865,46 @@ fn docs_screenshot_schedules() {
             && grid.contains("NEXT FIRE")
             && grid.contains("nightly-triage")
             && grid.contains("disabled")
+    });
+}
+
+/// The host the `host-metrics` capture reports: the desktop fixture's local
+/// deck (`fixtureHostMetrics("local")` in `desktop/src/data/fixture.ts`), so
+/// the TUI and desktop images show the same machine. Change the two together.
+const HOST_SAMPLE: &str = r#"{
+    "disks": [
+        {"role": "working_root", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "worktree_parent", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "temp_root", "free_bytes": 6442450944, "total_bytes": 68719476736}
+    ],
+    "load_per_cpu": 0.42,
+    "cpu_count": 16,
+    "memory_used_bytes": 19864223744,
+    "memory_available_bytes": 46707769344,
+    "sampled_at_ms": 1700000000000,
+    "sample_age_ms": 0
+}"#;
+
+/// Scenario: Press `m` on the empty dashboard, with the daemon reporting a
+/// fixed host sample, so the Host of this deck overlay shows per-role disk,
+/// load per core and memory, with the temp root's 9%
+/// free marked as a warning by the daemon's default thresholds.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_host_metrics() {
+    html_dir();
+    let deck =
+        launch_with(|builder| builder.with_env("DOT_AGENT_DECK_E2E_HOST_SAMPLE", HOST_SAMPLE));
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"m");
+    // The overlay's first and last rows, so a frame caught while it is still
+    // being drawn is not the one written.
+    capture(&deck, "host-metrics", |grid| {
+        grid.contains("Host of this deck")
+            && grid.contains("0.42 across 16 cores")
+            && grid.contains("(warning)")
+            && grid.contains("Memory available")
+            && grid.contains("Press Esc to close")
     });
 }
 

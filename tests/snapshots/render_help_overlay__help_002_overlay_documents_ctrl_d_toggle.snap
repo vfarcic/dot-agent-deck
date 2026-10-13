@@ -13,13 +13,12 @@ expression: buf
                                                                                                               
                                                                                                               
                                                                                                               
-                                                                                                              
    ┌ help ───────────────────────────────────────────────────────────────────────────────────────────────┐    
-   │  global (works from any pane)                       mouse                                           │    
+   │  global (chords work from any pane)                 mouse                                           │    
    │                                                                                                     │    
-   │  ctrl+d             toggle command / pane           mouse click     focus pane                      │    
-   │  ctrl+n             create new agent                ctrl+click      open hyperlink                  │    
-   │  ctrl+t             toggle layout (stacked/tiled)                                                   │    
+   │  d / ctrl+d         toggle command / pane           mouse click     focus pane                      │    
+   │  n / ctrl+n         create new agent                ctrl+click      open hyperlink                  │    
+   │  t / ctrl+t         toggle layout (stacked/tiled)                                                   │    
    │  ctrl+c             quit                            new agent form                                  │    
    │                                                                                                     │    
    │  tab navigation                                     tab             switch field                    │    
@@ -35,16 +34,17 @@ expression: buf
    │  k / up             select previous card            h / left / bksp     go up one level             │    
    │  1-9                jump to card n                  space           confirm current directory       │    
    │  enter              focus selected pane             /               filter (case-insensitive)       │    
-   │  ctrl+w             close selected agent (confirms) esc             clear filter (twice = close)    │    
+   │  w / ctrl+w         close selected agent (confirms) esc             clear filter (twice = close)    │    
    │  ctrl+l             toggle orch tab split ratio     q               cancel                          │    
-   │  ctrl+z             zoom focused pane                                                               │    
+   │  z / ctrl+z         zoom focused pane                                                               │    
    │  /                  filter agents                   session                                         │    
    │  esc                clear filter                                                                    │    
-   │  r                  rename agent                    panes auto-saved continuously.                  │    
-   │  g                  generate .dot-agent-deck.toml   restored automatically on launch.               │    
+   │  r / ctrl+r         rename agent                    panes auto-saved continuously.                  │    
+   │  g / ctrl+g         generate .dot-agent-deck.toml   restored automatically on launch.               │    
    │  y / n              approve / deny permission                                                       │    
-   │  s                  schedules manager                                                               │    
-   │  u                  upgrade (update badge)                                                          │    
+   │  s / ctrl+s         schedules manager                                                               │    
+   │  m / ctrl+m         host of this deck                                                               │    
+   │  u / ctrl+u         upgrade (update badge)                                                          │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    

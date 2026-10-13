@@ -10,6 +10,8 @@ import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
+import { HostMetricsButton } from "./HostMetricsPanel";
+import { chooseHostDeck } from "../lib/hostMetrics";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
@@ -1053,6 +1055,35 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     },
   };
   /*
+    PR #1672 — which daemon's Host popover is open, by deck id: at most one,
+    as before, now held here so the button and the spoken "show host" open it
+    through one registry action (`showHostMetrics`).
+  */
+  const [hostOpen, setHostOpen] = useState<string | undefined>();
+  const showHostMetrics = useCallback((deckId?: string): string | undefined => {
+    const choice = chooseHostDeck(decks.map((deck) => ({
+      deckId: deck.snapshot.connection.deckId,
+      name: deckName(deck.snapshot.connection),
+      connected: deck.connected,
+      hasFigures: deck.snapshot.hostMetrics !== undefined,
+    })), deckId);
+    if ("refused" in choice) return choice.refused;
+    setHostOpen(choice.open);
+    return undefined;
+  }, [decks]);
+  const closeHostMetrics = useCallback((deckId: string) => setHostOpen((open) => (open === deckId ? undefined : open)), []);
+  /*
+    PR #1672 — the open popover goes with its button. A daemon that
+    disconnects or stops sending figures loses its Host button, and the
+    popover is closed with it, so it does not reappear unasked when they come
+    back.
+  */
+  useEffect(() => {
+    if (hostOpen === undefined) return;
+    const shown = decks.some((deck) => deck.connected && deck.snapshot.connection.deckId === hostOpen && deck.snapshot.hostMetrics !== undefined);
+    if (!shown) setHostOpen(undefined);
+  }, [decks, hostOpen]);
+  /*
     Issue #1492 — the dashboard scrolls in its own region, and a row acted on
     by number or by name is scrolled into view first, so it is on screen
     behind the pane that opens over it, and on screen when that pane closes.
@@ -1125,13 +1156,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          scroll that lands under a pane moves only the screen behind it. */
       scrollDashboard: (move: DashboardScroll) => scrollDashboard(bodyRef.current, move),
       revealAgent,
+      /* PR #1672 — a daemon's Host figures, served always: Rust offers the
+         row only while the New agent dialog is closed. */
+      showHostMetrics,
+      /* And its close, published only while a popover is open, so
+         `closeTopmost` reads its presence the way it reads `closeNewAgent`'s. */
+      ...(hostOpen !== undefined ? { closeHostMetrics: () => setHostOpen(undefined) } : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
       : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
     return () => { voiceChannel.current = undefined; };
   });
-  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent }), [onNavigate, openNewAgent, revealAgent]);
+  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics }), [onNavigate, openNewAgent, revealAgent, showHostMetrics]);
   /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
      door on this screen exists only while it is shown. `undefined` removes
      the top bar's button and each deck group's alike. */
@@ -1553,6 +1590,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                 ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: upgradeKindOf(deck.snapshot.connection), offer: deck.snapshot.connection.upgradeOffer })
                 : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
+              hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
+              onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
+              onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
             />
           ))}
         </section>
@@ -1653,7 +1693,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1674,6 +1714,10 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
   onUpgrade?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
+  /** PR #1672 — whether THIS deck's Host popover is the open one, and the two ways to change that. */
+  hostOpen: boolean;
+  onOpenHost: () => void;
+  onCloseHost: () => void;
 }) {
   const connection = deck.snapshot.connection;
   /*
@@ -1762,6 +1806,8 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           */}
           <strong id={titleId} title={daemonIdentityTitle} data-testid="daemon-identity">{deckName(connection)}</strong>
         </div>
+        {/* PRD #1258: this deck's host, from its own daemon — a small button beside its name, coloured by the worst reading, that opens the numbers. Every deck in a fleet has its own. */}
+        {deck.connected && deck.snapshot.hostMetrics && <HostMetricsButton report={deck.snapshot.hostMetrics} deckLabel={deckName(connection)} open={hostOpen} onOpen={onOpenHost} onClose={onCloseHost} />}
         {/*
           Only when it says something the lamp does not. The element is
           not deleted — in the disconnected, incompatible and

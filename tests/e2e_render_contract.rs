@@ -103,7 +103,7 @@ fn render_001_enlarge_fills_new_width() {
 #[test]
 fn layout_001_toggle_layout_keeps_pane_intact() {
     // PRD #127: 200 cols so the Normal-mode bar renders the FULL labeled
-    // `[New Agent Ctrl+N]` (at the default 120 it collapses to `[Ctrl+N]`
+    // `[New Agent n/Ctrl+N]` (at the default 120 it collapses to `[Ctrl+N]`
     // chips once the always-shown Schedules button is included).
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
@@ -111,7 +111,7 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // The restored No-agent pane's card body anchors the assertion.
     deck.wait_for_string("Launch an agent");
 

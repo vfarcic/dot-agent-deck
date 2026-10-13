@@ -382,7 +382,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // positive confirmation, so the digit below can never be typed into the
     // orchestrator's stdin instead of being consumed by the deck.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // Jump into the SECOND role card — the `coder` worker — exactly as a user
     // does to watch a worker boot. This focuses its pane and expands it, so the
     // real Codex TUI is the visible surface.
@@ -418,7 +418,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // Detach again so the orchestration deck's role cards (and their live
     // status badges) are the visible surface while the delegate runs.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // Release the orchestrator: it runs the real `dot-agent-deck delegate`.
     //

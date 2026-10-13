@@ -58,7 +58,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     //  - Child-app mouse forwarding (mouse_mode_enabled): needs a child TUI
     //    that enables mouse mode; `sleep` does not.
     // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
-    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // the FULL `[New Agent n/Ctrl+N]` label; at 120 it collapses to chips once the
     // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
@@ -80,7 +80,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     deck.click(60, 5); // non-button click inside the focused-pane preview
     deck.scroll(60, 5, true); // scroll inside the pane region (not Down/Up → never hits buttons)
     deck.click(dcol, drow); // detach
-    deck.wait_for_string("[New Agent Ctrl+N]"); // cleanly back to Normal — events didn't navigate away
+    deck.wait_for_string("[New Agent n/Ctrl+N]"); // cleanly back to Normal — events didn't navigate away
     assert!(
         !deck.snapshot_grid().contains("Select Directory"),
         "a non-button click/scroll in the pane region must not open the New-Pane picker:\n{}",
@@ -92,7 +92,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
 /// fall through. With two dashboard cards (`alpha`, `bravo`): (1) clicking the
 /// `bravo` card (which misses every button) falls through to the existing
 /// card-selection path, moving the `▸` selection marker to `bravo`. (2)
-/// Clicking the global `[New Agent Ctrl+N]` bar button fires its action (the
+/// Clicking the global `[New Agent n/Ctrl+N]` bar button fires its action (the
 /// directory picker opens) AND short-circuits — after dismissing the picker
 /// the card selection is still on `bravo`, proving the button click did not
 /// also fall through to the card/pane layer underneath. Should be GREEN
@@ -100,7 +100,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
 #[spec("mouse/preserve/002")]
 #[test]
 fn preserve_002_button_short_circuits_miss_falls_through() {
-    // PRD #127: 200 cols so the bar renders the FULL `[New Agent Ctrl+N]` label;
+    // PRD #127: 200 cols so the bar renders the FULL `[New Agent n/Ctrl+N]` label;
     // at 120 it collapses to chips once the always-shown Schedules button
     // is included.
     let deck = TuiDeck::builder()
@@ -124,9 +124,9 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
 
-    // (2) Short-circuit: clicking the [New Agent Ctrl+N] bar button fires its
+    // (2) Short-circuit: clicking the [New Agent n/Ctrl+N] bar button fires its
     // action (picker opens) and does NOT also act on the cards underneath.
-    let (bcol, brow) = deck.wait_for_in_grid("[New Agent Ctrl+N]");
+    let (bcol, brow) = deck.wait_for_in_grid("[New Agent n/Ctrl+N]");
     deck.click(bcol, brow);
     deck.wait_for_string("Select Directory");
 
@@ -149,7 +149,7 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 #[test]
 fn preserve_modal_click_miss_is_consumed() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
-    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // the FULL `[New Agent n/Ctrl+N]` label; at 120 it collapses to chips once the
     // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
@@ -160,7 +160,7 @@ fn preserve_modal_click_miss_is_consumed() {
     // unfocused) pane region behind the centered popup.
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // Open the quit-confirm modal over the dashboard.
     deck.send_bytes(b"\x03"); // Ctrl+C → quit-confirm
@@ -240,7 +240,7 @@ fn preserve_disabled_button_is_inert() {
     deck.send_bytes(b"?");
     deck.wait_until_grid("help overlay open", |g| {
         assert_no_side_effect(g);
-        g.contains("works from any pane")
+        g.contains("chords work from any pane")
     });
 
     // Close the overlay and wait for the dashboard's own empty-state line to
@@ -253,6 +253,6 @@ fn preserve_disabled_button_is_inert() {
     deck.send_bytes(b"?");
     deck.wait_until_grid("help closed and the empty dashboard repainted", |g| {
         assert_no_side_effect(g);
-        !g.contains("works from any pane") && g.contains("No active agents. Press")
+        !g.contains("chords work from any pane") && g.contains("No active agents. Press")
     });
 }

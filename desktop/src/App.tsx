@@ -924,6 +924,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       closeOverlays: railContext.closeOverlays,
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* PR #1672 — the overview publishes the Host popover's close while one
+         is open; a stop or upgrade confirmation is modal over the dashboard,
+         so while one is open `close` does not reach behind it to the popover. */
+      ...(confirmationOpen ? { closeHostMetrics: undefined } : {}),
       /* Issue #1492 — the dashboard's scroll, refused while anything is in
          front of it: a dialog layer (the open Daemon selector's menu), the
          Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
