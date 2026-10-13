@@ -669,14 +669,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   prBrowserNow.current = prBrowser;
   prBrowserOpen.current = prBrowser !== undefined;
   /* What the open page last failed to do, held against the frame it failed
-     in (`opened`) so a new frame never inherits an old failure, and against
-     the call (`call`, numbered as they are asked) so a late failure of an
-     earlier call does not replace a later one's. Not against the toolbar's
-     session object: a queued switch that lands first replaces it, and the
-     failure of what was asked after it is about the page still on screen
-     (PR #1680 review). Cleared by the next thing asked of the page. */
+     in (`opened`) so a new frame never inherits an old failure. Only the LAST
+     call asked of the page (`prBrowserCalls`, numbered as they are asked) may
+     say why it failed: the next one cleared the problem, so an earlier one
+     failing after it is not what the page is doing now (PR #1680 review,
+     finding 13). Not keyed to the toolbar's session object: a queued switch
+     that lands first replaces it, and the failure of what was asked after it
+     is about the page still on screen. The caller still gets its own
+     failure's sentence, so voice reports what it asked. */
   // voice-registry-exempt: a report of what the page did not do, written by the entries that asked it, and not something anybody opens
-  const [prBrowserProblem, setPrBrowserProblem] = useState<{ opened: number; call: number; text: string }>();
+  const [prBrowserProblem, setPrBrowserProblem] = useState<{ opened: number; text: string }>();
   const prBrowserCalls = useRef(0);
   /** Run one thing on the frame numbered `opened`, and show why if it did not happen. Settles to that sentence, or `undefined`. */
   const onPrBrowserPage = useCallback((opened: number, work: Promise<void>): Promise<string | undefined> => {
@@ -685,7 +687,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     setPrBrowserProblem(undefined);
     return work.then(() => undefined, (cause: unknown) => {
       const text = cause instanceof Error ? cause.message : String(cause);
-      setPrBrowserProblem((was) => (was && was.call > call ? was : { opened, call, text }));
+      if (call === prBrowserCalls.current) setPrBrowserProblem({ opened, text });
       return text;
     });
   }, []);

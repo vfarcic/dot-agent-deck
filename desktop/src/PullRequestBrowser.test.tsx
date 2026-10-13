@@ -1101,3 +1101,134 @@ describe("PRD #1401 — a failure after a queued switch has landed", () => {
     expect(screen.queryAllByText(/could not go back/)).toHaveLength(0);
   });
 });
+
+/**
+ * PR #1680 review (Qodo, finding 13) — what the page last failed to do is the
+ * failure of the LAST thing asked of it. A newer action clears the problem, and
+ * an older one that fails afterwards does not bring it back.
+ */
+describe("PRD #1401 — an older failure after a newer action", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  function deferred() {
+    let reject: (error: Error) => void = () => undefined;
+    const promise = new Promise<undefined>((_done, fail) => { reject = fail; });
+    return { promise, reject };
+  }
+
+  /**
+   * Scenario: press Back on the pull request page, and press it again before
+   * the first answers. The second Back works; the first then fails. Nothing is
+   * said under the toolbar, because the page did what was last asked of it.
+   */
+  it("does not say an older Back's failure after a newer Back worked", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const older = deferred();
+    host.back.mockImplementationOnce(() => older.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(2);
+
+    await act(async () => { older.reject(new Error("The older Back could not go back")); });
+    expect(within(screen.getByTestId("pr-browser")).queryByRole("alert"), "an older failure must not outlive a newer action").toBeNull();
+  });
+
+  /**
+   * Scenario: say "scroll down" over the pull request page, then press Back
+   * before the scroll answers. Back works; the scroll then fails. Nothing is
+   * said under the toolbar, though voice still reports its own failure.
+   */
+  it("does not say an older scroll's failure under the toolbar after a newer Back worked", async () => {
+    const { host } = fakeHost();
+    const voice = voiceRuntime(dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling."));
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr], voice.overrides)} initialView={agentView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const older = deferred();
+    host.scroll.mockImplementationOnce(() => older.promise);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.scroll).toHaveBeenCalledWith("down"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(1);
+
+    await act(async () => { older.reject(new Error("The older scroll could not scroll")); });
+    expect(within(screen.getByTestId("pr-browser")).queryByRole("alert"), "an older failure must not outlive a newer action").toBeNull();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo, finding 15) — a sheet is raised over the pane and the
+ * pull request page only while one of them is up beneath it, and the command
+ * menu it was chosen from, which closes as the sheet opens, is not one.
+ */
+describe("PRD #1401 — when a sheet is raised", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const experimental = { desktopFeatures: fixtureDesktopFeatures("?experimental=1") };
+
+  function renderAt(host: PrBrowserHost, initialView: Parameters<typeof DeckShell>[0]["initialView"], agents: DesktopAgentDto[] = [withPr, agent("8")]) {
+    const result = render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(agents, experimental)} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return (next: DesktopAgentDto[]) => result.rerender(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(next, experimental)} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  async function settingsFromCommandMenu() {
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: /Open settings/ }));
+    const sheet = await screen.findByTestId("settings-panel");
+    await act(async () => { await Promise.resolve(); });
+    return sheet;
+  }
+
+  /**
+   * Scenario: on a deck with nothing open, Ctrl+K then Open settings. Settings
+   * is not raised and fences nothing: the rail behind it stays live.
+   */
+  it("does not raise a sheet chosen from the command menu on a plain deck", async () => {
+    const { host } = fakeHost();
+    renderAt(host, { kind: "deck" });
+    const sheet = await settingsFromCommandMenu();
+
+    expect.soft(sheet.parentElement, "nothing fenced is up beneath it").not.toHaveClass("is-raised");
+    expect(screen.getByRole("button", { name: "Dashboard" }).closest("[inert]"), "the deck stays live").toBeNull();
+  });
+
+  /**
+   * Scenario: on the deck with Coder 7's pane and pull request open, Ctrl+K
+   * then Open settings raises Settings over them. Coder 7 then ends: the page
+   * and the pane close, and Settings drops back to where a sheet is drawn,
+   * fencing nothing.
+   */
+  it("lowers a raised sheet once what it was raised over has gone", async () => {
+    const { host } = fakeHost();
+    const rerenderWith = renderAt(host, { kind: "agent", deckId: DECK, agentId: "7", from: "deck" });
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const sheet = await settingsFromCommandMenu();
+    expect(sheet.parentElement, "raised over the page and the pane").toHaveClass("is-raised");
+
+    await act(async () => { rerenderWith([agent("8")]); });
+    await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
+    expect.soft(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect.soft(screen.getByTestId("settings-panel").parentElement, "nothing is beneath it any more").not.toHaveClass("is-raised");
+    expect(screen.getByRole("button", { name: "Dashboard" }).closest("[inert]"), "and it fences nothing").toBeNull();
+  });
+});
