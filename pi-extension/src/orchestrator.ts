@@ -1072,6 +1072,14 @@ export function inboxIdsToAck(message: unknown): string[] {
  */
 export const WATCHER_NOT_IN_DECK_EXIT = 3;
 
+/**
+ * How long a deck message handed to Pi may stay uncommitted, while Pi sits idle
+ * with nothing queued, before the extension takes it as refused and hands it
+ * over again. Pi reports a refused `sendUserMessage` itself, never to the
+ * caller, so this is how a refusal with no run after it is noticed.
+ */
+export const INBOX_ADMISSION_RECHECK_MS = 30000;
+
 /** The first respawn delay after a watcher exits unexpectedly, and the longest. */
 export const WATCHER_BACKOFF_MIN_MS = 1000;
 export const WATCHER_BACKOFF_MAX_MS = 30000;

@@ -16,6 +16,7 @@ const hooks = registerHooks({
 	},
 });
 const { default: extension } = await import("../src/index.ts");
+const { INBOX_ADMISSION_RECHECK_MS } = await import("../src/orchestrator.ts");
 hooks.deregister();
 
 type Handler = (event: any, ctx: any) => unknown;
@@ -216,4 +217,126 @@ test("pi_inbox_008_watcher_backoff_env_fixes_every_respawn_delay", async (t) => 
 		if (saved === undefined) delete process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS;
 		else process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS = saved;
 	}
+});
+
+/**
+ * Pi 0.84.4's prompt admission, as `AgentSession.prompt` runs it: a send checks
+ * for a running agent only after the input hooks resolve, a send that finds one
+ * waits as a follow-up, and one that finds none runs its remaining preflight
+ * before the agent takes it. A second send still in that preflight when another
+ * prompt starts is refused by the agent ("Agent is already processing a
+ * prompt"), and Pi reports the refusal itself: `sendUserMessage` returns before
+ * it, so the caller never sees it.
+ */
+function admission(f: ReturnType<typeof fixture>) {
+	let running = false;
+	const followUps: string[] = [];
+	const committed: string[] = [];
+	const rejected: string[] = [];
+	let refuseNext = 0;
+	const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+	// Pi does not wait for the extension's card report before carrying on, and
+	// the report's CLI is this file's mocked child, which never exits.
+	const fire = (name: string, event: any = {}) => { void f.handlers.get(name)?.(event, f.ctx); };
+	const commit = async (text: string) => {
+		committed.push(text);
+		fire("message_start", { message: { role: "user", content: [{ type: "text", text }] } });
+		await tick();
+	};
+	const start = async (text: string) => { running = true; fire("agent_start"); await commit(text); };
+	f.ctx.isIdle = () => !running;
+	(f.ctx as any).hasPendingMessages = () => followUps.length > 0;
+	f.pi.sendUserMessage = (text: string, options: any) => {
+		f.sent.push({ text, options });
+		void (async () => {
+			await tick();
+			if (refuseNext > 0) { refuseNext--; rejected.push(text); return; }
+			if (running) { followUps.push(text); return; }
+			await tick();
+			if (running) { rejected.push(text); return; }
+			await start(text);
+		})();
+		return undefined;
+	};
+	const settle = async () => {
+		while (followUps.length) await commit(followUps.shift()!);
+		running = false;
+		fire("agent_settled");
+		await tick();
+	};
+	const quiesce = async () => { for (let i = 0; i < 8; i++) await tick(); };
+	return {
+		committed, rejected, tick, settle, quiesce,
+		foreign: (text: string) => start(text),
+		shutdown: () => fire("session_shutdown"),
+		refuse: (n: number) => { refuseNext = n; },
+		get running() { return running; },
+	};
+}
+
+const idsN = (n: number) => Array.from({ length: n }, (_, i) => `m-k3xzq2ab-${String(i).repeat(8)}54b742c9`);
+const line = (id: string) => JSON.stringify(delivery(BLOCK.replaceAll(ID, id), id));
+const acksOf = (child: Watcher) => child.writes.flatMap(s => JSON.parse(s).ack as string[]);
+const commitsOf = (committed: string[], id: string) => committed.filter(text => text.includes(`[dot-agent-deck message ${id} `)).length;
+
+/// Scenario: Five inbox messages reach an idle Pi in one burst, the way a loaded deck delivers its seed messages. Pi refuses a second prompt that arrives before the first one starts, and reports that refusal itself; the extension must still get every message committed exactly once, in order, and acknowledge each one only after its commit.
+test("pi_inbox_009_idle_burst_is_admitted_without_loss_or_duplicates", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const ids = idsN(5);
+	child.stdout.emit("data", Buffer.from(ids.map(line).join("\n") + "\n"));
+	for (let round = 0; round < 10 && acksOf(child).length < ids.length; round++) {
+		await pi.quiesce();
+		if (pi.running) await pi.settle();
+	}
+	await pi.quiesce();
+	assert.deepEqual(pi.rejected, [], "the extension must not race its own sends into Pi's idle admission");
+	for (const id of ids) assert.equal(commitsOf(pi.committed, id), 1, `${id} must be committed exactly once`);
+	assert.deepEqual(acksOf(child), ids, "each message is acknowledged once, after its commit, in inbox order");
+	pi.shutdown();
+});
+
+/// Scenario: An inbox message reaches an idle Pi just as another prompt wins Pi's admission, so Pi refuses the deck's message without telling the extension. Once that other run settles with nothing queued, the message is handed over again and committed once; a message handed over while Pi is busy waits as a follow-up and is never handed over twice.
+test("pi_inbox_010_send_refused_by_a_competing_prompt_is_handed_over_again", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [first, second] = idsN(2);
+	child.stdout.emit("data", Buffer.from(line(first) + "\n"));
+	await pi.tick();
+	await pi.foreign("a prompt the user typed");
+	await pi.quiesce();
+	assert.equal(pi.rejected.length, 1, "the fixture must reproduce Pi refusing the deck's send");
+	assert.deepEqual(acksOf(child), [], "a refused send is never acknowledged");
+	await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, first), 1, "the refused message is handed over again once the competing run settles");
+	child.stdout.emit("data", Buffer.from(line(second) + "\n"));
+	await pi.quiesce();
+	await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, first), 1, "never handed over twice");
+	assert.equal(commitsOf(pi.committed, second), 1, "a follow-up queued while busy is committed once and not resent");
+	assert.deepEqual(acksOf(child), [first, second]);
+	pi.shutdown();
+});
+
+/// Scenario: Pi refuses an inbox message while idle and no run follows, the way a send fails when Pi cannot start a turn. While Pi stays idle with nothing queued, the extension hands the message over again after the admission recheck interval, and not before.
+test("pi_inbox_011_refused_send_with_no_run_is_retried_after_the_recheck_interval", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	pi.refuse(1);
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(pi.rejected.length, 1);
+	t.mock.timers.tick(INBOX_ADMISSION_RECHECK_MS - 1);
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "not handed over again before the recheck interval");
+	t.mock.timers.tick(1);
+	await pi.quiesce();
+	assert.equal(f.sent.length, 2, "handed over again once Pi stayed idle with nothing queued");
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
 });
