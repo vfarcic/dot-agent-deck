@@ -1,0 +1,13 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 365
+expression: rendered
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────────────── ● Thinking ┐
+│Dir:  api-svc                                                                 │
+│Prmt: ✉ review fixture                                                        │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 0s  Tools: 14 ┘

@@ -7993,6 +7993,48 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** persistence across daemon restart; the deck-id persistence round trip is `inbox/core/002`.
 - **Platform coverage:** mac+linux.
 
+##### inbox/status/006 — TUI card counts queued and fetched inbox messages with the shared envelope badge.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render after ListAgents resync.
+- **Agent:** none.
+- **Asserts:** Queued-only, fetched-only and mixed summaries paint ✉2 and the shared queued word from `tests/fixtures/inbox-display.json`.
+- **Does not assert:** native wake-up or real daemon broadcast ingestion.
+- **Platform coverage:** all.
+
+##### inbox/status/007 — A narrow card retains inbox badge, status and tools within its width budget.
+- **Layer:** L1 (`tests/render_dashboard.rs`), Compact 20-column TestBackend + insta.
+- **Agent:** none.
+- **Asserts:** ✉2, Thinking and 14 tools remain visible without exceeding 20 cells per row.
+- **Does not assert:** desktop CSS layout.
+- **Platform coverage:** all.
+
+##### inbox/status/008 — TUI Error card explains an undeliverable inbox message.
+- **Layer:** L1 (`tests/render_dashboard.rs`), delivery_notice event + TestBackend + insta.
+- **Agent:** none.
+- **Asserts:** Error and the not-delivered notice are visible on the card; wording shares the desktop fixture.
+- **Does not assert:** daemon generation of the notice.
+- **Platform coverage:** all.
+
+##### inbox/status/009 — TUI prompt line labels deck messages without replacing the last human prompt.
+- **Layer:** L1 (`tests/render_dashboard.rs`), daemon-labelled prompt event + TestBackend + insta.
+- **Agent:** none.
+- **Asserts:** Prmt shows ✉ and the subject while last_user_prompt and first_prompts retain human text.
+- **Does not assert:** agent-side framing or acknowledgement, covered by inbox/claude.
+- **Platform coverage:** all.
+
+##### inbox/status/010 — Acknowledged inbox state says delivered in both clients.
+- **Layer:** L1 (`tests/render_dashboard.rs`), ListAgents resync + TestBackend.
+- **Agent:** none.
+- **Asserts:** Delivered wording comes from the same fixture as desktop rail tests; the empty inbox shows no ✉0.
+- **Does not assert:** delivery inference from terminal output.
+- **Platform coverage:** all.
+
+##### inbox/status/011 — Live subscriber updates the rendered inbox card without a ListAgents refresh.
+- **Layer:** L1 (`tests/render_dashboard.rs`), real event subscriber over a scripted attach socket and TestBackend card render.
+- **Agent:** none.
+- **Asserts:** A foreign pane notice leaves the card alone; queued and duplicate queued count once; fetched stays pending; acknowledgement replaces the pending badge with delivered. Ordinary tool events form ordered ingestion barriers.
+- **Does not assert:** daemon notice generation or real agent wake-up.
+- **Platform coverage:** mac+linux.
+
 #### inbox/claude
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.

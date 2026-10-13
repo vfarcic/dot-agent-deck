@@ -32,6 +32,9 @@ use ratatui::widgets::Widget;
 use spec::spec;
 use unicode_width::UnicodeWidthStr;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 /// Issue #413: the instant every card fixture in this file is built against
 /// and rendered at. The card seams take `now` instead of reading the clock, so
 /// a card's `Last:` field is a pure function of the fixture's own timestamps —
@@ -156,6 +159,241 @@ fn card_stats_session(cwd: &str) -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
     }
+}
+
+/// Feed the daemon's existing record/resync seam before rendering the card.
+/// No invented card-only inbox field: ListAgents already carries this data.
+fn inbox_card_session(queued: usize, fetched: usize, acknowledged: bool) -> SessionState {
+    let session = card_stats_session("/home/dev/api-svc");
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(),
+            "inbox": {
+                "queued": queued, "fetched": fetched, "undeliverable": 0,
+                "last_acked_at": acknowledged.then_some(render_now()),
+                "wake": "doorbell", "component": null
+            }
+        }))
+        .expect("the daemon's existing AgentRecord wire shape");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    state.sessions.remove("sess-card-stats").unwrap()
+}
+
+fn inbox_display_words() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap()
+}
+
+/// Scenario: Refresh a card from daemon inbox summaries containing queued, fetched or both kinds of pending messages. All three renders must show the same envelope count and queued wording as the desktop.
+#[spec("inbox/status/006")]
+#[test]
+fn status_006_card_counts_queued_and_fetched_messages() {
+    let words = inbox_display_words();
+    for (queued, fetched) in [(2, 0), (0, 2), (1, 1)] {
+        let session = inbox_card_session(queued, fetched, false);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        let badge = format!("{}2", words["glyph"].as_str().unwrap());
+        assert!(
+            rendered.contains(&badge),
+            "pending inbox badge {badge} missing for {queued} queued + {fetched} fetched:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(words["queued"].as_str().unwrap()),
+            "pending inbox must use the shared queued wording:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
+#[spec("inbox/status/007")]
+#[test]
+fn status_007_narrow_card_keeps_inbox_status_and_stats() {
+    let session = inbox_card_session(1, 1, false);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Compact,
+        0,
+        render_now(),
+        false,
+        20,
+        CardDensityKind::Compact.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("✉2"),
+        "narrow card lost its inbox badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Thinking"),
+        "inbox badge displaced the status:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("14 tools"),
+        "inbox badge displaced the tools counter:\n{rendered}"
+    );
+    for row in rendered.lines() {
+        assert_eq!(
+            UnicodeWidthStr::width(row),
+            20,
+            "narrow card overran its width:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
+#[spec("inbox/status/008")]
+#[test]
+fn status_008_card_shows_not_delivered_error_notice() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    let words = inbox_display_words();
+    let notice = format!(
+        "{}: review fixture (agent exited)",
+        words["notDelivered"].as_str().unwrap()
+    );
+    state.apply_daemon_report_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Error,
+        tool_name: None,
+        tool_detail: Some(notice.clone()),
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: None,
+        metadata: HashMap::from([(
+            dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.clone(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Error"),
+        "undeliverable message did not make the card Error:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&notice),
+        "Error card lost its not-delivered explanation:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: After a human prompt, the daemon broadcasts a deck-message prompt labelled with its subject. The card must render that envelope subject, while its user-prompt history still contains only the human's text.
+#[spec("inbox/status/009")]
+#[test]
+fn status_009_card_labels_deck_subject_without_replacing_user_prompt() {
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.last_user_prompt = Some("inspect the human fixture".into());
+    session.first_prompts = vec!["inspect the human fixture".into()];
+    state.sessions.insert(session.session_id.clone(), session);
+    state.apply_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Thinking,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: Some("✉ review fixture".into()),
+        metadata: HashMap::from([(
+            dot_agent_deck::inbox_prompt::DECK_MESSAGE_METADATA_KEY.to_string(),
+            "1".into(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let prompt = rendered.lines().find(|row| row.contains("Prmt:")).unwrap();
+    assert!(
+        prompt.contains("✉ review fixture"),
+        "card prompt line must show the deck subject:\n{rendered}"
+    );
+    assert_eq!(
+        session.last_user_prompt.as_deref(),
+        Some("inspect the human fixture")
+    );
+    assert_eq!(session.first_prompts, ["inspect the human fixture"]);
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Refresh a card whose pending messages have been acknowledged. Its rendered inbox state must say delivered, using the same fixture as the desktop, and its pending envelope count must disappear.
+#[spec("inbox/status/010")]
+#[test]
+fn status_010_card_uses_shared_delivered_word_after_ack() {
+    let session = inbox_card_session(0, 0, true);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let words = inbox_display_words();
+    assert!(
+        rendered.contains(words["delivered"].as_str().unwrap()),
+        "acknowledged inbox must say delivered, matching the desktop:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("✉0"),
+        "an empty inbox must not show a pending count:\n{rendered}"
+    );
 }
 
 /// Scenario: Render an over-long directory in a narrow L1 card, then render a
@@ -3759,4 +3997,95 @@ fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
         "the title counts the cards below the window:\n{title}"
     );
     insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Feed Inbox broadcasts through the real TUI subscriber, followed by ordinary tool events as ordered ingestion barriers. The rendered card must count a queued message once, keep that count when fetched, and replace it with delivered on acknowledgement without a ListAgents refresh.
+#[spec("inbox/status/011")]
+#[cfg(unix)]
+#[test]
+fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
+    use dot_agent_deck::daemon_client::DaemonClient;
+    use dot_agent_deck::daemon_protocol::{
+        AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, read_frame, write_frame,
+    };
+    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
+    use std::time::Duration;
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let root = test_temp::tempdir().unwrap();
+        let socket = root.path().join("inbox.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (send, mut batches) = tokio::sync::mpsc::unbounded_channel::<Vec<BroadcastMsg>>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(kind, KIND_REQ);
+            assert!(matches!(
+                serde_json::from_slice::<AttachRequest>(&payload).unwrap(),
+                AttachRequest::SubscribeEvents
+            ));
+            write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                .await.unwrap();
+            while let Some(batch) = batches.recv().await {
+                for event in batch {
+                    write_frame(&mut stream, KIND_EVENT, &serde_json::to_vec(&event).unwrap())
+                        .await.unwrap();
+                }
+            }
+        });
+        let mut app = AppState::default();
+        app.register_pane("pane-card-stats".into());
+        let session = card_stats_session("/home/dev/api-svc");
+        app.sessions.insert(session.session_id.clone(), session);
+        let state = Arc::new(tokio::sync::RwLock::new(app));
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), state.clone(), SubscriberConfig::default()));
+        for (index, (pane, message_state, expected)) in [
+            ("foreign-pane", "queued", ""),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "fetched", "✉1"),
+            ("pane-card-stats", "acknowledged", "delivered"),
+        ].into_iter().enumerate() {
+            let barrier = format!("InboxBarrier{index}");
+            let notice: BroadcastMsg = serde_json::from_value(serde_json::json!({
+                "kind":"inbox", "pane_id":pane, "agent_id":"agent-card-stats",
+                "message_id":"m-k3xzq2ab-0f3c9a71d2e4b850", "subject":"review fixture",
+                "from_label":"the orchestrator", "state":message_state
+            })).unwrap();
+            let event = AgentEvent {
+                session_id: "sess-card-stats".into(), agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart, tool_name: Some(barrier.clone()), tool_detail: None,
+                cwd: None, timestamp: render_now() + chrono::Duration::seconds(index as i64),
+                user_prompt: None, metadata: HashMap::new(), pane_id: Some("pane-card-stats".into()),
+                agent_id: Some("agent-card-stats".into()), agent_version: None,
+                schema_version: None, live_target: None,
+            };
+            send.send(vec![notice, BroadcastMsg::Event(event)]).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state.read().await.sessions["sess-card-stats"].active_tool.as_ref()
+                        .is_some_and(|tool| tool.name == barrier) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("ordinary event after Inbox must be applied as an ingestion barrier");
+            let app = state.read().await;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &app.sessions["sess-card-stats"], Some("api-svc"), Some(1),
+                CardDensityKind::Normal, 0, render_now(), false, 80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            if expected.is_empty() {
+                assert!(!rendered.contains("✉1"), "foreign inbox notice changed this card:\n{rendered}");
+            } else {
+                assert!(rendered.contains(expected), "live Inbox {message_state} must render {expected} after its ingestion barrier:\n{rendered}");
+                assert!(!rendered.contains("✉2"), "duplicate/transition counted twice:\n{rendered}");
+            }
+            if message_state == "acknowledged" {
+                assert!(!rendered.contains("✉1"), "acknowledged message still pending:\n{rendered}");
+            }
+        }
+        subscriber.abort();
+        server.abort();
+    });
 }
