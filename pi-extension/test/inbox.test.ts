@@ -188,3 +188,32 @@ test("pi_inbox_007_unarmed_doorbell_is_intercepted_without_model_fetch_or_early_
 	assert.ok(commands.some(argv => argv[0] === "ack" && argv.includes(ID)), "without a watcher, committed delivery needs the explicit CLI ack");
 	await f.emit("session_shutdown", { reason: "quit" });
 });
+
+/// Scenario: With DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS set, a Pi watcher that exits stays down for exactly that long every time, instead of the doubling one-second backoff; a value that is not a whole number of milliseconds leaves the default backoff.
+test("pi_inbox_008_watcher_backoff_env_fixes_every_respawn_delay", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const saved = process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS;
+	try {
+		process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS = "45000";
+		const f = fixture(); await f.emit("session_start");
+		for (let round = 1; round <= 3; round++) {
+			f.watcher().emit("exit", 1, null);
+			t.mock.timers.tick(44999);
+			assert.equal(spawned.length, round, `round ${round}: the watcher must stay down for the configured delay`);
+			t.mock.timers.tick(1);
+			assert.equal(spawned.length, round + 1, `round ${round}: the watcher must come back once the configured delay has passed`);
+		}
+		await f.emit("session_shutdown");
+
+		process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS = "soon";
+		spawned = [];
+		const g = fixture(); await g.emit("session_start");
+		g.watcher().emit("exit", 1, null);
+		t.mock.timers.tick(1000);
+		assert.equal(spawned.length, 2, "an unreadable value must leave the one-second first backoff");
+		await g.emit("session_shutdown");
+	} finally {
+		if (saved === undefined) delete process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS;
+		else process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS = saved;
+	}
+});

@@ -60,6 +60,13 @@ pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 /// Overrides [`DEFAULT_KEEPALIVE`], in milliseconds.
 pub const ENV_KEEPALIVE_MS: &str = "DOT_AGENT_DECK_INBOX_KEEPALIVE_MS";
 
+/// Sets every respawn delay of an agent-side inbox watcher — the Pi
+/// extension's and both OpenCode plugins' — to this many milliseconds (a whole
+/// number from 1 to 3 600 000) instead of the doubling 1 s → 30 s backoff. Read
+/// by those components, not by the daemon; named here beside the other inbox
+/// knobs. Lets a test stop a watcher and keep it down past the arm grace.
+pub const ENV_WATCHER_BACKOFF_MS: &str = "DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS";
+
 /// TEST knob: when set to a truthy value, waiters still register, keep alive
 /// and deregister on EOF, but are handed nothing. Lets the doorbell tests hold
 /// an armed waiter beside a queued message.

@@ -1028,6 +1028,18 @@ const inboxStop = (child) => {
     child.kill("SIGTERM");
   } catch (_) {}
 };
+// PRD #1666: DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS sets every watcher respawn
+// delay to that many milliseconds (a whole number, 1 to 3600000), as the Pi
+// extension's does; unset, the delay doubles from 1 s to 30 s.
+const inboxFixedBackoff = () => {
+  const raw = String(process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS ?? "").trim();
+  if (!/^[0-9]+$/.test(raw)) return undefined;
+  const ms = Number(raw);
+  return ms >= 1 && ms <= 3600000 ? ms : undefined;
+};
+const inboxFirstBackoff = () => inboxFixedBackoff() ?? 1000;
+const inboxNextBackoff = (backoff, ranForMs) =>
+  inboxFixedBackoff() ?? (ranForMs > 30000 ? 1000 : Math.min(backoff * 2, 30000));
 "#;
 
 /// PRD #1666 S8: the server plugin's inbox roles (design §7.3, §7.7, and
@@ -1113,12 +1125,12 @@ const startMini = (client, generation, backoff) => {
       (gone) => {
         if (globalThis[INBOX_WATCHER] === gone) globalThis[INBOX_WATCHER] = undefined;
         if (generation !== inboxGeneration() || gone.stdin.writableEnded) return;
-        const next = Date.now() - started > 30000 ? 1000 : Math.min(backoff * 2, 30000);
+        const next = inboxNextBackoff(backoff, Date.now() - started);
         setTimeout(() => startMini(client, generation, next), backoff).unref?.();
       }
     );
   } catch (_) {
-    setTimeout(() => startMini(client, generation, Math.min(backoff * 2, 30000)), backoff).unref?.();
+    setTimeout(() => startMini(client, generation, inboxNextBackoff(backoff, 0)), backoff).unref?.();
     return;
   }
   globalThis[INBOX_WATCHER] = child;
@@ -1146,7 +1158,7 @@ const startInbox = (client) => {
       }
       return;
     }
-    if (isMini() && client?.session) startMini(client, generation, 1000);
+    if (isMini() && client?.session) startMini(client, generation, inboxFirstBackoff());
   } catch (_) {}
 };
 
@@ -1395,12 +1407,12 @@ const tui = async (api) => {
           (gone) => {
             if (watcher === gone) watcher = undefined;
             if (!instance.active || gone.stdin.writableEnded) return;
-            const next = Date.now() - started > 30000 ? 1000 : Math.min(backoff * 2, 30000);
+            const next = inboxNextBackoff(backoff, Date.now() - started);
             setTimeout(() => start(next), backoff).unref?.();
           }
         );
       } catch (_) {
-        setTimeout(() => start(Math.min(backoff * 2, 30000)), backoff).unref?.();
+        setTimeout(() => start(inboxNextBackoff(backoff, 0)), backoff).unref?.();
       }
     };
     api.lifecycle?.onDispose?.(() => {
@@ -1409,7 +1421,7 @@ const tui = async (api) => {
       watcher = undefined;
       inboxStop(child);
     });
-    start(1000);
+    start(inboxFirstBackoff());
   } catch (_) {}
 };
 
@@ -3353,6 +3365,56 @@ await send("session.idle", {{ sessionID: "s1" }});
                 "{payload}"
             );
         }
+    }
+
+    /// PRD #1666: `DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS` sets both OpenCode
+    /// watchers' respawn delay, as it sets the Pi extension's
+    /// (`pi_inbox_008_watcher_backoff_env_fixes_every_respawn_delay`); unset or
+    /// unreadable, the delay starts at 1 s and doubles to 30 s.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_watcher_backoff_env_fixes_every_respawn_delay() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let script = format!(
+            "{}\n{}",
+            inbox_js(""),
+            r#"
+const check = (actual, expected, what) => {
+  if (actual !== expected) { console.error(what + ": " + actual + " != " + expected); process.exit(1); }
+};
+const ENV = "DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS";
+delete process.env[ENV];
+check(inboxFirstBackoff(), 1000, "default first");
+check(inboxNextBackoff(1000, 10), 2000, "default doubles");
+check(inboxNextBackoff(20000, 10), 30000, "default caps");
+check(inboxNextBackoff(8000, 31000), 1000, "default resets after a long run");
+process.env[ENV] = "45000";
+check(inboxFirstBackoff(), 45000, "fixed first");
+check(inboxNextBackoff(45000, 10), 45000, "fixed next");
+check(inboxNextBackoff(45000, 31000), 45000, "fixed after a long run");
+for (const bad of ["", "0", "1.5", "soon", "3600001"]) {
+  process.env[ENV] = bad;
+  check(inboxFirstBackoff(), 1000, "unreadable " + bad);
+}
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Run `body` under Node against the generated plugin, its binary pinned to

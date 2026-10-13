@@ -18,6 +18,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { describe, test } from "node:test";
 import {
+	watcherBackoffOverride,
+	WATCHER_BACKOFF_ENV,
+	WATCHER_BACKOFF_OVERRIDE_MAX_MS,
 	AGENT_EVENT_TYPES,
 	AGENT_STATES,
 	buildAgentEventArgv,
@@ -1032,5 +1035,17 @@ describe("PRD #1497: a reply reaches the CLI on stdin, never on its command line
 		const outcome = await execWithStdin(spawn, node, ["-e", "setTimeout(() => {}, 60000)"], "x", { timeout: 50 });
 		assert.equal(outcome.killed, true);
 		assert.notEqual(outcome.code, 0);
+	});
+});
+
+describe("watcherBackoffOverride (PRD #1666)", () => {
+	test("reads a whole number of milliseconds within bounds, and nothing else", () => {
+		const read = (value: string | undefined) => watcherBackoffOverride({ [WATCHER_BACKOFF_ENV]: value });
+		assert.equal(read("45000"), 45000);
+		assert.equal(read(" 1 "), 1);
+		assert.equal(read(String(WATCHER_BACKOFF_OVERRIDE_MAX_MS)), WATCHER_BACKOFF_OVERRIDE_MAX_MS);
+		for (const bad of [undefined, "", "0", "-5", "1.5", "1e3", "soon", String(WATCHER_BACKOFF_OVERRIDE_MAX_MS + 1)]) {
+			assert.equal(read(bad), undefined, `${bad} must leave the default backoff`);
+		}
 	});
 });

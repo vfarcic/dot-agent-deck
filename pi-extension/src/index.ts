@@ -49,6 +49,7 @@ import {
 	spawnFailureMessage,
 	WATCHER_BACKOFF_MIN_MS,
 	WATCHER_NOT_IN_DECK_EXIT,
+	watcherBackoffOverride,
 } from "./orchestrator.ts";
 
 /**
@@ -182,6 +183,11 @@ function createPiInbox(pi: ExtensionAPI) {
 	const writable = (child: WatcherChild | undefined): child is WatcherChild =>
 		!!child?.stdin && !child.stdin.writableEnded && !child.stdin.destroyed;
 
+	/** The fixed respawn delay the environment sets, read at each session start. */
+	let fixedBackoff: number | undefined;
+	const nextBackoff = (current: number, ranForMs: number): number =>
+		fixedBackoff ?? nextWatcherBackoff(current, ranForMs);
+
 	const scheduleRespawn = (delay: number, next: number): void => {
 		if (!current()) {
 			return;
@@ -210,7 +216,7 @@ function createPiInbox(pi: ExtensionAPI) {
 		try {
 			child = spawn(deckBin, buildInboxWaitArgv(), { stdio: ["pipe", "pipe", "inherit"] }) as unknown as WatcherChild;
 		} catch {
-			scheduleRespawn(backoff, nextWatcherBackoff(backoff, 0));
+			scheduleRespawn(backoff, nextBackoff(backoff, 0));
 			return;
 		}
 		watcher = child;
@@ -253,7 +259,7 @@ function createPiInbox(pi: ExtensionAPI) {
 				if (code === WATCHER_NOT_IN_DECK_EXIT) {
 					return;
 				}
-				scheduleRespawn(backoff, nextWatcherBackoff(backoff, Date.now() - started));
+				scheduleRespawn(backoff, nextBackoff(backoff, Date.now() - started));
 			} catch {
 				// An uncaught throw in a child-process callback would end Pi.
 			}
@@ -276,7 +282,8 @@ function createPiInbox(pi: ExtensionAPI) {
 			active = true;
 			stopWatcher(shared.watcher);
 			shared.watcher = undefined;
-			spawnWatcher(WATCHER_BACKOFF_MIN_MS);
+			fixedBackoff = watcherBackoffOverride(process.env);
+			spawnWatcher(fixedBackoff ?? WATCHER_BACKOFF_MIN_MS);
 		},
 
 		/** This instance's session ended: stop its watcher and never respawn it. */

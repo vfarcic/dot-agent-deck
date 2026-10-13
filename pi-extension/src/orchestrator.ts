@@ -1077,6 +1077,26 @@ export const WATCHER_BACKOFF_MIN_MS = 1000;
 export const WATCHER_BACKOFF_MAX_MS = 30000;
 
 /**
+ * PRD #1666: sets every watcher respawn delay to this many milliseconds instead
+ * of the doubling backoff — so a test can stop a watcher and know it stays
+ * down for longer than the deck's arm grace. Unset, or not a whole number from
+ * 1 to {@link WATCHER_BACKOFF_OVERRIDE_MAX_MS}, leaves the backoff as it is.
+ * The OpenCode plugin reads the same variable.
+ */
+export const WATCHER_BACKOFF_ENV = "DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS";
+export const WATCHER_BACKOFF_OVERRIDE_MAX_MS = 3_600_000;
+
+/** The fixed respawn delay {@link WATCHER_BACKOFF_ENV} sets, or `undefined`. */
+export function watcherBackoffOverride(env: Record<string, string | undefined>): number | undefined {
+	const raw = env[WATCHER_BACKOFF_ENV]?.trim();
+	if (!raw || !/^\d+$/.test(raw)) {
+		return undefined;
+	}
+	const ms = Number(raw);
+	return ms >= 1 && ms <= WATCHER_BACKOFF_OVERRIDE_MAX_MS ? ms : undefined;
+}
+
+/**
  * The delay before the respawn after the next one: back to the minimum when
  * the watcher had been running longer than the maximum, else doubled.
  */
