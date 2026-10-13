@@ -16,15 +16,13 @@
 //! already pins the plumbing deterministically; this test pins the thing a
 //! stand-in never can. Per Design Decision #7 the real-agent tier is sized to
 //! CONFIDENCE, not token cost — generous per-step timeouts, a directive prompt,
-//! and a distinctive sentinel — and is the flaky-tolerant pre-PR tier (rule 4/5),
-//! run once, never looped.
+//! and a distinctive sentinel. Run the scoped lane-2 cases locally (rule 4/5).
 //!
 //! ## Structure (mirrors `e2e_delegate_work_done_chain.rs`)
 //! An in-process daemon (`common::spawn_inprocess_daemon` — its hook loop ingests
 //! `delegate` / `work-done` / `agent-event` over the socket and re-broadcasts
 //! `AgentEvent`s), a REAL `claude` (Haiku) worker pane spawned + ready BEFORE the
-//! orchestrator delegates (so the daemon-injected pointer lands in a live input
-//! box), and a REAL `pi` orchestrator pane whose HOME carries the bundled
+//! orchestrator delegates, and a REAL `pi` orchestrator pane whose HOME carries the bundled
 //! extension, staged into the location pi resolves from that HOME (production
 //! materializes it at daemon startup; this in-process daemon bypasses that entry,
 //! so the test stages it, PRD #201). The
@@ -125,7 +123,7 @@ fn check_pi_available() -> Result<(), String> {
 /// Build an isolated `HOME` for the Claude worker that (a) carries the host
 /// credentials/onboarding so auth works without a fresh login, and (b) pre-marks
 /// `worker_cwd` as trusted so Claude's first-run "Is this a project you trust?"
-/// dialog never appears and the injected delegate pointer lands in the input box
+/// dialog does not block the worker from acting on its inbox delegation
 /// rather than being consumed answering the dialog. The returned TempDir must be
 /// kept alive for the worker's lifetime. Ported from
 /// `e2e_delegate_work_done_chain.rs::prepare_claude_home`.
@@ -140,6 +138,21 @@ fn prepare_claude_home(worker_cwd: &str) -> TempDir {
     let home = common::race_safe_tempdir();
     common::seed_claude_worker_home(home.path(), &[worker_cwd.to_string()])
         .expect("seed the isolated Claude worker HOME");
+    // The in-process daemon skips startup installation, and credential import
+    // strips host hooks. Install the worker's real inbox hooks in its scratch HOME.
+    let installed = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "install", "--agent", "claude-code"])
+        .current_dir(worker_cwd)
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+        .env("DOT_AGENT_DECK_LOG", home.path().join("hook-install.log"))
+        .env("PATH", path_with_binary_dir())
+        .output()
+        .expect("install scratch Claude inbox hooks");
+    assert!(
+        installed.status.success(),
+        "scratch Claude hook install failed"
+    );
     home
 }
 
@@ -177,26 +190,7 @@ fn path_with_binary_dir() -> String {
 // M4.1 — real-pi orchestrator delegate → work-done (test-plan ROW 13)
 // ---------------------------------------------------------------------------
 
-/// Scenario: Bring up an in-process daemon, spawn a REAL Claude Code (Haiku)
-/// worker as a long-running interactive `coder`-role pane and wait until it is
-/// input-ready, then spawn a REAL `pi` orchestrator pane IDLE (no CLI-arg
-/// prompt) whose HOME carries the bundled extension, staged (as the
-/// daemon-startup seam would) into the location pi resolves from that HOME before
-/// pi boots — and whose env explicitly propagates `ANTHROPIC_API_KEY` + `HOME`.
-/// Deliver pi's directive NATIVELY (PRD #201): stash it in the daemon seed store
-/// (`set_pending_seed`), and pi's extension pulls it on `session_start` via
-/// `dot-agent-deck get-seed` → `pi.sendUserMessage` (NOT a CLI arg, NOT PTY
-/// keystroke injection). The directive tells pi to call the native `delegate`
-/// tool once, delegating to the `coder` role a task that creates the
-/// uniquely-named sentinel `pi_orch_sentinel_7c3f.txt` (contents
-/// `PI_ORCH_SENTINEL_OK`). Assert the FULL chain: the sentinel file exists with
-/// the expected contents (the real worker ran the delegated task via the daemon
-/// route), the daemon wrote `.dot-agent-deck/work-done-coder.md` (work-done
-/// returned to the orchestrator), a `Pi`-typed `AgentEvent` for the orchestrator
-/// pane was observed on the daemon's broadcast (status via the extension's
-/// `agent-event` path, NO hook), AND the daemon recorded that the seed was
-/// delivered NATIVELY via the `get-seed` pull (proving the native path ran, not
-/// an injection fallback).
+/// Scenario: Start a real Claude Haiku worker and an idle real Pi orchestrator with the bundled extension in a scratch HOME. Post a directive to Pi's inbox; it must acknowledge through the extension, delegate the sentinel task, and receive the worker's work-done report while reporting real Pi status.
 #[spec("chain-smoke/pi/001")]
 #[test]
 fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker() {
@@ -225,12 +219,16 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let path_env = path_with_binary_dir();
 
     // --- WORKER: real Claude Haiku, spawned + ready before the orchestrator
-    // delegates (so the daemon-injected pointer lands in a live input box).
+    // delegates, so onboarding does not block the worker's inbox task.
     let claude_home = prepare_claude_home(&cwd_str);
     let worker_command =
         format!("claude --model {PINNED_CLAUDE_MODEL} --allowedTools Bash Read Write");
     let worker_env = vec![
         (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+        (
+            "DOT_AGENT_DECK_BIN".to_string(),
+            env!("CARGO_BIN_EXE_dot-agent-deck").to_string(),
+        ),
         (
             "DOT_AGENT_DECK_SOCKET".to_string(),
             daemon.hook_path.display().to_string(),
@@ -331,17 +329,14 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             "HOME".to_string(),
             pi_home.path().to_str().expect("pi home UTF-8").to_string(),
         ),
+        (
+            "PI_CODING_AGENT_DIR".to_string(),
+            pi_home.path().join(".pi/agent").display().to_string(),
+        ),
         ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
     ];
 
-    // Directive prompt: instruct pi to call `delegate` ONCE with role `coder` and
-    // a task that creates the distinctive sentinel. Robust to LLM phrasing — the
-    // sentinel filename + content are literal tokens the worker must reproduce.
-    // PRD #201: this directive is delivered NATIVELY — NOT as a CLI arg. It is
-    // stashed in the daemon seed store (`set_pending_seed`) and the pi extension
-    // pulls it on `session_start` via `dot-agent-deck get-seed` →
-    // `pi.sendUserMessage`, which "always triggers a turn". No PTY keystroke
-    // injection, no CLI positional arg.
+    // The directive is delivered through the inbox, without CLI-arg or PTY delivery.
     let directive = format!(
         "You are the orchestrator in a dot-agent-deck orchestration. A worker role named \
          \"coder\" is available. Call the delegate tool EXACTLY ONCE with role \"coder\" and \
@@ -349,10 +344,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
          whose entire contents are exactly the text {SENTINEL_CONTENT}. Use the Bash tool to \
          create it. Do NOT do the work yourself — only call the delegate tool, then stop."
     );
-    // Spawn pi IDLE — NO CLI-arg prompt. The only route the directive can reach
-    // pi is the native `get-seed` pull, so a successful delegate PROVES native
-    // delivery (there is no injection fallback armed on this direct-registry
-    // spawn path).
+    // Pi boots idle and its extension waits for inbox messages.
     let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
 
     let orch_agent_id = daemon
@@ -367,11 +359,12 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         })
         .expect("spawn pi orchestrator agent");
 
-    // PRD #201 native prompt delivery: stash the directive as the orchestrator
-    // pane's seed (keyed by DOT_AGENT_DECK_PANE_ID = ORCH_PANE). pi's extension
-    // pulls it on `session_start` — well after this returns, since pi's Node/Bun
-    // boot + extension load takes seconds.
-    daemon.registry.set_pending_seed(ORCH_PANE, &directive);
+    let directive_id = dot_agent_deck::inbox_hub::post_to_live(
+        &daemon.registry,
+        dot_agent_deck::inbox::Recipient::bound(ORCH_PANE, &orch_agent_id),
+        dot_agent_deck::inbox::Content::from_deck("seed", "delegate the sentinel task", directive),
+    )
+    .expect("post the directive to the real Pi orchestrator");
 
     // --- Assert the FULL chain. ---
 
@@ -473,21 +466,23 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
          === pi orchestrator pane ===\n{orch_pane}\n=== end ==="
     );
 
-    // 4. NATIVE-PATH PROOF (PRD #201, GAP-#1 discipline): the directive was
-    //    delivered by the extension's `get-seed` pull → `pi.sendUserMessage`,
-    //    NOT by a CLI arg and NOT by PTY keystroke injection. `get-seed`'s take
-    //    marks the delivery native, and there is no injection fallback on this
-    //    direct-registry spawn — so a delegate could only have happened if the
-    //    native pull delivered the seed. Asserting the registry flag makes that
-    //    explicit and bulletproof.
-    assert!(
-        daemon.registry.seed_delivered_native(ORCH_PANE),
-        "the pi orchestrator's directive must have been delivered NATIVELY via \
-         `get-seed` → `sendUserMessage` (the pane was spawned idle with no CLI-arg \
-         prompt and no PTY injection), but the daemon did not record a native seed \
-         delivery for {ORCH_PANE:?} — the extension's session_start → get-seed pull \
-         did not run."
+    // Pi acknowledges the native user message when it is committed.
+    let messages = daemon.registry.inbox().list(ORCH_PANE);
+    let delivered = messages
+        .iter()
+        .find(|message| message.id == directive_id)
+        .expect("posted directive remains in inbox history");
+    assert_eq!(
+        delivered.state,
+        dot_agent_deck::inbox::StateName::Acknowledged,
+        "{delivered:?}"
     );
+    assert_eq!(
+        delivered.ack_how,
+        Some(dot_agent_deck::inbox::AckHow::ExtensionConfirmed),
+        "{delivered:?}"
+    );
+    assert_eq!(delivered.deliveries, 1, "{delivered:?}");
 }
 
 // ---------------------------------------------------------------------------
