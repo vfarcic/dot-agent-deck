@@ -14,6 +14,7 @@ import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, 
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { speechAudioError } from "./speech";
+import { pullRequestFromDto } from "./pullRequest";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -353,6 +354,12 @@ export interface DesktopAgentDto {
    */
   promptKeys?: PromptKeys;
   /**
+   * PRD #1401 — the pull request this agent's work produced, copied through
+   * from `SessionSnapshot.pull_request`. Absent when the daemon knows of no PR
+   * or predates the field.
+   */
+  pullRequest?: PullRequestInfoDto;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -360,6 +367,21 @@ export interface DesktopAgentDto {
    */
   tab: AgentTab;
 }
+
+/**
+ * PRD #1401 — the daemon's `pull_request_info::PullRequestInfo`. `"unknown"` is what
+ * a value from a newer daemon that this build does not know arrives as.
+ */
+export interface PullRequestInfoDto {
+  number: number;
+  url: string;
+  state: PullRequestState;
+  review?: PullRequestReview;
+}
+
+export type PullRequestState = "open" | "draft" | "merged" | "closed" | "unknown";
+
+export type PullRequestReview = "approved" | "changes_requested" | "review_required" | "unknown";
 
 /** Result returned after the ordered Tauri output channel is registered. */
 export interface TerminalAttachResult {
@@ -836,7 +858,8 @@ export interface SecretStatusDto {
  * by `xtask/linkage-check`'s rule 13, which reads the union in `types.ts` so the
  * table and the app's own type stay in step without a second list.
  */
-export type VoiceScreen = "deck" | "overview" | "agent";
+/** PRD #1401 adds `pull_request`: the in-app pull request browser is open over the screen, which voice treats as a screen of its own (`voice::table::Screen`). */
+export type VoiceScreen = "deck" | "overview" | "agent" | "pull_request";
 
 /**
  * What the New agent dialog's directory browser is showing, declared with an
@@ -2252,6 +2275,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
+  const pullRequest = pullRequestFromDto(agent.pullRequest);
   return {
     id: agent.id,
     daemonId,
@@ -2308,6 +2332,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
+    ...(pullRequest ? { pullRequest } : {}),
     ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
@@ -2579,7 +2605,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;

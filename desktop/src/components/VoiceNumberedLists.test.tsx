@@ -7,6 +7,7 @@ import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResultDto, 
 import type { DeckRuntimeState } from "../types";
 import { VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 import type { VoiceNumberAnswerDto } from "../lib/voiceNumbers";
+import { PrBrowserHostContext, type PrBrowserHost } from "../lib/prBrowser";
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <div data-testid={`terminal-${agentId}`} />,
@@ -131,6 +132,58 @@ describe("numbered voice lists through the dashboard", () => {
     expect(resolveVoice).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-pane-overlay").querySelector(".agent-assignment p"))
       .toHaveTextContent("Check the payment API for breaking changes.");
+  });
+
+  /** Scenario: every dashboard agent has a pull request, and “open the PR for agent 3” or “open agent 3's pull request” opens the PR of the agent showing 3, in the app's browser. Neither phrase asks the Commands backend. */
+  it.each(["open the PR for agent 3", "open agent 3's pull request"])("opens the third agent's pull request for %s without a Commands backend call", async (phrase) => {
+    const voice = microphone();
+    const docs = createFixtureSnapshot("docs");
+    const snapshot = {
+      ...docs,
+      agents: docs.agents.map((agent, index) => ({
+        ...agent,
+        pullRequest: { number: 100 + index, url: `https://github.com/test-org/test-repo/pull/${100 + index}`, state: "open" as const, review: "review_required" as const },
+      })),
+    };
+    const { runtime, resolveVoice } = makeRuntime(voice, snapshot);
+    const host = {
+      available: true,
+      open: vi.fn(async () => undefined), setBounds: vi.fn(async () => undefined), setVisible: vi.fn(async () => undefined),
+      back: vi.fn(async () => undefined), scroll: vi.fn(async () => undefined), openExternal: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined), onClosed: vi.fn(() => () => undefined),
+    } satisfies PrBrowserHost;
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime} initialView={{ kind: "overview" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    const [third] = screen.getAllByRole("row", { name: /^3\./ });
+    const owner = snapshot.agents.find((agent) => within(third).queryByText(agent.displayName) !== null);
+    expect(owner, "the third row names one of the fixture's agents").toBeDefined();
+    voice.deliver(phrase);
+    await poll();
+    await finishPossibleNoMatch();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("no matching action");
+    expect(resolveVoice).not.toHaveBeenCalled();
+    expect(host.open).toHaveBeenCalledTimes(1);
+    expect(host.open).toHaveBeenCalledWith(owner?.pullRequest?.url, expect.anything());
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName(`Pull request #${owner?.pullRequest?.number} for ${owner?.displayName}`);
+  });
+
+  /** Scenario: on the Daemons screen, whose agent tiles are numbered too, “open the PR for agent 1” is not answered by number: it goes to the Commands backend, which says where a pull request opens. */
+  it("leaves a pull request by number on the Daemons screen to the Commands backend", async () => {
+    const voice = microphone();
+    const { runtime, resolveVoice } = makeRuntime(voice);
+    /* The Daemons screen is behind the experimental flag (issue #1198). */
+    runtime.desktopFeatures = fixtureDesktopFeatures("?experimental=1");
+    render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    expect(document.querySelector(".agent-tile[data-voice-number='1']"), "the Daemons screen's first tile shows 1").not.toBeNull();
+    voice.deliver("open the PR for agent 1");
+    await poll();
+    await finishPossibleNoMatch();
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: the New agent dialog shows daemon 1, and “Select daemon 1” chooses that daemon locally. The selected daemon's directory browser opens without a Commands call. */

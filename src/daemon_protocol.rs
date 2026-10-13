@@ -10701,6 +10701,8 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pull_request: None,
+                pull_request_revision: None,
                 background: None,
                 background_revision: None,
             };
@@ -10742,6 +10744,8 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pull_request: None,
+                pull_request_revision: None,
                 background: None,
                 background_revision: None,
             }),
@@ -10825,6 +10829,8 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pull_request: None,
+            pull_request_revision: 0,
         };
         let snap = session.live_snapshot();
         assert_eq!(

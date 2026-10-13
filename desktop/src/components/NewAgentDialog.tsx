@@ -3,7 +3,7 @@ import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } 
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
-import { useInertBackground } from "../hooks/useInertBackground";
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
 import { useVoiceOn } from "../hooks/useVoiceOn";
@@ -1636,7 +1636,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * about to be unmounted. (The open effect above focuses nothing itself: it
    * only files a request that the focus effect carries out.)
    */
-  const dialogRef = useInertBackground<HTMLElement>(true);
+  const dialogRef = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog);
 
   // -- focus: the first unsatisfied control, then onward as each is satisfied --
   // On open, the deck field — or, with a deck preselected, the browser; after

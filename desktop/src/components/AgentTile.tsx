@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   AlertTriangle,
@@ -33,6 +33,8 @@ import { blockedReasonText } from "../lib/blockedReason";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
+import { PullRequestBadge } from "./PullRequestBadge";
+import { OpenPullRequest } from "../lib/prBrowser";
 import { TerminalViewport } from "./TerminalViewport";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
@@ -299,6 +301,8 @@ export function AgentTile({
   panePresent,
   onClose,
 }: AgentTileProps) {
+  /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
+  const openPullRequest = useContext(OpenPullRequest);
   const handleInput = useCallback((data: string) => {
     void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id }, data);
   }, [agent.daemonId, agent.id, onTerminalInput]);
@@ -415,6 +419,14 @@ export function AgentTile({
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
               <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${statusLabel(agent.status)}` : statusLabel(agent.status)}</span>
+              {/* PRD #1401 — the agent's pull request, when the daemon found one. */}
+              {agent.pullRequest && (
+                <PullRequestBadge
+                  pullRequest={agent.pullRequest}
+                  testId={`pr-badge-${agent.id}`}
+                  onOpen={openPullRequest && agent.pullRequest.url ? () => openPullRequest({ deckId: agent.daemonId, agentId: agent.id }) : undefined}
+                />
+              )}
             </div>
             {renameDraft !== undefined ? (
               <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>

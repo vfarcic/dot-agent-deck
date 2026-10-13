@@ -1029,6 +1029,8 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
         last_activity_ms: Some(at.timestamp_millis()),
         blocked: None,
         hook_generation: None,
+        pull_request: None,
+        pull_request_revision: None,
         background: None,
         background_revision: None,
     };
@@ -1314,6 +1316,8 @@ fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_car
         last_activity_ms: Some(future.timestamp_millis()),
         blocked: None,
         hook_generation: None,
+        pull_request: None,
+        pull_request_revision: None,
         background: None,
         background_revision: None,
     };

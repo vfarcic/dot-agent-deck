@@ -1,6 +1,6 @@
 # Settings
 
-**Settings**, in the rail on the left, opens the app's settings over the current screen. It has four sections: **Appearance**, **Daemons**, **Voice** and **Zoom**. Changes are saved to the [settings file](#the-settings-file) as you make them. Press `Escape` to close it.
+**Settings**, in the rail on the left, opens the app's settings over the current screen. It has five sections: **Appearance**, **Daemons**, **Voice**, **Zoom** and **GitHub**. Changes are saved to the [settings file](#the-settings-file) as you make them. Press `Escape` to close it.
 
 **Daemons** is described on its own page, [Daemons](daemons.md), and **Voice** on [Voice Control](voice.md).
 
@@ -23,6 +23,14 @@ Scales the whole window. The levels are 75%, 90%, 100%, 110%, 125%, 150%, 175%, 
 Either modifier works on every platform, and the keys work while an agent's terminal has focus too: they are not passed to the agent. The level is saved in the settings file.
 
 This is not the TUI's `Ctrl+z`, which makes the focused pane fill the TUI's frame and changes no text size.
+
+## GitHub
+
+**Sign out of GitHub** ends the GitHub sign-in of the app's [pull request page](dashboard.md#read-a-pull-request-in-the-app). Press it, and wait until it says `Signed out`: the next pull request you open asks you to sign in again. If a pull request is open behind Settings, it is reloaded, signed out. Your system browser's GitHub sign-in is not affected. If it says `Could not sign out`, the reason follows; try again, or sign out on GitHub's page itself (your avatar, then **Sign out**).
+
+On macOS before 14 (Sonoma), the button says it cannot sign out: on those versions the pull request page shares the app's own storage, which the button would erase along with the sign-in. Sign out on GitHub's page instead.
+
+Nothing in this section is stored in the settings file. The TUI has no such setting: it opens pull requests in your system browser, which keeps its own sign-in.
 
 ## The settings file
 

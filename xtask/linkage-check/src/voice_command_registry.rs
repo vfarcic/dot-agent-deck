@@ -9,8 +9,10 @@
 //!
 //! 1. every `invoke` in `commands.toml` names a key in `VOICE_ACTIONS`;
 //! 2. every `screens` entry is a known screen — the `kind` literals of
-//!    `DeckView` in `desktop/src/types.ts`, so the table and the app's own type
-//!    stay in step without a second list;
+//!    `DeckView` in `desktop/src/types.ts`, plus the screens the webview may
+//!    declare besides a view (`VoiceScreen` in `desktop/src/lib/bridge.ts`:
+//!    PRD #1401's `pull_request`, the in-app pull request browser), so the
+//!    table and the app's own types stay in step without a second list;
 //! 3. every param `kind` is in the closed resolver set, read off `ParamKind` in
 //!    `voice/table.rs` for the same reason;
 //! 4. every `VOICE_ACTIONS` entry is **classified** — `voice: true` when a row
@@ -77,6 +79,9 @@ pub const COMMANDS_TOML: &str = "desktop/src-tauri/src/voice/commands.toml";
 pub const REGISTRY_TS: &str = "desktop/src/lib/voiceActions.ts";
 /// Where `DeckView`'s `kind` literals — the closed screen set — are declared.
 pub const DECK_VIEW_TS: &str = "desktop/src/types.ts";
+/// Where `VoiceScreen` — what the webview declares a voice command runs
+/// against, a `DeckView` kind or a screen over one (PRD #1401) — is declared.
+pub const VOICE_SCREEN_TS: &str = "desktop/src/lib/bridge.ts";
 /// Where `ParamKind` — the closed resolver set — is declared.
 pub const PARAM_KIND_RS: &str = "desktop/src-tauri/src/voice/table.rs";
 /// Where the only spoken phrases the model is never asked about live.
@@ -147,6 +152,7 @@ pub struct Sources {
     pub commands_toml: String,
     pub registry_ts: String,
     pub deck_view_ts: String,
+    pub voice_screen_ts: String,
     pub param_kind_rs: String,
     pub dictation_rs: String,
 }
@@ -170,6 +176,7 @@ pub fn run(root: &Path) -> Vec<String> {
         commands_toml: read(COMMANDS_TOML, &mut missing),
         registry_ts: read(REGISTRY_TS, &mut missing),
         deck_view_ts: read(DECK_VIEW_TS, &mut missing),
+        voice_screen_ts: read(VOICE_SCREEN_TS, &mut missing),
         param_kind_rs: read(PARAM_KIND_RS, &mut missing),
         dictation_rs: read(DICTATION_RS, &mut missing),
     };
@@ -189,7 +196,8 @@ fn annotate(finding: String) -> String {
 pub fn check(sources: &Sources) -> Vec<String> {
     let mut findings = Vec::new();
     let registry = registry_entries(&sources.registry_ts, &mut findings);
-    let screens = deck_view_kinds(&sources.deck_view_ts, &mut findings);
+    let mut screens = deck_view_kinds(&sources.deck_view_ts, &mut findings);
+    screens.extend(voice_screens(&sources.voice_screen_ts, &mut findings));
     let kinds = param_kinds(&sources.param_kind_rs, &mut findings);
     let rows = command_rows(&sources.commands_toml, &mut findings);
 
@@ -211,7 +219,7 @@ pub fn check(sources: &Sources) -> Vec<String> {
             if !screens.contains(screen) {
                 findings.push(format!(
                     "{COMMANDS_TOML}: row `{}` names the screen `{screen}`, which is not a `kind` of `DeckView` in \
-                     {DECK_VIEW_TS}. The known screens are: {}",
+                     {DECK_VIEW_TS} nor a `VoiceScreen` in {VOICE_SCREEN_TS}. The known screens are: {}",
                     row.id,
                     joined(screens.iter().map(String::as_str)),
                 ));
@@ -688,6 +696,33 @@ fn deck_view_kinds(source: &str, findings: &mut Vec<String>) -> BTreeSet<String>
     kinds
 }
 
+/// The string literals of the `VoiceScreen` union in `bridge.ts` — every
+/// screen the webview may declare, which is the `DeckView` kinds and the
+/// screens over them (PRD #1401's `pull_request`). An unreadable union is a
+/// finding, never an empty set that would quietly accept nothing extra.
+fn voice_screens(source: &str, findings: &mut Vec<String>) -> BTreeSet<String> {
+    let text: Vec<char> = source.chars().collect();
+    let masked = mask(&text);
+    let Some(start) = find(&masked, 0, "export type VoiceScreen =") else {
+        findings.push(format!(
+            "{VOICE_SCREEN_TS}: no `export type VoiceScreen =` declaration found — rule 14 cannot check a screen \
+             against a set it could not read"
+        ));
+        return BTreeSet::new();
+    };
+    let end = masked[start..]
+        .iter()
+        .position(|character| *character == ';')
+        .map_or(masked.len(), |offset| start + offset);
+    let screens = string_literals(&text, &masked, start..end);
+    if screens.is_empty() {
+        findings.push(format!(
+            "{VOICE_SCREEN_TS}: `VoiceScreen` yielded no string literals"
+        ));
+    }
+    screens
+}
+
 /// The closed resolver set, read off `ParamKind::as_str` in `table.rs`.
 fn param_kinds(source: &str, findings: &mut Vec<String>) -> BTreeSet<String> {
     let text: Vec<char> = source.chars().collect();
@@ -1133,6 +1168,7 @@ mod tests {
             commands_toml: read(COMMANDS_TOML),
             registry_ts: read(REGISTRY_TS),
             deck_view_ts: read(DECK_VIEW_TS),
+            voice_screen_ts: read(VOICE_SCREEN_TS),
             param_kind_rs: read(PARAM_KIND_RS),
             dictation_rs: read(DICTATION_RS),
         }
@@ -1183,6 +1219,16 @@ mod tests {
         assert_eq!(
             screens,
             ["agent", "deck", "overview"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        // PRD #1401: the webview's own list is the views plus the browser over them.
+        let declared = voice_screens(&sources.voice_screen_ts, &mut findings);
+        assert!(findings.is_empty(), "{}", findings.join("\n"));
+        assert_eq!(
+            declared,
+            ["agent", "deck", "overview", "pull_request"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
@@ -1285,6 +1331,25 @@ mod tests {
                 .replace("screens     = [\"agent\"]", "screens     = [\"dashboard\"]");
         });
         assert_reports(&findings, "names the screen `dashboard`");
+    }
+
+    /// Assertion 2, PRD #1401: `pull_request` is known only because the
+    /// webview's `VoiceScreen` declares it, so a `VoiceScreen` without it puts
+    /// every row naming it back in the findings.
+    #[test]
+    fn a_screen_the_webview_does_not_declare_is_caught() {
+        let findings = planted(|sources| {
+            sources.voice_screen_ts = sources.voice_screen_ts.replace(" | \"pull_request\";", ";");
+        });
+        assert_reports(&findings, "names the screen `pull_request`");
+    }
+
+    /// And a `VoiceScreen` the rule cannot find is a finding, not an empty set.
+    #[test]
+    fn a_missing_voice_screen_union_is_a_finding() {
+        let findings =
+            planted(|sources| sources.voice_screen_ts = "export type Other = string;".to_string());
+        assert_reports(&findings, "no `export type VoiceScreen =`");
     }
 
     /// Assertion 3.

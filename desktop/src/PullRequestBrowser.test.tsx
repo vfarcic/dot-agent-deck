@@ -1,0 +1,1234 @@
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto, type PullRequestInfoDto, type VoiceResultDto, type VoiceStatusDto } from "./lib/bridge";
+import { PrBrowserHostContext, type PrBrowserHost } from "./lib/prBrowser";
+import { PullRequestBadge } from "./components/PullRequestBadge";
+import { pullRequestFromDto, pullRequestLabel } from "./lib/pullRequest";
+import type { DeckActionResult, DeckRuntimeState } from "./types";
+
+vi.mock("./components/TerminalViewport", () => ({
+  TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
+}));
+
+import { DeckShell, PULL_REQUEST_COVERED } from "./App";
+
+const DECK = "deck-000000000000dec1";
+const PR_URL = "https://github.com/vfarcic/dot-agent-deck/pull/12345";
+
+function fakeHost() {
+  let closedListener: (() => void) | undefined;
+  const host = {
+    available: true,
+    open: vi.fn(async () => undefined),
+    setBounds: vi.fn(async () => undefined),
+    setVisible: vi.fn(async () => undefined),
+    back: vi.fn(async () => undefined),
+    scroll: vi.fn(async () => undefined),
+    openExternal: vi.fn(async () => undefined),
+    close: vi.fn(async () => undefined),
+    signOut: vi.fn(async () => undefined),
+    onClosed: vi.fn((listener: () => void) => {
+      closedListener = listener;
+      return () => { closedListener = undefined; };
+    }),
+  } satisfies PrBrowserHost;
+  return { host, closeFromPage: () => closedListener?.() };
+}
+
+function settingsStore() {
+  let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
+  return {
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+    saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+      document = structuredClone(next);
+      return structuredClone(document);
+    }),
+  };
+}
+
+function agent(id: string, pullRequest?: PullRequestInfoDto): DesktopAgentDto {
+  return { id, displayName: `Coder ${id}`, cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, tab: { kind: "dashboard" }, ...(pullRequest ? { pullRequest } : {}) };
+}
+
+function runtime(agents: DesktopAgentDto[], overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const snapshot = mapDesktopSnapshot({
+    connection: { status: "connected", deckId: DECK, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+    agents,
+    protocolVersion: 8,
+    source: "daemon",
+  });
+  const settings = settingsStore();
+  return {
+    mode: "live",
+    snapshot,
+    fleet: [snapshot],
+    terminalData: {},
+    clearError: vi.fn(),
+    runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
+    sendTerminalInput: vi.fn(async () => undefined),
+    resizeTerminal: vi.fn(async () => undefined),
+    setShownTerminals: vi.fn(async () => undefined),
+    reconnect: vi.fn(async () => undefined),
+    listProjects: vi.fn(async () => ({ projects: [] })),
+    resolveProject: vi.fn(async () => { throw new Error("unresolved: no such project"); }),
+    setZoom: vi.fn(async (level: number) => level),
+    getSettings: settings.getSettings,
+    saveSettings: settings.saveSettings,
+    ...overrides,
+  } as unknown as DeckRuntimeState;
+}
+
+/**
+ * The real shell and voice panel with one synthetic utterance: the microphone
+ * and the intent answer are stubbed, everything after them is the app's.
+ */
+function voiceRuntime(outcome: VoiceResultDto["outcome"]) {
+  let started = false;
+  let delivered = false;
+  let nextOutcome = outcome;
+  const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 1240, maxMs: 30_000, capped: false, available: true, backend: "remote" });
+  const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({ outcome: nextOutcome, resolveMs: null, backend: "stub" }));
+  const declareVoiceScreen = vi.fn();
+  return {
+    deliver: (next: VoiceResultDto["outcome"]) => { nextOutcome = next; delivered = false; },
+    resolveVoice,
+    declareVoiceScreen,
+    overrides: {
+      resolveVoice,
+      declareVoiceScreen,
+      voiceStatus: vi.fn(async () => {
+        if (started && !delivered) { delivered = true; return status("done"); }
+        return status(started ? "recording" : "idle");
+      }),
+      voiceStart: vi.fn(async () => { started = true; return status("recording"); }),
+      voiceStop: vi.fn(async () => {
+        const said = "transcript" in nextOutcome ? nextOutcome.transcript : "";
+        return { outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 };
+      }),
+      voiceCancel: vi.fn(async () => status("idle")),
+      voiceCommands: vi.fn(async () => []),
+    } satisfies Partial<DeckRuntimeState>,
+  };
+}
+
+function dispatchOutcome(action: string, invoke: string, transcript: string, sentence: string): VoiceResultDto["outcome"] {
+  return { kind: "dispatch", transcript, action, invoke, params: [], sentence };
+}
+
+const withPr = agent("7", { number: 12345, url: PR_URL, state: "open", review: "review_required" });
+const agentView = { kind: "agent" as const, deckId: DECK, agentId: "7", from: "overview" as const };
+
+function renderShell(host: PrBrowserHost, agents: DesktopAgentDto[] = [withPr]) {
+  const result = render(
+    <PrBrowserHostContext.Provider value={host}>
+      <DeckShell runtime={runtime(agents)} initialView={agentView} />
+    </PrBrowserHostContext.Provider>,
+  );
+  return {
+    ...result,
+    rerenderWith: (next: DesktopAgentDto[]) => result.rerender(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(next)} initialView={agentView} />
+      </PrBrowserHostContext.Provider>,
+    ),
+  };
+}
+
+describe("PRD #1401 — the pull request badge", () => {
+  /**
+   * Scenario: an agent the daemon found an open pull request for, still
+   * waiting on a review. Its screen shows `#12345` with the state and review
+   * icons, named in words for a screen reader and a tooltip.
+   */
+  it("shows the number, the state and the review on the agent's screen", () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    const badge = screen.getByTestId("pr-badge-7");
+
+    expect(badge).toHaveTextContent("#12345");
+    expect(badge).toHaveAttribute("data-pr-state", "open");
+    expect(badge).toHaveAttribute("data-pr-review", "review_required");
+    expect(badge).toHaveAccessibleName("Pull request #12345: open, review required");
+    expect(badge.getAttribute("title")).toContain("Pull request #12345: open, review required");
+    expect(badge.querySelectorAll("svg")).toHaveLength(2);
+  });
+
+  /** Scenario: an agent with no pull request shows nothing new. */
+  it("shows nothing for an agent with no pull request", () => {
+    const { host } = fakeHost();
+    renderShell(host, [agent("7")]);
+    expect(screen.queryByTestId("pr-badge-7")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Pull request #/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a pull request whose state is unknown uses a different glyph from an open request, with its unknown meaning named for readers. */
+  it("distinguishes an unknown PR state from the open PR icon", () => {
+    render(<>
+      <PullRequestBadge pullRequest={{ number: 9, state: "open" }} testId="open-badge" />
+      <PullRequestBadge pullRequest={{ number: 9, state: "unknown" }} testId="unknown-badge" />
+    </>);
+    const unknown = screen.getByTestId("unknown-badge");
+    expect(unknown).toHaveAccessibleName("Pull request #9: state unknown");
+    const glyph = (badge: HTMLElement) => badge.querySelector("svg")!.innerHTML;
+    expect(glyph(unknown), "Unknown must not show the open pull request glyph").not.toBe(glyph(screen.getByTestId("open-badge")));
+  });
+
+  it.each([
+    ["open", undefined, "Pull request #9: open"],
+    ["draft", "review_required", "Pull request #9: draft, review required"],
+    ["merged", "approved", "Pull request #9: merged, approved"],
+    ["closed", "changes_requested", "Pull request #9: closed, changes requested"],
+    ["unknown", "unknown", "Pull request #9: state unknown, review status unknown"],
+  ] as const)("names a %s pull request with review %s", (state, review, label) => {
+    const pullRequest = pullRequestFromDto({ number: 9, url: "https://github.com/o/r/pull/9", state, ...(review ? { review } : {}) })!;
+    render(<PullRequestBadge pullRequest={pullRequest} testId="badge" />);
+    const badge = screen.getByTestId("badge");
+
+    expect(badge).toHaveAccessibleName(label);
+    expect(badge).toHaveAttribute("data-pr-state", state);
+    expect(badge.className).toContain(`pr-state-${state}`);
+    // One icon for the state, and one for the review only when there is one.
+    expect(badge.querySelectorAll("svg")).toHaveLength(review ? 2 : 1);
+    // Without an opener it is a label, not a control.
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  /** A value from a newer daemon reads as unknown rather than failing the record. */
+  it("reads a state or review it does not know as unknown, and refuses a URL off github.com", () => {
+    const odd = pullRequestFromDto({ number: 3, url: "https://github.com.evil.example/o/r/pull/3", state: "queued" as never, review: "dismissed" as never })!;
+    expect(odd).toEqual({ number: 3, state: "unknown", review: "unknown" });
+    expect(pullRequestLabel(odd)).toBe("Pull request #3: state unknown, review status unknown");
+    expect(pullRequestFromDto({ number: 0, url: PR_URL, state: "open" })).toBeUndefined();
+    expect(pullRequestFromDto({ number: 1.5, url: PR_URL, state: "open" })).toBeUndefined();
+    expect(pullRequestFromDto(undefined)).toBeUndefined();
+    for (const bad of ["javascript:alert(1)", "http://github.com/o/r/pull/1", "https://github.com/o/r/issues/1", "https://user@github.com/o/r/pull/1", "https://github.com:8443/o/r/pull/1"]) {
+      expect(pullRequestFromDto({ number: 1, url: bad, state: "open" })?.url, bad).toBeUndefined();
+    }
+  });
+
+  /** Scenario: a badge whose address is not a github.com pull request opens nothing. */
+  it("is not a control when its address is not one the app can open", () => {
+    const { host } = fakeHost();
+    renderShell(host, [agent("7", { number: 5, url: "https://example.com/o/r/pull/5", state: "open" })]);
+    const badge = screen.getByTestId("pr-badge-7");
+    expect(badge.tagName).toBe("SPAN");
+    fireEvent.click(badge);
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+});
+
+describe("PRD #1401 — the in-app pull request browser", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  /**
+   * Scenario: on the agent's screen, click the badge. GitHub's page opens in
+   * the app over the agent's screen, with the app's toolbar around it, and the
+   * agent's pane is still there underneath.
+   */
+  it("opens over the agent's screen from the badge", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+
+    const browser = screen.getByTestId("pr-browser");
+    expect(browser).toHaveAccessibleName("Pull request #12345 for Coder 7");
+    expect(host.open).toHaveBeenCalledTimes(1);
+    expect(host.open).toHaveBeenCalledWith(PR_URL, expect.objectContaining({ x: expect.any(Number), y: expect.any(Number), width: expect.any(Number), height: expect.any(Number), viewportWidth: expect.any(Number), viewportHeight: expect.any(Number) }));
+    for (const name of ["Back", "Open in browser", "Close pull request"]) {
+      expect(within(browser).getByRole("button", { name })).toBeVisible();
+    }
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    // MutationObserver in the still-mounted pane must have had a chance to
+    // notice the new sibling. fireEvent itself does not respect inert.
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(browser.closest("[inert]") !== null, "The frontmost PR browser must accept pointer and keyboard input").toBe(false);
+    for (const name of ["Back", "Open in browser", "Close pull request"]) {
+      expect.soft(within(browser).getByRole("button", { name }).closest("[inert]") !== null, `${name} must be reachable`).toBe(false);
+    }
+    expect(screen.getByTestId("agent-pane-overlay").closest("[inert]")).not.toBeNull();
+  });
+
+  /** Scenario: the toolbar's Back steps the page back and leaves it open. */
+  it("steps the page back from the toolbar", () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+
+    expect(host.back).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+  });
+
+  /** Scenario: Open in browser hands the page to the system browser and closes it in the app. */
+  it("hands the page to the system browser and closes", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Open in browser" })); });
+
+    expect(host.openExternal).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: the system browser refuses to open the page; the app keeps the PR and explains the failure so the user can retry. */
+  it("keeps the PR open and shows a failed system-browser handoff", async () => {
+    const { host } = fakeHost();
+    host.openExternal.mockRejectedValueOnce(new Error("System browser launch failed"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Open in browser" })); });
+
+    expect.soft(screen.queryByTestId("pr-browser"), "A failed handoff must preserve the page").toBeInTheDocument();
+    expect.soft(screen.queryByRole("alert"), "The launch error must be visible").toHaveTextContent("System browser launch failed");
+    expect(host.close).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: Back cannot navigate the native PR page; the toolbar leaves it open and shows the navigation error. */
+  it("surfaces a rejected Back command", async () => {
+    const { host } = fakeHost();
+    host.back.mockRejectedValueOnce(new Error("PR page cannot go back"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByRole("alert"), "Back errors must be visible").toHaveTextContent("PR page cannot go back");
+  });
+
+  /**
+   * Scenario: Close returns to exactly the agent's screen, with focus back on
+   * the badge the browser was opened from, and the page is closed.
+   */
+  it("closes back to the agent's screen and the control that opened it", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    const badge = screen.getByTestId("pr-badge-7");
+    badge.focus();
+    fireEvent.click(badge);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.close).toHaveBeenCalled();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(document.activeElement).toBe(screen.getByTestId("pr-badge-7"));
+  });
+
+  /**
+   * Scenario: Escape in the app closes the browser and ONLY the browser — the
+   * agent's pane underneath stays — and a second Escape then closes the pane.
+   */
+  it("closes on Escape before anything under it", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: Escape inside the page closed it; the app forgets it and keeps the agent's pane. */
+  it("forgets a page that closed itself", () => {
+    const { host, closeFromPage } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    act(() => closeFromPage());
+
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: the agent ends while its pull request is open; the browser closes with it. */
+  it("closes when the agent is gone from a daemon that is answering", async () => {
+    const { host } = fakeHost();
+    const shell = renderShell(host, [withPr, agent("8")]);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+
+    await act(async () => { shell.rerenderWith([agent("8")]); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.close).toHaveBeenCalled();
+  });
+
+  /** Scenario: leaving the agent's screen (its own Back to dashboard) closes the browser too. */
+  it("closes when the screen it was opened over is left", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })); });
+
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: a dialog of the app's opens over the browser. The page — drawn
+   * by a native webview above the whole document — is hidden while it is up,
+   * and Escape is left to that dialog.
+   */
+  it("hides the page while one of the app's dialogs is over it", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(host.setVisible).toHaveBeenLastCalledWith(true);
+
+    const dialog = document.createElement("div");
+    dialog.setAttribute("aria-modal", "true");
+    await act(async () => { document.body.appendChild(dialog); });
+    expect(host.setVisible).toHaveBeenLastCalledWith(false);
+    expect(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+
+    await act(async () => { dialog.remove(); });
+    expect(host.setVisible).toHaveBeenLastCalledWith(true);
+  });
+});
+
+describe("PRD #1401 — the pull request browser when the host refuses", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const OTHER_URL = "https://github.com/vfarcic/dot-agent-deck/pull/23456";
+  const otherPr = agent("8", { number: 23456, url: OTHER_URL, state: "open" });
+
+  /** Two agents with pull requests on the deck, so a second badge can switch the open page. */
+  function renderDeck(host: PrBrowserHost) {
+    return render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, otherPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  /**
+   * Scenario: the platform refuses to close the page. The frame and its
+   * toolbar stay, saying why, so Close can try again; once a close succeeds
+   * the frame goes.
+   */
+  it("keeps the page and its Close when the host refuses to close it", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+
+    expect.soft(screen.queryByTestId("pr-browser"), "A refused close must leave the frame, or nothing can close the page").toBeInTheDocument();
+    expect.soft(screen.queryByRole("button", { name: "Close pull request" })).toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length, "The refusal must be visible").toBeGreaterThan(0);
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: Escape meets a refused close; the frame stays with the reason, and the next Escape closes it. */
+  it("retries a refused close on the next Escape", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length).toBeGreaterThan(0);
+
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: the agent ends while its pull request is open, and the page will
+   * not close (its pane closing too tries again, and is refused again); the
+   * frame stays with the reason, and Close retries once the platform lets it.
+   */
+  it("keeps the frame when the page will not close after its agent ended", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValue(new Error("The pull request page did not close: refused"));
+    const shell = renderShell(host, [withPr, agent("8")]);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { shell.rerenderWith([agent("8")]); });
+
+    expect(host.close).toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser"), "A page that did not close must keep its frame").toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length).toBeGreaterThan(0);
+
+    host.close.mockResolvedValue(undefined);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: with Coder 7's pull request open, open Coder 8's, and the host
+   * cannot switch the page. The toolbar still names the pull request on screen
+   * (#12345 for Coder 7), and says why the switch did not happen.
+   */
+  it("keeps the shown pull request when a switch to another fails", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    host.open.mockRejectedValueOnce(new Error("The pull request browser could not open: navigate failed"));
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+
+    expect(host.open).toHaveBeenLastCalledWith(OTHER_URL, expect.any(Object));
+    const browser = screen.getByTestId("pr-browser");
+    expect.soft(browser, "The toolbar must name the pull request the page still shows").toHaveAccessibleName("Pull request #12345 for Coder 7");
+    expect(screen.queryAllByText(/navigate failed/).length, "The failed switch must be visible").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: Close is pressed while a switch to Coder 8's pull request is
+   * still under way. The frame goes once the page has closed, and the switch
+   * settling afterwards does not bring it back.
+   */
+  it("stays closed when a switch settles after Close", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    let finishSwitch: () => void = () => undefined;
+    host.open.mockImplementationOnce(() => new Promise<undefined>((resolve) => { finishSwitch = () => resolve(undefined); }));
+    fireEvent.click(screen.getByTestId("pr-badge-8"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+
+    await act(async () => { finishSwitch(); });
+    expect(screen.queryByTestId("pr-browser"), "A late switch must not reopen a closed frame").not.toBeInTheDocument();
+  });
+
+  /** Scenario: a first open the host refuses is said in the frame; a switch that then succeeds shows its page, not the old failure. */
+  it("clears a failed first open once a switch succeeds", async () => {
+    const { host } = fakeHost();
+    host.open.mockRejectedValueOnce(new Error("The pull request browser could not open: no window"));
+    renderDeck(host);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(screen.getByTestId("pr-browser-frame")).toHaveTextContent("no window");
+
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.getByTestId("pr-browser-frame")).not.toHaveTextContent("no window");
+  });
+
+  /** Scenario: the page cannot be moved with its frame; the reason is shown under the toolbar. */
+  it("says when the page cannot follow its frame", async () => {
+    const { host } = fakeHost();
+    host.setBounds.mockRejectedValue(new Error("The pull request page could not move"));
+    renderShell(host);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(screen.queryAllByText(/could not move/).length, "A page left behind its frame must say so").toBeGreaterThan(0);
+  });
+
+  /** Scenario: one of the app's dialogs comes up and the page cannot be hidden under it; the reason is shown, and goes once hiding works. */
+  it("says when the page cannot be hidden under a dialog", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    host.setVisible.mockRejectedValueOnce(new Error("The pull request page could not be hidden"));
+    const dialog = document.createElement("div");
+    dialog.setAttribute("aria-modal", "true");
+    try {
+      await act(async () => { document.body.appendChild(dialog); });
+      expect(screen.queryAllByText(/could not be hidden/).length, "A page left over a dialog must say so").toBeGreaterThan(0);
+    } finally {
+      // Outside the rendered tree, so `cleanup` would leave it covering the next test's browser.
+      await act(async () => { dialog.remove(); });
+    }
+    expect(screen.queryAllByText(/could not be hidden/)).toHaveLength(0);
+  });
+
+  /** Scenario: the same switch succeeds; the toolbar names Coder 8's pull request once the page shows it. */
+  it("names the new pull request once a switch succeeds", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+
+    expect(host.open).toHaveBeenCalledTimes(2);
+    expect(host.open).toHaveBeenLastCalledWith(OTHER_URL, expect.any(Object));
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+  });
+});
+
+describe("PRD #1401 — the deck's own dialogs over the pull request browser", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  /**
+   * Scenario: Greptile on PR #1680 — on the deck (experimental), open Coder 7's pull request
+   * from its tile, and press Ctrl+K. The command menu comes up over the
+   * page and takes typing and clicks; closing it leaves the pull request open
+   * and usable. The same holds for the shortcut sheet on `?`.
+   */
+  it.each([
+    ["the command menu", { key: "k", ctrlKey: true }, "Command menu"],
+    ["the shortcut sheet", { key: "?" }, "Control keys"],
+  ])("lets %s take input over the page", async (_what, key, name) => {
+    const { host } = fakeHost();
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.keyDown(document.body, key);
+    const dialog = await screen.findByRole("dialog", { name, hidden: true });
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(dialog.closest("[inert]"), `${name} must take input over the page`).toBeNull();
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("dialog", { name, hidden: true })).not.toBeInTheDocument();
+    const browser = screen.getByTestId("pr-browser");
+    expect(browser).not.toHaveAttribute("data-covered");
+    expect(browser.closest("[inert]")).toBeNull();
+  });
+});
+
+describe("PRD #1401 — the pull request browser by voice", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  function renderVoice(host: PrBrowserHost, outcome: VoiceResultDto["outcome"], agents: DesktopAgentDto[] = [withPr]) {
+    const voice = voiceRuntime(outcome);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(agents, voice.overrides)} initialView={agentView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return voice;
+  }
+
+  async function openVoiceHelp(host: PrBrowserHost) {
+    const voice = renderVoice(host, dispatchOutcome("list_commands", "showVoiceCommands", "what can I say?", "Here is what you can say."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    expect(host.setVisible).toHaveBeenLastCalledWith(true);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await screen.findByTestId("voice-help");
+    return voice;
+  }
+
+  /** Scenario: the real What you can say overlay covers the PR, hides the native page, and Escape dismisses only help. */
+  it("hides the PR page under real voice help and leaves Escape to help", async () => {
+    const { host } = fakeHost();
+    await openVoiceHelp(host);
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+    expect.soft(host.setVisible).toHaveBeenLastCalledWith(false);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect.soft(screen.queryByTestId("voice-help")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pr-browser"), "Escape must preserve the PR underneath voice help").toBeInTheDocument();
+  });
+
+  /** Scenario: after asking for voice help over a PR, saying close dismisses the help through the real voice registry while keeping the PR open. */
+  it("withholds PR close from the voice registry while real help is up", async () => {
+    const { host } = fakeHost();
+    const voice = await openVoiceHelp(host);
+    act(() => voice.deliver(dispatchOutcome("close", "closeTopmost", "close", "Closed.")));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(2));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("voice-help")).not.toBeInTheDocument();
+    expect.soft(screen.queryByTestId("pr-browser"), "Voice close must dismiss help and keep the PR").toBeInTheDocument();
+    expect(host.close).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: a spoken system-browser handoff fails; the PR stays available and voice reports the failure instead of announcing success. */
+  it("does not announce a successful voice handoff when the host rejects", async () => {
+    const { host } = fakeHost();
+    host.openExternal.mockRejectedValueOnce(new Error("System browser launch failed"));
+    renderVoice(host, dispatchOutcome("open_pr_in_browser", "openPullRequestInBrowser", "open it in the browser", "Opened it in your browser."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.openExternal).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect.soft(screen.queryByText(/Opened it in your browser\./)).not.toBeInTheDocument();
+    expect(screen.queryAllByText(/System browser launch failed/).length, "Voice or browser must explain the host failure").toBeGreaterThan(0);
+  });
+
+  /** Scenario: a spoken scroll reaches the native PR page but fails; the app keeps the PR and explains the scroll failure. */
+  it("surfaces a rejected voice Scroll command", async () => {
+    const { host } = fakeHost();
+    host.scroll.mockRejectedValueOnce(new Error("PR page cannot scroll"));
+    renderVoice(host, dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.scroll).toHaveBeenCalledWith("down"));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryAllByText(/PR page cannot scroll/).length, "Scroll errors must be visible").toBeGreaterThan(0);
+  });
+
+  /** Scenario: on the agent's screen the user says "open the PR"; GitHub's page opens in the app. */
+  it("opens the pane's agent's pull request when told to", async () => {
+    const { host } = fakeHost();
+    const voice = renderVoice(host, dispatchOutcome("open_pr", "openPullRequest", "open the PR", "Opening the pull request."));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByTestId("pr-browser")).toBeInTheDocument());
+    expect(host.open).toHaveBeenCalledWith(PR_URL, expect.any(Object));
+    expect(voice.resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: "open the PR" for an agent that has none says so, and opens nothing. */
+  it("says the agent has no pull request rather than opening one", async () => {
+    const { host } = fakeHost();
+    renderVoice(host, dispatchOutcome("open_pr", "openPullRequest", "open the PR", "Opening the pull request."), [agent("7")]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByText(/Coder 7 has no pull request\./)).toBeInTheDocument());
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+
+  /** On the agent dashboard rather than an agent's screen (PRD #1401: "open the PR for agent X"). */
+  function renderOverviewVoice(host: PrBrowserHost, outcome: VoiceResultDto["outcome"], agents: DesktopAgentDto[]) {
+    const voice = voiceRuntime(outcome);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(agents, voice.overrides)} initialView={{ kind: "overview" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return voice;
+  }
+
+  function openNamedPr(id: string, label: string): VoiceResultDto["outcome"] {
+    return {
+      kind: "dispatch",
+      transcript: `open the PR for ${label}`,
+      action: "open_pr",
+      invoke: "openPullRequest",
+      params: [{ name: "agent", kind: "agent_ref", spoken: label, value: id, label }],
+      sentence: `Opening the pull request. Agent: ${label}.`,
+    };
+  }
+
+  /** Scenario: on the agent dashboard the user says "open the PR for Coder 7"; that agent's GitHub page opens in the app over the dashboard. */
+  it("opens the named agent's pull request from the dashboard", async () => {
+    const { host } = fakeHost();
+    renderOverviewVoice(host, openNamedPr("7", "Coder 7"), [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByTestId("pr-browser")).toBeInTheDocument());
+    expect(host.open).toHaveBeenCalledWith(PR_URL, expect.any(Object));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: on the agent dashboard, "open the PR for Coder 8" names an agent with no pull request; the app says so and opens nothing. */
+  it("says the named agent has no pull request from the dashboard", async () => {
+    const { host } = fakeHost();
+    renderOverviewVoice(host, openNamedPr("8", "Coder 8"), [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getByText(/Coder 8 has no pull request\./)).toBeInTheDocument());
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: on the agent dashboard a bare "open the PR" with two agents asks which agent's, and opens nothing until the user answers. */
+  it("asks which agent's pull request on the dashboard when none is named", async () => {
+    const { host } = fakeHost();
+    const candidates = [
+      { name: "agent", kind: "agent_ref", spoken: "", value: "8", label: "Coder 8" },
+      { name: "agent", kind: "agent_ref", spoken: "", value: "7", label: "Coder 7" },
+    ];
+    renderOverviewVoice(host, {
+      kind: "param_ambiguous",
+      transcript: "open the PR",
+      action: "open_pr",
+      invoke: "openPullRequest",
+      param: "agent",
+      spoken: "",
+      matches: ["Coder 8", "Coder 7"],
+      candidates,
+      params: [],
+      reports: ["Opening the pull request.", "Opening the pull request."],
+      sentence: "Heard: \u201copen the PR\u201d — say which agent's pull request to open: Coder 8, Coder 7.",
+    }, [agent("8"), withPr]);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.getAllByText(/say which agent's pull request to open/).length).toBeGreaterThan(0));
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect(host.open).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: with the pull request open, "scroll down" scrolls the PAGE from
+   * the app, and the voice surface declares the browser's own screen.
+   */
+  it.each([
+    ["scroll_down", "scrollDown", "scroll down", "down"],
+    ["scroll_up", "scrollUp", "scroll up", "up"],
+    ["scroll_to_top", "scrollToTop", "scroll to the top", "top"],
+    ["scroll_to_bottom", "scrollToBottom", "scroll to the bottom", "bottom"],
+  ] as const)("scrolls the page for %s", async (action, invoke, said, move) => {
+    const { host } = fakeHost();
+    const voice = renderVoice(host, dispatchOutcome(action, invoke, said, "Scrolling."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(host.scroll).toHaveBeenCalledWith(move));
+    expect(voice.declareVoiceScreen.mock.calls.some(([declared]) => declared === "pull_request")).toBe(true);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+  });
+
+  /** Scenario: "close" meets a page the platform will not close; the browser stays, and voice says why instead of "Closed.". */
+  it("does not announce a voice close the host refused", async () => {
+    const { host } = fakeHost();
+    host.close.mockRejectedValueOnce(new Error("The pull request page did not close: refused"));
+    renderVoice(host, dispatchOutcome("close", "closeTopmost", "close", "Closed."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.close).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect.soft(screen.queryByText(/^Closed\.$/)).not.toBeInTheDocument();
+    expect(screen.queryAllByText(/did not close: refused/).length, "Voice or browser must explain the refused close").toBeGreaterThan(0);
+  });
+
+  /** Scenario: "close" with the pull request open closes it, and only it. */
+  it("closes the browser first on close", async () => {
+    const { host } = fakeHost();
+    renderVoice(host, dispatchOutcome("close", "closeTopmost", "close", "Closed."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument());
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+  });
+
+  /** Scenario: "open it in the browser" hands the page to the system browser and closes it. */
+  it("hands off to the system browser when told to", async () => {
+    const { host } = fakeHost();
+    renderVoice(host, dispatchOutcome("open_pr_in_browser", "openPullRequestInBrowser", "open it in the browser", "Opened it in your browser."));
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+
+    await waitFor(() => expect(host.openExternal).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo) — voice's "close" closes what is drawn on top. The
+ * app's overlays paint in layers (`OVERLAY_LAYER`, read back from the
+ * stylesheet): a Settings or configuration sheet opened before the browser is
+ * drawn beneath it and the agent's pane, and one opened over them comes up
+ * above both. Each case below opens the browser over an agent's pane, puts one
+ * of the app's overlays with it, and says "close".
+ */
+describe("PRD #1401 — what close closes with the pull request browser open", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const CLOSE = dispatchOutcome("close", "closeTopmost", "close", "Closed.");
+  const experimental = { desktopFeatures: fixtureDesktopFeatures("?experimental=1") };
+  const deckPane = { kind: "agent" as const, deckId: DECK, agentId: "7", from: "deck" as const };
+
+  function renderAt(host: PrBrowserHost, initialView: Parameters<typeof DeckShell>[0]["initialView"], overrides: Partial<DeckRuntimeState> = {}, said = CLOSE) {
+    const voice = voiceRuntime(said);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, agent("8")], { ...voice.overrides, ...overrides })} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return voice;
+  }
+
+  async function say(voice: ReturnType<typeof voiceRuntime>, calls: number) {
+    if (calls === 1) fireEvent.click(screen.getByTestId("voice-trigger"));
+    else act(() => voice.deliver(CLOSE));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(calls));
+    await act(async () => { await Promise.resolve(); });
+  }
+
+  /**
+   * Scenario: Qodo's case. On the dashboard Settings is open, Coder 7's pane is
+   * opened over it, and its pull request over the pane. The page is on top and
+   * shown; "close" closes the page alone, the next one the pane, the next
+   * Settings.
+   */
+  it("closes the page over a pane opened over Settings, then the pane, then Settings", async () => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, { kind: "overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+
+    expect.soft(screen.getByTestId("pr-browser"), "Settings is drawn beneath the page, so it does not hide it").not.toHaveAttribute("data-covered");
+    await say(voice, 1);
+    expect.soft(host.close, "close must close the page on top").toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect.soft(screen.queryByTestId("agent-pane-overlay"), "the pane under the page stays").toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Settings" }), "Settings under the pane stays").toBeInTheDocument();
+
+    await say(voice, 2);
+    expect.soft(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+
+    await say(voice, 3);
+    expect(screen.queryByRole("dialog", { name: "Settings" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: the same, but "scroll down". With Settings open beneath the
+   * pane, the page is in front and scrolls; with Settings opened over the page
+   * from the deck's command menu, the page is behind it and does not move.
+   */
+  it("scrolls the page with Settings beneath it, and not with Settings over it", async () => {
+    const scroll = dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling.");
+    const beneath = fakeHost();
+    const voice = renderAt(beneath.host, { kind: "overview" }, {}, scroll);
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(beneath.host.scroll, "the page in front scrolls").toHaveBeenCalledWith("down");
+    cleanup();
+
+    const over = fakeHost();
+    const deckVoice = renderAt(over.host, deckPane, experimental, scroll);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: /Open settings/ }));
+    await screen.findByTestId("settings-panel");
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(deckVoice.resolveVoice).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(over.host.scroll, "the page behind Settings does not move").not.toHaveBeenCalled();
+    expect(screen.queryAllByText(PULL_REQUEST_COVERED).length, "and voice says why").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: on the deck, Coder 7's pane is open with its pull request over
+   * it, and the command menu (Ctrl+K) opens Settings or one of the
+   * configuration sheets over the page. That sheet comes up on top and takes
+   * input; "close" closes it, and the page and the pane stay.
+   */
+  it.each([
+    ["Settings", "Open settings", "settings-panel"],
+    ["the agent profiles sheet", "Open agent profiles", "agent-profiles-panel"],
+    ["the prompt library", "Open prompt library", "prompt-library-panel"],
+    ["the projects sheet", "Manage projects", "projects-panel"],
+  ])("closes %s opened over the page, and keeps the page and the pane", async (_what, command, testId) => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, deckPane, experimental);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(command) }));
+    const sheet = await screen.findByTestId(testId);
+    await act(async () => { await Promise.resolve(); });
+
+    expect.soft(sheet.closest("[inert]"), "a sheet opened over the page takes input").toBeNull();
+    expect.soft(screen.getByTestId("pr-browser"), "and hides the page drawn under it").toHaveAttribute("data-covered", "true");
+    await say(voice, 1);
+    expect.soft(screen.queryByTestId(testId), "close must close the sheet on top").not.toBeInTheDocument();
+    expect.soft(host.close, "and not the page under it").not.toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay"), "nor the pane under the page").toBeInTheDocument();
+    expect(screen.getByTestId("pr-browser")).not.toHaveAttribute("data-covered");
+  });
+
+  /**
+   * Scenario: on the deck, Coder 7's pane is open with its pull request over
+   * it, and the command menu (Ctrl+K) or the shortcut sheet (?) opens over
+   * the page. "close" closes that dialog, and the page and the pane stay.
+   */
+  it.each([
+    ["the command menu", { key: "k", ctrlKey: true }, "Command menu"],
+    ["the shortcut sheet", { key: "?" }, "Control keys"],
+  ])("closes %s over the page, and keeps the page and the pane", async (_what, key, name) => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, deckPane, experimental);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, key);
+    await screen.findByRole("dialog", { name, hidden: true });
+
+    await say(voice, 1);
+    expect.soft(screen.queryByRole("dialog", { name, hidden: true }), "close must close the dialog on top").not.toBeInTheDocument();
+    expect.soft(host.close, "and not the page under it").not.toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay"), "nor the pane under the page").toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: on the dashboard with Coder 7's pull request open, Ctrl+N opens
+   * the New agent dialog over the page. "close" closes the dialog and the page
+   * stays.
+   */
+  it("closes the New agent dialog over the page, and keeps the page", async () => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, { kind: "overview" }, {
+      listDirectories: vi.fn(async (_deckId: string, path?: string) => ({ kind: "listing" as const, path: path ?? "/tmp", displayPath: path ?? "/tmp", parent: "/", entries: [], truncated: false })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    } as Partial<DeckRuntimeState>);
+    act(() => voice.deliver({ kind: "dispatch", transcript: "open the PR for Coder 7", action: "open_pr", invoke: "openPullRequest", params: [{ name: "agent", kind: "agent_ref", spoken: "Coder 7", value: "7", label: "Coder 7" }], sentence: "Opening the pull request." }));
+    await say(voice, 1);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: /new agent/i });
+    expect.soft(dialog.closest("[inert]"), "the dialog over the page takes input").toBeNull();
+
+    await say(voice, 2);
+    expect.soft(screen.queryByRole("dialog", { name: /new agent/i })).not.toBeInTheDocument();
+    expect.soft(host.close).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo) — a failure belongs to the frame on screen and to the
+ * call that failed, not to the toolbar's session object at the time it was
+ * asked: an earlier switch that lands first replaces that object.
+ */
+describe("PRD #1401 — a failure after a queued switch has landed", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const OTHER_URL = "https://github.com/vfarcic/dot-agent-deck/pull/23456";
+  const otherPr = agent("8", { number: 23456, url: OTHER_URL, state: "open" });
+
+  function deferred() {
+    let resolve: () => void = () => undefined;
+    let reject: (error: Error) => void = () => undefined;
+    const promise = new Promise<undefined>((done, fail) => { resolve = () => done(undefined); reject = fail; });
+    return { promise, resolve, reject };
+  }
+
+  function renderDeck(host: PrBrowserHost) {
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, otherPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  /**
+   * Scenario: with Coder 7's pull request open, ask for Coder 8's and, before
+   * the page is there, for Coder 7's again. The switch to Coder 8's lands and
+   * the switch back fails: the toolbar names Coder 8's, the page on screen,
+   * and says why the switch back did not happen.
+   */
+  it("shows a later switch's failure once an earlier one has landed", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const toOther = deferred();
+    const back = deferred();
+    host.open.mockImplementationOnce(() => toOther.promise).mockImplementationOnce(() => back.promise);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(host.open).toHaveBeenCalledTimes(3);
+
+    await act(async () => { toOther.resolve(); });
+    await act(async () => { back.reject(new Error("The pull request browser could not open: navigate back failed")); });
+
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/navigate back failed/).length, "The failed switch back must be visible on the page on screen").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: with Coder 7's pull request open, ask for Coder 8's and press
+   * Close before the page is there. The switch lands and the close is refused:
+   * the frame stays on Coder 8's page and says why it did not close.
+   */
+  it("shows a close's failure once an earlier switch has landed", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const toOther = deferred();
+    const closing = deferred();
+    host.open.mockImplementationOnce(() => toOther.promise);
+    host.close.mockImplementationOnce(() => closing.promise);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+
+    await act(async () => { toOther.resolve(); });
+    await act(async () => { closing.reject(new Error("The pull request page did not close: refused")); });
+
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/did not close: refused/).length, "The refused close must be visible on the page on screen").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: a failure that arrives for a frame that has since closed and
+   * been opened again is not said on the new one.
+   */
+  it("does not say an old frame's failure on a new one", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const stale = deferred();
+    host.back.mockImplementationOnce(() => stale.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("pr-badge-8"));
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => { stale.reject(new Error("The old page could not go back")); });
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/could not go back/)).toHaveLength(0);
+  });
+});
+
+/**
+ * PR #1680 review (Qodo, finding 13) — what the page last failed to do is the
+ * failure of the LAST thing asked of it. A newer action clears the problem, and
+ * an older one that fails afterwards does not bring it back.
+ */
+describe("PRD #1401 — an older failure after a newer action", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  function deferred() {
+    let reject: (error: Error) => void = () => undefined;
+    const promise = new Promise<undefined>((_done, fail) => { reject = fail; });
+    return { promise, reject };
+  }
+
+  /**
+   * Scenario: press Back on the pull request page, and press it again before
+   * the first answers. The second Back works; the first then fails. Nothing is
+   * said under the toolbar, because the page did what was last asked of it.
+   */
+  it("does not say an older Back's failure after a newer Back worked", async () => {
+    const { host } = fakeHost();
+    renderShell(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const older = deferred();
+    host.back.mockImplementationOnce(() => older.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(2);
+
+    await act(async () => { older.reject(new Error("The older Back could not go back")); });
+    expect(within(screen.getByTestId("pr-browser")).queryByRole("alert"), "an older failure must not outlive a newer action").toBeNull();
+  });
+
+  /**
+   * Scenario: say "scroll down" over the pull request page, then press Back
+   * before the scroll answers. Back works; the scroll then fails. Nothing is
+   * said under the toolbar, though voice still reports its own failure.
+   */
+  it("does not say an older scroll's failure under the toolbar after a newer Back worked", async () => {
+    const { host } = fakeHost();
+    const voice = voiceRuntime(dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling."));
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr], voice.overrides)} initialView={agentView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const older = deferred();
+    host.scroll.mockImplementationOnce(() => older.promise);
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(host.scroll).toHaveBeenCalledWith("down"));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Back" })); });
+    expect(host.back).toHaveBeenCalledTimes(1);
+
+    await act(async () => { older.reject(new Error("The older scroll could not scroll")); });
+    expect(within(screen.getByTestId("pr-browser")).queryByRole("alert"), "an older failure must not outlive a newer action").toBeNull();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo, finding 15) — a sheet is raised over the pane and the
+ * pull request page only while one of them is up beneath it, and the command
+ * menu it was chosen from, which closes as the sheet opens, is not one.
+ */
+describe("PRD #1401 — when a sheet is raised", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const experimental = { desktopFeatures: fixtureDesktopFeatures("?experimental=1") };
+
+  function renderAt(host: PrBrowserHost, initialView: Parameters<typeof DeckShell>[0]["initialView"], agents: DesktopAgentDto[] = [withPr, agent("8")]) {
+    const result = render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(agents, experimental)} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return (next: DesktopAgentDto[]) => result.rerender(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime(next, experimental)} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  async function settingsFromCommandMenu() {
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: /Open settings/ }));
+    const sheet = await screen.findByTestId("settings-panel");
+    await act(async () => { await Promise.resolve(); });
+    return sheet;
+  }
+
+  /**
+   * Scenario: on a deck with nothing open, Ctrl+K then Open settings. Settings
+   * is not raised and fences nothing: the rail behind it stays live.
+   */
+  it("does not raise a sheet chosen from the command menu on a plain deck", async () => {
+    const { host } = fakeHost();
+    renderAt(host, { kind: "deck" });
+    const sheet = await settingsFromCommandMenu();
+
+    expect.soft(sheet.parentElement, "nothing fenced is up beneath it").not.toHaveClass("is-raised");
+    expect(screen.getByRole("button", { name: "Dashboard" }).closest("[inert]"), "the deck stays live").toBeNull();
+  });
+
+  /**
+   * Scenario: on the deck with Coder 7's pane and pull request open, Ctrl+K
+   * then Open settings raises Settings over them. Coder 7 then ends: the page
+   * and the pane close, and Settings drops back to where a sheet is drawn,
+   * fencing nothing.
+   */
+  it("lowers a raised sheet once what it was raised over has gone", async () => {
+    const { host } = fakeHost();
+    const rerenderWith = renderAt(host, { kind: "agent", deckId: DECK, agentId: "7", from: "deck" });
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const sheet = await settingsFromCommandMenu();
+    expect(sheet.parentElement, "raised over the page and the pane").toHaveClass("is-raised");
+
+    await act(async () => { rerenderWith([agent("8")]); });
+    await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
+    expect.soft(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect.soft(screen.getByTestId("settings-panel").parentElement, "nothing is beneath it any more").not.toHaveClass("is-raised");
+    expect(screen.getByRole("button", { name: "Dashboard" }).closest("[inert]"), "and it fences nothing").toBeNull();
+  });
+});

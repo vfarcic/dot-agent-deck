@@ -86,7 +86,7 @@ import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
-import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
+import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceItemAnswerDto, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedOpens, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
 import { READING_ALREADY_OFF, READING_ALREADY_ON, READING_NOTICE_VOICE_KEY, readingNotice, type ReadingAgent } from "../lib/reading";
 import { useReadingMode } from "../hooks/useReadingMode";
@@ -1109,9 +1109,10 @@ type VoiceChoiceOffer = {
    * numbered list on screen (a number that is also an item's name): the list
    * as it was heard, and the item each candidate is, in the same order. Such a
    * choice is answered by the webview's own rule and dispatched as its item's
-   * row, and refused if the list has changed since.
+   * row, and refused if the list has changed since. `opens` is what choosing
+   * one opens: the item, or the agent's pull request (PRD #1401).
    */
-  numbered?: { heard: VoiceNumberedListDto; entries: VoiceNumberedEntryDto[] };
+  numbered?: { heard: VoiceNumberedListDto; entries: VoiceNumberedEntryDto[]; opens: VoiceNumberedOpens };
 };
 
 const IDLE: VoicePanelState = { kind: "idle" };
@@ -2372,10 +2373,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * PR #1451 round 3, change 3 — run what choosing a numbered item runs: the
    * row a spoken name for it would have run, with the item as its param,
    * through the same dispatch and the same target checks. No backend was
-   * asked anything, so no timing is shown.
+   * asked anything, so no timing is shown. With `opens` an agent's pull
+   * request, that row is `open_pr` (PRD #1401).
    */
-  const runNumbered = useCallback((entry: VoiceNumberedEntryDto, transcript: string, declared: VoiceContext, refusal: (lost: Lost) => string) => {
-    const outcome = numberedOutcome(entry, transcript);
+  const runNumbered = useCallback((entry: VoiceNumberedEntryDto, transcript: string, declared: VoiceContext, refusal: (lost: Lost) => string, opens: VoiceNumberedOpens) => {
+    const outcome = numberedOutcome(entry, transcript, opens);
     /* PR #1451 round 3 review (Qodo) — held to the context the number was
        said in, like a resolved dispatch: an agent entry to the deck and the
        incarnation declared then. */
@@ -2410,7 +2412,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(VOICE_NUMBERS_CHOICE_MOVED_ON);
       return;
     }
-    runNumbered(entry, offer.outcome.transcript, offer.declared, choiceRefusal);
+    runNumbered(entry, offer.outcome.transcript, offer.declared, choiceRefusal, numbered.opens);
   }, [current, runNumbered]);
 
   /**
@@ -2422,7 +2424,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * more than one. With a confirmation open, or more items than a choice
    * shows, it is only refused.
    */
-  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, choices: VoiceNumberRefDto[], declared: VoiceContext) => {
+  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, choices: VoiceNumberRefDto[], declared: VoiceContext, opens: VoiceNumberedOpens) => {
     const found = choices.flatMap((choice) => {
       const entry = numberedEntry(heard, choice.section, choice.number);
       return entry ? [{ choice, entry }] : [];
@@ -2437,7 +2439,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(`${sentence} Nothing ran.`);
       return;
     }
-    const row = numberedOutcome(first, utterance);
+    const row = numberedOutcome(first, utterance, opens);
     /* Each candidate's `value` is its section and number: unique, where two
        decks' agents can share an id and two sections a number. The item
        itself rides in `numbered`. */
@@ -2457,7 +2459,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
     setPanelState({
       kind: "awaitingChoice",
-      offer: { outcome, backend: NUMBERS_BACKEND, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, numbered: { heard, entries } },
+      offer: { outcome, backend: NUMBERS_BACKEND, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, numbered: { heard, entries, opens } },
     });
   }, [setPanelState]);
 
@@ -2482,15 +2484,23 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (heard === undefined || read === undefined || !hasNumbered(heard)) return false;
     const declared = heardContext.current ?? current();
     setPhase("resolving");
-    let verdict: VoiceNumberAnswerDto;
+    let answered: VoiceNumberAnswerDto;
     try {
       const now = read().generation;
-      verdict = answerVoiceNumber ? await answerVoiceNumber(utterance, heard, now) : answerNumberLocally(utterance, heard, now);
+      answered = answerVoiceNumber ? await answerVoiceNumber(utterance, heard, now) : answerNumberLocally(utterance, heard, now);
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
       return true;
     }
     if (!ours()) return true;
+    /* PRD #1401 — "open the PR for agent 3": the same answer about the agent,
+       run as `open_pr` rather than as opening the agent. */
+    /* `open_pr` is the dashboard's and the agent screen's; on the Daemons
+       screen, whose tiles are numbered too, the resolver refuses it with the
+       row's own hint. */
+    if (answered.kind === "pull_request" && declared.screen !== "overview") return false;
+    const opens: VoiceNumberedOpens = answered.kind === "pull_request" ? "pull_request" : "item";
+    let verdict: VoiceItemAnswerDto = answered.kind === "pull_request" ? answered.of : answered;
     if (verdict.kind === "not_number") return false;
     if (verdict.kind !== "stale" && read().generation !== heard.generation) verdict = { kind: "stale" };
     if (verdict.kind === "stale") {
@@ -2508,11 +2518,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* The gate for acting on the answer at all, as for a resolved one. */
     const lost = contextLost(declared, current(), { answer: true });
     if (lost) setProblem(answerRefusal(lost));
-    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.choices, declared);
+    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.choices, declared, opens);
     else {
       const entry = numberedEntry(heard, verdict.section, verdict.number);
       if (entry === undefined) setProblem(voiceNumberNotShown(verdict.number, verdict.section));
-      else runNumbered(entry, utterance, declared, answerRefusal);
+      else runNumbered(entry, utterance, declared, answerRefusal, opens);
     }
     return true;
   }, [answerVoiceNumber, current, offerNumbered, runNumbered, setPhase]);
@@ -3211,6 +3221,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     refusedRef.current = true;
     setProblem(reason);
   }, []);
+  /**
+   * PRD #1401 — a dispatch whose effect settles later: `pending` now, through
+   * {@link reportRefused} so the resolver's sentence (written before anything
+   * ran) is not shown, then how it ended — unless the user has said something
+   * since ({@link forget} moves the generation), whose report this must not
+   * cover.
+   */
+  const reportPending = useCallback((pending: string, work: Promise<string | undefined>, done: string) => {
+    reportRefused(pending);
+    const reported = reportGeneration.current;
+    void work.then((failed) => {
+      if (reportGeneration.current === reported) setProblem(failed ?? done);
+    });
+  }, [reportRefused]);
   /**
    * Type one utterance's words into the open agent's prompt, then start the
    * countdown to a send (PRD #802 D6, rebuilt).
@@ -3973,6 +3997,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       scratchLastDictation,
       reportNothingToClose,
       reportRefused,
+      reportPending,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

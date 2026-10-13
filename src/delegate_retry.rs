@@ -329,6 +329,7 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
         | EventType::WaitingForInput
         | EventType::ShellBusy
         | EventType::ShellIdle
+        | EventType::PullRequest
         | EventType::Unknown => EventVerdict::Ignore,
     }
 }
@@ -2290,6 +2291,7 @@ mod tests {
             (EventType::WaitingForInput, EventVerdict::Ignore),
             (EventType::ShellBusy, EventVerdict::Ignore),
             (EventType::ShellIdle, EventVerdict::Ignore),
+            (EventType::PullRequest, EventVerdict::Ignore),
             (EventType::Unknown, EventVerdict::Ignore),
         ];
         for (event_type, expected) in table {
@@ -2321,6 +2323,7 @@ mod tests {
             EventType::WaitingForInput,
             EventType::ShellBusy,
             EventType::ShellIdle,
+            EventType::PullRequest,
             EventType::Unknown,
         ] {
             let e = event(event_type);

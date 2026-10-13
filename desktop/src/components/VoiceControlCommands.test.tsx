@@ -2587,6 +2587,37 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
   });
 
+  /** Scenario: Greptile on PR #1680 — with typing mode on and words unsent,
+   * the user clicks Coder's pull request badge, and GitHub's page opens over
+   * the pane. Coder's prompt is no longer on screen, so typing mode ends and
+   * says why, and a spoken "send it" presses no Enter on it. */
+  it("ends dictation when the pull request browser opens over the pane", async () => {
+    const voice = microphone([]);
+    const sendIt = dispatch("submit_prompt", "submitAgentPrompt", "Sent.", "send it");
+    const resolveVoice: ResolveVoice = vi.fn(async (said: string) => ({ "type on": modeOn, "send it": sendIt }[said] ?? inModeText(said)));
+    const crowded = createFixtureSnapshot("crowded");
+    const snapshot = {
+      ...crowded,
+      agents: crowded.agents.map((agent) => (agent.id === coderId
+        ? { ...agent, pullRequest: { number: 77, url: "https://github.com/o/r/pull/77", state: "open" as const } }
+        : agent)),
+    };
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    render(<DeckShell runtime={deck} />);
+    await enter(voice);
+    voice.deliver("unsent words");
+    await completeUtterance();
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await act(async () => { fireEvent.click(within(pane).getByRole("button", { name: /pull request #77/i })); });
+    await flush();
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/typing mode off.*terminal is not shown.*nothing was sent to coder/i);
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+  });
+
   /** Scenario: issue #1400 — coder's pane is left on its Diff tab, then the
    * agent details are hidden, so the pane falls back to showing its terminal.
    * The voice panel reads the tab the pane shows, not the one it stored, so

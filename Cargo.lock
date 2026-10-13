@@ -1406,14 +1406,19 @@ dependencies = [
 name = "dot-agent-deck-desktop"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "chrono",
  "cpal",
  "dot-agent-deck",
  "earshot",
  "getrandom 0.4.3",
+ "gtk",
  "http",
  "keyring",
  "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-web-kit",
  "reqwest",
  "serde",
  "serde_json",
@@ -1423,6 +1428,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit 0.25.17+spec-1.1.0",
+ "webkit2gtk",
+ "webview2-com",
+ "windows-core",
  "windows-sys 0.61.2",
  "zbus",
 ]

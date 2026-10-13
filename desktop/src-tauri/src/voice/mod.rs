@@ -656,6 +656,7 @@ pub mod test_support {
             background: None,
             authoring_kind: None,
             tab: DesktopTab::Dashboard,
+            pull_request: None,
         }
     }
 

@@ -24,29 +24,46 @@ pub const TABLE_SOURCE: &str = include_str!("commands.toml");
 /// id is refused by [`TableError::ReservedId`].
 pub const NO_MATCH_ACTION: &str = "none";
 
-/// Which top-level surface is mounted — the three `DeckView` kinds in
-/// `desktop/src/types.ts`, and the closed set the `screens` column draws from.
+/// Which top-level surface is in front — the three `DeckView` kinds in
+/// `desktop/src/types.ts`, the in-app pull request browser (PRD #1401), and
+/// the closed set the `screens` column draws from.
 ///
-/// It is three because `DeckView` is three. Notably it cannot express *"an
-/// overlay is open"*: five of the rail's seven buttons toggle booleans that are
-/// not in `DeckView` at all, so a command whose availability depends on one of
-/// those is a change to where that state lives and not a change to this enum.
+/// It cannot express *"an overlay is open"* in general: five of the rail's
+/// seven buttons toggle booleans that are not in `DeckView` at all, so a
+/// command whose availability depends on one of those is a change to where
+/// that state lives and not a change to this enum.
+///
+/// [`Screen::PullRequest`] is the one surface here that is not a `DeckView`,
+/// and it earns the place by being a screen in every way voice cares about: it
+/// covers the view under it — the agent's pane and its prompt included — and
+/// has commands of its own (`open_pr_in_browser`, the scrolls of its page).
+/// The webview declares it INSTEAD of the view under it while the browser is
+/// open, so a row callable on `agent` is not callable over the browser, which
+/// is what keeps dictation out of a prompt the user cannot see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Screen {
     Deck,
     Overview,
     Agent,
+    /// The in-app pull request browser, open over one of the three above.
+    PullRequest,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 3] = [Screen::Deck, Screen::Overview, Screen::Agent];
+    pub const ALL: [Screen; 4] = [
+        Screen::Deck,
+        Screen::Overview,
+        Screen::Agent,
+        Screen::PullRequest,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Screen::Deck => "deck",
             Screen::Overview => "overview",
             Screen::Agent => "agent",
+            Screen::PullRequest => "pull_request",
         }
     }
 
@@ -1414,10 +1431,30 @@ mod tests {
                 ("previous_page", "previousPage", vec!["deck", "overview"]),
                 // Scrolling the agent dashboard, which no longer pages (issue
                 // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
-                ("scroll_down", "scrollDown", vec!["overview"]),
-                ("scroll_up", "scrollUp", vec!["overview"]),
-                ("scroll_to_top", "scrollToTop", vec!["overview"]),
-                ("scroll_to_bottom", "scrollToBottom", vec!["overview"]),
+                // PRD #1401: and the page of a pull request open in the app.
+                (
+                    "scroll_down",
+                    "scrollDown",
+                    vec!["overview", "pull_request"]
+                ),
+                ("scroll_up", "scrollUp", vec!["overview", "pull_request"]),
+                (
+                    "scroll_to_top",
+                    "scrollToTop",
+                    vec!["overview", "pull_request"]
+                ),
+                (
+                    "scroll_to_bottom",
+                    "scrollToBottom",
+                    vec!["overview", "pull_request"]
+                ),
+                // PRD #1401 — an agent's pull request in the app's own browser.
+                ("open_pr", "openPullRequest", vec!["overview", "agent"]),
+                (
+                    "open_pr_in_browser",
+                    "openPullRequestInBrowser",
+                    vec!["pull_request"]
+                ),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
@@ -2496,6 +2533,8 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
+                // PRD #1401: the pull request of the agent it names (or the only one).
+                "open_pr",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2518,7 +2557,29 @@ mod tests {
                 "scratch_that",
                 "reading_on",
                 "reading_off",
-                "hush_reading"
+                "hush_reading",
+                // PRD #1401: the open pane's agent's pull request, or the named agent's.
+                "open_pr"
+            ]
+        );
+        // PRD #1401 — over the pull request browser: the rows callable
+        // everywhere, the four scrolls (of the page) and the hand-off, and
+        // NOT the agent screen's — the browser covers the prompt they type in.
+        assert_eq!(
+            callable(Screen::PullRequest),
+            vec![
+                "clear_dashboard_filter",
+                "close",
+                "voice_off",
+                "list_commands",
+                "reading_on",
+                "reading_off",
+                "hush_reading",
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
+                "open_pr_in_browser"
             ]
         );
     }
@@ -3448,7 +3509,13 @@ mod tests {
                 .row(id)
                 .unwrap_or_else(|| panic!("{id} is in the table"));
             assert_eq!(row.invoke, invoke, "{id}");
-            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            // PRD #1401: and over a pull request open in the app, whose page
+            // they scroll.
+            assert_eq!(
+                row.screens,
+                vec![Screen::Overview, Screen::PullRequest],
+                "{id}"
+            );
             assert_eq!(
                 row.requires,
                 vec![Requirement::NewAgentDialogClosed],
@@ -3468,6 +3535,57 @@ mod tests {
             );
             assert!(!row.callable(Screen::Deck, None, None), "{id}");
             assert!(!row.callable(Screen::Agent, None, None), "{id}");
+            assert!(row.callable(Screen::PullRequest, None, None), "{id}");
+        }
+    }
+
+    /// Scenario: PRD #1401's two rows. "open the PR" is the agent dashboard's
+    /// and the agent screen's, and takes the agent it names as an optional
+    /// `agent_ref` (no name on the agent screen is the open pane's agent);
+    /// "open it in the browser" is the pull request browser's own and takes
+    /// no param. Both are grounded by their own words and only change what is
+    /// on screen.
+    #[test]
+    fn voice_table_pull_request_rows_are_pinned_by_value() {
+        let table = super::table();
+        let open = table.row("open_pr").expect("open_pr is in the table");
+        assert_eq!(open.invoke, "openPullRequest");
+        assert_eq!(open.screens, vec![Screen::Overview, Screen::Agent]);
+        assert!(open.requires.is_empty());
+        assert_eq!(
+            open.params,
+            vec![ParamSpec {
+                name: "agent".to_string(),
+                kind: ParamKind::AgentRef,
+                optional: true,
+            }]
+        );
+        let ActionGrounding::HeardAs(heard) = &open.grounding else {
+            panic!("open_pr is grounded by `heard_as`");
+        };
+        assert!(heard.iter().any(|word| word == "pull request"));
+        assert!(heard.iter().any(|word| word == "pr"));
+        for screen in [Screen::Deck, Screen::PullRequest] {
+            assert!(!open.callable(screen, None, None), "open_pr on {screen}");
+        }
+        assert!(open.callable(Screen::Overview, None, None));
+        assert!(open.callable(Screen::Agent, None, None));
+
+        let handoff = table
+            .row("open_pr_in_browser")
+            .expect("open_pr_in_browser is in the table");
+        assert_eq!(handoff.invoke, "openPullRequestInBrowser");
+        assert_eq!(handoff.screens, vec![Screen::PullRequest]);
+        assert!(handoff.params.is_empty());
+        let ActionGrounding::HeardAs(heard) = &handoff.grounding else {
+            panic!("open_pr_in_browser is grounded by `heard_as`");
+        };
+        assert!(heard.iter().any(|word| word == "browser"));
+        for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
+            assert!(
+                !handoff.callable(screen, None, None),
+                "open_pr_in_browser on {screen}"
+            );
         }
     }
 

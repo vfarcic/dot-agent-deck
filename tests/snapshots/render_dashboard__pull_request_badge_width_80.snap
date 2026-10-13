@@ -1,0 +1,13 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 92
+expression: rendered
+---
+┏ ▸ 1 ClaudeCode · api-svc ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Thinking ┓
+┃Dir:  api-svc                                                                 ┃
+┃Prmt: move the stats into the border                                          ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┃                                                                              ┃
+┗ #1234 ⊙ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛

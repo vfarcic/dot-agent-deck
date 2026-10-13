@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
+use dot_agent_deck::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
 use dot_agent_deck::state::{
     ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
     SessionState, SessionStatus,
@@ -57,6 +58,122 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Scenario: Render a PR card at the widths where review, lifecycle, stats and
+/// the entire badge stop fitting. Snapshot the rendered boundaries and every
+/// lifecycle/review value, including unknown values displayed as question marks.
+#[spec("dashboard/pane/016")]
+#[test]
+fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.pull_request = Some(PullRequestInfo {
+        number: 1234,
+        url: "https://github.com/test-org/test-repo/pull/1234".into(),
+        state: PullRequestState::Open,
+        review: Some(PullRequestReview::ReviewRequired),
+    });
+    for width in [80, 30] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        assert!(
+            rendered.contains("#1234 ⊙ ◐"),
+            "card must show its PR number, state and review at width {width}:\n{rendered}"
+        );
+        insta::assert_snapshot!(format!("pull_request_badge_width_{width}"), rendered);
+    }
+    let mut boundaries = String::new();
+    for (width, badge, stats) in [
+        (22, "#1234 ⊙ ◐", true),
+        (21, "#1234 ⊙", true),
+        (20, "#1234 ⊙", true),
+        (19, "#1234", true),
+        (18, "#1234", true),
+        (17, "#1234 ⊙ ◐", false),
+        (13, "#1234 ⊙ ◐", false),
+        (12, "#1234 ⊙", false),
+        (11, "#1234 ⊙", false),
+        (10, "#1234", false),
+        (9, "#1234", false),
+        (8, "", false),
+    ] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        let border = rendered.lines().last().unwrap();
+        assert_eq!(
+            border.contains("#1234"),
+            !badge.is_empty(),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('⊙'),
+            badge.contains('⊙'),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('◐'),
+            badge.contains('◐'),
+            "width {width}: {border}"
+        );
+        assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
+        boundaries.push_str(&format!("width {width}\n{rendered}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_boundaries", boundaries);
+
+    let mut values = String::new();
+    for (state, state_glyph) in [
+        (PullRequestState::Open, "⊙"),
+        (PullRequestState::Draft, "◌"),
+        (PullRequestState::Merged, "◆"),
+        (PullRequestState::Closed, "⊘"),
+        (PullRequestState::Unknown, "?"),
+    ] {
+        for (review, review_glyph) in [
+            (None, ""),
+            (Some(PullRequestReview::Approved), " ✓"),
+            (Some(PullRequestReview::ChangesRequested), " ✗"),
+            (Some(PullRequestReview::ReviewRequired), " ◐"),
+            (Some(PullRequestReview::Unknown), " ?"),
+        ] {
+            let pr = session.pull_request.as_mut().unwrap();
+            pr.state = state;
+            pr.review = review;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &session,
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                render_now(),
+                true,
+                80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            let border = rendered.lines().last().unwrap();
+            let badge = format!(" #1234 {state_glyph}{review_glyph} ");
+            assert!(border.contains(&badge), "{state:?}/{review:?}: {border}");
+            values.push_str(&format!("{state:?}/{review:?}\n{border}\n"));
+        }
+    }
+    insta::assert_snapshot!("pull_request_badge_states_and_reviews", values);
 }
 
 /// Scenario: Hydrate Idle cards with background commands and subagents, then render wide and narrow cards at a fixed clock. The visible line uses the shared singular/plural and elapsed vocabulary, omits zero kinds and invalid durations, and disappears without background work.
@@ -278,6 +395,8 @@ fn pane_004_card_title_row() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -329,6 +448,8 @@ fn card_stats_session(cwd: &str) -> SessionState {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -474,6 +595,8 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_activity_ms,
             blocked: None,
             hook_generation: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         };
@@ -814,6 +937,8 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -1009,6 +1134,8 @@ fn pane_007_pi_card_shows_pi_identity() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1076,6 +1203,8 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1338,6 +1467,8 @@ fn palette_session(status: SessionStatus) -> SessionState {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -2227,6 +2358,8 @@ fn pane_005_highlight_follows_selected_session_id() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2438,6 +2571,8 @@ fn filled_session() -> SessionState {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -3206,6 +3341,8 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3556,6 +3693,8 @@ fn role_session(index: usize, role: &str) -> SessionState {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 

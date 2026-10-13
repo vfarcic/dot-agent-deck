@@ -9,7 +9,7 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -25,6 +25,15 @@ desktopScenario("dashboard", async (page) => {
 desktopScenario("dashboard-empty", async (page) => {
   await overview(page, "empty");
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
+});
+
+desktopScenario("pull-request-badge", async (page) => {
+  await overview(page, "docs-pr");
+  await expect(page.locator(".overview-row")).toHaveCount(1);
+  const badge = page.getByTestId("overview-pr-badge");
+  await expect(badge).toHaveAccessibleName("Pull request #1234: open, review required");
+  await expect(badge).toHaveAttribute("data-pr-state", "open");
+  await expect(badge).toHaveAttribute("data-pr-review", "review_required");
 });
 
 desktopScenario("dashboard-fleet", async (page) => {

@@ -1,0 +1,13 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 92
+expression: rendered
+---
+┏ ▸ 1 ClaudeCode… ● Thinking ┓
+┃Dir:  api-svc               ┃
+┃Prmt: move the stats into t…┃
+┃                            ┃
+┃                            ┃
+┃                            ┃
+┃                            ┃
+┗ #1234 ⊙ ◐ ━━ 1h · 14 tools ┛

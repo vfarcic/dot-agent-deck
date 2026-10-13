@@ -82,6 +82,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "pull-request-badge",
+        description: "An agent with open pull request #1234 awaiting review, on its TUI card and desktop Dashboard row.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "dashboard-fleet",
         description: "The desktop Dashboard with agents grouped under two connected daemons.",
         clients: &[Client::Desktop],
