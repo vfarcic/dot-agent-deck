@@ -8484,3 +8484,77 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** SIGKILL of this fixture's Pi process is followed by its child watcher exiting on stdin EOF.
 - **Does not assert:** Doorbell fallback or message delivery after a crash.
 - **Platform coverage:** linux (uses /proc).
+
+#### inbox/publish
+
+##### inbox/publish/001 — Subscription names are validated at every configuration seam.
+- **Layer:** L1 unit (`tests/inbox_subscriptions.rs`).
+- **Agent:** none.
+- **Asserts:** Valid slugs up to 64 characters pass; malformed orchestration, role and dispatch subscriptions produce errors naming subscribe.
+- **Does not assert:** Delivery or cross-project dispatch resolution.
+- **Platform coverage:** all.
+
+##### inbox/publish/002 — Same-name orchestration instances stay isolated and publications are fenced.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real binary and hook/attach sockets.
+- **Agent:** synthetic raw PTY recorders.
+- **Asserts:** Only two configured subscribers in the attested sender's token receive the id; the sender and other same-name instance receive nothing; fetched text has message frames and worker-report fencing.
+- **Does not assert:** Real models or a dispatch tree spanning projects.
+- **Platform coverage:** mac+linux.
+
+##### inbox/publish/003 — Unattested publication and offer requests are explicitly refused.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
+- **Agent:** synthetic PTY recorders and a legacy unattested status sender.
+- **Asserts:** Both verbs refuse missing attestation without enqueueing content for subscribers.
+- **Does not assert:** Cross-user socket access.
+- **Platform coverage:** mac+linux.
+
+##### inbox/publish/004 — Empty topics and the shared sender rate budget are explicit.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** No subscribers returns delivered_to=0; publish and offer share the overridden per-sender budget and excess posts are refused without an id.
+- **Does not assert:** The minute reset, covered by inbox/core/015.
+- **Platform coverage:** mac+linux.
+
+##### inbox/publish/005 — The CLI publishes text, offers a file, releases and completes a claim.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real CLI help.
+- **Agent:** none.
+- **Asserts:** All four subcommands exist; text publication delivers fenced content; file-backed offer, release and complete operate on the same inspectable job id through attested CLI calls.
+- **Does not assert:** Large spill files or invalid claim TTL parsing.
+- **Platform coverage:** mac+linux.
+
+#### inbox/offer
+
+##### inbox/offer/001 — Configured offer pool names are validated.
+- **Layer:** L1 unit (`tests/inbox_subscriptions.rs`).
+- **Agent:** none.
+- **Asserts:** Valid role take_offers slugs pass; malformed pool names produce an error naming the setting.
+- **Does not assert:** Subscription delivery.
+- **Platform coverage:** all.
+
+##### inbox/offer/002 — Workers cannot offer jobs; orchestrators can.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** A worker request is explicitly refused, enqueues nothing, and the attested start-role request succeeds.
+- **Does not assert:** Dispatch caller authority.
+- **Platform coverage:** mac+linux.
+
+##### inbox/offer/003 — Competing subscribers produce one claimant inside one instance.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), concurrent public fetch requests.
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** Exactly one subscriber fetches/claims; another worker cannot complete it; a second same-name instance receives nothing.
+- **Does not assert:** Real-agent scheduling or fairness between equally eligible roles.
+- **Platform coverage:** mac+linux.
+
+##### inbox/offer/004 — Expired claims reoffer to a new worker and notify the offerer.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** An overridden short claim expires, the other subscriber gets the same id, the previous holder cannot fetch it again, and the offerer receives an expiry notice.
+- **Does not assert:** The production 30-minute wait or max_deliver exhaustion.
+- **Platform coverage:** mac+linux.
+
+##### inbox/offer/005 — Release returns a job to the pool and completion notifies the offerer.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** Explicit release reassigns to the other subscriber, its completion acknowledges the id, and the offerer receives a completion notice.
+- **Does not assert:** Claimant exit, covered by inbox/core/011.
+- **Platform coverage:** mac+linux.
