@@ -95,7 +95,7 @@ To pin a release, append its tag: `github:vfarcic/dot-agent-deck/<tag>`. Tags fr
 {
   inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
   # Optional: build against your nixpkgs instead of the one this flake pins.
-  # Your nixpkgs must then carry rustc 1.97.1 or newer.
+  # Your nixpkgs must then carry rustc 1.98.1 or newer.
   inputs.dot-agent-deck.inputs.nixpkgs.follows = "nixpkgs";
 
   # NixOS
@@ -106,7 +106,7 @@ To pin a release, append its tag: `github:vfarcic/dot-agent-deck/<tag>`. Tags fr
 }
 ```
 
-**Via the overlay**, to reach it as `pkgs.dot-agent-deck`. The overlay builds against your nixpkgs, so it needs rustc 1.97.1 or newer there; an older rustc makes cargo stop and name the version it needs.
+**Via the overlay**, to reach it as `pkgs.dot-agent-deck`. The overlay builds against your nixpkgs, so it needs rustc 1.98.1 or newer there; an older rustc makes cargo stop and name the version it needs.
 
 ```nix
 {
@@ -157,7 +157,7 @@ home-manager links these files from the Nix store, so change `settings` and `key
 
 ## Build from Source
 
-Requires Rust 1.97.1 or newer.
+Requires Rust 1.98.1 or newer.
 
 ```bash
 git clone https://github.com/vfarcic/dot-agent-deck.git
