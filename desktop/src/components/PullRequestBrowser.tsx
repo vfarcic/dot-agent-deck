@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowLeft, ExternalLink, GitPullRequest, X } from "lucide-react";
-import { useInertBackground } from "../hooks/useInertBackground";
+import { OVERLAY_LAYER, overlayAbove, stackedOverlay, useInertBackground } from "../hooks/useInertBackground";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import type { PrBrowserBounds, PrBrowserHost } from "../lib/prBrowser";
 
@@ -28,15 +28,22 @@ export type PullRequestBrowserSession = {
 const DIALOG_SELECTOR = "[role='dialog'], [role='alertdialog'], [aria-modal='true']";
 
 /**
- * The dialogs of the app's own that can come up over the browser. A native
+ * The dialogs of the app's own that are drawn over the browser. A native
  * webview is drawn above everything the main webview renders, so while one of
- * these is open the page is hidden rather than left covering it. The agent's
- * pane is excluded: the browser is opened over it.
+ * these is open the page is hidden rather than left covering it.
+ *
+ * Over it means what is PAINTED over it (PR #1680 review). An overlay on the
+ * fence's stack is placed there by its layer: the agent's pane the browser was
+ * opened over is beneath it, and so is a Settings or configuration sheet that
+ * was open before it, which is drawn beneath the pane — while one opened over
+ * the browser is raised above it. A dialog on no stack counts as over it: the
+ * voice surface's list and the app's confirmations are, drawn above its layer.
  */
 function coveredByDialog(self: Element | null): boolean {
+  if (overlayAbove(self)) return true;
   for (const modal of Array.from(document.querySelectorAll(DIALOG_SELECTOR))) {
     if (modal === self || self?.contains(modal) || modal.contains(self)) continue;
-    if (modal.classList.contains("agent-pane-overlay")) continue;
+    if (stackedOverlay(modal)) continue;
     return true;
   }
   return false;
@@ -49,7 +56,9 @@ function useCovered(ref: React.RefObject<HTMLElement | null>): boolean {
     const check = () => setCovered(coveredByDialog(ref.current));
     check();
     const observer = new MutationObserver(check);
-    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-modal", "role"] });
+    /* `inert` too: an overlay coming onto the stack takes the fence from the
+       browser, which is when its place above it is known. */
+    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-modal", "role", "inert"] });
     return () => observer.disconnect();
   }, [ref]);
   return covered;
@@ -102,7 +111,7 @@ export function PullRequestBrowser<S extends PullRequestBrowserSession>({ sessio
   /** The page closed itself; the session is over and nothing needs closing. */
   onClosedByPage: () => void;
 }) {
-  const overlayRef = useInertBackground<HTMLDivElement>(true);
+  const overlayRef = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.pullRequest);
   const frameRef = useRef<HTMLDivElement>(null);
   const covered = useCovered(overlayRef);
   /* Why the first page did not open, against the address it was for, so a

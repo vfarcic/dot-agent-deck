@@ -822,6 +822,21 @@ describe("the pull request browser by voice (PRD #1401)", () => {
     expect(context.closeSettings).not.toHaveBeenCalled();
   });
 
+  /**
+   * Scenario: PR #1680 review — Settings, or an overlay with no member of its
+   * own (the command menu, a configuration sheet), published because it is on
+   * top, closes before the pane under it.
+   */
+  it.each(["closeSettings", "closeOverlay"] as const)("closes %s's overlay before the pane", async (member) => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const close = vi.fn();
+    const context = { ...base(), [member]: close };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+  });
+
   /** Scenario: "close" on the browser is reported once the page has closed, not when it was asked for. */
   it("reports the browser's close once it has happened", async () => {
     const { dispatchVoiceAction, PULL_REQUEST_CLOSED, PULL_REQUEST_CLOSING } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");

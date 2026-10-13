@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useOverlaySheet } from "../hooks/useInertBackground";
 import {
   AlertTriangle,
   ArrowDown,
@@ -48,6 +49,7 @@ interface ProjectsPanelProps {
 
 export function ProjectsPanel({ open, state, onClose, onConfigureOrchestration, allDecks = false }: ProjectsPanelProps) {
   const [pasted, setPasted] = useState("");
+  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
   if (!open) return null;
   const { projects, primary, listing, listingError, selected, resolving, resolveError, vanished } = state;
   const submitPasted = async () => {
@@ -65,8 +67,8 @@ export function ProjectsPanel({ open, state, onClose, onConfigureOrchestration, 
       : undefined;
 
   return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="projects-title" data-testid="projects-panel" onMouseDown={(event) => event.stopPropagation()}>
+    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
+      <section ref={sheet.ref} tabIndex={-1} className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="projects-title" data-testid="projects-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
           <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this orchestration runs in. The daemon answers with what it knows.</p></div>
           <button className="icon-button" aria-label="Close projects" onClick={onClose}><X size={18} /></button>
@@ -155,11 +157,12 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
   const [removeArmed, setRemoveArmed] = useState(false);
   const prompt = prompts.find((candidate) => candidate.id === selectedId) ?? prompts[0];
   useEffect(() => setRemoveArmed(false), [selectedId, open]);
+  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
   if (!open) return null;
 
   return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
+    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
+      <section ref={sheet.ref} tabIndex={-1} className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
           <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the orchestration task prompt and for messaging a running agent.</p></div>
           <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
@@ -216,13 +219,16 @@ export function ProfilesPanel({ open, profiles, onClose, onUpdate, onReset, onSa
   useEffect(() => {
     if (!profiles.some((profile) => profile.id === selectedId)) setSelectedId(profiles[0]?.id);
   }, [profiles, selectedId]);
+  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
   if (!open) return null;
   const profile = profiles.find((candidate) => candidate.id === selectedId);
   const commandResolution = profile ? resolveProfileCommand(profile) : undefined;
 
   return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
+    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
       <section
+        ref={sheet.ref}
+        tabIndex={-1}
         className="config-sheet profiles-sheet"
         role="dialog"
         aria-modal="true"
@@ -470,6 +476,7 @@ export function OrchestrationPanel({ open, profiles, order, mode, project, onCho
     if (orchestrations.some((orchestration) => orchestration.name === name)) return;
     setName(orchestrations.find((orchestration) => orchestration.default)?.name ?? orchestrations[0]?.name ?? "");
   }, [name, orchestrations]);
+  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
   if (!open) return null;
   // Two values, deliberately: `cwd` is the daemon's canonical spelling and is
   // what the launch submits; `cwdDisplay` is the escaped twin and is all that
@@ -548,8 +555,8 @@ export function OrchestrationPanel({ open, profiles, order, mode, project, onCho
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="config-sheet orchestration-sheet" role="dialog" aria-modal="true" aria-labelledby="orchestration-editor-title" data-testid="orchestration-editor" onMouseDown={(event) => event.stopPropagation()}>
+    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
+      <section ref={sheet.ref} tabIndex={-1} className="config-sheet orchestration-sheet" role="dialog" aria-modal="true" aria-labelledby="orchestration-editor-title" data-testid="orchestration-editor" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
           <div><span className="eyebrow">LOOP CONFIGURATION</span><h2 id="orchestration-editor-title">Orchestration order</h2><p>Shape the role sequence used by the cockpit preview.</p></div>
           <button className="icon-button" aria-label="Close orchestration editor" onClick={onClose}><X size={18} /></button>

@@ -741,6 +741,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .empty-deck > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
+/* PR #1680 review — a sheet opened over the agent's pane (90) or the pull
+   request browser (92), from the deck's command menu, is what the user just
+   asked for: drawn above both, and still below the voice row (95) and every
+   dialog (100). `OVERLAY_LAYER` in `useInertBackground.ts` holds these
+   numbers as the order voice's "close" walks; `overlayLayers.test.ts` reads
+   them back from this file. */
+.sheet-backdrop.is-raised { z-index: 93; }
 .config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
 .orchestration-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }

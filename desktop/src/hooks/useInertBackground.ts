@@ -15,10 +15,13 @@
  * can show both.
  *
  * **The other dialogs here are NOT fenced, and saying so is the honest version
- * of "a repo-wide convention".** `ConfirmDialog`, `SettingsSheet`,
- * `OutputReader` and `ConfigurationPanels`'s four sheets each declare
- * `aria-modal="true"` over the same mounted background and each call nothing
- * here, so the claim is as untrue for them as it was for the pane. PRD #1401's
+ * of "a repo-wide convention".** `ConfirmDialog` and `OutputReader` each
+ * declare `aria-modal="true"` over the same mounted background and each call
+ * nothing here, so the claim is as untrue for them as it was for the pane.
+ * `SettingsSheet` and `ConfigurationPanels`'s four sheets are on the stack
+ * through {@link useOverlaySheet} (PR #1680 review), and fence only when they
+ * open over a fenced overlay; opened with nothing up, they fence nothing, as
+ * before. PRD #1401's
  * pull request browser is the third caller, and the first that opens over
  * another: it comes up over a still-mounted pane, so only the topmost open
  * caller fences (see `stack` below) and the pane beneath it is background like
@@ -128,7 +131,7 @@
  * in the browser tier (`desktop/e2e/agent-pane-modal.spec.ts`) and only its
  * presence is pinned here.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * The marker that makes an element a peer of the agent pane rather than
@@ -146,16 +149,41 @@ export const VOICE_PEER_PROPS = { "data-modal-peer": "voice" } as const;
 const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-peer"]}"]`;
 
 /**
- * One open fenced overlay: whatever this hook was given to fence, once it has
- * rendered. The node is refreshed on every commit, so an overlay whose root
- * element was replaced is fenced by its new one.
+ * PR #1680 review (Qodo) — the layer each overlay on the stack paints in: the
+ * `z-index` of its backdrop in `styles.css`, which `overlayLayers.test.ts`
+ * reads back so the two cannot drift. The stack is ordered by layer and then
+ * by when each overlay opened, so "on top" here is what is drawn on top.
+ *
+ * Open order alone was not that: a sheet is drawn beneath the agent's pane and
+ * the pull request browser whenever it opened, so a sheet opened BEFORE them
+ * is under them on screen however recent it is.
  */
-type Fenced = { node: HTMLElement | null };
+export const OVERLAY_LAYER = {
+  /** `.sheet-backdrop`: Settings and the configuration sheets, opened with no fenced overlay up. */
+  sheet: 80,
+  /** `.agent-pane-overlay`. */
+  pane: 90,
+  /** `.pr-browser-overlay`. */
+  pullRequest: 92,
+  /** `.sheet-backdrop.is-raised`: a sheet opened over the pane or the pull request browser, which the user just asked for. */
+  raisedSheet: 93,
+  /** `.dialog-backdrop`: the New agent dialog, the command menu and the shortcut sheet. */
+  dialog: 100,
+} as const;
 
 /**
- * PRD #1401 — every open fenced overlay, in the order it opened. The LAST one
- * is the topmost and the only one that fences; the ones beneath it are
- * background to it like anything else.
+ * One open overlay on the stack: whatever this hook was given, once it has
+ * rendered, the layer it paints in, and when it opened. The node is refreshed
+ * on every commit, so an overlay whose root element was replaced is found by
+ * its new one. `close` is how voice's "close" dismisses it when it has no
+ * member of its own; `fences` is false for a sheet opened with nothing fenced
+ * up, which fences nothing (see {@link useOverlaySheet}).
+ */
+type Fenced = { node: HTMLElement | null; layer: number; opened: number; fences: boolean; close?: () => void };
+
+/**
+ * PRD #1401 — every open overlay. The topmost FENCING one is the only one that
+ * fences; the ones beneath it are background to it like anything else.
  *
  * **Why one owner rather than one walk per overlay.** The in-app pull request
  * browser opens over a still-mounted agent pane, and both call this hook. With
@@ -167,21 +195,46 @@ type Fenced = { node: HTMLElement | null };
  * the marks are held here rather than per instance, so no overlay's cleanup
  * can unmark what the topmost one still needs marked.
  *
- * Open order rather than DOM order: an overlay that opens is what the user
- * just asked for, and the one place two are open together (the browser over
- * the pane) opens the later one over the earlier. Closing the topmost hands the
- * fence back to the one beneath it on the same commit.
+ * Ordered by {@link OVERLAY_LAYER} and then by open order: within a layer the
+ * overlay that opened last is what the user just asked for. Closing the
+ * topmost hands the fence back to the one beneath it on the same commit.
  */
 const stack: Fenced[] = [];
+/** How many overlays have opened, to order those that share a layer. */
+let opens = 0;
 /** The elements the fence marked, and only those, so an element inert for some other reason keeps its own state. */
 let marked = new Set<Element>();
 
-/** The topmost open overlay that has a node in the document. */
+/** The open overlays that have a node in the document, bottom first. */
+function ordered(): Fenced[] {
+  return stack.filter((entry) => entry.node?.isConnected).sort((a, b) => a.layer - b.layer || a.opened - b.opened);
+}
+
+/** The topmost open overlay that fences. */
 function topmost(): Fenced | undefined {
-  for (let index = stack.length - 1; index >= 0; index -= 1) {
-    if (stack[index].node?.isConnected) return stack[index];
-  }
-  return undefined;
+  return ordered().filter((entry) => entry.fences).at(-1);
+}
+
+/** Whether `element` is one of the open overlays on the stack, or inside one. */
+export function stackedOverlay(element: Element): boolean {
+  return ordered().some((entry) => entry.node?.contains(element));
+}
+
+/**
+ * Whether an open overlay on the stack is drawn over the one `element` is (or
+ * is in). `false` for an element in no overlay on the stack.
+ */
+export function overlayAbove(element: Element | null): boolean {
+  if (!element) return false;
+  const open = ordered();
+  let index = -1;
+  open.forEach((entry, at) => { if (entry.node?.contains(element)) index = at; });
+  return index >= 0 && index < open.length - 1;
+}
+
+/** How to close the topmost open overlay, when it registered one (see `Fenced`). */
+export function topmostOverlayClose(): (() => void) | undefined {
+  return ordered().at(-1)?.close;
 }
 
 /**
@@ -214,11 +267,47 @@ function fence() {
   marked = next;
 }
 
-export function useInertBackground<T extends HTMLElement>(open: boolean) {
+/**
+ * Fence the background while `open`, as the overlay of `layer`
+ * ({@link OVERLAY_LAYER}). `close`, when given, is how voice's "close"
+ * dismisses this overlay while it is the topmost one: for the overlays that
+ * have no voice member of their own.
+ */
+export function useInertBackground<T extends HTMLElement>(open: boolean, layer: number, close?: () => void) {
+  return useOverlay<T>(open, layer, true, close);
+}
+
+/**
+ * PR #1680 review (Qodo) — Settings and the configuration sheets on the stack.
+ *
+ * A sheet opened with nothing fenced up is drawn at {@link OVERLAY_LAYER}'s
+ * `sheet`, beneath the agent's pane and the pull request browser, and fences
+ * nothing — what it did before it was on the stack. One opened OVER a fenced
+ * overlay (from the deck's command menu, over the pull request browser) is
+ * what the user just asked for, so it is `raised`: drawn above the pane and
+ * the browser (`.sheet-backdrop.is-raised`), and fencing them, since it would
+ * otherwise be inert under their fence. Which it is is decided once, as it
+ * opens.
+ */
+export function useOverlaySheet<T extends HTMLElement>(open: boolean, close: () => void): { ref: React.RefObject<T | null>; raised: boolean } {
+  // voice-registry-exempt: decided as the sheet opens, from the overlays already up; it opens nothing
+  const [raisedAt, setRaisedAt] = useState<boolean>();
+  const raised = open ? (raisedAt ?? topmost() !== undefined) : false;
+  useEffect(() => {
+    setRaisedAt(open ? (was) => was ?? raised : undefined);
+  }, [open, raised]);
+  const ref = useOverlay<T>(open, raised ? OVERLAY_LAYER.raisedSheet : OVERLAY_LAYER.sheet, raised, close);
+  return { ref, raised };
+}
+
+function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences: boolean, close?: () => void) {
   const ref = useRef<T>(null);
   /** What had focus when this opened, so that closing can give it back. */
   const opener = useRef<Element | null>(null);
-  const entry = useRef<Fenced>({ node: null });
+  const entry = useRef<Fenced>({ node: null, layer, opened: 0, fences, close });
+  entry.current.layer = layer;
+  entry.current.fences = fences;
+  entry.current.close = close;
 
   /**
    * Captured FIRST — before the walk below, on the same commit, moves focus
@@ -239,6 +328,8 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
   useEffect(() => {
     if (!open) return;
     const mine = entry.current;
+    opens += 1;
+    mine.opened = opens;
     stack.push(mine);
     return () => {
       const index = stack.indexOf(mine);
@@ -295,13 +386,13 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
    * is, not somewhere to put it.
    */
   useEffect(() => {
-    if (!open) return;
+    if (!open || !fences) return;
     return () => {
       const element = opener.current;
       opener.current = null;
       if (element instanceof HTMLElement && element !== document.body && element.isConnected) element.focus();
     };
-  }, [open]);
+  }, [open, fences]);
 
   return ref;
 }

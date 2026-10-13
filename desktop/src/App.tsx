@@ -63,7 +63,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
-import { useInertBackground } from "./hooks/useInertBackground";
+import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
@@ -180,6 +180,8 @@ const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
 const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 /** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
+/** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
+const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -666,17 +668,24 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const prBrowserNow = useRef(prBrowser);
   prBrowserNow.current = prBrowser;
   prBrowserOpen.current = prBrowser !== undefined;
-  /* What the open page last failed to do, held against the session it failed
-     in so a new page never inherits an old failure. Cleared by the next thing
-     asked of it. */
+  /* What the open page last failed to do, held against the frame it failed
+     in (`opened`) so a new frame never inherits an old failure, and against
+     the call (`call`, numbered as they are asked) so a late failure of an
+     earlier call does not replace a later one's. Not against the toolbar's
+     session object: a queued switch that lands first replaces it, and the
+     failure of what was asked after it is about the page still on screen
+     (PR #1680 review). Cleared by the next thing asked of the page. */
   // voice-registry-exempt: a report of what the page did not do, written by the entries that asked it, and not something anybody opens
-  const [prBrowserProblem, setPrBrowserProblem] = useState<{ session: PullRequestBrowserSession; text: string }>();
-  /** Run one thing on the open page, and show why if it did not happen. Settles to that sentence, or `undefined`. */
-  const onPrBrowserPage = useCallback((session: PullRequestBrowserSession, work: Promise<void>): Promise<string | undefined> => {
+  const [prBrowserProblem, setPrBrowserProblem] = useState<{ opened: number; call: number; text: string }>();
+  const prBrowserCalls = useRef(0);
+  /** Run one thing on the frame numbered `opened`, and show why if it did not happen. Settles to that sentence, or `undefined`. */
+  const onPrBrowserPage = useCallback((opened: number, work: Promise<void>): Promise<string | undefined> => {
+    prBrowserCalls.current += 1;
+    const call = prBrowserCalls.current;
     setPrBrowserProblem(undefined);
     return work.then(() => undefined, (cause: unknown) => {
       const text = cause instanceof Error ? cause.message : String(cause);
-      setPrBrowserProblem({ session, text });
+      setPrBrowserProblem((was) => (was && was.call > call ? was : { opened, call, text }));
       return text;
     });
   }, []);
@@ -697,7 +706,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const closePrBrowser = useCallback((): Promise<string | undefined> => {
     const open = prBrowserNow.current;
     if (!open) return Promise.resolve(undefined);
-    return onPrBrowserPage(open, prBrowserHost.close()).then((failed) => {
+    return onPrBrowserPage(open.opened, prBrowserHost.close()).then((failed) => {
       if (failed === undefined) forgetPrBrowser(open.opened);
       return failed;
     });
@@ -729,13 +738,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     openPullRequestInBrowser: () => {
       if (!prBrowser) return PULL_REQUEST_NONE_OPEN;
       const session = prBrowser;
-      return onPrBrowserPage(session, prBrowserHost.openExternal()).then((failed) => {
+      return onPrBrowserPage(session.opened, prBrowserHost.openExternal()).then((failed) => {
         if (failed === undefined) forgetPrBrowser(session.opened);
         return failed;
       });
     },
     closePullRequest: closePrBrowser,
-    pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser, prBrowserHost.back()); },
+    pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser.opened, prBrowserHost.back()); },
   }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.fleet, view]);
   /* The page has moved to `request`, or failed to: the toolbar names it only
      once the host has it there, and a failure is said under the toolbar of
@@ -743,8 +752,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
      switch that settles has put the page where it says, whatever else was
      asked meanwhile; one about a frame that has since closed is ignored. */
   const switchPrBrowser = useCallback((request: OpenPrBrowser, work: Promise<void>) => {
-    const shown = prBrowserNow.current;
-    const failure = shown ? onPrBrowserPage(shown, work) : work.then(() => undefined, () => undefined);
+    const failure = prBrowserNow.current?.opened === request.opened ? onPrBrowserPage(request.opened, work) : work.then(() => undefined, () => undefined);
     void failure.then((failed) => {
       // voice-registry-exempt: the switch `openPullRequest` asked for has settled, and is no longer waiting
       setPrBrowserRequest((pending) => (pending === request ? undefined : pending));
@@ -1060,8 +1068,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The shell's, so Settings opens from the overview as from the deck (#1197). */
       openOverlay: railContext.openOverlay,
       closeOverlays: railContext.closeOverlays,
-      /* Only while Settings is open, so `close` reads its presence (#1197). */
-      ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* Only while Settings is open and nothing is drawn over it, so `close`
+         reads its presence as "Settings is on top" (#1197, PR #1680 review). */
+      ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* The topmost overlay when it is one with no member of its own — the
+         deck's command menu, its shortcut sheet, a configuration sheet — read
+         from the fence's stack, which orders them as they are drawn. */
+      ...(topmostOverlayClose() ? { closeOverlay: () => topmostOverlayClose()?.() } : {}),
       /* Issue #1492 — the dashboard's scroll, refused while anything is in
          front of it: a dialog layer (the open Daemon selector's menu), the
          Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
@@ -1075,7 +1088,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
-          void onPrBrowserPage(prBrowser, prBrowserHost.scroll(move));
+          void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
           return undefined;
         } }
         : overviewVoiceContext.current?.scrollDashboard
@@ -1265,7 +1278,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
             onSwitch={switchPrBrowser}
             host={prBrowserHost}
             zoom={zoom.level}
-            problem={prBrowserProblem?.session === prBrowser ? prBrowserProblem.text : undefined}
+            problem={prBrowserProblem?.opened === prBrowser.opened ? prBrowserProblem.text : undefined}
             onClose={() => VOICE_ACTIONS.closePullRequest.run(pullRequestContext)}
             onBack={() => VOICE_ACTIONS.pullRequestBack.run(pullRequestContext)}
             onOpenExternal={() => VOICE_ACTIONS.openPullRequestInBrowser.run(pullRequestContext)}
@@ -1460,7 +1473,7 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
     of this one inert and moving focus inside. See that hook for why it walks
     siblings rather than marking one subtree.
   */
-  const paneRef = useInertBackground<HTMLDivElement>(open);
+  const paneRef = useInertBackground<HTMLDivElement>(open, OVERLAY_LAYER.pane);
   return (
     <div
       ref={paneRef}
@@ -2685,13 +2698,13 @@ function CommandPalette({ commands, onClose }: { commands: { label: string; hint
   const filtered = commands.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(query.toLowerCase()));
   /* It can open over the pull request browser, which fences the deck it is
      mounted in, so it fences too: the topmost fence is the one that holds. */
-  const ref = useInertBackground<HTMLElement>(true);
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, onClose);
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="command-palette" role="dialog" aria-modal="true" aria-label="Command menu" onMouseDown={(event) => event.stopPropagation()}><label><Search size={17} /><input autoFocus placeholder="Search controls, agents, and views…" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>ESC</kbd></label><div>{filtered.map(({ label, hint, icon: Icon, run }) => <button key={label} onClick={() => { run(); onClose(); }}><Icon size={16} /><span><strong>{label}</strong><small>{hint}</small></span><ChevronRight size={14} /></button>)}{!filtered.length && <p>No matching controls.</p>}</div><footer><span><Command size={12} /> local control surface</span><span><kbd>↵</kbd> select</span></footer></section></div>;
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
   const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through events"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   /* Fenced for the command palette's reason (above). */
-  const ref = useInertBackground<HTMLElement>(true);
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, onClose);
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

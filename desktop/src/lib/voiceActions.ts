@@ -321,13 +321,25 @@ export type VoiceActionContext = {
   /**
    * Close the Settings sheet (issue #1197).
    *
-   * **Served by the SHELL, and only while Settings is OPEN**, for
-   * {@link dismissVoiceOverlay}'s reason: Settings is a shell-level overlay
-   * boolean (`useShellOverlays`), not a `DeckView`, so {@link closeTopmost}
-   * reads *"Settings is open"* as this member's presence. The shell and not a
-   * screen, because the sheet opens over the overview as well as the deck.
+   * **Served by the SHELL, and only while Settings is OPEN with nothing drawn
+   * over it**, for {@link dismissVoiceOverlay}'s reason: Settings is a
+   * shell-level overlay boolean (`useShellOverlays`), not a `DeckView`, so
+   * {@link closeTopmost} reads *"Settings is on top"* as this member's
+   * presence. The shell and not a screen, because the sheet opens over the
+   * overview as well as the deck. What is drawn over it is the fence's stack
+   * (`useInertBackground`), which orders the app's overlays as they paint.
    */
   closeSettings: () => void;
+  /**
+   * PR #1680 review — close the topmost of the app's overlays when it is one
+   * with no member of its own: the deck's command menu, its shortcut sheet, or
+   * a configuration sheet.
+   *
+   * **Served by the SHELL, and only while such an overlay is on top**, read
+   * from the fence's stack (`useInertBackground`) at dispatch time, for
+   * {@link dismissVoiceOverlay}'s reason.
+   */
+  closeOverlay: () => void;
   /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
@@ -669,18 +681,21 @@ export const VOICE_ACTIONS = {
      * open, so its absence IS the answer to "is anything on top?". Declaring it
      * would refuse the whole row whenever the overlay was closed. The same
      * holds for `closeNewAgent`, which the overview publishes only while the
-     * dialog is open, and for `closeSettings`, which the shell publishes only
-     * while Settings is open.
+     * dialog is open, and for `closeSettings` and `closeOverlay`, which the
+     * shell publishes only while what they close is open and on top.
      *
-     * **Settings is checked LAST, below the agent's pane** (issue #1197). The
-     * sheet is a shell overlay that stays open across a pane opened over it —
-     * by voice, or from the rail — and that pane is then what the user is
-     * looking at, so `close` takes the pane first and Settings on the next
-     * utterance. Before Settings moved to the shell it was not in this order
-     * at all, and `close` with it open answered "nothing to close".
+     * **Settings, and the overlays with no member of their own, are published
+     * only while they are on top** (issue #1197, PR #1680 review). The sheet is
+     * a shell overlay that stays open across a pane opened over it — by voice,
+     * or from the rail — and that pane is then what the user is looking at, so
+     * `close` takes the pane first and Settings on the next utterance. Which is
+     * on top is the fence's stack (`useInertBackground`), ordered as the app
+     * paints them: a sheet opened over the pane or the browser is raised above
+     * them, and `close` takes it first. So they are checked before the pane,
+     * and whichever is published closes what is on top.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closePullRequest" | "reportPending">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeOverlay" | "closePullRequest" | "reportPending">>,
       target: VoiceDispatchTarget,
     ) => {
       /* Reported once the page has closed, for `openPullRequestInBrowser`'s
@@ -696,8 +711,9 @@ export const VOICE_ACTIONS = {
         if (refused !== undefined) context.reportRefused(refused);
         return;
       }
-      if (target.agentViewOpen) return context.closeAgentView();
       if (context.closeSettings) return context.closeSettings();
+      if (context.closeOverlay) return context.closeOverlay();
+      if (target.agentViewOpen) return context.closeAgentView();
       context.reportNothingToClose();
     },
   },
@@ -1449,10 +1465,12 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * The members only the SHELL serves (issue #1197): closing Settings, which is
  * the shell's overlay rather than a screen's, since it opens over the overview
  * as well as the deck — published only while the sheet is open, see
- * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
+ * {@link VoiceActionContext.closeSettings} — closing the topmost overlay with
+ * no member of its own, read from the fence's stack, which spans both screens
+ * ({@link VoiceActionContext.closeOverlay}), and switching deck (PRD #1195),
  * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

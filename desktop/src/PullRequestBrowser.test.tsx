@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto, type PullRequestInfoDto, type VoiceResultDto, type VoiceStatusDto } from "./lib/bridge";
 import { PrBrowserHostContext, type PrBrowserHost } from "./lib/prBrowser";
@@ -10,7 +10,7 @@ vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
 }));
 
-import { DeckShell } from "./App";
+import { DeckShell, PULL_REQUEST_COVERED } from "./App";
 
 const DECK = "deck-000000000000dec1";
 const PR_URL = "https://github.com/vfarcic/dot-agent-deck/pull/12345";
@@ -823,5 +823,281 @@ describe("PRD #1401 — the pull request browser by voice", () => {
 
     await waitFor(() => expect(host.openExternal).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo) — voice's "close" closes what is drawn on top. The
+ * app's overlays paint in layers (`OVERLAY_LAYER`, read back from the
+ * stylesheet): a Settings or configuration sheet opened before the browser is
+ * drawn beneath it and the agent's pane, and one opened over them comes up
+ * above both. Each case below opens the browser over an agent's pane, puts one
+ * of the app's overlays with it, and says "close".
+ */
+describe("PRD #1401 — what close closes with the pull request browser open", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const CLOSE = dispatchOutcome("close", "closeTopmost", "close", "Closed.");
+  const experimental = { desktopFeatures: fixtureDesktopFeatures("?experimental=1") };
+  const deckPane = { kind: "agent" as const, deckId: DECK, agentId: "7", from: "deck" as const };
+
+  function renderAt(host: PrBrowserHost, initialView: Parameters<typeof DeckShell>[0]["initialView"], overrides: Partial<DeckRuntimeState> = {}, said = CLOSE) {
+    const voice = voiceRuntime(said);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, agent("8")], { ...voice.overrides, ...overrides })} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return voice;
+  }
+
+  async function say(voice: ReturnType<typeof voiceRuntime>, calls: number) {
+    if (calls === 1) fireEvent.click(screen.getByTestId("voice-trigger"));
+    else act(() => voice.deliver(CLOSE));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(calls));
+    await act(async () => { await Promise.resolve(); });
+  }
+
+  /**
+   * Scenario: Qodo's case. On the dashboard Settings is open, Coder 7's pane is
+   * opened over it, and its pull request over the pane. The page is on top and
+   * shown; "close" closes the page alone, the next one the pane, the next
+   * Settings.
+   */
+  it("closes the page over a pane opened over Settings, then the pane, then Settings", async () => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, { kind: "overview" });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+
+    expect.soft(screen.getByTestId("pr-browser"), "Settings is drawn beneath the page, so it does not hide it").not.toHaveAttribute("data-covered");
+    await say(voice, 1);
+    expect.soft(host.close, "close must close the page on top").toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    expect.soft(screen.queryByTestId("agent-pane-overlay"), "the pane under the page stays").toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Settings" }), "Settings under the pane stays").toBeInTheDocument();
+
+    await say(voice, 2);
+    expect.soft(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+
+    await say(voice, 3);
+    expect(screen.queryByRole("dialog", { name: "Settings" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: the same, but "scroll down". With Settings open beneath the
+   * pane, the page is in front and scrolls; with Settings opened over the page
+   * from the deck's command menu, the page is behind it and does not move.
+   */
+  it("scrolls the page with Settings beneath it, and not with Settings over it", async () => {
+    const scroll = dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling.");
+    const beneath = fakeHost();
+    const voice = renderAt(beneath.host, { kind: "overview" }, {}, scroll);
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(voice.resolveVoice).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(beneath.host.scroll, "the page in front scrolls").toHaveBeenCalledWith("down");
+    cleanup();
+
+    const over = fakeHost();
+    const deckVoice = renderAt(over.host, deckPane, experimental, scroll);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: /Open settings/ }));
+    await screen.findByTestId("settings-panel");
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    await waitFor(() => expect(deckVoice.resolveVoice).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect.soft(over.host.scroll, "the page behind Settings does not move").not.toHaveBeenCalled();
+    expect(screen.queryAllByText(PULL_REQUEST_COVERED).length, "and voice says why").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: on the deck, Coder 7's pane is open with its pull request over
+   * it, and the command menu (Ctrl+K) opens Settings or one of the
+   * configuration sheets over the page. That sheet comes up on top and takes
+   * input; "close" closes it, and the page and the pane stay.
+   */
+  it.each([
+    ["Settings", "Open settings", "settings-panel"],
+    ["the agent profiles sheet", "Open agent profiles", "agent-profiles-panel"],
+    ["the prompt library", "Open prompt library", "prompt-library-panel"],
+    ["the projects sheet", "Manage projects", "projects-panel"],
+  ])("closes %s opened over the page, and keeps the page and the pane", async (_what, command, testId) => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, deckPane, experimental);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(command) }));
+    const sheet = await screen.findByTestId(testId);
+    await act(async () => { await Promise.resolve(); });
+
+    expect.soft(sheet.closest("[inert]"), "a sheet opened over the page takes input").toBeNull();
+    expect.soft(screen.getByTestId("pr-browser"), "and hides the page drawn under it").toHaveAttribute("data-covered", "true");
+    await say(voice, 1);
+    expect.soft(screen.queryByTestId(testId), "close must close the sheet on top").not.toBeInTheDocument();
+    expect.soft(host.close, "and not the page under it").not.toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay"), "nor the pane under the page").toBeInTheDocument();
+    expect(screen.getByTestId("pr-browser")).not.toHaveAttribute("data-covered");
+  });
+
+  /**
+   * Scenario: on the deck, Coder 7's pane is open with its pull request over
+   * it, and the command menu (Ctrl+K) or the shortcut sheet (?) opens over
+   * the page. "close" closes that dialog, and the page and the pane stay.
+   */
+  it.each([
+    ["the command menu", { key: "k", ctrlKey: true }, "Command menu"],
+    ["the shortcut sheet", { key: "?" }, "Control keys"],
+  ])("closes %s over the page, and keeps the page and the pane", async (_what, key, name) => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, deckPane, experimental);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.keyDown(document.body, key);
+    await screen.findByRole("dialog", { name, hidden: true });
+
+    await say(voice, 1);
+    expect.soft(screen.queryByRole("dialog", { name, hidden: true }), "close must close the dialog on top").not.toBeInTheDocument();
+    expect.soft(host.close, "and not the page under it").not.toHaveBeenCalled();
+    expect.soft(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay"), "nor the pane under the page").toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: on the dashboard with Coder 7's pull request open, Ctrl+N opens
+   * the New agent dialog over the page. "close" closes the dialog and the page
+   * stays.
+   */
+  it("closes the New agent dialog over the page, and keeps the page", async () => {
+    const { host } = fakeHost();
+    const voice = renderAt(host, { kind: "overview" }, {
+      listDirectories: vi.fn(async (_deckId: string, path?: string) => ({ kind: "listing" as const, path: path ?? "/tmp", displayPath: path ?? "/tmp", parent: "/", entries: [], truncated: false })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    } as Partial<DeckRuntimeState>);
+    act(() => voice.deliver({ kind: "dispatch", transcript: "open the PR for Coder 7", action: "open_pr", invoke: "openPullRequest", params: [{ name: "agent", kind: "agent_ref", spoken: "Coder 7", value: "7", label: "Coder 7" }], sentence: "Opening the pull request." }));
+    await say(voice, 1);
+    expect(screen.getByTestId("pr-browser")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: /new agent/i });
+    expect.soft(dialog.closest("[inert]"), "the dialog over the page takes input").toBeNull();
+
+    await say(voice, 2);
+    expect.soft(screen.queryByRole("dialog", { name: /new agent/i })).not.toBeInTheDocument();
+    expect.soft(host.close).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("pr-browser")).toBeInTheDocument();
+  });
+});
+
+/**
+ * PR #1680 review (Qodo) — a failure belongs to the frame on screen and to the
+ * call that failed, not to the toolbar's session object at the time it was
+ * asked: an earlier switch that lands first replaces that object.
+ */
+describe("PRD #1401 — a failure after a queued switch has landed", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const OTHER_URL = "https://github.com/vfarcic/dot-agent-deck/pull/23456";
+  const otherPr = agent("8", { number: 23456, url: OTHER_URL, state: "open" });
+
+  function deferred() {
+    let resolve: () => void = () => undefined;
+    let reject: (error: Error) => void = () => undefined;
+    const promise = new Promise<undefined>((done, fail) => { resolve = () => done(undefined); reject = fail; });
+    return { promise, resolve, reject };
+  }
+
+  function renderDeck(host: PrBrowserHost) {
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr, otherPr], { desktopFeatures: fixtureDesktopFeatures("?experimental=1") })} initialView={{ kind: "deck" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+  }
+
+  /**
+   * Scenario: with Coder 7's pull request open, ask for Coder 8's and, before
+   * the page is there, for Coder 7's again. The switch to Coder 8's lands and
+   * the switch back fails: the toolbar names Coder 8's, the page on screen,
+   * and says why the switch back did not happen.
+   */
+  it("shows a later switch's failure once an earlier one has landed", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const toOther = deferred();
+    const back = deferred();
+    host.open.mockImplementationOnce(() => toOther.promise).mockImplementationOnce(() => back.promise);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-7")); });
+    expect(host.open).toHaveBeenCalledTimes(3);
+
+    await act(async () => { toOther.resolve(); });
+    await act(async () => { back.reject(new Error("The pull request browser could not open: navigate back failed")); });
+
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/navigate back failed/).length, "The failed switch back must be visible on the page on screen").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: with Coder 7's pull request open, ask for Coder 8's and press
+   * Close before the page is there. The switch lands and the close is refused:
+   * the frame stays on Coder 8's page and says why it did not close.
+   */
+  it("shows a close's failure once an earlier switch has landed", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const toOther = deferred();
+    const closing = deferred();
+    host.open.mockImplementationOnce(() => toOther.promise);
+    host.close.mockImplementationOnce(() => closing.promise);
+    await act(async () => { fireEvent.click(screen.getByTestId("pr-badge-8")); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+
+    await act(async () => { toOther.resolve(); });
+    await act(async () => { closing.reject(new Error("The pull request page did not close: refused")); });
+
+    expect.soft(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/did not close: refused/).length, "The refused close must be visible on the page on screen").toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: a failure that arrives for a frame that has since closed and
+   * been opened again is not said on the new one.
+   */
+  it("does not say an old frame's failure on a new one", async () => {
+    const { host } = fakeHost();
+    renderDeck(host);
+    fireEvent.click(screen.getByTestId("pr-badge-7"));
+    await act(async () => { await Promise.resolve(); });
+    const stale = deferred();
+    host.back.mockImplementationOnce(() => stale.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Close pull request" })); });
+    expect(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("pr-badge-8"));
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => { stale.reject(new Error("The old page could not go back")); });
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName("Pull request #23456 for Coder 8");
+    expect(screen.queryAllByText(/could not go back/)).toHaveLength(0);
   });
 });
