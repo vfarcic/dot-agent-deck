@@ -336,7 +336,7 @@ zbus = "5"
 # webview is moved into a `GtkOverlay` over the main one. NOT a new dependency:
 # `tauri`, `tao` and `wry` all build on this `gtk` on Linux and the lockfile
 # carries one 0.18. Declared for the discipline the `zbus` entry states.
-gtk = "0.18"
+gtk = "0.19"
 # PRD #1401's sign-out: `webkit_website_data_manager_clear` with its completion
 # callback, which wry's `clear_all_browsing_data` calls but discards, so the
 # app can say "signed out" only once WebKitGTK has said the delete finished.
