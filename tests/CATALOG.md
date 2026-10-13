@@ -3566,16 +3566,12 @@ without depending on the config struct API.
 - **Does not assert:** OpenCode delivery, covered separately by delegate/015 and /046.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/015 — Post-fix `clear = true` delivery reaches a REAL interactive OpenCode worker and the worker visibly acts on it. [reel]
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness; flaky-tolerant lane-2 e2e tier, runtime-skipped when the OpenCode CLI or credentials are unavailable). Imported OpenCode credentials and `--auto` prevent a permission prompt from blocking the pane; a test-only forwarding env can repoint the production readiness buffer to any value, which is how the pre-fix observation run was made and how the buffer is re-bracketed on a box the shipped figure was not measured on.
-- **Agent:** REAL interactive OpenCode (no `opencode run`, no stand-in) as the `clear = true` `coder` role, on whatever `common::opencode_test_model()` resolves — `anthropic/claude-haiku-4-5-20251001` by default since issue #922, overridable per host with `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`. That accessor is the single source of truth and is deliberately not restated as a literal here: this line said `openrouter/openai/gpt-4o-mini` for two defaults after that stopped being true. The deterministic orchestrator role invokes the genuine delegate CLI.
-- **Asserts:** the OpenCode TUI is visibly ready before delegation; after the delegate respawns it, the role card visibly traverses Thinking → Working with its shell tool, the OpenCode plugin's native `session.prompt` event carries the injected `worker-task-coder.md` pointer, and it creates `prd249-opencode-respawn-8a62f4.txt` with exact known contents.
-- **Could not pass at all between an unknown OpenCode release and 2026-09-08 (issues #878/#921), and it failed in the FIRST assertion above rather than in anything it exists to cover.** The readiness needle was the literal `"Ask anything..."` (ASCII `2e 2e 2e`) while OpenCode paints `Ask anything…` (one U+2026, `e2 80 a6`); the wait underneath is a plain `contains`, so it burned its full 120 s on a run where OpenCode had booted and was visibly at its composer, then blamed credentials. Repaired by matching `Ask anything` and leaving the decoration out — see `RealDelegateCase::input_ready_needles`, which explains why pasting in the new glyph was the wrong repair — and the diagnostic no longer asserts a cause. **This is CLAUDE.md rule 5's stated cost, observed:** nothing in CI runs this lane, the trigger was an upstream UI string rather than any change here, and the sibling Claude arm `/014` was unaffected because its needle (`? for shortcuts`) carries no decorative glyph.
-- **Also asserts, since issue #243 and reworked by issue #1381:** that the pointer is SUBMITTED within the 8000 ms hold plus the first two waits of the shipped re-send schedule plus 10 s (`opencode_delegate_to_submit_budget`, 78 s at the defaults), with the in-place re-send ON as in production; that the daemon log shows the declared-no-signal hold at `buffer_ms=8000` and no `SessionStart wait timed out` fallback; and that OpenCode's transcript holds the task pointer as exactly one user turn. Until #1381 the bound was 20 s, chosen to sit under the ~31 s a regression to #243's dead wait would take, and it was the only thing separating the two paths. That needed the re-send off, which is a path production no longer has, and on a loaded box the test then went red with #1381's own symptom. A recovered delivery lands about 30 s after release, which is the range the old bound separated, so the dead-wait check now reads the daemon's own log instead of elapsed time.
-- **Was RED at the shipped defaults on 2026-08-26 — this test had never been executed by anyone before that — and the product changed in `df11513` rather than the test.** The pin above is now 8000 ms, mirroring the `NO_SIGNAL_READINESS_BUFFER` a declared-`NoSignal` agent resolves in production (1.78x the contended requirement, 3.2x the idle one, 19/19 delivered at the shipped value). What follows is the finding that produced it, kept because it is the derivation. The 20 s bound is not what fails and widening it would move nothing: the deck delivers promptly (`delegate exit=0`, pointer file on disk inside 5 s, every run) and that assertion is never reached. The run dies three assertions earlier, on the worker never entering `Thinking` at all — the pointer is written into a replacement OpenCode still bringing its TUI up and the bytes are swallowed outright, with the composer rendering its empty `Ask anything` placeholder afterwards (PRD #225 Defect 1's shape, a write into a line discipline that is not yet the agent's — not #663's parked-payload shape). Bracketed one full run per value against `DOT_AGENT_DECK_E2E_DELEGATE_READINESS_BUFFER_MS`: **1000 ms FAIL (2/2), 2000 ms FAIL, 5000 ms PASS (25.3 s), 15000 ms PASS (43.0 s)** — so a replacement OpenCode needs between 2 s and 5 s and the shipped value is under it by at least 2x. **A product finding, and a regression this issue introduced:** before #243 an OpenCode delegate sat out the full 30 s `SESSION_START_WAIT_TIMEOUT` for an event measured never to arrive, which was dead time by every measure except one — it happened to give the replacement 30 s to boot. Deleting that dead wait for declared-`NoSignal` agents is right; it left the 1000 ms `DELEGATE_READINESS_BUFFER` carrying a load it was never sized for (PRD #249's "warm-case 500 ms, doubled for a cold start", derived against a 650 ms stub). The fix landed on the `NoSignal` path rather than in this test: a third default sized across 176 runs against real `opencode` 1.18.23, where delivery tracks the composer paint alone and **zero runs parked** the payload — so unlike the wrapper path the loss is monotonic and a longer interval introduces no second failure mode.
-- **Does not assert:** exact model phrasing, a universal OpenCode startup-time distribution from one host, the deterministic race (covered by `/012`), or work-done delivery. The sibling `orchestration/delegate/014` carries NO such bound, deliberately: Claude's readiness path is untouched by #243 and is the healthy baseline its budgets are derived from, not one of its victims.
-- **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
-- **Cost note:** one short cheap-model worker turn per observation (Haiku at the current default), plus the one-turn model probe `check_opencode_available` runs as its preflight since issue #922.
+##### orchestration/delegate/015 — A declared OpenCode launcher receives a clear=true inbox delegate.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`).
+- **Agent:** genuine interactive OpenCode on `opencode_test_model()`, behind a launcher with `agent = "opencode"`; real orchestrator delegate CLI and branch-installed plugins in scratch HOME/XDG.
+- **Asserts:** clear replaces the worker, native inbox delivery visibly runs in the replacement, exact sentinel, final reply and plugin-confirmed acknowledgement without a doorbell.
+- **Does not assert:** retired no-signal typing buffers, Enter probes, pointer retypes or their latency bounds.
+- **Cost:** one cheap real-agent work turn.
 
 ##### orchestration/delegate/016 — The generated orchestrator context names what `binary_name()` resolves for the running process, not a baked-in literal (issue prageethw/dot-agent-deck#253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `orchestrator_context::build_orchestrator_context`; no TUI harness, no daemon).
@@ -3802,13 +3798,12 @@ without depending on the config struct API.
 - **Does not assert:** an LLM following the task-file instruction or a real agent's hook delivery.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/046 — A real interactive OpenCode worker completes a delegation whose first pointer is sent during boot (issue #1383).
-- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`; real TUI, daemon, OpenCode, and `work-done` CLI; developer credentials required).
-- **Agent:** real interactive OpenCode on the configured cheap test model, with `--auto`; the worker has a uniquely named fixture sentinel in its orchestration worktree.
-- **Asserts:** with a zero readiness buffer and the shipped re-send schedule (it used a shorter test-only one until issue #1381; on a starved box that ran out before OpenCode booted), the replacement worker lists the fixture worktree by its explicit path, reports the exact sentinel filename through `work-done`, and keeps the same daemon agent identity until completion. The daemon log shows no Enter-only probe or pointer retype after that pane's first `Thinking` or `ToolStart` proof; OpenCode's transcript database contains exactly one user text part for the task pointer. It counts submit-only probes and in-place pointer re-deliveries separately and reports whether a retype was likely the copy that landed; the log cannot identify the consumed copy with certainty. A failure preserves the log beside the harness cast.
-- **Does not assert:** a universal OpenCode boot distribution or that every run loses its first pointer; the zero buffer makes that race likely, while `/042` pins the loss deterministically.
-- **Platform coverage:** mac+linux (Unix PTY; local lane 2 only).
-- **Cost note:** one short real OpenCode worker turn plus the model preflight.
+##### orchestration/delegate/046 — A real OpenCode replacement consumes a task queued before its launcher permits boot.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`).
+- **Agent:** genuine interactive OpenCode on `opencode_test_model()`, delayed only by its scratch launcher; real delegate CLI.
+- **Asserts:** the task is queued before the replacement boots; releasing the launcher leads to visible native execution, exact sentinel and one acknowledged hand-over in that same replacement.
+- **Does not assert:** recovery of typed pointers, which inbox delivery removed, or ack-wait retry after a committed-but-unacknowledged turn.
+- **Cost:** one cheap real-agent work turn.
 
 ##### orchestration/delegate/047 — A ready Claude composer recovers an unsubmitted pointer (issue #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
@@ -8363,3 +8358,60 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** early native announcement holds the spawn-time task, stream delivery and acknowledgement send zero composer input.
 - **Does not assert:** real OpenCode's boot event ordering.
 - **Cost:** none.
+
+
+##### inbox/opencode/015 — Real idle OpenCode receives a native delegate in its shown session. [reel]
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** Idle with a prior prompt, same shown session, visible framed message and reply, exact sentinel, plugin-confirmed acknowledgement.
+- **Does not assert:** Fresh-home routing and busy queues.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/016 — Real OpenCode /new keeps a draft and leaves the old session unchanged.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** New shown session, retained composer draft, unchanged old messages, sentinel and acknowledgement.
+- **Does not assert:** A model change made on home before any prompt.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/017 — Real fresh OpenCode avoids three older roots and uses the argv model.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** Three real seeded roots remain unchanged; a fourth shown root uses the argv test model and executes the task.
+- **Does not assert:** Provider defaults when argv has no model.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/018 — Real busy OpenCode shows QUEUED and executes native delegates in order.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** A genuine slow tool followed by a delegate, visible QUEUED, exact append order and acknowledgement.
+- **Does not assert:** Escape cancellation and ack-wait redelivery.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/019 — A real OpenCode child view returns to the root to execute a delegate.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** A genuine subagent child, actual child-view precondition, navigation to root, visible reply, sentinel and no task in the child.
+- **Does not assert:** Manual navigation shortcuts; a test observer invokes the real route API for setup.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/020 — Real OpenCode mini redraws native work without losing a draft.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** Native mini component, visible framed task and final reply without further input, draft retained, sentinel and acknowledgement.
+- **Does not assert:** A long transcript's redraw latency.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/021 — Real OpenCode respawns a killed inbox watcher and delivers natively.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** Only the captured pane-owned watcher is killed; a new watcher arms and the next delegate visibly completes without a doorbell.
+- **Does not assert:** Pi or OpenCode process crash cleanup.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/022 — Real unarmed OpenCode intercepts a doorbell before the model.
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
+- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** No deck TUI watcher, genuine doorbell, server-plugin fetch, visible reply and sentinel, server-plugin CLI acknowledgement (`explicit`), no model-side inbox fetch.
+- **Does not assert:** Remote attach and non-TUI OpenCode commands.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
