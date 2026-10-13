@@ -240,8 +240,11 @@ enum Commands {
         tool_detail: Option<String>,
         /// Declare that the reporter reports every prompt the agent submits,
         /// so the deck may re-submit a delivered prompt it never reported
-        /// (issue #1567). Sent by the bundled Pi extension on every report.
-        #[arg(long = "reports-prompts")]
+        /// (issue #1567). Hidden: inbox delivery (PRD #1666) re-submits
+        /// nothing and the prompt-confirmation machinery this declaration
+        /// feeds is being removed, but installed Pi extensions still pass it
+        /// on every report, so it stays accepted.
+        #[arg(long = "reports-prompts", hide = true)]
         reports_prompts: bool,
         /// Read the final reply of the turn that just settled (with `--type
         /// finished`) from stdin, for the deck's reading mode (PRD #1497). Sent

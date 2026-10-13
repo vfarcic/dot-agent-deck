@@ -459,6 +459,55 @@ mod tests {
         assert!(index.contains("./orchestrator.ts"));
     }
 
+    fn embedded(name: &str) -> &'static str {
+        EXTENSION_FILES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("{name} must be embedded"))
+    }
+
+    /// The extension prefixes every inbox delivery with its own copy of the
+    /// framing sentence, which must stay the deck's `AGENT_FRAMING` byte for
+    /// byte (PRD #1666): the copy is a single-line JSON string literal, so it
+    /// is the Rust constant's JSON encoding.
+    #[test]
+    fn embedded_inbox_framing_matches_agent_framing() {
+        let literal = serde_json::to_string(crate::inbox_hub::AGENT_FRAMING).unwrap();
+        assert!(
+            embedded("orchestrator.ts")
+                .contains(&format!("export const INBOX_FRAMING =\n\t{literal};")),
+            "pi-extension/src/orchestrator.ts INBOX_FRAMING drifted from inbox_hub::AGENT_FRAMING"
+        );
+    }
+
+    /// The extension recognises the doorbell line typed into Pi by the deck's
+    /// own prefix and suffix, and stops respawning its watcher on the exit
+    /// status `inbox wait --stream` gives outside a deck.
+    #[test]
+    fn embedded_doorbell_and_exit_constants_match_the_deck() {
+        let source = embedded("orchestrator.ts");
+        let prefix = crate::doorbell::LINE_PREFIX.trim();
+        assert!(
+            source.contains(&format!("export const DOORBELL_PREFIX = \"{prefix}\";")),
+            "DOORBELL_PREFIX drifted from doorbell::LINE_PREFIX"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const DOORBELL_SUFFIX = \"{}\";",
+                crate::doorbell::LINE_SUFFIX
+            )),
+            "DOORBELL_SUFFIX drifted from doorbell::LINE_SUFFIX"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const WATCHER_NOT_IN_DECK_EXIT = {};",
+                crate::inbox_cli::STREAM_NOT_IN_DECK_EXIT
+            )),
+            "WATCHER_NOT_IN_DECK_EXIT drifted from inbox_cli::STREAM_NOT_IN_DECK_EXIT"
+        );
+    }
+
     /// Re-running materialization overwrites in place (idempotent refresh),
     /// never erroring on an existing dir/file.
     #[test]

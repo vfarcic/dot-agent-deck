@@ -96,6 +96,13 @@ fn parent_pid() -> Option<u32> {
     }
 }
 
+/// Exit status of `inbox wait --stream` run outside a deck pane or without a
+/// capability token. The Pi extension stops respawning its watcher on it
+/// (`WATCHER_NOT_IN_DECK_EXIT` in `pi-extension/src/orchestrator.ts`, pinned by
+/// a test in `orchestrator_ext`), so a Pi started outside the deck does not
+/// retry forever.
+pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
+
 /// `dot-agent-deck inbox wait --agent <agent> [--stream]`.
 ///
 /// **Once** (Claude Code's `asyncRewake` hook): blocks until the deck hands
@@ -106,13 +113,20 @@ fn parent_pid() -> Option<u32> {
 ///
 /// **Stream** (the OpenCode plugin, the Pi extension): prints each handed-over
 /// message as one JSON line on stdout and forwards `{"ack":[…]}` /
-/// `{"nack":[…]}` lines from stdin to the deck, until either side closes.
+/// `{"nack":[…]}` lines from stdin to the deck, until either side closes. Run
+/// outside a deck pane, or without a capability token, it exits
+/// [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot succeed.
 pub fn wait(agent: &str, stream: bool) -> ExitCode {
+    let not_in_deck = if stream {
+        ExitCode::from(STREAM_NOT_IN_DECK_EXIT)
+    } else {
+        ExitCode::SUCCESS
+    };
     let Some(identity) = identity() else {
-        return ExitCode::SUCCESS;
+        return not_in_deck;
     };
     if identity.token.is_none() {
-        return ExitCode::SUCCESS;
+        return not_in_deck;
     }
     let session = if stream { None } else { read_hook_session() };
     let request = DaemonMessage::InboxWait(InboxWaitRequest {
