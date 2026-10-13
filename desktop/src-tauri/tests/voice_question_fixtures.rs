@@ -66,7 +66,8 @@ const OPENCODE_PERMISSION: &str =
 #[derive(Debug, Clone, Copy)]
 enum Planted {
     /// Claude Code's Bash permission: 1 Yes, 2 always allow access to the
-    /// directory, 3 the keyboard-only "Yes, and switch to auto mode", 4 No.
+    /// directory, 3 the keyboard-only "Yes, and switch to auto mode", which
+    /// Claude may leave out, 4 No.
     ClaudeBash,
     /// Codex's command approval: 1 Yes, proceed, 2 don't ask again for the
     /// prefix, 3 No, and tell Codex what to do differently.
@@ -164,6 +165,14 @@ fn fixtures() -> Vec<Fixture> {
             "no, don't run that",
             answer(&[(0, &[4])]),
         ),
+        // PR #1698: Claude may leave the auto-mode option out, so No is 3 or 4
+        // on screen and the number chooses nothing.
+        f(
+            "claude-permission-number-after-auto-mode",
+            ClaudeBash,
+            "three",
+            Expect::Refused("say \u{201c}No\u{201d}"),
+        ),
         f(
             "claude-permission-always-allow",
             ClaudeBash,
@@ -176,13 +185,13 @@ fn fixtures() -> Vec<Fixture> {
             "open the dashboard",
             Expect::NotAnswer,
         ),
-        // PR #1698: "yes" fits both "Yes, proceed" and "Yes, and don't ask
-        // again …" and is neither whole, so it chooses nothing and names both.
+        // PR #1698: "yes" starts both "Yes, proceed" and "Yes, and don't ask
+        // again …", and only the first allows once, so it is that one.
         f(
             "codex-permission-yes",
             CodexPermission,
             "yes",
-            Expect::Refused("could be 1"),
+            answer(&[(0, &[1])]),
         ),
         f(
             "codex-permission-go-ahead",

@@ -3320,8 +3320,8 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     tool: { name: "Bash", detail: "git push origin main" },
     questions: [{ prompt: "Allow Bash?", multiSelect: false, options: [
       { index: 1, label: "Yes", role: "allow_once", answerable: true },
-      { index: 2, label: "Yes, and switch to auto mode", role: "allow_always", answerable: false },
-      { index: 3, label: "No", role: "deny", answerable: true },
+      { index: 2, label: "Yes, and switch to auto mode", role: "allow_always", answerable: false, screenNumbers: [2] },
+      { index: 3, label: "No", role: "deny", answerable: true, screenNumbers: [2, 3] },
     ] }],
   };
   /** Planner in typing mode: "typing on" enters it, "send it" submits, anything else is dictated. */
@@ -3367,8 +3367,9 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
   /**
    * Scenario (question/desktop/030, PR #1698): typing mode is on and Planner
    * waits on the same prompt. "run the tests" is no option, so nothing is
-   * typed, and the row lists what can be said — the options with their
-   * numbers, the keyboard-only one left out. "send it" presses nothing.
+   * typed, and the row lists what can be said — Yes with its number and No
+   * by name, since Claude may leave the auto-mode option before it out, and
+   * the keyboard-only one left out. "send it" presses nothing.
    * Typing mode stays on throughout.
    */
   it("question/desktop/030: in typing mode words that are no option are refused, listing the options", async () => {
@@ -3377,14 +3378,14 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await h.say("typing on");
     await h.say("run the tests");
     expect(written(h.deck)).toEqual([]);
-    const refusal = "Nothing was typed — Planner is waiting on a question. Answer it by saying an option or its number — 1 “Yes”, 3 “No” — or use the keyboard.";
+    const refusal = "Nothing was typed — Planner is waiting on a question. Answer it by saying an option or its number — 1 “Yes”, “No” — or use the keyboard.";
     expect(screen.getByTestId("voice-report")).toHaveTextContent(refusal);
-    expect(voiceQuestionWaitingNoTyping("Planner", "voice", "1 “Yes”, 3 “No”")).toBe(refusal);
+    expect(voiceQuestionWaitingNoTyping("Planner", "voice", "1 “Yes”, “No”")).toBe(refusal);
     await h.say("send it");
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS * 2); });
     await flush();
     expect(written(h.deck)).toEqual([]);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was pressed — Planner is waiting on a question. Answer it by saying an option or its number — 1 “Yes”, 3 “No” — or use the keyboard.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was pressed — Planner is waiting on a question. Answer it by saying an option or its number — 1 “Yes”, “No” — or use the keyboard.");
     expect(screen.getByTestId("voice-typing-indicator")).toHaveTextContent("Typing to Planner");
   });
 
@@ -3424,7 +3425,9 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(questionReach(pane, false)).toBe("keyboard");
     expect(questionReach({ ...pane, question: { ...WAITING, answerable: false } }, true)).toBe("keyboard");
     expect(questionOptionsToSay(WAITING)).toBe("1 “Yes”, 3 “No”");
-    expect(questionOptionsToSay(AUTO_MODE)).toBe("1 “Yes”, 3 “No”");
+    // Claude may leave the auto-mode option out, so No's number is not
+    // certain and it is named alone (PR #1698).
+    expect(questionOptionsToSay(AUTO_MODE)).toBe("1 “Yes”, “No”");
     expect(voiceQuestionNextStep("voice")).toBe("Answer it by voice, or use the keyboard.");
     expect(voiceQuestionNextStep("voice", "1 “Yes”, 3 “No”")).toBe("Answer it by saying an option or its number — 1 “Yes”, 3 “No” — or use the keyboard.");
     expect(voiceQuestionNextStep("hidden", "1 “Yes”")).toBe("Open its terminal to answer it, or use the keyboard.");

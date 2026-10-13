@@ -217,10 +217,9 @@ desktopScenario("voice-choice", async (page) => {
 // PRD #1631 — answering an agent's question, desktop-only (the TUI has no
 // voice). The `docs-question` fixture stops the Desktop implementation agent
 // (Codex) on a command approval; with its pane open, the scripted microphone
-// says "go ahead" — not "yes", which on Codex's prompt fits two options and
-// chooses nothing (PR #1698) — and the image shows the voice row's answer,
-// naming the option and the command, with its countdown and Cancel, beside
-// the prompt in the pane.
+// says "go ahead", and the image shows the voice row's answer, naming the
+// option and the command, with its countdown and Cancel, beside the prompt in
+// the pane.
 desktopScenario("voice-question", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({

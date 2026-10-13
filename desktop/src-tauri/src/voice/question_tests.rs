@@ -17,6 +17,7 @@ fn option(index: u32, label: &str, role: OptionRole) -> QuestionOption {
         role,
         keyboard_only: false,
         scope: None,
+        maybe_hidden: false,
     }
 }
 
@@ -1419,13 +1420,14 @@ fn refusal(verdict: Result<Vec<(u32, Vec<u32>)>, QuestionVerdict>) -> String {
 /// waiting, the user picks an option by its number — "2", "two", "second",
 /// "option two", "number two", "the second one" — or "the last one". The
 /// number is the one the agent draws beside the option (or its place in
-/// OpenCode's unnumbered row), so on Claude Code's prompt "3" is No, as on
+/// OpenCode's unnumbered row), so on Claude Code's prompt "1" is Yes, as on
 /// screen; a number the agent draws beside nothing is refused, naming the
-/// options with their numbers.
+/// options with their numbers. Claude's No, after an option Claude may leave
+/// out, is chosen by name, not number (question/desktop/031).
 #[tokio::test]
 async fn question_desktop_020_an_option_is_chosen_by_its_number() {
     let cases: [(&str, DesktopPendingQuestion, u32); 5] = [
-        ("claude", claude_auto_mode(), 3),
+        ("claude", claude_auto_mode(), 1),
         ("codex", codex_permission(), 2),
         ("opencode", opencode_permission(), 2),
         ("pi", pi_select(), 2),
@@ -1457,11 +1459,11 @@ async fn question_desktop_020_an_option_is_chosen_by_its_number() {
             );
         }
     }
-    // Claude's own case: "two" names the keyboard-only auto-mode option the
-    // screen shows at 2, which voice cannot pick — never No.
+    // Claude's own case: "two" is the auto-mode option where Claude draws
+    // it and No where it does not, so it chooses neither.
     assert_eq!(
         refusal(chose(&claude_auto_mode(), &[], "two").await),
-        "\u{201c}Yes, and switch to auto mode\u{201d} has to be answered by keyboard."
+        "On screen \u{201c}No\u{201d} may be 2 or 3 — say \u{201c}No\u{201d}. Nothing was chosen."
     );
     assert_eq!(
         chose(&claude_auto_mode(), &[], "the last one")
@@ -1603,19 +1605,21 @@ async fn question_desktop_022_a_whole_label_wins_and_the_countdown_names_it() {
 }
 
 /// Scenario (question/desktop/023): the user says words that fit more than
-/// one option and match none whole — "yes" to Codex (Yes, proceed / Yes, and
-/// don't ask again …), "allow" to OpenCode (Allow once / Allow always). Nothing
-/// is chosen, and the refusal names the options it could be with their
-/// numbers, so the user can say one.
+/// one option, match none whole, and fit no option that allows once — "yes
+/// and" to Claude Code (its always option and "Yes, and switch to auto mode"),
+/// "allow for" to Devin (its session and project options). Nothing is chosen,
+/// and the refusal names the options it could be — with their numbers where
+/// the screen's number is certain — so the user can say one.
 #[tokio::test]
 async fn question_desktop_023_words_that_fit_several_options_choose_none() {
+    let claude = map_pending_question(&claude_bash_suggested());
     assert_eq!(
-        refusal(chose(&codex_permission(), &[], "yes").await),
-        "\u{201c}yes\u{201d} could be 1 \u{201c}Yes, proceed\u{201d} or 2 \u{201c}Yes, and don't ask again for commands that start with the prefix shown\u{201d} — say its number or more of its words. Nothing was chosen."
+        refusal(chose(&claude, &[], "yes and").await),
+        "\u{201c}yes and\u{201d} could be 2 \u{201c}Yes, and always allow access to /work/proj from this project\u{201d} or \u{201c}Yes, and switch to auto mode\u{201d} — say more of its words. Nothing was chosen."
     );
     assert_eq!(
-        refusal(chose(&opencode_permission(), &[], "allow").await),
-        "\u{201c}allow\u{201d} could be 1 \u{201c}Allow once\u{201d} or 2 \u{201c}Allow always\u{201d} — say its number or more of its words. Nothing was chosen."
+        refusal(chose(&devin_permission(), &[], "allow for").await),
+        "\u{201c}allow for\u{201d} could be 2 \u{201c}Allow for session\u{201d}, 3 \u{201c}Allow for project\u{201d} or 4 \u{201c}Allow for project (local)\u{201d} — say its number or more of its words. Nothing was chosen."
     );
     // Said more fully, it is one option.
     assert_eq!(
@@ -1644,7 +1648,8 @@ async fn question_desktop_023_words_that_fit_several_options_choose_none() {
 /// option's label, part or number — "go to the overview" — so nothing is
 /// chosen here and the Commands model is asked; when it says this is not an
 /// answer, the utterance goes on to ordinary command handling. A model answer
-/// the question cannot take is refused naming every option with its number.
+/// the question cannot take is refused naming every option with its number,
+/// or by name alone where the number on screen is not certain.
 #[tokio::test]
 async fn question_desktop_024_words_that_match_nothing_choose_nothing() {
     for question in [
@@ -1668,7 +1673,7 @@ async fn question_desktop_024_words_that_match_nothing_choose_nothing() {
     match say(&resolver, &claude_auto_mode(), &[], "both of them").await {
         QuestionVerdict::Refused { sentence } => assert_eq!(
             sentence,
-            "I couldn't match that to the options: 1 \u{201c}Yes\u{201d}, 3 \u{201c}No\u{201d}."
+            "I couldn't match that to the options: 1 \u{201c}Yes\u{201d}, \u{201c}No\u{201d}."
         ),
         other => panic!("{other:?}"),
     }
@@ -1849,5 +1854,144 @@ async fn question_desktop_029_typing_mode_matches_on_this_machine_only() {
         resolver.question_calls(),
         0,
         "nothing reached the Commands model"
+    );
+}
+
+/// Claude Code's Bash prompt in the default mode beside an "always"
+/// suggestion, as the daemon builds it: 1 Yes, 2 "Yes, and always allow access
+/// to /work/proj from this project", 3 the keyboard-only "Yes, and switch to
+/// auto mode" Claude may or may not draw, 4 No.
+fn claude_bash_suggested() -> PendingQuestion {
+    let payload = agent_fixture("claude-permission-bash.json");
+    dot_agent_deck::question::claude_permission_request(
+        "q-claude".into(),
+        "Bash",
+        payload.get("tool_input"),
+        Some("touch created_m1.txt".into()),
+        payload.get("permission_suggestions"),
+        payload["permission_mode"].as_str(),
+        1,
+        None,
+    )
+    .question
+}
+
+/// Scenario (question/desktop/031): Claude Code asks to run a Bash command in
+/// the default mode and may or may not draw "Yes, and switch to auto mode"
+/// before No — the deck cannot tell which — so No is 3 or 4 on screen. "1"
+/// and "two" still choose Yes and the always option, which come before it;
+/// "3", "4" and "the fourth one" choose nothing and say to say No by name;
+/// "no" and "the last one" choose No. The refusal lists and reading mode name
+/// No without a number. Without the suggestion, "2" and "3" are refused the
+/// same way and "4" is no option at all.
+#[tokio::test]
+async fn question_desktop_031_numbers_after_an_option_claude_may_leave_out_choose_nothing() {
+    let question = map_pending_question(&claude_bash_suggested());
+    assert_eq!(chose(&question, &[], "1").await.unwrap(), [(0, vec![1])]);
+    assert_eq!(chose(&question, &[], "two").await.unwrap(), [(0, vec![2])]);
+    for said in ["3", "three", "4", "four", "the fourth one", "option 4"] {
+        assert_eq!(
+            refusal(chose(&question, &[], said).await),
+            "On screen \u{201c}No\u{201d} may be 3 or 4 — say \u{201c}No\u{201d}. Nothing was chosen.",
+            "{said:?}"
+        );
+    }
+    for said in ["no", "No.", "um, no", "the last one"] {
+        assert_eq!(
+            chose(&question, &[], said).await.unwrap(),
+            [(0, vec![4])],
+            "{said:?}"
+        );
+    }
+    assert_eq!(chose(&question, &[], "Yes").await.unwrap(), [(0, vec![1])]);
+    assert_eq!(
+        refusal(chose(&question, &[], "seven").await),
+        "There is no option 7, so nothing was chosen. The options are 1 \u{201c}Yes\u{201d}, 2 \u{201c}Yes, and always allow access to /work/proj from this project\u{201d}, \u{201c}No\u{201d}."
+    );
+    let resolver = StubResolver::new().answering_question(
+        "both of them",
+        ModelAnswer::answer(0, &[1, 4]).citing("both of them"),
+    );
+    match say(&resolver, &question, &[], "both of them").await {
+        QuestionVerdict::Refused { sentence } => assert_eq!(
+            sentence,
+            "I couldn't match that to the options: 1 \u{201c}Yes\u{201d}, 2 \u{201c}Yes, and always allow access to /work/proj from this project\u{201d}, \u{201c}No\u{201d}."
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        crate::voice::reading::options_sentence(&claude_bash_suggested()),
+        " Say 1 for Yes or 2 for Yes, and always allow access to /work/proj from this project, or say No."
+    );
+
+    // Without the suggestion: 1 Yes, 2 auto mode (may be left out), 3 No.
+    let bare = claude_auto_mode();
+    for said in ["2", "two", "3", "three"] {
+        assert_eq!(
+            refusal(chose(&bare, &[], said).await),
+            "On screen \u{201c}No\u{201d} may be 2 or 3 — say \u{201c}No\u{201d}. Nothing was chosen.",
+            "{said:?}"
+        );
+    }
+    assert_eq!(
+        refusal(chose(&bare, &[], "4").await),
+        "There is no option 4, so nothing was chosen. The options are 1 \u{201c}Yes\u{201d}, \u{201c}No\u{201d}."
+    );
+    assert_eq!(chose(&bare, &[], "no").await.unwrap(), [(0, vec![3])]);
+}
+
+/// Scenario (question/desktop/032): the user says "yes" to Codex's approval,
+/// which fits both "Yes, proceed" and "Yes, and don't ask again …" as their
+/// first word. Exactly one of them allows once, so it is chosen, and the
+/// countdown names it; OpenCode's "allow" is Allow once the same way. Words that start two options neither of which allows
+/// once, or two that both do, or that start only one of them, still choose
+/// nothing; a whole label still wins over everything.
+#[tokio::test]
+async fn question_desktop_032_a_leading_word_shared_with_allow_once_chooses_it() {
+    let codex = codex_permission();
+    for said in ["yes", "Yes.", "um, yes please"] {
+        assert_eq!(
+            chose(&codex, &[], said).await.unwrap(),
+            [(0, vec![1])],
+            "{said:?}"
+        );
+    }
+    let resolver = StubResolver::new();
+    match say(&resolver, &codex, &[], "yes").await {
+        QuestionVerdict::Answered {
+            summary, always, ..
+        } => {
+            assert_eq!(
+                summary,
+                "\u{201c}Yes, proceed\u{201d} (allow once) — touch codex_b.txt"
+            );
+            assert_eq!(always, None);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // "yes and" starts the always option and the auto-mode one on Claude's
+    // prompt, and neither allows once.
+    let claude = map_pending_question(&claude_bash_suggested());
+    assert!(
+        refusal(chose(&claude, &[], "yes and").await).contains("could be 2 "),
+        "two options, neither allowing once, stay ambiguous"
+    );
+    // Two allow-once options that both start so: still ambiguous.
+    let mut twice = codex_permission();
+    twice.questions[0].options[1].role = "allow_once".into();
+    assert!(refusal(chose(&twice, &[], "yes").await).contains("could be 1 "));
+    // A word that starts one label and sits later in another is no tie
+    // between leading parts.
+    let mut later = opencode_permission();
+    later.questions[0].options[1].label = "Always allow".into();
+    assert!(refusal(chose(&later, &[], "allow").await).contains("could be 1 "));
+    // A whole label still wins, as on Claude's prompt.
+    assert_eq!(chose(&claude, &[], "yes").await.unwrap(), [(0, vec![1])]);
+    // Every agent's table the same way: OpenCode's "allow" starts Allow once
+    // and Allow always, and is Allow once.
+    assert_eq!(
+        chose(&opencode_permission(), &[], "allow").await.unwrap(),
+        [(0, vec![1])]
     );
 }

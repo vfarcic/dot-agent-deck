@@ -88,7 +88,9 @@ each selection names a question by `question_index` and options by their `index`
 numbers, and you may only name options listed there. Match by number, by ordinal, by \
 the option's words, or by a synonym — \"yes\", \"go ahead\", \"sure\", \"do it\" pick \
 an `allow_once` option; \"no\", \"don't\", \"stop\" pick a `deny` option; \"always\", \
-\"don't ask again\" pick an `allow_always` option. One utterance may answer several \
+\"don't ask again\" pick an `allow_always` option. An option that lists \
+`screen_numbers` may be drawn under any of them, so never choose it by a number or an \
+ordinal. One utterance may answer several \
 questions (\"red for colour and large for size\"), and a question with `multi_select` \
 true takes several options at once. Every selection carries `evidence`: the words \
 of the utterance that chose it, copied EXACTLY as the user said them — never \
@@ -1208,13 +1210,19 @@ pub fn question_state(request: &QuestionRequest<'_>) -> Value {
                 "header": q.header,
                 "prompt": q.prompt,
                 "multi_select": q.multi_select,
-                "options": q.options.iter().map(|option| json!({
-                    "index": option.index,
-                    "label": option.label,
-                    "description": option.description,
-                    "role": option.role,
-                    "answerable": option.answerable,
-                })).collect::<Vec<_>>(),
+                "options": q.options.iter().map(|option| {
+                    let mut entry = json!({
+                        "index": option.index,
+                        "label": option.label,
+                        "description": option.description,
+                        "role": option.role,
+                        "answerable": option.answerable,
+                    });
+                    if let Some(numbers) = &option.screen_numbers {
+                        entry["screen_numbers"] = json!(numbers);
+                    }
+                    entry
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();

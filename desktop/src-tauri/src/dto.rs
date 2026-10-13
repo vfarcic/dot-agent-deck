@@ -774,6 +774,20 @@ pub struct DesktopQuestionOption {
     /// For `allow_always`: what "always" covers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// PR #1698: set when the number the agent draws beside this option is
+    /// not certain — every number it may be, lowest first — because the agent
+    /// may leave out an option before it, or this one. Such an option is
+    /// named by its label, never chosen by a number said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_numbers: Option<Vec<u32>>,
+}
+
+impl DesktopQuestionOption {
+    /// Whether the agent draws `index` beside this option whatever it leaves
+    /// out.
+    pub fn number_certain(&self) -> bool {
+        self.screen_numbers.is_none()
+    }
 }
 
 impl DesktopPendingQuestion {
@@ -833,6 +847,7 @@ pub(crate) fn map_pending_question(
                         .as_deref()
                         .map(safe_display_text)
                         .filter(|scope| !scope.is_empty()),
+                    screen_numbers: (!q.number_certain(option)).then(|| q.screen_numbers(option)),
                 })
                 .collect(),
         })

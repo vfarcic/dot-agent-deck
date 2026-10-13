@@ -10,7 +10,8 @@
 //! - **a number** — "2", "two", "second", "option two", "number two", "the
 //!   second one", "the last one" — read as the number the agent draws beside
 //!   the option ([`DesktopQuestionOption::index`]), which for an agent that
-//!   draws no numbers is the option's place in the row;
+//!   draws no numbers is the option's place in the row — unless the agent may
+//!   leave out an option before it, when the number chooses nothing (below);
 //! - **part of one label**: words the label has, in its order, with at least
 //!   one that is not a little word like "and" or "the" — "auto mode" picks
 //!   "Yes, and switch to auto mode";
@@ -33,10 +34,23 @@
 //! # Ambiguity is refused, never guessed
 //!
 //! A whole label wins over a part of another ("Yes" is "Yes", not "Yes, and
-//! switch to auto mode"). Otherwise words that fit more than one option choose
-//! nothing: the refusal names the options they could be, with their numbers.
-//! So does a number that names two options — the one drawn beside it, and one
-//! whose label is that number — and a number no option has.
+//! switch to auto mode"). Words that begin several labels on one question,
+//! exactly one of them the allow-once option, choose that one ("yes" to
+//! Codex's "Yes, proceed" and "Yes, and don't ask again …"); the countdown
+//! names it before it is sent. Otherwise words that fit more than one option
+//! choose nothing: the refusal names the options they could be, with their
+//! numbers. So does a number that names two options — the one drawn beside
+//! it, and one whose label is that number — and a number no option has.
+//!
+//! # Numbers the screen may not show
+//!
+//! An agent may or may not draw an option, on something its payload does not
+//! say (Claude Code's "Yes, and switch to auto mode"), and every option after
+//! it then has more than one possible number on screen
+//! ([`DesktopQuestionOption::screen_numbers`]). Any of those numbers chooses
+//! nothing and the refusal says to name the option; the lists this module
+//! writes name such an option by its label alone. "The last one" is the same
+//! option either way, and still chooses it.
 //!
 //! Whatever this picks is still held to the question by
 //! [`super::question::validate`], so a keyboard-only option it names is
@@ -172,6 +186,9 @@ pub fn match_options(
     if let Some(at) = current
         && let Some(said_number) = ordinal(&said)
     {
+        if let Some(sentence) = uncertain_number(question, at, said_number) {
+            return OptionMatch::Refused(sentence);
+        }
         let q = &question.questions[at];
         let named = numbered(q, said_number);
         if named.is_empty() {
@@ -190,7 +207,7 @@ pub fn match_options(
     };
     if let Some(at) = current {
         let q = &question.questions[at];
-        match decide(question, &said, &[(at, part(q))]) {
+        match decide_part(question, &said, &[(at, part(q))]) {
             OptionMatch::Unmatched => {}
             decided => return decided,
         }
@@ -203,7 +220,7 @@ pub fn match_options(
         }
     }
     let elsewhere: Vec<(usize, Vec<u32>)> = others().map(|(at, q)| (at, part(q))).collect();
-    decide(question, &said, &elsewhere)
+    decide_part(question, &said, &elsewhere)
 }
 
 /// The question a number or a part of a label is read against: the only one,
@@ -233,6 +250,134 @@ fn decide(
         [(at, index)] => OptionMatch::Chosen(ModelAnswer::answer(*at as i64, &[i64::from(*index)])),
         several => OptionMatch::Refused(could_be(question, said, several)),
     }
+}
+
+/// [`decide`] for options `said` is part of: where it starts every one of
+/// them, all on one question, and exactly one of them is the plain allow-once
+/// option the deck can send, that one is chosen — "yes" to "Yes, proceed" and
+/// "Yes, and don't ask again …" (PR #1698). The countdown names it before it
+/// is sent. Anything else that fits several options is refused as ambiguous.
+fn decide_part(
+    question: &DesktopPendingQuestion,
+    said: &[String],
+    candidates: &[(usize, Vec<u32>)],
+) -> OptionMatch {
+    let all: Vec<(usize, &DesktopQuestionOption)> = candidates
+        .iter()
+        .flat_map(|(at, indices)| {
+            indices.iter().filter_map(move |index| {
+                Some((*at, question.question(*at as u32)?.option(*index)?))
+            })
+        })
+        .collect();
+    let one_question = all
+        .iter()
+        .all(|(at, _)| Some(*at) == all.first().map(|(a, _)| *a));
+    if all.len() > 1
+        && one_question
+        && all
+            .iter()
+            .all(|(_, option)| leads(&spoken_words(&option.label), said))
+    {
+        let allow_once: Vec<&(usize, &DesktopQuestionOption)> = all
+            .iter()
+            .filter(|(_, option)| option.role == "allow_once")
+            .collect();
+        if let [(at, option)] = allow_once.as_slice()
+            && option.answerable
+        {
+            return OptionMatch::Chosen(ModelAnswer::answer(
+                *at as i64,
+                &[i64::from(option.index)],
+            ));
+        }
+    }
+    decide(question, said, candidates)
+}
+
+/// Whether `said` is how `label` begins, word for word, allowing each
+/// [`same_word`] slip, with a leading article dropped.
+fn leads(label: &[String], said: &[String]) -> bool {
+    let said = match said {
+        [article, rest @ ..]
+            if !rest.is_empty() && matches!(article.as_str(), "the" | "a" | "an") =>
+        {
+            rest
+        }
+        _ => said,
+    };
+    !said.is_empty()
+        && label.len() >= said.len()
+        && label.iter().zip(said).all(|(l, s)| same_word(l, s))
+}
+
+/// The refusal for a number said on question `at` that the agent may draw
+/// beside more than one option — because it may leave out an option before
+/// them ([`DesktopQuestionOption::screen_numbers`]) — or `None` when the
+/// number is the same option whatever the agent draws. "The last one" is the
+/// same option either way, so it is never refused here.
+fn uncertain_number(question: &DesktopPendingQuestion, at: usize, said: Ordinal) -> Option<String> {
+    let Ordinal::Nth(number) = said else {
+        return None;
+    };
+    let number = u32::try_from(number).ok()?;
+    let q = question.question(at as u32)?;
+    let uncertain: Vec<&DesktopQuestionOption> = q
+        .options
+        .iter()
+        .filter(|option| {
+            option
+                .screen_numbers
+                .as_ref()
+                .is_some_and(|numbers| numbers.contains(&number))
+        })
+        .collect();
+    if uncertain.is_empty() {
+        return None;
+    }
+    let candidates: Vec<&&DesktopQuestionOption> = uncertain
+        .iter()
+        .filter(|option| option.answerable)
+        .collect();
+    let may_be = |option: &DesktopQuestionOption| {
+        let numbers: Vec<String> = option
+            .screen_numbers
+            .iter()
+            .flatten()
+            .map(u32::to_string)
+            .collect();
+        format!(
+            "\u{201c}{}\u{201d} may be {}",
+            option.label,
+            or_list(&numbers)
+        )
+    };
+    Some(match candidates.as_slice() {
+        [] => {
+            let options = numbered_options(q);
+            if options.is_empty() {
+                format!(
+                    "What is {number} on screen depends on what the agent draws, so nothing was chosen."
+                )
+            } else {
+                format!(
+                    "What is {number} on screen depends on what the agent draws, so nothing was chosen. The options are {options}."
+                )
+            }
+        }
+        [only] => format!(
+            "On screen {} — say \u{201c}{}\u{201d}. Nothing was chosen.",
+            may_be(only),
+            only.label
+        ),
+        several => {
+            let each: Vec<String> = several.iter().map(|option| may_be(option)).collect();
+            format!(
+                "On screen {} — say the option by name. Nothing was chosen.",
+                each.join(", and ")
+            )
+        }
+    })
 }
 
 /// The options `said` names by number on `q`: the one drawn with that number,
@@ -289,6 +434,9 @@ fn several(question: &DesktopPendingQuestion, at: usize, text: &str) -> OptionMa
         if named.is_empty()
             && let Some(number) = ordinal(part)
         {
+            if let Some(sentence) = uncertain_number(question, at, number) {
+                return OptionMatch::Refused(sentence);
+            }
             named = numbered(q, number);
             if named.is_empty() {
                 return OptionMatch::Refused(no_such_number(question, at, number));
@@ -413,12 +561,19 @@ fn one_letter_apart(a: &str, b: &str) -> bool {
     }
 }
 
-/// "1 “Yes”" — an option with the number the agent draws beside it.
+/// "1 “Yes”" — an option with the number the agent draws beside it, or "“No”"
+/// alone where that number is not certain
+/// ([`DesktopQuestionOption::screen_numbers`]).
 pub fn numbered_option(option: &DesktopQuestionOption) -> String {
-    format!("{} \u{201c}{}\u{201d}", option.index, option.label)
+    if option.number_certain() {
+        format!("{} \u{201c}{}\u{201d}", option.index, option.label)
+    } else {
+        format!("\u{201c}{}\u{201d}", option.label)
+    }
 }
 
-/// The options the deck can answer on `q`, numbered: "1 “Yes”, 3 “No”".
+/// The options the deck can answer on `q`, numbered where the number on
+/// screen is certain: "1 “Yes”, 3 “No”", or "1 “Yes”, “No”".
 pub fn numbered_options(q: &DesktopQuestion) -> String {
     q.options
         .iter()
@@ -460,8 +615,19 @@ fn could_be(
             })
         })
         .collect();
+    let numbers_certain = candidates.iter().all(|(at, index)| {
+        question
+            .question(*at as u32)
+            .and_then(|q| q.option(*index))
+            .is_none_or(DesktopQuestionOption::number_certain)
+    });
+    let hint = if numbers_certain {
+        "say its number or more of its words"
+    } else {
+        "say more of its words"
+    };
     format!(
-        "\u{201c}{}\u{201d} could be {} — say its number or more of its words. Nothing was chosen.",
+        "\u{201c}{}\u{201d} could be {} — {hint}. Nothing was chosen.",
         safe_message(said.join(" ")),
         or_list(&named)
     )

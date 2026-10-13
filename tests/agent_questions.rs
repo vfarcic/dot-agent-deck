@@ -32,6 +32,7 @@ fn question(id: &str, tool: Option<(&str, Option<&str>)>) -> PendingQuestion {
         role,
         keyboard_only: false,
         scope: None,
+        maybe_hidden: false,
     };
     PendingQuestion {
         id: id.to_string(),

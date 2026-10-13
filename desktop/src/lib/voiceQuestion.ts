@@ -22,6 +22,8 @@ export type PendingQuestionOptionDto = {
   answerable: boolean;
   /** For `allow_always`: what "always" covers. */
   scope?: string;
+  /** PR #1698: set when the number the agent draws beside this option is not certain — every number it may be — because the agent may leave out an option before it. Such an option is named by its label, never by a number. */
+  screenNumbers?: number[];
 };
 
 /** One question of a pending question. */
@@ -88,14 +90,16 @@ export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: stri
  * PR #1698 — the options of `question` voice can pick, with the numbers the
  * agent draws beside them — "1 “Yes”, 3 “No”" — for the question a spoken
  * number or label goes to: the first one `form` has not answered (the only
- * one, for a single question). Empty when voice can pick none of them.
+ * one, for a single question). An option whose number on screen is not
+ * certain is named alone: "1 “Yes”, “No”". Empty when voice can pick none of
+ * them.
  */
 export function questionOptionsToSay(question: PendingQuestionDto, form: QuestionSelectionDto[] = []): string {
   const current = question.questions.length === 1
     ? question.questions[0]
     : question.questions.find((_, at) => !form.some((selection) => selection.questionIndex === at));
   if (!current) return "";
-  return current.options.filter((option) => option.answerable).map((option) => `${option.index} “${option.label}”`).join(", ");
+  return current.options.filter((option) => option.answerable).map((option) => option.screenNumbers ? `“${option.label}”` : `${option.index} “${option.label}”`).join(", ");
 }
 
 /** The countdown was running for a question that is no longer the one waiting. */

@@ -488,6 +488,9 @@ pub struct TableOption {
     pub keys: Option<&'static str>,
     /// The deck shows this option but cannot pick it.
     pub keyboard_only: bool,
+    /// The agent may or may not draw this option, on something its payload
+    /// does not say ([`crate::question::QuestionOption::maybe_hidden`]).
+    pub maybe_hidden: bool,
     /// For an "always" option: what it covers, for the confirmation.
     pub scope: Option<&'static str>,
     pub when: TableWhen,
@@ -503,6 +506,7 @@ const fn table_option(
         role,
         keys,
         keyboard_only: false,
+        maybe_hidden: false,
         scope: None,
         when: TableWhen::Always,
     }
@@ -510,6 +514,11 @@ const fn table_option(
 
 const fn keyboard_only(mut option: TableOption) -> TableOption {
     option.keyboard_only = true;
+    option
+}
+
+const fn maybe_hidden(mut option: TableOption) -> TableOption {
+    option.maybe_hidden = true;
     option
 }
 
@@ -577,22 +586,22 @@ pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
                     TableWhen::SuggestionOther,
                 ),
                 // Read from 2.1.296's own bundle (PR #1698): its Bash prompt
-                // puts this after the "always" option and before No whenever
-                // the permission mode is `default` or `acceptEdits` and auto
-                // mode is available to the account. The payload says nothing
-                // about that availability, so the producer lists it in those
-                // two modes for Bash; where Claude leaves it out, the deck's
-                // No is one number higher than the screen's, and the number
-                // the screen gives No names this keyboard-only option, which
-                // is refused rather than read as another one. Keyboard-only:
-                // picking it switches Claude's mode on Claude's side, which a
-                // hook decision cannot do.
+                // puts this after the "always" option and before No when the
+                // permission mode is `default` or `acceptEdits`, auto mode is
+                // available to the account, and neither a matched "ask" rule,
+                // an organisation cap nor the command's display rules it out.
+                // The payload carries only the mode, so the producer lists it
+                // in those two modes for Bash, marked as one Claude may leave
+                // out: where it does, No is drawn one number lower than the
+                // deck's, so a client takes No by name, not number.
+                // Keyboard-only: picking it switches Claude's mode on Claude's
+                // side, which a hook decision cannot do.
                 when(
-                    keyboard_only(table_option(
+                    maybe_hidden(keyboard_only(table_option(
                         "Yes, and switch to auto mode",
                         AllowAlways,
                         None,
-                    )),
+                    ))),
                     TableWhen::AutoModeOffer,
                 ),
                 table_option("No", Deny, None),

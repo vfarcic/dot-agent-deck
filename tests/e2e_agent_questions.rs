@@ -34,24 +34,21 @@ fn submit_claude(deck: &TuiDeck, id: &str, prompt: &str, probe: &str) {
 }
 
 /// The number Claude Code draws beside No. The deck lists Claude's "Yes, and
-/// switch to auto mode", keyboard-only, wherever the payload says a Bash prompt
-/// may draw it (PR #1698); Claude draws it only where auto mode is available
-/// to the account, which the payload does not say. Where the screen has none,
-/// No sits one number lower than the deck's — the side on which the screen's
-/// number for No names the keyboard-only entry and is refused, rather than
-/// naming another option.
+/// switch to auto mode", keyboard-only and marked as one Claude may leave out,
+/// wherever the payload says a Bash prompt may draw it (PR #1698); Claude
+/// draws it only where auto mode is available to the account, which the
+/// payload does not say. Where the screen has none, No sits one number lower
+/// than the deck's, which is why voice takes No by name and not by number.
 fn screen_no(deck: &TuiDeck, q: &dot_agent_deck::question::PendingQuestion) -> u32 {
     let options = &q.questions[0].options;
     let no = options.last().unwrap().index;
     visible(deck, "Esc to cancel");
-    let listed = options
+    let grid = deck.snapshot_grid();
+    let left_out = options
         .iter()
-        .any(|o| o.label == "Yes, and switch to auto mode" && o.keyboard_only);
-    if listed && !deck.snapshot_grid().contains("switch to auto mode") {
-        no - 1
-    } else {
-        no
-    }
+        .filter(|o| o.maybe_hidden && !grid.contains(&o.label))
+        .count() as u32;
+    no - left_out
 }
 
 fn assert_claude_permission(deck: &TuiDeck, q: &dot_agent_deck::question::PendingQuestion) {

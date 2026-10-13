@@ -5305,6 +5305,55 @@ mod question_tests {
         assert!(!labels(&write, 0).contains(&"Yes, and switch to auto mode"));
     }
 
+    /// Scenario: Claude Code asks to run a Bash command in the default mode,
+    /// with and without an "always" suggestion. Whether Claude draws "Yes, and
+    /// switch to auto mode" depends on things the payload does not carry, so
+    /// the deck marks that one option as one Claude may leave out — and no
+    /// other option, of this prompt or of any agent's table.
+    #[spec("question/detect/019")]
+    #[test]
+    fn question_detect_019_only_claude_s_auto_mode_option_may_be_hidden() {
+        fn hidden(q: &PendingQuestion) -> Vec<&str> {
+            q.questions
+                .iter()
+                .flat_map(|question| &question.options)
+                .filter(|o| o.maybe_hidden)
+                .map(|o| o.label.as_str())
+                .collect()
+        }
+        for name in [
+            "claude-permission-bash-auto-mode.json",
+            "claude-permission-bash.json",
+        ] {
+            let q = question_for(AgentType::ClaudeCode, &fixture(name));
+            assert_eq!(hidden(&q), vec!["Yes, and switch to auto mode"], "{name}");
+        }
+        let mut plan_mode = fixture("claude-permission-bash.json");
+        plan_mode["permission_mode"] = Value::from("plan");
+        assert!(hidden(&question_for(AgentType::ClaudeCode, &plan_mode)).is_empty());
+        for (agent, name) in [
+            (AgentType::ClaudeCode, "claude-permission-write.json"),
+            (AgentType::ClaudeCode, "claude-permission-plan.json"),
+            (AgentType::ClaudeCode, "claude-ask-user-question-form.json"),
+            (AgentType::Codex, "codex-permission-request.json"),
+            (AgentType::Codex, "codex-request-user-input.json"),
+        ] {
+            let q = question_for(agent, &fixture(name));
+            assert!(hidden(&q).is_empty(), "{name}: {:?}", hidden(&q));
+        }
+
+        // Every table of every agent: the auto-mode entry is the only one.
+        let marked: Vec<&str> = crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| spec.questions)
+            .flat_map(|tables| tables.menus.iter())
+            .flat_map(|menu| menu.options.iter())
+            .filter(|option| option.maybe_hidden)
+            .map(|option| option.label)
+            .collect();
+        assert_eq!(marked, vec!["Yes, and switch to auto mode"]);
+    }
+
     /// Scenario: Claude Code's captured `PermissionRequest` for a Write, whose
     /// suggestion is `setMode acceptEdits`, names option 2 "Yes, and switch to
     /// accept edits for this session".

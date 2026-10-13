@@ -849,11 +849,13 @@ pub const MAX_OPTIONS_READ: usize = 6;
 const MAX_OPTION_LABEL_CHARS: usize = 120;
 
 /// PR #1698: how to answer a prompt by voice, read after it so the user knows
-/// what to say — " Say 1 for Yes, or 3 for No." — with the numbers the agent
-/// draws beside its options. Only the options voice can pick are read, so a
-/// number skipped is one to answer by keyboard. On a form, the first
-/// question's: " First, Colour: say 1 for Red, 2 for Green, or 3 for Blue."
-/// Empty when voice can answer none of them.
+/// what to say — " Say 1 for Yes or 3 for No." — with the numbers the agent
+/// draws beside its options. An option whose number on screen is not certain,
+/// because the agent may leave out an option before it, is read by name
+/// alone: " Say 1 for Yes, or say No." Only the options voice can pick are
+/// read, so a number skipped is one to answer by keyboard. On a form, the
+/// first question's: " First, Colour: say 1 for Red; 2 for Green; or 3 for
+/// Blue." Empty when voice can answer none of them.
 pub fn options_sentence(question: &dot_agent_deck::question::PendingQuestion) -> String {
     use dot_agent_deck::question::AnswerChannel;
     if !matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys) {
@@ -862,34 +864,52 @@ pub fn options_sentence(question: &dot_agent_deck::question::PendingQuestion) ->
     let Some(first) = question.questions.first() else {
         return String::new();
     };
-    let options: Vec<String> = first
+    // Each option voice can pick: its label, and its number where that is
+    // the number on screen whatever the agent draws.
+    let options: Vec<(Option<u32>, String)> = first
         .options
         .iter()
         .filter(|option| option.answerable())
         .map(|option| {
             let label = one_line(&option.label, MAX_OPTION_LABEL_CHARS);
-            format!(
-                "{} for {}",
-                option.index,
-                label.trim_end_matches(['.', ' '])
+            (
+                first.number_certain(option).then_some(option.index),
+                label.trim_end_matches(['.', ' ']).to_string(),
             )
         })
         .collect();
     if options.is_empty() {
         return String::new();
     }
-    let read: Vec<String> = options.iter().take(MAX_OPTIONS_READ).cloned().collect();
+    let read = &options[..options.len().min(MAX_OPTIONS_READ)];
     let more = options.len() - read.len();
-    let list = if more > 0 {
-        format!("{}, or one of {more} more", read.join("; "))
-    } else {
-        match read.as_slice() {
-            [only] => only.clone(),
-            [first, second] => format!("{first} or {second}"),
-            [init @ .., last] => format!("{}; or {last}", init.join("; ")),
-            [] => String::new(),
-        }
+    let numbered: Vec<String> = read
+        .iter()
+        .filter_map(|(number, label)| number.map(|number| format!("{number} for {label}")))
+        .collect();
+    let by_name: Vec<&str> = read
+        .iter()
+        .filter(|(number, _)| number.is_none())
+        .map(|(_, label)| label.as_str())
+        .collect();
+    let mut list = match numbered.as_slice() {
+        _ if more > 0 => numbered.join("; "),
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        [init @ .., last] => format!("{}; or {last}", init.join("; ")),
     };
+    if !by_name.is_empty() {
+        let names = by_name.join(" or ");
+        list = if list.is_empty() {
+            names
+        } else {
+            format!("{list}, or say {names}")
+        };
+    }
+    if more > 0 {
+        list = format!("{list}, or one of {more} more");
+    }
     if question.questions.len() > 1 {
         let name = first.header.as_deref().unwrap_or(&first.prompt);
         format!(
@@ -1574,10 +1594,12 @@ mod tests {
     }
 
     /// Scenario (question/desktop/028, PR #1698): with reading on, Claude Code
-    /// asks to run `git push origin main` and draws Yes, "Yes, and switch to
-    /// auto mode" and No. The announcement ends by saying how to answer by
-    /// voice, with the numbers on screen: "Say 1 for Yes or 3 for No." — the
-    /// keyboard-only auto-mode option is not offered. A Codex approval reads
+    /// asks to run `git push origin main` and may draw Yes, "Yes, and switch
+    /// to auto mode" and No, or leave the auto-mode option out. The
+    /// announcement ends by saying how to answer by voice: "Say 1 for Yes, or
+    /// say No." — Yes by its number, No by name, since its number depends on
+    /// whether Claude drew the keyboard-only auto-mode option, which is not
+    /// offered. A Codex approval reads
     /// its three options, an OpenCode form reads its first question's, and a
     /// question voice cannot answer reads none.
     #[tokio::test]
@@ -1613,11 +1635,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             announced.text,
-            "The coder is asking for permission: Bash: git push origin main. Say 1 for Yes or 3 for No."
+            "The coder is asking for permission: Bash: git push origin main. Say 1 for Yes, or say No."
         );
         assert_eq!(
             announced.bare,
-            "Asking for permission: Bash: git push origin main. Say 1 for Yes or 3 for No."
+            "Asking for permission: Bash: git push origin main. Say 1 for Yes, or say No."
         );
 
         let codex = dot_agent_deck::question::codex_permission_request(

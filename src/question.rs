@@ -171,6 +171,14 @@ pub struct QuestionOption {
     /// pattern text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// PR #1698: the agent may or may not draw this option, on something the
+    /// payload does not say — Claude Code's "Yes, and switch to auto mode".
+    /// Where it is left out, every option after it is drawn one number lower
+    /// than its `index`, so a client does not take those numbers as answers
+    /// ([`Question::screen_numbers`]). Additive: a build that does not know
+    /// it reads the option as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maybe_hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +207,27 @@ pub enum AnswerChannel {
     /// Deserialize-only; treated as unsupported.
     #[serde(other)]
     Unknown,
+}
+
+impl Question {
+    /// PR #1698: every number the agent may draw beside `option`, lowest
+    /// first — its `index`, and one lower for each option before it that the
+    /// agent may leave out ([`QuestionOption::maybe_hidden`]).
+    pub fn screen_numbers(&self, option: &QuestionOption) -> Vec<u32> {
+        let hidden_before = self
+            .options
+            .iter()
+            .filter(|o| o.maybe_hidden && o.index < option.index)
+            .count() as u32;
+        (option.index.saturating_sub(hidden_before).max(1)..=option.index).collect()
+    }
+
+    /// Whether the number beside `option` is its `index` whatever the agent
+    /// draws: it is not an option the agent may leave out, and none before it
+    /// is.
+    pub fn number_certain(&self, option: &QuestionOption) -> bool {
+        !option.maybe_hidden && self.screen_numbers(option).len() == 1
+    }
 }
 
 impl QuestionOption {
@@ -503,6 +532,7 @@ impl PendingQuestion {
                     role: option.role,
                     keyboard_only: option.keyboard_only,
                     scope: clean_opt(option.scope, MAX_DESCRIPTION_BYTES),
+                    maybe_hidden: option.maybe_hidden,
                 })
                 .collect();
             if options.is_empty() {
@@ -730,6 +760,7 @@ fn table_option(
         role: option.role,
         keyboard_only: option.keyboard_only || !covered,
         scope: option.scope.map(fill),
+        maybe_hidden: option.maybe_hidden,
     }
 }
 
@@ -789,6 +820,7 @@ fn payload_options(question: &Value) -> PayloadOptions {
                 role: OptionRole::Choice,
                 keyboard_only: false,
                 scope: None,
+                maybe_hidden: false,
             })
         })
         .collect();
@@ -1709,6 +1741,7 @@ pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion
         role,
         keyboard_only: false,
         scope: None,
+        maybe_hidden: false,
     };
     let (kind, prompt, options) = match dialog.kind.as_str() {
         "select" => (
@@ -1873,6 +1906,7 @@ mod tests {
             role,
             keyboard_only: false,
             scope: None,
+            maybe_hidden: false,
         }
     }
 
@@ -2913,6 +2947,92 @@ mod tests {
         let gap = gap.sanitized().expect("still shown");
         assert_eq!(gap.channel, AnswerChannel::Unsupported);
         assert!(!gap.has_answerable_option());
+    }
+
+    /// Scenario: A question with an option the agent may leave out is written
+    /// to JSON and read back with the mark, and survives sanitizing; an
+    /// unmarked option writes no key, so the JSON is what an older build
+    /// wrote, and a question from a build that never sends the mark reads as
+    /// unmarked. An older build's option type, which has no such field, reads
+    /// the marked question as it always did. The numbers the screen may draw
+    /// beside each option are certain up to the marked one and two-valued
+    /// from it on.
+    #[spec("question/model/008")]
+    #[test]
+    fn question_model_008_the_maybe_hidden_mark_is_additive() {
+        let mut marked = permission(AnswerChannel::Held);
+        marked.questions[0].options.insert(
+            2,
+            QuestionOption {
+                keyboard_only: true,
+                maybe_hidden: true,
+                ..option(3, "Yes, and switch to auto mode", OptionRole::AllowAlways)
+            },
+        );
+        marked.questions[0].options[3].index = 4;
+        let json = serde_json::to_value(&marked).unwrap();
+        let options = &json["questions"][0]["options"];
+        assert_eq!(options[2]["maybe_hidden"], true);
+        for at in [0, 1, 3] {
+            assert!(
+                options[at].get("maybe_hidden").is_none(),
+                "an unmarked option writes no key: {}",
+                options[at]
+            );
+        }
+        let back: PendingQuestion = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, marked);
+        assert_eq!(
+            back.clone().sanitized().unwrap(),
+            back,
+            "sanitizing keeps it"
+        );
+
+        // An older daemon never sends the key: every option reads unmarked.
+        let unmarked = permission(AnswerChannel::Held);
+        let json_old = serde_json::to_string(&unmarked).unwrap();
+        assert!(!json_old.contains("maybe_hidden"));
+        let read: PendingQuestion = serde_json::from_str(&json_old).unwrap();
+        assert!(read.questions[0].options.iter().all(|o| !o.maybe_hidden));
+
+        // An older build's option, without the field, reads the marked one as
+        // before: same number, label, role, keyboard-only flag.
+        #[derive(Deserialize)]
+        struct OlderOption {
+            index: u32,
+            label: String,
+            role: OptionRole,
+            #[serde(default)]
+            keyboard_only: bool,
+        }
+        let older: Vec<OlderOption> = serde_json::from_value(options.clone()).unwrap();
+        let seen: Vec<(u32, &str, OptionRole, bool)> = older
+            .iter()
+            .map(|o| (o.index, o.label.as_str(), o.role, o.keyboard_only))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (1, "Yes", OptionRole::AllowOnce, false),
+                (2, "Always", OptionRole::AllowAlways, false),
+                (
+                    3,
+                    "Yes, and switch to auto mode",
+                    OptionRole::AllowAlways,
+                    true
+                ),
+                (4, "No", OptionRole::Deny, false),
+            ]
+        );
+
+        // The numbers the screen may show beside each option.
+        let q = &marked.questions[0];
+        let numbers: Vec<Vec<u32>> = q.options.iter().map(|o| q.screen_numbers(o)).collect();
+        assert_eq!(numbers, vec![vec![1], vec![2], vec![3], vec![3, 4]]);
+        let certain: Vec<bool> = q.options.iter().map(|o| q.number_certain(o)).collect();
+        assert_eq!(certain, vec![true, true, false, false]);
+        let plain = &unmarked.questions[0];
+        assert!(plain.options.iter().all(|o| plain.number_certain(o)));
     }
 
     /// Scenario: Every shape an answer can be wrong in is refused with the
