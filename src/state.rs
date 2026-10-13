@@ -941,6 +941,15 @@ pub struct SessionSnapshot {
     /// ignores the key, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_generation: Option<HookGeneration>,
+    /// PRD #1666 §2.8: the deck's notice explaining the Error status — a
+    /// message it could not deliver ([`SessionState::delivery_notice`]) — so
+    /// a client that attaches, or re-reads the agent list, after the notice was
+    /// broadcast still shows why the card is in Error. `Some` only while the
+    /// status is `Error` because of it. Additive optional, the `blocked`
+    /// precedent: an older reader ignores the key, a newer one reads its
+    /// absence as no notice, so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<String>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1135,6 +1144,7 @@ impl SessionState {
             subagent_wait: self.subagent_wait.clone(),
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
+            delivery_notice: self.delivery_notice().map(str::to_string),
         }
     }
 
@@ -1167,6 +1177,32 @@ impl SessionState {
     /// fixtures construct the struct by exhaustive literal.
     pub fn live_target(&self) -> Option<LiveTarget> {
         self.recent_events.iter().rev().find_map(|e| e.live_target)
+    }
+
+    /// PRD #1666 §2.8: what this card shows of its agent's inbox, from the
+    /// journal entry [`AppState`] keeps for it (see
+    /// [`crate::inbox_display::CARD_INBOX_METADATA_KEY`]). `None` when this
+    /// client knows nothing of the inbox.
+    pub fn card_inbox(&self) -> Option<crate::inbox_display::CardInbox> {
+        self.recent_events.iter().rev().find_map(card_inbox_of)
+    }
+
+    /// PRD #1666 §2.8: the deck's notice explaining this card's Error — a
+    /// message it could not deliver — while the card is in Error because of it.
+    /// The notice is the `delivery_notice` the daemon's report event carried;
+    /// an Error of the agent's own reporting after it explains nothing, so it
+    /// ends the notice.
+    pub fn delivery_notice(&self) -> Option<&str> {
+        if self.status != SessionStatus::Error {
+            return None;
+        }
+        self.recent_events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == EventType::Error)
+            .and_then(|e| e.metadata.get(crate::event::DELIVERY_NOTICE_METADATA_KEY))
+            .map(String::as_str)
+            .filter(|notice| !notice.trim().is_empty())
     }
 
     /// PRD #20 M3: the write-semantics of this session's live target. A session
@@ -1625,6 +1661,11 @@ pub struct AppState {
     /// agent's first real hook, or a pane that never sends one. Order only:
     /// nothing here is identity, and dropped with the pane.
     pane_surfaced_agent_seq: HashMap<String, u64>,
+    /// PRD #1666 §2.8: per pane, what this client knows of the inbox of the
+    /// agent in it — the daemon's last summary and the messages seen change
+    /// state since — from which its card's `✉N` / `delivered` line is drawn
+    /// ([`Self::apply_inbox_notice`], [`Self::apply_inbox_summary`]).
+    pane_inboxes: HashMap<String, PaneInbox>,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
@@ -11217,6 +11258,62 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     if let Some(live_target) = snap.live_target {
         push_live_target_carrier(session, live_target);
     }
+    // PRD #1666 §2.8: the notice explaining an Error comes back the way it first
+    // arrived — as the deck's report event in the journal, which is where
+    // `SessionState::delivery_notice` reads it. Wire text, so it is bounded and
+    // stripped of control characters first.
+    if snap.status == SessionStatus::Error
+        && let Some(notice) = snap.delivery_notice.as_deref().map(clean_delivery_notice)
+        && !notice.is_empty()
+        && session.delivery_notice() != Some(notice.as_str())
+    {
+        push_delivery_notice_carrier(session, notice);
+    }
+}
+
+/// Bound on a delivery notice read off the wire, in characters. The daemon's
+/// own notices are fixed sentences well inside it.
+const MAX_DELIVERY_NOTICE_CHARS: usize = 512;
+
+/// A delivery notice from the wire as a card may show it.
+fn clean_delivery_notice(notice: &str) -> String {
+    notice
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_DELIVERY_NOTICE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Push the deck's report event explaining an Error onto `session`'s journal,
+/// stamped at its `last_activity`, shaped as the daemon's delivery-notice sink
+/// shapes it.
+fn push_delivery_notice_carrier(session: &mut SessionState, notice: String) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+        notice.clone(),
+    );
+    session.recent_events.push_back(AgentEvent {
+        session_id: session.session_id.clone(),
+        agent_type: AgentType::None,
+        event_type: EventType::Error,
+        tool_name: None,
+        tool_detail: Some(notice),
+        cwd: None,
+        timestamp: session.last_activity,
+        user_prompt: None,
+        metadata,
+        pane_id: session.pane_id.clone(),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    while session.recent_events.len() > MAX_RECENT_EVENTS {
+        pop_oldest_event(&mut session.recent_events);
+    }
 }
 
 /// Push a [`live_target_carrier_event`] onto `session`'s bounded journal,
@@ -11225,7 +11322,147 @@ fn push_live_target_carrier(session: &mut SessionState, live_target: LiveTarget)
     let carrier = live_target_carrier_event(session, live_target);
     session.recent_events.push_back(carrier);
     if session.recent_events.len() > MAX_RECENT_EVENTS {
-        session.recent_events.pop_front();
+        pop_oldest_event(&mut session.recent_events);
+    }
+}
+
+/// PRD #1666: the inbox state a journal entry carries, if it is the card's
+/// inbox entry.
+fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> {
+    event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_METADATA_KEY)
+        .and_then(|value| crate::inbox_display::CardInbox::decode(value))
+}
+
+/// Drop the oldest entry of a card's bounded journal, keeping its inbox entry
+/// (PRD #1666): that entry is state rather than history, and a card that
+/// reports often would otherwise age it out within fifty events. The inbox
+/// entry is one at most, so the next oldest goes in its place.
+fn pop_oldest_event(journal: &mut VecDeque<AgentEvent>) -> Option<AgentEvent> {
+    if journal.len() > 1 && journal.front().is_some_and(|e| card_inbox_of(e).is_some()) {
+        return journal.remove(1);
+    }
+    journal.pop_front()
+}
+
+/// PRD #1666: replace `session`'s inbox entry with one carrying `inbox`, or
+/// remove it when there is nothing to show. Stamped at the card's
+/// `last_activity` and carrying no agent, prompt or tool, so nothing that reads
+/// the journal as the agent's history sees it ([`AgentEvent::is_daemon_synthetic`]).
+fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardInbox) {
+    session.recent_events.retain(|e| card_inbox_of(e).is_none());
+    if inbox == crate::inbox_display::CardInbox::default() {
+        return;
+    }
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::inbox_display::CARD_INBOX_METADATA_KEY.to_string(),
+        inbox.encode(),
+    );
+    session.recent_events.push_back(AgentEvent {
+        session_id: session.session_id.clone(),
+        agent_type: session.agent_type.clone(),
+        event_type: EventType::Unknown,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: session.last_activity,
+        user_prompt: None,
+        metadata,
+        pane_id: session.pane_id.clone(),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    });
+    while session.recent_events.len() > MAX_RECENT_EVENTS {
+        pop_oldest_event(&mut session.recent_events);
+    }
+}
+
+/// PRD #1666 §2.8: one message this client has seen change state since the
+/// daemon's last inbox summary for the pane ([`PaneInbox::seen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeenMessage {
+    /// Pending, and posted after the summary, so not in its count.
+    PendingNew,
+    /// Pending, and first seen already taken, so one the summary counted.
+    PendingCounted,
+    /// Acknowledged or undeliverable.
+    Settled,
+}
+
+/// Bound on [`PaneInbox::seen`]. Settled entries are dropped first; they
+/// are kept only so a repeated terminal frame is not counted twice.
+const MAX_SEEN_INBOX_MESSAGES: usize = 256;
+
+/// PRD #1666 §2.8: what a client knows of one pane's inbox — the daemon's last
+/// summary, and the messages seen change state since. Keyed by message id, so
+/// a frame repeated or a hand-back (`fetched` → `queued`) counts nothing twice.
+#[derive(Debug, Clone, Default)]
+struct PaneInbox {
+    /// The agent generation the counts belong to; a different one in the pane
+    /// starts them over.
+    agent_id: Option<String>,
+    /// Pending messages the summary counted that no notice has settled yet.
+    baseline: usize,
+    seen: HashMap<String, SeenMessage>,
+    /// The agent has acknowledged a message.
+    delivered: bool,
+}
+
+impl PaneInbox {
+    fn claimed(&self) -> usize {
+        self.seen
+            .values()
+            .filter(|seen| **seen == SeenMessage::PendingCounted)
+            .count()
+    }
+
+    fn card(&self) -> crate::inbox_display::CardInbox {
+        let new = self
+            .seen
+            .values()
+            .filter(|seen| **seen == SeenMessage::PendingNew)
+            .count();
+        crate::inbox_display::CardInbox {
+            pending: self.baseline + new,
+            delivered: self.delivered,
+        }
+    }
+
+    fn apply(&mut self, id: &str, state: crate::inbox::StateName) {
+        use crate::inbox::StateName;
+        // A claimed offer is taken and not yet acknowledged, as a fetch is.
+        let taken = matches!(state, StateName::Fetched | StateName::Claimed);
+        let pending = taken || state == StateName::Queued;
+        // Whether the summary counted a message this client has not placed yet.
+        let unclaimed = self.baseline > self.claimed();
+        let next = match (self.seen.get(id).copied(), pending) {
+            (Some(SeenMessage::Settled), _) => SeenMessage::Settled,
+            (Some(kept), true) => kept,
+            (None, true) if taken && unclaimed => SeenMessage::PendingCounted,
+            (None, true) => SeenMessage::PendingNew,
+            (Some(SeenMessage::PendingCounted), false) => {
+                self.baseline = self.baseline.saturating_sub(1);
+                SeenMessage::Settled
+            }
+            (None, false) => {
+                if unclaimed {
+                    self.baseline -= 1;
+                }
+                SeenMessage::Settled
+            }
+            (Some(SeenMessage::PendingNew), false) => SeenMessage::Settled,
+        };
+        if state == StateName::Acknowledged {
+            self.delivered = true;
+        }
+        self.seen.insert(id.to_string(), next);
+        if self.seen.len() > MAX_SEEN_INBOX_MESSAGES {
+            self.seen.retain(|_, seen| *seen != SeenMessage::Settled);
+        }
     }
 }
 
@@ -12351,6 +12588,7 @@ impl AppState {
         // Issue #1507: likewise its surfaced creation order — a successor on a
         // reused pane id surfaces with its own.
         self.pane_surfaced_agent_seq.remove(pane_id);
+        self.pane_inboxes.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -12804,7 +13042,13 @@ impl AppState {
             if !self.managed_pane_ids.contains(pane_id) {
                 continue;
             }
+            // PRD #1666 §2.8: the reply's inbox counts are the card's new
+            // starting point, applied below once its live fields are.
+            let inbox = record.inbox.as_ref();
             let Some(snap) = record.live.as_ref() else {
+                if let Some(summary) = inbox {
+                    self.apply_inbox_summary(pane_id, &record.id, summary);
+                }
                 continue;
             };
             match snap.hook_generation.as_ref() {
@@ -12852,6 +13096,108 @@ impl AppState {
                     entry.journal_bytes = None;
                 }
             }
+            if let Some(summary) = inbox {
+                self.apply_inbox_summary(pane_id, &record.id, summary);
+            }
+        }
+    }
+
+    /// PRD #1666 §2.8: take the daemon's inbox summary for the agent `agent_id`
+    /// in `pane_id` — from a `ListAgents` reply, at hydration or after an event
+    /// gap — as what the pane's card shows, replacing whatever the notices
+    /// since the last one built up.
+    pub fn apply_inbox_summary(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        summary: &crate::inbox_hub::InboxSummary,
+    ) {
+        self.pane_inboxes.insert(
+            pane_id.to_string(),
+            PaneInbox {
+                agent_id: Some(agent_id.to_string()),
+                baseline: summary.queued.saturating_add(summary.fetched),
+                seen: HashMap::new(),
+                delivered: summary.last_acked_at.is_some(),
+            },
+        );
+        self.refresh_card_inbox(pane_id);
+    }
+
+    /// PRD #1666 §2.8: one message in the inbox of a pane this client manages
+    /// changed state ([`crate::event::BroadcastMsg::Inbox`]). Keyed by message
+    /// id, so a repeated frame or a message going back and forth between
+    /// queued and fetched is counted once. A notice for a pane this client
+    /// does not manage changes nothing.
+    pub fn apply_inbox_notice(&mut self, notice: &crate::event::InboxNotice) {
+        if !self.managed_pane_ids.contains(&notice.pane_id) {
+            return;
+        }
+        let inbox = self.pane_inboxes.entry(notice.pane_id.clone()).or_default();
+        match (&inbox.agent_id, &notice.agent_id) {
+            (Some(held), Some(named)) if held != named => {
+                *inbox = PaneInbox {
+                    agent_id: Some(named.clone()),
+                    ..PaneInbox::default()
+                };
+            }
+            (None, Some(named)) => inbox.agent_id = Some(named.clone()),
+            _ => {}
+        }
+        inbox.apply(&notice.message_id, notice.state);
+        self.refresh_card_inbox(&notice.pane_id);
+    }
+
+    /// The card [`Self::pane_inboxes`] draws `pane_id`'s inbox on: the pane's
+    /// newest card belonging to the agent the counts are for, or with no agent
+    /// recorded.
+    fn inbox_card_id(&self, pane_id: &str) -> Option<String> {
+        let agent = self
+            .pane_inboxes
+            .get(pane_id)
+            .and_then(|inbox| inbox.agent_id.as_deref());
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && (agent.is_none() || s.agent_id.is_none() || s.agent_id.as_deref() == agent)
+            })
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.session_id.clone())
+    }
+
+    /// Draw `pane_id`'s inbox on its card.
+    fn refresh_card_inbox(&mut self, pane_id: &str) {
+        let Some(inbox) = self.pane_inboxes.get(pane_id).map(PaneInbox::card) else {
+            return;
+        };
+        let Some(card_id) = self.inbox_card_id(pane_id) else {
+            return;
+        };
+        if let Some(card) = self.sessions.get_mut(&card_id) {
+            set_card_inbox(card, inbox);
+        }
+    }
+
+    /// After an event for `pane_id`: a card the pane's inbox is not drawn on
+    /// yet — a new conversation's card — gets it.
+    fn carry_card_inbox(&mut self, pane_id: &str) {
+        if !self.pane_inboxes.contains_key(pane_id) {
+            return;
+        }
+        let Some(card_id) = self.inbox_card_id(pane_id) else {
+            return;
+        };
+        if self
+            .sessions
+            .get(&card_id)
+            .is_some_and(|card| card.card_inbox().is_none())
+        {
+            self.refresh_card_inbox(pane_id);
         }
     }
 
@@ -13645,6 +13991,7 @@ impl AppState {
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
+        self.pane_inboxes.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -15669,7 +16016,11 @@ impl AppState {
         attested_agent: Option<&str>,
     ) -> AppliedEvent {
         self.applied_unproven = false;
+        let pane_id = event.pane_id.clone();
         let applied = self.apply_event_unsettled(event, attested_agent);
+        if let Some(pane_id) = pane_id {
+            self.carry_card_inbox(&pane_id);
+        }
         // Issue #697: whatever the event removed, the unproven bookkeeping
         // follows it — see [`Self::settle_unproven`].
         self.settle_unproven(None);
@@ -17163,7 +17514,7 @@ impl AppState {
         session.recent_events.push_back(event);
         let mut popped = 0;
         while session.recent_events.len() > journal_cap {
-            if let Some(old) = session.recent_events.pop_front()
+            if let Some(old) = pop_oldest_event(&mut session.recent_events)
                 && pushed.is_some()
             {
                 popped += retained_event_bytes(&old);
@@ -17651,7 +18002,7 @@ impl AppState {
         event.live_target = session.live_target();
         session.recent_events.push_back(event);
         while session.recent_events.len() > MAX_RECENT_EVENTS {
-            session.recent_events.pop_front();
+            pop_oldest_event(&mut session.recent_events);
         }
         if asserted {
             AppliedEvent::StatusAsserted
@@ -26542,6 +26893,129 @@ while True:
         }
     }
 
+    fn inbox_notice(
+        pane: &str,
+        id: &str,
+        state: crate::inbox::StateName,
+    ) -> crate::event::InboxNotice {
+        crate::event::InboxNotice {
+            pane_id: pane.to_string(),
+            agent_id: Some("agent-q".to_string()),
+            message_id: id.to_string(),
+            subject: "subject".to_string(),
+            from_label: "the orchestrator".to_string(),
+            state,
+            reason: None,
+        }
+    }
+
+    /// PRD #1666 §2.8: a card's inbox line starts from the daemon's summary and
+    /// follows each message by id — a repeated frame, a hand-back or a second
+    /// terminal frame counts nothing twice, a message the summary counted is
+    /// subtracted once when it settles, the count never goes below zero, a
+    /// notice for another pane changes nothing, and the line outlives a long
+    /// run of events trimming the card's journal.
+    #[test]
+    fn a_cards_inbox_counts_each_message_once_against_the_daemons_summary() {
+        use crate::inbox::StateName::{Acknowledged, Fetched, Queued, Undeliverable};
+        use crate::inbox_display::CardInbox;
+        fn card(state: &AppState) -> Option<CardInbox> {
+            state.sessions["gen-q"].card_inbox()
+        }
+        let pending = |pending, delivered| Some(CardInbox { pending, delivered });
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        assert_eq!(card(&state), None);
+        state.apply_inbox_summary(
+            "pane-q",
+            "agent-q",
+            &crate::inbox_hub::InboxSummary {
+                queued: 1,
+                fetched: 1,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: crate::inbox_hub::WakePath::Doorbell,
+                component: None,
+            },
+        );
+        assert_eq!(card(&state), pending(2, false));
+        // The summary's taken message, seen for the first time, then settled.
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Fetched));
+        assert_eq!(card(&state), pending(2, false));
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Acknowledged));
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Acknowledged));
+        assert_eq!(card(&state), pending(1, true));
+        // A new message, repeated, taken and handed back, then lost.
+        for step in [Queued, Queued, Fetched, Queued] {
+            state.apply_inbox_notice(&inbox_notice("pane-q", "m-b", step));
+            assert_eq!(card(&state), pending(2, true), "{step:?}");
+        }
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-b", Undeliverable));
+        assert_eq!(card(&state), pending(1, true));
+        // Another pane's message is not this card's.
+        state.apply_inbox_notice(&inbox_notice("pane-other", "m-x", Queued));
+        assert_eq!(card(&state), pending(1, true));
+        // The summary's other message settles unseen, and no more can.
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-c", Acknowledged));
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-d", Acknowledged));
+        assert_eq!(card(&state), pending(0, true));
+        for secs in 0..(MAX_RECENT_EVENTS as i64 + 10) {
+            state.apply_event(quota_event(EventType::ToolStart, 10 + secs));
+        }
+        assert_eq!(card(&state), pending(0, true));
+        assert_eq!(
+            state.sessions["gen-q"].recent_events.len(),
+            MAX_RECENT_EVENTS
+        );
+    }
+
+    /// PRD #1666 §2.8: the deck's not-delivered notice explains the card's
+    /// Error, travels in the session snapshot to a client that seeds from it,
+    /// and ends when the agent reports something else.
+    #[test]
+    fn a_delivery_notice_survives_the_snapshot_and_ends_with_the_error() {
+        let notice = crate::inbox_display::NOTICE_MAX_DELIVER;
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let mut report = quota_event(EventType::Error, 2);
+        report.agent_type = AgentType::None;
+        report.tool_name = None;
+        report.tool_detail = Some(notice.to_string());
+        report.metadata.insert(
+            crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.to_string(),
+        );
+        state.apply_daemon_report_event(report);
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.status, SessionStatus::Error);
+        assert_eq!(card.delivery_notice(), Some(notice));
+        let snap = card.live_snapshot();
+        assert_eq!(snap.delivery_notice.as_deref(), Some(notice));
+
+        let mut other = AppState::default();
+        other.register_pane("pane-q".to_string());
+        other.seed_hydrated_session(
+            "pane-q".to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some("agent-q".to_string()),
+            Some(&snap),
+        );
+        let seeded = other
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("pane-q"))
+            .unwrap();
+        assert_eq!(seeded.delivery_notice(), Some(notice));
+
+        state.apply_event(quota_event(EventType::Idle, 3));
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.delivery_notice(), None);
+        assert_eq!(card.live_snapshot().delivery_notice, None);
+    }
+
     fn quota_blocked_event(kind: BlockedKind, detail: &str, secs: i64) -> AgentEvent {
         let mut event = quota_event(EventType::QuotaBlocked, secs);
         event.tool_name = None;
@@ -27192,6 +27666,7 @@ while True:
                 resets_at_ms: Some(9_000),
             }),
             hook_generation: None,
+            delivery_notice: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -27257,6 +27732,7 @@ while True:
                 resets_at_ms,
             }),
             hook_generation: None,
+            delivery_notice: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

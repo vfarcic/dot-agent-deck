@@ -1425,6 +1425,11 @@ impl AgentEvent {
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
             || self.is_unproven_eviction()
+            // PRD #1666: a card's inbox state, held in its journal by the
+            // client itself and never sent by anyone.
+            || self
+                .metadata
+                .contains_key(crate::inbox_display::CARD_INBOX_METADATA_KEY)
     }
 }
 

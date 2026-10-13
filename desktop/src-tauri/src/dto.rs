@@ -571,7 +571,34 @@ pub struct DesktopAgent {
     /// whose authoring agents the webview then shows as single agents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authoring_kind: Option<AuthoringKind>,
+    /// PRD #1666 §2.8: the daemon's summary of this agent's inbox
+    /// (`AgentRecord::inbox`), which the tile's `✉N` / `delivered` line is
+    /// drawn from. Absent from a daemon predating it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<DesktopInbox>,
+    /// PRD #1666 §2.8: the deck's notice explaining an `error` status — a
+    /// message it could not deliver — from the daemon's session record
+    /// (`SessionSnapshot::delivery_notice`). Present only beside
+    /// `status: "error"`, and scrubbed here like every other daemon text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<String>,
     pub tab: DesktopTab,
+}
+
+/// PRD #1666 §2.8: the webview's view of an `InboxSummary`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInbox {
+    pub queued: usize,
+    pub fetched: usize,
+    pub undeliverable: usize,
+    /// When the agent last acknowledged a message, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_acked_at: Option<String>,
+    /// `native`, `turn_end`, `doorbell` or `none` — the daemon's wire value.
+    pub wake: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
 }
 
 /// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
@@ -1753,6 +1780,24 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // PRD #1541: the daemon's keys, bounded — never this crate's own registry.
     let prompt_keys = record.prompt_keys.as_ref().and_then(map_prompt_keys);
     let tab = map_tab(record.tab_membership.as_ref());
+    // Inline rather than a helper naming `InboxSummary`'s module, which is the
+    // daemon's and outside what this crate reaches across (linkage-check rule 12).
+    let inbox = record.inbox.as_ref().map(|summary| DesktopInbox {
+        queued: summary.queued,
+        fetched: summary.fetched,
+        undeliverable: summary.undeliverable,
+        last_acked_at: summary.last_acked_at.map(|at| at.to_rfc3339()),
+        wake: serde_json::to_value(summary.wake)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string()),
+        component: summary.component.as_deref().map(safe_display_text),
+    });
+    let delivery_notice = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Error)
+        .and_then(|snapshot| snapshot.delivery_notice.as_deref())
+        .map(safe_display_text)
+        .filter(|notice| !notice.is_empty());
 
     DesktopAgent {
         id: record.id,
@@ -1773,6 +1818,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         blocked,
         prompt_keys,
         authoring_kind: record.authoring_kind,
+        inbox,
+        delivery_notice,
         tab,
     }
 }
@@ -3395,6 +3442,7 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                delivery_notice: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is

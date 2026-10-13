@@ -21758,6 +21758,7 @@ mod spawn_tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                delivery_notice: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

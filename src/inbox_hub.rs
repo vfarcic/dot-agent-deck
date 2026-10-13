@@ -299,6 +299,13 @@ struct HubState {
     exited_ledgers: Vec<DelegateLedger>,
     /// Ids minted for a delegated task that is not yet posted, nor abandoned.
     pending_posts: std::collections::HashSet<String>,
+    /// PRD #1666 §2.8: where a recipient's card is told a message could not
+    /// reach it — the daemon's delivery-notice channel, installed by
+    /// [`InboxHub::set_card_notice_sink`]. Nothing is owed while it is unset.
+    card_notice_sink: Option<crate::agent_pty::DeliveryNoticeSink>,
+    /// Card notices a state change owes, published with the other owed notices
+    /// once the lock is released ([`InboxHub::post_owed_notices`]).
+    owed_card_notices: Vec<crate::agent_pty::DeliveryNotice>,
 }
 
 /// The daemon's inbox and the components armed on it. See the module docs.
@@ -374,6 +381,8 @@ impl InboxHub {
                 rings: HashMap::new(),
                 exited_ledgers: Vec::new(),
                 pending_posts: std::collections::HashSet::new(),
+                card_notice_sink: None,
+                owed_card_notices: Vec::new(),
             }),
             changed: Arc::new(Notify::new()),
             keepalive,
@@ -406,6 +415,13 @@ impl InboxHub {
     /// [`BroadcastMsg::Inbox`].
     pub fn set_broadcast(&self, tx: broadcast::Sender<BroadcastMsg>) {
         self.lock().broadcast = Some(tx);
+    }
+
+    /// PRD #1666 §2.8: tell the recipient's card, through `sink`, of every
+    /// later message that turns undeliverable because it was handed over too
+    /// many times or its agent exited — the card shows Error and the notice.
+    pub fn set_card_notice_sink(&self, sink: crate::agent_pty::DeliveryNoticeSink) {
+        self.lock().card_notice_sink = Some(sink);
     }
 
     pub fn deck(&self) -> DeckId {
@@ -583,7 +599,19 @@ impl InboxHub {
 
     /// Post every notice a state change has owed since the last call.
     pub fn post_owed_notices(&self) {
-        let owed = std::mem::take(&mut self.lock().owed_notices);
+        let (owed, cards, sink) = {
+            let mut st = self.lock();
+            (
+                std::mem::take(&mut st.owed_notices),
+                std::mem::take(&mut st.owed_card_notices),
+                st.card_notice_sink.clone(),
+            )
+        };
+        if let Some(sink) = sink {
+            for notice in cards {
+                sink(notice);
+            }
+        }
         for (to, body) in owed {
             let pane_id = to.pane_id.clone();
             if let Err(error) = self.post_notice(to, "task not delivered", body) {
@@ -1203,6 +1231,7 @@ fn drain_events(st: &mut HubState) {
             state = %event.state,
             "inbox: state change"
         );
+        owe_card_notice(st, &event);
         let (Some(tx), Some(recipient)) = (st.broadcast.as_ref(), event.recipient) else {
             continue;
         };
@@ -1217,6 +1246,35 @@ fn drain_events(st: &mut HubState) {
             reason: event.undeliverable_reason,
         }));
     }
+}
+
+/// PRD #1666 §2.8: owe the recipient's card a notice when `event` made its
+/// message undeliverable for a reason the card should explain. A superseded
+/// message was replaced, and a shut inbox is the daemon going away; neither is
+/// the agent's to explain.
+fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
+    use crate::inbox_display::{NOTICE_AGENT_EXITED, NOTICE_MAX_DELIVER};
+    if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
+        return;
+    }
+    let detail = match event.undeliverable_reason {
+        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
+        Some(UndeliverableReason::AgentExited) => NOTICE_AGENT_EXITED,
+        _ => return,
+    };
+    let Some(recipient) = event.recipient.as_ref() else {
+        return;
+    };
+    let Some(agent_id) = recipient.agent_id.clone() else {
+        return;
+    };
+    st.owed_card_notices.push(crate::agent_pty::DeliveryNotice {
+        pane_id: recipient.pane_id.clone(),
+        agent_id,
+        delivery_id: event.message_id.to_string(),
+        session_id: None,
+        detail,
+    });
 }
 
 /// PRD #1666 S5: end the watch on a delegated task once it is acknowledged or
@@ -1646,6 +1704,43 @@ mod tests {
 
     fn hub() -> InboxHub {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
+    }
+
+    /// PRD #1666 §2.8: a message handed over the most times allowed, none
+    /// acknowledged, owes its recipient's card a notice through the installed
+    /// sink — once, with the fixed not-delivered text.
+    #[test]
+    fn an_undeliverable_message_tells_its_recipients_card() {
+        let limits = InboxLimits {
+            max_deliver: 1,
+            ..InboxLimits::default()
+        };
+        let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        let told: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&told);
+        hub.set_card_notice_sink(Arc::new(move |notice| {
+            sink.lock().unwrap().push(format!(
+                "{} {} {} {}",
+                notice.pane_id, notice.agent_id, notice.delivery_id, notice.detail
+            ));
+        }));
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("task"))
+            .unwrap()
+            .to_string();
+        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        assert!(told.lock().unwrap().is_empty(), "a fetch owes no notice");
+        // Handed back after its one allowed hand-over: undeliverable.
+        hub.nack(&id, "p", "a");
+        assert_eq!(
+            *told.lock().unwrap(),
+            [format!(
+                "p a {id} {}",
+                crate::inbox_display::NOTICE_MAX_DELIVER
+            )]
+        );
+        hub.post_owed_notices();
+        assert_eq!(told.lock().unwrap().len(), 1, "a notice is owed once");
     }
 
     /// PRD #1666 S8 (FT-18): a stream's `{"repaint":true}` line reaches the

@@ -2968,6 +2968,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_activity_ms: None,
         blocked: None,
         hook_generation: None,
+        delivery_notice: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3117,6 +3118,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_activity_ms: None,
                         blocked: None,
                         hook_generation: None,
+                        delivery_notice: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,

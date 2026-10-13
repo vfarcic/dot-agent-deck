@@ -13818,6 +13818,11 @@ pub fn run_tui(
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
             );
+            // PRD #1666 §2.8: the card's inbox line starts from the daemon's
+            // summary; live notices move it from here.
+            if let Some(summary) = h.inbox.as_ref() {
+                st.apply_inbox_summary(&h.pane_id, &h.agent_id, summary);
+            }
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -21411,6 +21416,21 @@ fn render_session_card(
 
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
+    // PRD #1666 §2.8: the inbox line rides the status badge — `✉2 queued` /
+    // `✉ delivered` where the title keeps room, the pending count alone on a
+    // narrow card, and nothing where even that does not fit.
+    let inbox_text = if is_placeholder {
+        None
+    } else {
+        session
+            .card_inbox()
+            .and_then(|inbox| card_inbox_badge(inbox, &status_text, area.width as usize))
+    };
+    let badge_width = unicode_width::UnicodeWidthStr::width(status_text.as_str())
+        + inbox_text
+            .as_deref()
+            .map(unicode_width::UnicodeWidthStr::width)
+            .unwrap_or(0);
     // What is left of the card's width once the right-hand status badge and the
     // two border cells are paid for. Issue #357: this is a COLUMN budget — both
     // terms it subtracts are cells on the same row — and `truncate_styled_segments`
@@ -21418,8 +21438,7 @@ fn render_session_card(
     // reason rather than by `char`; the two agree on every badge this renders
     // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
     // column), so the budget is unchanged and no card snapshot moves.
-    let max_title = (area.width as usize)
-        .saturating_sub(unicode_width::UnicodeWidthStr::width(status_text.as_str()) + 2);
+    let max_title = (area.width as usize).saturating_sub(badge_width + 2);
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -21465,10 +21484,13 @@ fn render_session_card(
         .border_style(border_style)
         .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
-        .title(
-            Line::from(Span::styled(status_text, status_style))
-                .alignment(ratatui::layout::Alignment::Right),
-        );
+        .title({
+            let mut badge = vec![Span::styled(status_text, status_style)];
+            if let Some(inbox) = inbox_text {
+                badge.push(Span::styled(inbox, text_primary()));
+            }
+            Line::from(badge).alignment(ratatui::layout::Alignment::Right)
+        });
     // Omitted entirely when even the shortest form would overrun the corners.
     if let Some(stats) = stats_title {
         block = block.title_bottom(
@@ -21565,6 +21587,16 @@ fn render_session_card(
         )));
     }
 
+    // PRD #1666 §2.8: why the card is in Error when the deck said — a message
+    // it could not deliver. Daemon-authored text, under `Dir:` like the
+    // Blocked reason.
+    if !is_placeholder && let Some(notice) = session.delivery_notice() {
+        status_lines.push(Line::from(Span::styled(
+            truncate_with_ellipsis(notice, w),
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        )));
+    }
+
     let prompts = if density.max_prompts() == 0 {
         Vec::new()
     } else if is_placeholder {
@@ -21609,6 +21641,34 @@ fn render_session_card(
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Title columns a card keeps before its inbox line gives up its words for
+/// the bare count ([`card_inbox_badge`]).
+const CARD_TITLE_MIN_FOR_INBOX_WORDS: usize = 16;
+
+/// PRD #1666 §2.8: the inbox text a card of `width` columns appends to its
+/// status badge, trailing space included — the full line where the title keeps
+/// [`CARD_TITLE_MIN_FOR_INBOX_WORDS`] columns, the pending count alone where
+/// only that fits, else nothing.
+fn card_inbox_badge(
+    inbox: crate::inbox_display::CardInbox,
+    status_text: &str,
+    width: usize,
+) -> Option<String> {
+    let status = unicode_width::UnicodeWidthStr::width(status_text);
+    let fits = |text: &str, title: usize| {
+        status + unicode_width::UnicodeWidthStr::width(text) + 2 + title <= width
+    };
+    if let Some(full) = inbox.full_text().map(|text| format!("{text} "))
+        && fits(&full, CARD_TITLE_MIN_FOR_INBOX_WORDS)
+    {
+        return Some(full);
+    }
+    inbox
+        .short_text()
+        .map(|text| format!("{text} "))
+        .filter(|short| fits(short, 0))
 }
 
 /// Which of a card's sheddable rows [`render_session_card`] draws.
@@ -27190,6 +27250,7 @@ mod tests {
             agent_type: None,
             live: None,
             orchestrator_context_path: None,
+            inbox: None,
         }
     }
 

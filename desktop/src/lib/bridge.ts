@@ -4,7 +4,7 @@ import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./act
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
-import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
+import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
@@ -17,6 +17,7 @@ import { speechAudioError } from "./speech";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
+  AgentInbox,
   AuthoringKind,
   AgentSession,
   AgentTarget,
@@ -331,6 +332,24 @@ export interface DesktopAgentDto {
    * the voice surface then refuses the command rather than guessing.
    */
   promptKeys?: PromptKeys;
+  /**
+   * PRD #1666 — `AgentRecord.inbox`, the daemon's summary of this agent's
+   * inbox. Absent from a daemon predating the inbox.
+   */
+  inbox?: {
+    queued: number;
+    fetched: number;
+    undeliverable: number;
+    lastAckedAt?: string;
+    wake: string;
+    component?: string;
+  };
+  /**
+   * PRD #1666 — the deck's notice explaining an `error` status (a message the
+   * deck could not deliver), from the daemon's session record. Daemon text;
+   * `agentFromDto` keeps it only beside `status: "error"` and as a display copy.
+   */
+  deliveryNotice?: string;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -2200,6 +2219,52 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
   };
 }
 
+/** PRD #1666: the card's view of `DesktopAgentDto.inbox`; counts the crate did not send read as zero. */
+function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox {
+  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
+  return {
+    queued: count(inbox.queued),
+    fetched: count(inbox.fetched),
+    undeliverable: count(inbox.undeliverable),
+    ...(inbox.lastAckedAt ? { lastAckedAt: inbox.lastAckedAt } : {}),
+    wake: inbox.wake,
+    ...(inbox.component ? { component: inbox.component } : {}),
+  };
+}
+
+/**
+ * PRD #1666: the notice a `delivery_notice` error event carries for an agent
+ * card, or `undefined` for any other payload. The daemon applies the same event
+ * to its own record, so the next snapshot carries the notice too
+ * (`DesktopAgentDto.deliveryNotice`); this is what shows it before that.
+ */
+function deliveryNoticeOf(payload: unknown): { agentId?: string; paneId?: string; notice: string } | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const event = payload as DaemonHookEvent;
+  if (event.kind !== undefined && event.kind !== "event") return undefined;
+  if (event.event_type !== "error") return undefined;
+  const notice = metadataOf(event).delivery_notice;
+  if (!notice?.trim()) return undefined;
+  const agentId = typeof event.agent_id === "string" ? event.agent_id : undefined;
+  const paneId = typeof event.pane_id === "string" ? event.pane_id : undefined;
+  if (!agentId && !paneId) return undefined;
+  return { agentId, paneId, notice: displayText(notice, DISPLAY_LIMITS.prompt) };
+}
+
+/**
+ * PRD #1666: `agents` with a `delivery_notice` error event applied to the card
+ * it names — Error, and the notice — or the same array for any other payload.
+ */
+function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSession[] {
+  const found = deliveryNoticeOf(payload);
+  if (!found) return agents;
+  const index = agents.findIndex((agent) => (found.agentId ? agent.id === found.agentId : agent.paneId === found.paneId));
+  if (index === -1) return agents;
+  const next = agents.slice();
+  next[index] = { ...next[index], status: "failed", daemonStatus: "error", deliveryNotice: found.notice };
+  return next;
+}
+
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
@@ -2260,6 +2325,10 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    ...(agent.inbox ? { inbox: inboxFromDto(agent.inbox) } : {}),
+    ...(agent.status === "error" && agent.deliveryNotice
+      ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
+      : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -3681,7 +3750,7 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   private recordDaemonEvent(payload: unknown): boolean {
-    const edges = applyHandoffEvent(this.handoffs, payload);
+    const edges = applyHandoffEvent(this.handoffs, payload, (agentId, paneId) => this.resolveAgent(agentId, paneId)?.role);
     const edgesChanged = edges !== this.handoffs;
     this.handoffs = edges;
     const item = mapDaemonEvent(payload, this.evidenceSequence, this.resolveAgent);
@@ -4400,7 +4469,7 @@ export class TauriDeckBridge implements DeckBridge {
       const selectedDeckId = this.selectedDeckId;
       const selected = selectedDeckId === undefined ? undefined : this.fleet.get(selectedDeckId);
       if (!changed || selectedDeckId === undefined || selected === undefined) return;
-      this.fleet.set(selectedDeckId, { ...selected, evidence: this.evidence, handoffs: this.handoffs });
+      this.fleet.set(selectedDeckId, { ...selected, agents: withDeliveryNotice(selected.agents, event.payload), evidence: this.evidence, handoffs: this.handoffs });
       onFleet(this.fleetView());
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {

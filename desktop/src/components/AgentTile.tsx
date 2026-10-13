@@ -30,6 +30,7 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
+import { inboxBadge } from "../lib/inboxWords";
 import { displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
@@ -362,6 +363,11 @@ export function AgentTile({
     void onRename(agent.id, next);
   };
 
+  // The daemon's `error` is merged into `failed` for grouping; the card says
+  // what the daemon said, the word the TUI's card uses (rule 22).
+  const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
+  const badge = inboxBadge(agent.inbox);
+
   return (
     <article
       className={`agent-tile ${selected ? "is-selected" : ""}`}
@@ -405,7 +411,9 @@ export function AgentTile({
                 takes, and half of them are not verbs — `last seen passed` and
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
-              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${statusLabel(agent.status)}` : statusLabel(agent.status)}</span>
+              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              {/* PRD #1666: the inbox line the TUI's card prints too. */}
+              {badge && !held && <span className="agent-inbox-badge" data-testid={`inbox-badge-${agent.id}`}>{badge}</span>}
             </div>
             {renameDraft !== undefined ? (
               <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>
@@ -443,6 +451,11 @@ export function AgentTile({
                 explains. Not on a held record: that status is a past reading. */}
             {agent.status === "blocked" && !held && (
               <p className="agent-blocked-reason" data-testid={`blocked-reason-${agent.id}`}>{blockedReasonText(agent.blocked)}</p>
+            )}
+            {/* PRD #1666: why the agent is in error, when the deck said — a
+                message it could not deliver. */}
+            {agent.deliveryNotice && !held && (
+              <p className="agent-delivery-notice" data-testid={`delivery-notice-${agent.id}`}>{agent.deliveryNotice}</p>
             )}
           </div>
         </div>

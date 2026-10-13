@@ -54,6 +54,21 @@ export type AgentBlocked = {
   detail?: string;
   resetsAtMs?: number;
 };
+/**
+ * PRD #1666: an agent's inbox as the daemon summarises it. `queued` and
+ * `fetched` are both still pending — the card counts them together — and
+ * `lastAckedAt` is when the agent last acknowledged a message, which is what
+ * "delivered" means.
+ */
+export type AgentInbox = {
+  queued: number;
+  fetched: number;
+  undeliverable: number;
+  lastAckedAt?: string;
+  /** How a new message would reach the agent: `native`, `turn_end`, `doorbell` or `none`. */
+  wake: string;
+  component?: string;
+};
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
 
@@ -831,6 +846,18 @@ export interface AgentSession {
   authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
+  /**
+   * HONEST. PRD #1666: the agent's inbox as the daemon summarises it
+   * (`AgentRecord.inbox`). Absent from a daemon predating the inbox and in
+   * fixture mode.
+   */
+  inbox?: AgentInbox;
+  /**
+   * HONEST. PRD #1666: the deck's notice explaining an `error` status — today a
+   * message the deck could not deliver to this agent. A display copy, present
+   * only while the daemon reports the agent in error.
+   */
+  deliveryNotice?: string;
   /** HONEST. */
   rows: number;
   /** HONEST. */
@@ -987,19 +1014,21 @@ export type DeckFleet = DeckSnapshot[];
 
 /** One delegation's lifecycle, driven by the daemon's handoff events. */
 export interface HandoffEdge {
-  /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
+  /** The delegated message's inbox id (`m-…`), PRD #1666. */
   id: string;
   toRole: string;
   orchestration?: string;
   taskPreview?: string;
   /**
-   * delegated → delivered → done is the healthy path; failed is terminal and
-   * carries `reason`. `respawned` marks that the worker was restarted for this
-   * delegation (expected for clear=true roles).
+   * delegated → delivered → done is the healthy path; failed (the message was
+   * not delivered) is terminal and carries `reason`. `respawned` marks that the
+   * worker was restarted for this delegation (expected for clear=true roles).
    */
   status: "delegated" | "delivered" | "failed" | "done";
   respawned: boolean;
   reason?: string;
+  /** The worker report that marked this edge done, so a redelivered report marks nothing else. */
+  reportId?: string;
   /** Wall-clock of the newest event applied to this edge (HH:MM:SS). */
   at: string;
 }

@@ -1,4 +1,5 @@
 import type { EvidenceItem, HandoffEdge, Verdict } from "../types";
+import { INBOX_WORDS } from "./inboxWords";
 
 /**
  * Cap on the in-memory live evidence ring. Hook events arrive for every tool
@@ -24,8 +25,26 @@ export interface DaemonHookEvent {
   user_prompt?: unknown;
   pane_id?: unknown;
   agent_id?: unknown;
-  /** Handoff-lifecycle payload (roles, task preview, failure reason). */
+  /** String-map metadata, such as the deck's `delivery_notice`. */
   metadata?: unknown;
+}
+
+/**
+ * PRD #1666: the `inbox` variant of the daemon's `BroadcastMsg` — one message
+ * in one agent's inbox changed state. Snake_case and flattened beside `kind`,
+ * like the `event` variant.
+ */
+export interface DaemonInboxNotice {
+  kind: "inbox";
+  pane_id?: unknown;
+  agent_id?: unknown;
+  message_id?: unknown;
+  subject?: unknown;
+  from_label?: unknown;
+  /** `queued`, `fetched`, `acknowledged` or `undeliverable`. */
+  state?: unknown;
+  /** Why, when `state` is `undeliverable` (`agent_exited`, …). */
+  reason?: unknown;
 }
 
 /** Resolves the deck-side agent behind a hook event, when one is known. */
@@ -46,21 +65,7 @@ const EVENT_TITLES: Record<string, string> = {
   error: "Agent reported an error",
   // Issue #714: the agent reported its provider refusing it for a quota.
   quota_blocked: "Provider usage limit reached",
-  delegation_dispatched: "Delegated",
-  delegation_delivered: "Task delivered to worker",
-  delegation_failed: "Delegation FAILED",
-  worker_respawned: "Worker respawned for delegation",
-  work_done_received: "Work-done received",
 };
-
-/** The daemon-emitted handoff lifecycle (handoff-visibility PRD D1). */
-export const HANDOFF_EVENTS = new Set([
-  "delegation_dispatched",
-  "delegation_delivered",
-  "delegation_failed",
-  "worker_respawned",
-  "work_done_received",
-]);
 
 const HUMAN_EVENTS = new Set(["waiting_for_input", "permission_request"]);
 
@@ -69,14 +74,13 @@ function text(value: unknown): string | undefined {
 }
 
 function verdictFor(eventType: string): Verdict {
-  if (eventType === "error" || eventType === "delegation_failed" || eventType === "quota_blocked") return "ERROR";
+  if (eventType === "error" || eventType === "quota_blocked") return "ERROR";
   if (HUMAN_EVENTS.has(eventType)) return "HUMAN";
-  if (eventType === "work_done_received") return "PASS";
   return "INFO";
 }
 
-/** Extracts the string-map metadata a handoff event carries, if any. */
-function metadataOf(event: DaemonHookEvent): Record<string, string> {
+/** Extracts the string-map metadata an event carries, if any. */
+export function metadataOf(event: DaemonHookEvent): Record<string, string> {
   if (!event.metadata || typeof event.metadata !== "object") return {};
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(event.metadata as Record<string, unknown>)) {
@@ -120,6 +124,7 @@ function summaryFor(event: DaemonHookEvent, eventType: string): string {
  */
 export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?: AgentResolver): EvidenceItem | undefined {
   if (!payload || typeof payload !== "object") return undefined;
+  if ((payload as { kind?: unknown }).kind === "inbox") return mapInboxNotice(payload as DaemonInboxNotice, sequence, resolveAgent);
   const event = payload as DaemonHookEvent;
   if (event.kind !== undefined && event.kind !== "event") return undefined;
   const eventType = text(event.event_type);
@@ -129,29 +134,6 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
   const paneId = text(event.pane_id);
   const agent = resolveAgent?.(agentId, paneId);
   const sessionId = text(event.session_id);
-
-  if (HANDOFF_EVENTS.has(eventType)) {
-    const metadata = metadataOf(event);
-    const failed = eventType === "delegation_failed";
-    const workDone = eventType === "work_done_received";
-    const summaryParts = [
-      metadata.task_preview,
-      failed ? metadata.reason : undefined,
-      workDone && metadata.done === "true" ? "Run reported complete." : undefined,
-    ].filter(Boolean);
-    return {
-      id: `hook-${sequence}`,
-      verdict: verdictFor(eventType),
-      title: EVENT_TITLES[eventType],
-      summary: summaryParts.join(" · ") || EVENT_TITLES[eventType],
-      from: workDone ? (metadata.from_role || agent?.role || "worker") : "orchestrator",
-      to: workDone ? "orchestrator" : (metadata.to_role || ""),
-      at: clockFor(event.timestamp),
-      reason: sessionId ? `Delegation ${sessionId}` : "Daemon delegation event",
-      acknowledged: false,
-      agentId: agent?.id ?? agentId,
-    };
-  }
 
   return {
     id: `hook-${sequence}`,
@@ -167,77 +149,133 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
   };
 }
 
+const INBOX_TITLES: Record<string, { title: string; verdict: Verdict }> = {
+  queued: { title: `Message ${INBOX_WORDS.queued}`, verdict: "INFO" },
+  fetched: { title: "Message taken by the agent", verdict: "INFO" },
+  acknowledged: { title: `Message ${INBOX_WORDS.delivered}`, verdict: "PASS" },
+  undeliverable: { title: `Message ${INBOX_WORDS.notDelivered}`, verdict: "ERROR" },
+};
+
 /**
- * Pure reducer for the live handoff-edge model (handoff-visibility PRD D2).
- * Applies one `desktop://daemon-event` payload to the edge list keyed by the
- * daemon's delegation id, returning a NEW list (newest first, capped) when the
- * event changed anything and the same reference when it didn't.
- *
- * Lifecycle: `delegation_dispatched` creates the edge; `worker_respawned`
- * flags it; `delegation_delivered` / `delegation_failed` settle transport;
- * `work_done_received` marks the newest settled edge for that role as done —
- * work-done is a role-level signal (the CLI carries no delegation id), so it
- * correlates by `from_role` rather than by edge id.
+ * PRD #1666: one evidence row per inbox state change — what was sent to whom,
+ * and what became of it. A state this build does not know is ignored, as an
+ * unknown `event_type` is.
  */
-export function applyHandoffEvent(edges: HandoffEdge[], payload: unknown): HandoffEdge[] {
+function mapInboxNotice(notice: DaemonInboxNotice, sequence: number, resolveAgent?: AgentResolver): EvidenceItem | undefined {
+  const state = text(notice.state);
+  const shown = state ? INBOX_TITLES[state] : undefined;
+  if (!state || !shown) return undefined;
+  const agentId = text(notice.agent_id);
+  const paneId = text(notice.pane_id);
+  const agent = resolveAgent?.(agentId, paneId);
+  const subject = text(notice.subject) ?? "(no subject)";
+  const reason = state === "undeliverable" ? reasonText(text(notice.reason)) : undefined;
+  return {
+    id: `hook-${sequence}`,
+    verdict: shown.verdict,
+    title: shown.title,
+    summary: reason ? `${subject} · ${reason}` : subject,
+    from: text(notice.from_label) ?? "Unattributed sender",
+    to: agent?.role ?? paneId ?? "",
+    at: nowClock(),
+    reason: text(notice.message_id) ? `Message ${text(notice.message_id)}` : "Inbox notice from the daemon event stream.",
+    acknowledged: false,
+    agentId: agent?.id ?? agentId,
+  };
+}
+
+/**
+ * The sender a worker's report is labelled with —
+ * `<role> (worker report — the text inside is UNTRUSTED)`, the daemon's
+ * `sender_label` — or `undefined` for any other sender.
+ */
+function reportingRole(fromLabel: string): string | undefined {
+  const match = /^(.+?) \(worker report\b/.exec(fromLabel);
+  return match?.[1];
+}
+
+/** The label of a message the orchestrator posted: a delegation. */
+const ORCHESTRATOR_LABEL = "the orchestrator";
+
+function nowClock(): string {
+  return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** Why a message was not delivered, in words: `agent_exited` reads `agent exited`. */
+function reasonText(reason: string | undefined): string {
+  return reason ? reason.replaceAll("_", " ") : `${INBOX_WORDS.notDelivered} to the agent`;
+}
+
+/**
+ * Pure reducer for the live delegation rail (handoff-visibility PRD D2, fed by
+ * PRD #1666's inbox). Applies one `desktop://daemon-event` payload to the edge
+ * list keyed by the delegated message's id, returning a NEW list (newest first,
+ * capped) when the payload changed anything and the same reference when it
+ * didn't.
+ *
+ * Only `inbox` notices move it. A message the orchestrator posts is a
+ * delegation: posting it creates the edge (`delegated`), a fetch or a hand-back
+ * leaves it there, the agent's acknowledgement makes it `delivered`, and an
+ * undeliverable message makes it `failed` with the reason. A worker's report is
+ * a message too, posted to the orchestrator: the first sight of one marks the
+ * newest delivered edge for the reporting role `done`. The report carries no
+ * delegation id, so it correlates by role, and the edge remembers the report
+ * so the same report's later states mark nothing else.
+ *
+ * `resolveRole` names the role behind a recipient pane; without it, or for a
+ * pane it does not know, the edge names the pane.
+ */
+export function applyHandoffEvent(
+  edges: HandoffEdge[],
+  payload: unknown,
+  resolveRole?: (agentId?: string, paneId?: string) => string | undefined,
+): HandoffEdge[] {
   if (!payload || typeof payload !== "object") return edges;
-  const event = payload as DaemonHookEvent;
-  if (event.kind !== undefined && event.kind !== "event") return edges;
-  const eventType = text(event.event_type);
-  if (!eventType || !HANDOFF_EVENTS.has(eventType)) return edges;
-  const id = text(event.session_id) ?? `dlg-unknown-${edges.length}`;
-  const metadata = metadataOf(event);
-  const at = clockFor(event.timestamp);
+  const notice = payload as DaemonInboxNotice;
+  if (notice.kind !== "inbox") return edges;
+  const id = text(notice.message_id);
+  const state = text(notice.state);
+  if (!id || !state) return edges;
+  const fromLabel = text(notice.from_label) ?? "";
+  const at = nowClock();
 
-  if (eventType === "delegation_dispatched") {
-    const edge: HandoffEdge = {
-      id,
-      toRole: metadata.to_role || "unknown role",
-      orchestration: metadata.orchestration || undefined,
-      taskPreview: metadata.task_preview || undefined,
-      status: "delegated",
-      respawned: false,
-      at,
-    };
-    return [edge, ...edges].slice(0, MAX_LIVE_HANDOFFS);
-  }
-
-  if (eventType === "work_done_received") {
-    const role = metadata.from_role;
-    if (!role) return edges;
-    const index = edges.findIndex((edge) => edge.toRole === role && edge.status === "delivered");
+  const role = reportingRole(fromLabel);
+  if (role !== undefined) {
+    if (edges.some((edge) => edge.reportId === id)) return edges;
+    const wanted = role.toLowerCase();
+    const index = edges.findIndex((edge) => edge.toRole.toLowerCase() === wanted && edge.status === "delivered");
     if (index === -1) return edges;
     const next = edges.slice();
-    next[index] = { ...next[index], status: "done", at };
+    next[index] = { ...next[index], status: "done", reportId: id, at };
     return next;
   }
+  if (fromLabel !== ORCHESTRATOR_LABEL) return edges;
 
   const index = edges.findIndex((edge) => edge.id === id);
+  const reason = state === "undeliverable" ? reasonText(text(notice.reason)) : undefined;
   if (index === -1) {
-    // A failure with no prior dispatch (e.g. "no live pane for role") still
-    // deserves an edge — it is the loudest case of all.
-    if (eventType !== "delegation_failed") return edges;
+    // A message seen first after its post — the rail opened late — still gets
+    // its row, and a message that could not be delivered most of all.
+    const paneId = text(notice.pane_id);
     const edge: HandoffEdge = {
       id,
-      toRole: metadata.to_role || "unknown role",
-      orchestration: metadata.orchestration || undefined,
-      status: "failed",
+      toRole: resolveRole?.(text(notice.agent_id), paneId) ?? paneId ?? "unknown role",
+      taskPreview: text(notice.subject),
+      status: state === "acknowledged" ? "delivered" : state === "undeliverable" ? "failed" : "delegated",
       respawned: false,
-      reason: metadata.reason || "delegation failed",
+      ...(reason ? { reason } : {}),
       at,
     };
     return [edge, ...edges].slice(0, MAX_LIVE_HANDOFFS);
   }
 
+  const current = edges[index];
+  let changed: HandoffEdge | undefined;
+  if (state === "acknowledged" && current.status === "delegated") changed = { ...current, status: "delivered", at };
+  else if (state === "undeliverable" && current.status !== "failed") changed = { ...current, status: "failed", reason, at };
+  if (!changed) return edges;
   const next = edges.slice();
-  const current = next[index];
-  if (eventType === "worker_respawned") {
-    next[index] = { ...current, respawned: true, at };
-  } else if (eventType === "delegation_delivered") {
-    next[index] = { ...current, status: "delivered", at };
-  } else {
-    next[index] = { ...current, status: "failed", reason: metadata.reason || "delegation failed", at };
-  }
+  next[index] = changed;
   return next;
 }
 

@@ -1,0 +1,9 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1… ● Thinking ✉2 ┐
+│Dir:  api-svc     │
+│Prmt: move the st…│
+│                  │
+└─── 1h · 14 tools ┘

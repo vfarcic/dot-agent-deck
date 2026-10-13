@@ -654,6 +654,8 @@ pub mod test_support {
             spawned_at_ms: None,
             blocked: None,
             authoring_kind: None,
+            inbox: None,
+            delivery_notice: None,
             tab: DesktopTab::Dashboard,
         }
     }

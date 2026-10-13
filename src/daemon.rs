@@ -2563,6 +2563,16 @@ fn install_delivery_notice_sink(
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) {
+    // PRD #1666 §2.8: a message the inbox could not deliver reaches its
+    // recipient's card through this same sink.
+    let card_registry = Arc::downgrade(registry);
+    registry
+        .inbox()
+        .set_card_notice_sink(std::sync::Arc::new(move |notice| {
+            if let Some(registry) = card_registry.upgrade() {
+                registry.publish_delivery_notice(notice);
+            }
+        }));
     let weak_registry = Arc::downgrade(registry);
     registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
         let state = state.clone();

@@ -77,6 +77,10 @@ pub struct HydratedPane {
     /// older daemon), or a path that fails that check, keeps the fixed-path
     /// mirror fallback.
     pub orchestrator_context_path: Option<std::path::PathBuf>,
+    /// PRD #1666 §2.8: the daemon's summary of this agent's inbox
+    /// ([`crate::agent_pty::AgentRecord::inbox`]), which the hydrated card's
+    /// `✉N` / `delivered` line starts from. `None` from a daemon predating it.
+    pub inbox: Option<crate::inbox_hub::InboxSummary>,
 }
 
 /// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
@@ -1854,6 +1858,7 @@ impl EmbeddedPaneController {
                     .orchestrator_context_path
                     .as_deref()
                     .map(std::path::PathBuf::from),
+                inbox: record.inbox.clone(),
             });
         }
         hydrated
