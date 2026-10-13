@@ -447,13 +447,13 @@ mod tests {
         assert!(system.contains("open_agent"), "{system}");
         // The observed labels are NOT in the system turn (audit finding A2).
         assert!(!system.contains("\"agents_on_screen\":"), "{system}");
-        assert!(!system.contains("\"label\":\"tester\""), "{system}");
+        assert!(!system.contains("\"label\":\"build tester\""), "{system}");
         assert!(!system.contains("show me the tester"), "{system}");
         // They are the data turn, framed as untrusted …
         assert_eq!(messages[1]["role"], "user");
         let data = messages[1]["content"].as_str().expect("a string");
         assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
-        assert!(data.contains("\"label\":\"tester\""), "{data}");
+        assert!(data.contains("\"label\":\"build tester\""), "{data}");
         // … and the utterance is last, verbatim.
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "show me the tester");

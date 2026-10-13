@@ -23,7 +23,7 @@ import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
-import { orchestrationTitle } from "../lib/agentNames";
+import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
 
@@ -1243,15 +1243,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* Issue #1496 — the rows SHOWING, so a number names a row on screen. */
       : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
   ), [decks, rowsShown]);
-  const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
-    kind: "agent",
-    value: agent.id,
-    deckId: agent.daemonId,
-    label: agent.displayName,
-    /* The names a spoken number can also be: the role and the CLI. Not the
-       id, which nobody reads off the row and which often ends in a digit. */
-    names: [agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli].filter((name): name is string => Boolean(name)),
-  })), [numberedAgents]);
+  const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => {
+    /* Issue #1668 — an orchestration's row by its run's title and its name,
+       as Reading names it, so two runs' coders are two names in a choice. */
+    const label = agentSpokenName(agent);
+    return {
+      kind: "agent",
+      value: agent.id,
+      deckId: agent.daemonId,
+      label,
+      /* The names a spoken number can also be: its own name, the role and the
+         CLI. Not the id, which nobody reads off the row and which often ends
+         in a digit. */
+      names: [...new Set([agent.displayName, agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli])].filter((name): name is string => Boolean(name) && name !== label),
+    };
+  }), [numberedAgents]);
   /* One section across every daemon group (round 4, D7). */
   const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "agent", entries: numberedEntries }], [numberedEntries]);
   useNumberedList("screen", numberedSections);

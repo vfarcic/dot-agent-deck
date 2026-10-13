@@ -61,13 +61,15 @@ You do not have to say an agent's exact name. Say what you know about it:
 | Its mode | "select dispatcher agent", "go to the dispatcher" |
 | Its agent type | "switch to the Codex agent", "open the OpenCode one" |
 | Its directory | "open the agent in billing" |
-| Its orchestration | "show the reviewer in the PRD 1487 orchestration" |
+| Its orchestration's title and its role | "open prd-1401 coder", "show the reviewer in the PRD 1487 orchestration" |
 | The daemon it is on | "open the Codex agent on the local daemon" |
 | What it was last asked to do | "show me the one fixing the scroll" |
 | When it started | "open the newest agent", "open the oldest one" |
 | What it is doing now | "show me the one that's stuck" |
 
 You can combine them, as in "the newest reviewer". A name the screen shows wins: "open tester" opens the agent called tester even if another agent runs in a mode called tester. A directory is named by its own name, not its full path.
+
+An agent that is part of an orchestration is called by the orchestration's title, the heading its group has on the dashboard, followed by its own name, for example "prd-1401 coder". That is the name the app uses when it lists agents for you to choose from, in the command palette's **Focus** entries, and when it tells you an agent is on another page, and it is the name [Reading](#how-agents-are-named) speaks. Every run of an orchestration has the same roles, so say the title when several orchestrations are running: "open prd-1401 coder". The role alone still works while only one agent on the screen has it; when several do, the app asks which one you meant rather than picking one. An agent that is not part of an orchestration is called by its own name.
 
 "Select", "go to" and "switch to" open an agent when you name an agent. When you name a daemon, as in "select the build box daemon", they switch which daemon the app shows instead.
 
