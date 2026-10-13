@@ -87,6 +87,7 @@ pub mod new_agent_options;
 pub mod opencode_manage;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
+pub mod osc52;
 pub mod palette;
 pub mod pane;
 pub mod pane_delivery_queue;

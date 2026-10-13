@@ -607,6 +607,15 @@ pub struct EmbeddedPaneController {
     /// honest feedback + leaves PaneInput — closing the server/UI race where the
     /// UI's pre-forward liveness snapshot was stale.
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
+    /// Issue #1705: the newest clipboard copy an agent asked its terminal for
+    /// (OSC 52), from any pane, not yet passed on. One slot rather than a
+    /// queue: each copy replaces the last on the clipboard, so a copy that is
+    /// overtaken before the render loop drains it would only be overwritten.
+    /// The pane I/O tasks set it; the render loop takes it each frame via
+    /// [`Self::take_clipboard_copy`] and passes it on to the user's own
+    /// terminal, from the UI thread so it cannot land inside a frame being
+    /// drawn.
+    clipboard_copy: Arc<Mutex<Option<String>>>,
     /// PRD #241 F3b (review finding G2): warnings from closes that COMPLETED
     /// without being able to confirm the daemon side (see
     /// [`StopOutcome::DoneUnverified`]). `close_pane` returns `Ok(())` on that
@@ -776,6 +785,7 @@ impl EmbeddedPaneController {
             client,
             runtime,
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
+            clipboard_copy: Arc::new(Mutex::new(None)),
             close_warnings: Arc::new(Mutex::new(Vec::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
         }
@@ -826,6 +836,14 @@ impl EmbeddedPaneController {
     /// feedback and leave PaneInput.
     pub fn take_stream_rejections(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.stream_rejections.lock().unwrap())
+    }
+
+    /// Issue #1705: take the newest clipboard copy an agent has asked for
+    /// since the last call, already validated by
+    /// [`crate::osc52::osc52_copy_text`]. The render loop passes it on to the
+    /// user's terminal.
+    pub fn take_clipboard_copy(&self) -> Option<String> {
+        self.clipboard_copy.lock().unwrap().take()
     }
 
     /// PRD #241 F3b (review finding G2): drain and return the warnings queued by
@@ -1648,6 +1666,7 @@ impl EmbeddedPaneController {
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
         let rejections_for_task = Arc::clone(&self.stream_rejections);
+        let clipboard_for_task = Arc::clone(&self.clipboard_copy);
 
         // PRD #241 F3b: published state for the I/O task. Seeded here rather
         // than inside `run_pane_io_task` so it already reads `IO_ATTACHED`
@@ -1678,6 +1697,7 @@ impl EmbeddedPaneController {
                 hyperlinks_for_task,
                 bytes_for_task,
                 rejections_for_task,
+                clipboard_for_task,
                 io_state_for_task,
                 lost_for_task,
             )
@@ -2945,6 +2965,7 @@ async fn run_pane_io_task(
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
     bytes_since_spawn: Arc<AtomicU64>,
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
+    clipboard_copy: Arc<Mutex<Option<String>>>,
     io_state: Arc<AtomicU8>,
     lost: Arc<Mutex<Option<PaneLostReason>>>,
 ) {
@@ -2975,6 +2996,18 @@ async fn run_pane_io_task(
                         Ok(None) => break,
                         Ok(Some((kind, bytes))) => match kind {
                             crate::daemon_protocol::KIND_STREAM_OUT => {
+                                // Issue #1705: the daemon sends its scrollback
+                                // snapshot as the first STREAM_OUT of every
+                                // attach (`daemon_protocol.rs`, "Replay the
+                                // consistent scrollback snapshot"), so a copy in
+                                // that frame is one the agent made earlier — on
+                                // a reattach or a TUI restart it would overwrite
+                                // the user's clipboard with stale text. Only
+                                // copies in later frames are passed on. With an
+                                // empty scrollback no snapshot frame is sent and
+                                // the first frame is live output, so a copy in
+                                // exactly that frame is the one lost.
+                                let replayed = !bytes_received_this_session;
                                 bytes_received_this_session = true;
                                 process_agent_output_chunk(
                                     &bytes,
@@ -2985,6 +3018,19 @@ async fn run_pane_io_task(
                                     &hyperlinks,
                                     &bytes_since_spawn,
                                 );
+                                // Taken on every frame, replayed or not, so a
+                                // replayed request never waits for a live one.
+                                // Newest first: only the last valid copy in
+                                // the frame would survive on the clipboard.
+                                let requests = osc8.take_clipboard_requests();
+                                if !replayed
+                                    && let Some(text) = requests
+                                        .iter()
+                                        .rev()
+                                        .find_map(|r| crate::osc52::osc52_copy_text(r))
+                                {
+                                    *clipboard_copy.lock().unwrap() = Some(text);
+                                }
                             }
                             crate::daemon_protocol::KIND_STREAM_END => break,
                             // PRD #20 R20-007 (finding #10): a typed, NON-terminal

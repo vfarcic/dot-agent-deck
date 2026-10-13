@@ -1844,18 +1844,24 @@ fn spawn_with_dir(
         .clone()
         .or_else(|| AgentType::from_command(opts.command))
         .unwrap_or(AgentType::None);
-    let launch_command: Option<String> = opts
+    // Issue #1685: a wrapped command the shell has to run itself (a leading
+    // assignment, a compound) comes back as an argv that hands it to
+    // `default_shell` inside the wrapper, so it is exec'd as it stands.
+    let launch_command = opts
         .command
-        .map(|c| crate::wrap::wrap_launch_command(c, &resolved_agent));
+        .map(|c| crate::wrap::wrap_launch_command(c, &resolved_agent, &default_shell));
 
-    let mut cmd = match launch_command.as_deref() {
-        Some(c) if command_needs_shell_wrap(c) => {
+    let mut cmd = match launch_command {
+        Some(crate::wrap::LaunchCommand::Argv(argv)) => {
+            CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect())
+        }
+        Some(crate::wrap::LaunchCommand::Line(c)) if command_needs_shell_wrap(&c) => {
             let mut cb = CommandBuilder::new(&default_shell);
             cb.arg(crate::platform::shell::shell_command_flag());
             cb.arg(c);
             cb
         }
-        Some(c) => CommandBuilder::new(c),
+        Some(crate::wrap::LaunchCommand::Line(c)) => CommandBuilder::new(c),
         None => CommandBuilder::new(&default_shell),
     };
 

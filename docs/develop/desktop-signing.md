@@ -61,7 +61,7 @@ The App Store Connect API key is used rather than an Apple ID plus app-specific 
 
 ### Why an environment, and what its restriction does
 
-GitHub makes an environment's secrets available only to jobs that reference that environment. Two consequences are concrete here. First, a job in `release.yml` that does not declare the environment does not receive them — including `docs`, which calls `docs-publish.yml` with `secrets: inherit` and would forward every *repository* secret to that reusable workflow. Second, the environment's deployment-ref restriction limits which refs can reach them at all.
+GitHub makes an environment's secrets available only to jobs that reference that environment. Two consequences are concrete here. First, a job in `release.yml` that does not declare the environment does not receive them — including `docs`, which calls `docs-publish.yml` and forwards it only `NETLIFY_AUTH_TOKEN` and `NETLIFY_SITE_ID` (issue #514; it used `secrets: inherit`, which forwarded every *repository* secret, until then). Second, the environment's deployment-ref restriction limits which refs can reach them at all.
 
 **Configure the restriction to exactly the refs a release runs from:**
 

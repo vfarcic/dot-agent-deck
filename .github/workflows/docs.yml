@@ -53,7 +53,7 @@ jobs:
           context: .
           file: site/Dockerfile
           load: true
-          tags: ghcr.io/vfarcic/dot-agent-deck-docs:test
+          tags: dot-agent-deck-docs:test
 
       # The Netlify preview is DEPLOYED by docs-preview.yml, not here. This job
       # runs the PR's own code -- its workflow, its devbox.json init hook, the
