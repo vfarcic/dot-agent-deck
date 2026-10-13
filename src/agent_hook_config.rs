@@ -303,12 +303,23 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     Ok(())
 }
 
-/// How long a writer waits for another process's read-modify-write of the same
-/// agent config to finish. One is a few milliseconds, most of it the `fsync`;
-/// a holder still busy after this long is stuck, and the caller's own error
-/// path (a logged warning on the startup install, a printed one from the CLI)
-/// beats blocking a pane's spawn forever.
+/// How long a writer waits without seeing the config published before it
+/// decides the holder is stuck. One read-modify-write is a few milliseconds,
+/// most of it the `fsync`; a holder that publishes nothing for this long is
+/// stuck, and the caller's own error path (a logged warning on the startup
+/// install, a printed one from the CLI) beats blocking a pane's spawn forever.
+///
+/// It bounds a STALL, not the whole wait: the lock is not fair, so under
+/// contention a waiter can lose the lock to other writers many times in a row
+/// while every one of them finishes promptly. Counting that queue against this
+/// window is what failed `codex/trust/008` on a loaded Windows runner — 160
+/// writes at ~90 ms each, and one waiter refused after 10 s while the lock
+/// changed hands throughout. [`CONFIG_LOCK_CEILING`] bounds the whole wait.
 const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a writer waits for the lock in total, however steadily other
+/// writers keep publishing meanwhile.
+const CONFIG_LOCK_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How often a waiting writer retries the lock.
 const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
@@ -355,10 +366,22 @@ pub(crate) struct ConfigLock {
 ///
 /// Every other failure is an error: the sidecar's name is taken by something
 /// that is not a regular file (a lock would land on whatever it points at), it
-/// cannot be opened, or another process still holds it after
-/// [`CONFIG_LOCK_WAIT`]. Going ahead unlocked is exactly the race this exists
+/// cannot be opened, another process holds it for [`CONFIG_LOCK_WAIT`] without
+/// `dest` being published once, or others keep it busy past
+/// [`CONFIG_LOCK_CEILING`]. Going ahead unlocked is exactly the race this exists
 /// to stop.
 pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
+    lock_config_waiting(dest, CONFIG_LOCK_WAIT, CONFIG_LOCK_CEILING)
+}
+
+/// [`lock_config`] with its two bounds as arguments, so tests can exercise them
+/// in milliseconds. `stall` is how long the lock may stay taken with `dest`
+/// unchanged; `ceiling` is the whole wait.
+fn lock_config_waiting(
+    dest: &Path,
+    stall: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> io::Result<ConfigLock> {
     let dir = match dest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -405,25 +428,48 @@ pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
         opts.mode(0o600);
     }
     let file = opts.open(&lock_path)?;
-    let deadline = std::time::Instant::now() + CONFIG_LOCK_WAIT;
+    let started = std::time::Instant::now();
+    let give_up = started + ceiling;
+    let mut stall_deadline = (started + stall).min(give_up);
+    // Sampled only when a stall window runs out, not on every poll, so waiters
+    // add one `stat` of `dest` per window rather than hundreds per second.
+    let mut seen = PublishMark::of(dest);
     loop {
         match file.try_lock() {
             Ok(()) => {
                 reap_stale_temps(dir, name);
                 return Ok(ConfigLock { _file: Some(file) });
             }
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(CONFIG_LOCK_POLL);
-            }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "another process has been updating {} for over {}s; not updating it",
-                        dest.display(),
-                        CONFIG_LOCK_WAIT.as_secs()
-                    ),
-                ));
+                let now = std::time::Instant::now();
+                if now >= stall_deadline {
+                    let current = PublishMark::of(dest);
+                    if current == seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "another process has been updating {} for over {stall:?} \
+                                 without finishing; not updating it",
+                                dest.display(),
+                            ),
+                        ));
+                    }
+                    if now >= give_up {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "other processes have kept {} busy for over {ceiling:?}; \
+                                 not updating it",
+                                dest.display(),
+                            ),
+                        ));
+                    }
+                    // Another writer published since the last look: the lock
+                    // is changing hands, not stuck. Start a fresh window.
+                    seen = current;
+                    stall_deadline = (now + stall).min(give_up);
+                }
+                std::thread::sleep(CONFIG_LOCK_POLL);
             }
             Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
                 tracing::warn!(
@@ -435,6 +481,41 @@ pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
+    }
+}
+
+/// What [`lock_config_waiting`] compares to tell whether `dest` was published
+/// between two looks. Every deck writer publishes by renaming a fresh temp file
+/// over `dest` ([`write_atomic`]), so a publish changes the file's identity —
+/// its inode on unix, its creation time elsewhere (a rename keeps the temp
+/// file's) — as well as, nearly always, its modification time. `None` when
+/// `dest` cannot be read, which compares equal to itself: a config that stays
+/// absent shows no progress.
+#[derive(Debug, PartialEq, Eq)]
+struct PublishMark(Option<PublishMarkFields>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct PublishMarkFields {
+    #[cfg(unix)]
+    inode: (u64, u64),
+    created: Option<std::time::SystemTime>,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl PublishMark {
+    fn of(dest: &Path) -> Self {
+        Self(std::fs::symlink_metadata(dest).ok().map(|meta| {
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt as _;
+            PublishMarkFields {
+                #[cfg(unix)]
+                inode: (meta.dev(), meta.ino()),
+                created: meta.created().ok(),
+                modified: meta.modified().ok(),
+                len: meta.len(),
+            }
+        }))
     }
 }
 
@@ -3933,6 +4014,129 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dir.path().join(".config.toml.lock"))
             .expect("symlink");
         assert!(lock_config(&dest).is_err());
+    }
+
+    /// Hold the config's lock on a thread that publishes `dest` every `every`
+    /// until `stop` is set, then release it. Returns once the lock is held.
+    fn hold_and_keep_publishing(
+        dest: &Path,
+        every: std::time::Duration,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<usize> {
+        let dest = dest.to_path_buf();
+        let (locked, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = lock_config(&dest).expect("holder takes the lock");
+            locked.send(()).expect("signal the lock is held");
+            let dir = dest.parent().expect("dest has a directory");
+            let mut published = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(every);
+                published += 1;
+                // A different length each time, so the change shows even where
+                // the modification time is coarse.
+                write_atomic(dir, &dest, "x".repeat(published).as_bytes()).expect("publish");
+            }
+            published
+        });
+        held.recv().expect("the holder took the lock");
+        holder
+    }
+
+    /// `codex/trust/008` on a loaded Windows runner: the lock is not fair, so a
+    /// waiter can lose it to other writers for longer than the stall window
+    /// while every one of them finishes promptly. A config that keeps being
+    /// published is a lock changing hands, not a stuck holder, so the wait goes
+    /// on past the stall window and succeeds once the lock is free.
+    #[test]
+    fn the_config_lock_waits_past_the_stall_window_while_the_config_keeps_being_published() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stall = std::time::Duration::from_millis(500);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder =
+            hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
+        let release = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(stall * 3);
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let waited = lock_config_waiting(&dest, stall, std::time::Duration::from_secs(60));
+        let elapsed = started.elapsed();
+        release.join().expect("release thread");
+        let published = holder.join().expect("holder thread");
+
+        waited.expect("a lock changing hands is waited for past the stall window");
+        assert!(
+            elapsed > stall,
+            "the wait ended after {elapsed:?}, inside the {stall:?} stall window, so it \
+             proved nothing about waiting past it"
+        );
+        assert!(published > 0, "the holder never published");
+    }
+
+    /// A holder that keeps the lock without publishing is stuck: the waiter
+    /// gives up once the stall window passes, long before the ceiling.
+    #[test]
+    fn the_config_lock_gives_up_on_a_holder_that_publishes_nothing() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let _held = lock_config(&dest).expect("take the lock");
+
+        let stall = std::time::Duration::from_millis(200);
+        let ceiling = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let err = lock_config_waiting(&dest, stall, ceiling)
+            .err()
+            .expect("a stuck holder is not waited for");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("without finishing"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed >= stall,
+            "gave up after {elapsed:?}, before {stall:?}"
+        );
+        assert!(
+            elapsed < ceiling / 2,
+            "waited {elapsed:?} for a stuck holder"
+        );
+    }
+
+    /// However steadily the config keeps being published, the whole wait is
+    /// bounded by the ceiling.
+    #[test]
+    fn the_config_lock_gives_up_at_the_ceiling_however_busy_the_config_is() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder =
+            hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
+
+        let ceiling = std::time::Duration::from_millis(1200);
+        let started = std::time::Instant::now();
+        let waited = lock_config_waiting(&dest, std::time::Duration::from_millis(500), ceiling);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        holder.join().expect("holder thread");
+
+        let err = waited.err().expect("the ceiling bounds the wait");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
+        assert!(
+            elapsed >= ceiling,
+            "gave up after {elapsed:?}, before {ceiling:?}"
+        );
     }
 
     #[test]
