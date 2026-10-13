@@ -147,7 +147,9 @@ impl VoiceMeasure {
 fn frame_gains(audio: &Pcm16) -> Vec<f64> {
     let rms: Vec<f64> = audio
         .samples()
-        .chunks_exact(LEVEL_FRAME)
+        .as_chunks::<LEVEL_FRAME>()
+        .0
+        .iter()
         .map(|frame| {
             let energy: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
             (energy / frame.len() as f64).sqrt()
@@ -197,7 +199,7 @@ pub fn measure(audio: &Pcm16) -> VoiceMeasure {
     let mut frame = [0i16; VOICE_FRAME];
     let mut voiced = 0usize;
     let mut peak_score = 0.0f32;
-    for (index, chunk) in samples.chunks_exact(VOICE_FRAME).enumerate() {
+    for (index, chunk) in samples.as_chunks::<VOICE_FRAME>().0.iter().enumerate() {
         let start = index * VOICE_FRAME;
         for (offset, (slot, &sample)) in frame.iter_mut().zip(chunk).enumerate() {
             *slot = (f64::from(sample) * gain_at(start + offset))

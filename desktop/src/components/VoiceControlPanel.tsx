@@ -1164,7 +1164,11 @@ function choiceRefusal(lost: Lost): string {
  * `turn === "working"`), and the deck's prompt keys for it (absent ⇒ the deck
  * is too old or the agent is unsupported, and the command is refused).
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto } & VoicePaneAgent;
+/**
+ * `questionLabel`: what a sentence about `question` calls the agent
+ * ({@link questionAgentName}, issue #1668); `label` when absent.
+ */
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string } & VoicePaneAgent;
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -1752,7 +1756,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!shows(shown, aim) || !shown.question) return undefined;
     const held = questionFormRef.current;
     const form = held && held.target.questionId === shown.question.id ? held.form : [];
-    return { label: shown.label, reach: questionReach(shown, resolveVoiceQuestion !== undefined), options: questionOptionsToSay(shown.question, form) };
+    return { label: shown.questionLabel ?? shown.label, reach: questionReach(shown, resolveVoiceQuestion !== undefined), options: questionOptionsToSay(shown.question, form) };
   }, [resolveVoiceQuestion]);
   /**
    * The write line of `aim`'s incarnation on screen: one per incarnation
@@ -2266,7 +2270,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(QUESTION_SAY_CONFIRM);
       return true;
     }
-    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.label, questionId: question.id, revision: question.revision };
+    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision };
     const spawnedAtMs = shown.spawnedAtMs;
     const deck = selectedDeckRef.current;
     setPhase("resolving");

@@ -1304,7 +1304,10 @@ pub enum DesktopActionError {
 #[serde(untagged)]
 pub enum DesktopSettingsSaveError {
     Message(String),
-    Partial(DesktopPartialSettingsSave),
+    /// Boxed because it carries a whole `DesktopSettings` and is much the
+    /// larger arm, so `clippy::result_large_err` would otherwise object.
+    /// `untagged` serializes the box as its contents: the wire is unchanged.
+    Partial(Box<DesktopPartialSettingsSave>),
 }
 
 /// A save whose deck edits landed and whose `desktop.toml` write did not, or
@@ -5124,12 +5127,12 @@ mod tests {
         );
         let written = crate::settings::DesktopSettings::default();
         assert_eq!(
-            serde_json::to_value(DesktopSettingsSaveError::Partial(
+            serde_json::to_value(DesktopSettingsSaveError::Partial(Box::new(
                 DesktopPartialSettingsSave {
                     message: "the deck list was saved".into(),
                     written: written.clone(),
                 }
-            ))
+            )))
             .unwrap(),
             serde_json::json!({
                 "message": "the deck list was saved",

@@ -2057,7 +2057,7 @@ where
         .await
         {
             Ok(ingested) => return ingested,
-            Err((again, unused)) => (event, stale) = (again, unused),
+            Err(unapplied) => (event, stale) = *unapplied,
         }
     }
 }
@@ -2103,7 +2103,9 @@ pub(crate) async fn ingest_event_in_lifecycle(
 /// lifecycle of `held`, the pane it resolved the event to (`None`: none). Under
 /// the `AppState` write lock, before anything else, the event is resolved again
 /// — the pane it names, else its session's — and handed back unapplied, with
-/// `stale` unasked, when that is not `held` (audit T2).
+/// `stale` unasked, when that is not `held` (audit T2). Handed back boxed,
+/// since an [`AgentEvent`] makes the pair large and it comes back only when the
+/// resolve moved.
 #[allow(clippy::too_many_arguments)]
 async fn ingest_event_core<F>(
     state: &SharedState,
@@ -2115,7 +2117,7 @@ async fn ingest_event_core<F>(
     unproven: bool,
     attested_agent: Option<&str>,
     stale: F,
-) -> Result<bool, (AgentEvent, F)>
+) -> Result<bool, Box<(AgentEvent, F)>>
 where
     F: FnOnce(&mut crate::state::AppState) -> bool,
 {
@@ -2127,7 +2129,7 @@ where
         None => state.session_pane(&event.session_id),
     };
     if question_pane.as_deref() != held {
-        return Err((event, stale));
+        return Err(Box::new((event, stale)));
     }
     if stale(&mut state) {
         return Ok(false);

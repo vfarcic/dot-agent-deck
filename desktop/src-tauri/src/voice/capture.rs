@@ -217,7 +217,7 @@ impl Pcm16 {
     /// [`MAX_UTTERANCE`] instead).
     pub fn measure_speech(&self) -> SpeechMeasure {
         let mut detector = SpeechDetector::default();
-        for frame in self.samples.chunks_exact(VAD_FRAME) {
+        for frame in self.samples.as_chunks::<VAD_FRAME>().0 {
             detector.push_frame(mean_square(frame));
         }
         detector.measure()
@@ -231,7 +231,9 @@ impl Pcm16 {
     pub fn speech_frames(&self) -> Vec<bool> {
         let mut detector = SpeechDetector::default();
         self.samples
-            .chunks_exact(VAD_FRAME)
+            .as_chunks::<VAD_FRAME>()
+            .0
+            .iter()
             .map(|frame| detector.push_frame(mean_square(frame)))
             .collect()
     }
@@ -2388,7 +2390,7 @@ mod tests {
         const SPEECH_FLOOR: f64 = 600.0;
         let floor = SPEECH_FLOOR * SPEECH_FLOOR;
         let (mut longest, mut run) = (0usize, 0usize);
-        for frame in audio.samples().chunks_exact(VAD_FRAME) {
+        for frame in audio.samples().as_chunks::<VAD_FRAME>().0 {
             let energy: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
             if energy / VAD_FRAME as f64 >= floor {
                 run += VAD_FRAME;
@@ -2823,7 +2825,7 @@ mod tests {
         let span = speech_window_frames();
         let mut window: VecDeque<bool> = VecDeque::with_capacity(span);
         let (mut inside, mut densest) = (0usize, 0usize);
-        for frame in audio.samples().chunks_exact(VAD_FRAME) {
+        for frame in audio.samples().as_chunks::<VAD_FRAME>().0 {
             if window.len() == span && window.pop_front() == Some(true) {
                 inside -= 1;
             }

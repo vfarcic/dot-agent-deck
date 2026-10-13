@@ -4043,6 +4043,17 @@ mod tests {
             .expect("publish");
     }
 
+    /// The stall window the busy-holder tests wait with: each window has to
+    /// see one of the holder's publishes, or the holder reads as stuck. It is
+    /// shared so the two tests cannot drift apart, and load-scaled from twice
+    /// the 452 ms the slowest [`publish_by_appending`] took under load. A flat
+    /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
+    /// (2026-10-13); at that load the factor alone brings this window to about
+    /// the 2 s a flat window was raised to.
+    fn busy_holder_stall() -> std::time::Duration {
+        crate::test_budget::load_scaled(std::time::Duration::from_secs(1))
+    }
+
     /// Hold the config's lock on a thread that publishes `dest` every `every`
     /// until `stop` is set, then release it. Returns once the lock is held.
     fn hold_and_keep_publishing(
@@ -4077,10 +4088,7 @@ mod tests {
         let dir = crate::test_temp::tempdir().expect("lock tempdir");
         let dest = dir.path().join("config.toml");
         std::fs::write(&dest, b"").expect("seed destination");
-        // Load-scaled, and twice the 452 ms the slowest publish took under
-        // load ([`publish_by_appending`]): each window has to see one of the
-        // holder's publishes, or the holder reads as stuck.
-        let stall = crate::test_budget::load_scaled(std::time::Duration::from_secs(1));
+        let stall = busy_holder_stall();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
@@ -4156,7 +4164,7 @@ mod tests {
 
         // The stall window is sized as in the test above: a publish has to land
         // inside each one for the wait to reach the ceiling at all.
-        let stall = crate::test_budget::load_scaled(std::time::Duration::from_secs(1));
+        let stall = busy_holder_stall();
         let ceiling = stall.mul_f64(2.4);
         let started = std::time::Instant::now();
         let waited = lock_config_waiting(&dest, stall, ceiling);

@@ -2719,7 +2719,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
    * Reading switch the settings document starts with; `notice` whether its
    * one-time notice was shown.
    */
-  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, holdStart, question, questionBridge }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; holdStart?: Promise<void>; question?: PendingQuestionDto; questionBridge?: Pick<DeckRuntimeState, "resolveVoiceQuestion" | "sendVoiceAnswer" | "cancelVoiceAnswer"> } = {}) {
+  async function mount({ reading = "off", notice = "pending", openPane = false, typing = false, silent = true, holdNotice = false, holdStart, question, questionBridge, runTitle }: { reading?: "on" | "off"; notice?: "pending" | "shown"; openPane?: boolean; typing?: boolean; silent?: boolean; holdNotice?: boolean; holdStart?: Promise<void>; question?: PendingQuestionDto; questionBridge?: Pick<DeckRuntimeState, "resolveVoiceQuestion" | "sendVoiceAnswer" | "cancelVoiceAnswer">; runTitle?: string } = {}) {
     const finished: string[] = [];
     const spoken = synth(silent, finished);
     const steps: Parameters<typeof sequencedVoice>[0] = [];
@@ -2751,6 +2751,15 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
       const snapshot = {
         ...deck.snapshot,
         agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? { ...agent, status: "needs_input" as const, pendingQuestion: question } : agent),
+      };
+      deck.snapshot = snapshot;
+      deck.fleet = [snapshot];
+    }
+    /* Issue #1668 — Planner is a role of an orchestration run titled `runTitle`. */
+    if (runTitle) {
+      const snapshot = {
+        ...deck.snapshot,
+        agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? { ...agent, tab: { kind: "orchestration" as const, name: "build", roleIndex: 0, roleName: "planner", isStartRole: true, displayTitle: runTitle } } : agent),
       };
       deck.snapshot = snapshot;
       deck.fleet = [snapshot];
@@ -3278,6 +3287,23 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS + VOICE_SUBMIT_SETTLE_MS * 2); });
     await flush();
     expect(written(h.deck)).toEqual([]);
+  });
+
+  /**
+   * Scenario (question/desktop/018): Planner is a role of the orchestration
+   * run titled prd-1401 and waits on a permission prompt. "type run the
+   * tests" types nothing, and the row names the agent as Reading and voice's
+   * lists do, "prd-1401 Planner", as does the name the question's own
+   * sentences are given (issue #1668).
+   */
+  it("question/desktop/018: the refusal names an orchestration agent by its run title", async () => {
+    const resolveVoiceQuestion = notAnswer();
+    const h = await mount({ openPane: true, typing: true, question: WAITING, questionBridge: answering(resolveVoiceQuestion), runTitle: "prd-1401" });
+    h.deck.resolveVoice.mockImplementation(async (heard) => dictates(heard));
+    await h.say("type run the tests");
+    expect(written(h.deck)).toEqual([]);
+    expect((resolveVoiceQuestion.mock.calls[0] as unknown[] | undefined)?.[0]).toMatchObject({ agentId: "planner", agent: "prd-1401 Planner" });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(voiceQuestionWaitingNoTyping("prd-1401 Planner", "voice", questionOptionsToSay(WAITING)));
   });
 
   /**

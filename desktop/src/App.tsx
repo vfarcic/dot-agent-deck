@@ -90,6 +90,7 @@ import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRu
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
+import { questionAgentName } from "./lib/voiceQuestion";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -817,6 +818,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PRD #1631 — the question the agent is waiting on, which voice answers
          from this pane, and only from this pane (decision 9). */
       question: paneShownAgent.pendingQuestion,
+      /* Issue #1668 — sentences about that question name the agent as
+         Reading does: an orchestration agent by its run's title too. */
+      questionLabel: questionAgentName(paneShownAgent),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
@@ -1449,6 +1453,18 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
 const TILE_PAGE = 4;
 
 /**
+ * Issue #1668 — what voice calls a tile, in its numbered list, its off-page
+ * sentence and the palette's Focus entry. An orchestration agent is named by
+ * {@link agentSpokenName}, its run's title and its name, as the overview's
+ * heading and Reading name it: every run of one orchestration names its roles
+ * alike, so "Coder" alone could be any run's. A standalone agent keeps the role
+ * its tile is headed with.
+ */
+function tileVoiceName(agent: AgentSession): string {
+  return agent.tab.kind === "orchestration" ? agentSpokenName(agent) : agent.role;
+}
+
+/**
  * PRD #1105 M3 — the pane's WRAPPER, and the reason it is rendered whether or
  * not the pane is open.
  *
@@ -1609,19 +1625,22 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       turn: (delta) => setTilePage(tileSlice.page + delta),
       elsewhere: snapshot.agents.flatMap((agent, index): VoiceOffPageItem[] => (index >= tileSlice.start && index < tileSlice.end
         ? []
-        : [{ kind: "agent", value: agent.id, deckId: agent.daemonId, label: agent.role, page: Math.floor(index / TILE_PAGE) + 1 }])),
+        : [{ kind: "agent", value: agent.id, deckId: agent.daemonId, label: tileVoiceName(agent), page: Math.floor(index / TILE_PAGE) + 1 }])),
     }
     : undefined), [snapshot.agents, tileSlice, tilesPaged]);
   usePager("screen", tilePager);
   const numberedTiles = useMemo(() => (
     tilesPageable
-      ? shownTiles.map((agent): VoiceNumberedEntryDto => ({
-        kind: "agent",
-        value: agent.id,
-        deckId: agent.daemonId,
-        label: agent.role,
-        names: [agent.displayName, agent.cli].filter((name): name is string => Boolean(name) && name !== agent.role),
-      }))
+      ? shownTiles.map((agent): VoiceNumberedEntryDto => {
+        const label = tileVoiceName(agent);
+        return {
+          kind: "agent",
+          value: agent.id,
+          deckId: agent.daemonId,
+          label,
+          names: [...new Set([agent.role, agent.displayName, agent.cli])].filter((name): name is string => Boolean(name) && name !== label),
+        };
+      })
       : undefined
   ), [shownTiles, tilesPageable]);
   const numberedTileSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedTiles && [{ kind: "agent", entries: numberedTiles }], [numberedTiles]);
@@ -2327,7 +2346,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
     { label: evidenceOpen ? "Hide events drawer" : "Show events drawer", hint: "Toggle transition events", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
-    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
+    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${tileVoiceName(agent)}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 

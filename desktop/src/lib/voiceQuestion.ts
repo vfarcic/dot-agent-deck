@@ -10,6 +10,9 @@
  * key while the question waits ({@link questionOptionsToSay}).
  */
 
+import { agentSpokenName } from "./agentNames";
+import type { AgentSession } from "../types";
+
 /** One option of a pending question, as the desktop crate projects it. Every text field is the agent's own, already scrubbed. */
 export type PendingQuestionOptionDto = {
   /** 1-based, the number the agent shows beside it. */
@@ -82,6 +85,23 @@ export type AnswerOutcomeDto = {
   code?: string;
   sentence: string;
 };
+
+/**
+ * The most characters of the agent's name a question sentence quotes:
+ * `MAX_VOICE_AGENT_NAME_CHARS` on the Rust side, which cuts at that many. The
+ * cut is made here instead, where {@link agentSpokenName} takes it from the
+ * run's title first, so a long title never cuts off the agent's own name.
+ */
+export const QUESTION_AGENT_NAME_MAX_CHARS = 120;
+
+/**
+ * Issue #1668 — what a question sentence calls the agent waiting on it: an
+ * orchestration agent by its run's title and its name ("prd-1401 Coder"), as
+ * Reading and voice's lists name it, and a standalone agent by its own name.
+ */
+export function questionAgentName(agent: Pick<AgentSession, "displayName" | "tab">): string {
+  return agentSpokenName(agent, QUESTION_AGENT_NAME_MAX_CHARS);
+}
 
 /** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id — and revision, audit A4 — it saw. */
 export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number };

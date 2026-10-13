@@ -818,7 +818,7 @@ mod tests {
         assert!(system.contains("open_agent"), "{system}");
         // The observed labels are NOT in the system role (audit finding A2).
         assert!(!system.contains("\"agents_on_screen\":"), "{system}");
-        assert!(!system.contains("\"label\":\"tester\""), "{system}");
+        assert!(!system.contains("\"label\":\"build tester\""), "{system}");
         assert!(!system.contains("show me the tester"), "{system}");
         assert_eq!(body["messages"].as_array().expect("an array").len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(content.len(), 2, "{body}");
         let data = content[0]["text"].as_str().expect("a string");
         assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
-        assert!(data.contains("\"label\":\"tester\""), "{data}");
+        assert!(data.contains("\"label\":\"build tester\""), "{data}");
         // The utterance is last, verbatim.
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "show me the tester");
