@@ -8,7 +8,7 @@
     "openstackclient":              "10.3.0",
     "gh":                           "2.102.0",
     "asciinema":                    "3.2.1",
-    "cargo-nextest":                "0.9.143",
+    "cargo-nextest":                "0.9.146",
     "rustc":                        "1.97.1",
     "cargo":                        "1.97.1",
     "clippy":                       "1.97.1",
