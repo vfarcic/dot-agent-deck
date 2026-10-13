@@ -1201,7 +1201,9 @@ pub async fn handle_utterance_with_modes(
         // user never asked about instead of asking which. The daemon's words
         // must be heard beside the ones that asked for the row: a daemon
         // called "host" is not named by "show host" (Qodo on PR #1672).
-        if row.id == SHOW_HOST_METRICS_ROW && !said_beyond_the_ask(spoken, transcript.text(), row) {
+        if row.id == SHOW_HOST_METRICS_ROW
+            && !said_beyond_the_ask(spoken, transcript.text(), row, decks)
+        {
             continue;
         }
         // An observed-name param the model supplied while labels are withheld:
@@ -1678,7 +1680,18 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// occurrence of each of `row`'s `heard_as` entries is taken out — the words
 /// that asked for the row. "host for host" names a daemon called "host";
 /// "show host" does not, though its one "host" is that daemon's whole name.
-fn said_beyond_the_ask(spoken: &str, transcript: &str, row: &CommandRow) -> bool {
+///
+/// When `spoken` is a deck's label as listed — which the row's description
+/// asks the model for — a word of it that no other deck's names hold counts
+/// as said ([`mentioned`]): "show host for the build box" names
+/// `deploy@build-box`, though nobody says its user part (PR #1672 round 10,
+/// the `show-host-named-daemon` fixture).
+fn said_beyond_the_ask(
+    spoken: &str,
+    transcript: &str,
+    row: &CommandRow,
+    decks: &[VoiceDeck],
+) -> bool {
     let mut rest = spoken_words(transcript);
     if let ActionGrounding::HeardAs(entries) = &row.grounding {
         for entry in entries.iter().chain(&row.grounding_also) {
@@ -1696,9 +1709,9 @@ fn said_beyond_the_ask(spoken: &str, transcript: &str, row: &CommandRow) -> bool
             }
         }
     }
-    let words = content_words(spoken);
-    let heard = Heard::from_words(rest);
-    !words.is_empty() && words.iter().all(|word| heard.word(word))
+    let rest = rest.join(" ");
+    said(spoken, &rest)
+        || (decks.iter().any(|deck| deck.label == spoken) && mentioned(spoken, &rest, decks))
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -8327,6 +8340,35 @@ mod tests {
                 "{said:?}: {outcome:?}"
             );
         }
+    }
+
+    /// Scenario (PR #1672 round 10): two remote daemons are labelled
+    /// `deploy@build-box` and `ci@stale-box`, and the model answers the one
+    /// the user meant by its label as listed. "show host for the build box"
+    /// opens the build box, though the user never said "deploy"; "show host
+    /// for the box" names a word both labels share, so it names neither and
+    /// the dashboard decides.
+    #[tokio::test]
+    async fn voice_outcome_show_host_names_a_daemon_by_a_word_of_its_label() {
+        let decks = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build-box", "deploy@build-box", false),
+            deck("deck-stale-box", "ci@stale-box", false),
+        ];
+        let answer =
+            || IntentAnswer::new(SHOW_HOST_METRICS_ROW).with_param("deck", "deploy@build-box");
+        let (outcome, _) =
+            open_new_agent_over(&decks, answer(), "show host for the build box").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-build-box"),
+            "{outcome:?}"
+        );
+        let (outcome, _) = open_new_agent_over(&decks, answer(), "show host for the box").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
     }
 
     /// Scenario (PR #1672): "show host for all daemons" resolves to the Daemon
@@ -15172,7 +15214,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 25] = [
+    const CONTROL_LABELS: [ControlLabel; 26] = [
         ControlLabel {
             source: "\"Activate orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,
@@ -15356,6 +15398,14 @@ mod tests {
             row: SHOW_HOST_METRICS_ROW,
             over_the_form: false,
         },
+        // PR #1672 round 10 — the open popover's X, which `close` closes.
+        ControlLabel {
+            source: "export const HOST_CLOSE_LABEL = \"Close host\";",
+            file: HOST_METRICS_TS,
+            said: "Close host",
+            row: "close",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label, said as it reads,
@@ -15423,6 +15473,11 @@ mod tests {
             ("show_host_metrics", "host of this deck"),
             ("show_host_metrics", "open host info"),
             ("show_host_metrics", "show resource usage"),
+            ("close", "close host"),
+            ("close", "close host info"),
+            ("close", "close resource usage"),
+            ("close", "hide resource usage"),
+            ("close", "close the host figures"),
         ] {
             // A description wraps across lines, so compare word runs.
             let description = spoken_words(&table().row(row).expect("present").description);
@@ -15465,6 +15520,58 @@ mod tests {
         }
         let close = table().row("close").expect("present");
         assert!(action_grounded(close, "Close", None, None));
+    }
+
+    /// Scenario: with a daemon's Host popover open, the user says "close
+    /// host" (its X's accessible name), "close resource usage" or the other
+    /// words for closing it. Each grounds `close`, which closes the popover,
+    /// and none grounds a row that stops something; `show_host_metrics`'s
+    /// description says it only opens and sends a close to `close`.
+    #[test]
+    fn voice_outcome_closing_the_host_popover_is_the_close_row() {
+        let close = table().row("close").expect("present");
+        let stops =
+            ["stop_agent", "close_orchestration"].map(|id| table().row(id).expect("present"));
+        for said in [
+            "close host",
+            "Close host",
+            "close host info",
+            "close resource usage",
+            "hide resource usage",
+            "close the host figures",
+            "close",
+            "close it",
+            "close this",
+        ] {
+            assert!(
+                action_grounded(close, said, None, None),
+                "{said:?} does not ground `close`"
+            );
+            for stop in &stops {
+                assert!(
+                    !action_grounded(stop, said, None, None),
+                    "{said:?} grounds `{}`",
+                    stop.id
+                );
+            }
+        }
+        let host = table()
+            .row(SHOW_HOST_METRICS_ROW)
+            .expect("present")
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(host.contains("This only OPENS the figures"));
+        assert!(
+            host.contains("close host, close resource usage, hide resource usage — is `close`")
+        );
+        let close_description = close
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(close_description.contains("otherwise a daemon's Host popover if it is open"));
     }
 
     /// Scenario: the user reads the X button's accessible name, "Close new
