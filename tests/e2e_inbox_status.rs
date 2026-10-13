@@ -40,7 +40,7 @@ fn pending(daemon: &impl Endpoint, pane: &Pane, queued: u64, fetched: u64, wake:
     assert_eq!(value["wake"], wake, "current wake path: {value}");
 }
 
-/// Scenario: Queue and fetch work for one synthetic agent while another remains empty. ListAgents must carry separate inbox summaries, reflect acknowledgement, and switch wake from doorbell to native only while a waiter is armed, then to turn-end when announced.
+/// Scenario: Queue and fetch work for one synthetic agent while another remains empty, then announce Pi's extension without a watcher. ListAgents must show doorbell fallback until the Pi stream arms, native while it is armed, and doorbell again after EOF; acknowledgements and other panes' counts remain separate.
 #[spec("inbox/status/003")]
 #[test]
 fn status_003_list_agents_reports_counts_and_armed_wake() {
@@ -64,6 +64,14 @@ fn status_003_list_agents_reports_counts_and_armed_wake() {
         !summary(&daemon, &worker)["last_acked_at"].is_null(),
         "ack time must be reported"
     );
+    let mut pi_announce = request(&worker, "inbox_announce");
+    pi_announce["component"] = json!("pi_extension");
+    pi_announce["component_version"] = json!("synthetic-pi");
+    pi_announce["wake"] = json!("native");
+    pi_announce["pid"] = json!(worker.pid);
+    assert_eq!(hook(&daemon, pi_announce)["accepted"], true);
+    pending(&daemon, &worker, 2, 0, "doorbell");
+    assert_eq!(summary(&daemon, &worker)["component"], "pi_extension");
     let wait = waiter(&daemon, &worker);
     armed(&daemon, &worker, 1);
     pending(&daemon, &worker, 2, 0, "native");

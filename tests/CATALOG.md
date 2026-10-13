@@ -7980,7 +7980,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/003 — ListAgents carries live per-agent inbox counts and the currently armed wake path.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and attach/hook sockets.
 - **Agent:** none (raw Python stand-in; no credential).
-- **Asserts:** AgentRecord.inbox separates queued/fetched counts by agent, tracks ack time, and changes doorbell → native → doorbell on waiter arm/EOF, then turn_end on announce; armed component is pi_extension.
+- **Asserts:** AgentRecord.inbox separates queued/fetched counts by agent and tracks ack time; Pi's native announcement without a watcher retains doorbell fallback, then waiter arm/EOF changes doorbell → native → doorbell, followed by turn_end on announce.
 - **Does not assert:** native delivery to a real model, user-facing dashboard badges or status subprocess formatting.
 - **Platform coverage:** mac+linux.
 
