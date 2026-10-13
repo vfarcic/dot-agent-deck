@@ -8558,3 +8558,35 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** Explicit release reassigns to the other subscriber, its completion acknowledges the id, and the offerer receives a completion notice.
 - **Does not assert:** Claimant exit, covered by inbox/core/011.
 - **Platform coverage:** mac+linux.
+
+#### inbox/load
+
+Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when scheduled on the shared box. Use `cargo test-e2e-live --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture`; this dedicated configuration selects the four load cases, runs one at a time, and allows 12 minutes for fixture setup plus each case's absolute agent deadline. The ordinary nextest configuration stays unchanged. Without opt-in each case emits `SKIP:` before the agent preflight calls, fixture setup or CPU loops; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure.
+
+##### inbox/load/001 — Claude Haiku inbox delivery under deliberate CPU pressure. [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
+- **Agent:** Real interactive Claude Haiku, established inbox live fixtures, isolated HOME.
+- **Asserts:** 25 messages across genuine spawn seed, idle, a sleep-tool turn and /clear all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
+- **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
+- **Platform coverage:** mac+linux, local credentials only; never CI.
+
+##### inbox/load/002 — OpenCode on opencode_test_model() (Haiku by default) inbox delivery under deliberate CPU pressure. [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_002_opencode_acknowledges_seed_idle_and_busy_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
+- **Agent:** Real interactive OpenCode on opencode_test_model() (Haiku by default), established inbox live fixtures, isolated HOME.
+- **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
+- **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
+- **Platform coverage:** mac+linux, local credentials only; never CI.
+
+##### inbox/load/003 — Pi Haiku inbox delivery under deliberate CPU pressure. [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
+- **Agent:** Real interactive Pi Haiku, established inbox live fixtures, isolated HOME.
+- **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
+- **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
+- **Platform coverage:** mac+linux, local credentials only; never CI.
+
+##### inbox/load/004 — Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL (gpt-5.6-luna on this host) inbox delivery under deliberate CPU pressure. [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_004_codex_never_loses_seed_idle_or_busy_messages_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
+- **Agent:** Real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL (gpt-5.6-luna on this host), established inbox live fixtures, isolated HOME.
+- **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on or explicitly listed as Queued/Undeliverable by the actual inbox list CLI, never absent, within a 300-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
+- **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
+- **Platform coverage:** mac+linux, local credentials only; never CI.
