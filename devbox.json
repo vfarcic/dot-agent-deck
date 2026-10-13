@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": {
-    "vals":                         "0.46.0",
+    "vals":                         "0.46.1",
     "go-task":                      "3.53.1",
     "git":                          "2.55.0",
     "upcloud-cli":                  "3.36.0",
@@ -12,7 +12,7 @@
     "rustc":                        "1.97.1",
     "cargo":                        "1.97.1",
     "clippy":                       "1.97.1",
-    "mold":                         "2.42.0",
+    "mold":                         "2.42.1",
     "rustfmt":                      "1.97.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",
