@@ -4057,15 +4057,19 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
+        // The release is anchored to the instant the measurement starts, not to
+        // when this thread is next scheduled, so a delay before the wait cannot
+        // let the holder let go before the waiter has been blocked past `stall`.
+        let started = std::time::Instant::now();
         let release = {
             let stop = stop.clone();
+            let release_at = started + stall * 3;
             std::thread::spawn(move || {
-                std::thread::sleep(stall * 3);
+                std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
 
-        let started = std::time::Instant::now();
         let waited = lock_config_waiting(&dest, stall, std::time::Duration::from_secs(60));
         let elapsed = started.elapsed();
         release.join().expect("release thread");
