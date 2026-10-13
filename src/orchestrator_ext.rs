@@ -144,7 +144,9 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 /// discovers: `<target_dir>/index.ts` + `<target_dir>/orchestrator.ts`.
 ///
 /// Creates `target_dir` (and parents) if needed and (over)writes each embedded
-/// file, so re-running is idempotent and refreshes a stale copy. Returns the
+/// file, so re-running is idempotent and refreshes a stale copy. Each file is
+/// published by an atomic rename of an owner-only temp file, and a destination
+/// that is a symlink is refused (PRD #1666 hardening M8). Returns the
 /// list of paths written, in embed order. Hermetic — pass any directory
 /// (a temp dir in tests, the real `~/.pi/...` in the CLI); it never reads the
 /// environment.
@@ -160,9 +162,23 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut written = Vec::with_capacity(EXTENSION_FILES.len());
     for (name, contents) in EXTENSION_FILES {
         let path = target_dir.join(name);
+        // PRD #1666 hardening M8: a destination that is a symlink is refused,
+        // so the extension is never written through a link to another file.
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; remove it so the deck can write its Pi extension there",
+                    path.display()
+                ),
+            ));
+        }
         // An identical file is not rewritten (PRD #1487).
         if !std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
-            std::fs::write(&path, contents)?;
+            // Hardening M8: an owner-only temp file created exclusively, then
+            // renamed over the destination, so Pi never loads a partial file
+            // and a concurrent refresh never truncates one in place.
+            crate::agent_hook_config::write_atomic(target_dir, &path, contents.as_bytes())?;
         }
         written.push(path);
     }
@@ -421,6 +437,62 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// Hardening M8: a destination that is a symlink is refused, and the file
+    /// it points at is left exactly as it was — materialising never writes
+    /// through a link.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_a_symlinked_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("dot-agent-deck");
+        std::fs::create_dir_all(&target).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, target.join("index.ts")).unwrap();
+        assert!(materialize(&target).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(
+            std::fs::symlink_metadata(target.join("index.ts"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// Hardening M8: a new file is published whole and owner-only, and a
+    /// stale copy is replaced by a rename over it, not truncated in place.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_publishes_owner_only_files_by_rename() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh");
+        materialize(&fresh).unwrap();
+        for (name, contents) in EXTENSION_FILES {
+            let meta = std::fs::metadata(fresh.join(name)).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o077, 0, "{name} owner-only");
+            assert_eq!(
+                std::fs::read_to_string(fresh.join(name)).unwrap(),
+                *contents
+            );
+        }
+        let target = tmp.path().join("dot-agent-deck");
+        std::fs::create_dir_all(&target).unwrap();
+        let stale = target.join("index.ts");
+        std::fs::write(&stale, "stale").unwrap();
+        let before = std::fs::metadata(&stale).unwrap().ino();
+        materialize(&target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            EXTENSION_FILES[0].1
+        );
+        assert_ne!(
+            std::fs::metadata(&stale).unwrap().ino(),
+            before,
+            "the stale file was replaced by a rename, not rewritten in place"
+        );
     }
 
     /// The materialized layout is exactly the two files Pi's subdirectory

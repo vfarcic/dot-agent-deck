@@ -1051,9 +1051,10 @@ const inboxNextBackoff = (backoff, ranForMs) =>
 /// - In `opencode --mini`, where no TUI plugin loads, it arms its own stream
 ///   and starts each message in mini's session, then asks the deck to nudge
 ///   the pane into drawing it.
-/// - In every mode, it catches a submitted doorbell line before the model sees
-///   it, swaps in the waiting content, and acknowledges it on decision B's
-///   signal, like the TUI plugin.
+/// - In the full TUI and `--mini` — never in `run`, `serve` or another
+///   subcommand (hardening M2) — it catches a submitted doorbell line before
+///   the model sees it, swaps in the waiting content, and acknowledges it on
+///   decision B's signal, like the TUI plugin.
 const SERVER_INBOX_JS: &str = r#"// OpenCode's subcommands (1.18.35 `--help`): a main-thread load under one of
 // them is not a TUI in this pane.
 const INBOX_SUBCOMMANDS = new Set(["completion", "acp", "mcp", "attach", "run", "debug",
@@ -1099,7 +1100,11 @@ const miniDeliver = async (client, message, generation) => {
       const model = inboxArgvModel();
       selection = model ? { model } : {};
     }
+    // Hardening M7: re-checked after the lookup, right before the prompt. A
+    // retired instance does nothing (its stream's end hands the message back);
+    // a target that moved on hands it back now.
     if (generation !== inboxGeneration()) return;
+    if (miniTarget !== sessionID) throw new Error("the session changed during the lookup");
     const body = { parts: [{ type: "text", text: inboxText(message) }] };
     if (selection.model) body.model = selection.model;
     if (selection.agent) body.agent = selection.agent;
@@ -1216,9 +1221,13 @@ const observeInbox = (event) => {
 // acknowledging. A recalled doorbell whose message was already handed over
 // fetches nothing. If the deck cannot be asked, the line stays as it is, and
 // asks the model to fetch.
+// PRD #1666 hardening M2: only in the interactive OpenCode the deck manages —
+// the full TUI, whose server plugin runs in a worker thread, or `--mini` — never
+// in `run`, `serve` or another subcommand an agent starts inside its pane.
+const inboxInteractive = () => !isMainThread || isMini();
 const interceptDoorbell = async (input, output) => {
   try {
-    if (!inboxInPane() || !Array.isArray(output?.parts)) return;
+    if (!inboxInPane() || !inboxInteractive() || !Array.isArray(output?.parts)) return;
     for (const part of output.parts) {
       if (part?.type !== "text" || typeof part.text !== "string") continue;
       const match = INBOX_DOORBELL.exec(part.text);
@@ -1335,39 +1344,58 @@ const tui = async (api) => {
       }
       return current;
     };
-    // The session a delivery goes to, read when it is made.
-    const target = async () => {
+    // The session the TUI shows now, if any.
+    const shownSession = () => {
       const route = api.route?.current;
-      const shown = route?.name === "session" ? route.params?.sessionID : undefined;
+      return route?.name === "session" ? route.params?.sessionID : undefined;
+    };
+    // Hardening M7: a delivery whose instance was disposed during an await is
+    // dropped — its stream's end hands the message back.
+    class Retired extends Error {}
+    const stillActive = () => {
+      if (!instance.active) throw new Retired();
+    };
+    // The session a delivery goes to, read when it is made — and read again
+    // after every wait (hardening M7), since the person may have switched
+    // sessions while a dialog was open.
+    const target = async () => {
+      await untilNoDialog();
+      stillActive();
+      const shown = shownSession();
       if (shown) {
         const root = rootOf(shown);
-        if (root !== shown) {
-          await untilNoDialog();
-          api.route.navigate("session", { sessionID: root });
-        }
+        if (root !== shown) api.route.navigate("session", { sessionID: root });
         return root;
       }
-      await untilNoDialog();
       const created = await api.client.session.create({});
+      stillActive();
       const sessionID = created?.data?.id;
       if (!sessionID) throw new Error("no session was created");
+      if (shownSession()) throw new Error("the person opened a session meanwhile");
       api.route.navigate("session", { sessionID });
       return sessionID;
     };
     const deliver = async (message) => {
       try {
-        if (!instance.active) return;
+        stillActive();
         const sessionID = await target();
         const selection = selectionFor(sessionID);
         const request = { sessionID, parts: [{ type: "text", text: inboxText(message) }] };
         if (selection.model) request.model = selection.model;
         if (selection.agent) request.agent = selection.agent;
+        // Hardening M7: the last check before the side effect — still this
+        // instance, and the screen not moved to another conversation. (A
+        // navigation this delivery made may not have reached the route yet,
+        // so the route may still show the subagent or the home screen.)
+        stillActive();
+        const now = shownSession();
+        if (now !== undefined && rootOf(now) !== sessionID) throw new Error("the session changed");
         delivered.add(message.id);
         const result = await api.client.session.promptAsync(request);
         if (result?.error) throw new Error("promptAsync refused");
-      } catch (_) {
+      } catch (error) {
         delivered.delete(message.id);
-        inboxWrite(watcher, { nack: [message.id] });
+        if (!(error instanceof Retired)) inboxWrite(watcher, { nack: [message.id] });
       }
     };
 
@@ -1716,26 +1744,72 @@ fn is_deck_tui_entry(entry: &str) -> bool {
 
 /// A TUI config's text, `None` when the file does not exist, or why it may
 /// not be edited.
+///
+/// PRD #1666 hardening M5: the type and size are judged on the descriptor that
+/// is then read — opened without following a final symlink, and without
+/// blocking on a FIFO — and the read itself is bounded, so a file swapped in
+/// between a check and the read is not what gets read.
 fn read_tui_config(path: &Path) -> Result<Option<String>, String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let symlink = "it is a symlink, and rewriting it would replace the link";
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Err(symlink.to_string()),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("it is not a regular file".to_string());
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("it cannot be read ({e})")),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err("it is a symlink, and rewriting it would replace the link".to_string());
     }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            return Err(symlink.to_string());
+        }
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("it cannot be read ({e})"))?;
     if !metadata.is_file() {
         return Err("it is not a regular file".to_string());
     }
     if metadata.len() > MAX_TUI_CONFIG_BYTES {
         return Err("it is larger than 1 MiB".to_string());
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("it cannot be read ({e})"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_TUI_CONFIG_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|e| format!("it cannot be read ({e})"))?;
+    if bytes.len() as u64 > MAX_TUI_CONFIG_BYTES {
+        return Err("it is larger than 1 MiB".to_string());
+    }
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| "it is not UTF-8".to_string())
 }
+
+/// PRD #1666 hardening M5: the cross-process lock every edit of `root`'s TUI
+/// configs holds from the first read to the last publish — the sidecar lock
+/// the deck's other agent-config writers take ([`crate::agent_hook_config::lock_config`]),
+/// one per root, named for its first TUI config.
+fn lock_tui_configs(root: &Path) -> std::io::Result<crate::agent_hook_config::ConfigLock> {
+    crate::agent_hook_config::lock_config(&root.join(TUI_CONFIG_FILES[0]))
+}
+
+/// Why a TUI config edit stops: the file changed under the edit, which only a
+/// writer outside the deck's lock can do (an editor, OpenCode itself).
+const CHANGED_DURING_EDIT: &str =
+    "it changed while the deck was editing it; run the install again to retry";
 
 /// What became of the deck's entry in a TUI config.
 enum TuiEntry {
@@ -1755,6 +1829,7 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
     for name in TUI_CONFIG_FILES {
         crate::config_write_guard::ensure_config_write_allowed(&root.join(name))?;
     }
+    let _lock = lock_tui_configs(root)?;
     if let Some(pin) = pin {
         let content = tui_plugin_template(pin);
         if std::fs::read(&file).ok().as_deref() != Some(content.as_bytes()) {
@@ -1783,14 +1858,19 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
         .find(|(path, _)| exists(path))
         .cloned()
         .unwrap_or_else(|| (root.join(TUI_CONFIG_FILES[0]), Ok(None)));
-    let updated = match text {
-        Err(why) => return Ok(TuiEntry::Refused(target, why)),
+    let updated = match &text {
+        Err(why) => return Ok(TuiEntry::Refused(target, why.clone())),
         Ok(None) => fresh_tui_config(&file),
-        Ok(Some(text)) => match crate::jsonc_edit::insert_entry(&text, &entry) {
+        Ok(Some(text)) => match crate::jsonc_edit::insert_entry(text, &entry) {
             Ok(updated) => updated,
             Err(why) => return Ok(TuiEntry::Refused(target, why.to_string())),
         },
     };
+    // Hardening M5: a writer outside the lock may have saved the file since
+    // it was read; publishing the splice would undo that save.
+    if read_tui_config(&target) != text {
+        return Ok(TuiEntry::Refused(target, CHANGED_DURING_EDIT.to_string()));
+    }
     crate::agent_hook_config::write_atomic(root, &target, updated.as_bytes())?;
     Ok(TuiEntry::Added(target))
 }
@@ -1831,6 +1911,7 @@ fn auto_install_tui(root: &Path, binary_path: &str) {
 /// that is gone.
 fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
     let file = tui_plugin_file(root);
+    let _lock = lock_tui_configs(root)?;
     let file_exists = std::fs::symlink_metadata(&file).is_ok();
     let mut edits = Vec::new();
     for name in TUI_CONFIG_FILES {
@@ -1842,25 +1923,32 @@ fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
             Err(_) => continue,
         };
         if text == fresh_tui_config(&file) {
-            edits.push((path, None));
+            edits.push((path, text, None));
             continue;
         }
         match crate::jsonc_edit::remove_entries(&text, is_deck_tui_entry) {
             Ok(None) => {}
-            Ok(Some(updated)) => edits.push((path, Some(updated))),
+            Ok(Some(updated)) => edits.push((path, text, Some(updated))),
             Err(why) if file_exists || text.contains("dot-agent-deck-tui.js") => {
                 return Err(left_unchanged(&path, &file, &why.to_string()));
             }
             Err(_) => {}
         }
     }
-    for (path, _) in &edits {
+    for (path, _, _) in &edits {
         crate::config_write_guard::ensure_config_write_allowed(path)?;
     }
     if file_exists {
         crate::config_write_guard::ensure_config_write_allowed(&file)?;
     }
-    for (path, updated) in edits {
+    // Hardening M5: nothing is changed when a config was saved since it was
+    // read, by a writer outside the deck's lock.
+    for (path, text, _) in &edits {
+        if read_tui_config(path).ok().flatten().as_ref() != Some(text) {
+            return Err(left_unchanged(path, &file, CHANGED_DURING_EDIT));
+        }
+    }
+    for (path, _, updated) in edits {
         match updated {
             Some(updated) => {
                 crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())?;
@@ -3086,6 +3174,323 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
             (runs * per_run, per_run),
             "absolute: only the named binary"
         );
+    }
+
+    /// Hardening M5: the TUI config is edited under the same cross-process
+    /// lock the deck's other agent-config writers take, for the whole
+    /// read-splice-publish: while another process holds it, nothing is written.
+    #[test]
+    fn opencode_tui_config_edit_waits_for_the_config_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(TUI_CONFIG_FILES[0]);
+        let held = crate::agent_hook_config::lock_config(&config).unwrap();
+        let worker = {
+            let root = root.path().to_path_buf();
+            std::thread::spawn(move || {
+                install_tui_half(&root, Some("/opt/dot-agent-deck")).map(|_| ())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !config.exists(),
+            "the config was written while another process held its lock"
+        );
+        drop(held);
+        worker.join().unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("dot-agent-deck-tui.js")
+        );
+    }
+
+    /// A recorder standing in for the deck binary: `inbox wait` hands over one
+    /// deck message and then records every control line the plugin writes
+    /// back; every call is logged.
+    #[cfg(unix)]
+    fn inbox_recorder(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let controls = dir.join("controls.log");
+        let recorder = dir.join("recorder.sh");
+        let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+        let message = serde_json::json!({
+            "id": id,
+            "text": format!("[dot-agent-deck message {id} from x]\nbody\n[end of dot-agent-deck message {id}]"),
+        });
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\necho \"call $*\" >> '{c}'\ncase \"$1 $2\" in 'inbox wait') printf '%s\\n' '{m}'; cat >> '{c}';; esac\nexit 0\n",
+                c = controls.display(),
+                m = message,
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (recorder, controls)
+    }
+
+    /// Run `driver` under Node in a deck pane's environment; its last stdout
+    /// line, parsed.
+    #[cfg(unix)]
+    fn run_inbox_driver(driver: &std::path::Path) -> serde_json::Value {
+        let out = std::process::Command::new("node")
+            .arg(driver)
+            .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap()
+    }
+
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// The fake OpenCode TUI API the TUI plugin is driven with: a route, a
+    /// dialog flag and a session client the driver controls.
+    const FAKE_TUI_API_JS: &str = r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const navigations = [];
+let dialog = false;
+let route = { name: "home", params: {} };
+const sessions = { child: { parentID: "rootA" }, rootA: {}, rootB: {} };
+let disposeCb;
+let releaseCreate;
+const api = {
+  state: { session: { get: (id) => sessions[id], messages: () => [] } },
+  ui: { dialog: { get open() { return dialog; } } },
+  mode: { current: () => "normal" },
+  route: {
+    get current() { return route; },
+    navigate: (name, params) => { navigations.push(params.sessionID); route = { name, params }; },
+  },
+  client: { session: {
+    create: () => new Promise((r) => { releaseCreate = r; }),
+    promptAsync: async (req) => { prompts.push(req.sessionID); return {}; },
+  } },
+  event: { on: () => {} },
+  lifecycle: { onDispose: (cb) => { disposeCb = cb; } },
+};
+"#;
+
+    /// Hardening M7: a delivery waiting for a dialog to close re-reads the
+    /// route when it does — the person switched to another session meanwhile —
+    /// and starts the message where they now are, never navigating back to the
+    /// session it saw before the wait.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_tui_delivery_rereads_the_route_after_a_dialog_wait() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck-tui.mjs");
+        std::fs::write(&plugin, tui_plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"{FAKE_TUI_API_JS}
+dialog = true;
+route = {{ name: "session", params: {{ sessionID: "child" }} }};
+const {{ default: mod }} = await import("{}");
+await mod.tui(api);
+await sleep(700);
+route = {{ name: "session", params: {{ sessionID: "rootB" }} }};
+dialog = false;
+await sleep(700);
+disposeCb?.();
+console.log(JSON.stringify({{ prompts, navigations }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["navigations"], serde_json::json!([]), "{result}");
+        assert_eq!(result["prompts"], serde_json::json!(["rootB"]), "{result}");
+    }
+
+    /// Hardening M7: disposing the TUI plugin while it waits on OpenCode to
+    /// create a session leaves the old instance with nothing to do: no
+    /// navigation, no prompt.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_tui_delivery_stops_when_disposed_during_an_api_call() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck-tui.mjs");
+        std::fs::write(&plugin, tui_plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"{FAKE_TUI_API_JS}
+const {{ default: mod }} = await import("{}");
+await mod.tui(api);
+for (let n = 0; n < 100 && !releaseCreate; n++) await sleep(20);
+const held = !!releaseCreate;
+disposeCb();
+releaseCreate?.({{ data: {{ id: "fresh" }} }});
+await sleep(300);
+console.log(JSON.stringify({{ held, prompts, navigations }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["held"], true,
+            "the delivery reached session.create: {result}"
+        );
+        assert_eq!(result["navigations"], serde_json::json!([]), "{result}");
+        assert_eq!(result["prompts"], serde_json::json!([]), "{result}");
+    }
+
+    /// Hardening M7: in `--mini`, a delivery whose target session changes
+    /// while it looks up that session's model is handed back (nack), not
+    /// started in the session that is no longer the target.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_mini_delivery_is_handed_back_when_its_session_changes_mid_lookup() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"process.argv = [process.argv[0], "opencode", "--mini"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+let releaseMessages;
+const client = {{ session: {{
+  messages: () => new Promise((r) => {{ releaseMessages = r; }}),
+  promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
+}} }};
+const {{ default: plugin }} = await import("{}");
+const hooks = await plugin({{ directory: "/work", client }});
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
+for (let n = 0; n < 100 && !releaseMessages; n++) await sleep(20);
+const held = !!releaseMessages;
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s2" }} }} }} }});
+releaseMessages?.({{ data: [] }});
+await sleep(400);
+console.log(JSON.stringify({{ held, prompts }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["held"], true,
+            "the delivery reached the lookup: {result}"
+        );
+        assert_eq!(result["prompts"], serde_json::json!([]), "{result}");
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"nack\""), "handed back: {written}");
+    }
+
+    /// Hardening M2: the server plugin swaps a submitted doorbell line for the
+    /// waiting content only in the managed interactive OpenCode — the full
+    /// TUI's worker or `--mini`. A nested `opencode run`, `serve` or other
+    /// subcommand an agent starts in its pane leaves the line alone and never
+    /// fetches the pane's inbox.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_doorbell_interception_runs_only_in_the_interactive_tui() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in 'inbox fetch') echo '{{\"messages\":[]}}';; esac\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let line = crate::doorbell::doorbell_line("m-k3xzq2ab-0f3c9a71d2e4b850");
+        let line_json = serde_json::to_string(&line).unwrap();
+        for (argv, intercepts) in [
+            (r#"["run", "fix it"]"#, false),
+            (r#"["serve"]"#, false),
+            (r#"["acp"]"#, false),
+            (r#"["--mini"]"#, true),
+        ] {
+            let _ = std::fs::remove_file(&calls);
+            let driver = dir.path().join("driver.mjs");
+            std::fs::write(
+                &driver,
+                format!(
+                    r#"process.argv = [process.argv[0], "opencode", ...{argv}];
+const {{ default: plugin }} = await import("{}");
+const hooks = await plugin({{ directory: "/work" }});
+const output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
+await hooks["chat.message"]({{ messageID: "u1" }}, output);
+console.log(JSON.stringify(output.parts[0].text));
+process.exit(0);
+"#,
+                    plugin.display()
+                ),
+            )
+            .unwrap();
+            let out = std::process::Command::new("node")
+                .arg(&driver)
+                .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+                .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+                .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+                .output()
+                .expect("run node");
+            assert!(out.status.success(), "{argv}: {out:?}");
+            let text: String =
+                serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+            let fetched = std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .any(|call| call.starts_with("inbox fetch"));
+            assert_eq!(fetched, intercepts, "{argv}: fetch calls");
+            assert_eq!(text == line, !intercepts, "{argv}: {text:?}");
+        }
     }
 
     /// Scenario: Load the generated plugin under Node with its binary pinned to
