@@ -1479,8 +1479,12 @@ pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDel
 /// Serve one `inbox wait` connection after the hook loop has moved it out of
 /// the hook-ingest pool, until the waiter is spent, superseded or its peer goes
 /// away.
+///
+/// `repaint` is called with the agent id when the stream asks for a repaint
+/// (PRD #1666 S8) — only from an [`InboxComponent::OpenCodeMini`] stream; the
+/// daemon passes [`crate::agent_pty::AgentPtyRegistry::nudge_repaint`].
 #[allow(clippy::too_many_arguments)]
-pub async fn serve_waiter<R, W>(
+pub async fn serve_waiter<R, W, P>(
     hub: Arc<InboxHub>,
     pane_id: String,
     agent_id: String,
@@ -1488,9 +1492,11 @@ pub async fn serve_waiter<R, W>(
     component: InboxComponent,
     reader: R,
     mut writer: W,
+    repaint: P,
 ) where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
+    P: Fn(&str),
 {
     let armed = match hub.arm(&pane_id, &agent_id, mode, component) {
         Ok(armed) => armed,
@@ -1527,7 +1533,7 @@ pub async fn serve_waiter<R, W>(
         }
     });
     let ack_how = match component {
-        InboxComponent::OpenCodePlugin => AckHow::PluginConfirmed,
+        InboxComponent::OpenCodePlugin | InboxComponent::OpenCodeMini => AckHow::PluginConfirmed,
         InboxComponent::PiExtension => AckHow::ExtensionConfirmed,
         _ => AckHow::Explicit,
     };
@@ -1568,6 +1574,13 @@ pub async fn serve_waiter<R, W>(
                             for id in &control.nack {
                                 let requeued = hub.nack(id, &pane_id, &agent_id);
                                 debug!(conn_id, %id, requeued, "inbox: stream nack");
+                            }
+                            if control.repaint {
+                                if component == InboxComponent::OpenCodeMini {
+                                    repaint(&agent_id);
+                                } else {
+                                    debug!(conn_id, ?component, "inbox: ignoring a repaint request from a component that may not ask for one");
+                                }
                             }
                         }
                         Err(_) => debug!(conn_id, "inbox: ignoring a stream line that is not ack/nack"),
@@ -1633,6 +1646,54 @@ mod tests {
 
     fn hub() -> InboxHub {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
+    }
+
+    /// PRD #1666 S8 (FT-18): a stream's `{"repaint":true}` line reaches the
+    /// repaint nudge, for the stream's own agent, only from an `opencode_mini`
+    /// stream; from the full TUI's plugin, Pi's extension or Claude's waiter it
+    /// is ignored.
+    #[tokio::test]
+    async fn repaint_requests_reach_the_nudge_only_from_a_mini_stream() {
+        use tokio::io::AsyncReadExt;
+        for (component, nudged) in [
+            (InboxComponent::OpenCodeMini, true),
+            (InboxComponent::OpenCodePlugin, false),
+            (InboxComponent::PiExtension, false),
+            (InboxComponent::ClaudeWaiter, false),
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(server);
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&calls);
+            let serve = tokio::spawn(serve_waiter(
+                Arc::new(hub()),
+                "p".to_string(),
+                "a".to_string(),
+                InboxWaitMode::Stream,
+                component,
+                tokio::io::BufReader::new(read),
+                write,
+                move |agent: &str| seen.lock().unwrap().push(agent.to_string()),
+            ));
+            let (mut from_daemon, mut to_daemon) = tokio::io::split(client);
+            to_daemon
+                .write_all(b"{\"repaint\":true}\n{\"ack\":[],\"repaint\":true}\n")
+                .await
+                .unwrap();
+            to_daemon.shutdown().await.unwrap();
+            let mut sink = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), from_daemon.read_to_end(&mut sink))
+                .await
+                .expect("the waiter ends at its peer's EOF")
+                .unwrap();
+            serve.await.unwrap();
+            let expected: Vec<String> = if nudged {
+                vec!["a".to_string(), "a".to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(*calls.lock().unwrap(), expected, "{component:?}");
+        }
     }
 
     /// PRD #1666 S3: the summary counts one generation's messages and names

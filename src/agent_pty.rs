@@ -2787,6 +2787,15 @@ const STRANDED_WRITE_NOTICE: &str = "a daemon write into this pane stopped part-
 /// Issue #525: how long a guarded delivery waits on a single PTY write.
 pub const PTY_WRITE_STALL_BOUND: Duration = Duration::from_secs(10);
 
+/// PRD #1666 S8: how long [`AgentPtyRegistry::nudge_repaint`] keeps a PTY one
+/// column narrower. Measured on OpenCode 1.18.35's `--mini`: chained resizes
+/// with no gap failed 1 of 3, a 50 ms gap passed 2 of 2 and 300 ms passed 3 of
+/// 3 (design §7.7).
+pub const REPAINT_NUDGE_GAP: Duration = Duration::from_millis(300);
+
+/// Overrides [`REPAINT_NUDGE_GAP`], in milliseconds.
+pub const ENV_REPAINT_NUDGE_GAP_MS: &str = "DOT_AGENT_DECK_REPAINT_NUDGE_GAP_MS";
+
 /// Issue #876: `DEL`, the byte a terminal sends for the Backspace key under the
 /// default `stty erase ^?`, and so the byte an agent TUI reading from a PTY has
 /// to read as "erase the character before the cursor" for its own users to be
@@ -5533,6 +5542,14 @@ pub struct AgentPtyRegistry {
     /// milliseconds so a test can change it through the `Arc` every caller
     /// shares.
     pty_write_stall_bound_ms: AtomicU64,
+    /// PRD #1666 S8: agents with a repaint nudge in flight
+    /// ([`AgentPtyRegistry::nudge_repaint`]), each mapped to whether another
+    /// was asked for while it ran.
+    repaint_nudges: Mutex<HashMap<String, bool>>,
+    /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
+    /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
+    /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
+    repaint_nudge_gap_ms: AtomicU64,
     /// Issue #424 F4: agents whose pane declared BOOT PROVENANCE before their
     /// spawn-time prompt was written — a `wrapper_fork`-origin `SessionStart`
     /// that the readiness gate skipped
@@ -7524,6 +7541,13 @@ impl AgentPtyRegistry {
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             draft_defer_cap: crate::draft_deferral::draft_defer_cap_from_env(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
+            repaint_nudges: Mutex::new(HashMap::new()),
+            repaint_nudge_gap_ms: AtomicU64::new(
+                std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(REPAINT_NUDGE_GAP.as_millis() as u64),
+            ),
             launcher_handoff_agents: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
@@ -14216,6 +14240,115 @@ impl AgentPtyRegistry {
             .get(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         Ok((agent.bus.snapshot(), agent.pty_rows, agent.pty_cols))
+    }
+
+    /// PRD #1666 S8 (design §7.7): make `agent_id`'s program repaint, by
+    /// narrowing its PTY one column for [`REPAINT_NUDGE_GAP`] and restoring it.
+    /// `opencode --mini` draws a turn it did not start only after a resize;
+    /// its server plugin asks for this after each deck message it hands over
+    /// and when that turn ends.
+    ///
+    /// **Invisible to the deck's bookkeeping.** Unlike
+    /// [`Self::apply_dims_locked`] it moves neither the recorded size nor
+    /// `geometry_changes`, clears no scrollback ring and tells no viewer:
+    /// shrinking means everything drawn in the gap still fits every viewer's
+    /// parser. The restore goes to the size recorded **at restore time**, so a
+    /// real resize during the gap wins. Coalesced per agent: a request while
+    /// one runs schedules at most one more after it, one gap after its restore.
+    pub fn nudge_repaint(self: &Arc<Self>, agent_id: &str) {
+        if !self.nudge_begin(agent_id) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.repaint_nudges.lock().unwrap().remove(agent_id);
+            return;
+        }
+        let registry = Arc::clone(self);
+        let agent_id = agent_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                if !registry.nudge_shrink(&agent_id) {
+                    registry.repaint_nudges.lock().unwrap().remove(&agent_id);
+                    return;
+                }
+                let gap =
+                    Duration::from_millis(registry.repaint_nudge_gap_ms.load(Ordering::Relaxed));
+                tokio::time::sleep(gap).await;
+                registry.nudge_restore(&agent_id);
+                if !registry.nudge_finish(&agent_id) {
+                    return;
+                }
+                // The follow-up waits a gap too: a shrink right after the
+                // restore would merge into one resize for the program.
+                tokio::time::sleep(gap).await;
+            }
+        });
+    }
+
+    /// Whether a nudge for `agent_id` should start now: `false` when one is
+    /// already running, which is then told to run once more.
+    fn nudge_begin(&self, agent_id: &str) -> bool {
+        let mut nudges = self.repaint_nudges.lock().unwrap();
+        match nudges.get_mut(agent_id) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                nudges.insert(agent_id.to_string(), false);
+                true
+            }
+        }
+    }
+
+    /// Whether the nudge for `agent_id` that just restored should run again;
+    /// when not, it is over.
+    fn nudge_finish(&self, agent_id: &str) -> bool {
+        let mut nudges = self.repaint_nudges.lock().unwrap();
+        match nudges.get_mut(agent_id) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                nudges.remove(agent_id);
+                false
+            }
+        }
+    }
+
+    /// The nudge's first ioctl: the recorded size, one column narrower.
+    /// `false` when the agent is gone or too narrow to shrink.
+    fn nudge_shrink(&self, agent_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(agent) = inner.agents.get(agent_id) else {
+            return false;
+        };
+        if agent.pty_cols < 2 || agent.exited.load(Ordering::SeqCst) {
+            return false;
+        }
+        agent
+            .master
+            .resize(PtySize {
+                rows: agent.pty_rows,
+                cols: agent.pty_cols - 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+    }
+
+    /// The nudge's second ioctl: back to the size recorded now.
+    fn nudge_restore(&self, agent_id: &str) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner.agents.get(agent_id) {
+            let _ = agent.master.resize(PtySize {
+                rows: agent.pty_rows,
+                cols: agent.pty_cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
     }
 
     /// PRD #1666 S7: the composer recogniser the doorbell must satisfy before
@@ -22358,6 +22491,88 @@ mod spawn_tests {
         registry
             .subscribe_with_viewport_for_client(id, geometry, true, client)
             .expect("attach as a viewer")
+    }
+
+    /// PRD #1666 S8: the size the kernel holds for agent `id`'s PTY, which a
+    /// repaint nudge moves without the registry's record.
+    fn kernel_size(registry: &AgentPtyRegistry, id: &str) -> (u16, u16) {
+        let inner = registry.inner.lock().unwrap();
+        let size = inner.agents[id]
+            .master
+            .get_size()
+            .expect("read the PTY size");
+        (size.rows, size.cols)
+    }
+
+    /// PRD #1666 S8 (FT-19): a repaint nudge's two ioctls narrow the PTY one
+    /// column and restore it, and neither moves the recorded size, the
+    /// geometry-change count, the scrollback ring or the viewers' geometry
+    /// broadcast. A real resize between them wins: the restore goes to the
+    /// size recorded at restore time.
+    #[test]
+    fn repaint_nudge_moves_only_the_kernel_size_and_a_real_resize_wins() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let mut geometry = registry.inner.lock().unwrap().agents[&id]
+            .geometry_tx
+            .subscribe();
+        let before = registry.snapshot_with_pty_size(&id).expect("agent");
+        let changes = registry.geometry_changes_of(&id).expect("agent");
+        let untouched = |geometry: &mut broadcast::Receiver<(u16, u16)>| {
+            assert_eq!(registry.snapshot_with_pty_size(&id).expect("agent"), before);
+            assert_eq!(registry.geometry_changes_of(&id), Some(changes));
+            assert!(geometry.try_recv().is_err(), "no viewer is told");
+        };
+
+        assert!(registry.nudge_shrink(&id));
+        assert_eq!(kernel_size(&registry, &id), (24, 79));
+        untouched(&mut geometry);
+        registry.nudge_restore(&id);
+        assert_eq!(kernel_size(&registry, &id), (24, 80));
+        untouched(&mut geometry);
+
+        assert!(registry.nudge_shrink(&id));
+        registry.resize(&id, 30, 100).expect("a real resize");
+        registry.nudge_restore(&id);
+        assert_eq!(kernel_size(&registry, &id), (30, 100));
+        assert_eq!(registry.pty_size_for_agent(&id), Some((30, 100)));
+        assert!(!registry.nudge_shrink("no-such-agent"));
+        registry.shutdown_all();
+    }
+
+    /// PRD #1666 S8 (FT-19): requests while a nudge runs coalesce, per agent,
+    /// into at most one more nudge after it.
+    #[test]
+    fn repaint_nudge_requests_during_one_coalesce_into_one_more() {
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.nudge_begin("a"));
+        for _ in 0..3 {
+            assert!(!registry.nudge_begin("a"));
+        }
+        assert!(registry.nudge_begin("b"), "another agent nudges on its own");
+        assert!(registry.nudge_finish("a"), "the burst schedules one more");
+        assert!(!registry.nudge_finish("a"), "and only one");
+        assert!(registry.nudge_begin("a"), "a later request starts afresh");
+    }
+
+    /// PRD #1666 S8: a whole nudge, timed by its gap, leaves the PTY at its
+    /// recorded size and the registry with no nudge in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repaint_nudge_restores_the_recorded_size_after_its_gap() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.repaint_nudge_gap_ms.store(50, Ordering::Relaxed);
+        let id = spawn_focus_agent(&registry);
+        let changes = registry.geometry_changes_of(&id).expect("agent");
+        registry.nudge_repaint(&id);
+        registry.nudge_repaint(&id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry.repaint_nudges.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the nudge must finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(kernel_size(&registry, &id), (24, 80));
+        assert_eq!(registry.geometry_changes_of(&id), Some(changes));
+        registry.shutdown_all();
     }
 
     /// PRD #1105 — the last-focused client's viewer decides both axes, a later

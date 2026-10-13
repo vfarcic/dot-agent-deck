@@ -135,8 +135,10 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
+    let inbox = inbox_js(SERVER_INBOX_JS);
     format!(
-        r#"import {{ execFileSync }} from "child_process";
+        r#"import {{ execFile, execFileSync, spawn }} from "child_process";
+import {{ isMainThread }} from "worker_threads";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
 // that exists (`$XDG_CONFIG_HOME/opencode` and `~/.opencode`) because it cannot
@@ -787,6 +789,7 @@ const handleMessagePartUpdated = (event, directory) => {{
   messageRoles.delete(part.messageID);
 }};
 
+{inbox}
 export const DotAgentDeckPlugin = async (ctx) => {{
   // A second copy of this plugin in the same OpenCode process returns inert
   // hooks, so one real action produces one event. See DAD_GUARD above.
@@ -796,11 +799,14 @@ export const DotAgentDeckPlugin = async (ctx) => {{
 
   const directory = ctx?.directory ?? process.cwd();
   sessionClient = ctx?.client;
+  startInbox(ctx?.client);
 
   return {{
+    "chat.message": async (input, output) => interceptDoorbell(input, output),
     event: async (input) => {{
       const event = input?.event;
       const eventType = event?.type ?? "";
+      observeInbox(event);
       if (
         eventType === "message.created" ||
         eventType === "message.updated"
@@ -891,6 +897,525 @@ export default DotAgentDeckPlugin;
     )
 }
 
+/// PRD #1666 S8: `chunk` with the deck's shared inbox helpers in front of it
+/// and its placeholders filled: the framing every hand-over starts with
+/// ([`crate::inbox_hub::AGENT_FRAMING`]) and the doorbell line's two halves
+/// ([`crate::doorbell::LINE_PREFIX`], [`crate::doorbell::LINE_SUFFIX`]).
+fn inbox_js(chunk: &str) -> String {
+    let json = |text: &str| {
+        serde_json::to_string(text).expect("serializing a &str to a String is infallible")
+    };
+    format!("{INBOX_SHARED_JS}{chunk}")
+        .replace("__FRAMING_JSON__", &json(crate::inbox_hub::AGENT_FRAMING))
+        .replace(
+            "__DOORBELL_PREFIX_JSON__",
+            &json(crate::doorbell::LINE_PREFIX.trim()),
+        )
+        .replace(
+            "__DOORBELL_SUFFIX_JSON__",
+            &json(crate::doorbell::LINE_SUFFIX),
+        )
+}
+
+/// PRD #1666 S8: what both plugins share for the deck's inbox.
+const INBOX_SHARED_JS: &str = r#"// PRD #1666: dot-agent-deck's inbox. The deck hands its messages to a
+// watcher this plugin runs (`dot-agent-deck inbox wait --stream`), one JSON
+// line each; the plugin starts them as prompts with OpenCode's own client and
+// acknowledges each once OpenCode starts answering it — the first assistant
+// message whose parent is the deck's prompt — so a turn aborted before then
+// is handed over again. It never touches what the user is typing.
+const INBOX_FRAMING = __FRAMING_JSON__;
+const INBOX_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
+const INBOX_OPENER = new RegExp("\\[dot-agent-deck message " + INBOX_ID, "g");
+const INBOX_MAX_TRACKED = 256;
+const inboxSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const inboxRemember = (map, key, value) => {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > INBOX_MAX_TRACKED) {
+    map.delete(map.keys().next().value);
+  }
+};
+const inboxInPane = () =>
+  !!process.env.DOT_AGENT_DECK_PANE_ID && !!process.env.DOT_AGENT_DECK_PANE_CAPABILITY;
+// The deck message ids whose opener `text` carries.
+const inboxIdsIn = (text) =>
+  typeof text === "string" ? [...new Set([...text.matchAll(INBOX_OPENER)].map((m) => m[1]))] : [];
+// `--model provider/model` (or `-m`, or `--model=`) from the user's argv.
+const inboxArgvModel = () => {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    let value;
+    if (argv[i] === "--model" || argv[i] === "-m") {
+      value = argv[i + 1];
+    } else if (typeof argv[i] === "string" && argv[i].startsWith("--model=")) {
+      value = argv[i].slice("--model=".length);
+    } else {
+      continue;
+    }
+    const slash = typeof value === "string" ? value.indexOf("/") : -1;
+    return slash > 0 && slash < value.length - 1
+      ? { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
+      : undefined;
+  }
+  return undefined;
+};
+// The model and agent a user message ran with, if it names either.
+const inboxSelectionOf = (info) => {
+  if (!info || info.role !== "user") return undefined;
+  const model =
+    info.model && typeof info.model.providerID === "string" && typeof info.model.modelID === "string"
+      ? { providerID: info.model.providerID, modelID: info.model.modelID }
+      : undefined;
+  const agent = typeof info.agent === "string" && info.agent ? info.agent : undefined;
+  return model || agent ? { model, agent } : undefined;
+};
+const inboxLastSelection = (messages) => {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const selection = inboxSelectionOf(list[i]?.info ?? list[i]);
+    if (selection) return selection;
+  }
+  return undefined;
+};
+const inboxText = (message) => INBOX_FRAMING + "\n\n" + message.text;
+// Run the watcher; `deliver` gets each message, `exited` hears when it ends.
+const inboxSpawnWatcher = (agent, deliver, exited) => {
+  const child = spawn(hookBinary(), ["inbox", "wait", "--agent", agent, "--stream"], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  let buffer = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    try {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch (_) {
+          continue;
+        }
+        if (message && typeof message.id === "string" && typeof message.text === "string") {
+          deliver(message);
+        }
+      }
+    } catch (_) {}
+  });
+  child.stdin.on("error", () => {});
+  child.on("error", () => {});
+  child.on("exit", () => {
+    try {
+      exited(child);
+    } catch (_) {}
+  });
+  return child;
+};
+const inboxWrite = (child, control) => {
+  try {
+    child?.stdin?.write(JSON.stringify(control) + "\n");
+  } catch (_) {}
+};
+const inboxStop = (child) => {
+  if (!child) return;
+  try {
+    child.stdin.end();
+  } catch (_) {}
+  try {
+    child.kill("SIGTERM");
+  } catch (_) {}
+};
+"#;
+
+/// PRD #1666 S8: the server plugin's inbox roles (design §7.3, §7.7, and
+/// decisions E and F).
+///
+/// - In the full TUI it loads in a worker thread, and only announces: the TUI
+///   plugin arms the stream, possibly after this plugin's first status report,
+///   so the announce holds the doorbell for the arm grace.
+/// - In `opencode --mini`, where no TUI plugin loads, it arms its own stream
+///   and starts each message in mini's session, then asks the deck to nudge
+///   the pane into drawing it.
+/// - In every mode, it catches a submitted doorbell line before the model sees
+///   it, swaps in the waiting content, and acknowledges it on decision B's
+///   signal, like the TUI plugin.
+const SERVER_INBOX_JS: &str = r#"// OpenCode's subcommands (1.18.35 `--help`): a main-thread load under one of
+// them is not a TUI in this pane.
+const INBOX_SUBCOMMANDS = new Set(["completion", "acp", "mcp", "attach", "run", "debug",
+  "providers", "auth", "agent", "upgrade", "uninstall", "serve", "web", "models", "stats",
+  "export", "import", "github", "pr", "session", "plugin", "plug", "db"]);
+const INBOX_DOORBELL = new RegExp(
+  __DOORBELL_PREFIX_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " " + INBOX_ID +
+    __DOORBELL_SUFFIX_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+const INBOX_HANDLED =
+  "[dot-agent-deck: the message this line announced was already handed over. Nothing is waiting.]";
+const INBOX_WATCHER = "__dotAgentDeckWatcher";
+const INBOX_GENERATION = "__dotAgentDeckGeneration";
+const INBOX_ANNOUNCED = "__dotAgentDeckAnnounced";
+// --mini: the last root session this process created, the deck messages its
+// stream handed over and not yet acknowledged, which OpenCode user message
+// carries which of them, and the sessions running a deck turn.
+let miniTarget = undefined;
+const miniDelivered = new Set();
+const miniPending = new Map();
+const miniTurns = new Set();
+let miniQueue = Promise.resolve();
+// Every mode: doorbell prompts whose content this plugin swapped in, by
+// OpenCode user message id.
+const intercepted = new Map();
+
+const inboxGeneration = () => globalThis[INBOX_GENERATION] ?? 0;
+const isMini = () =>
+  isMainThread && process.argv.slice(2).includes("--mini") && !INBOX_SUBCOMMANDS.has(process.argv[2]);
+
+const miniDeliver = async (client, message, generation) => {
+  try {
+    while (!miniTarget) {
+      if (generation !== inboxGeneration()) return;
+      await inboxSleep(200);
+    }
+    const sessionID = miniTarget;
+    let selection;
+    try {
+      const response = await client.session.messages({ path: { id: sessionID } });
+      selection = inboxLastSelection(response?.data);
+    } catch (_) {}
+    if (!selection) {
+      const model = inboxArgvModel();
+      selection = model ? { model } : {};
+    }
+    if (generation !== inboxGeneration()) return;
+    const body = { parts: [{ type: "text", text: inboxText(message) }] };
+    if (selection.model) body.model = selection.model;
+    if (selection.agent) body.agent = selection.agent;
+    miniDelivered.add(message.id);
+    const result = await client.session.promptAsync({ path: { id: sessionID }, body });
+    if (result?.error) throw new Error("promptAsync refused");
+  } catch (_) {
+    miniDelivered.delete(message.id);
+    inboxWrite(globalThis[INBOX_WATCHER], { nack: [message.id] });
+  }
+};
+
+const startMini = (client, generation, backoff) => {
+  if (generation !== inboxGeneration()) return;
+  const started = Date.now();
+  let child;
+  try {
+    child = inboxSpawnWatcher(
+      "opencode-mini",
+      (message) => {
+        miniQueue = miniQueue.then(() => miniDeliver(client, message, generation));
+      },
+      (gone) => {
+        if (globalThis[INBOX_WATCHER] === gone) globalThis[INBOX_WATCHER] = undefined;
+        if (generation !== inboxGeneration() || gone.stdin.writableEnded) return;
+        const next = Date.now() - started > 30000 ? 1000 : Math.min(backoff * 2, 30000);
+        setTimeout(() => startMini(client, generation, next), backoff).unref?.();
+      }
+    );
+  } catch (_) {
+    setTimeout(() => startMini(client, generation, Math.min(backoff * 2, 30000)), backoff).unref?.();
+    return;
+  }
+  globalThis[INBOX_WATCHER] = child;
+};
+
+// Called at every instantiation: OpenCode re-runs a plugin in the same module
+// when it disposes an instance, and the previous instance hears nothing, so
+// its watcher is stopped here and its callbacks retire with its generation.
+const startInbox = (client) => {
+  try {
+    if (!inboxInPane()) return;
+    const generation = inboxGeneration() + 1;
+    globalThis[INBOX_GENERATION] = generation;
+    inboxStop(globalThis[INBOX_WATCHER]);
+    globalThis[INBOX_WATCHER] = undefined;
+    if (!isMainThread) {
+      if (!globalThis[INBOX_ANNOUNCED]) {
+        globalThis[INBOX_ANNOUNCED] = true;
+        try {
+          execFileSync(hookBinary(), ["inbox", "announce", "--agent", "opencode"], {
+            timeout: 5000,
+            stdio: ["ignore", "ignore", "ignore"],
+          });
+        } catch (_) {}
+      }
+      return;
+    }
+    if (isMini() && client?.session) startMini(client, generation, 1000);
+  } catch (_) {}
+};
+
+const inboxAck = (assistant) => {
+  const parent = assistant?.parentID;
+  if (!parent) return;
+  const fromDoorbell = intercepted.get(parent);
+  if (fromDoorbell) {
+    intercepted.delete(parent);
+    for (const id of fromDoorbell) {
+      try {
+        execFile(hookBinary(), ["ack", id], { timeout: 5000 }, () => {});
+      } catch (_) {}
+    }
+  }
+  const fromStream = miniPending.get(parent);
+  if (fromStream) {
+    miniPending.delete(parent);
+    const ids = fromStream.filter((id) => miniDelivered.delete(id));
+    if (ids.length) {
+      if (assistant.sessionID) miniTurns.add(assistant.sessionID);
+      inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, repaint: true });
+    }
+  }
+};
+
+const observeInbox = (event) => {
+  try {
+    const type = event?.type;
+    const properties = event?.properties;
+    if (type === "session.created") {
+      const info = properties?.info;
+      if (info?.id && !info.parentID) miniTarget = info.id;
+    } else if (type === "message.part.updated") {
+      const part = properties?.part;
+      if (part?.type !== "text" || !part.messageID) return;
+      const ids = inboxIdsIn(part.text).filter((id) => miniDelivered.has(id));
+      if (ids.length) {
+        inboxRemember(miniPending, part.messageID, [...new Set([...(miniPending.get(part.messageID) ?? []), ...ids])]);
+      }
+    } else if (type === "message.updated") {
+      if (properties?.info?.role === "assistant") inboxAck(properties.info);
+    } else if (type === "session.idle" || (type === "session.status" && properties?.status?.type === "idle")) {
+      const sessionID = properties?.sessionID;
+      if (sessionID && miniTurns.delete(sessionID)) {
+        inboxWrite(globalThis[INBOX_WATCHER], { repaint: true });
+      }
+    }
+  } catch (_) {}
+};
+
+// The doorbell, submitted because no watcher was armed, never reaches the
+// model as typed: its text is replaced IN PLACE (OpenCode saves the parts
+// array it passed in) with the waiting content, fetched without
+// acknowledging. A recalled doorbell whose message was already handed over
+// fetches nothing. If the deck cannot be asked, the line stays as it is, and
+// asks the model to fetch.
+const interceptDoorbell = async (input, output) => {
+  try {
+    if (!inboxInPane() || !Array.isArray(output?.parts)) return;
+    for (const part of output.parts) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue;
+      const match = INBOX_DOORBELL.exec(part.text);
+      if (!match) continue;
+      let reply;
+      try {
+        reply = JSON.parse(
+          execFileSync(hookBinary(), ["inbox", "fetch", "--json", "--doorbell", match[1]], {
+            timeout: 3000,
+            stdio: ["ignore", "pipe", "ignore"],
+            encoding: "utf8",
+          })
+        );
+      } catch (_) {
+        return;
+      }
+      const messages = Array.isArray(reply?.messages) ? reply.messages : undefined;
+      if (!messages) return;
+      if (messages.length === 0) {
+        part.text = part.text.replace(match[0], () => INBOX_HANDLED);
+        return;
+      }
+      const content = INBOX_FRAMING + messages.map((m) => "\n\n" + m.text).join("");
+      part.text = part.text.replace(match[0], () => content);
+      const messageID = input?.messageID ?? output?.message?.id;
+      if (messageID) inboxRemember(intercepted, messageID, messages.map((m) => m.id));
+      return;
+    }
+  } catch (_) {}
+};
+"#;
+
+/// PRD #1666 S8 (design §7.1–§7.6): the TUI plugin, `<root>/dot-agent-deck-tui.js`,
+/// with `BINARY_PATH` pinned like the server plugin's ([`plugin_template`]).
+///
+/// OpenCode loads it from the `plugin` list of `tui.json` in the process that
+/// draws the TUI (the full TUI and `attach`; not `--mini`, `run` or `serve`).
+/// It arms the deck's stream and starts each message in the session on
+/// screen: in place in a root session, in the root of a subagent's session
+/// (shown first), and in a new session, shown, from the home screen.
+fn tui_plugin_template(binary_path: &str) -> String {
+    let binary_path_json =
+        serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
+    format!(
+        "// dot-agent-deck's OpenCode TUI plugin, generated by `dot-agent-deck hooks install`.\n\
+         // Regenerated on every install; edits are overwritten.\n\
+         import {{ spawn }} from \"child_process\";\n\n\
+         const BINARY_PATH = {binary_path_json};\n\n{}{}",
+        TUI_HOOK_BINARY_JS,
+        inbox_js(TUI_INBOX_JS)
+    )
+}
+
+/// The TUI plugin's copy of the server plugin's `hookBinary` (PRD #1497's
+/// `DOT_AGENT_DECK_BIN` override, absolute paths only).
+const TUI_HOOK_BINARY_JS: &str = r#"const isAbsoluteOverride = (value) =>
+  process.platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(value) : value.startsWith("/");
+const hookBinary = () => {
+  const override = process.env.DOT_AGENT_DECK_BIN;
+  return typeof override === "string" && isAbsoluteOverride(override) ? override : BINARY_PATH;
+};
+
+"#;
+
+const TUI_INBOX_JS: &str = r#"// One live instance per process: a second copy of this file (another
+// spelling of its path, another tui.json) stays inert while the first runs.
+const TUI_GUARD = "__dotAgentDeckTuiLoaded";
+
+const tui = async (api) => {
+  try {
+    if (globalThis[TUI_GUARD]?.active || !inboxInPane()) return;
+    const instance = { active: true };
+    globalThis[TUI_GUARD] = instance;
+    let watcher;
+    let lastSeen;
+    let queue = Promise.resolve();
+    const delivered = new Set();
+    const pending = new Map();
+
+    const sessionOf = (id) => {
+      try {
+        return api.state?.session?.get?.(id);
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const selectionFor = (sessionID) => {
+      let messages;
+      try {
+        messages = api.state?.session?.messages?.(sessionID);
+      } catch (_) {}
+      const own = inboxLastSelection(messages);
+      if (own) return own;
+      if (lastSeen) return lastSeen;
+      const model = inboxArgvModel();
+      return model ? { model } : {};
+    };
+    const dialogOpen = () => {
+      try {
+        return !!api.ui?.dialog?.open || api.mode?.current?.() === "modal";
+      } catch (_) {
+        return false;
+      }
+    };
+    const untilNoDialog = async () => {
+      while (instance.active && dialogOpen()) await inboxSleep(100);
+    };
+    const rootOf = (id) => {
+      let current = id;
+      for (let n = 0; n < 64; n++) {
+        const parent = sessionOf(current)?.parentID;
+        if (!parent) return current;
+        current = parent;
+      }
+      return current;
+    };
+    // The session a delivery goes to, read when it is made.
+    const target = async () => {
+      const route = api.route?.current;
+      const shown = route?.name === "session" ? route.params?.sessionID : undefined;
+      if (shown) {
+        const root = rootOf(shown);
+        if (root !== shown) {
+          await untilNoDialog();
+          api.route.navigate("session", { sessionID: root });
+        }
+        return root;
+      }
+      await untilNoDialog();
+      const created = await api.client.session.create({});
+      const sessionID = created?.data?.id;
+      if (!sessionID) throw new Error("no session was created");
+      api.route.navigate("session", { sessionID });
+      return sessionID;
+    };
+    const deliver = async (message) => {
+      try {
+        if (!instance.active) return;
+        const sessionID = await target();
+        const selection = selectionFor(sessionID);
+        const request = { sessionID, parts: [{ type: "text", text: inboxText(message) }] };
+        if (selection.model) request.model = selection.model;
+        if (selection.agent) request.agent = selection.agent;
+        delivered.add(message.id);
+        const result = await api.client.session.promptAsync(request);
+        if (result?.error) throw new Error("promptAsync refused");
+      } catch (_) {
+        delivered.delete(message.id);
+        inboxWrite(watcher, { nack: [message.id] });
+      }
+    };
+
+    api.event.on("message.updated", (event) => {
+      try {
+        const info = event?.properties?.info;
+        if (info?.role === "user") {
+          lastSeen = inboxSelectionOf(info) ?? lastSeen;
+          return;
+        }
+        if (info?.role !== "assistant" || !info.parentID || !pending.has(info.parentID)) return;
+        const ids = pending.get(info.parentID).filter((id) => delivered.delete(id));
+        pending.delete(info.parentID);
+        if (ids.length) inboxWrite(watcher, { ack: ids });
+      } catch (_) {}
+    });
+    api.event.on("message.part.updated", (event) => {
+      try {
+        const part = event?.properties?.part;
+        if (part?.type !== "text" || !part.messageID) return;
+        const ids = inboxIdsIn(part.text).filter((id) => delivered.has(id));
+        if (ids.length) {
+          inboxRemember(pending, part.messageID, [...new Set([...(pending.get(part.messageID) ?? []), ...ids])]);
+        }
+      } catch (_) {}
+    });
+
+    const start = (backoff) => {
+      if (!instance.active) return;
+      const started = Date.now();
+      try {
+        watcher = inboxSpawnWatcher(
+          "opencode",
+          (message) => {
+            queue = queue.then(() => deliver(message));
+          },
+          (gone) => {
+            if (watcher === gone) watcher = undefined;
+            if (!instance.active || gone.stdin.writableEnded) return;
+            const next = Date.now() - started > 30000 ? 1000 : Math.min(backoff * 2, 30000);
+            setTimeout(() => start(next), backoff).unref?.();
+          }
+        );
+      } catch (_) {
+        setTimeout(() => start(Math.min(backoff * 2, 30000)), backoff).unref?.();
+      }
+    };
+    api.lifecycle?.onDispose?.(() => {
+      instance.active = false;
+      const child = watcher;
+      watcher = undefined;
+      inboxStop(child);
+    });
+    start(1000);
+  } catch (_) {}
+};
+
+export default { id: "dot-agent-deck", tui };
+"#;
+
 /// Ensure `<root>/plugin/` exists and (over)write the flat `dot-agent-deck.js`
 /// pinned to `binary_path`, returning the file path written. Also removes any
 /// obsolete nested `dot-agent-deck/` directory (see [`stale_plugin_dir`]) so an
@@ -970,7 +1495,13 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
 /// literal on one line and the `;` the template writes is always the last byte
 /// of it. The first matching line wins, as before.
 fn existing_binary_path(root: &Path) -> Option<String> {
-    let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    existing_pin(&plugin_file(root))
+}
+
+/// The `BINARY_PATH` a generated plugin file pins; see
+/// [`existing_binary_path`].
+fn existing_pin(file: &Path) -> Option<String> {
+    let js = std::fs::read_to_string(file).ok()?;
     js.lines()
         .filter_map(|line| line.strip_prefix("const BINARY_PATH = "))
         .filter_map(|rest| rest.strip_suffix(';'))
@@ -1133,13 +1664,231 @@ fn install_to_roots(
     }
 }
 
-/// Silently install OpenCode plugin into every existing layout.
+/// PRD #1666 S8: the TUI plugin file under an OpenCode config root. Not under
+/// `plugin/`, where OpenCode's server-plugin glob would load it as a server
+/// plugin, and not the obsolete nested `plugin/dot-agent-deck/` directory.
+fn tui_plugin_file(root: &Path) -> PathBuf {
+    root.join("dot-agent-deck-tui.js")
+}
+
+/// The files OpenCode reads its TUI config from, in the order the installer
+/// edits them: `tui.json` if it exists, otherwise `tui.jsonc`.
+const TUI_CONFIG_FILES: [&str; 2] = ["tui.json", "tui.jsonc"];
+
+/// The largest `tui.json` the installer edits.
+const MAX_TUI_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// The `plugin` entry naming `file`, as a JSON string.
+fn tui_entry_literal(file: &Path) -> String {
+    serde_json::to_string(&file.to_string_lossy()).expect("serializing a str is infallible")
+}
+
+/// The `tui.json` the installer creates when there is none.
+fn fresh_tui_config(file: &Path) -> String {
+    format!(
+        "{{\"$schema\": \"https://opencode.ai/tui.json\", \"plugin\": [{}]}}\n",
+        tui_entry_literal(file)
+    )
+}
+
+/// Whether `entry` is the deck's own TUI plugin entry: the TUI file's path
+/// under a candidate root, as a plain path or a `file://` URL. Anything else,
+/// even an entry that mentions `dot-agent-deck`, is the user's.
+fn is_deck_tui_entry(entry: &str) -> bool {
+    candidate_roots().iter().any(|root| {
+        let file = tui_plugin_file(root);
+        let path = file.to_string_lossy();
+        entry == path || entry.strip_prefix("file://") == Some(&*path)
+    })
+}
+
+/// A TUI config's text, `None` when the file does not exist, or why it may
+/// not be edited.
+fn read_tui_config(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err("it is a symlink, and rewriting it would replace the link".to_string());
+    }
+    if !metadata.is_file() {
+        return Err("it is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_TUI_CONFIG_BYTES {
+        return Err("it is larger than 1 MiB".to_string());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("it cannot be read ({e})"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "it is not UTF-8".to_string())
+}
+
+/// What became of the deck's entry in a TUI config.
+enum TuiEntry {
+    Added(PathBuf),
+    Present(PathBuf),
+    Refused(PathBuf, String),
+}
+
+/// Write the TUI plugin under `root` pinned to `pin` (left alone when `None`,
+/// or when it already holds those bytes), then make sure a TUI config lists
+/// it (design §7.2). An `Err` is a write the config guard or the filesystem
+/// refused; a config the installer will not edit is [`TuiEntry::Refused`],
+/// with the TUI file still written. Callers hold [`PLUGIN_LOCK`].
+fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry> {
+    let file = tui_plugin_file(root);
+    crate::config_write_guard::ensure_config_write_allowed(&file)?;
+    for name in TUI_CONFIG_FILES {
+        crate::config_write_guard::ensure_config_write_allowed(&root.join(name))?;
+    }
+    if let Some(pin) = pin {
+        let content = tui_plugin_template(pin);
+        if std::fs::read(&file).ok().as_deref() != Some(content.as_bytes()) {
+            crate::agent_hook_config::write_atomic(root, &file, content.as_bytes())?;
+        }
+    }
+    let entry = file.to_string_lossy().into_owned();
+    let configs: Vec<(PathBuf, Result<Option<String>, String>)> = TUI_CONFIG_FILES
+        .iter()
+        .map(|name| {
+            let path = root.join(name);
+            let text = read_tui_config(&path);
+            (path, text)
+        })
+        .collect();
+    for (path, text) in &configs {
+        if let Ok(Some(text)) = text
+            && crate::jsonc_edit::has_entry(text, is_deck_tui_entry).unwrap_or(false)
+        {
+            return Ok(TuiEntry::Present(path.clone()));
+        }
+    }
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    let (target, text) = configs
+        .iter()
+        .find(|(path, _)| exists(path))
+        .cloned()
+        .unwrap_or_else(|| (root.join(TUI_CONFIG_FILES[0]), Ok(None)));
+    let updated = match text {
+        Err(why) => return Ok(TuiEntry::Refused(target, why)),
+        Ok(None) => fresh_tui_config(&file),
+        Ok(Some(text)) => match crate::jsonc_edit::insert_entry(&text, &entry) {
+            Ok(updated) => updated,
+            Err(why) => return Ok(TuiEntry::Refused(target, why.to_string())),
+        },
+    };
+    crate::agent_hook_config::write_atomic(root, &target, updated.as_bytes())?;
+    Ok(TuiEntry::Added(target))
+}
+
+/// The automatic install's TUI half: the pin follows the server plugin's
+/// rules, and a refusal is one `warn!` and nothing on stdout.
+fn auto_install_tui(root: &Path, binary_path: &str) {
+    let _guard = lock_plugin();
+    let pin = match existing_pin(&tui_plugin_file(root)) {
+        Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
+            crate::agent_hook_config::executables_match(&existing, binary_path).then_some(existing)
+        }
+        _ => Some(binary_path.to_string()),
+    };
+    match install_tui_half(root, pin.as_deref()) {
+        Ok(TuiEntry::Added(file)) => tracing::info!(
+            "auto-install: added the OpenCode TUI plugin to {}",
+            file.display()
+        ),
+        Ok(TuiEntry::Present(_)) => {}
+        Ok(TuiEntry::Refused(file, why)) => tracing::warn!(
+            "auto-install: left {} unchanged: {why}; deck messages will reach OpenCode by \
+             the doorbell instead. To enable them, add {} to its \"plugin\" list",
+            file.display(),
+            tui_entry_literal(&tui_plugin_file(root))
+        ),
+        Err(e) => tracing::warn!(
+            "auto-install: failed to install the OpenCode TUI plugin under {}: {e}",
+            root.display()
+        ),
+    }
+}
+
+/// Remove the deck's entry from `root`'s TUI configs (deleting one the
+/// installer created from nothing), then the TUI file. A config that cannot
+/// be edited safely, while the deck's TUI plugin may be listed in it, stops
+/// here with nothing deleted, so OpenCode is never left listing a plugin file
+/// that is gone.
+fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
+    let file = tui_plugin_file(root);
+    let file_exists = std::fs::symlink_metadata(&file).is_ok();
+    let mut edits = Vec::new();
+    for name in TUI_CONFIG_FILES {
+        let path = root.join(name);
+        let text = match read_tui_config(&path) {
+            Ok(None) => continue,
+            Ok(Some(text)) => text,
+            Err(why) if file_exists => return Err(left_unchanged(&path, &file, &why)),
+            Err(_) => continue,
+        };
+        if text == fresh_tui_config(&file) {
+            edits.push((path, None));
+            continue;
+        }
+        match crate::jsonc_edit::remove_entries(&text, is_deck_tui_entry) {
+            Ok(None) => {}
+            Ok(Some(updated)) => edits.push((path, Some(updated))),
+            Err(why) if file_exists || text.contains("dot-agent-deck-tui.js") => {
+                return Err(left_unchanged(&path, &file, &why.to_string()));
+            }
+            Err(_) => {}
+        }
+    }
+    for (path, _) in &edits {
+        crate::config_write_guard::ensure_config_write_allowed(path)?;
+    }
+    if file_exists {
+        crate::config_write_guard::ensure_config_write_allowed(&file)?;
+    }
+    for (path, updated) in edits {
+        match updated {
+            Some(updated) => {
+                crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())?;
+                println!("Removed the OpenCode TUI plugin from {}", path.display());
+            }
+            None => {
+                std::fs::remove_file(&path)?;
+                println!("Removed {}", path.display());
+            }
+        }
+    }
+    if file_exists {
+        std::fs::remove_file(&file)?;
+        println!("Removed OpenCode TUI plugin: {}", file.display());
+    }
+    Ok(())
+}
+
+fn left_unchanged(config: &Path, file: &Path, why: &str) -> std::io::Error {
+    println!(
+        "Left {} unchanged: {why}. Kept {} so OpenCode does not list a missing plugin. \
+         Remove {} from its \"plugin\" list, then run the uninstall again.",
+        config.display(),
+        file.display(),
+        tui_entry_literal(file)
+    );
+    std::io::Error::other(format!("left {} unchanged: {why}", config.display()))
+}
+
+/// Silently install OpenCode plugin into every existing layout, and the TUI
+/// plugin into the XDG root when it exists (PRD #1666 S8).
 /// Intended for dashboard startup — never prints to stdout, refusal included.
 pub fn auto_install() {
-    auto_install_resolved(
-        &candidate_roots(),
-        crate::platform::paths::durable_binary_path,
-    );
+    let roots = candidate_roots();
+    if let Some(binary_path) =
+        auto_install_resolved(&roots, crate::platform::paths::durable_binary_path)
+        && roots[0].exists()
+    {
+        auto_install_tui(&roots[0], &binary_path);
+    }
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -1156,13 +1905,24 @@ pub fn auto_install() {
 /// often absent; resolving first logged `durable_binary_path`'s "pinning … as a
 /// last resort" warning for a plugin that was then never written (Qodo on PR
 /// #1344).
-fn auto_install_resolved(roots: &[PathBuf], resolve: impl FnOnce() -> Result<String, String>) {
+///
+/// Returns the binary path it installed with, `None` when it installed nothing.
+fn auto_install_resolved(
+    roots: &[PathBuf],
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Option<String> {
     if !roots.iter().any(|root| root.exists()) {
-        return;
+        return None;
     }
     match resolve() {
-        Ok(binary_path) => auto_install_to(roots, &binary_path),
-        Err(e) => tracing::warn!("auto-install: {e}"),
+        Ok(binary_path) => {
+            auto_install_to(roots, &binary_path);
+            Some(binary_path)
+        }
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            None
+        }
     }
 }
 
@@ -1178,10 +1938,44 @@ pub fn install() -> std::io::Result<()> {
         xdg_default_root,
         &binary_path,
         &mut std::io::stdout(),
-    )
+    )?;
+    // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
+    let root = xdg_default_root();
+    let _guard = lock_plugin();
+    std::fs::create_dir_all(&root)?;
+    let tui_file = tui_plugin_file(&root);
+    match install_tui_half(&root, Some(&binary_path))? {
+        TuiEntry::Added(file) => {
+            println!("Installed OpenCode TUI plugin: {}", tui_file.display());
+            println!("Added the OpenCode TUI plugin to {}", file.display());
+            Ok(())
+        }
+        TuiEntry::Present(file) => {
+            println!("Installed OpenCode TUI plugin: {}", tui_file.display());
+            println!("The OpenCode TUI plugin is listed in {}", file.display());
+            Ok(())
+        }
+        TuiEntry::Refused(file, why) => {
+            println!(
+                "Left {} unchanged: {why}. Deck messages will reach OpenCode by the doorbell instead. \
+                 To enable them, add {} to its \"plugin\" list.",
+                file.display(),
+                tui_entry_literal(&tui_file)
+            );
+            Err(std::io::Error::other(format!(
+                "left {} unchanged: {why}",
+                file.display()
+            )))
+        }
+    }
 }
 
 pub fn uninstall() -> std::io::Result<()> {
+    // PRD #1666 S8: the TUI plugin's entry and file first, so a config that
+    // cannot be edited safely stops the uninstall before anything is deleted.
+    for root in candidate_roots() {
+        uninstall_tui_half(&root)?;
+    }
     let artifacts = existing_plugin_artifacts();
     if artifacts.is_empty() {
         println!("No OpenCode plugin found to remove.");
@@ -1438,7 +2232,9 @@ pub(crate) mod tests {
     #[test]
     fn plugin_template_uses_exec_file_sync() {
         let content = plugin_template("/usr/local/bin/dot-agent-deck");
-        assert!(content.contains("import { execFileSync } from \"child_process\";"));
+        assert!(
+            content.contains("import { execFile, execFileSync, spawn } from \"child_process\";")
+        );
         assert!(!content.contains("execSync("));
         assert!(content.contains(r#"BINARY_PATH = "/usr/local/bin/dot-agent-deck""#));
         assert!(content.contains("const knownSessions = new Map();"));

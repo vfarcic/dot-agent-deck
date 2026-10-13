@@ -74,6 +74,7 @@ pub mod inbox_prompt;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
+pub mod jsonc_edit;
 pub mod keybindings;
 // Issue #1540: the deck's last New-agent-form command, owned by the daemon.
 pub mod last_command;

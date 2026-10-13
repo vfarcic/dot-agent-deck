@@ -375,6 +375,18 @@ pub fn deck_prompt_submit(
         .map(|injection| crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context))
 }
 
+/// PRD #1666 S8: send an `inbox_announce` on its own connection, for a
+/// component that announces outside a hook event (OpenCode's server plugin, as
+/// it loads in the full TUI). Nothing is sent without the pane's token.
+pub(crate) fn send_inbox_announce(
+    component: crate::event::InboxComponent,
+    wake: crate::event::InboxWake,
+) {
+    if let Some(announce) = inbox_announce(component, wake) {
+        let _ = send_lines_and_drain(&announce);
+    }
+}
+
 /// The `inbox_announce` line an agent's `SessionStart` hook sends, or `None`
 /// without the pane's token (the daemon would refuse it).
 fn inbox_announce(

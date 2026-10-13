@@ -2912,6 +2912,11 @@ pub enum InboxComponent {
     ClaudeHooks,
     #[serde(rename = "opencode_plugin")]
     OpenCodePlugin,
+    /// PRD #1666 S8: OpenCode's server plugin, armed only in `opencode
+    /// --mini`, where no TUI plugin loads. Its stream may ask the daemon to
+    /// nudge the pane into repainting ([`InboxStreamControl::repaint`]).
+    #[serde(rename = "opencode_mini")]
+    OpenCodeMini,
     PiExtension,
     CodexHooks,
     DevinHooks,
@@ -2932,6 +2937,7 @@ impl InboxComponent {
             InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => InboxBudget::Chars(9_000),
             InboxComponent::CodexHooks => InboxBudget::Bytes(6_000),
             InboxComponent::OpenCodePlugin
+            | InboxComponent::OpenCodeMini
             | InboxComponent::PiExtension
             | InboxComponent::DevinHooks
             | InboxComponent::Other => InboxBudget::Chars(64 * 1024),
@@ -3192,6 +3198,12 @@ pub struct InboxStreamControl {
     pub ack: Vec<String>,
     #[serde(default)]
     pub nack: Vec<String>,
+    /// PRD #1666 S8: ask the daemon to make the agent's pane repaint (a
+    /// one-column shrink and restore of its PTY). Honoured only from an
+    /// [`InboxComponent::OpenCodeMini`] stream; a daemon that predates it
+    /// reads the line as an empty ack and ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repaint: bool,
 }
 
 /// The answer to [`DaemonMessage::InboxList`].
@@ -3203,6 +3215,11 @@ pub struct InboxListReply {
     /// What the caller's component announced, if anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<InboxWake>,
+    /// PRD #1666 S8: the component behind the caller's wake path
+    /// (`opencode_mini`, `claude_waiter`, …), when one is armed or announced —
+    /// the summary's `component`. Absent from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.

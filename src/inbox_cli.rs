@@ -13,8 +13,9 @@ use std::time::Duration;
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
     DaemonMessage, InboxComponent, InboxFetchConsumer, InboxFetchRequest, InboxListReply,
-    InboxListRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession,
+    InboxListRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession, InboxWake,
 };
+use crate::inbox::StateName;
 use crate::inbox_hub::AGENT_FRAMING;
 
 /// The most of a hook's stdin `inbox wait` reads.
@@ -52,6 +53,7 @@ fn component_for(agent: &str) -> InboxComponent {
     match agent {
         "claude-code" | "claude_code" | "claude" => InboxComponent::ClaudeWaiter,
         "opencode" => InboxComponent::OpenCodePlugin,
+        "opencode-mini" => InboxComponent::OpenCodeMini,
         "pi" => InboxComponent::PiExtension,
         "codex" => InboxComponent::CodexHooks,
         "devin" => InboxComponent::DevinHooks,
@@ -135,6 +137,19 @@ pub fn wait(agent: &str, stream: bool) -> ExitCode {
     } else {
         wait_once(&json)
     }
+}
+
+/// PRD #1666 S8: `dot-agent-deck inbox announce --agent <agent>`. Tells the
+/// deck that `agent`'s native component is coming, so the doorbell gives it
+/// the arm grace before ringing. Run by OpenCode's server plugin as it loads
+/// in the full TUI, ahead of its first status report, because the TUI plugin
+/// that arms the stream may load after that report. Silent and always
+/// successful: outside a deck, or with no daemon, there is nobody to tell.
+pub fn announce(agent: &str) -> ExitCode {
+    if identity().is_some_and(|identity| identity.token.is_some()) {
+        crate::hook::send_inbox_announce(component_for(agent), InboxWake::Native);
+    }
+    ExitCode::SUCCESS
 }
 
 /// How often a Once waiter checks that the agent that ran it is still there.
@@ -246,7 +261,10 @@ fn wait_stream(json: &str) -> ExitCode {
     {
         return ExitCode::SUCCESS;
     }
-    // Acks and nacks from the component, forwarded as they come.
+    // Acks and nacks from the component, forwarded as they come. The
+    // component closing our stdin is how it says it is done (PRD #1666 S8:
+    // OpenCode's plugin on dispose), so the watcher then exits, and the deck
+    // takes back whatever it handed over and was not acknowledged.
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -264,6 +282,7 @@ fn wait_stream(json: &str) -> ExitCode {
                 break;
             }
         }
+        std::process::exit(0);
     });
     let reader = BufReader::new(socket);
     let mut stdout = std::io::stdout().lock();
@@ -323,18 +342,63 @@ fn refusal(line: &str) -> Option<String> {
 /// `dot-agent-deck inbox fetch`: print the framing sentence and every message
 /// waiting for this agent, and acknowledge them.
 pub fn fetch(json: bool) -> ExitCode {
+    fetch_as(json, None)
+}
+
+/// PRD #1666 S8: `dot-agent-deck inbox fetch --json --doorbell <id>`, run by
+/// an agent-side component that caught the doorbell naming message `id` on
+/// its way to the model (OpenCode's server plugin). Prints the deck's JSON
+/// answer and acknowledges nothing: the component acknowledges once the agent
+/// has started on the content, so a turn aborted before then is handed over
+/// again. When `id` is no longer waiting — a doorbell recalled from prompt
+/// history — it fetches nothing, so a newer message is never pulled into an
+/// old doorbell's turn.
+pub fn fetch_for_doorbell(id: &str) -> ExitCode {
+    if !crate::inbox::is_valid_message_id(id) {
+        eprintln!("Could not fetch messages: {id:?} is not a deck message id.");
+        return ExitCode::FAILURE;
+    }
+    fetch_as(true, Some(id))
+}
+
+fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
     let Some(identity) = identity() else {
         eprintln!("{NOT_IN_PANE}");
         return ExitCode::FAILURE;
     };
+    if let Some(id) = doorbell {
+        let listing = DaemonMessage::InboxList(InboxListRequest {
+            pane_id: identity.pane_id.clone(),
+            agent_id: identity.agent_id.clone(),
+            token: identity.token.clone(),
+            all: false,
+        });
+        let waiting = request(&listing)
+            .ok()
+            .and_then(|line| serde_json::from_str::<InboxListReply>(&line).ok())
+            .is_some_and(|reply| {
+                reply
+                    .messages
+                    .iter()
+                    .any(|m| m.id.as_str() == id && m.state == StateName::Queued)
+            });
+        if !waiting {
+            println!("{}", serde_json::json!({ "messages": [] }));
+            return ExitCode::SUCCESS;
+        }
+    }
     let message = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id: identity.pane_id,
         agent_id: identity.agent_id,
         token: identity.token,
-        consumer: InboxFetchConsumer::Cli,
+        consumer: if doorbell.is_some() {
+            InboxFetchConsumer::DoorbellHook
+        } else {
+            InboxFetchConsumer::Cli
+        },
         max_chars: None,
         max_bytes: None,
-        ack: true,
+        ack: doorbell.is_none(),
     });
     let line = match request(&message) {
         Ok(line) => line,
@@ -465,4 +529,23 @@ fn render_list(pane_id: &str, reply: &InboxListReply) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PRD #1666 S8: `inbox wait --agent opencode-mini` speaks for OpenCode's
+    /// `--mini` server plugin, on the wire as `opencode_mini`; the full TUI's
+    /// plugin keeps `opencode_plugin`.
+    #[test]
+    fn opencode_mini_agent_maps_to_its_own_component() {
+        assert_eq!(component_for("opencode-mini"), InboxComponent::OpenCodeMini);
+        assert_eq!(
+            serde_json::to_value(component_for("opencode-mini")).unwrap(),
+            "opencode_mini"
+        );
+        assert_eq!(component_for("opencode"), InboxComponent::OpenCodePlugin);
+        assert_eq!(component_for("unheard-of"), InboxComponent::Other);
+    }
 }

@@ -704,6 +704,11 @@ enum InboxAction {
         /// Print the deck's JSON answer instead.
         #[arg(long)]
         json: bool,
+        /// For an agent-side component that caught the doorbell naming this
+        /// message: fetch without acknowledging, and only while that message
+        /// is still waiting. Implies `--json`.
+        #[arg(long, hide = true, value_name = "ID")]
+        doorbell: Option<String>,
     },
     /// List your messages and their delivery states.
     List {
@@ -725,6 +730,14 @@ enum InboxAction {
         /// `{"ack":[…]}` / `{"nack":[…]}` lines from stdin.
         #[arg(long)]
         stream: bool,
+    },
+    /// Tell the deck an agent's native inbox component is about to arm. Run
+    /// by those components, not by hand.
+    #[command(hide = true)]
+    Announce {
+        /// The agent the component belongs to.
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -1579,9 +1592,16 @@ fn main() -> ExitCode {
             send_signal_and_report_ack(&json, "work-done", "work-done report")
         }
         Some(Commands::Inbox { action }) => match action {
-            InboxAction::Fetch { json } => dot_agent_deck::inbox_cli::fetch(json),
+            InboxAction::Fetch {
+                doorbell: Some(id), ..
+            } => dot_agent_deck::inbox_cli::fetch_for_doorbell(&id),
+            InboxAction::Fetch {
+                json,
+                doorbell: None,
+            } => dot_agent_deck::inbox_cli::fetch(json),
             InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
             InboxAction::Wait { agent, stream } => dot_agent_deck::inbox_cli::wait(&agent, stream),
+            InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
         },
         Some(Commands::Ack { delivery_id }) => {
             let reply = match (

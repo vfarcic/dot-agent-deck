@@ -3941,6 +3941,7 @@ async fn handle_inbox_list(
         messages,
         armed: hub.armed(&req.pane_id, agent_id),
         wake: hub.announced_wake(&req.pane_id, agent_id),
+        component: hub.summary(&req.pane_id, agent_id).component,
     })
 }
 
@@ -4335,6 +4336,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         req.component,
                                         reader,
                                         write_half,
+                                        |agent: &str| pty_registry.nudge_repaint(agent),
                                     )
                                     .await;
                                     return;
